@@ -5,6 +5,8 @@
 //! Repository methods are delegated to the fusillade/ crate - which (as of 04/11/2025) stores
 //! files disaggregated in postgres.
 
+use sqlx_pool_router::PoolProvider;
+
 use crate::api::models::files::{
     FileContentQuery, FileCostEstimate, FileCostEstimateQuery, FileDeleteResponse, FileListResponse, FileResponse, ListFilesQuery,
     ListObject, ObjectType, Purpose,
@@ -509,8 +511,8 @@ Each line must be a valid JSON object containing `custom_id`, `method`, `url`, a
     )
 )]
 #[tracing::instrument(skip(state, current_user, multipart), fields(user_id = %current_user.id))]
-pub async fn upload_file(
-    State(state): State<AppState>,
+pub async fn upload_file<P: PoolProvider>(
+    State(state): State<AppState<P>>,
     current_user: RequiresPermission<resource::Files, operation::CreateOwn>,
     multipart: Multipart,
 ) -> Result<(StatusCode, Json<FileResponse>)> {
@@ -614,8 +616,8 @@ Use cursor-based pagination: pass `last_id` from the response as the `after` par
     )
 )]
 #[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, limit = ?query.pagination.limit, order = %query.order))]
-pub async fn list_files(
-    State(state): State<AppState>,
+pub async fn list_files<P: PoolProvider>(
+    State(state): State<AppState<P>>,
     Query(query): Query<ListFilesQuery>,
     current_user: RequiresPermission<resource::Files, operation::ReadOwn>,
 ) -> Result<Json<FileListResponse>> {
@@ -715,8 +717,8 @@ pub async fn list_files(
     )
 )]
 #[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, file_id = %file_id_str))]
-pub async fn get_file(
-    State(state): State<AppState>,
+pub async fn get_file<P: PoolProvider>(
+    State(state): State<AppState<P>>,
     Path(file_id_str): Path<String>,
     current_user: RequiresPermission<resource::Files, operation::ReadOwn>,
 ) -> Result<Json<FileResponse>> {
@@ -784,8 +786,8 @@ For input files, returns the original request templates. For output files, retur
     )
 )]
 #[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, file_id = %file_id_str, limit = ?query.pagination.limit, offset = ?query.pagination.skip))]
-pub async fn get_file_content(
-    State(state): State<AppState>,
+pub async fn get_file_content<P: PoolProvider>(
+    State(state): State<AppState<P>>,
     Path(file_id_str): Path<String>,
     Query(query): Query<FileContentQuery>,
     current_user: RequiresPermission<resource::Files, operation::ReadOwn>,
@@ -976,8 +978,8 @@ Deleting a file also deletes any batches that were created from it. This action 
     )
 )]
 #[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, file_id = %file_id_str))]
-pub async fn delete_file(
-    State(state): State<AppState>,
+pub async fn delete_file<P: PoolProvider>(
+    State(state): State<AppState<P>>,
     Path(file_id_str): Path<String>,
     current_user: RequiresPermission<resource::Files, operation::DeleteOwn>,
 ) -> Result<Json<FileDeleteResponse>> {
@@ -1043,8 +1045,8 @@ Returns a breakdown by model including estimated input/output tokens and cost. U
     )
 )]
 #[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, file_id = %file_id_str, completion_window = ?query.completion_window))]
-pub async fn get_file_cost_estimate(
-    State(state): State<AppState>,
+pub async fn get_file_cost_estimate<P: PoolProvider>(
+    State(state): State<AppState<P>>,
     Path(file_id_str): Path<String>,
     Query(query): Query<FileCostEstimateQuery>,
     current_user: RequiresPermission<resource::Files, operation::ReadOwn>,

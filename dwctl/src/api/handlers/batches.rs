@@ -4,6 +4,8 @@
 //!
 //! Repository methods are delegated to the fusillade/ crate.
 
+use sqlx_pool_router::PoolProvider;
+
 use crate::AppState;
 use crate::api::models::batches::{
     BatchAnalytics, BatchErrors, BatchListResponse, BatchObjectType, BatchResponse, BatchResultsQuery, CreateBatchRequest,
@@ -147,8 +149,8 @@ The batch will begin processing immediately. Use `GET /batches/{batch_id}` to mo
     )
 )]
 #[tracing::instrument(skip(state, current_user, has_api_key), fields(user_id = %current_user.id, input_file_id = %req.input_file_id))]
-pub async fn create_batch(
-    State(state): State<AppState>,
+pub async fn create_batch<P: PoolProvider>(
+    State(state): State<AppState<P>>,
     current_user: RequiresPermission<resource::Batches, operation::CreateOwn>,
     has_api_key: crate::auth::current_user::HasApiKey,
     Json(req): Json<CreateBatchRequest>,
@@ -261,8 +263,8 @@ Poll this endpoint to monitor progress. Results are streamed to `output_file_id`
     )
 )]
 #[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, batch_id = %batch_id_str))]
-pub async fn get_batch(
-    State(state): State<AppState>,
+pub async fn get_batch<P: PoolProvider>(
+    State(state): State<AppState<P>>,
     Path(batch_id_str): Path<String>,
     current_user: RequiresPermission<resource::Batches, operation::ReadOwn>,
 ) -> Result<Json<BatchResponse>> {
@@ -293,7 +295,7 @@ pub async fn get_batch(
     }
 
     // Fetch creator email for the response
-    let creator_email = fetch_creator_email(&state.db, &batch).await;
+    let creator_email = fetch_creator_email(state.db.read(), &batch).await;
     Ok(Json(to_batch_response_with_email(batch, creator_email.as_deref())))
 }
 
@@ -315,8 +317,8 @@ Analytics update in real-time as requests complete.",
     )
 )]
 #[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, batch_id = %batch_id_str))]
-pub async fn get_batch_analytics(
-    State(state): State<AppState>,
+pub async fn get_batch_analytics<P: PoolProvider>(
+    State(state): State<AppState<P>>,
     Path(batch_id_str): Path<String>,
     current_user: RequiresPermission<resource::Batches, operation::ReadOwn>,
 ) -> Result<Json<BatchAnalytics>> {
@@ -377,8 +379,8 @@ Supports pagination via `limit` and `skip` query parameters, and filtering by `c
     )
 )]
 #[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, batch_id = %batch_id_str, limit = ?query.pagination.limit, skip = ?query.pagination.skip))]
-pub async fn get_batch_results(
-    State(state): State<AppState>,
+pub async fn get_batch_results<P: PoolProvider>(
+    State(state): State<AppState<P>>,
     Path(batch_id_str): Path<String>,
     Query(query): Query<BatchResultsQuery>,
     current_user: RequiresPermission<resource::Batches, operation::ReadOwn>,
@@ -495,8 +497,8 @@ Pending requests will not be processed. Requests already in progress will comple
     )
 )]
 #[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, batch_id = %batch_id_str))]
-pub async fn cancel_batch(
-    State(state): State<AppState>,
+pub async fn cancel_batch<P: PoolProvider>(
+    State(state): State<AppState<P>>,
     Path(batch_id_str): Path<String>,
     current_user: RequiresPermission<resource::Batches, operation::UpdateOwn>,
 ) -> Result<Json<BatchResponse>> {
@@ -548,7 +550,7 @@ pub async fn cancel_batch(
     tracing::info!("Batch {} cancelled", batch_id);
 
     // Fetch creator email for the response
-    let creator_email = fetch_creator_email(&state.db, &batch).await;
+    let creator_email = fetch_creator_email(state.db.read(), &batch).await;
     Ok(Json(to_batch_response_with_email(batch, creator_email.as_deref())))
 }
 
@@ -571,8 +573,8 @@ This action cannot be undone. The input file is not deleted.",
     )
 )]
 #[tracing::instrument(skip(state, current_user), fields(batch_id = %batch_id_str))]
-pub async fn delete_batch(
-    State(state): State<AppState>,
+pub async fn delete_batch<P: PoolProvider>(
+    State(state): State<AppState<P>>,
     Path(batch_id_str): Path<String>,
     current_user: RequiresPermission<resource::Batches, operation::DeleteOwn>,
 ) -> Result<StatusCode> {
@@ -635,8 +637,8 @@ Failed requests are reset to pending and will be processed again. Use this after
     )
 )]
 #[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, batch_id = %batch_id_str))]
-pub async fn retry_failed_batch_requests(
-    State(state): State<AppState>,
+pub async fn retry_failed_batch_requests<P: PoolProvider>(
+    State(state): State<AppState<P>>,
     Path(batch_id_str): Path<String>,
     current_user: RequiresPermission<resource::Batches, operation::UpdateOwn>,
 ) -> Result<Json<BatchResponse>> {
@@ -741,7 +743,7 @@ pub async fn retry_failed_batch_requests(
         })?;
 
     // Fetch creator email for the response
-    let creator_email = fetch_creator_email(&state.db, &batch).await;
+    let creator_email = fetch_creator_email(state.db.read(), &batch).await;
     Ok(Json(to_batch_response_with_email(batch, creator_email.as_deref())))
 }
 
@@ -765,8 +767,8 @@ Use this for fine-grained control over which requests to retry, rather than retr
     )
 )]
 #[tracing::instrument(skip(state, current_user, req), fields(user_id = %current_user.id, batch_id = %batch_id_str))]
-pub async fn retry_specific_requests(
-    State(state): State<AppState>,
+pub async fn retry_specific_requests<P: PoolProvider>(
+    State(state): State<AppState<P>>,
     Path(batch_id_str): Path<String>,
     current_user: RequiresPermission<resource::Batches, operation::UpdateOwn>,
     Json(req): Json<RetryRequestsRequest>,
@@ -858,7 +860,7 @@ pub async fn retry_specific_requests(
         })?;
 
     // Fetch creator email for the response
-    let creator_email = fetch_creator_email(&state.db, &batch).await;
+    let creator_email = fetch_creator_email(state.db.read(), &batch).await;
     Ok(Json(to_batch_response_with_email(batch, creator_email.as_deref())))
 }
 
@@ -879,8 +881,8 @@ Use cursor-based pagination: pass `last_id` from the response as the `after` par
     )
 )]
 #[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, limit = ?query.pagination.limit, after = ?query.pagination.after))]
-pub async fn list_batches(
-    State(state): State<AppState>,
+pub async fn list_batches<P: PoolProvider>(
+    State(state): State<AppState<P>>,
     Query(query): Query<ListBatchesQuery>,
     current_user: RequiresPermission<resource::Batches, operation::ReadOwn>,
 ) -> Result<Json<BatchListResponse>> {
@@ -925,7 +927,7 @@ pub async fn list_batches(
 
     // Bulk fetch user emails
     let email_map: HashMap<String, String> = if !user_ids.is_empty() {
-        let mut conn = state.db.acquire().await.map_err(|e| Error::Internal {
+        let mut conn = state.db.read().acquire().await.map_err(|e| Error::Internal {
             operation: format!("acquire db connection: {}", e),
         })?;
         let users = Users::new(&mut conn).get_bulk(user_ids).await.map_err(|e| Error::Internal {

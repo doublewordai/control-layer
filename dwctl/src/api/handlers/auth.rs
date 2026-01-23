@@ -6,6 +6,8 @@ use axum::{
 };
 use uuid::Uuid;
 
+use sqlx_pool_router::PoolProvider;
+
 use crate::{
     AppState,
     api::models::{
@@ -40,7 +42,7 @@ use crate::{
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn get_registration_info(State(state): State<AppState>) -> Result<Json<RegistrationInfo>, Error> {
+pub async fn get_registration_info<P: PoolProvider>(State(state): State<AppState<P>>) -> Result<Json<RegistrationInfo>, Error> {
     Ok(Json(RegistrationInfo {
         enabled: state.config.auth.native.enabled && state.config.auth.native.allow_registration,
         message: if state.config.auth.native.enabled && state.config.auth.native.allow_registration {
@@ -68,7 +70,10 @@ pub async fn get_registration_info(State(state): State<AppState>) -> Result<Json
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn register(State(state): State<AppState>, Json(request): Json<RegisterRequest>) -> Result<RegisterResponse, Error> {
+pub async fn register<P: PoolProvider>(
+    State(state): State<AppState<P>>,
+    Json(request): Json<RegisterRequest>,
+) -> Result<RegisterResponse, Error> {
     // Check if native auth is enabled
     if !state.config.auth.native.enabled {
         return Err(Error::BadRequest {
@@ -96,7 +101,7 @@ pub async fn register(State(state): State<AppState>, Json(request): Json<Registe
         });
     }
 
-    let mut tx = state.db.begin().await.map_err(|e| Error::Database(e.into()))?;
+    let mut tx = state.db.write().begin().await.map_err(|e| Error::Database(e.into()))?;
 
     // Check if user with this email already exists
     let mut user_repo = Users::new(&mut tx);
@@ -187,7 +192,7 @@ pub async fn register(State(state): State<AppState>, Json(request): Json<Registe
 /// This function is called asynchronously after user registration to avoid
 /// blocking the registration response. Failures are logged but don't affect
 /// the user creation.
-async fn create_sample_files_for_new_user(state: &AppState, user_id: Uuid) -> Result<(), Error> {
+async fn create_sample_files_for_new_user<P: PoolProvider>(state: &AppState<P>, user_id: Uuid) -> Result<(), Error> {
     use crate::db::handlers::deployments::DeploymentFilter;
     use crate::sample_files;
 
@@ -245,7 +250,7 @@ async fn create_sample_files_for_new_user(state: &AppState, user_id: Uuid) -> Re
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn get_login_info(State(state): State<AppState>) -> Result<Json<LoginInfo>, Error> {
+pub async fn get_login_info<P: PoolProvider>(State(state): State<AppState<P>>) -> Result<Json<LoginInfo>, Error> {
     Ok(Json(LoginInfo {
         enabled: state.config.auth.native.enabled,
         message: if state.config.auth.native.enabled {
@@ -272,7 +277,7 @@ pub async fn get_login_info(State(state): State<AppState>) -> Result<Json<LoginI
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn login(State(state): State<AppState>, Json(request): Json<LoginRequest>) -> Result<LoginResponse, Error> {
+pub async fn login<P: PoolProvider>(State(state): State<AppState<P>>, Json(request): Json<LoginRequest>) -> Result<LoginResponse, Error> {
     // Check if native auth is enabled
     if !state.config.auth.native.enabled {
         return Err(Error::BadRequest {
@@ -341,7 +346,7 @@ pub async fn login(State(state): State<AppState>, Json(request): Json<LoginReque
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn logout(State(state): State<AppState>) -> Result<LogoutResponse, Error> {
+pub async fn logout<P: PoolProvider>(State(state): State<AppState<P>>) -> Result<LogoutResponse, Error> {
     // Create expired cookie to clear session
     let cookie = format!(
         "{}=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0",
@@ -372,8 +377,8 @@ pub async fn logout(State(state): State<AppState>) -> Result<LogoutResponse, Err
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn request_password_reset(
-    State(state): State<AppState>,
+pub async fn request_password_reset<P: PoolProvider>(
+    State(state): State<AppState<P>>,
     Json(request): Json<PasswordResetRequest>,
 ) -> Result<Json<PasswordResetResponse>, Error> {
     // Check if native auth is enabled
@@ -382,7 +387,7 @@ pub async fn request_password_reset(
             message: "Native authentication is disabled".to_string(),
         });
     }
-    let mut tx = state.db.begin().await.unwrap();
+    let mut tx = state.db.write().begin().await.unwrap();
 
     let mut user_repo = Users::new(&mut tx);
 
@@ -428,8 +433,8 @@ pub async fn request_password_reset(
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn confirm_password_reset(
-    State(state): State<AppState>,
+pub async fn confirm_password_reset<P: PoolProvider>(
+    State(state): State<AppState<P>>,
     Path(token_id): Path<Uuid>,
     Json(request): Json<PasswordResetConfirmRequest>,
 ) -> Result<Json<PasswordResetResponse>, Error> {
@@ -475,7 +480,7 @@ pub async fn confirm_password_reset(
         password_hash: Some(new_password_hash),
     };
 
-    let mut tx = state.db.begin().await.unwrap();
+    let mut tx = state.db.write().begin().await.unwrap();
     let token;
     {
         let mut token_repo = PasswordResetTokens::new(&mut tx);
@@ -529,8 +534,8 @@ pub async fn confirm_password_reset(
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn change_password(
-    State(state): State<AppState>,
+pub async fn change_password<P: PoolProvider>(
+    State(state): State<AppState<P>>,
     current_user: CurrentUser,
     Json(request): Json<ChangePasswordRequest>,
 ) -> Result<Json<AuthSuccessResponse>, Error> {
@@ -638,12 +643,7 @@ mod tests {
         config.auth.native.enabled = true;
         config.auth.native.allow_registration = true;
 
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
-        let state = AppState::builder()
-            .db(crate::db::DbPools::new(pool))
-            .config(config)
-            .request_manager(request_manager)
-            .build();
+        let state = crate::test::utils::create_test_app_state_with_config(pool, config).await;
 
         let app = axum::Router::new()
             .route("/auth/register", axum::routing::post(register))
@@ -673,12 +673,7 @@ mod tests {
         let mut config = create_test_config();
         config.auth.native.enabled = false;
 
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
-        let state = AppState::builder()
-            .db(crate::db::DbPools::new(pool))
-            .config(config)
-            .request_manager(request_manager)
-            .build();
+        let state = crate::test::utils::create_test_app_state_with_config(pool, config).await;
 
         let app = axum::Router::new()
             .route("/auth/register", axum::routing::post(register))
@@ -703,12 +698,7 @@ mod tests {
         config.auth.native.enabled = true;
         config.auth.native.password.min_length = 10;
 
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
-        let state = AppState::builder()
-            .db(crate::db::DbPools::new(pool))
-            .config(config)
-            .request_manager(request_manager)
-            .build();
+        let state = crate::test::utils::create_test_app_state_with_config(pool, config).await;
 
         let app = axum::Router::new()
             .route("/auth/register", axum::routing::post(register))
@@ -735,12 +725,7 @@ mod tests {
         // Set initial credits for standard users
         config.credits.initial_credits_for_standard_users = rust_decimal::Decimal::new(10000, 2); // 100.00 credits
 
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
-        let state = AppState::builder()
-            .db(crate::db::DbPools::new(pool.clone()))
-            .config(config)
-            .request_manager(request_manager)
-            .build();
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
 
         let app = axum::Router::new()
             .route("/auth/register", axum::routing::post(register))
@@ -796,12 +781,7 @@ mod tests {
         // Set initial credits to zero (default)
         config.credits.initial_credits_for_standard_users = rust_decimal::Decimal::ZERO;
 
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
-        let state = AppState::builder()
-            .db(crate::db::DbPools::new(pool.clone()))
-            .config(config)
-            .request_manager(request_manager)
-            .build();
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
 
         let app = axum::Router::new()
             .route("/auth/register", axum::routing::post(register))
@@ -841,12 +821,7 @@ mod tests {
         config.auth.native.enabled = true;
         config.auth.native.allow_registration = true;
 
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
-        let state = AppState::builder()
-            .db(crate::db::DbPools::new(pool.clone()))
-            .config(config)
-            .request_manager(request_manager)
-            .build();
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
 
         let app = axum::Router::new()
             .route("/auth/register", axum::routing::post(register))
@@ -888,12 +863,7 @@ mod tests {
         config.auth.native.enabled = true;
         config.auth.native.allow_registration = true;
 
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
-        let state = AppState::builder()
-            .db(crate::db::DbPools::new(pool))
-            .config(config)
-            .request_manager(request_manager)
-            .build();
+        let state = crate::test::utils::create_test_app_state_with_config(pool, config).await;
 
         let app = axum::Router::new()
             .route("/auth/register-info", axum::routing::get(get_registration_info))
@@ -914,12 +884,7 @@ mod tests {
         config.auth.native.enabled = false;
         config.auth.native.allow_registration = true;
 
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
-        let state = AppState::builder()
-            .db(crate::db::DbPools::new(pool))
-            .config(config)
-            .request_manager(request_manager)
-            .build();
+        let state = crate::test::utils::create_test_app_state_with_config(pool, config).await;
 
         let app = axum::Router::new()
             .route("/auth/register-info", axum::routing::get(get_registration_info))
@@ -940,12 +905,7 @@ mod tests {
         config.auth.native.enabled = true;
         config.auth.native.allow_registration = false;
 
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
-        let state = AppState::builder()
-            .db(crate::db::DbPools::new(pool))
-            .config(config)
-            .request_manager(request_manager)
-            .build();
+        let state = crate::test::utils::create_test_app_state_with_config(pool, config).await;
 
         let app = axum::Router::new()
             .route("/auth/register-info", axum::routing::get(get_registration_info))
@@ -965,12 +925,7 @@ mod tests {
         let mut config = create_test_config();
         config.auth.native.enabled = true;
 
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
-        let state = AppState::builder()
-            .db(crate::db::DbPools::new(pool))
-            .config(config)
-            .request_manager(request_manager)
-            .build();
+        let state = crate::test::utils::create_test_app_state_with_config(pool, config).await;
 
         let app = axum::Router::new()
             .route("/auth/login-info", axum::routing::get(get_login_info))
@@ -990,12 +945,7 @@ mod tests {
         let mut config = create_test_config();
         config.auth.native.enabled = false;
 
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
-        let state = AppState::builder()
-            .db(crate::db::DbPools::new(pool))
-            .config(config)
-            .request_manager(request_manager)
-            .build();
+        let state = crate::test::utils::create_test_app_state_with_config(pool, config).await;
 
         let app = axum::Router::new()
             .route("/auth/login-info", axum::routing::get(get_login_info))
@@ -1015,12 +965,7 @@ mod tests {
         let mut config = create_test_config();
         config.auth.native.enabled = true;
 
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
-        let state = AppState::builder()
-            .db(crate::db::DbPools::new(pool.clone()))
-            .config(config)
-            .request_manager(request_manager)
-            .build();
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
 
         // Create a user using the repository
         // Use weak params for fast testing
@@ -1075,12 +1020,7 @@ mod tests {
         let mut config = create_test_config();
         config.auth.native.enabled = false;
 
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
-        let state = AppState::builder()
-            .db(crate::db::DbPools::new(pool))
-            .config(config)
-            .request_manager(request_manager)
-            .build();
+        let state = crate::test::utils::create_test_app_state_with_config(pool, config).await;
 
         let app = axum::Router::new()
             .route("/auth/login", axum::routing::post(login))
@@ -1102,12 +1042,7 @@ mod tests {
         let mut config = create_test_config();
         config.auth.native.enabled = true;
 
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
-        let state = AppState::builder()
-            .db(crate::db::DbPools::new(pool))
-            .config(config)
-            .request_manager(request_manager)
-            .build();
+        let state = crate::test::utils::create_test_app_state_with_config(pool, config).await;
 
         let app = axum::Router::new()
             .route("/auth/login", axum::routing::post(login))
@@ -1129,12 +1064,7 @@ mod tests {
         let mut config = create_test_config();
         config.auth.native.enabled = true;
 
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
-        let state = AppState::builder()
-            .db(crate::db::DbPools::new(pool.clone()))
-            .config(config)
-            .request_manager(request_manager)
-            .build();
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
 
         // Create a user using the repository
         let password_hash = password::hash_string_with_params(
@@ -1184,12 +1114,7 @@ mod tests {
         let mut config = create_test_config();
         config.auth.native.enabled = true;
 
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
-        let state = AppState::builder()
-            .db(crate::db::DbPools::new(pool.clone()))
-            .config(config)
-            .request_manager(request_manager)
-            .build();
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
 
         // Create a user without password_hash (e.g., SSO user)
         let mut conn = pool.acquire().await.unwrap();
@@ -1228,12 +1153,7 @@ mod tests {
     #[sqlx::test]
     async fn test_logout(pool: PgPool) {
         let config = create_test_config();
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
-        let state = AppState::builder()
-            .db(crate::db::DbPools::new(pool))
-            .config(config)
-            .request_manager(request_manager)
-            .build();
+        let state = crate::test::utils::create_test_app_state_with_config(pool, config).await;
 
         let app = axum::Router::new()
             .route("/auth/logout", axum::routing::post(logout))
@@ -1260,12 +1180,7 @@ mod tests {
         config.auth.native.enabled = true;
         config.auth.native.allow_registration = true;
 
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
-        let state = AppState::builder()
-            .db(crate::db::DbPools::new(pool.clone()))
-            .config(config)
-            .request_manager(request_manager)
-            .build();
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
 
         // Create a user first
         let mut conn = pool.acquire().await.unwrap();
@@ -1321,12 +1236,7 @@ mod tests {
         config.auth.native.allow_registration = true;
         config.auth.native.password.max_length = 20;
 
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
-        let state = AppState::builder()
-            .db(crate::db::DbPools::new(pool))
-            .config(config)
-            .request_manager(request_manager)
-            .build();
+        let state = crate::test::utils::create_test_app_state_with_config(pool, config).await;
 
         let app = axum::Router::new()
             .route("/auth/register", axum::routing::post(register))
@@ -1351,12 +1261,7 @@ mod tests {
         config.auth.native.enabled = true;
         config.auth.native.allow_registration = false;
 
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
-        let state = AppState::builder()
-            .db(crate::db::DbPools::new(pool))
-            .config(config)
-            .request_manager(request_manager)
-            .build();
+        let state = crate::test::utils::create_test_app_state_with_config(pool, config).await;
 
         let app = axum::Router::new()
             .route("/auth/register", axum::routing::post(register))
@@ -1380,12 +1285,7 @@ mod tests {
         let mut config = create_test_config();
         config.auth.native.enabled = false;
 
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
-        let state = AppState::builder()
-            .db(crate::db::DbPools::new(pool))
-            .config(config)
-            .request_manager(request_manager)
-            .build();
+        let state = crate::test::utils::create_test_app_state_with_config(pool, config).await;
 
         let app = axum::Router::new()
             .route("/auth/password-reset", axum::routing::post(request_password_reset))
@@ -1406,12 +1306,7 @@ mod tests {
         let mut config = create_test_config();
         config.auth.native.enabled = true;
 
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
-        let state = AppState::builder()
-            .db(crate::db::DbPools::new(pool))
-            .config(config)
-            .request_manager(request_manager)
-            .build();
+        let state = crate::test::utils::create_test_app_state_with_config(pool, config).await;
 
         let app = axum::Router::new()
             .route("/auth/password-reset", axum::routing::post(request_password_reset))
@@ -1436,12 +1331,7 @@ mod tests {
         let mut config = create_test_config();
         config.auth.native.enabled = true;
 
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
-        let state = AppState::builder()
-            .db(crate::db::DbPools::new(pool.clone()))
-            .config(config)
-            .request_manager(request_manager)
-            .build();
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
 
         // Create an SSO user (no password_hash)
         let mut conn = pool.acquire().await.unwrap();
@@ -1485,12 +1375,7 @@ mod tests {
         let mut config = create_test_config();
         config.auth.native.enabled = false;
 
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
-        let state = AppState::builder()
-            .db(crate::db::DbPools::new(pool))
-            .config(config)
-            .request_manager(request_manager)
-            .build();
+        let state = crate::test::utils::create_test_app_state_with_config(pool, config).await;
 
         let app = axum::Router::new()
             .route(
@@ -1520,12 +1405,7 @@ mod tests {
         let mut config = create_test_config();
         config.auth.native.enabled = true;
 
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
-        let state = AppState::builder()
-            .db(crate::db::DbPools::new(pool))
-            .config(config)
-            .request_manager(request_manager)
-            .build();
+        let state = crate::test::utils::create_test_app_state_with_config(pool, config).await;
 
         let app = axum::Router::new()
             .route(
@@ -1556,12 +1436,7 @@ mod tests {
         config.auth.native.enabled = true;
         config.auth.native.password.min_length = 10;
 
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
-        let state = AppState::builder()
-            .db(crate::db::DbPools::new(pool))
-            .config(config)
-            .request_manager(request_manager)
-            .build();
+        let state = crate::test::utils::create_test_app_state_with_config(pool, config).await;
 
         let app = axum::Router::new()
             .route(
@@ -1592,12 +1467,7 @@ mod tests {
         config.auth.native.enabled = true;
         config.auth.native.password.max_length = 20;
 
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
-        let state = AppState::builder()
-            .db(crate::db::DbPools::new(pool))
-            .config(config)
-            .request_manager(request_manager)
-            .build();
+        let state = crate::test::utils::create_test_app_state_with_config(pool, config).await;
 
         let app = axum::Router::new()
             .route(
@@ -2157,12 +2027,7 @@ mod tests {
         // Configure default roles to include RequestViewer in addition to StandardUser
         config.auth.default_user_roles = vec![Role::StandardUser, Role::RequestViewer];
 
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
-        let state = AppState::builder()
-            .db(crate::db::DbPools::new(pool.clone()))
-            .config(config)
-            .request_manager(request_manager)
-            .build();
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
 
         let app = axum::Router::new()
             .route("/auth/register", axum::routing::post(register))
@@ -2198,12 +2063,7 @@ mod tests {
         // Configure default roles without StandardUser - it should still be added
         config.auth.default_user_roles = vec![Role::RequestViewer];
 
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
-        let state = AppState::builder()
-            .db(crate::db::DbPools::new(pool.clone()))
-            .config(config)
-            .request_manager(request_manager)
-            .build();
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
 
         let app = axum::Router::new()
             .route("/auth/register", axum::routing::post(register))
