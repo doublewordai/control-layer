@@ -355,11 +355,11 @@ impl FromRequestParts<AppState> for HasApiKey {
     }
 }
 
-impl FromRequestParts<AppState> for CurrentUser {
+impl<P: sqlx_pool_router::PoolProvider + Clone + Send + Sync> FromRequestParts<crate::AppState<P>> for CurrentUser {
     type Rejection = Error;
 
     #[instrument(skip(parts, state))]
-    async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self> {
+    async fn from_request_parts(parts: &mut Parts, state: &crate::AppState<P>) -> Result<Self> {
         // Try all authentication methods and accumulate results
         // Each method returns Option<Result<CurrentUser>>:
         // - None means the auth method is not applicable (no credentials present)
@@ -374,7 +374,7 @@ impl FromRequestParts<AppState> for CurrentUser {
         let mut any_auth_attempted = false;
 
         // Try API key authentication first (most specific)
-        match try_api_key_auth(parts, &state.db).await {
+        match try_api_key_auth(parts, state.db.read()).await {
             Some(Ok(user)) => {
                 debug!("Authentication successful via API key");
                 trace!("Authenticated user: {}", user.id);
@@ -392,7 +392,7 @@ impl FromRequestParts<AppState> for CurrentUser {
 
         // Native authentication (JWT sessions)
         if state.config.auth.native.enabled {
-            match try_jwt_session_auth(parts, &state.config, &state.db).await {
+            match try_jwt_session_auth(parts, &state.config, state.db.read()).await {
                 Some(Ok(user)) => {
                     debug!("Authentication successful via JWT session");
                     trace!("Authenticated user: {}", user.id);
@@ -411,7 +411,7 @@ impl FromRequestParts<AppState> for CurrentUser {
 
         // Fall back to proxy header authentication
         if state.config.auth.proxy_header.enabled {
-            match try_proxy_header_auth(parts, &state.config, &state.db).await {
+            match try_proxy_header_auth(parts, &state.config, state.db.write()).await {
                 Some(Ok(user)) => {
                     debug!("Authentication successful via proxy header");
                     trace!("Authenticated user: {}", user.id);
@@ -444,7 +444,6 @@ impl FromRequestParts<AppState> for CurrentUser {
 #[cfg(test)]
 mod tests {
     use crate::{
-        AppState,
         api::models::{
             transactions::TransactionFilters,
             users::{CurrentUser, Role},
@@ -472,14 +471,7 @@ mod tests {
     #[sqlx::test]
     async fn test_existing_user_extraction(pool: PgPool) {
         let config = create_test_config();
-        let state = {
-            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
-            AppState::builder()
-                .db(crate::db::DbPools::new(pool.clone()))
-                .config(config)
-                .request_manager(request_manager)
-                .build()
-        };
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
 
         // Create a test user first
         let test_user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
@@ -500,14 +492,7 @@ mod tests {
     #[sqlx::test]
     async fn test_auto_create_nonexistent_user(pool: PgPool) {
         let config = create_test_config();
-        let state = {
-            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
-            AppState::builder()
-                .db(crate::db::DbPools::new(pool.clone()))
-                .config(config)
-                .request_manager(request_manager)
-                .build()
-        };
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
 
         let new_email = "newuser@example.com";
         let new_external_id = "auth0|newuser123";
@@ -549,14 +534,7 @@ mod tests {
     #[sqlx::test]
     async fn test_missing_header_returns_unauthorized(pool: PgPool) {
         let config = create_test_config();
-        let state = {
-            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
-            AppState::builder()
-                .db(crate::db::DbPools::new(pool.clone()))
-                .config(config)
-                .request_manager(request_manager)
-                .build()
-        };
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
 
         // Create parts without x-doubleword-user header
         let request = axum::http::Request::builder().uri("http://localhost/test").body(()).unwrap();
@@ -573,14 +551,7 @@ mod tests {
     #[sqlx::test]
     async fn test_backwards_compatibility_single_header(pool: PgPool) {
         let config = create_test_config();
-        let state = {
-            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
-            AppState::builder()
-                .db(crate::db::DbPools::new(pool.clone()))
-                .config(config)
-                .request_manager(request_manager)
-                .build()
-        };
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
 
         // Old deployment behavior: single header with email value
         // Should use it as both external_user_id and email
@@ -615,14 +586,7 @@ mod tests {
     #[sqlx::test]
     async fn test_multiple_federated_identities_same_email(pool: PgPool) {
         let config = create_test_config();
-        let state = {
-            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
-            AppState::builder()
-                .db(crate::db::DbPools::new(pool.clone()))
-                .config(config)
-                .request_manager(request_manager)
-                .build()
-        };
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
 
         let shared_email = "user@example.com";
 
@@ -672,14 +636,7 @@ mod tests {
     #[sqlx::test]
     async fn test_migration_backfill_external_user_id(pool: PgPool) {
         let config = create_test_config();
-        let state = {
-            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
-            AppState::builder()
-                .db(crate::db::DbPools::new(pool.clone()))
-                .config(config)
-                .request_manager(request_manager)
-                .build()
-        };
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
 
         let email = "legacy-user@example.com";
 
@@ -738,14 +695,7 @@ mod tests {
     #[sqlx::test]
     async fn test_backwards_compat_no_backfill(pool: PgPool) {
         let config = create_test_config();
-        let state = {
-            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
-            AppState::builder()
-                .db(crate::db::DbPools::new(pool.clone()))
-                .config(config)
-                .request_manager(request_manager)
-                .build()
-        };
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
 
         let email = "legacy-user@example.com";
 
@@ -825,14 +775,7 @@ mod tests {
     #[sqlx::test]
     async fn test_only_email_header_sent_fails(pool: PgPool) {
         let config = create_test_config();
-        let state = {
-            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
-            AppState::builder()
-                .db(crate::db::DbPools::new(pool.clone()))
-                .config(config)
-                .request_manager(request_manager)
-                .build()
-        };
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
 
         // Send only email header, not user header - this is invalid
         let request = axum::http::Request::builder()
@@ -855,14 +798,7 @@ mod tests {
         let mut config = create_test_config();
         config.auth.proxy_header.auto_create_users = false;
 
-        let state = {
-            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
-            AppState::builder()
-                .db(crate::db::DbPools::new(pool.clone()))
-                .config(config)
-                .request_manager(request_manager)
-                .build()
-        };
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
 
         // Create a user first
         let test_user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
@@ -889,14 +825,7 @@ mod tests {
         let mut config = create_test_config();
         config.auth.proxy_header.auto_create_users = false;
 
-        let state = {
-            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
-            AppState::builder()
-                .db(crate::db::DbPools::new(pool.clone()))
-                .config(config)
-                .request_manager(request_manager)
-                .build()
-        };
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
 
         // Try to login as new user with auto_create disabled
         let request = axum::http::Request::builder()
@@ -917,14 +846,7 @@ mod tests {
     #[sqlx::test]
     async fn test_existing_user_email_update(pool: PgPool) {
         let config = create_test_config();
-        let state = {
-            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
-            AppState::builder()
-                .db(crate::db::DbPools::new(pool.clone()))
-                .config(config)
-                .request_manager(request_manager)
-                .build()
-        };
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
 
         let external_user_id = "github|user123";
         let old_email = "old@example.com";
@@ -971,14 +893,7 @@ mod tests {
     #[sqlx::test]
     async fn test_idempotent_logins(pool: PgPool) {
         let config = create_test_config();
-        let state = {
-            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
-            AppState::builder()
-                .db(crate::db::DbPools::new(pool.clone()))
-                .config(config)
-                .request_manager(request_manager)
-                .build()
-        };
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
 
         let external_user_id = "auth0|user456";
         let email = "user@example.com";
@@ -1010,14 +925,7 @@ mod tests {
     #[sqlx::test]
     async fn test_special_characters_in_external_user_id(pool: PgPool) {
         let config = create_test_config();
-        let state = {
-            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
-            AppState::builder()
-                .db(crate::db::DbPools::new(pool.clone()))
-                .config(config)
-                .request_manager(request_manager)
-                .build()
-        };
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
 
         // Test various special characters that might appear in IdP identifiers
         let test_cases = vec![
@@ -1122,14 +1030,7 @@ mod tests {
         };
         let jwt_token = session::create_session_token(&current_user, &config).unwrap();
 
-        let state = {
-            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
-            AppState::builder()
-                .db(crate::db::DbPools::new(pool.clone()))
-                .config(config.clone())
-                .request_manager(request_manager)
-                .build()
-        };
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config.clone()).await;
 
         // Create request with JWT
         let request = axum::http::Request::builder()
@@ -1193,14 +1094,7 @@ mod tests {
         };
         let jwt_token = session::create_session_token(&current_user, &config).unwrap();
 
-        let state = {
-            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
-            AppState::builder()
-                .db(crate::db::DbPools::new(pool.clone()))
-                .config(config.clone())
-                .request_manager(request_manager)
-                .build()
-        };
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config.clone()).await;
 
         // First extraction should succeed
         let request = axum::http::Request::builder()
@@ -1245,14 +1139,7 @@ mod tests {
         // Set initial credits for standard users
         config.credits.initial_credits_for_standard_users = rust_decimal::Decimal::new(10000, 2); // 100.00 credits
 
-        let state = {
-            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
-            AppState::builder()
-                .db(crate::db::DbPools::new(pool.clone()))
-                .config(config)
-                .request_manager(request_manager)
-                .build()
-        };
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
 
         let new_email = "proxy-user@example.com";
         let new_external_id = "auth0|proxyuser123";
@@ -1309,14 +1196,7 @@ mod tests {
         config.auth.proxy_header.auto_create_users = true;
         config.credits.initial_credits_for_standard_users = rust_decimal::Decimal::new(10000, 2); // 100.00 credits
 
-        let state = {
-            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
-            AppState::builder()
-                .db(crate::db::DbPools::new(pool.clone()))
-                .config(config)
-                .request_manager(request_manager)
-                .build()
-        };
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
 
         let email = "existing-proxy@example.com";
         let external_id = "auth0|existing123";

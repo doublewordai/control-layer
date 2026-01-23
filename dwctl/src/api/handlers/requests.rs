@@ -6,6 +6,7 @@ use axum::{
     extract::{Query, State},
     response::Json,
 };
+use sqlx_pool_router::PoolProvider;
 
 use crate::{
     AppState,
@@ -37,9 +38,9 @@ use utoipa::IntoParams;
     tag = "requests",
 )]
 #[tracing::instrument(skip_all)]
-pub async fn list_requests(
+pub async fn list_requests<P: PoolProvider>(
     Query(query): Query<ListRequestsQuery>,
-    State(state): State<AppState>,
+    State(state): State<AppState<P>>,
     _: RequiresPermission<resource::Requests, operation::ReadAll>,
 ) -> Result<Json<ListAnalyticsResponse>, Error> {
     // Validate and apply limits
@@ -82,9 +83,9 @@ pub async fn list_requests(
     tag = "requests",
 )]
 #[tracing::instrument(skip_all)]
-pub async fn aggregate_requests(
+pub async fn aggregate_requests<P: PoolProvider>(
     Query(query): Query<AggregateRequestsQuery>,
-    State(state): State<AppState>,
+    State(state): State<AppState<P>>,
     _: RequiresPermission<resource::Analytics, operation::ReadAll>,
 ) -> Result<Json<RequestsAggregateResponse>, Error> {
     // Use provided timestamps or default to last 24 hours
@@ -125,9 +126,9 @@ pub struct AggregateByUserQuery {
     tag = "requests",
 )]
 #[tracing::instrument(skip_all)]
-pub async fn aggregate_by_user(
+pub async fn aggregate_by_user<P: PoolProvider>(
     Query(query): Query<AggregateByUserQuery>,
-    State(state): State<AppState>,
+    State(state): State<AppState<P>>,
     _: RequiresPermission<resource::Analytics, operation::ReadAll>,
 ) -> Result<Json<ModelUserUsageResponse>, Error> {
     // Model is required for this endpoint

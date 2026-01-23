@@ -93,4 +93,5 @@ pub mod handlers;
 pub mod models;
 pub mod pools;
 
-pub use pools::{DbPools, LabeledPool, PoolMetricsConfig, run_pool_metrics_sampler};
+// Re-export only the metrics types (not DbPools/PoolProvider - use sqlx_pool_router directly)
+pub use pools::{LabeledPool, PoolMetricsConfig, run_pool_metrics_sampler};

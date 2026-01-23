@@ -1,5 +1,7 @@
 //! HTTP handlers for model deployment endpoints.
 
+use sqlx_pool_router::PoolProvider;
+
 use crate::db::models::tariffs::TariffCreateDBRequest;
 use crate::{
     AppState,
@@ -83,8 +85,8 @@ fn db_component_to_response(c: DeploymentComponentDBResponse) -> ModelComponentR
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn list_deployed_models(
-    State(state): State<AppState>,
+pub async fn list_deployed_models<P: PoolProvider>(
+    State(state): State<AppState<P>>,
     Query(query): Query<ListModelsQuery>,
     // Lots of conditional logic here, so no logic in extractor
     current_user: CurrentUser,
@@ -229,7 +231,7 @@ pub async fn list_deployed_models(
 
     // Use ModelEnricher to add requested data
     let enricher = DeployedModelEnricher {
-        db: &state.db,
+        db: state.db.read(),
         include_groups,
         include_metrics,
         include_status,
@@ -269,8 +271,8 @@ pub async fn list_deployed_models(
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn create_deployed_model(
-    State(state): State<AppState>,
+pub async fn create_deployed_model<P: PoolProvider>(
+    State(state): State<AppState<P>>,
     current_user: RequiresPermission<resource::Models, operation::CreateAll>,
     Json(create): Json<DeployedModelCreate>,
 ) -> Result<Json<DeployedModelResponse>> {
@@ -296,7 +298,7 @@ pub async fn create_deployed_model(
         });
     }
 
-    let mut tx = state.db.begin().await.map_err(|e| Error::Database(e.into()))?;
+    let mut tx = state.db.write().begin().await.map_err(|e| Error::Database(e.into()))?;
 
     // Validate endpoint exists (only for standard models)
     if let Some(endpoint_id) = hosted_on {
@@ -359,15 +361,15 @@ pub async fn create_deployed_model(
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn update_deployed_model(
-    State(state): State<AppState>,
+pub async fn update_deployed_model<P: PoolProvider>(
+    State(state): State<AppState<P>>,
     Path(deployment_id): Path<DeploymentId>,
     current_user: RequiresPermission<resource::Models, operation::UpdateAll>,
     Json(update): Json<DeployedModelUpdate>,
 ) -> Result<Json<DeployedModelResponse>> {
     let has_system_access = has_permission(&current_user, resource::Models.into(), operation::SystemAccess.into());
 
-    let mut tx = state.db.begin().await.map_err(|e| Error::Database(e.into()))?;
+    let mut tx = state.db.write().begin().await.map_err(|e| Error::Database(e.into()))?;
     let mut repo = Deployments::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
 
     // Verify deployment exists and check access based on permissions
@@ -472,8 +474,8 @@ pub async fn update_deployed_model(
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn get_deployed_model(
-    State(state): State<AppState>,
+pub async fn get_deployed_model<P: PoolProvider>(
+    State(state): State<AppState<P>>,
     Path(deployment_id): Path<DeploymentId>,
     Query(query): Query<GetModelQuery>,
     current_user: CurrentUser,
@@ -598,7 +600,7 @@ pub async fn get_deployed_model(
 
     // Use ModelEnricher to add related data
     let enricher = DeployedModelEnricher {
-        db: &state.db,
+        db: state.db.read(),
         include_groups,
         include_metrics,
         include_status,
@@ -638,8 +640,8 @@ pub async fn get_deployed_model(
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn delete_deployed_model(
-    State(state): State<AppState>,
+pub async fn delete_deployed_model<P: PoolProvider>(
+    State(state): State<AppState<P>>,
     Path(deployment_id): Path<DeploymentId>,
     _: RequiresPermission<resource::Models, operation::DeleteAll>,
 ) -> Result<Json<String>> {
@@ -681,16 +683,15 @@ use crate::db::models::deployments::DeploymentComponentCreateDBRequest;
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn get_model_components(
-    State(state): State<AppState>,
+pub async fn get_model_components<P: PoolProvider>(
+    State(state): State<AppState<P>>,
     Path(id): Path<DeploymentId>,
     _: RequiresPermission<resource::CompositeModels, operation::ReadAll>,
 ) -> Result<Json<Vec<ModelComponentResponse>>> {
-    let mut tx = state.db.begin().await.map_err(|e| Error::Database(e.into()))?;
-
     // Verify the model exists and is composite
     {
-        let mut repo = Deployments::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
+        let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+        let mut repo = Deployments::new(&mut conn);
         let deployment = repo.get_by_id(id).await?.ok_or_else(|| Error::NotFound {
             resource: "model".to_string(),
             id: id.to_string(),
@@ -704,7 +705,8 @@ pub async fn get_model_components(
     }
 
     // Get components
-    let mut repo = Deployments::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
+    let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+    let mut repo = Deployments::new(&mut conn);
     let components = repo.get_components(id).await?;
 
     let response: Vec<ModelComponentResponse> = components.into_iter().map(db_component_to_response).collect();
@@ -737,8 +739,8 @@ pub async fn get_model_components(
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn add_model_component(
-    State(state): State<AppState>,
+pub async fn add_model_component<P: PoolProvider>(
+    State(state): State<AppState<P>>,
     Path((id, component_id)): Path<(DeploymentId, DeploymentId)>,
     _: RequiresPermission<resource::CompositeModels, operation::UpdateAll>,
     Json(body): Json<ModelComponentCreate>,
@@ -750,7 +752,7 @@ pub async fn add_model_component(
         });
     }
 
-    let mut tx = state.db.begin().await.map_err(|e| Error::Database(e.into()))?;
+    let mut tx = state.db.write().begin().await.map_err(|e| Error::Database(e.into()))?;
 
     // Verify both models exist and constraints are met
     {
@@ -822,8 +824,8 @@ pub async fn add_model_component(
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn update_model_component(
-    State(state): State<AppState>,
+pub async fn update_model_component<P: PoolProvider>(
+    State(state): State<AppState<P>>,
     Path((id, component_id)): Path<(DeploymentId, DeploymentId)>,
     _: RequiresPermission<resource::CompositeModels, operation::UpdateAll>,
     Json(body): Json<ModelComponentUpdate>,
@@ -874,8 +876,8 @@ pub async fn update_model_component(
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn remove_model_component(
-    State(state): State<AppState>,
+pub async fn remove_model_component<P: PoolProvider>(
+    State(state): State<AppState<P>>,
     Path((id, component_id)): Path<(DeploymentId, DeploymentId)>,
     _: RequiresPermission<resource::CompositeModels, operation::UpdateAll>,
 ) -> Result<Json<String>> {

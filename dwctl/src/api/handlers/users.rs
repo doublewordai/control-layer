@@ -1,5 +1,7 @@
 //! HTTP handlers for user management endpoints.
 
+use sqlx_pool_router::PoolProvider;
+
 use crate::{
     AppState,
     api::models::{
@@ -49,8 +51,8 @@ use tracing::error;
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn list_users(
-    State(state): State<AppState>,
+pub async fn list_users<P: PoolProvider>(
+    State(state): State<AppState<P>>,
     Query(query): Query<ListUsersQuery>,
     current_user: CurrentUser,
     _: RequiresPermission<resource::Users, operation::ReadAll>,
@@ -176,8 +178,8 @@ pub async fn list_users(
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn get_user(
-    State(state): State<AppState>,
+pub async fn get_user<P: PoolProvider>(
+    State(state): State<AppState<P>>,
     Path(user_id): Path<UserIdOrCurrent>,
     Query(query): Query<GetUserQuery>,
     // Can't use RequiresPermission here because we need conditional logic for own vs other users
@@ -265,12 +267,12 @@ pub async fn get_user(
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn create_user(
-    State(state): State<AppState>,
+pub async fn create_user<P: PoolProvider>(
+    State(state): State<AppState<P>>,
     _: RequiresPermission<resource::Users, operation::CreateAll>,
     Json(user_data): Json<UserCreate>,
 ) -> Result<(StatusCode, Json<UserResponse>)> {
-    let mut tx = state.db.begin().await.map_err(|e| Error::Database(e.into()))?;
+    let mut tx = state.db.write().begin().await.map_err(|e| Error::Database(e.into()))?;
 
     let mut repo = Users::new(&mut tx);
     let db_request = UserCreateDBRequest::from(user_data);
@@ -310,8 +312,8 @@ pub async fn create_user(
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn update_user(
-    State(state): State<AppState>,
+pub async fn update_user<P: PoolProvider>(
+    State(state): State<AppState<P>>,
     Path(user_id): Path<UserId>,
     current_user: CurrentUser,
     Json(user_data): Json<UserUpdate>,
@@ -374,8 +376,8 @@ pub async fn update_user(
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn delete_user(
-    State(state): State<AppState>,
+pub async fn delete_user<P: PoolProvider>(
+    State(state): State<AppState<P>>,
     Path(user_id): Path<UserId>,
     current_user: RequiresPermission<resource::Users, operation::DeleteAll>,
 ) -> Result<StatusCode> {

@@ -299,6 +299,23 @@ prevent name clashes.
 - Keep repository instantiation scoped in blocks to avoid borrow checker issues
 - Repositories are thin wrappers around transactions using `&mut Transaction`
 
+**Pool Management:**
+
+- **Production**: Use `DbPools` from `sqlx-pool-router` crate
+  - Provides primary pool via `.write()` for writes (transactions, mutations)
+  - Provides replica pool via `.read()` for read-only queries (when replica configured)
+  - Falls back to primary pool if no replica configured
+- **Tests**: Use `TestDbPools` from `sqlx-pool-router` crate
+  - Automatically creates a read-only replica from the test pool
+  - Enforces proper read/write separation during testing
+  - Tests use `#[sqlx::test]` which provides a `PgPool` - this is automatically converted to `TestDbPools` in `setup_database()`
+- **Handler Pattern**: All handlers are generic over `PoolProvider` trait
+  - Function signature: `async fn handler<P: PoolProvider>(State(state): State<AppState<P>>, ...) -> Result<...>`
+  - Write operations: `state.db.write().begin()` for transactions
+  - Read operations: `state.db.read().acquire()` for read-only queries
+  - This pattern ensures zero runtime overhead (monomorphization) while allowing production and test code to use different pool types
+- **Never** directly use `PgPool` in handler signatures - always use generic `P: PoolProvider`
+
 **Testing:**
 
 - Test incrementally: write one test, make it pass, write the next test (not all at once)
