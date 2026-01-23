@@ -389,7 +389,6 @@ mod tests {
     use axum_test::TestServer;
     use rust_decimal::Decimal;
     use sqlx::PgPool;
-    use sqlx_pool_router::DbPools;
 
     #[sqlx::test]
     async fn test_dummy_payment_flow(pool: PgPool) {

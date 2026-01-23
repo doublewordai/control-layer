@@ -887,7 +887,7 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
             state.metrics_recorder.clone(),
         );
 
-        let postgres_handler = PostgresHandler::<ParsedAIRequest, AiResponse>::from_pool(outlet_pool.clone())
+        let postgres_handler = PostgresHandler::<PgPool, ParsedAIRequest, AiResponse>::from_pool(outlet_pool.clone())
             .await
             .expect("Failed to create PostgresHandler for request logging")
             .with_request_serializer(parse_ai_request)

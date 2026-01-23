@@ -25,12 +25,12 @@ use crate::{
 };
 use axum_test::TestServer;
 use sqlx::{PgConnection, PgPool};
-use sqlx_pool_router::{PoolProvider, TestDbPools};
+use sqlx_pool_router::TestDbPools;
 use uuid::Uuid;
 
 /// Create an AppState with TestDbPools for proper read/write replica testing
 /// Use this in tests that need to manually construct AppState instead of using create_test_app
-pub async fn create_test_app_state(pool: PgPool) -> crate::AppState<TestDbPools> {
+async fn create_test_app_state(pool: PgPool) -> crate::AppState<TestDbPools> {
     create_test_app_state_with_config(pool, create_test_config()).await
 }
 

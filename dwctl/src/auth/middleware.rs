@@ -111,7 +111,6 @@ pub async fn admin_ai_proxy_middleware<P: sqlx_pool_router::PoolProvider + Clone
 mod tests {
     use serde_json::json;
     use sqlx::PgPool;
-    use sqlx_pool_router::DbPools;
     use uuid::Uuid;
 
     use crate::{

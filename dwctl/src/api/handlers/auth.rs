@@ -636,7 +636,6 @@ mod tests {
     };
     use axum_test::TestServer;
     use sqlx::PgPool;
-    use sqlx_pool_router::DbPools;
 
     #[sqlx::test]
     async fn test_register_success(pool: PgPool) {

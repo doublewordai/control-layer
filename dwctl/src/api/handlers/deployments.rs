@@ -688,7 +688,7 @@ pub async fn get_model_components<P: PoolProvider>(
     Path(id): Path<DeploymentId>,
     _: RequiresPermission<resource::CompositeModels, operation::ReadAll>,
 ) -> Result<Json<Vec<ModelComponentResponse>>> {
-    let mut tx = state.db.write().begin().await.map_err(|e| Error::Database(e.into()))?;
+    let mut tx = state.db.read().begin().await.map_err(|e| Error::Database(e.into()))?;
 
     // Verify the model exists and is composite
     {

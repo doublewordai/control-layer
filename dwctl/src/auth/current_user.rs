@@ -444,7 +444,6 @@ impl<P: sqlx_pool_router::PoolProvider + Clone + Send + Sync> FromRequestParts<c
 #[cfg(test)]
 mod tests {
     use crate::{
-        AppState,
         api::models::{
             transactions::TransactionFilters,
             users::{CurrentUser, Role},
@@ -456,7 +455,6 @@ mod tests {
     };
     use axum::{extract::FromRequestParts as _, http::request::Parts};
     use sqlx::PgPool;
-    use sqlx_pool_router::DbPools;
 
     fn create_test_parts_with_auth(external_user_id: &str, email: &str) -> Parts {
         let request = axum::http::Request::builder()
