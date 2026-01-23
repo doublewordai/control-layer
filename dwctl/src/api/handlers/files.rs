@@ -564,6 +564,7 @@ pub async fn upload_file<P: PoolProvider>(
     tracing::info!("File {} uploaded successfully", created_file_id);
 
     // Build response using the fusillade file
+    // We use the primary pool to avoid transaction or read lags if using replicas
     let file = state
         .request_manager
         .get_file_from_primary_pool(created_file_id)
