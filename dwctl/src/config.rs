@@ -1411,6 +1411,88 @@ impl Config {
             });
         }
 
+        // Validate batch configuration (if batches are enabled)
+        if self.batches.enabled {
+            if self.batches.files.batch_insert_size == 0 {
+                return Err(Error::Internal {
+                    operation: "Config validation: batch_insert_size cannot be 0. Set a positive integer value (recommended: 1000-10000)."
+                        .to_string(),
+                });
+            }
+
+            if self.batches.files.upload_buffer_size == 0 {
+                return Err(Error::Internal {
+                    operation: "Config validation: upload_buffer_size cannot be 0. Set a positive integer value (default: 100)."
+                        .to_string(),
+                });
+            }
+
+            if self.batches.files.download_buffer_size == 0 {
+                return Err(Error::Internal {
+                    operation: "Config validation: download_buffer_size cannot be 0. Set a positive integer value (default: 100)."
+                        .to_string(),
+                });
+            }
+
+            // Validate file size limits are sensible
+            if self.batches.files.max_file_size == 0 {
+                return Err(Error::Internal {
+                    operation: "Config validation: max_file_size cannot be 0. Set a positive value in bytes (default: 100MB)."
+                        .to_string(),
+                });
+            }
+
+            // Validate expiry times are positive and in sensible order
+            if self.batches.files.min_expiry_seconds <= 0 {
+                return Err(Error::Internal {
+                    operation: "Config validation: min_expiry_seconds must be positive (default: 3600 = 1 hour)."
+                        .to_string(),
+                });
+            }
+
+            if self.batches.files.default_expiry_seconds <= 0 {
+                return Err(Error::Internal {
+                    operation: "Config validation: default_expiry_seconds must be positive (default: 86400 = 24 hours)."
+                        .to_string(),
+                });
+            }
+
+            if self.batches.files.max_expiry_seconds <= 0 {
+                return Err(Error::Internal {
+                    operation: "Config validation: max_expiry_seconds must be positive (default: 2592000 = 30 days)."
+                        .to_string(),
+                });
+            }
+
+            // Validate expiry times are in correct order
+            if self.batches.files.min_expiry_seconds > self.batches.files.default_expiry_seconds {
+                return Err(Error::Internal {
+                    operation: format!(
+                        "Config validation: min_expiry_seconds ({}) cannot be greater than default_expiry_seconds ({})",
+                        self.batches.files.min_expiry_seconds, self.batches.files.default_expiry_seconds
+                    ),
+                });
+            }
+
+            if self.batches.files.default_expiry_seconds > self.batches.files.max_expiry_seconds {
+                return Err(Error::Internal {
+                    operation: format!(
+                        "Config validation: default_expiry_seconds ({}) cannot be greater than max_expiry_seconds ({})",
+                        self.batches.files.default_expiry_seconds, self.batches.files.max_expiry_seconds
+                    ),
+                });
+            }
+
+            if self.batches.files.min_expiry_seconds > self.batches.files.max_expiry_seconds {
+                return Err(Error::Internal {
+                    operation: format!(
+                        "Config validation: min_expiry_seconds ({}) cannot be greater than max_expiry_seconds ({})",
+                        self.batches.files.min_expiry_seconds, self.batches.files.max_expiry_seconds
+                    ),
+                });
+            }
+        }
+
         Ok(())
     }
 
@@ -1599,6 +1681,198 @@ auth:
         config.auth.native.enabled = true;
         config.secret_key = Some("test-secret-key".to_string());
 
+        let result = config.validate();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_batch_insert_size_default() {
+        let config = Config::default();
+        assert_eq!(config.batches.files.batch_insert_size, 5000);
+    }
+
+    #[test]
+    fn test_batch_insert_size_yaml_override() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+batches:
+  files:
+    batch_insert_size: 10000
+"#,
+            )?;
+
+            let args = Args {
+                config: "test.yaml".to_string(),
+                validate: false,
+            };
+
+            let config = Config::load(&args)?;
+            assert_eq!(config.batches.files.batch_insert_size, 10000);
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_batch_insert_size_env_override() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+"#,
+            )?;
+
+            jail.set_env("DWCTL_BATCHES__FILES__BATCH_INSERT_SIZE", "7500");
+
+            let args = Args {
+                config: "test.yaml".to_string(),
+                validate: false,
+            };
+
+            let config = Config::load(&args)?;
+            assert_eq!(config.batches.files.batch_insert_size, 7500);
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_batch_insert_size_zero_validation() {
+        let mut config = Config::default();
+        config.auth.native.enabled = true;
+        config.secret_key = Some("test-secret-key".to_string());
+        config.batches.enabled = true;
+        config.batches.files.batch_insert_size = 0;
+
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("batch_insert_size cannot be 0"));
+    }
+
+    #[test]
+    fn test_upload_buffer_size_zero_validation() {
+        let mut config = Config::default();
+        config.auth.native.enabled = true;
+        config.secret_key = Some("test-secret-key".to_string());
+        config.batches.enabled = true;
+        config.batches.files.upload_buffer_size = 0;
+
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("upload_buffer_size cannot be 0"));
+    }
+
+    #[test]
+    fn test_download_buffer_size_zero_validation() {
+        let mut config = Config::default();
+        config.auth.native.enabled = true;
+        config.secret_key = Some("test-secret-key".to_string());
+        config.batches.enabled = true;
+        config.batches.files.download_buffer_size = 0;
+
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("download_buffer_size cannot be 0"));
+    }
+
+    #[test]
+    fn test_max_file_size_zero_validation() {
+        let mut config = Config::default();
+        config.auth.native.enabled = true;
+        config.secret_key = Some("test-secret-key".to_string());
+        config.batches.enabled = true;
+        config.batches.files.max_file_size = 0;
+
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("max_file_size cannot be 0"));
+    }
+
+    #[test]
+    fn test_expiry_times_positive_validation() {
+        let mut config = Config::default();
+        config.auth.native.enabled = true;
+        config.secret_key = Some("test-secret-key".to_string());
+        config.batches.enabled = true;
+        
+        // Test min_expiry_seconds
+        config.batches.files.min_expiry_seconds = 0;
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("min_expiry_seconds must be positive"));
+        
+        // Test default_expiry_seconds
+        config.batches.files.min_expiry_seconds = 3600;
+        config.batches.files.default_expiry_seconds = 0;
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("default_expiry_seconds must be positive"));
+        
+        // Test max_expiry_seconds
+        config.batches.files.default_expiry_seconds = 86400;
+        config.batches.files.max_expiry_seconds = 0;
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("max_expiry_seconds must be positive"));
+    }
+
+    #[test]
+    fn test_expiry_times_order_validation() {
+        let mut config = Config::default();
+        config.auth.native.enabled = true;
+        config.secret_key = Some("test-secret-key".to_string());
+        config.batches.enabled = true;
+        
+        // Test min > default
+        config.batches.files.min_expiry_seconds = 86400;
+        config.batches.files.default_expiry_seconds = 3600;
+        config.batches.files.max_expiry_seconds = 2592000;
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("min_expiry_seconds") && 
+                result.unwrap_err().to_string().contains("default_expiry_seconds"));
+        
+        // Test default > max
+        config.batches.files.min_expiry_seconds = 3600;
+        config.batches.files.default_expiry_seconds = 2592000;
+        config.batches.files.max_expiry_seconds = 86400;
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("default_expiry_seconds") && 
+                result.unwrap_err().to_string().contains("max_expiry_seconds"));
+        
+        // Test min > max (should also fail)
+        config.batches.files.min_expiry_seconds = 2592000;
+        config.batches.files.default_expiry_seconds = 86400;
+        config.batches.files.max_expiry_seconds = 3600;
+        let result = config.validate();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_batch_validation_skipped_when_disabled() {
+        let mut config = Config::default();
+        config.auth.native.enabled = true;
+        config.secret_key = Some("test-secret-key".to_string());
+        config.batches.enabled = false; // Disabled
+        config.batches.files.batch_insert_size = 0; // Invalid, but should be ignored
+
+        let result = config.validate();
+        assert!(result.is_ok()); // Should pass because batches are disabled
+    }
+
+    #[test]
+    fn test_batch_config_all_valid() {
+        let mut config = Config::default();
+        config.auth.native.enabled = true;
+        config.secret_key = Some("test-secret-key".to_string());
+        config.batches.enabled = true;
+        
+        // All defaults should be valid
         let result = config.validate();
         assert!(result.is_ok());
     }
