@@ -211,7 +211,7 @@ pub use types::{ApiKeyId, DeploymentId, GroupId, InferenceEndpointId, UserId};
 ///
 /// - `db`: Main PostgreSQL connection pool for application data
 /// - `config`: Application configuration loaded from environment/files
-/// - `outlet_db`: Optional connection pool for request logging (when enabled)
+/// - `outlet_db`: Optional connection pool for request logging (when enabled), uses same pool provider type as db
 /// - `metrics_recorder`: Optional Prometheus metrics recorder (when enabled)
 /// - `is_leader`: Whether this instance is the elected leader (for distributed deployments)
 /// - `request_manager`: Fusillade batch request manager for async processing
@@ -234,7 +234,9 @@ where
     /// Use `.read()` for read-only queries, `.write()` for writes.
     pub db: P,
     pub config: Config,
-    pub outlet_db: Option<PgPool>,
+    /// Outlet database pools for request logging. Always uses DbPools (production type).
+    /// In tests, this uses DbPools without read-only enforcement (outlet is write-heavy).
+    pub outlet_db: Option<DbPools>,
     pub metrics_recorder: Option<GenAiMetrics>,
     #[builder(default = false)]
     pub is_leader: bool,
@@ -881,13 +883,13 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
         }
 
         let analytics_serializer = AnalyticsResponseSerializer::new(
-            (*state.db).clone(),
+            state.db.write().clone(),
             uuid::Uuid::new_v4(),
             state.config.clone(),
             state.metrics_recorder.clone(),
         );
 
-        let postgres_handler = PostgresHandler::<PgPool, ParsedAIRequest, AiResponse>::from_pool(outlet_pool.clone())
+        let postgres_handler = PostgresHandler::<DbPools, ParsedAIRequest, AiResponse>::from_pool_provider(outlet_pool.clone())
             .await
             .expect("Failed to create PostgresHandler for request logging")
             .with_request_serializer(parse_ai_request)
@@ -1083,7 +1085,7 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
 
     // Apply error enrichment middleware to onwards router (before outlet logging)
     let onwards_router = onwards_router.layer(middleware::from_fn_with_state(
-        (*state.db).clone(),
+        state.db.write().clone(),
         error_enrichment::error_enrichment_middleware,
     ));
 
@@ -1707,13 +1709,12 @@ impl Application {
         let onwards_router = onwards::build_router(onwards_app_state);
 
         // Build app state and router
-        // Extract primary pool for outlet_db (via Deref)
         let mut app_state = AppState::builder()
             .db(db_pools.clone())
             .config(config.clone())
             .is_leader(bg_services.is_leader)
             .request_manager(bg_services.request_manager.clone())
-            .maybe_outlet_db(outlet_pools.as_ref().map(|p| (**p).clone()))
+            .maybe_outlet_db(outlet_pools.clone())
             .build();
 
         let router = build_router(&mut app_state, onwards_router).await?;
