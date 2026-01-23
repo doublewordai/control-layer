@@ -1437,30 +1437,26 @@ impl Config {
             // Validate file size limits are sensible
             if self.batches.files.max_file_size == 0 {
                 return Err(Error::Internal {
-                    operation: "Config validation: max_file_size cannot be 0. Set a positive value in bytes (default: 100MB)."
-                        .to_string(),
+                    operation: "Config validation: max_file_size cannot be 0. Set a positive value in bytes (default: 100MB).".to_string(),
                 });
             }
 
             // Validate expiry times are positive and in sensible order
             if self.batches.files.min_expiry_seconds <= 0 {
                 return Err(Error::Internal {
-                    operation: "Config validation: min_expiry_seconds must be positive (default: 3600 = 1 hour)."
-                        .to_string(),
+                    operation: "Config validation: min_expiry_seconds must be positive (default: 3600 = 1 hour).".to_string(),
                 });
             }
 
             if self.batches.files.default_expiry_seconds <= 0 {
                 return Err(Error::Internal {
-                    operation: "Config validation: default_expiry_seconds must be positive (default: 86400 = 24 hours)."
-                        .to_string(),
+                    operation: "Config validation: default_expiry_seconds must be positive (default: 86400 = 24 hours).".to_string(),
                 });
             }
 
             if self.batches.files.max_expiry_seconds <= 0 {
                 return Err(Error::Internal {
-                    operation: "Config validation: max_expiry_seconds must be positive (default: 2592000 = 30 days)."
-                        .to_string(),
+                    operation: "Config validation: max_expiry_seconds must be positive (default: 2592000 = 30 days).".to_string(),
                 });
             }
 
@@ -1798,20 +1794,20 @@ secret_key: "test-secret-key"
         config.auth.native.enabled = true;
         config.secret_key = Some("test-secret-key".to_string());
         config.batches.enabled = true;
-        
+
         // Test min_expiry_seconds
         config.batches.files.min_expiry_seconds = 0;
         let result = config.validate();
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("min_expiry_seconds must be positive"));
-        
+
         // Test default_expiry_seconds
         config.batches.files.min_expiry_seconds = 3600;
         config.batches.files.default_expiry_seconds = 0;
         let result = config.validate();
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("default_expiry_seconds must be positive"));
-        
+
         // Test max_expiry_seconds
         config.batches.files.default_expiry_seconds = 86400;
         config.batches.files.max_expiry_seconds = 0;
@@ -1826,25 +1822,25 @@ secret_key: "test-secret-key"
         config.auth.native.enabled = true;
         config.secret_key = Some("test-secret-key".to_string());
         config.batches.enabled = true;
-        
+
         // Test min > default
         config.batches.files.min_expiry_seconds = 86400;
         config.batches.files.default_expiry_seconds = 3600;
         config.batches.files.max_expiry_seconds = 2592000;
         let result = config.validate();
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("min_expiry_seconds") && 
-                result.unwrap_err().to_string().contains("default_expiry_seconds"));
-        
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("min_expiry_seconds") && err_msg.contains("default_expiry_seconds"));
+
         // Test default > max
         config.batches.files.min_expiry_seconds = 3600;
         config.batches.files.default_expiry_seconds = 2592000;
         config.batches.files.max_expiry_seconds = 86400;
         let result = config.validate();
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("default_expiry_seconds") && 
-                result.unwrap_err().to_string().contains("max_expiry_seconds"));
-        
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("default_expiry_seconds") && err_msg.contains("max_expiry_seconds"));
+
         // Test min > max (should also fail)
         config.batches.files.min_expiry_seconds = 2592000;
         config.batches.files.default_expiry_seconds = 86400;
@@ -1871,7 +1867,7 @@ secret_key: "test-secret-key"
         config.auth.native.enabled = true;
         config.secret_key = Some("test-secret-key".to_string());
         config.batches.enabled = true;
-        
+
         // All defaults should be valid
         let result = config.validate();
         assert!(result.is_ok());
