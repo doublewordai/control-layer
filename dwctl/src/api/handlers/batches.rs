@@ -184,9 +184,10 @@ pub async fn create_batch<P: PoolProvider>(
     })?;
 
     // Verify file exists and user has access
+    // Use primary pool to avoid read-after-write consistency issues with replicas
     let file = state
         .request_manager
-        .get_file(fusillade::FileId(file_id))
+        .get_file_from_primary_pool(fusillade::FileId(file_id))
         .await
         .map_err(|_| Error::NotFound {
             resource: "File".to_string(),
