@@ -61,7 +61,18 @@ fn to_batch_response_with_email(batch: fusillade::Batch, creator_email: Option<&
     } else if batch.total_requests == 0 {
         "validating"
     } else if is_finished && batch.failed_requests == batch.total_requests {
-        "failed"
+        // Don't show "failed" until we're certain recovery is impossible
+        // Check if we're still within the SLA window
+        if chrono::Utc::now() < batch.expires_at {
+            // Within SLA - escalation might still recover these failures
+            "in_progress"
+        } else if batch.failed_at.is_none() {
+            // Past SLA but no failed_at timestamp - escalation may still be attempting recovery
+            "in_progress"
+        } else {
+            // Past SLA and failed_at is set - terminal failure confirmed
+            "failed"
+        }
     } else if is_finished {
         "completed"
     } else {
