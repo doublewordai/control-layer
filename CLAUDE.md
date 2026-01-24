@@ -40,7 +40,7 @@ The application handles two distinct request flows:
 
 Uses SQLx with PostgreSQL following the Repository pattern:
 
-```
+```text
 Handlers (API) → Repositories (db::handlers) → Models (db::models) → PostgreSQL
 ```
 
@@ -316,6 +316,30 @@ prevent name clashes.
   - This pattern ensures zero runtime overhead (monomorphization) while allowing production and test code to use different pool types
 - **Never** directly use `PgPool` in handler signatures - always use generic `P: PoolProvider`
 
+**Read-After-Write Consistency:**
+
+When reading data immediately after writing it (e.g., verifying a file exists right after upload, or checking a batch right after creation), always use the **primary pool** to avoid replication lag issues:
+
+- **Problem**: Replica pools may lag behind the primary database by milliseconds to seconds. Reading from a replica immediately after a write to the primary can return stale data (e.g., "not found" errors for just-created records).
+- **Solution**: Use `.write()` pool for both the write AND the subsequent read in read-after-write scenarios.
+- **Examples**:
+  - File verification during batch creation: Use `get_file_from_primary_pool()` instead of `get_file()` (see `batches.rs:187-194`)
+  - Reading just-uploaded file metadata: Use primary pool (see `files.rs:567-570`)
+- **General rule**: If you write data and immediately need to read it within the same request handler, use the primary pool for both operations.
+- **When to use replica**: Only use `.read()` pool for queries that don't depend on recent writes in the same request, or for read-only endpoints querying stable data.
+
+**CRITICAL - Inter-Endpoint Consistency:**
+
+When clients make sequential API calls where one endpoint writes data and another endpoint reads it, **both endpoints MUST use the same pool** (primary) to avoid replication lag issues:
+
+- **Problem**: Client creates a resource via `POST /batches` (writes to primary), then immediately calls `GET /batches/:id` (reads from replica) → 404 Not Found due to replication lag.
+- **Solution**: If an endpoint creates/updates data that clients will immediately query via another endpoint, the read endpoint MUST also use the primary pool.
+- **Example**: After `POST /batches` writes to primary, `GET /batches/:id` must use primary pool for consistency (not replica).
+- **Design principle**: Choose pool routing based on typical client workflows, not just the individual endpoint's operation. If clients will chain requests (create → retrieve), both endpoints need primary pool.
+- **Acceptable lag**: Only use replica pools for read endpoints when clients can tolerate eventual consistency (e.g., analytics dashboards, list views with "refresh" buttons, non-critical data).
+
+Note: Even databases claiming "zero replication lag" (like Neon) can exhibit lag under load, especially with high concurrency (observed 100ms-1000ms+ lag during stress testing with 50-100 parallel requests).
+
 **Testing:**
 
 - Test incrementally: write one test, make it pass, write the next test (not all at once)
@@ -392,4 +416,3 @@ AND TESTS.
 - Avoid N+1 queries - batch fetch related data when possible
 - To run sqlx migrations, navigate to the appropriate directory (dwctl, or fusillade/) and run `cargo sqlx migrate run`. NEVER try to run sqlx migrate run --source ... --database-url from the root.
 - Instead of calling 'tokio::time::sleep' in tests, try to poll until the condition you're waiting for becomes true. Assert both against the state its in at first, then the state it changes to. Then the tests 1. Aren't slow - because they can change state immediately, and 2. test against the whole flow - both before and after the condition becomes true
-
