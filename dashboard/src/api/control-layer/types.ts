@@ -75,6 +75,8 @@ export interface ConfigResponse {
     enabled: boolean;
     allowed_completion_windows: string[]; // Available SLAs like ["24h", "1h", "12h"]
   };
+  /** Base URL for AI API endpoints (files, batches, daemons). If not set, use relative paths. */
+  ai_api_base_url?: string;
 }
 
 // Model metrics time series point
