@@ -1,5 +1,12 @@
 # Changelog
 
+## [3.1.1](https://github.com/doublewordai/control-layer/compare/v3.1.0...v3.1.1) (2026-01-26)
+
+
+### Performance Improvements
+
+* defer files query until files tab is active on batches page ([#607](https://github.com/doublewordai/control-layer/issues/607)) ([d060328](https://github.com/doublewordai/control-layer/commit/d060328b22bf534e3e7ca35ecd9a28c955aad347))
+
 ## [3.1.0](https://github.com/doublewordai/control-layer/compare/v3.0.1...v3.1.0) (2026-01-26)
 
 
