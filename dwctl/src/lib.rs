@@ -919,11 +919,8 @@ pub async fn build_router(
         // Add AnalyticsHandler for analytics/billing if enabled
         if analytics_enabled {
             // Create the analytics batcher and spawn it as a background task
-            let (batcher, sender) = request_logging::AnalyticsBatcher::new(
-                state.db.write().clone(),
-                state.config.clone(),
-                state.metrics_recorder.clone(),
-            );
+            let (batcher, sender) =
+                request_logging::AnalyticsBatcher::new(state.db.write().clone(), state.config.clone(), state.metrics_recorder.clone());
 
             // Spawn the batcher background task with the shutdown token
             let batcher_shutdown = shutdown_token.clone();
@@ -932,11 +929,7 @@ pub async fn build_router(
             });
 
             // Create handler that sends records to the batcher
-            let analytics_handler = request_logging::AnalyticsHandler::new(
-                sender,
-                uuid::Uuid::new_v4(),
-                state.config.clone(),
-            );
+            let analytics_handler = request_logging::AnalyticsHandler::new(sender, uuid::Uuid::new_v4(), state.config.clone());
             multi_handler = multi_handler.with(analytics_handler);
         }
 

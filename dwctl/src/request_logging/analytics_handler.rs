@@ -45,10 +45,10 @@
 //! ```
 
 use crate::config::Config;
+use crate::request_logging::AiResponse;
 use crate::request_logging::batcher::{AnalyticsSender, RawAnalyticsRecord};
 use crate::request_logging::serializers::{Auth, UsageMetrics, parse_ai_response};
 use crate::request_logging::utils::{extract_header_as_string, extract_header_as_uuid};
-use crate::request_logging::AiResponse;
 use outlet::{RequestData, RequestHandler, ResponseData};
 use serde_json::Value;
 use tracing::{Instrument, info_span, warn};
@@ -121,13 +121,7 @@ impl RequestHandler for AnalyticsHandler {
             };
 
             // Extract basic metrics - captures status_code, duration, model from request, etc.
-            let metrics = UsageMetrics::extract(
-                self.instance_id,
-                &request_data,
-                &response_data,
-                &metrics_response,
-                &self.config,
-            );
+            let metrics = UsageMetrics::extract(self.instance_id, &request_data, &response_data, &metrics_response, &self.config);
 
             // Extract auth information from headers
             let auth = Auth::from_request(&request_data, &self.config);
@@ -136,10 +130,8 @@ impl RequestHandler for AnalyticsHandler {
             let fusillade_batch_id = extract_header_as_uuid(&request_data, "x-fusillade-batch-id");
             let fusillade_request_id = extract_header_as_uuid(&request_data, "x-fusillade-request-id");
             let custom_id = extract_header_as_string(&request_data, "x-fusillade-custom-id");
-            let batch_completion_window =
-                extract_header_as_string(&request_data, "x-fusillade-batch-completion-window");
-            let batch_request_source =
-                extract_header_as_string(&request_data, "x-fusillade-batch-request-source").unwrap_or_default();
+            let batch_completion_window = extract_header_as_string(&request_data, "x-fusillade-batch-completion-window");
+            let batch_request_source = extract_header_as_string(&request_data, "x-fusillade-batch-request-source").unwrap_or_default();
 
             // Extract batch creation timestamp for pricing lookup
             // This ensures batch requests are priced as of batch creation, not processing time

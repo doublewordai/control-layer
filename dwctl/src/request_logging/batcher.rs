@@ -170,10 +170,7 @@ where
     /// This minimizes latency at low load (single record → immediate write) while
     /// getting batching efficiency at high load (records queue while writing → bigger batch).
     pub async fn run(mut self, shutdown_token: CancellationToken) {
-        info!(
-            max_batch_size = self.batch_size,
-            "Analytics batcher started (write-through mode)"
-        );
+        info!(max_batch_size = self.batch_size, "Analytics batcher started (write-through mode)");
 
         let mut buffer: Vec<RawAnalyticsRecord> = Vec::with_capacity(self.batch_size);
 
@@ -511,9 +508,7 @@ where
 
         // Fall back to realtime
         if purpose != &ApiKeyPurpose::Realtime
-            && let Some(tariff) = valid_tariffs
-                .iter()
-                .find(|t| t.purpose == ApiKeyPurpose::Realtime)
+            && let Some(tariff) = valid_tariffs.iter().find(|t| t.purpose == ApiKeyPurpose::Realtime)
         {
             return (Some(tariff.input_price_per_token), Some(tariff.output_price_per_token));
         }

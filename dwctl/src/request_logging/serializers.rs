@@ -1112,5 +1112,4 @@ mod tests {
         assert_eq!(metrics.total_tokens, 4);
         assert_eq!(metrics.response_type, "base64_embeddings");
     }
-
 }
