@@ -1,7 +1,7 @@
 import { useState, useEffect } from "react";
 import * as React from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
-import { useQueryClient, useQueries } from "@tanstack/react-query";
+import { useQueryClient } from "@tanstack/react-query";
 import {
   Upload,
   Play,
@@ -25,10 +25,7 @@ import { createBatchColumns } from "../BatchesTable/columns";
 import { useFiles, useBatches } from "../../../../api/control-layer/hooks";
 import { dwctlApi } from "../../../../api/control-layer/client";
 import type { FileObject, Batch } from "../types";
-import type {
-  BatchAnalytics,
-  FileCostEstimate,
-} from "../../../../api/control-layer/types";
+import type { BatchAnalytics } from "../../../../api/control-layer/types";
 import { useServerCursorPagination } from "../../../../hooks/useServerCursorPagination";
 import { useDebounce } from "../../../../hooks/useDebounce";
 import { useAuthorization } from "../../../../utils/authorization";
@@ -186,30 +183,6 @@ export function Batches({
     });
     return map;
   }, [batches]);
-
-  // Fetch file cost estimates for batch input files
-  const fileEstimateQueries = useQueries({
-    queries: files
-      .filter((file) => file.purpose === "batch")
-      .map((file) => ({
-        queryKey: ["files", "cost-estimate", file.id],
-        queryFn: () => dwctlApi.files.getCostEstimate(file.id),
-        staleTime: 60000, // 1 minute - cost estimates don't change frequently
-      })),
-  });
-
-  // Create a map of file ID to cost estimate for easy lookup
-  const fileEstimatesMap = React.useMemo(() => {
-    const map = new Map<string, FileCostEstimate>();
-    const batchFiles = files.filter((file) => file.purpose === "batch");
-    batchFiles.forEach((file, index) => {
-      const estimate = fileEstimateQueries[index]?.data;
-      if (estimate) {
-        map.set(file.id, estimate);
-      }
-    });
-    return map;
-  }, [files, fileEstimateQueries]);
 
   // Prefetch next page for files - only if user has already started paginating
   useEffect(() => {
@@ -404,7 +377,6 @@ export function Batches({
     onTriggerBatch: handleTriggerBatch,
     onViewBatches: handleFileClick,
     isFileInProgress,
-    fileEstimates: fileEstimatesMap,
   });
 
   const handleBatchClick = (batch: Batch) => {
