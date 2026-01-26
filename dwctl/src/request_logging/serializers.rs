@@ -648,68 +648,44 @@ pub async fn store_analytics_record(
                     let mut conn = pool.acquire().await?;
                     let mut credits = Credits::new(&mut conn);
 
-                    // Get user balance to check for negative balance warning
-                    match credits.get_user_balance(user_id).await {
-                        Ok(balance) => {
-                            // Warn if this will result in negative balance
-                            if balance < total_cost {
-                                warn!(
-                                    user_id = %user_id,
-                                    current_balance = %balance,
-                                    cost = %total_cost,
-                                    "API usage will result in negative balance"
-                                );
-                            }
-
-                            // Create usage transaction referencing the analytics record
-                            // Include fusillade_batch_id to enable fast batch grouping in transactions list
-                            match credits
-                                .create_transaction(&CreditTransactionCreateDBRequest {
-                                    user_id,
-                                    transaction_type: CreditTransactionType::Usage,
-                                    amount: total_cost,
-                                    source_id: analytics_id.to_string(),
-                                    description: Some(format!(
-                                        "API usage: {} ({} input + {} output tokens)",
-                                        model, row.prompt_tokens, row.completion_tokens
-                                    )),
-                                    fusillade_batch_id: row.fusillade_batch_id,
-                                })
-                                .await
-                            {
-                                Ok(result) => {
-                                    debug!(
-                                        user_id = %user_id,
-                                        transaction_id = %result.id,
-                                        amount = %total_cost,
-                                        model = %model,
-                                        "Credits deducted for API usage"
-                                    );
-                                    let cents = (total_cost.to_f64().unwrap_or(0.0) * 100.0).round() as u64;
-                                    counter!(
-                                        "dwctl_credits_deducted_total",
-                                        "user_id" => user_id.to_string(),
-                                        "model" => model.to_string()
-                                    )
-                                    .increment(cents);
-                                }
-                                Err(e) => {
-                                    tracing::error!(
-                                        error = %e,
-                                        correlation_id = %row.correlation_id,
-                                        user_id = %user_id,
-                                        "Failed to create credit transaction for API usage"
-                                    );
-                                    counter!("dwctl_credits_deduction_errors_total").increment(1);
-                                }
-                            }
+                    // Create usage transaction referencing the analytics record
+                    // Include fusillade_batch_id to enable fast batch grouping in transactions list
+                    match credits
+                        .create_transaction(&CreditTransactionCreateDBRequest {
+                            user_id,
+                            transaction_type: CreditTransactionType::Usage,
+                            amount: total_cost,
+                            source_id: analytics_id.to_string(),
+                            description: Some(format!(
+                                "API usage: {} ({} input + {} output tokens)",
+                                model, row.prompt_tokens, row.completion_tokens
+                            )),
+                            fusillade_batch_id: row.fusillade_batch_id,
+                        })
+                        .await
+                    {
+                        Ok(result) => {
+                            debug!(
+                                user_id = %user_id,
+                                transaction_id = %result.id,
+                                amount = %total_cost,
+                                model = %model,
+                                "Credits deducted for API usage"
+                            );
+                            let cents = (total_cost.to_f64().unwrap_or(0.0) * 100.0).round() as u64;
+                            counter!(
+                                "dwctl_credits_deducted_total",
+                                "user_id" => user_id.to_string(),
+                                "model" => model.to_string()
+                            )
+                            .increment(cents);
                         }
                         Err(e) => {
                             tracing::error!(
                                 error = %e,
                                 correlation_id = %row.correlation_id,
                                 user_id = %user_id,
-                                "Failed to get user balance for credit deduction"
+                                "Failed to create credit transaction for API usage"
                             );
                             counter!("dwctl_credits_deduction_errors_total").increment(1);
                         }
