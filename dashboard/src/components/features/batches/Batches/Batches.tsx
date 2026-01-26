@@ -9,6 +9,7 @@ import {
   FileInput,
   FileCheck,
   AlertCircle,
+  X,
 } from "lucide-react";
 import { Button } from "../../../ui/button";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "../../../ui/tabs";
@@ -29,6 +30,7 @@ import type { BatchAnalytics } from "../../../../api/control-layer/types";
 import { useServerCursorPagination } from "../../../../hooks/useServerCursorPagination";
 import { useDebounce } from "../../../../hooks/useDebounce";
 import { useAuthorization } from "../../../../utils/authorization";
+import { useBootstrapContent } from "@/hooks/use-bootstrap-content";
 
 /**
  * Props for the Batches component.
@@ -398,6 +400,9 @@ export function Batches({
     showUserColumn: isPlatformManager,
   });
 
+  const bootstrapBanner = useBootstrapContent();
+  console.log("bootstrapBanner", bootstrapBanner);
+
   return (
     <div
       className="py-4 px-6"
@@ -467,6 +472,22 @@ export function Batches({
             </TabsList>
           </div>
         </div>
+
+        {/* Bootstrap Banner */}
+        {bootstrapBanner.content && !bootstrapBanner.isClosed && (
+          <div className="relative mb-6">
+            <div
+              dangerouslySetInnerHTML={{ __html: bootstrapBanner.content }}
+            />
+            <button
+              onClick={bootstrapBanner.close}
+              className="absolute top-3 right-3 rounded-sm opacity-50 transition-opacity hover:opacity-100 focus:ring-2 focus:ring-ring focus:ring-offset-2 focus:outline-hidden"
+              aria-label="Close banner"
+            >
+              <X className="h-4 w-4 text-doubleword-neutral-600" />
+            </button>
+          </div>
+        )}
 
         {/* Content */}
         <TabsContent value="batches" className="space-y-4">
