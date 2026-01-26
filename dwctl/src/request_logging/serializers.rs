@@ -69,8 +69,11 @@ impl fmt::Debug for Auth {
     }
 }
 
-/// Complete row structure for http_analytics table
+/// Complete row structure for http_analytics table.
+///
+/// Fields are read by `MetricsRecorder::record_from_analytics()` for Prometheus metrics.
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // Fields accessed via MetricsRecorder trait
 pub struct HttpAnalyticsRow {
     pub instance_id: Uuid,
     pub correlation_id: i64,

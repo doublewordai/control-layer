@@ -11,7 +11,7 @@
 //!                                                            ↓
 //!                                                 [Accumulate in buffer]
 //!                                                            ↓
-//!                                              [Flush on size/time threshold]
+//!                                              [Flush immediately (write-through)]
 //!                                                            ↓
 //!                                              Phase 1: Batch enrich
 //!                                                - Token → user_id lookup
@@ -182,9 +182,12 @@ where
                 _ = shutdown_token.cancelled() => {
                     info!("Shutdown signal received, draining analytics channel");
                     self.receiver.close();
-                    // Drain any remaining records
+                    // Drain remaining records in batches to avoid OOM with large backlogs
                     while let Some(record) = self.receiver.recv().await {
                         buffer.push(record);
+                        if buffer.len() >= self.batch_size {
+                            self.flush_batch(&mut buffer).await;
+                        }
                     }
                     if !buffer.is_empty() {
                         self.flush_batch(&mut buffer).await;
@@ -750,14 +753,22 @@ where
 
         let expected_count = user_ids.len() as u64;
 
-        // Batch INSERT with RETURNING to count actual inserts
-        let result = sqlx::query!(
+        // Build a map from source_id to (index, user_id, amount, model) for metric recording
+        let source_id_to_record: HashMap<String, (usize, Uuid, Decimal, String)> = source_ids
+            .iter()
+            .enumerate()
+            .map(|(i, sid)| (sid.clone(), (i, user_ids[i], amounts[i], models[i].clone())))
+            .collect();
+
+        // Batch INSERT with RETURNING source_id to know exactly which were inserted
+        let inserted_rows = sqlx::query_scalar!(
             r#"
             INSERT INTO credits_transactions (user_id, transaction_type, amount, source_id, description, fusillade_batch_id)
             SELECT * FROM UNNEST(
                 $1::uuid[], $2::text[], $3::numeric[], $4::text[], $5::text[], $6::uuid[]
             )
             ON CONFLICT (source_id) DO NOTHING
+            RETURNING source_id
             "#,
             &user_ids,
             &vec!["usage".to_string(); user_ids.len()],
@@ -766,24 +777,24 @@ where
             &descriptions as &[Option<String>],
             &fusillade_batch_ids as &[Option<Uuid>],
         )
-        .execute(&mut **tx)
+        .fetch_all(&mut **tx)
         .await?;
 
-        let inserted_count = result.rows_affected();
+        let inserted_count = inserted_rows.len() as u64;
         let duplicates = expected_count.saturating_sub(inserted_count);
 
         // Record metrics only for successfully inserted credit transactions
-        // We can't know exactly which ones were inserted vs skipped due to ON CONFLICT,
-        // so we record metrics for the first N transactions where N = inserted_count.
-        // This is imperfect but avoids over-counting duplicates.
-        for (i, amount) in amounts.iter().take(inserted_count as usize).enumerate() {
-            let cents = (amount.to_f64().unwrap_or(0.0) * 100.0).round() as u64;
-            counter!(
-                "dwctl_credits_deducted_total",
-                "user_id" => user_ids[i].to_string(),
-                "model" => models[i].clone()
-            )
-            .increment(cents);
+        // Now we know exactly which source_ids were inserted
+        for source_id in &inserted_rows {
+            if let Some((_, user_id, amount, model)) = source_id_to_record.get(source_id) {
+                let cents = (amount.to_f64().unwrap_or(0.0) * 100.0).round() as u64;
+                counter!(
+                    "dwctl_credits_deducted_total",
+                    "user_id" => user_id.to_string(),
+                    "model" => model.clone()
+                )
+                .increment(cents);
+            }
         }
 
         trace!(

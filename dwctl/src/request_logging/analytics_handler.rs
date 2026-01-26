@@ -49,6 +49,7 @@ use crate::request_logging::AiResponse;
 use crate::request_logging::batcher::{AnalyticsSender, RawAnalyticsRecord};
 use crate::request_logging::serializers::{Auth, UsageMetrics, parse_ai_response};
 use crate::request_logging::utils::{extract_header_as_string, extract_header_as_uuid};
+use metrics::counter;
 use outlet::{RequestData, RequestHandler, ResponseData};
 use serde_json::Value;
 use tracing::{Instrument, info_span, warn};
@@ -174,6 +175,7 @@ impl RequestHandler for AnalyticsHandler {
 
             // Send to batcher (non-blocking, just puts in channel)
             if let Err(e) = self.sender.send(record).await {
+                counter!("dwctl_analytics_send_errors_total").increment(1);
                 warn!(
                     correlation_id = correlation_id,
                     error = %e,
