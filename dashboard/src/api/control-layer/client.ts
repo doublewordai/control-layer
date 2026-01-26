@@ -66,8 +66,8 @@ import { ApiError } from "./errors";
 
 // Optional override for AI API endpoints (files, batches, daemons)
 // Falls back to same origin if not set (relative paths)
-// Priority: runtime config > build-time env var > empty (same-origin)
-let aiApiBaseUrl = import.meta.env.VITE_aiApiBaseUrl || "";
+// Set at runtime via setAiApiBaseUrl() after fetching /config
+let aiApiBaseUrl = "";
 
 /**
  * Set the AI API base URL at runtime (called after fetching config)
