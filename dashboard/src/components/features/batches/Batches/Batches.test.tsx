@@ -16,11 +16,6 @@ vi.mock("../../../../api/control-layer/hooks", () => ({
     data: null,
     isLoading: false,
   })),
-  useFileCostEstimate: vi.fn(() => ({
-    data: null,
-    isLoading: false,
-    error: null,
-  })),
   // Required by useAuthorization
   useUser: vi.fn(() => ({
     data: { roles: ["PlatformManager"] },
@@ -92,6 +87,12 @@ const mockFiles = [
     expires_at: 1765065600,
     filename: "test_file.jsonl",
     purpose: "batch",
+    cost_estimate: {
+      total_requests: 100,
+      total_estimated_input_tokens: 50000,
+      total_estimated_output_tokens: 25000,
+      total_estimated_cost: "0.75",
+    },
   },
   {
     id: "file-2",
