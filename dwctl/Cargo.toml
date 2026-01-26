@@ -36,16 +36,18 @@ serde_json = "1.0"
 uuid = { version = "1.0", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 anyhow = "1.0"
+log = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # OpenTelemetry
-opentelemetry = "0.27"
-opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.27", features = [
+opentelemetry = "0.29"
+opentelemetry_sdk = { version = "0.29", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.29", features = [
   "http-proto",
   "reqwest-client",
 ] }
-tracing-opentelemetry = "0.28"
+tracing-opentelemetry = "0.30"
+axum-otel = "0.29"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "fs", "trace"] }
 async-trait = "0.1"

@@ -188,14 +188,13 @@ use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 use outlet::{MultiHandler, RequestLoggerConfig, RequestLoggerLayer};
 use outlet_postgres::PostgresHandler;
 use request_logging::{AiResponse, ParsedAIRequest};
-use sqlx::{Executor, PgPool};
+use sqlx::{ConnectOptions, Executor, PgPool, postgres::PgConnectOptions};
+use std::str::FromStr;
 use std::sync::{Arc, OnceLock};
 use tokio::net::TcpListener;
 use tower::Layer;
-use tower_http::{
-    cors::CorsLayer,
-    trace::{DefaultMakeSpan, DefaultOnRequest, DefaultOnResponse, TraceLayer},
-};
+use tower_http::{cors::CorsLayer, trace::TraceLayer};
+use axum_otel::{AxumOtelSpanCreator, AxumOtelOnResponse, AxumOtelOnFailure};
 use tracing::{Level, debug, info, instrument};
 use utoipa::OpenApi;
 use utoipa_scalar::{Scalar, Servable};
@@ -554,6 +553,8 @@ async fn setup_database(
         };
 
         let main_settings = config.database.main_pool_settings();
+        let connect_opts = PgConnectOptions::from_str(&database_url)?
+            .log_slow_statements(log::LevelFilter::Warn, std::time::Duration::from_millis(100));
         let pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(main_settings.max_connections)
             .min_connections(main_settings.min_connections)
@@ -568,7 +569,7 @@ async fn setup_database(
             } else {
                 None
             })
-            .connect(&database_url)
+            .connect_with(connect_opts)
             .await?;
         (_embedded_db, pool, None)
     };
@@ -582,6 +583,8 @@ async fn setup_database(
     } else if let Some(replica_url) = config.database.external_replica_url() {
         info!("Setting up read replica pool");
         let replica_settings = config.database.main_replica_pool_settings();
+        let replica_opts = PgConnectOptions::from_str(replica_url)?
+            .log_slow_statements(log::LevelFilter::Warn, std::time::Duration::from_millis(100));
         let replica_pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(replica_settings.max_connections)
             .min_connections(replica_settings.min_connections)
@@ -596,7 +599,7 @@ async fn setup_database(
             } else {
                 None
             })
-            .connect(replica_url)
+            .connect_with(replica_opts)
             .await?;
         DbPools::with_replica(pool, replica_pool)
     } else {
@@ -670,6 +673,8 @@ async fn setup_database(
             ..
         } => {
             info!("Using dedicated database for fusillade");
+            let connect_opts = PgConnectOptions::from_str(url)?
+                .log_slow_statements(log::LevelFilter::Warn, std::time::Duration::from_millis(100));
             let primary = sqlx::postgres::PgPoolOptions::new()
                 .max_connections(pool_settings.max_connections)
                 .min_connections(pool_settings.min_connections)
@@ -684,12 +689,14 @@ async fn setup_database(
                 } else {
                     None
                 })
-                .connect(url)
+                .connect_with(connect_opts)
                 .await?;
 
             if let Some(replica_url) = replica_url {
                 info!("Setting up fusillade read replica");
                 let replica_pool_settings = config.database.fusillade().replica_pool_settings();
+                let replica_opts = PgConnectOptions::from_str(replica_url)?
+                    .log_slow_statements(log::LevelFilter::Warn, std::time::Duration::from_millis(100));
                 let replica = sqlx::postgres::PgPoolOptions::new()
                     .max_connections(replica_pool_settings.max_connections)
                     .min_connections(replica_pool_settings.min_connections)
@@ -704,7 +711,7 @@ async fn setup_database(
                     } else {
                         None
                     })
-                    .connect(replica_url)
+                    .connect_with(replica_opts)
                     .await?;
                 DbPools::with_replica(primary, replica)
             } else {
@@ -743,6 +750,8 @@ async fn setup_database(
                 ..
             } => {
                 info!("Using dedicated database for outlet");
+                let connect_opts = PgConnectOptions::from_str(url)?
+                    .log_slow_statements(log::LevelFilter::Warn, std::time::Duration::from_millis(100));
                 let primary = sqlx::postgres::PgPoolOptions::new()
                     .max_connections(pool_settings.max_connections)
                     .min_connections(pool_settings.min_connections)
@@ -757,12 +766,14 @@ async fn setup_database(
                     } else {
                         None
                     })
-                    .connect(url)
+                    .connect_with(connect_opts)
                     .await?;
 
                 if let Some(replica_url) = replica_url {
                     info!("Setting up outlet read replica");
                     let replica_pool_settings = config.database.outlet().replica_pool_settings();
+                    let replica_opts = PgConnectOptions::from_str(replica_url)?
+                        .log_slow_statements(log::LevelFilter::Warn, std::time::Duration::from_millis(100));
                     let replica = sqlx::postgres::PgPoolOptions::new()
                         .max_connections(replica_pool_settings.max_connections)
                         .min_connections(replica_pool_settings.min_connections)
@@ -777,7 +788,7 @@ async fn setup_database(
                         } else {
                             None
                         })
-                        .connect(replica_url)
+                        .connect_with(replica_opts)
                         .await?;
                     DbPools::with_replica(primary, replica)
                 } else {
@@ -1207,12 +1218,12 @@ pub async fn build_router(
             .layer(prometheus_layer);
     }
 
-    // Add tracing layer
+    // Add tracing layer with OTel semantic conventions
     let router = router.layer(
         TraceLayer::new_for_http()
-            .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
-            .on_request(DefaultOnRequest::new().level(Level::INFO))
-            .on_response(DefaultOnResponse::new().level(Level::INFO)),
+            .make_span_with(AxumOtelSpanCreator::new().level(Level::INFO))
+            .on_response(AxumOtelOnResponse::new().level(Level::INFO))
+            .on_failure(AxumOtelOnFailure::new()),
     );
 
     Ok(router)
