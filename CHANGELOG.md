@@ -1,5 +1,12 @@
 # Changelog
 
+## [3.1.0](https://github.com/doublewordai/control-layer/compare/v3.0.1...v3.1.0) (2026-01-26)
+
+
+### Features
+
+* add include=analytics to batches list endpoint ([#602](https://github.com/doublewordai/control-layer/issues/602)) ([36f5ff1](https://github.com/doublewordai/control-layer/commit/36f5ff153ce5c21beba52d73d7dee89c595218b7))
+
 ## [3.0.1](https://github.com/doublewordai/control-layer/compare/v3.0.0...v3.0.1) (2026-01-26)
 
 
