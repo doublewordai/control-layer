@@ -195,7 +195,7 @@ use tower_http::{
     cors::CorsLayer,
     trace::{DefaultMakeSpan, DefaultOnRequest, DefaultOnResponse, TraceLayer},
 };
-use tracing::{Level, debug, error, info, instrument};
+use tracing::{Level, debug, info, instrument};
 use utoipa::OpenApi;
 use utoipa_scalar::{Scalar, Servable};
 use uuid::Uuid;
@@ -867,7 +867,8 @@ fn create_cors_layer(config: &Config) -> anyhow::Result<CorsLayer> {
 ///
 /// - `state`: Mutable application state (metrics recorder may be initialized here)
 /// - `onwards_router`: Pre-configured router for AI request proxying
-/// - `shutdown_token`: Cancellation token for graceful shutdown of spawned tasks
+/// - `analytics_sender`: Optional sender for analytics records (from background services)
+/// - `metrics_recorder`: Optional GenAI metrics recorder (created before background services)
 ///
 /// # Returns
 ///
@@ -880,7 +881,8 @@ fn create_cors_layer(config: &Config) -> anyhow::Result<CorsLayer> {
 pub async fn build_router(
     state: &mut AppState,
     onwards_router: Router,
-    shutdown_token: tokio_util::sync::CancellationToken,
+    analytics_sender: Option<request_logging::batcher::AnalyticsSender>,
+    metrics_recorder: Option<GenAiMetrics>,
 ) -> anyhow::Result<Router> {
     // Setup request logging and/or analytics based on config flags
     //
@@ -894,13 +896,8 @@ pub async fn build_router(
     let analytics_enabled = state.config.enable_analytics;
 
     let outlet_layer = if request_logging_enabled || analytics_enabled {
-        // Initialize GenAI metrics BEFORE creating analytics handler if metrics enabled
-        if state.config.enable_metrics && analytics_enabled {
-            let gen_ai_registry = prometheus::Registry::new();
-            let gen_ai_metrics =
-                GenAiMetrics::new(&gen_ai_registry).map_err(|e| anyhow::anyhow!("Failed to create GenAI metrics: {}", e))?;
-            state.metrics_recorder = Some(gen_ai_metrics);
-        }
+        // Store the metrics recorder in state (created earlier in Application::new)
+        state.metrics_recorder = metrics_recorder;
 
         // Build handler chain based on config
         let mut multi_handler = MultiHandler::new();
@@ -917,34 +914,8 @@ pub async fn build_router(
         }
 
         // Add AnalyticsHandler for analytics/billing if enabled
-        if analytics_enabled {
-            // Create the analytics batcher and spawn it as a background task
-            let (batcher, sender) =
-                request_logging::AnalyticsBatcher::new(state.db.write().clone(), state.config.clone(), state.metrics_recorder.clone());
-
-            // Spawn the batcher background task with the shutdown token
-            // Monitor the task so panics are logged (not silently swallowed)
-            let batcher_shutdown = shutdown_token.clone();
-            let batcher_handle = tokio::spawn(async move {
-                batcher.run(batcher_shutdown).await;
-            });
-
-            // Spawn a monitor task to log if the batcher exits unexpectedly
-            let monitor_shutdown = shutdown_token.clone();
-            tokio::spawn(async move {
-                tokio::select! {
-                    result = batcher_handle => {
-                        if let Err(e) = result {
-                            error!(error = %e, "Analytics batcher task panicked - analytics data may be lost");
-                        }
-                    }
-                    _ = monitor_shutdown.cancelled() => {
-                        // Normal shutdown, don't log anything
-                    }
-                }
-            });
-
-            // Create handler that sends records to the batcher
+        // The batcher is spawned in setup_background_services and managed by BackgroundServices
+        if let Some(sender) = analytics_sender {
             let analytics_handler = request_logging::AnalyticsHandler::new(sender, uuid::Uuid::new_v4(), state.config.clone());
             multi_handler = multi_handler.with(analytics_handler);
         }
@@ -1258,6 +1229,8 @@ pub struct BackgroundServices {
     onwards_targets: onwards::target::Targets,
     #[cfg_attr(not(test), allow(dead_code))]
     onwards_sender: Option<tokio::sync::watch::Sender<onwards::target::Targets>>,
+    /// Sender for analytics records (if analytics is enabled)
+    analytics_sender: Option<request_logging::batcher::AnalyticsSender>,
     // JoinSet is cancel-safe - can be polled in select! without losing tasks
     background_tasks: tokio::task::JoinSet<anyhow::Result<()>>,
     // Map task IDs to names for logging
@@ -1383,6 +1356,7 @@ async fn setup_background_services(
     outlet_pool: Option<PgPool>,
     config: Config,
     shutdown_token: tokio_util::sync::CancellationToken,
+    metrics_recorder: Option<GenAiMetrics>,
 ) -> anyhow::Result<BackgroundServices> {
     use fusillade::manager::postgres::BatchInsertStrategy;
     let drop_guard = shutdown_token.clone().drop_guard();
@@ -1685,6 +1659,21 @@ async fn setup_background_services(
         });
     }
 
+    // Start analytics batcher if enabled
+    let analytics_sender = if config.enable_analytics {
+        let (batcher, sender) = request_logging::AnalyticsBatcher::new(pool.clone(), config.clone(), metrics_recorder);
+
+        let batcher_shutdown = shutdown_token.clone();
+        background_tasks.spawn("analytics-batcher", async move {
+            batcher.run(batcher_shutdown).await;
+            Ok(())
+        });
+
+        Some(sender)
+    } else {
+        None
+    };
+
     let (background_tasks, task_names) = background_tasks.into_parts();
 
     Ok(BackgroundServices {
@@ -1692,6 +1681,7 @@ async fn setup_background_services(
         is_leader,
         onwards_targets: initial_targets,
         onwards_sender,
+        analytics_sender,
         background_tasks,
         task_names,
         shutdown_token,
@@ -1753,6 +1743,15 @@ impl Application {
         // Create a shutdown token for coordinating graceful shutdown of background tasks
         let shutdown_token = tokio_util::sync::CancellationToken::new();
 
+        // Create GenAI metrics recorder if both metrics and analytics are enabled
+        // This is created here (before background services) so the analytics batcher can use it
+        let metrics_recorder = if config.enable_metrics && config.enable_analytics {
+            let gen_ai_registry = prometheus::Registry::new();
+            Some(GenAiMetrics::new(&gen_ai_registry).map_err(|e| anyhow::anyhow!("Failed to create GenAI metrics: {}", e))?)
+        } else {
+            None
+        };
+
         // Setup background services (onwards integration, probe scheduler, batch daemon, leader election)
         // Note: Must use primary pool (via Deref) because onwards sync uses LISTEN/NOTIFY
         // which requires direct database connection to primary (not through PgBouncer transaction pooling)
@@ -1762,6 +1761,7 @@ impl Application {
             outlet_pools.as_ref().map(|p| (**p).clone()),
             config.clone(),
             shutdown_token.clone(),
+            metrics_recorder.clone(),
         )
         .await?;
 
@@ -1779,7 +1779,13 @@ impl Application {
             .maybe_outlet_db(outlet_pools.clone())
             .build();
 
-        let router = build_router(&mut app_state, onwards_router, shutdown_token).await?;
+        let router = build_router(
+            &mut app_state,
+            onwards_router,
+            bg_services.analytics_sender.clone(),
+            metrics_recorder,
+        )
+        .await?;
 
         Ok(Self {
             router,
