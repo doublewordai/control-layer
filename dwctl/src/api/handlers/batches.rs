@@ -97,8 +97,18 @@ fn to_batch_response_with_email(batch: fusillade::Batch, creator_email: Option<&
     let failed_at = batch.failed_at.map(|dt| dt.timestamp());
     let cancelled_at = batch.cancelled_at.map(|dt| dt.timestamp());
 
-    // Parse errors from JSON if present
-    let errors = batch.errors.and_then(|e| serde_json::from_value::<BatchErrors>(e).ok());
+    // Only show errors if batch has terminally failed AND SLA has expired
+    // This prevents showing errors to users while escalation might still recover failures
+    let errors = if batch.failed_at.is_some() && chrono::Utc::now() > batch.expires_at {
+        // Terminal failure past SLA - show errors to user
+        batch.errors.and_then(|e| serde_json::from_value::<BatchErrors>(e).ok())
+    } else {
+        // Either:
+        // - No terminal failure yet (failed_at is None) - escalation might recover
+        // - Still within SLA window - escalation has time to recover
+        // In both cases, hide errors from user
+        None
+    };
 
     // Check if batch has expired
     let expired_at = if chrono::Utc::now() > batch.expires_at {
@@ -974,6 +984,7 @@ mod tests {
     use crate::test::utils::*;
     use axum::http::StatusCode;
     use sqlx::PgPool;
+    use uuid::Uuid;
 
     #[sqlx::test]
     #[test_log::test]
@@ -1290,6 +1301,139 @@ mod tests {
             expected_expiry,
             expires_at_dt,
             diff.num_seconds()
+        );
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_errors_hidden_until_sla_expires(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        let deployment = create_test_deployment(&pool, user.id, "test-model", "test-model").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        // Upload a batch file
+        let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"test-model","messages":[{"role":"user","content":"Test"}]}}"#;
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test.jsonl");
+        let multipart = axum_test::multipart::MultipartForm::new()
+            .add_part("file", file_part)
+            .add_part("purpose", axum_test::multipart::Part::text("batch"));
+        let upload_resp = app
+            .post("/ai/v1/files")
+            .multipart(multipart)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        upload_resp.assert_status(StatusCode::CREATED);
+        let file: serde_json::Value = upload_resp.json();
+        let file_id = file["id"].as_str().unwrap();
+
+        // Create batch
+        let create_req = CreateBatchRequest {
+            input_file_id: file_id.to_string(),
+            endpoint: "/v1/chat/completions".to_string(),
+            completion_window: "24h".to_string(),
+            metadata: None,
+        };
+
+        let resp = app
+            .post("/ai/v1/batches")
+            .json(&create_req)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        resp.assert_status(StatusCode::CREATED);
+        let batch: serde_json::Value = resp.json();
+        let batch_id = batch["id"].as_str().unwrap();
+        let batch_uuid = Uuid::parse_str(batch_id).unwrap();
+
+        // Scenario 1: Simulate errors exist but batch is still within SLA (no failed_at)
+        sqlx::query(
+            r#"
+            UPDATE fusillade.batches
+            SET errors = '{"object":"list","data":[{"code":"invalid_request","message":"Test error"}]}'::jsonb
+            WHERE id = $1
+            "#,
+        )
+        .bind(batch_uuid)
+        .execute(&pool)
+        .await
+        .expect("Failed to set errors");
+
+        // GET batch - errors should be HIDDEN (null) because within SLA
+        let get_resp = app
+            .get(&format!("/ai/v1/batches/{}", batch_id))
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        get_resp.assert_status(StatusCode::OK);
+        let batch_response: serde_json::Value = get_resp.json();
+
+        assert!(
+            batch_response["errors"].is_null(),
+            "Errors should be hidden when batch is within SLA (no failed_at set)"
+        );
+
+        // Scenario 2: Set failed_at but still within SLA - errors should STILL be hidden
+        sqlx::query(
+            r#"
+            UPDATE fusillade.batches
+            SET failed_at = NOW()
+            WHERE id = $1
+            "#,
+        )
+        .bind(batch_uuid)
+        .execute(&pool)
+        .await
+        .expect("Failed to set failed_at");
+
+        // GET batch - errors should STILL be HIDDEN because within SLA
+        let get_resp2 = app
+            .get(&format!("/ai/v1/batches/{}", batch_id))
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        get_resp2.assert_status(StatusCode::OK);
+        let batch_response2: serde_json::Value = get_resp2.json();
+
+        assert!(
+            batch_response2["errors"].is_null(),
+            "Errors should be hidden when failed_at is set but SLA has not expired"
+        );
+
+        // Scenario 3: Expire the SLA AND have failed_at - NOW errors should be visible
+        sqlx::query(
+            r#"
+            UPDATE fusillade.batches
+            SET expires_at = NOW() - INTERVAL '1 hour'
+            WHERE id = $1
+            "#,
+        )
+        .bind(batch_uuid)
+        .execute(&pool)
+        .await
+        .expect("Failed to expire batch");
+
+        // GET batch - errors should NOW be VISIBLE
+        let get_resp3 = app
+            .get(&format!("/ai/v1/batches/{}", batch_id))
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        get_resp3.assert_status(StatusCode::OK);
+        let batch_response3: serde_json::Value = get_resp3.json();
+
+        assert!(
+            !batch_response3["errors"].is_null(),
+            "Errors should be visible when both failed_at is set AND SLA has expired"
+        );
+        assert_eq!(
+            batch_response3["errors"]["data"][0]["message"].as_str().unwrap(),
+            "Test error",
+            "Error message should match what we set"
         );
     }
 }
