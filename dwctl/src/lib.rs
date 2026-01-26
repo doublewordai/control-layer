@@ -604,11 +604,15 @@ async fn setup_database(
     // Reuses connection URLs from main pool (both primary and replica if configured)
     // Sets search_path at the connection level (via PgConnectOptions) rather than using
     // after_connect hooks, ensuring it cannot be unset and works reliably with replicas
-    let create_schema_pool = |schema: String, opts: sqlx::postgres::PgConnectOptions, settings: &config::PoolSettings| {
+    // Uses eager connection (connect_with) to respect min_connections at startup
+    async fn create_schema_pool(
+        schema: String,
+        opts: sqlx::postgres::PgConnectOptions,
+        settings: &config::PoolSettings,
+    ) -> Result<sqlx::PgPool, sqlx::Error> {
         // Set search_path directly in connection options so PostgreSQL enforces it
         // This is more reliable than after_connect hooks, especially with replicas
         // The options() method formats as: "-c key=value"
-        // We need to create owned values that live long enough for the closure
         let search_path_key = "search_path".to_string();
         let search_path_value = schema.clone();
         info!("Setting search_path={} via connection options for schema pool", schema);
@@ -628,8 +632,9 @@ async fn setup_database(
             } else {
                 None
             })
-            .connect_lazy_with(opts_with_schema)
-    };
+            .connect_with(opts_with_schema)
+            .await
+    }
 
     // Setup fusillade batch processing pool
     info!("Setting up fusillade batch processing pool");
@@ -638,7 +643,7 @@ async fn setup_database(
             name, pool: pool_settings, ..
         } => {
             // Create primary pool using main's connection, with schema-specific search_path
-            let primary = create_schema_pool(name.clone(), main_connect_opts.clone(), pool_settings);
+            let primary = create_schema_pool(name.clone(), main_connect_opts.clone(), pool_settings).await?;
             primary.execute(&*format!("CREATE SCHEMA IF NOT EXISTS {name}")).await?;
 
             // Create replica pool if main has one configured (inherits main's replica connection)
@@ -646,7 +651,7 @@ async fn setup_database(
                 info!("Setting up fusillade read replica (schema mode)");
                 let replica_opts = db_pools.read().connect_options().as_ref().clone();
                 let replica_pool_settings = config.database.fusillade().replica_pool_settings();
-                let replica = create_schema_pool(name.clone(), replica_opts, replica_pool_settings);
+                let replica = create_schema_pool(name.clone(), replica_opts, replica_pool_settings).await?;
                 DbPools::with_replica(primary, replica)
             } else {
                 DbPools::new(primary)
@@ -711,7 +716,7 @@ async fn setup_database(
                 name, pool: pool_settings, ..
             } => {
                 // Create primary pool using main's connection, with schema-specific search_path
-                let primary = create_schema_pool(name.clone(), main_connect_opts.clone(), pool_settings);
+                let primary = create_schema_pool(name.clone(), main_connect_opts.clone(), pool_settings).await?;
                 primary.execute(&*format!("CREATE SCHEMA IF NOT EXISTS {name}")).await?;
 
                 // Create replica pool if main has one configured (inherits main's replica connection)
@@ -719,7 +724,7 @@ async fn setup_database(
                     info!("Setting up outlet read replica (schema mode)");
                     let replica_opts = db_pools.read().connect_options().as_ref().clone();
                     let replica_pool_settings = config.database.outlet().replica_pool_settings();
-                    let replica = create_schema_pool(name.clone(), replica_opts, replica_pool_settings);
+                    let replica = create_schema_pool(name.clone(), replica_opts, replica_pool_settings).await?;
                     DbPools::with_replica(primary, replica)
                 } else {
                     DbPools::new(primary)
