@@ -1,0 +1,64 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            fusillade_batch_id,\n            COUNT(*) as \"total_requests!\",\n            COALESCE(SUM(prompt_tokens), 0) as \"total_prompt_tokens!\",\n            COALESCE(SUM(completion_tokens), 0) as \"total_completion_tokens!\",\n            COALESCE(SUM(total_tokens), 0) as \"total_tokens!\",\n            AVG(duration_ms) as \"avg_duration_ms\",\n            AVG(duration_to_first_byte_ms) as \"avg_ttfb_ms\",\n            SUM((prompt_tokens * COALESCE(input_price_per_token, 0)) +\n                (completion_tokens * COALESCE(output_price_per_token, 0))) as \"total_cost\"\n        FROM http_analytics\n        WHERE fusillade_batch_id = ANY($1)\n        GROUP BY fusillade_batch_id\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "fusillade_batch_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "total_requests!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "total_prompt_tokens!",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 3,
+        "name": "total_completion_tokens!",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 4,
+        "name": "total_tokens!",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 5,
+        "name": "avg_duration_ms",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 6,
+        "name": "avg_ttfb_ms",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 7,
+        "name": "total_cost",
+        "type_info": "Numeric"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      true,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "4776d053a2e3ac09af497c1589b4450211757d358a0f8e244b56f2430a8b14d1"
+}

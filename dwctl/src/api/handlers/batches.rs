@@ -121,6 +121,7 @@ fn to_batch_response_with_email(batch: fusillade::Batch, creator_email: Option<&
             failed: batch.failed_requests,
         },
         metadata,
+        analytics: None,
     }
 }
 
@@ -939,12 +940,37 @@ pub async fn list_batches<P: PoolProvider>(
         HashMap::new()
     };
 
-    // Convert batches to responses with email injection
+    // Parse include parameter
+    let includes: Vec<&str> = query
+        .include
+        .as_ref()
+        .map(|s| s.split(',').map(|s| s.trim()).collect())
+        .unwrap_or_default();
+    let include_analytics = includes.contains(&"analytics");
+
+    // Fetch analytics in bulk if requested
+    let analytics_map: HashMap<Uuid, BatchAnalytics> = if include_analytics && !batches.is_empty() {
+        let batch_ids: Vec<Uuid> = batches.iter().map(|b| b.id.0).collect();
+        crate::db::handlers::analytics::get_batches_analytics_bulk(state.db.read(), &batch_ids)
+            .await
+            .map_err(|e| Error::Internal {
+                operation: format!("fetch bulk batch analytics: {}", e),
+            })?
+    } else {
+        HashMap::new()
+    };
+
+    // Convert batches to responses with email injection and optional analytics
     let data: Vec<_> = batches
         .into_iter()
         .map(|batch| {
+            let batch_id = batch.id.0;
             let email = batch.created_by.as_ref().and_then(|id| email_map.get(id)).map(|s| s.as_str());
-            to_batch_response_with_email(batch, email)
+            let mut response = to_batch_response_with_email(batch, email);
+            if include_analytics {
+                response.analytics = analytics_map.get(&batch_id).cloned();
+            }
+            response
         })
         .collect();
 
@@ -1281,5 +1307,82 @@ mod tests {
             expires_at_dt,
             diff.num_seconds()
         );
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_list_batches_with_include_analytics(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        // Create a deployment and add to group so user has access to the model
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        // Upload a batch file
+        let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}"#;
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test-batch.jsonl");
+        let multipart = axum_test::multipart::MultipartForm::new()
+            .add_part("file", file_part)
+            .add_part("purpose", axum_test::multipart::Part::text("batch"));
+        let upload_resp = app
+            .post("/ai/v1/files")
+            .multipart(multipart)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        upload_resp.assert_status(StatusCode::CREATED);
+        let file: serde_json::Value = upload_resp.json();
+        let file_id = file["id"].as_str().unwrap();
+
+        // Create a batch
+        let create_req = CreateBatchRequest {
+            input_file_id: file_id.to_string(),
+            endpoint: "/v1/chat/completions".to_string(),
+            completion_window: "24h".to_string(),
+            metadata: None,
+        };
+
+        let create_resp = app
+            .post("/ai/v1/batches")
+            .json(&create_req)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        create_resp.assert_status(StatusCode::CREATED);
+
+        // List batches without include=analytics - analytics should not be present
+        let list_resp = app
+            .get("/ai/v1/batches")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        list_resp.assert_status_ok();
+        let list_result: serde_json::Value = list_resp.json();
+        assert!(list_result["data"].as_array().unwrap().len() >= 1);
+        // Without include=analytics, analytics field should be null/missing
+        let first_batch = &list_result["data"][0];
+        assert!(first_batch["analytics"].is_null());
+
+        // List batches with include=analytics - analytics should be present
+        let list_with_analytics_resp = app
+            .get("/ai/v1/batches?include=analytics")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        list_with_analytics_resp.assert_status_ok();
+        let list_with_analytics: serde_json::Value = list_with_analytics_resp.json();
+        assert!(list_with_analytics["data"].as_array().unwrap().len() >= 1);
+        // With include=analytics, analytics field should be an object (even if empty)
+        let first_batch_with_analytics = &list_with_analytics["data"][0];
+        assert!(first_batch_with_analytics["analytics"].is_object());
+        // Verify analytics has expected fields
+        let analytics = &first_batch_with_analytics["analytics"];
+        assert!(analytics["total_requests"].is_number());
+        assert!(analytics["total_prompt_tokens"].is_number());
+        assert!(analytics["total_completion_tokens"].is_number());
+        assert!(analytics["total_tokens"].is_number());
     }
 }
