@@ -138,12 +138,10 @@ var bootstrapContent = `
       backdrop-filter: blur(4px);
       padding: 1rem;
       text-decoration: none;
-      transition: all 0.3s;
+      transition: border-color 0.2s;
     }
     .dw-card:hover {
       border-color: rgba(37, 99, 235, 0.5);
-      background: rgba(255, 255, 255, 0.9);
-      transform: translateY(-2px);
     }
     .dw-card-header {
       display: flex;
@@ -154,10 +152,6 @@ var bootstrapContent = `
       width: 1.25rem;
       height: 1.25rem;
       color: ${colors.primary};
-      transition: transform 0.3s;
-    }
-    .dw-card:hover .dw-card-header svg {
-      transform: scale(1.1);
     }
     .dw-card-arrow {
       font-size: 0.75rem;
@@ -183,18 +177,7 @@ var bootstrapContent = `
       color: ${colors.muted};
       margin: 0.125rem 0 0 0;
     }
-    .dw-card-overlay {
-      position: absolute;
-      inset: 0;
-      border-radius: 0.5rem;
-      background: linear-gradient(to bottom right, ${colors.primaryLighter}, transparent);
-      opacity: 0;
-      transition: opacity 0.3s;
-      pointer-events: none;
-    }
-    .dw-card:hover .dw-card-overlay {
-      opacity: 1;
-    }
+
   </style>
   <div class="dw-bootstrap-banner">
     <div class="dw-glow-top"></div>
@@ -241,8 +224,7 @@ var bootstrapContent = `
             <h3 class="dw-card-title">Getting Started</h3>
             <p class="dw-card-desc">Learn how to run your first batch job</p>
           </div>
-          <div class="dw-card-overlay"></div>
-        </a>
+          </a>
         <a href="https://github.com/doublewordai/autobatcher" target="_blank" rel="noopener noreferrer" class="dw-card">
           <div class="dw-card-header">
             <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -254,8 +236,7 @@ var bootstrapContent = `
             <h3 class="dw-card-title">Coming from Real-Time?</h3>
             <p class="dw-card-desc">Use Autobatcher to migrate existing API calls</p>
           </div>
-          <div class="dw-card-overlay"></div>
-        </a>
+          </a>
         <a href="https://github.com/doublewordai/Unsplash-Image-Summarizer-Demo" target="_blank" rel="noopener noreferrer" class="dw-card">
           <div class="dw-card-header">
             <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -269,8 +250,7 @@ var bootstrapContent = `
             <h3 class="dw-card-title">Large Scale Image Processing</h3>
             <p class="dw-card-desc">See batch inference in action</p>
           </div>
-          <div class="dw-card-overlay"></div>
-        </a>
+          </a>
       </div>
     </div>
   </div>
