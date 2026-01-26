@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT m.alias as model, sub.avg_tokens\n        FROM unnest($1::text[]) AS m(alias)\n        LEFT JOIN LATERAL (\n            SELECT AVG(completion_tokens)::BIGINT as avg_tokens\n            FROM (\n                SELECT completion_tokens\n                FROM http_analytics\n                WHERE model = m.alias\n                  AND completion_tokens IS NOT NULL\n                  AND status_code = 200\n                ORDER BY timestamp DESC\n                LIMIT 100\n            ) recent\n        ) sub ON true\n        WHERE sub.avg_tokens IS NOT NULL\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "model",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "avg_tokens",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "2c225dd4065341001ee312dbe725654f74978ff7eb356bc694d405ef03f8389e"
+}

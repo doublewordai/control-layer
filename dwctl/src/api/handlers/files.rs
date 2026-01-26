@@ -607,17 +607,14 @@ pub async fn upload_file<P: PoolProvider>(
 use rust_decimal::Decimal;
 use std::collections::HashMap;
 
-/// Allowed completion windows for cost estimates
-const ALLOWED_COMPLETION_WINDOWS: &[&str] = &["24h", "1h"];
-
-/// Validate the completion_window parameter
-fn validate_completion_window(completion_window: &str) -> Result<()> {
-    if !ALLOWED_COMPLETION_WINDOWS.contains(&completion_window) {
+/// Validate the completion_window parameter against allowed values from config
+fn validate_completion_window(completion_window: &str, allowed_windows: &[String]) -> Result<()> {
+    if !allowed_windows.iter().any(|w| w == completion_window) {
         return Err(Error::BadRequest {
             message: format!(
                 "Invalid completion_window '{}'. Allowed values are: {}",
                 completion_window,
-                ALLOWED_COMPLETION_WINDOWS.join(", ")
+                allowed_windows.join(", ")
             ),
         });
     }
@@ -635,17 +632,61 @@ struct CostEstimateContext {
     pricing: HashMap<crate::types::DeploymentId, (Decimal, Decimal)>,
 }
 
+/// Fetch avg output tokens for specific models using an index-friendly LATERAL join.
+///
+/// This query uses LATERAL to efficiently fetch the last 100 completion_tokens per model,
+/// leveraging the index on (model, timestamp DESC) with early termination.
+async fn fetch_avg_output_tokens(conn: &mut sqlx::PgConnection, model_aliases: &[String]) -> Result<HashMap<String, i64>> {
+    if model_aliases.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    // Use LATERAL join for index-friendly access - each subquery terminates after 100 rows
+    let records = sqlx::query!(
+        r#"
+        SELECT m.alias as model, sub.avg_tokens
+        FROM unnest($1::text[]) AS m(alias)
+        LEFT JOIN LATERAL (
+            SELECT AVG(completion_tokens)::BIGINT as avg_tokens
+            FROM (
+                SELECT completion_tokens
+                FROM http_analytics
+                WHERE model = m.alias
+                  AND completion_tokens IS NOT NULL
+                  AND status_code = 200
+                ORDER BY timestamp DESC
+                LIMIT 100
+            ) recent
+        ) sub ON true
+        WHERE sub.avg_tokens IS NOT NULL
+        "#,
+        model_aliases
+    )
+    .fetch_all(conn)
+    .await
+    .map_err(|e| Error::Database(e.into()))?;
+
+    Ok(records
+        .into_iter()
+        .filter_map(|r| match (r.model, r.avg_tokens) {
+            (Some(model), Some(avg)) => Some((model, avg)),
+            _ => None,
+        })
+        .collect())
+}
+
 /// Build the cost estimate context by pre-fetching all deployment info, analytics, and pricing.
 ///
 /// This function performs 3 SQL queries regardless of the number of deployments:
 /// 1. List all active deployments
-/// 2. Get avg output tokens for all models in one query
+/// 2. Get avg output tokens for all models in one query (using LATERAL for efficiency)
 /// 3. Get pricing for all deployments in one query
 async fn build_cost_estimate_context<P: PoolProvider>(state: &AppState<P>, completion_window: &str) -> Result<CostEstimateContext> {
     let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut deployments_repo = Deployments::new(&mut conn);
 
-    let filter = DeploymentFilter::new(0, 1000)
+    // Use a large limit - in practice deployments are bounded, but don't silently truncate
+    let filter = DeploymentFilter::new(0, i64::MAX)
         .with_statuses(vec![ModelStatus::Active])
         .with_deleted(false);
     let all_deployments = deployments_repo.list(&filter).await.map_err(Error::Database)?;
@@ -659,43 +700,63 @@ async fn build_cost_estimate_context<P: PoolProvider>(state: &AppState<P>, compl
         model_info.insert(deployment.alias.clone(), (deployment.id, deployment.model_type.clone()));
     }
 
-    // Bulk query for avg output tokens - single query for all models
-    let avg_output_tokens: HashMap<String, i64> = if model_aliases.is_empty() {
-        HashMap::new()
-    } else {
-        let records = sqlx::query!(
-            r#"
-            WITH model_stats AS (
-                SELECT
-                    model,
-                    completion_tokens,
-                    ROW_NUMBER() OVER (PARTITION BY model ORDER BY timestamp DESC) as rn
-                FROM http_analytics
-                WHERE model = ANY($1)
-                  AND completion_tokens IS NOT NULL
-                  AND status_code = 200
-            )
-            SELECT model, AVG(completion_tokens)::BIGINT as avg_tokens
-            FROM model_stats
-            WHERE rn <= 100
-            GROUP BY model
-            "#,
-            &model_aliases
-        )
-        .fetch_all(&mut *conn)
-        .await
-        .map_err(|e| Error::Database(e.into()))?;
-
-        records
-            .into_iter()
-            .filter_map(|r| match (r.model, r.avg_tokens) {
-                (Some(model), Some(avg)) => Some((model, avg)),
-                _ => None,
-            })
-            .collect()
-    };
+    // Fetch avg output tokens using index-friendly LATERAL join
+    let avg_output_tokens = fetch_avg_output_tokens(&mut conn, &model_aliases).await?;
 
     // Bulk query for pricing - single query for all deployments
+    let mut tariffs_repo = Tariffs::new(&mut conn);
+    let pricing = tariffs_repo
+        .get_bulk_pricing_for_deployments(&deployment_ids, Some(completion_window))
+        .await
+        .map_err(Error::Database)?;
+
+    Ok(CostEstimateContext {
+        model_info,
+        avg_output_tokens,
+        pricing,
+    })
+}
+
+/// Build a minimal cost estimate context for specific models only.
+///
+/// This is more efficient than build_cost_estimate_context when you know
+/// which models you need (e.g., for single-file cost estimates).
+async fn build_cost_estimate_context_for_models<P: PoolProvider>(
+    state: &AppState<P>,
+    model_aliases: &[String],
+    completion_window: &str,
+) -> Result<CostEstimateContext> {
+    if model_aliases.is_empty() {
+        return Ok(CostEstimateContext {
+            model_info: HashMap::new(),
+            avg_output_tokens: HashMap::new(),
+            pricing: HashMap::new(),
+        });
+    }
+
+    let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+
+    // Fetch only the fields we need for cost estimation using the existing repository
+    // This reuses the same DeploymentFilter pattern used elsewhere
+    let mut deployments_repo = Deployments::new(&mut conn);
+    let filter = DeploymentFilter::new(0, i64::MAX)
+        .with_aliases(model_aliases.to_vec())
+        .with_statuses(vec![ModelStatus::Active])
+        .with_deleted(false);
+    let deployments = deployments_repo.list(&filter).await.map_err(Error::Database)?;
+
+    // Build model info lookup
+    let mut model_info = HashMap::new();
+    let deployment_ids: Vec<crate::types::DeploymentId> = deployments.iter().map(|d| d.id).collect();
+
+    for deployment in &deployments {
+        model_info.insert(deployment.alias.clone(), (deployment.id, deployment.model_type.clone()));
+    }
+
+    // Fetch avg output tokens for just these models
+    let avg_output_tokens = fetch_avg_output_tokens(&mut conn, model_aliases).await?;
+
+    // Fetch pricing for just these deployments
     let mut tariffs_repo = Tariffs::new(&mut conn);
     let pricing = tariffs_repo
         .get_bulk_pricing_for_deployments(&deployment_ids, Some(completion_window))
@@ -785,7 +846,7 @@ async fn compute_bulk_cost_estimates<P: PoolProvider>(
         return Ok(HashMap::new());
     }
 
-    validate_completion_window(completion_window)?;
+    validate_completion_window(completion_window, &state.config.batches.allowed_completion_windows)?;
 
     // Build context with all deployment info, analytics, and pricing
     let context = build_cost_estimate_context(state, completion_window).await?;
@@ -885,7 +946,7 @@ pub async fn list_files<P: PoolProvider>(
     // Validate completion_window early if cost estimates are requested
     let completion_window = query.completion_window.as_deref().unwrap_or("24h");
     if include_cost_estimate {
-        validate_completion_window(completion_window)?;
+        validate_completion_window(completion_window, &state.config.batches.allowed_completion_windows)?;
     }
 
     // Compute cost estimates if requested (only for batch purpose files)
@@ -1314,12 +1375,9 @@ pub async fn get_file_cost_estimate<P: PoolProvider>(
 
     // Use the completion_window from query params, defaulting to "24h"
     let completion_window = query.completion_window.as_deref().unwrap_or("24h");
-    validate_completion_window(completion_window)?;
+    validate_completion_window(completion_window, &state.config.batches.allowed_completion_windows)?;
 
-    // Build context with all deployment info, analytics, and pricing (3 SQL queries total)
-    let context = build_cost_estimate_context(&state, completion_window).await?;
-
-    // Get aggregated template statistics
+    // Get aggregated template statistics first to know which models we need
     let template_stats = state
         .request_manager
         .get_file_template_stats(fusillade::FileId(file_id))
@@ -1327,6 +1385,12 @@ pub async fn get_file_cost_estimate<P: PoolProvider>(
         .map_err(|e| Error::Internal {
             operation: format!("get file template stats: {}", e),
         })?;
+
+    // Extract unique model aliases from the file
+    let model_aliases: Vec<String> = template_stats.iter().map(|s| s.model.clone()).collect();
+
+    // Build minimal context for just the models used in this file
+    let context = build_cost_estimate_context_for_models(&state, &model_aliases, completion_window).await?;
 
     // Compute per-model breakdown and totals
     let mut total_cost = Decimal::ZERO;
@@ -1886,7 +1950,11 @@ mod tests {
         use rust_decimal::Decimal;
         use std::str::FromStr;
 
-        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        // Create app with custom config allowing 1h and 24h SLAs
+        let mut config = create_test_config();
+        config.batches.allowed_completion_windows = vec!["1h".to_string(), "24h".to_string()];
+
+        let (app, _bg_services) = create_test_app_with_config(pool.clone(), config, false).await;
         let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
         let group = create_test_group(&pool).await;
         add_user_to_group(&pool, user.id, group.id).await;
