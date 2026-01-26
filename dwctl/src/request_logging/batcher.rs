@@ -100,7 +100,6 @@ struct EnrichedRecord {
     user_id: Option<Uuid>,
     access_source: String,
     api_key_purpose: Option<ApiKeyPurpose>,
-    model_id: Option<Uuid>,
     provider_name: Option<String>,
     input_price_per_token: Option<Decimal>,
     output_price_per_token: Option<Decimal>,
@@ -340,7 +339,7 @@ where
                 (None, "unauthenticated".to_string(), None)
             };
 
-            let (model_id, provider_name, input_price, output_price) = if let Some(ref model_alias) = raw.request_model {
+            let (provider_name, input_price, output_price) = if let Some(ref model_alias) = raw.request_model {
                 if let Some(model_info) = model_map.get(model_alias) {
                     // Use batch_created_at for pricing if available (for batch requests)
                     // This ensures batch requests are priced as of batch creation, not processing time
@@ -353,12 +352,12 @@ where
                         raw.batch_completion_window.as_deref(),
                         pricing_timestamp,
                     );
-                    (Some(model_info.model_id), Some(model_info.provider_name.clone()), input, output)
+                    (Some(model_info.provider_name.clone()), input, output)
                 } else {
-                    (None, None, None, None)
+                    (None, None, None)
                 }
             } else {
-                (None, None, None, None)
+                (None, None, None)
             };
 
             enriched.push(EnrichedRecord {
@@ -366,7 +365,6 @@ where
                 user_id,
                 access_source,
                 api_key_purpose,
-                model_id,
                 provider_name,
                 input_price_per_token: input_price,
                 output_price_per_token: output_price,
@@ -414,7 +412,6 @@ where
 
         struct ModelRow {
             alias: String,
-            model_id: Uuid,
             provider_name: Option<String>,
             tariff_purpose: Option<String>,
             tariff_valid_from: Option<DateTime<Utc>>,
@@ -429,7 +426,6 @@ where
             r#"
             SELECT
                 dm.alias,
-                dm.id as model_id,
                 ie.name as provider_name,
                 mt.api_key_purpose as tariff_purpose,
                 mt.valid_from as tariff_valid_from,
@@ -451,7 +447,6 @@ where
         let mut map: HashMap<String, ModelInfo> = HashMap::new();
         for row in rows {
             let entry = map.entry(row.alias.clone()).or_insert_with(|| ModelInfo {
-                model_id: row.model_id,
                 provider_name: row.provider_name.unwrap_or_default(),
                 tariffs: Vec::new(),
             });
@@ -849,7 +844,6 @@ where
 /// Model info with tariffs
 #[derive(Debug)]
 struct ModelInfo {
-    model_id: Uuid,
     provider_name: String,
     tariffs: Vec<TariffInfo>,
 }

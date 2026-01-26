@@ -1,0 +1,58 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT\n                dm.alias,\n                ie.name as provider_name,\n                mt.api_key_purpose as tariff_purpose,\n                mt.valid_from as tariff_valid_from,\n                mt.input_price_per_token as tariff_input_price,\n                mt.output_price_per_token as tariff_output_price,\n                mt.completion_window as tariff_completion_window\n            FROM deployed_models dm\n            LEFT JOIN inference_endpoints ie ON dm.hosted_on = ie.id\n            LEFT JOIN model_tariffs mt ON mt.deployed_model_id = dm.id AND mt.valid_until IS NULL\n            WHERE dm.alias = ANY($1)\n            ORDER BY dm.alias, mt.valid_from DESC\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "alias",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "provider_name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "tariff_purpose",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "tariff_valid_from",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 4,
+        "name": "tariff_input_price",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 5,
+        "name": "tariff_output_price",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 6,
+        "name": "tariff_completion_window",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "0e39e790387832ada096c623f99b76651252cdb8a819061565f87b33e28b781f"
+}

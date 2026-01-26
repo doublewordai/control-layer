@@ -195,7 +195,7 @@ use tower_http::{
     cors::CorsLayer,
     trace::{DefaultMakeSpan, DefaultOnRequest, DefaultOnResponse, TraceLayer},
 };
-use tracing::{Level, debug, info, instrument};
+use tracing::{Level, debug, error, info, instrument};
 use utoipa::OpenApi;
 use utoipa_scalar::{Scalar, Servable};
 use uuid::Uuid;
@@ -923,9 +923,25 @@ pub async fn build_router(
                 request_logging::AnalyticsBatcher::new(state.db.write().clone(), state.config.clone(), state.metrics_recorder.clone());
 
             // Spawn the batcher background task with the shutdown token
+            // Monitor the task so panics are logged (not silently swallowed)
             let batcher_shutdown = shutdown_token.clone();
-            tokio::spawn(async move {
+            let batcher_handle = tokio::spawn(async move {
                 batcher.run(batcher_shutdown).await;
+            });
+
+            // Spawn a monitor task to log if the batcher exits unexpectedly
+            let monitor_shutdown = shutdown_token.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    result = batcher_handle => {
+                        if let Err(e) = result {
+                            error!(error = %e, "Analytics batcher task panicked - analytics data may be lost");
+                        }
+                    }
+                    _ = monitor_shutdown.cancelled() => {
+                        // Normal shutdown, don't log anything
+                    }
+                }
             });
 
             // Create handler that sends records to the batcher
