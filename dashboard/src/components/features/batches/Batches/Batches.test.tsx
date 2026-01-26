@@ -289,6 +289,21 @@ describe("Batches", () => {
       expect(useBatchesSpy).toHaveBeenCalled();
     });
 
+    it("should request batches with include=analytics to avoid N+1 requests", () => {
+      const useBatchesSpy = vi.mocked(hooks.useBatches);
+
+      render(<Batches {...defaultProps} />, {
+        wrapper: createWrapper(),
+      });
+
+      // Verify useBatches is called with include: "analytics"
+      expect(useBatchesSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          include: "analytics",
+        }),
+      );
+    });
+
     it("should show correct tab when starting on files tab", () => {
       const { container } = render(<Batches {...defaultProps} />, {
         wrapper: createWrapper(),

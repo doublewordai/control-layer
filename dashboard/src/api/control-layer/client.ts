@@ -1338,6 +1338,7 @@ const batchesApi = {
     if (options?.after) params.set("after", options.after);
     if (options?.limit) params.set("limit", options.limit.toString());
     if (options?.search) params.set("search", options.search);
+    if (options?.include) params.set("include", options.include);
 
     const response = await fetchAiApi(
       `/ai/v1/batches${params.toString() ? "?" + params.toString() : ""}`,
