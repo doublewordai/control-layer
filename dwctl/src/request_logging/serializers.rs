@@ -648,7 +648,6 @@ pub async fn store_analytics_record(
                     let mut conn = pool.acquire().await?;
                     let mut credits = Credits::new(&mut conn);
 
-
                     // Create usage transaction referencing the analytics record
                     // Include fusillade_batch_id to enable fast batch grouping in transactions list
                     match credits
@@ -691,8 +690,6 @@ pub async fn store_analytics_record(
                             counter!("dwctl_credits_deduction_errors_total").increment(1);
                         }
                     }
-
-
                 } else {
                     tracing::trace!(
                         user_id = %user_id,
