@@ -3480,9 +3480,9 @@ dependencies = [
 
 [[package]]
 name = "outlet"
-version = "0.4.4"
+version = "0.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cf1fe92691fe9a54b63b9b5e424801da9a1d1f3c7dd0b3492fcbfb1e2e1e4a98"
+checksum = "b4f758dc3f2fc74b18f4df9222b5bd7d2ed540547c38f09e0840b5d6c16f9b6e"
 dependencies = [
  "anyhow",
  "async-stream",

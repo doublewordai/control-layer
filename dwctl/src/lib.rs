@@ -168,7 +168,7 @@ use crate::{
     db::models::{deployments::DeploymentCreateDBRequest, users::UserCreateDBRequest},
     metrics::GenAiMetrics,
     openapi::{AdminApiDoc, AiApiDoc},
-    request_logging::serializers::{AnalyticsResponseSerializer, parse_ai_request},
+    request_logging::serializers::{parse_ai_request, parse_ai_response},
 };
 use sqlx_pool_router::{DbPools, PoolProvider};
 
@@ -184,7 +184,7 @@ use axum_prometheus::PrometheusMetricLayerBuilder;
 use bon::Builder;
 pub use config::Config;
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
-use outlet::{RequestLoggerConfig, RequestLoggerLayer};
+use outlet::{MultiHandler, RequestLoggerConfig, RequestLoggerLayer};
 use outlet_postgres::PostgresHandler;
 use request_logging::{AiResponse, ParsedAIRequest};
 use sqlx::{Executor, PgPool};
@@ -872,36 +872,62 @@ fn create_cors_layer(config: &Config) -> anyhow::Result<CorsLayer> {
 /// Returns an error if CORS configuration is invalid or metrics initialization fails.
 #[instrument(skip_all)]
 pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyhow::Result<Router> {
-    // Setup request logging if enabled
-    let outlet_layer = if let Some(outlet_pool) = state.outlet_db.as_ref() {
-        // Initialize GenAI metrics BEFORE creating analytics serializer if metrics enabled
-        if state.config.enable_metrics {
+    // Setup request logging and/or analytics based on config flags
+    //
+    // These can be enabled independently:
+    // - enable_request_logging: stores raw request/response bodies via outlet-postgres
+    // - enable_analytics: stores analytics data, handles billing, records Prometheus metrics
+    //
+    // Both require the RequestLoggerLayer to capture request/response data, but use
+    // different handlers to process that data.
+    let request_logging_enabled = state.outlet_db.is_some() && state.config.enable_request_logging;
+    let analytics_enabled = state.config.enable_analytics;
+
+    let outlet_layer = if request_logging_enabled || analytics_enabled {
+        // Initialize GenAI metrics BEFORE creating analytics handler if metrics enabled
+        if state.config.enable_metrics && analytics_enabled {
             let gen_ai_registry = prometheus::Registry::new();
             let gen_ai_metrics =
                 GenAiMetrics::new(&gen_ai_registry).map_err(|e| anyhow::anyhow!("Failed to create GenAI metrics: {}", e))?;
             state.metrics_recorder = Some(gen_ai_metrics);
         }
 
-        let analytics_serializer = AnalyticsResponseSerializer::new(
-            state.db.write().clone(),
-            uuid::Uuid::new_v4(),
-            state.config.clone(),
-            state.metrics_recorder.clone(),
-        );
+        // Build handler chain based on config
+        let mut multi_handler = MultiHandler::new();
 
-        let postgres_handler = PostgresHandler::<DbPools, ParsedAIRequest, AiResponse>::from_pool_provider(outlet_pool.clone())
-            .await
-            .expect("Failed to create PostgresHandler for request logging")
-            .with_request_serializer(parse_ai_request)
-            .with_response_serializer(analytics_serializer.create_serializer());
+        // Add PostgresHandler for request logging if enabled
+        if request_logging_enabled {
+            let outlet_pool = state.outlet_db.as_ref().expect("outlet_db checked above");
+            let postgres_handler = PostgresHandler::<DbPools, ParsedAIRequest, AiResponse>::from_pool_provider(outlet_pool.clone())
+                .await
+                .expect("Failed to create PostgresHandler for request logging")
+                .with_request_serializer(parse_ai_request)
+                .with_response_serializer(parse_ai_response);
+            multi_handler = multi_handler.with(postgres_handler);
+        }
 
-        let outlet_config = RequestLoggerConfig {
-            capture_request_body: true,
-            capture_response_body: true,
-            path_filter: None, // No path filter needed - applied directly to ai_router
-        };
+        // Add AnalyticsHandler for analytics/billing if enabled
+        if analytics_enabled {
+            let analytics_handler = request_logging::AnalyticsHandler::new(
+                state.db.write().clone(),
+                uuid::Uuid::new_v4(),
+                state.config.clone(),
+                state.metrics_recorder.clone(),
+            );
+            multi_handler = multi_handler.with(analytics_handler);
+        }
 
-        Some(RequestLoggerLayer::new(outlet_config, postgres_handler))
+        // Only create layer if at least one handler is enabled (should always be true here)
+        if multi_handler.is_empty() {
+            None
+        } else {
+            let outlet_config = RequestLoggerConfig {
+                capture_request_body: true,
+                capture_response_body: true,
+                path_filter: None, // No path filter needed - applied directly to ai_router
+            };
+            Some(RequestLoggerLayer::new(outlet_config, multi_handler))
+        }
     } else {
         None
     };
