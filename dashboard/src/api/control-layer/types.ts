@@ -863,6 +863,13 @@ export interface ProbeStatistics {
   last_failure: string | null;
 }
 
+export interface FileCostEstimateSummary {
+  total_requests: number;
+  total_estimated_input_tokens: number;
+  total_estimated_output_tokens: number;
+  total_estimated_cost: string;
+}
+
 export interface FileObject {
   id: string;
   object: "file";
@@ -879,6 +886,7 @@ export interface FileObject {
     | "vision"
     | "user_data"
     | "evals";
+  cost_estimate?: FileCostEstimateSummary;
 }
 
 export interface FileListResponse {
@@ -911,6 +919,10 @@ export interface FilesListQuery {
   order?: "asc" | "desc";
   purpose?: string;
   search?: string;
+  /** Comma-separated list of related resources to include. Supported: "cost_estimate" */
+  include?: string;
+  /** Completion window (SLA) for cost estimates (e.g., "24h", "1h"). Only used when include=cost_estimate. */
+  completion_window?: string;
 }
 
 export interface ModelCostBreakdown {

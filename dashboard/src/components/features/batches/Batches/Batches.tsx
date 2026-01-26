@@ -142,6 +142,11 @@ export function Batches({
     purpose: filePurpose,
     search: debouncedFileSearch.trim() || undefined,
     ...filesPagination.queryParams,
+    // Include cost estimates for batch input files
+    ...(filePurpose === "batch" && {
+      include: "cost_estimate",
+      completion_window: "24h",
+    }),
   });
 
   // Paginated batches query
@@ -196,29 +201,27 @@ export function Batches({
     return map;
   }, [batches, analyticsQueries]);
 
-  // Fetch file cost estimates for batch input files
-  const fileEstimateQueries = useQueries({
-    queries: files
-      .filter((file) => file.purpose === "batch")
-      .map((file) => ({
-        queryKey: ["files", "cost-estimate", file.id],
-        queryFn: () => dwctlApi.files.getCostEstimate(file.id),
-        staleTime: 60000, // 1 minute - cost estimates don't change frequently
-      })),
-  });
-
   // Create a map of file ID to cost estimate for easy lookup
+  // Cost estimates are now embedded in the file response when include=cost_estimate
   const fileEstimatesMap = React.useMemo(() => {
     const map = new Map<string, FileCostEstimate>();
-    const batchFiles = files.filter((file) => file.purpose === "batch");
-    batchFiles.forEach((file, index) => {
-      const estimate = fileEstimateQueries[index]?.data;
-      if (estimate) {
-        map.set(file.id, estimate);
+    files.forEach((file) => {
+      if (file.cost_estimate) {
+        // Convert embedded summary to full FileCostEstimate format
+        map.set(file.id, {
+          file_id: file.id,
+          total_requests: file.cost_estimate.total_requests,
+          total_estimated_input_tokens:
+            file.cost_estimate.total_estimated_input_tokens,
+          total_estimated_output_tokens:
+            file.cost_estimate.total_estimated_output_tokens,
+          total_estimated_cost: file.cost_estimate.total_estimated_cost,
+          models: [], // Model breakdown not included in embedded summary
+        });
       }
     });
     return map;
-  }, [files, fileEstimateQueries]);
+  }, [files]);
 
   // Prefetch next page for files - only if user has already started paginating
   useEffect(() => {

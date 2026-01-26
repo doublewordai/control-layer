@@ -8,8 +8,8 @@
 use sqlx_pool_router::PoolProvider;
 
 use crate::api::models::files::{
-    FileContentQuery, FileCostEstimate, FileCostEstimateQuery, FileDeleteResponse, FileListResponse, FileResponse, ListFilesQuery,
-    ListObject, ObjectType, Purpose,
+    FileContentQuery, FileCostEstimate, FileCostEstimateQuery, FileCostEstimateSummary, FileDeleteResponse, FileListResponse,
+    FileResponse, ListFilesQuery, ListObject, ObjectType, Purpose,
 };
 use crate::auth::permissions::{RequiresPermission, can_read_all_resources, operation, resource};
 
@@ -600,8 +600,163 @@ pub async fn upload_file<P: PoolProvider>(
             filename: file.name,
             purpose: api_purpose,
             expires_at: file.expires_at.map(|dt| dt.timestamp()),
+            cost_estimate: None,
         }),
     ))
+}
+
+use std::collections::HashMap;
+
+/// Compute cost estimates for multiple files efficiently.
+///
+/// This fetches deployment info and pricing once, then computes estimates for all files.
+/// Returns a map of file_id -> cost estimate summary.
+async fn compute_bulk_cost_estimates<P: PoolProvider>(
+    state: &AppState<P>,
+    file_ids: &[Uuid],
+    completion_window: &str,
+) -> Result<HashMap<Uuid, FileCostEstimateSummary>> {
+    use rust_decimal::Decimal;
+
+    if file_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    // Fetch all deployments and their pricing information upfront (shared across all files)
+    let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+    let mut deployments_repo = Deployments::new(&mut conn);
+
+    let filter = DeploymentFilter::new(0, 1000)
+        .with_statuses(vec![ModelStatus::Active])
+        .with_deleted(false);
+    let all_deployments = deployments_repo.list(&filter).await.map_err(Error::Database)?;
+
+    // Build a lookup map of model alias -> (deployment, avg_output_tokens, model_type)
+    let mut model_info: HashMap<
+        String,
+        (
+            crate::db::models::deployments::DeploymentDBResponse,
+            Option<i64>,
+            Option<crate::db::models::deployments::ModelType>,
+        ),
+    > = HashMap::new();
+
+    for deployment in all_deployments {
+        // Query http_analytics for last 100 responses to get average output token count
+        let avg_output_tokens: Option<i64> = sqlx::query_scalar(
+            r#"
+            SELECT AVG(completion_tokens)::BIGINT
+            FROM (
+                SELECT completion_tokens
+                FROM http_analytics
+                WHERE model = $1
+                  AND completion_tokens IS NOT NULL
+                  AND status_code = 200
+                ORDER BY timestamp DESC
+                LIMIT 100
+            ) recent_responses
+            "#,
+        )
+        .bind(&deployment.alias)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(|e| Error::Database(e.into()))?
+        .flatten();
+
+        model_info.insert(
+            deployment.alias.clone(),
+            (deployment.clone(), avg_output_tokens, deployment.model_type.clone()),
+        );
+    }
+
+    let mut tariffs_repo = Tariffs::new(&mut conn);
+    let current_time = Utc::now();
+
+    let mut result = HashMap::new();
+
+    // Process each file
+    for file_id in file_ids {
+        // Get aggregated template statistics for this file
+        let template_stats = match state
+            .request_manager
+            .get_file_template_stats(fusillade::FileId(*file_id))
+            .await
+        {
+            Ok(stats) => stats,
+            Err(_) => continue, // Skip files that can't be processed
+        };
+
+        // Convert to the format needed for cost calculation
+        let mut model_stats: HashMap<String, (i64, i64)> = HashMap::new(); // (request_count, input_tokens)
+
+        for stat in template_stats {
+            // Estimate input tokens: body size in bytes / 4
+            let estimated_input_tokens = stat.total_body_bytes / 4;
+            model_stats.insert(stat.model, (stat.request_count, estimated_input_tokens));
+        }
+
+        let mut total_cost = Decimal::ZERO;
+        let mut total_requests: i64 = 0;
+        let mut total_input_tokens: i64 = 0;
+        let mut total_output_tokens: i64 = 0;
+
+        for (model_alias, (request_count, input_tokens)) in model_stats {
+            total_requests += request_count;
+            total_input_tokens += input_tokens;
+
+            // Look up the deployment and historical average
+            let (deployment_opt, avg_output_tokens, model_type) = model_info
+                .get(&model_alias)
+                .map(|(d, avg, mt)| (Some(d.clone()), *avg, mt.clone()))
+                .unwrap_or((None, None, None));
+
+            // Calculate estimated output tokens using historical average or fallback heuristics
+            let estimated_output_tokens = if matches!(model_type, Some(crate::db::models::deployments::ModelType::Embeddings)) {
+                // Embedding models have minimal output
+                request_count
+            } else if let Some(avg) = avg_output_tokens {
+                // Use historical average multiplied by request count
+                avg * request_count
+            } else {
+                // Fallback: estimate 10% larger than input
+                ((input_tokens as f64) * 1.1) as i64
+            };
+
+            total_output_tokens += estimated_output_tokens;
+
+            if let Some(deployment) = deployment_opt {
+                // Look up tariff pricing for Batch API key purpose, with fallback to realtime
+                let pricing_result = tariffs_repo
+                    .get_pricing_at_timestamp_with_fallback(
+                        deployment.id,
+                        Some(&ApiKeyPurpose::Batch),
+                        &ApiKeyPurpose::Realtime,
+                        current_time,
+                        Some(completion_window),
+                    )
+                    .await
+                    .map_err(Error::Database)?;
+
+                if let Some((input_price, output_price)) = pricing_result {
+                    let input_cost = Decimal::from(input_tokens) * input_price;
+                    let output_cost = Decimal::from(estimated_output_tokens) * output_price;
+                    total_cost += input_cost + output_cost;
+                }
+            }
+        }
+
+        result.insert(
+            *file_id,
+            FileCostEstimateSummary {
+                total_requests,
+                total_estimated_input_tokens: total_input_tokens,
+                total_estimated_output_tokens: total_output_tokens,
+                total_estimated_cost: total_cost.to_string(),
+            },
+        );
+    }
+
+    Ok(result)
 }
 
 #[utoipa::path(
@@ -674,6 +829,26 @@ pub async fn list_files<P: PoolProvider>(
     let first_id = files.first().map(|f| f.id.0.to_string());
     let last_id = files.last().map(|f| f.id.0.to_string());
 
+    // Check if cost estimates are requested
+    let include_cost_estimate = query
+        .include
+        .as_ref()
+        .is_some_and(|inc| inc.split(',').any(|s| s.trim() == "cost_estimate"));
+
+    // Compute cost estimates if requested (only for batch purpose files)
+    let cost_estimates = if include_cost_estimate {
+        let batch_file_ids: Vec<Uuid> = files
+            .iter()
+            .filter(|f| matches!(f.purpose, Some(fusillade::batch::Purpose::Batch)))
+            .map(|f| f.id.0)
+            .collect();
+
+        let completion_window = query.completion_window.as_deref().unwrap_or("24h");
+        compute_bulk_cost_estimates(&state, &batch_file_ids, completion_window).await?
+    } else {
+        HashMap::new()
+    };
+
     let data: Vec<FileResponse> = files
         .iter()
         .map(|f| {
@@ -693,6 +868,7 @@ pub async fn list_files<P: PoolProvider>(
                 filename: f.name.clone(),
                 purpose: api_purpose,
                 expires_at: f.expires_at.map(|dt| dt.timestamp()),
+                cost_estimate: cost_estimates.get(&f.id.0).cloned(),
             }
         })
         .collect();
@@ -769,6 +945,7 @@ pub async fn get_file<P: PoolProvider>(
         filename: file.name,
         purpose: api_purpose,
         expires_at: file.expires_at.map(|dt| dt.timestamp()),
+        cost_estimate: None,
     }))
 }
 

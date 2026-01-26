@@ -23,6 +23,14 @@ pub struct ListFilesQuery {
 
     /// Search query to filter files by filename (case-insensitive substring match)
     pub search: Option<String>,
+
+    /// Comma-separated list of related resources to include. Supported: "cost_estimate"
+    #[param(example = "cost_estimate")]
+    pub include: Option<String>,
+
+    /// Completion window (SLA) for cost estimates (e.g., "24h", "1h"). Only used when include=cost_estimate.
+    #[param(example = "24h")]
+    pub completion_window: Option<String>,
 }
 
 fn default_order() -> String {
@@ -73,6 +81,29 @@ pub struct FileResponse {
     pub purpose: Purpose,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<i64>, // Unix timestamp
+    /// Cost estimate for this file (only included when requested via include=cost_estimate)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost_estimate: Option<FileCostEstimateSummary>,
+}
+
+/// Summary cost estimate for a file (embedded in file response)
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[schema(example = json!({
+    "total_requests": 100,
+    "total_estimated_input_tokens": 50000,
+    "total_estimated_output_tokens": 25000,
+    "total_estimated_cost": "0.75"
+}))]
+pub struct FileCostEstimateSummary {
+    #[schema(example = 100)]
+    pub total_requests: i64,
+    #[schema(example = 50000)]
+    pub total_estimated_input_tokens: i64,
+    #[schema(example = 25000)]
+    pub total_estimated_output_tokens: i64,
+    /// Total cost as string to preserve decimal precision
+    #[schema(example = "0.75")]
+    pub total_estimated_cost: String,
 }
 
 /// Object type - always "file"

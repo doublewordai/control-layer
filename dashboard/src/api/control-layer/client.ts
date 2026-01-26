@@ -1180,6 +1180,9 @@ const filesApi = {
     if (options?.order) params.set("order", options.order);
     if (options?.purpose) params.set("purpose", options.purpose);
     if (options?.search) params.set("search", options.search);
+    if (options?.include) params.set("include", options.include);
+    if (options?.completion_window)
+      params.set("completion_window", options.completion_window);
 
     const response = await fetchAiApi(
       `/ai/v1/files${params.toString() ? "?" + params.toString() : ""}`,
