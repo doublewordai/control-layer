@@ -97,9 +97,11 @@ fn to_batch_response_with_email(batch: fusillade::Batch, creator_email: Option<&
     let failed_at = batch.failed_at.map(|dt| dt.timestamp());
     let cancelled_at = batch.cancelled_at.map(|dt| dt.timestamp());
 
-    // Only show errors if batch has terminally failed AND SLA has expired
-    // This prevents showing errors to users while escalation might still recover failures
-    let errors = if batch.failed_at.is_some() && chrono::Utc::now() > batch.expires_at {
+    // Only show failure indicators if batch has terminally failed AND SLA has expired
+    // This prevents showing any failure information while escalation might still recover
+    let show_failures = batch.failed_at.is_some() && chrono::Utc::now() > batch.expires_at;
+
+    let errors = if show_failures {
         // Terminal failure past SLA - show errors to user
         batch.errors.and_then(|e| serde_json::from_value::<BatchErrors>(e).ok())
     } else {
@@ -126,20 +128,27 @@ fn to_batch_response_with_email(batch: fusillade::Batch, creator_email: Option<&
         completion_window: batch.completion_window.clone(),
         status: openai_status.to_string(),
         output_file_id: batch.output_file_id.map(|id| id.0.to_string()),
-        error_file_id: batch.error_file_id.map(|id| id.0.to_string()),
+        // Hide error_file_id until terminal failure past SLA
+        error_file_id: if show_failures {
+            batch.error_file_id.map(|id| id.0.to_string())
+        } else {
+            None
+        },
         created_at: batch.created_at.timestamp(),
         in_progress_at,
         expires_at: Some(batch.expires_at.timestamp()),
         finalizing_at,
         completed_at,
-        failed_at,
+        // Hide failed_at timestamp until terminal failure past SLA
+        failed_at: if show_failures { failed_at } else { None },
         expired_at,
         cancelling_at: batch.cancelling_at.map(|dt| dt.timestamp()),
         cancelled_at,
+        // Hide failed count until terminal failure past SLA
         request_counts: RequestCounts {
             total: batch.total_requests,
             completed: batch.completed_requests,
-            failed: batch.failed_requests,
+            failed: if show_failures { batch.failed_requests } else { 0 },
         },
         metadata,
         analytics: None,
@@ -1480,6 +1489,19 @@ mod tests {
             batch_response["errors"].is_null(),
             "Errors should be hidden when batch is within SLA (no failed_at set)"
         );
+        assert!(
+            batch_response["error_file_id"].is_null(),
+            "Error file ID should be hidden when batch is within SLA"
+        );
+        assert!(
+            batch_response["failed_at"].is_null(),
+            "failed_at should be hidden when batch is within SLA"
+        );
+        assert_eq!(
+            batch_response["request_counts"]["failed"].as_i64().unwrap(),
+            0,
+            "Failed request count should be hidden (shown as 0) when within SLA"
+        );
 
         // Scenario 2: Set failed_at but still within SLA - errors should STILL be hidden
         sqlx::query(
@@ -1506,6 +1528,19 @@ mod tests {
         assert!(
             batch_response2["errors"].is_null(),
             "Errors should be hidden when failed_at is set but SLA has not expired"
+        );
+        assert!(
+            batch_response2["error_file_id"].is_null(),
+            "Error file ID should be hidden even with failed_at set, until SLA expires"
+        );
+        assert!(
+            batch_response2["failed_at"].is_null(),
+            "failed_at should be hidden until SLA expires"
+        );
+        assert_eq!(
+            batch_response2["request_counts"]["failed"].as_i64().unwrap(),
+            0,
+            "Failed request count should still be hidden even with failed_at set"
         );
 
         // Scenario 3: Expire the SLA AND have failed_at - NOW errors should be visible
@@ -1539,5 +1574,16 @@ mod tests {
             "Test error",
             "Error message should match what we set"
         );
+        assert!(
+            !batch_response3["error_file_id"].is_null(),
+            "Error file ID should now be visible after SLA expires"
+        );
+        assert!(
+            !batch_response3["failed_at"].is_null(),
+            "failed_at should now be visible after SLA expires"
+        );
+        // Note: We can't easily verify the exact failed count since we didn't actually
+        // create failed requests in the DB (just set the errors field). But we verified
+        // it was hidden before, so the logic is working.
     }
 }
