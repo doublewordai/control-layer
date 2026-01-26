@@ -679,26 +679,6 @@ dependencies = [
 
 [[package]]
 name = "axum-prometheus"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "42e1a6651f119707ec6c416f38fdb5be223707627fe6d47f912850634c106215"
-dependencies = [
- "axum 0.8.8",
- "bytes",
- "futures-core",
- "http",
- "http-body",
- "matchit 0.8.4",
- "metrics",
- "metrics-exporter-prometheus 0.16.2",
- "pin-project",
- "tokio",
- "tower 0.5.2",
- "tower-http",
-]
-
-[[package]]
-name = "axum-prometheus"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dd44522c72edf6a45dfdd73ea201937bdaa8610cdf473151f694900837ab3879"
@@ -710,7 +690,7 @@ dependencies = [
  "http-body",
  "matchit 0.8.4",
  "metrics",
- "metrics-exporter-prometheus 0.18.1",
+ "metrics-exporter-prometheus",
  "pin-project-lite",
  "tokio",
  "tower 0.5.2",
@@ -1555,7 +1535,7 @@ dependencies = [
  "async-stripe-webhook",
  "async-trait",
  "axum 0.8.8",
- "axum-prometheus 0.10.0",
+ "axum-prometheus",
  "axum-test",
  "base64",
  "bon",
@@ -1573,7 +1553,7 @@ dependencies = [
  "jsonwebtoken",
  "lettre",
  "metrics",
- "metrics-exporter-prometheus 0.18.1",
+ "metrics-exporter-prometheus",
  "mime_guess",
  "moka",
  "once_cell",
@@ -2920,20 +2900,6 @@ dependencies = [
 
 [[package]]
 name = "metrics-exporter-prometheus"
-version = "0.16.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dd7399781913e5393588a8d8c6a2867bf85fb38eaf2502fdce465aad2dc6f034"
-dependencies = [
- "base64",
- "indexmap 2.12.1",
- "metrics",
- "metrics-util 0.19.1",
- "quanta",
- "thiserror 1.0.69",
-]
-
-[[package]]
-name = "metrics-exporter-prometheus"
 version = "0.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3589659543c04c7dc5526ec858591015b87cd8746583b51b48ef4353f99dbcda"
@@ -2946,28 +2912,12 @@ dependencies = [
  "indexmap 2.12.1",
  "ipnet",
  "metrics",
- "metrics-util 0.20.1",
+ "metrics-util",
  "quanta",
  "rustls",
  "thiserror 2.0.17",
  "tokio",
  "tracing",
-]
-
-[[package]]
-name = "metrics-util"
-version = "0.19.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b8496cc523d1f94c1385dd8f0f0c2c480b2b8aeccb5b7e4485ad6365523ae376"
-dependencies = [
- "crossbeam-epoch",
- "crossbeam-utils",
- "hashbrown 0.15.5",
- "metrics",
- "quanta",
- "rand 0.9.2",
- "rand_xoshiro",
- "sketches-ddsketch",
 ]
 
 [[package]]
@@ -3312,15 +3262,16 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "onwards"
-version = "0.11.0"
+version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4c5d9f8cca56b834542842a11b19ceb9c7a118168e739f6af22fba364b8b19dc"
+checksum = "1eb2477a73bdbb61df18331d6fcd22275ce0fcce136988b61cf7ac117f1ecc24"
 dependencies = [
  "anyhow",
  "async-trait",
  "axum 0.8.8",
- "axum-prometheus 0.8.0",
+ "axum-prometheus",
  "bon",
+ "bytes",
  "clap",
  "dashmap",
  "futures-util",

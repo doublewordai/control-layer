@@ -121,10 +121,12 @@ export function Batches({
   // Pagination hooks with prefixed URL params for multi-table support
   const filesPagination = useServerCursorPagination({
     paramPrefix: "files",
+    defaultPageSize: 10,
   });
 
   const batchesPagination = useServerCursorPagination({
     paramPrefix: "batches",
+    defaultPageSize: 10,
   });
 
   // API queries
@@ -421,10 +423,12 @@ export function Batches({
           {/* Left: Title */}
           <div className="shrink-0">
             <h1 className="text-3xl font-bold text-doubleword-neutral-900">
-              Batch Processing
+              {activeTab === "batches" ? "Batch Requests" : "Batch Files"}
             </h1>
             <p className="text-doubleword-neutral-600 mt-1">
-              Upload files and create batches to process requests at scale
+              {activeTab === "batches"
+                ? "Create and manage batch requests"
+                : "Upload and manage files for batch processing"}
             </p>
           </div>
 

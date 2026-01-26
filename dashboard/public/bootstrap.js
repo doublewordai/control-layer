@@ -1,14 +1,17 @@
 // insert custom scripts for analytics etc here
 console.log("Bootstrap setup completed.");
 
-// Monochrome colors matching the dashboard table styling
+// DoubleWord brand colors from the dashboard theme
 const colors = {
-  accent: "#2e2c26",
-  accentBorder: "rgba(46, 44, 38, 0.2)",
+  primary: "#2563eb",
+  primaryLight: "rgba(37, 99, 235, 0.1)",
+  primaryLighter: "rgba(37, 99, 235, 0.05)",
+  primaryBorder: "rgba(37, 99, 235, 0.3)",
+  primaryBorderLight: "rgba(37, 99, 235, 0.2)",
+  background: "#ffffff",
   backgroundSecondary: "#fafaf9",
   foreground: "#2e2c26",
-  muted: "#726e5b",
-  mutedLight: "#938f78",
+  muted: "#938f78",
   border: "#e2e0d3",
 };
 
@@ -16,53 +19,108 @@ var bootstrapContent = `
   <style>
     .dw-bootstrap-banner {
       position: relative;
+      border-radius: 0.75rem;
+      border: 1px solid ${colors.primaryBorder};
+      background: ${colors.background};
+      padding: 1.5rem;
       overflow: hidden;
       font-family: 'Space Grotesk', ui-sans-serif, system-ui, sans-serif;
     }
     .dw-bootstrap-banner * {
       box-sizing: border-box;
     }
+    .dw-glow-top {
+      position: absolute;
+      top: 0;
+      right: 0;
+      width: 16rem;
+      height: 16rem;
+      background: ${colors.primaryLighter};
+      border-radius: 9999px;
+      filter: blur(48px);
+      transform: translate(50%, -50%);
+      pointer-events: none;
+    }
+    .dw-glow-bottom {
+      position: absolute;
+      bottom: 0;
+      left: 0;
+      width: 12rem;
+      height: 12rem;
+      background: ${colors.primaryLight};
+      border-radius: 9999px;
+      filter: blur(32px);
+      transform: translate(-25%, 50%);
+      pointer-events: none;
+    }
     .dw-content {
       position: relative;
       display: flex;
       flex-direction: column;
-      align-items: flex-start;
-      gap: 0.75rem;
+      gap: 1rem;
+    }
+    .dw-heading {
+      font-size: 1.25rem;
+      font-weight: 600;
+      color: ${colors.foreground};
+      margin: 0 0 0.5rem 0;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+    .dw-pulse-dot {
+      display: inline-block;
+      width: 0.5rem;
+      height: 0.5rem;
+      border-radius: 9999px;
+      background: ${colors.primary};
+      animation: dwPulse 2s ease-in-out infinite;
+    }
+    @keyframes dwPulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.3; }
+    }
+    .dw-description {
+      color: ${colors.muted};
+      font-size: 0.875rem;
+      margin: 0;
+      line-height: 1.5;
+    }
+    .dw-highlight {
+      color: ${colors.primary};
+      font-weight: 500;
     }
     .dw-badges {
       display: flex;
       flex-wrap: wrap;
-      gap: 0.5rem;
+      gap: 0.75rem;
     }
     .dw-badge {
       display: flex;
       align-items: center;
       gap: 0.5rem;
       border-radius: 9999px;
-      background: ${colors.backgroundSecondary};
-      border: 1px solid ${colors.border};
+      background: rgba(255, 255, 255, 0.8);
+      backdrop-filter: blur(4px);
+      border: 1px solid ${colors.primaryBorderLight};
       padding: 0.375rem 0.75rem;
-      font-size: 0.8125rem;
-      color: ${colors.muted};
-      transition: all 0.2s;
+      font-size: 0.875rem;
+      box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
+      transition: border-color 0.2s;
     }
     .dw-badge:hover {
-      border-color: ${colors.accentBorder};
-      color: ${colors.foreground};
+      border-color: rgba(37, 99, 235, 0.4);
     }
     .dw-badge svg {
-      width: 0.875rem;
-      height: 0.875rem;
-      color: ${colors.mutedLight};
-    }
-    .dw-badge:hover svg {
-      color: ${colors.foreground};
+      width: 1rem;
+      height: 1rem;
+      color: ${colors.primary};
     }
     .dw-cards {
       display: grid;
       grid-template-columns: repeat(1, 1fr);
       gap: 0.75rem;
-      width: 100%;
+      margin-top: 0.5rem;
     }
     @media (min-width: 768px) {
       .dw-cards {
@@ -74,16 +132,18 @@ var bootstrapContent = `
       display: flex;
       flex-direction: column;
       gap: 0.5rem;
-      border-radius: 0.375rem;
+      border-radius: 0.5rem;
       border: 1px solid ${colors.border};
-      background: transparent;
+      background: rgba(255, 255, 255, 0.7);
+      backdrop-filter: blur(4px);
       padding: 1rem;
       text-decoration: none;
-      transition: all 0.2s;
+      transition: all 0.3s;
     }
     .dw-card:hover {
-      border-color: ${colors.accentBorder};
-      background: ${colors.backgroundSecondary};
+      border-color: rgba(37, 99, 235, 0.5);
+      background: rgba(255, 255, 255, 0.9);
+      transform: translateY(-2px);
     }
     .dw-card-header {
       display: flex;
@@ -91,17 +151,17 @@ var bootstrapContent = `
       justify-content: space-between;
     }
     .dw-card-header svg {
-      width: 1.125rem;
-      height: 1.125rem;
-      color: ${colors.mutedLight};
-      transition: color 0.2s;
+      width: 1.25rem;
+      height: 1.25rem;
+      color: ${colors.primary};
+      transition: transform 0.3s;
     }
     .dw-card:hover .dw-card-header svg {
-      color: ${colors.foreground};
+      transform: scale(1.1);
     }
     .dw-card-arrow {
       font-size: 0.75rem;
-      color: ${colors.mutedLight};
+      color: ${colors.muted};
       opacity: 0;
       transition: opacity 0.2s;
     }
@@ -115,14 +175,35 @@ var bootstrapContent = `
       margin: 0;
       transition: color 0.2s;
     }
+    .dw-card:hover .dw-card-title {
+      color: ${colors.primary};
+    }
     .dw-card-desc {
       font-size: 0.75rem;
-      color: ${colors.mutedLight};
+      color: ${colors.muted};
       margin: 0.125rem 0 0 0;
+    }
+    .dw-card-overlay {
+      position: absolute;
+      inset: 0;
+      border-radius: 0.5rem;
+      background: linear-gradient(to bottom right, ${colors.primaryLighter}, transparent);
+      opacity: 0;
+      transition: opacity 0.3s;
+      pointer-events: none;
+    }
+    .dw-card:hover .dw-card-overlay {
+      opacity: 1;
     }
   </style>
   <div class="dw-bootstrap-banner">
+    <div class="dw-glow-top"></div>
+    <div class="dw-glow-bottom"></div>
     <div class="dw-content">
+      <div>
+        <h2 class="dw-heading"><span class="dw-pulse-dot"></span>Async inference for workloads at scale</h2>
+        <p class="dw-description">Run batch inference at up to <span class="dw-highlight">10x lower cost</span> than real-time APIs. Perfect for data processing, content generation, model evals, and any task that doesn't need an immediate response.</p>
+      </div>
       <div class="dw-badges">
         <div class="dw-badge">
           <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -160,6 +241,7 @@ var bootstrapContent = `
             <h3 class="dw-card-title">Getting Started</h3>
             <p class="dw-card-desc">Learn how to run your first batch job</p>
           </div>
+          <div class="dw-card-overlay"></div>
         </a>
         <a href="https://github.com/doublewordai/autobatcher" target="_blank" rel="noopener noreferrer" class="dw-card">
           <div class="dw-card-header">
@@ -172,6 +254,7 @@ var bootstrapContent = `
             <h3 class="dw-card-title">Coming from Real-Time?</h3>
             <p class="dw-card-desc">Use Autobatcher to migrate existing API calls</p>
           </div>
+          <div class="dw-card-overlay"></div>
         </a>
         <a href="https://github.com/doublewordai/Unsplash-Image-Summarizer-Demo" target="_blank" rel="noopener noreferrer" class="dw-card">
           <div class="dw-card-header">
@@ -186,6 +269,7 @@ var bootstrapContent = `
             <h3 class="dw-card-title">Large Scale Image Processing</h3>
             <p class="dw-card-desc">See batch inference in action</p>
           </div>
+          <div class="dw-card-overlay"></div>
         </a>
       </div>
     </div>
