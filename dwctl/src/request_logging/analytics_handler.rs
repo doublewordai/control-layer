@@ -141,14 +141,10 @@ impl RequestHandler for AnalyticsHandler {
             let batch_request_source =
                 extract_header_as_string(&request_data, "x-fusillade-batch-request-source").unwrap_or_default();
 
-            // Determine request origin based on fusillade headers
-            let request_origin = if fusillade_batch_id.is_some() {
-                "fusillade".to_string()
-            } else {
-                // Check if bearer token looks like a batch API key (heuristic: check headers)
-                // For now, default to "api" for non-batch requests
-                "api".to_string()
-            };
+            // Extract batch creation timestamp for pricing lookup
+            // This ensures batch requests are priced as of batch creation, not processing time
+            let batch_created_at = extract_header_as_string(&request_data, "x-fusillade-batch-created-at")
+                .and_then(|s| s.parse::<chrono::DateTime<chrono::Utc>>().ok());
 
             // Extract bearer token from auth
             let bearer_token = match &auth {
@@ -157,6 +153,7 @@ impl RequestHandler for AnalyticsHandler {
             };
 
             // Build the raw record (no DB enrichment)
+            // Note: request_origin is computed in the batcher after api_key_purpose is resolved
             let record = RawAnalyticsRecord {
                 instance_id: metrics.instance_id,
                 correlation_id: metrics.correlation_id,
@@ -179,7 +176,7 @@ impl RequestHandler for AnalyticsHandler {
                 fusillade_request_id,
                 custom_id,
                 batch_completion_window,
-                request_origin,
+                batch_created_at,
                 batch_request_source,
             };
 

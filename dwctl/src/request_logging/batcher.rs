@@ -85,8 +85,9 @@ pub struct RawAnalyticsRecord {
     pub custom_id: Option<String>,
     /// The completion window SLA (e.g., "24h") - used for batch pricing lookup
     pub batch_completion_window: Option<String>,
-    /// Request origin: "api", "frontend", or "fusillade"
-    pub request_origin: String,
+    /// The batch creation timestamp (from x-fusillade-batch-created-at header)
+    /// Used to look up tariff pricing as of batch creation time, not processing time
+    pub batch_created_at: Option<DateTime<Utc>>,
     /// The request_source from batch metadata
     pub batch_request_source: String,
 }
@@ -341,12 +342,16 @@ where
 
             let (model_id, provider_name, input_price, output_price) = if let Some(ref model_alias) = raw.request_model {
                 if let Some(model_info) = model_map.get(model_alias) {
+                    // Use batch_created_at for pricing if available (for batch requests)
+                    // This ensures batch requests are priced as of batch creation, not processing time
+                    let pricing_timestamp = raw.batch_created_at.unwrap_or(raw.timestamp);
+
                     // Find best matching tariff
                     let (input, output) = self.find_best_tariff(
                         &model_info.tariffs,
                         api_key_purpose.as_ref(),
                         raw.batch_completion_window.as_deref(),
-                        raw.timestamp,
+                        pricing_timestamp,
                     );
                     (Some(model_info.model_id), Some(model_info.provider_name.clone()), input, output)
                 } else {
@@ -590,7 +595,20 @@ where
             fusillade_batch_ids.push(record.raw.fusillade_batch_id);
             fusillade_request_ids.push(record.raw.fusillade_request_id);
             custom_ids.push(record.raw.custom_id.clone());
-            request_origins.push(record.raw.request_origin.clone());
+
+            // Compute request_origin from enriched api_key_purpose and fusillade metadata
+            let request_origin = match (&record.api_key_purpose, &record.raw.fusillade_batch_id) {
+                // Any record with fusillade_batch_id is "fusillade"
+                (_, Some(_)) => "fusillade",
+                // Batch API keys without fusillade_batch_id are still "fusillade"
+                (Some(ApiKeyPurpose::Batch), None) => "fusillade",
+                // Playground keys are "frontend"
+                (Some(ApiKeyPurpose::Playground), _) => "frontend",
+                // Everything else is "api"
+                _ => "api",
+            };
+            request_origins.push(request_origin.to_string());
+
             batch_slas.push(record.raw.batch_completion_window.clone().unwrap_or_default());
             batch_request_sources.push(record.raw.batch_request_source.clone());
         }
@@ -759,8 +777,11 @@ where
         let inserted_count = result.rows_affected();
         let duplicates = expected_count.saturating_sub(inserted_count);
 
-        // Record metrics for deducted credits
-        for (i, amount) in amounts.iter().enumerate() {
+        // Record metrics only for successfully inserted credit transactions
+        // We can't know exactly which ones were inserted vs skipped due to ON CONFLICT,
+        // so we record metrics for the first N transactions where N = inserted_count.
+        // This is imperfect but avoids over-counting duplicates.
+        for (i, amount) in amounts.iter().take(inserted_count as usize).enumerate() {
             let cents = (amount.to_f64().unwrap_or(0.0) * 100.0).round() as u64;
             counter!(
                 "dwctl_credits_deducted_total",
@@ -805,7 +826,14 @@ where
             fusillade_batch_id: record.raw.fusillade_batch_id,
             fusillade_request_id: record.raw.fusillade_request_id,
             custom_id: record.raw.custom_id.clone(),
-            request_origin: record.raw.request_origin.clone(),
+            // Compute request_origin from enriched api_key_purpose
+            request_origin: match (&record.api_key_purpose, &record.raw.fusillade_batch_id) {
+                (_, Some(_)) => "fusillade",
+                (Some(ApiKeyPurpose::Batch), None) => "fusillade",
+                (Some(ApiKeyPurpose::Playground), _) => "frontend",
+                _ => "api",
+            }
+            .to_string(),
             batch_sla: record.raw.batch_completion_window.clone().unwrap_or_default(),
             batch_request_source: record.raw.batch_request_source.clone(),
         }
@@ -868,7 +896,7 @@ mod tests {
             fusillade_request_id: None,
             custom_id: None,
             batch_completion_window: None,
-            request_origin: "api".to_string(),
+            batch_created_at: None,
             batch_request_source: "".to_string(),
         };
 
