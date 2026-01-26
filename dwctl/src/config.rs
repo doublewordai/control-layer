@@ -151,6 +151,9 @@ pub struct Config {
     ///
     /// When disabled, no analytics, billing, or GenAI metrics are recorded.
     pub enable_analytics: bool,
+    /// Analytics batching configuration
+    #[serde(default)]
+    pub analytics: AnalyticsConfig,
     /// Enable OpenTelemetry OTLP export for distributed tracing
     pub enable_otel_export: bool,
     /// Credit system configuration
@@ -1155,6 +1158,29 @@ impl Default for CreditsConfig {
     }
 }
 
+/// Analytics batching configuration.
+///
+/// The batcher uses a write-through strategy:
+/// 1. Block until at least one record arrives
+/// 2. Drain all available records (up to batch_size)
+/// 3. Write immediately
+///
+/// This minimizes latency at low load while getting batching efficiency at high load.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AnalyticsConfig {
+    /// Maximum number of records to write in a single batch.
+    /// At high load, records queue while writing, naturally forming larger batches.
+    /// Default: 100
+    pub batch_size: usize,
+}
+
+impl Default for AnalyticsConfig {
+    fn default() -> Self {
+        Self { batch_size: 100 }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -1175,6 +1201,7 @@ impl Default for Config {
             enable_metrics: true,
             enable_request_logging: true,
             enable_analytics: true,
+            analytics: AnalyticsConfig::default(),
             enable_otel_export: false,
             credits: CreditsConfig::default(),
             sample_files: SampleFilesConfig::default(),

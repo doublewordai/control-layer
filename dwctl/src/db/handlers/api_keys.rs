@@ -1856,6 +1856,7 @@ mod tests {
             enable_metrics: false,
             enable_request_logging: false,
             enable_analytics: true,
+            analytics: Default::default(),
             enable_otel_export: false,
             credits: Default::default(),
             batches: Default::default(),

@@ -867,6 +867,7 @@ fn create_cors_layer(config: &Config) -> anyhow::Result<CorsLayer> {
 ///
 /// - `state`: Mutable application state (metrics recorder may be initialized here)
 /// - `onwards_router`: Pre-configured router for AI request proxying
+/// - `shutdown_token`: Cancellation token for graceful shutdown of spawned tasks
 ///
 /// # Returns
 ///
@@ -876,7 +877,11 @@ fn create_cors_layer(config: &Config) -> anyhow::Result<CorsLayer> {
 ///
 /// Returns an error if CORS configuration is invalid or metrics initialization fails.
 #[instrument(skip_all)]
-pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyhow::Result<Router> {
+pub async fn build_router(
+    state: &mut AppState,
+    onwards_router: Router,
+    shutdown_token: tokio_util::sync::CancellationToken,
+) -> anyhow::Result<Router> {
     // Setup request logging and/or analytics based on config flags
     //
     // These can be enabled independently:
@@ -913,11 +918,24 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
 
         // Add AnalyticsHandler for analytics/billing if enabled
         if analytics_enabled {
-            let analytics_handler = request_logging::AnalyticsHandler::new(
+            // Create the analytics batcher and spawn it as a background task
+            let (batcher, sender) = request_logging::AnalyticsBatcher::new(
                 state.db.write().clone(),
-                uuid::Uuid::new_v4(),
                 state.config.clone(),
                 state.metrics_recorder.clone(),
+            );
+
+            // Spawn the batcher background task with the shutdown token
+            let batcher_shutdown = shutdown_token.clone();
+            tokio::spawn(async move {
+                batcher.run(batcher_shutdown).await;
+            });
+
+            // Create handler that sends records to the batcher
+            let analytics_handler = request_logging::AnalyticsHandler::new(
+                sender,
+                uuid::Uuid::new_v4(),
+                state.config.clone(),
             );
             multi_handler = multi_handler.with(analytics_handler);
         }
@@ -1752,7 +1770,7 @@ impl Application {
             .maybe_outlet_db(outlet_pools.clone())
             .build();
 
-        let router = build_router(&mut app_state, onwards_router).await?;
+        let router = build_router(&mut app_state, onwards_router, shutdown_token).await?;
 
         Ok(Self {
             router,
