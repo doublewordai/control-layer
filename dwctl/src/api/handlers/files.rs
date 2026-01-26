@@ -8,8 +8,8 @@
 use sqlx_pool_router::PoolProvider;
 
 use crate::api::models::files::{
-    FileContentQuery, FileCostEstimate, FileCostEstimateQuery, FileCostEstimateSummary, FileDeleteResponse, FileListResponse,
-    FileResponse, ListFilesQuery, ListObject, ObjectType, Purpose,
+    FileContentQuery, FileCostEstimate, FileCostEstimateQuery, FileCostEstimateSummary, FileDeleteResponse, FileListResponse, FileResponse,
+    ListFilesQuery, ListObject, ObjectType, Purpose,
 };
 use crate::auth::permissions::{RequiresPermission, can_read_all_resources, operation, resource};
 
@@ -29,7 +29,6 @@ use axum::{
     extract::{Multipart, Path, Query, State},
     http::StatusCode,
 };
-use chrono::Utc;
 use fusillade::Storage;
 use futures::StreamExt;
 use futures::stream::Stream;
@@ -605,7 +604,173 @@ pub async fn upload_file<P: PoolProvider>(
     ))
 }
 
+use rust_decimal::Decimal;
 use std::collections::HashMap;
+
+/// Allowed completion windows for cost estimates
+const ALLOWED_COMPLETION_WINDOWS: &[&str] = &["24h", "1h"];
+
+/// Validate the completion_window parameter
+fn validate_completion_window(completion_window: &str) -> Result<()> {
+    if !ALLOWED_COMPLETION_WINDOWS.contains(&completion_window) {
+        return Err(Error::BadRequest {
+            message: format!(
+                "Invalid completion_window '{}'. Allowed values are: {}",
+                completion_window,
+                ALLOWED_COMPLETION_WINDOWS.join(", ")
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Pre-fetched context for computing cost estimates.
+/// This is shared between bulk and single-file cost estimate functions.
+struct CostEstimateContext {
+    /// Map of model alias -> (deployment_id, model_type)
+    model_info: HashMap<String, (crate::types::DeploymentId, Option<crate::db::models::deployments::ModelType>)>,
+    /// Map of model alias -> average output tokens (from http_analytics)
+    avg_output_tokens: HashMap<String, i64>,
+    /// Map of deployment_id -> (input_price, output_price)
+    pricing: HashMap<crate::types::DeploymentId, (Decimal, Decimal)>,
+}
+
+/// Build the cost estimate context by pre-fetching all deployment info, analytics, and pricing.
+///
+/// This function performs 3 SQL queries regardless of the number of deployments:
+/// 1. List all active deployments
+/// 2. Get avg output tokens for all models in one query
+/// 3. Get pricing for all deployments in one query
+async fn build_cost_estimate_context<P: PoolProvider>(state: &AppState<P>, completion_window: &str) -> Result<CostEstimateContext> {
+    let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+    let mut deployments_repo = Deployments::new(&mut conn);
+
+    let filter = DeploymentFilter::new(0, 1000)
+        .with_statuses(vec![ModelStatus::Active])
+        .with_deleted(false);
+    let all_deployments = deployments_repo.list(&filter).await.map_err(Error::Database)?;
+
+    // Build model info lookup
+    let mut model_info = HashMap::new();
+    let deployment_ids: Vec<crate::types::DeploymentId> = all_deployments.iter().map(|d| d.id).collect();
+    let model_aliases: Vec<String> = all_deployments.iter().map(|d| d.alias.clone()).collect();
+
+    for deployment in &all_deployments {
+        model_info.insert(deployment.alias.clone(), (deployment.id, deployment.model_type.clone()));
+    }
+
+    // Bulk query for avg output tokens - single query for all models
+    let avg_output_tokens: HashMap<String, i64> = if model_aliases.is_empty() {
+        HashMap::new()
+    } else {
+        let records = sqlx::query!(
+            r#"
+            WITH model_stats AS (
+                SELECT
+                    model,
+                    completion_tokens,
+                    ROW_NUMBER() OVER (PARTITION BY model ORDER BY timestamp DESC) as rn
+                FROM http_analytics
+                WHERE model = ANY($1)
+                  AND completion_tokens IS NOT NULL
+                  AND status_code = 200
+            )
+            SELECT model, AVG(completion_tokens)::BIGINT as avg_tokens
+            FROM model_stats
+            WHERE rn <= 100
+            GROUP BY model
+            "#,
+            &model_aliases
+        )
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|e| Error::Database(e.into()))?;
+
+        records
+            .into_iter()
+            .filter_map(|r| match (r.model, r.avg_tokens) {
+                (Some(model), Some(avg)) => Some((model, avg)),
+                _ => None,
+            })
+            .collect()
+    };
+
+    // Bulk query for pricing - single query for all deployments
+    let mut tariffs_repo = Tariffs::new(&mut conn);
+    let pricing = tariffs_repo
+        .get_bulk_pricing_for_deployments(&deployment_ids, Some(completion_window))
+        .await
+        .map_err(Error::Database)?;
+
+    Ok(CostEstimateContext {
+        model_info,
+        avg_output_tokens,
+        pricing,
+    })
+}
+
+/// Calculate estimated output tokens based on model type and historical data
+fn estimate_output_tokens(
+    model_type: Option<&crate::db::models::deployments::ModelType>,
+    avg_output_tokens: Option<i64>,
+    request_count: i64,
+    input_tokens: i64,
+) -> i64 {
+    if matches!(model_type, Some(crate::db::models::deployments::ModelType::Embeddings)) {
+        // Embedding models have minimal output
+        request_count
+    } else if let Some(avg) = avg_output_tokens {
+        // Use historical average multiplied by request count
+        avg * request_count
+    } else {
+        // Fallback: estimate 10% larger than input
+        ((input_tokens as f64) * 1.1) as i64
+    }
+}
+
+/// Compute cost estimate for a single file's template stats using pre-fetched context
+fn compute_file_cost(template_stats: Vec<fusillade::ModelTemplateStats>, context: &CostEstimateContext) -> FileCostEstimateSummary {
+    let mut total_cost = Decimal::ZERO;
+    let mut total_requests: i64 = 0;
+    let mut total_input_tokens: i64 = 0;
+    let mut total_output_tokens: i64 = 0;
+
+    for stat in template_stats {
+        let request_count = stat.request_count;
+        // Estimate input tokens: body size in bytes / 4
+        let input_tokens = stat.total_body_bytes / 4;
+
+        total_requests += request_count;
+        total_input_tokens += input_tokens;
+
+        // Look up model info
+        let (deployment_id, model_type) = context
+            .model_info
+            .get(&stat.model)
+            .map(|(id, mt)| (Some(*id), mt.as_ref()))
+            .unwrap_or((None, None));
+
+        let avg = context.avg_output_tokens.get(&stat.model).copied();
+        let estimated_output_tokens = estimate_output_tokens(model_type, avg, request_count, input_tokens);
+        total_output_tokens += estimated_output_tokens;
+
+        // Calculate cost if we have deployment and pricing info
+        if let Some(id) = deployment_id
+            && let Some((input_price, output_price)) = context.pricing.get(&id)
+        {
+            let input_cost = Decimal::from(input_tokens) * input_price;
+            let output_cost = Decimal::from(estimated_output_tokens) * output_price;
+            total_cost += input_cost + output_cost;
+        }
+    }
+
+    FileCostEstimateSummary {
+        total_requests,
+        total_estimated_input_tokens: total_input_tokens,
+        total_estimated_output_tokens: total_output_tokens,
+        total_estimated_cost: total_cost.to_string(),
+    }
+}
 
 /// Compute cost estimates for multiple files efficiently.
 ///
@@ -616,144 +781,26 @@ async fn compute_bulk_cost_estimates<P: PoolProvider>(
     file_ids: &[Uuid],
     completion_window: &str,
 ) -> Result<HashMap<Uuid, FileCostEstimateSummary>> {
-    use rust_decimal::Decimal;
-
     if file_ids.is_empty() {
         return Ok(HashMap::new());
     }
 
-    // Fetch all deployments and their pricing information upfront (shared across all files)
-    let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
-    let mut deployments_repo = Deployments::new(&mut conn);
+    validate_completion_window(completion_window)?;
 
-    let filter = DeploymentFilter::new(0, 1000)
-        .with_statuses(vec![ModelStatus::Active])
-        .with_deleted(false);
-    let all_deployments = deployments_repo.list(&filter).await.map_err(Error::Database)?;
-
-    // Build a lookup map of model alias -> (deployment, avg_output_tokens, model_type)
-    let mut model_info: HashMap<
-        String,
-        (
-            crate::db::models::deployments::DeploymentDBResponse,
-            Option<i64>,
-            Option<crate::db::models::deployments::ModelType>,
-        ),
-    > = HashMap::new();
-
-    for deployment in all_deployments {
-        // Query http_analytics for last 100 responses to get average output token count
-        let avg_output_tokens: Option<i64> = sqlx::query_scalar(
-            r#"
-            SELECT AVG(completion_tokens)::BIGINT
-            FROM (
-                SELECT completion_tokens
-                FROM http_analytics
-                WHERE model = $1
-                  AND completion_tokens IS NOT NULL
-                  AND status_code = 200
-                ORDER BY timestamp DESC
-                LIMIT 100
-            ) recent_responses
-            "#,
-        )
-        .bind(&deployment.alias)
-        .fetch_optional(&mut *conn)
-        .await
-        .map_err(|e| Error::Database(e.into()))?
-        .flatten();
-
-        model_info.insert(
-            deployment.alias.clone(),
-            (deployment.clone(), avg_output_tokens, deployment.model_type.clone()),
-        );
-    }
-
-    let mut tariffs_repo = Tariffs::new(&mut conn);
-    let current_time = Utc::now();
+    // Build context with all deployment info, analytics, and pricing
+    let context = build_cost_estimate_context(state, completion_window).await?;
 
     let mut result = HashMap::new();
 
-    // Process each file
+    // Process each file using the pre-fetched context
     for file_id in file_ids {
-        // Get aggregated template statistics for this file
-        let template_stats = match state
-            .request_manager
-            .get_file_template_stats(fusillade::FileId(*file_id))
-            .await
-        {
+        let template_stats = match state.request_manager.get_file_template_stats(fusillade::FileId(*file_id)).await {
             Ok(stats) => stats,
             Err(_) => continue, // Skip files that can't be processed
         };
 
-        // Convert to the format needed for cost calculation
-        let mut model_stats: HashMap<String, (i64, i64)> = HashMap::new(); // (request_count, input_tokens)
-
-        for stat in template_stats {
-            // Estimate input tokens: body size in bytes / 4
-            let estimated_input_tokens = stat.total_body_bytes / 4;
-            model_stats.insert(stat.model, (stat.request_count, estimated_input_tokens));
-        }
-
-        let mut total_cost = Decimal::ZERO;
-        let mut total_requests: i64 = 0;
-        let mut total_input_tokens: i64 = 0;
-        let mut total_output_tokens: i64 = 0;
-
-        for (model_alias, (request_count, input_tokens)) in model_stats {
-            total_requests += request_count;
-            total_input_tokens += input_tokens;
-
-            // Look up the deployment and historical average
-            let (deployment_opt, avg_output_tokens, model_type) = model_info
-                .get(&model_alias)
-                .map(|(d, avg, mt)| (Some(d.clone()), *avg, mt.clone()))
-                .unwrap_or((None, None, None));
-
-            // Calculate estimated output tokens using historical average or fallback heuristics
-            let estimated_output_tokens = if matches!(model_type, Some(crate::db::models::deployments::ModelType::Embeddings)) {
-                // Embedding models have minimal output
-                request_count
-            } else if let Some(avg) = avg_output_tokens {
-                // Use historical average multiplied by request count
-                avg * request_count
-            } else {
-                // Fallback: estimate 10% larger than input
-                ((input_tokens as f64) * 1.1) as i64
-            };
-
-            total_output_tokens += estimated_output_tokens;
-
-            if let Some(deployment) = deployment_opt {
-                // Look up tariff pricing for Batch API key purpose, with fallback to realtime
-                let pricing_result = tariffs_repo
-                    .get_pricing_at_timestamp_with_fallback(
-                        deployment.id,
-                        Some(&ApiKeyPurpose::Batch),
-                        &ApiKeyPurpose::Realtime,
-                        current_time,
-                        Some(completion_window),
-                    )
-                    .await
-                    .map_err(Error::Database)?;
-
-                if let Some((input_price, output_price)) = pricing_result {
-                    let input_cost = Decimal::from(input_tokens) * input_price;
-                    let output_cost = Decimal::from(estimated_output_tokens) * output_price;
-                    total_cost += input_cost + output_cost;
-                }
-            }
-        }
-
-        result.insert(
-            *file_id,
-            FileCostEstimateSummary {
-                total_requests,
-                total_estimated_input_tokens: total_input_tokens,
-                total_estimated_output_tokens: total_output_tokens,
-                total_estimated_cost: total_cost.to_string(),
-            },
-        );
+        let estimate = compute_file_cost(template_stats, &context);
+        result.insert(*file_id, estimate);
     }
 
     Ok(result)
@@ -835,6 +882,12 @@ pub async fn list_files<P: PoolProvider>(
         .as_ref()
         .is_some_and(|inc| inc.split(',').any(|s| s.trim() == "cost_estimate"));
 
+    // Validate completion_window early if cost estimates are requested
+    let completion_window = query.completion_window.as_deref().unwrap_or("24h");
+    if include_cost_estimate {
+        validate_completion_window(completion_window)?;
+    }
+
     // Compute cost estimates if requested (only for batch purpose files)
     let cost_estimates = if include_cost_estimate {
         let batch_file_ids: Vec<Uuid> = files
@@ -843,7 +896,6 @@ pub async fn list_files<P: PoolProvider>(
             .map(|f| f.id.0)
             .collect();
 
-        let completion_window = query.completion_window.as_deref().unwrap_or("24h");
         compute_bulk_cost_estimates(&state, &batch_file_ids, completion_window).await?
     } else {
         HashMap::new()
@@ -1233,9 +1285,6 @@ pub async fn get_file_cost_estimate<P: PoolProvider>(
     Query(query): Query<FileCostEstimateQuery>,
     current_user: RequiresPermission<resource::Files, operation::ReadOwn>,
 ) -> Result<Json<crate::api::models::files::FileCostEstimate>> {
-    use rust_decimal::Decimal;
-    use std::collections::HashMap;
-
     let can_read_all_files = can_read_all_resources(&current_user, Resource::Files);
 
     let file_id = Uuid::parse_str(&file_id_str).map_err(|_| Error::BadRequest {
@@ -1263,54 +1312,14 @@ pub async fn get_file_cost_estimate<P: PoolProvider>(
         }
     }
 
-    // Fetch all deployments and their pricing information upfront
-    let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
-    let mut deployments_repo = Deployments::new(&mut conn);
+    // Use the completion_window from query params, defaulting to "24h"
+    let completion_window = query.completion_window.as_deref().unwrap_or("24h");
+    validate_completion_window(completion_window)?;
 
-    let filter = DeploymentFilter::new(0, 1000)
-        .with_statuses(vec![ModelStatus::Active])
-        .with_deleted(false);
-    let all_deployments = deployments_repo.list(&filter).await.map_err(Error::Database)?;
+    // Build context with all deployment info, analytics, and pricing (3 SQL queries total)
+    let context = build_cost_estimate_context(&state, completion_window).await?;
 
-    // Build a lookup map of model alias -> (deployment, avg_output_tokens, model_type)
-    let mut model_info: HashMap<
-        String,
-        (
-            crate::db::models::deployments::DeploymentDBResponse,
-            Option<i64>,
-            Option<crate::db::models::deployments::ModelType>,
-        ),
-    > = HashMap::new();
-
-    for deployment in all_deployments {
-        // Query http_analytics for last 100 responses to get average output token count
-        let avg_output_tokens: Option<i64> = sqlx::query_scalar(
-            r#"
-            SELECT AVG(completion_tokens)::BIGINT
-            FROM (
-                SELECT completion_tokens
-                FROM http_analytics
-                WHERE model = $1
-                  AND completion_tokens IS NOT NULL
-                  AND status_code = 200
-                ORDER BY timestamp DESC
-                LIMIT 100
-            ) recent_responses
-            "#,
-        )
-        .bind(&deployment.alias)
-        .fetch_optional(&mut *conn)
-        .await
-        .map_err(|e| Error::Database(e.into()))?
-        .flatten();
-
-        model_info.insert(
-            deployment.alias.clone(),
-            (deployment.clone(), avg_output_tokens, deployment.model_type.clone()),
-        );
-    }
-
-    // Get aggregated template statistics (optimized single query)
+    // Get aggregated template statistics
     let template_stats = state
         .request_manager
         .get_file_template_stats(fusillade::FileId(file_id))
@@ -1319,58 +1328,28 @@ pub async fn get_file_cost_estimate<P: PoolProvider>(
             operation: format!("get file template stats: {}", e),
         })?;
 
-    // Convert to the format needed for cost calculation
-    let mut model_stats: HashMap<String, (i64, i64)> = HashMap::new(); // (request_count, input_tokens)
-
-    for stat in template_stats {
-        // Estimate input tokens: body size in bytes / 4
-        let estimated_input_tokens = stat.total_body_bytes / 4;
-        model_stats.insert(stat.model, (stat.request_count, estimated_input_tokens));
-    }
-
+    // Compute per-model breakdown and totals
     let mut total_cost = Decimal::ZERO;
     let mut model_breakdowns = Vec::new();
 
-    // Create tariffs repository once for all pricing lookups
-    let mut tariffs_repo = Tariffs::new(&mut conn);
-    let current_time = Utc::now();
+    for stat in template_stats {
+        let request_count = stat.request_count;
+        // Estimate input tokens: body size in bytes / 4
+        let input_tokens = stat.total_body_bytes / 4;
 
-    // Use the completion_window from query params, defaulting to "24h"
-    let completion_window = query.completion_window.as_deref().unwrap_or("24h");
+        // Look up model info
+        let (deployment_id, model_type) = context
+            .model_info
+            .get(&stat.model)
+            .map(|(id, mt)| (Some(*id), mt.as_ref()))
+            .unwrap_or((None, None));
 
-    for (model_alias, (request_count, input_tokens)) in model_stats {
-        // Look up the deployment and historical average
-        let (deployment_opt, avg_output_tokens, model_type) = model_info
-            .get(&model_alias)
-            .map(|(d, avg, mt)| (Some(d.clone()), *avg, mt.clone()))
-            .unwrap_or((None, None, None));
+        let avg = context.avg_output_tokens.get(&stat.model).copied();
+        let estimated_output_tokens = estimate_output_tokens(model_type, avg, request_count, input_tokens);
 
-        // Calculate estimated output tokens using historical average or fallback heuristics
-        let estimated_output_tokens = if matches!(model_type, Some(crate::db::models::deployments::ModelType::Embeddings)) {
-            // Embedding models have minimal output
-            request_count
-        } else if let Some(avg) = avg_output_tokens {
-            // Use historical average multiplied by request count
-            avg * request_count
-        } else {
-            // Fallback: estimate 10% larger than input
-            ((input_tokens as f64) * 1.1) as i64
-        };
-
-        let cost = if let Some(deployment) = deployment_opt {
-            // Look up tariff pricing for Batch API key purpose, with fallback to realtime
-            let pricing_result = tariffs_repo
-                .get_pricing_at_timestamp_with_fallback(
-                    deployment.id,
-                    Some(&ApiKeyPurpose::Batch),
-                    &ApiKeyPurpose::Realtime,
-                    current_time,
-                    Some(completion_window),
-                )
-                .await
-                .map_err(Error::Database)?;
-
-            if let Some((input_price, output_price)) = pricing_result {
+        // Calculate cost if we have deployment and pricing info
+        let cost = if let Some(id) = deployment_id {
+            if let Some((input_price, output_price)) = context.pricing.get(&id) {
                 let input_cost = Decimal::from(input_tokens) * input_price;
                 let output_cost = Decimal::from(estimated_output_tokens) * output_price;
                 input_cost + output_cost
@@ -1378,14 +1357,13 @@ pub async fn get_file_cost_estimate<P: PoolProvider>(
                 Decimal::ZERO
             }
         } else {
-            // Model not found, cost is 0
             Decimal::ZERO
         };
 
         total_cost += cost;
 
         model_breakdowns.push(crate::api::models::files::ModelCostBreakdown {
-            model: model_alias,
+            model: stat.model,
             request_count,
             estimated_input_tokens: input_tokens,
             estimated_output_tokens,
@@ -2411,5 +2389,111 @@ mod tests {
             Some("false"),
             "Output file should be complete when batch has no pending/in-progress requests"
         );
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_list_files_with_include_cost_estimate(pool: PgPool) {
+        use crate::api::models::files::FileListResponse;
+        use rust_decimal::Decimal;
+        use std::str::FromStr;
+
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        // Create a deployment with pricing
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        // Add batch tariff pricing for the deployment
+        sqlx::query!(
+            r#"
+            INSERT INTO model_tariffs (deployed_model_id, name, input_price_per_token, output_price_per_token, api_key_purpose, completion_window)
+            VALUES ($1, 'batch-24h', $2, $3, 'batch', '24h')
+            "#,
+            deployment.id,
+            Decimal::from_str("0.000001").unwrap(),
+            Decimal::from_str("0.000002").unwrap(),
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Create test JSONL content
+        let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello 1"}]}}
+{"custom_id":"request-2","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello 2"}]}}"#;
+
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test-batch.jsonl");
+
+        // Upload the file
+        let upload_response = app
+            .post("/ai/v1/files")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .multipart(
+                axum_test::multipart::MultipartForm::new()
+                    .add_text("purpose", "batch")
+                    .add_part("file", file_part),
+            )
+            .await;
+
+        upload_response.assert_status(axum::http::StatusCode::CREATED);
+        let file: FileResponse = upload_response.json();
+
+        // List files without include=cost_estimate - should not have cost_estimate
+        let list_response = app
+            .get("/ai/v1/files")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+
+        list_response.assert_status(axum::http::StatusCode::OK);
+        let list: FileListResponse = list_response.json();
+        assert!(!list.data.is_empty());
+        let file_without_estimate = list.data.iter().find(|f| f.id == file.id).unwrap();
+        assert!(
+            file_without_estimate.cost_estimate.is_none(),
+            "Without include param, cost_estimate should be None"
+        );
+
+        // List files with include=cost_estimate - should have cost_estimate
+        let list_with_estimate_response = app
+            .get("/ai/v1/files?include=cost_estimate&completion_window=24h")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+
+        list_with_estimate_response.assert_status(axum::http::StatusCode::OK);
+        let list_with_estimate: FileListResponse = list_with_estimate_response.json();
+        let file_with_estimate = list_with_estimate.data.iter().find(|f| f.id == file.id).unwrap();
+        assert!(
+            file_with_estimate.cost_estimate.is_some(),
+            "With include=cost_estimate, cost_estimate should be present"
+        );
+
+        let estimate = file_with_estimate.cost_estimate.as_ref().unwrap();
+        assert_eq!(estimate.total_requests, 2, "Should have 2 requests");
+        assert!(estimate.total_estimated_input_tokens > 0, "Should have positive input tokens");
+        assert!(estimate.total_estimated_output_tokens > 0, "Should have positive output tokens");
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_list_files_with_invalid_completion_window(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+
+        // List files with invalid completion_window - should fail
+        let response = app
+            .get("/ai/v1/files?include=cost_estimate&completion_window=invalid")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+
+        response.assert_status(axum::http::StatusCode::BAD_REQUEST);
+        let error_body = response.text();
+        assert!(error_body.contains("completion_window"), "Error should mention completion_window");
     }
 }

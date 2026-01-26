@@ -233,6 +233,75 @@ impl<'c> Tariffs<'c> {
         Ok(result.map(|r| (r.input_price_per_token, r.output_price_per_token)))
     }
 
+    /// Get bulk pricing for multiple deployments at once.
+    ///
+    /// This is an optimization to avoid N+1 queries when computing cost estimates
+    /// for multiple files/deployments. It fetches current batch tariffs for all
+    /// provided deployment IDs, with optional fallback to realtime pricing.
+    ///
+    /// Returns a map of deployment_id -> (input_price, output_price)
+    #[instrument(skip(self, deployment_ids), fields(deployment_count = deployment_ids.len()), err)]
+    pub async fn get_bulk_pricing_for_deployments(
+        &mut self,
+        deployment_ids: &[DeploymentId],
+        completion_window: Option<&str>,
+    ) -> Result<std::collections::HashMap<DeploymentId, (Decimal, Decimal)>> {
+        use std::collections::HashMap;
+
+        if deployment_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        // Fetch current batch tariffs for all deployments in one query
+        // Uses window function to rank tariffs and pick the best match:
+        // 1. Prefer batch tariffs with matching completion_window
+        // 2. Fall back to batch tariffs without completion_window
+        // 3. Fall back to realtime tariffs
+        let records = sqlx::query!(
+            r#"
+            WITH ranked_tariffs AS (
+                SELECT
+                    deployed_model_id,
+                    input_price_per_token,
+                    output_price_per_token,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY deployed_model_id
+                        ORDER BY
+                            -- Prefer batch purpose
+                            CASE WHEN api_key_purpose = 'batch' THEN 0 ELSE 1 END,
+                            -- Prefer matching completion_window for batch tariffs
+                            CASE
+                                WHEN api_key_purpose = 'batch' AND completion_window = $2 THEN 0
+                                WHEN api_key_purpose = 'batch' AND completion_window IS NULL THEN 1
+                                ELSE 2
+                            END
+                    ) as rn
+                FROM model_tariffs
+                WHERE deployed_model_id = ANY($1)
+                  AND valid_until IS NULL
+                  AND api_key_purpose IN ('batch', 'realtime')
+            )
+            SELECT deployed_model_id, input_price_per_token, output_price_per_token
+            FROM ranked_tariffs
+            WHERE rn = 1
+            "#,
+            deployment_ids as &[DeploymentId],
+            completion_window
+        )
+        .fetch_all(&mut *self.db)
+        .await?;
+
+        let mut result = HashMap::new();
+        for record in records {
+            result.insert(
+                record.deployed_model_id,
+                (record.input_price_per_token, record.output_price_per_token),
+            );
+        }
+
+        Ok(result)
+    }
+
     /// Close multiple tariffs by setting valid_until to the current time
     /// More efficient than calling close_tariff in a loop
     #[instrument(skip(self), fields(count = ids.len()), err)]

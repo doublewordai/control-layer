@@ -1,0 +1,35 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            WITH ranked_tariffs AS (\n                SELECT\n                    deployed_model_id,\n                    input_price_per_token,\n                    output_price_per_token,\n                    ROW_NUMBER() OVER (\n                        PARTITION BY deployed_model_id\n                        ORDER BY\n                            -- Prefer batch purpose\n                            CASE WHEN api_key_purpose = 'batch' THEN 0 ELSE 1 END,\n                            -- Prefer matching completion_window for batch tariffs\n                            CASE\n                                WHEN api_key_purpose = 'batch' AND completion_window = $2 THEN 0\n                                WHEN api_key_purpose = 'batch' AND completion_window IS NULL THEN 1\n                                ELSE 2\n                            END\n                    ) as rn\n                FROM model_tariffs\n                WHERE deployed_model_id = ANY($1)\n                  AND valid_until IS NULL\n                  AND api_key_purpose IN ('batch', 'realtime')\n            )\n            SELECT deployed_model_id, input_price_per_token, output_price_per_token\n            FROM ranked_tariffs\n            WHERE rn = 1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "deployed_model_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "input_price_per_token",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 2,
+        "name": "output_price_per_token",
+        "type_info": "Numeric"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "15a9d8cb84c3cde3f5bb393af3c036d61fd3b9d2de3aea3d7e0a9b9e354ea50a"
+}

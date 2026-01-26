@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            WITH model_stats AS (\n                SELECT\n                    model,\n                    completion_tokens,\n                    ROW_NUMBER() OVER (PARTITION BY model ORDER BY timestamp DESC) as rn\n                FROM http_analytics\n                WHERE model = ANY($1)\n                  AND completion_tokens IS NOT NULL\n                  AND status_code = 200\n            )\n            SELECT model, AVG(completion_tokens)::BIGINT as avg_tokens\n            FROM model_stats\n            WHERE rn <= 100\n            GROUP BY model\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "model",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "avg_tokens",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      true,
+      null
+    ]
+  },
+  "hash": "1a52d8ca6a165402d42e399323790c9eec65074fe21d71e56ae31e990bec4d72"
+}
