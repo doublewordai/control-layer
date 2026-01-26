@@ -138,8 +138,19 @@ pub struct Config {
     pub background_services: BackgroundServicesConfig,
     /// Enable Prometheus metrics endpoint at `/internal/metrics`
     pub enable_metrics: bool,
-    /// Enable request/response logging to PostgreSQL
+    /// Enable request/response logging to PostgreSQL (outlet-postgres)
+    ///
+    /// When enabled, raw request and response bodies are stored in the
+    /// `http_requests` and `http_responses` tables for debugging and auditing.
     pub enable_request_logging: bool,
+    /// Enable analytics and billing (http_analytics table, credit deduction, Prometheus metrics)
+    ///
+    /// Can be enabled independently of `enable_request_logging`. When enabled without
+    /// request logging, analytics data is still recorded but raw request/response
+    /// bodies are not stored.
+    ///
+    /// When disabled, no analytics, billing, or GenAI metrics are recorded.
+    pub enable_analytics: bool,
     /// Enable OpenTelemetry OTLP export for distributed tracing
     pub enable_otel_export: bool,
     /// Credit system configuration
@@ -1157,6 +1168,7 @@ impl Default for Config {
             background_services: BackgroundServicesConfig::default(),
             enable_metrics: true,
             enable_request_logging: true,
+            enable_analytics: true,
             enable_otel_export: false,
             credits: CreditsConfig::default(),
             sample_files: SampleFilesConfig::default(),
