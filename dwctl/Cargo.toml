@@ -19,7 +19,7 @@ embedded-db = ["dep:postgresql_embedded"]
 
 [dependencies]
 axum = { version = "0.8", features = ["multipart"] }
-fusillade = "2.2.0" 
+fusillade = "2.2.0"
 tokio = { version = "1.0", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = "0.7"
@@ -68,7 +68,7 @@ jsonwebtoken = "9.0"
 argon2 = "0.5"
 base64 = "0.22"
 bytes = "1.5"
-onwards = "0.11.0"
+onwards = "0.11.1"
 thiserror = "2.0.14"
 axum-prometheus = "0.10"
 # Metrics facade and exporter (same versions as axum-prometheus uses)

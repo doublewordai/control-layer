@@ -58,15 +58,19 @@ describe("canAccessRoute", () => {
 });
 
 describe("getFirstAccessibleRoute", () => {
-  it("returns /models as first choice for PlatformManager", () => {
-    expect(getFirstAccessibleRoute(["PlatformManager"])).toBe("/models");
+  it("returns /batches as first choice for PlatformManager", () => {
+    expect(getFirstAccessibleRoute(["PlatformManager"])).toBe("/batches");
   });
 
-  it("returns /models as first choice for StandardUser", () => {
+  it("returns /batches as first choice for BatchAPIUser", () => {
+    expect(getFirstAccessibleRoute(["BatchAPIUser"])).toBe("/batches");
+  });
+
+  it("returns /models as first choice for StandardUser (no batches access)", () => {
     expect(getFirstAccessibleRoute(["StandardUser"])).toBe("/models");
   });
 
-  it("returns /models for RequestViewer who can access models", () => {
+  it("returns /models for RequestViewer who can access models but not batches", () => {
     expect(getFirstAccessibleRoute(["RequestViewer"])).toBe("/models");
   });
 
