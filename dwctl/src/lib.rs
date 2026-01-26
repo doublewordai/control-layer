@@ -168,7 +168,7 @@ use crate::{
     db::models::{deployments::DeploymentCreateDBRequest, users::UserCreateDBRequest},
     metrics::GenAiMetrics,
     openapi::{AdminApiDoc, AiApiDoc},
-    request_logging::serializers::{AnalyticsResponseSerializer, parse_ai_request},
+    request_logging::serializers::{parse_ai_request, parse_ai_response},
 };
 use sqlx_pool_router::{DbPools, PoolProvider};
 
@@ -184,7 +184,7 @@ use axum_prometheus::PrometheusMetricLayerBuilder;
 use bon::Builder;
 pub use config::Config;
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
-use outlet::{RequestLoggerConfig, RequestLoggerLayer};
+use outlet::{MultiHandler, RequestLoggerConfig, RequestLoggerLayer};
 use outlet_postgres::PostgresHandler;
 use request_logging::{AiResponse, ParsedAIRequest};
 use sqlx::{Executor, PgPool};
@@ -604,11 +604,15 @@ async fn setup_database(
     // Reuses connection URLs from main pool (both primary and replica if configured)
     // Sets search_path at the connection level (via PgConnectOptions) rather than using
     // after_connect hooks, ensuring it cannot be unset and works reliably with replicas
-    let create_schema_pool = |schema: String, opts: sqlx::postgres::PgConnectOptions, settings: &config::PoolSettings| {
+    // Uses eager connection (connect_with) to respect min_connections at startup
+    async fn create_schema_pool(
+        schema: String,
+        opts: sqlx::postgres::PgConnectOptions,
+        settings: &config::PoolSettings,
+    ) -> Result<sqlx::PgPool, sqlx::Error> {
         // Set search_path directly in connection options so PostgreSQL enforces it
         // This is more reliable than after_connect hooks, especially with replicas
         // The options() method formats as: "-c key=value"
-        // We need to create owned values that live long enough for the closure
         let search_path_key = "search_path".to_string();
         let search_path_value = schema.clone();
         info!("Setting search_path={} via connection options for schema pool", schema);
@@ -628,8 +632,9 @@ async fn setup_database(
             } else {
                 None
             })
-            .connect_lazy_with(opts_with_schema)
-    };
+            .connect_with(opts_with_schema)
+            .await
+    }
 
     // Setup fusillade batch processing pool
     info!("Setting up fusillade batch processing pool");
@@ -638,7 +643,7 @@ async fn setup_database(
             name, pool: pool_settings, ..
         } => {
             // Create primary pool using main's connection, with schema-specific search_path
-            let primary = create_schema_pool(name.clone(), main_connect_opts.clone(), pool_settings);
+            let primary = create_schema_pool(name.clone(), main_connect_opts.clone(), pool_settings).await?;
             primary.execute(&*format!("CREATE SCHEMA IF NOT EXISTS {name}")).await?;
 
             // Create replica pool if main has one configured (inherits main's replica connection)
@@ -646,7 +651,7 @@ async fn setup_database(
                 info!("Setting up fusillade read replica (schema mode)");
                 let replica_opts = db_pools.read().connect_options().as_ref().clone();
                 let replica_pool_settings = config.database.fusillade().replica_pool_settings();
-                let replica = create_schema_pool(name.clone(), replica_opts, replica_pool_settings);
+                let replica = create_schema_pool(name.clone(), replica_opts, replica_pool_settings).await?;
                 DbPools::with_replica(primary, replica)
             } else {
                 DbPools::new(primary)
@@ -711,7 +716,7 @@ async fn setup_database(
                 name, pool: pool_settings, ..
             } => {
                 // Create primary pool using main's connection, with schema-specific search_path
-                let primary = create_schema_pool(name.clone(), main_connect_opts.clone(), pool_settings);
+                let primary = create_schema_pool(name.clone(), main_connect_opts.clone(), pool_settings).await?;
                 primary.execute(&*format!("CREATE SCHEMA IF NOT EXISTS {name}")).await?;
 
                 // Create replica pool if main has one configured (inherits main's replica connection)
@@ -719,7 +724,7 @@ async fn setup_database(
                     info!("Setting up outlet read replica (schema mode)");
                     let replica_opts = db_pools.read().connect_options().as_ref().clone();
                     let replica_pool_settings = config.database.outlet().replica_pool_settings();
-                    let replica = create_schema_pool(name.clone(), replica_opts, replica_pool_settings);
+                    let replica = create_schema_pool(name.clone(), replica_opts, replica_pool_settings).await?;
                     DbPools::with_replica(primary, replica)
                 } else {
                     DbPools::new(primary)
@@ -872,36 +877,62 @@ fn create_cors_layer(config: &Config) -> anyhow::Result<CorsLayer> {
 /// Returns an error if CORS configuration is invalid or metrics initialization fails.
 #[instrument(skip_all)]
 pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyhow::Result<Router> {
-    // Setup request logging if enabled
-    let outlet_layer = if let Some(outlet_pool) = state.outlet_db.as_ref() {
-        // Initialize GenAI metrics BEFORE creating analytics serializer if metrics enabled
-        if state.config.enable_metrics {
+    // Setup request logging and/or analytics based on config flags
+    //
+    // These can be enabled independently:
+    // - enable_request_logging: stores raw request/response bodies via outlet-postgres
+    // - enable_analytics: stores analytics data, handles billing, records Prometheus metrics
+    //
+    // Both require the RequestLoggerLayer to capture request/response data, but use
+    // different handlers to process that data.
+    let request_logging_enabled = state.outlet_db.is_some() && state.config.enable_request_logging;
+    let analytics_enabled = state.config.enable_analytics;
+
+    let outlet_layer = if request_logging_enabled || analytics_enabled {
+        // Initialize GenAI metrics BEFORE creating analytics handler if metrics enabled
+        if state.config.enable_metrics && analytics_enabled {
             let gen_ai_registry = prometheus::Registry::new();
             let gen_ai_metrics =
                 GenAiMetrics::new(&gen_ai_registry).map_err(|e| anyhow::anyhow!("Failed to create GenAI metrics: {}", e))?;
             state.metrics_recorder = Some(gen_ai_metrics);
         }
 
-        let analytics_serializer = AnalyticsResponseSerializer::new(
-            state.db.write().clone(),
-            uuid::Uuid::new_v4(),
-            state.config.clone(),
-            state.metrics_recorder.clone(),
-        );
+        // Build handler chain based on config
+        let mut multi_handler = MultiHandler::new();
 
-        let postgres_handler = PostgresHandler::<DbPools, ParsedAIRequest, AiResponse>::from_pool_provider(outlet_pool.clone())
-            .await
-            .expect("Failed to create PostgresHandler for request logging")
-            .with_request_serializer(parse_ai_request)
-            .with_response_serializer(analytics_serializer.create_serializer());
+        // Add PostgresHandler for request logging if enabled
+        if request_logging_enabled {
+            let outlet_pool = state.outlet_db.as_ref().expect("outlet_db checked above");
+            let postgres_handler = PostgresHandler::<DbPools, ParsedAIRequest, AiResponse>::from_pool_provider(outlet_pool.clone())
+                .await
+                .expect("Failed to create PostgresHandler for request logging")
+                .with_request_serializer(parse_ai_request)
+                .with_response_serializer(parse_ai_response);
+            multi_handler = multi_handler.with(postgres_handler);
+        }
 
-        let outlet_config = RequestLoggerConfig {
-            capture_request_body: true,
-            capture_response_body: true,
-            path_filter: None, // No path filter needed - applied directly to ai_router
-        };
+        // Add AnalyticsHandler for analytics/billing if enabled
+        if analytics_enabled {
+            let analytics_handler = request_logging::AnalyticsHandler::new(
+                state.db.write().clone(),
+                uuid::Uuid::new_v4(),
+                state.config.clone(),
+                state.metrics_recorder.clone(),
+            );
+            multi_handler = multi_handler.with(analytics_handler);
+        }
 
-        Some(RequestLoggerLayer::new(outlet_config, postgres_handler))
+        // Only create layer if at least one handler is enabled (should always be true here)
+        if multi_handler.is_empty() {
+            None
+        } else {
+            let outlet_config = RequestLoggerConfig {
+                capture_request_body: true,
+                capture_response_body: true,
+                path_filter: None, // No path filter needed - applied directly to ai_router
+            };
+            Some(RequestLoggerLayer::new(outlet_config, multi_handler))
+        }
     } else {
         None
     };

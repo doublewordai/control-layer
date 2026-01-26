@@ -1,5 +1,51 @@
 # Changelog
 
+## [3.0.1](https://github.com/doublewordai/control-layer/compare/v3.0.0...v3.0.1) (2026-01-26)
+
+
+### Bug Fixes
+
+* use eager connection for schema pools to respect min_connections ([#600](https://github.com/doublewordai/control-layer/issues/600)) ([ac96ba0](https://github.com/doublewordai/control-layer/commit/ac96ba05fd32b4ba4e83efa3b53a164a8673ff49))
+
+## [3.0.0](https://github.com/doublewordai/control-layer/compare/v2.9.2...v3.0.0) (2026-01-26)
+
+
+### ⚠ BREAKING CHANGES
+
+* add runtime config for AI API base URL ([#595](https://github.com/doublewordai/control-layer/issues/595))
+
+### Features
+
+* add pool exhaustion error handling with 503 response ([#597](https://github.com/doublewordai/control-layer/issues/597)) ([80230ac](https://github.com/doublewordai/control-layer/commit/80230ac868b7d964a711f27bdbfc811124d2c388))
+* add runtime config for AI API base URL ([#595](https://github.com/doublewordai/control-layer/issues/595)) ([1bda2ff](https://github.com/doublewordai/control-layer/commit/1bda2ff519ee9fb4f29280fdee62df68cdfa4f3b))
+* decouple analytics/billing from request logging ([#596](https://github.com/doublewordai/control-layer/issues/596)) ([7846dac](https://github.com/doublewordai/control-layer/commit/7846dac137088ab51aa32a181c3dd7d3fe65e19e))
+
+
+### Bug Fixes
+
+* remove super-slow log statement in transaction writing ([#599](https://github.com/doublewordai/control-layer/issues/599)) ([443d0f4](https://github.com/doublewordai/control-layer/commit/443d0f46071b2092ea5c8d2875441f0a4defa2c5))
+
+## [2.9.2](https://github.com/doublewordai/control-layer/compare/v2.9.1...v2.9.2) (2026-01-24)
+
+
+### Bug Fixes
+
+* use get file from primary pool to avoid any internal lag and errors ([#591](https://github.com/doublewordai/control-layer/issues/591)) ([cfa56ef](https://github.com/doublewordai/control-layer/commit/cfa56ef9d8136304cff5205a5c4644dac2961009))
+
+## [2.9.1](https://github.com/doublewordai/control-layer/compare/v2.9.0...v2.9.1) (2026-01-23)
+
+
+### Bug Fixes
+
+* write pool for get file right after creation, due to tx race conditions ([#588](https://github.com/doublewordai/control-layer/issues/588)) ([3a2b35f](https://github.com/doublewordai/control-layer/commit/3a2b35f4e94f1a77cbf310150d6ac0c24ab02723))
+
+## [2.9.0](https://github.com/doublewordai/control-layer/compare/v2.8.0...v2.9.0) (2026-01-23)
+
+
+### Features
+
+* add model filtering by group ([#586](https://github.com/doublewordai/control-layer/issues/586)) ([0be0ef3](https://github.com/doublewordai/control-layer/commit/0be0ef336ef0bc5019cbc66fbcf8b92f2ce7b28e))
+
 ## [2.8.0](https://github.com/doublewordai/control-layer/compare/v2.7.2...v2.8.0) (2026-01-23)
 
 

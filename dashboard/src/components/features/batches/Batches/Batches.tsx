@@ -144,9 +144,10 @@ export function Batches({
     ...filesPagination.queryParams,
   });
 
-  // Paginated batches query
+  // Paginated batches query - include analytics to avoid N+1 requests
   const { data: batchesResponse, isLoading: batchesLoading } = useBatches({
     search: debouncedBatchSearch.trim() || undefined,
+    include: "analytics",
     ...batchesPagination.queryParams,
     // Always fetch to populate tab counts, but refetch interval is lower when not active
   });
@@ -174,27 +175,16 @@ export function Batches({
     return batches.filter((b) => b.input_file_id === batchFileFilter);
   }, [batches, batchFileFilter]);
 
-  // Fetch analytics for all batches in parallel
-  const analyticsQueries = useQueries({
-    queries: batches.map((batch) => ({
-      queryKey: ["batches", "analytics", batch.id],
-      queryFn: () => dwctlApi.batches.getAnalytics(batch.id),
-      staleTime: 5000, // 5 seconds
-      refetchInterval: 5000, // Refetch every 5 seconds for in-progress batches
-    })),
-  });
-
-  // Create a map of batch ID to analytics for easy lookup
+  // Create a map of batch ID to analytics for easy lookup (analytics are now embedded in batch response)
   const batchAnalyticsMap = React.useMemo(() => {
     const map = new Map<string, BatchAnalytics>();
-    batches.forEach((batch, index) => {
-      const analytics = analyticsQueries[index]?.data;
-      if (analytics) {
-        map.set(batch.id, analytics);
+    batches.forEach((batch) => {
+      if (batch.analytics) {
+        map.set(batch.id, batch.analytics);
       }
     });
     return map;
-  }, [batches, analyticsQueries]);
+  }, [batches]);
 
   // Fetch file cost estimates for batch input files
   const fileEstimateQueries = useQueries({

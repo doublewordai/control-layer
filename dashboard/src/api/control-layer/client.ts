@@ -66,14 +66,30 @@ import { ApiError } from "./errors";
 
 // Optional override for AI API endpoints (files, batches, daemons)
 // Falls back to same origin if not set (relative paths)
-const AI_API_BASE_URL = import.meta.env.VITE_AI_API_BASE_URL || "";
+// Set at runtime via setAiApiBaseUrl() after fetching /config
+let aiApiBaseUrl = "";
+
+/**
+ * Set the AI API base URL at runtime (called after fetching config)
+ * This allows the same build to work in different environments
+ */
+export function setAiApiBaseUrl(url: string | undefined): void {
+  aiApiBaseUrl = url || "";
+}
+
+/**
+ * Get the current AI API base URL
+ */
+export function getAiApiBaseUrl(): string {
+  return aiApiBaseUrl;
+}
 
 // Helper to construct AI API URLs - strips /ai prefix when using override domain
 const getAiApiUrl = (path: string): string => {
-  if (AI_API_BASE_URL) {
+  if (aiApiBaseUrl) {
     // When using api.doubleword.ai, strip /ai prefix because ingress adds it
     // Use lookahead to match /ai only when followed by / to avoid false matches
-    return `${AI_API_BASE_URL}${path.replace(/^\/ai(?=\/)/, "")}`;
+    return `${aiApiBaseUrl}${path.replace(/^\/ai(?=\/)/, "")}`;
   }
   // When using same origin (app.doubleword.ai), keep /ai prefix
   return path;
@@ -85,7 +101,7 @@ const fetchAiApi = (path: string, init?: RequestInit): Promise<Response> => {
   // When making cross-origin requests, include credentials for session cookies
   const options: RequestInit = {
     ...init,
-    credentials: AI_API_BASE_URL
+    credentials: aiApiBaseUrl
       ? "include"
       : init?.credentials || "same-origin",
   };
@@ -1257,7 +1273,7 @@ const filesApi = {
 
       const url = getAiApiUrl("/ai/v1/files");
       xhr.open("POST", url);
-      xhr.withCredentials = !!AI_API_BASE_URL;
+      xhr.withCredentials = !!aiApiBaseUrl;
       xhr.send(formData);
     });
   },
@@ -1322,6 +1338,7 @@ const batchesApi = {
     if (options?.after) params.set("after", options.after);
     if (options?.limit) params.set("limit", options.limit.toString());
     if (options?.search) params.set("search", options.search);
+    if (options?.include) params.set("include", options.include);
 
     const response = await fetchAiApi(
       `/ai/v1/batches${params.toString() ? "?" + params.toString() : ""}`,

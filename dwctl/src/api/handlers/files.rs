@@ -564,9 +564,14 @@ pub async fn upload_file<P: PoolProvider>(
     tracing::info!("File {} uploaded successfully", created_file_id);
 
     // Build response using the fusillade file
-    let file = state.request_manager.get_file(created_file_id).await.map_err(|e| Error::Internal {
-        operation: format!("retrieve created file: {}", e),
-    })?;
+    // We use the primary pool to avoid transaction or read lags if using replicas
+    let file = state
+        .request_manager
+        .get_file_from_primary_pool(created_file_id)
+        .await
+        .map_err(|e| Error::Internal {
+            operation: format!("retrieve created file: {}", e),
+        })?;
 
     // Validate purpose (only batch is supported)
     if let Some(purpose) = file.purpose

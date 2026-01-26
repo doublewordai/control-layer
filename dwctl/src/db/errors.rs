@@ -1,4 +1,5 @@
 use crate::types::Operation;
+use metrics::counter;
 use thiserror::Error;
 
 /// Unified error type for database operations that application code can handle
@@ -49,6 +50,10 @@ pub enum DbError {
     #[error("Invalid model field: {field} must not be empty or whitespace")]
     InvalidModelField { field: &'static str },
 
+    /// Connection pool exhausted - all connections are in use and acquire timed out
+    #[error("Database connection pool exhausted")]
+    PoolExhausted,
+
     /// Catch-all for non-recoverable errors
     #[error(transparent)]
     Other(#[from] anyhow::Error),
@@ -59,6 +64,11 @@ impl From<sqlx::Error> for DbError {
     fn from(err: sqlx::Error) -> Self {
         match &err {
             sqlx::Error::RowNotFound => DbError::NotFound,
+            sqlx::Error::PoolTimedOut => {
+                // Record metric for pool exhaustion - this is a key indicator of capacity issues
+                counter!("dwctl_db_pool_acquire_timeouts_total").increment(1);
+                DbError::PoolExhausted
+            }
             sqlx::Error::Database(db_err) => {
                 if db_err.is_unique_violation() {
                     let constraint = db_err.constraint().map(|s| s.to_string());

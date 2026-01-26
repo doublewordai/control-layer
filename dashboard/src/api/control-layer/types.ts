@@ -75,6 +75,8 @@ export interface ConfigResponse {
     enabled: boolean;
     allowed_completion_windows: string[]; // Available SLAs like ["24h", "1h", "12h"]
   };
+  /** Base URL for AI API endpoints (files, batches, daemons). If not set, use relative paths. */
+  ai_api_base_url?: string;
 }
 
 // Model metrics time series point
@@ -994,6 +996,8 @@ export interface Batch {
   request_counts: BatchRequestCounts;
   metadata?: Record<string, string>;
   usage?: BatchUsage;
+  /** Included when requesting with include=analytics */
+  analytics?: BatchAnalytics;
 }
 
 export interface BatchListResponse {
@@ -1019,6 +1023,8 @@ export interface BatchesListQuery {
   after?: string;
   limit?: number;
   search?: string;
+  /** Comma-separated list of related resources to include. Supported: "analytics" */
+  include?: string;
 }
 
 // ===== BATCH REQUESTS (Custom endpoints beyond OpenAI spec) =====

@@ -813,6 +813,70 @@ pub async fn get_batch_analytics(pool: &PgPool, batch_id: &Uuid) -> Result<Batch
     })
 }
 
+/// Get aggregated analytics metrics for multiple batches in a single query
+#[instrument(skip(pool))]
+pub async fn get_batches_analytics_bulk(pool: &PgPool, batch_ids: &[Uuid]) -> Result<HashMap<Uuid, BatchAnalytics>> {
+    if batch_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    // Query analytics for all batch IDs at once, grouped by batch ID
+    let rows = sqlx::query!(
+        r#"
+        SELECT
+            fusillade_batch_id,
+            COUNT(*) as "total_requests!",
+            COALESCE(SUM(prompt_tokens), 0) as "total_prompt_tokens!",
+            COALESCE(SUM(completion_tokens), 0) as "total_completion_tokens!",
+            COALESCE(SUM(total_tokens), 0) as "total_tokens!",
+            AVG(duration_ms) as "avg_duration_ms",
+            AVG(duration_to_first_byte_ms) as "avg_ttfb_ms",
+            SUM((prompt_tokens * COALESCE(input_price_per_token, 0)) +
+                (completion_tokens * COALESCE(output_price_per_token, 0))) as "total_cost"
+        FROM http_analytics
+        WHERE fusillade_batch_id = ANY($1)
+        GROUP BY fusillade_batch_id
+        "#,
+        batch_ids
+    )
+    .fetch_all(pool)
+    .await?;
+
+    // Convert rows to HashMap
+    let mut result = HashMap::new();
+    for row in rows {
+        if let Some(batch_id) = row.fusillade_batch_id {
+            result.insert(
+                batch_id,
+                BatchAnalytics {
+                    total_requests: row.total_requests,
+                    total_prompt_tokens: row.total_prompt_tokens.to_i64().unwrap_or(0),
+                    total_completion_tokens: row.total_completion_tokens.to_i64().unwrap_or(0),
+                    total_tokens: row.total_tokens.to_i64().unwrap_or(0),
+                    avg_duration_ms: row.avg_duration_ms.and_then(|d: Decimal| d.to_f64()),
+                    avg_ttfb_ms: row.avg_ttfb_ms.and_then(|d: Decimal| d.to_f64()),
+                    total_cost: row.total_cost.map(|d: Decimal| d.to_string()),
+                },
+            );
+        }
+    }
+
+    // For batch IDs with no analytics data, insert empty analytics
+    for batch_id in batch_ids {
+        result.entry(*batch_id).or_insert(BatchAnalytics {
+            total_requests: 0,
+            total_prompt_tokens: 0,
+            total_completion_tokens: 0,
+            total_tokens: 0,
+            avg_duration_ms: None,
+            avg_ttfb_ms: None,
+            total_cost: None,
+        });
+    }
+
+    Ok(result)
+}
+
 /// Row type for http_analytics query
 #[derive(FromRow)]
 struct HttpAnalyticsRow {
@@ -1706,5 +1770,103 @@ mod tests {
         assert_eq!(result.total_prompt_tokens, 125); // 50 + 75
         assert_eq!(result.total_completion_tokens, 55); // 25 + 30
         assert_eq!(result.avg_duration_ms, Some(125.0)); // (100 + 150) / 2
+    }
+
+    #[sqlx::test]
+    async fn test_get_batches_analytics_bulk_empty_input(pool: PgPool) {
+        // Empty batch IDs should return empty HashMap
+        let result = get_batches_analytics_bulk(&pool, &[]).await.unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[sqlx::test]
+    async fn test_get_batches_analytics_bulk_multiple_batches(pool: PgPool) {
+        let batch_id_1 = Uuid::new_v4();
+        let batch_id_2 = Uuid::new_v4();
+        let batch_id_3 = Uuid::new_v4(); // This one will have no analytics
+        let now = Utc::now();
+
+        // Insert analytics for batch 1
+        insert_test_analytics_with_batch_id(
+            &pool,
+            TestBatchAnalyticsData {
+                fusillade_batch_id: batch_id_1,
+                fusillade_request_id: Some(Uuid::new_v4()),
+                timestamp: now,
+                model: "gpt-4",
+                status_code: 200,
+                duration_ms: 100.0,
+                duration_to_first_byte_ms: Some(20.0),
+                prompt_tokens: 50,
+                completion_tokens: 25,
+                input_price_per_token: Some(0.00001),
+                output_price_per_token: Some(0.00003),
+            },
+        )
+        .await;
+
+        // Insert analytics for batch 2 (two requests)
+        insert_test_analytics_with_batch_id(
+            &pool,
+            TestBatchAnalyticsData {
+                fusillade_batch_id: batch_id_2,
+                fusillade_request_id: Some(Uuid::new_v4()),
+                timestamp: now,
+                model: "gpt-3.5-turbo",
+                status_code: 200,
+                duration_ms: 50.0,
+                duration_to_first_byte_ms: Some(10.0),
+                prompt_tokens: 100,
+                completion_tokens: 50,
+                input_price_per_token: Some(0.000001),
+                output_price_per_token: Some(0.000002),
+            },
+        )
+        .await;
+        insert_test_analytics_with_batch_id(
+            &pool,
+            TestBatchAnalyticsData {
+                fusillade_batch_id: batch_id_2,
+                fusillade_request_id: Some(Uuid::new_v4()),
+                timestamp: now,
+                model: "gpt-3.5-turbo",
+                status_code: 200,
+                duration_ms: 60.0,
+                duration_to_first_byte_ms: Some(15.0),
+                prompt_tokens: 200,
+                completion_tokens: 100,
+                input_price_per_token: Some(0.000001),
+                output_price_per_token: Some(0.000002),
+            },
+        )
+        .await;
+
+        // Query bulk analytics for all three batches
+        let result = get_batches_analytics_bulk(&pool, &[batch_id_1, batch_id_2, batch_id_3])
+            .await
+            .unwrap();
+
+        // Should have entries for all three batches
+        assert_eq!(result.len(), 3);
+
+        // Batch 1 should have 1 request
+        let analytics_1 = result.get(&batch_id_1).unwrap();
+        assert_eq!(analytics_1.total_requests, 1);
+        assert_eq!(analytics_1.total_prompt_tokens, 50);
+        assert_eq!(analytics_1.total_completion_tokens, 25);
+
+        // Batch 2 should have 2 requests aggregated
+        let analytics_2 = result.get(&batch_id_2).unwrap();
+        assert_eq!(analytics_2.total_requests, 2);
+        assert_eq!(analytics_2.total_prompt_tokens, 300); // 100 + 200
+        assert_eq!(analytics_2.total_completion_tokens, 150); // 50 + 100
+        assert_eq!(analytics_2.avg_duration_ms, Some(55.0)); // (50 + 60) / 2
+
+        // Batch 3 should have zero counts (no analytics data)
+        let analytics_3 = result.get(&batch_id_3).unwrap();
+        assert_eq!(analytics_3.total_requests, 0);
+        assert_eq!(analytics_3.total_prompt_tokens, 0);
+        assert_eq!(analytics_3.total_completion_tokens, 0);
+        assert!(analytics_3.avg_duration_ms.is_none());
     }
 }

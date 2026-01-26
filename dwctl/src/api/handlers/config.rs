@@ -31,6 +31,10 @@ pub struct ConfigResponse {
     /// Batch processing configuration, only present if batches are enabled
     #[serde(skip_serializing_if = "Option::is_none")]
     pub batches: Option<BatchConfigResponse>,
+    /// Base URL for AI API endpoints (files, batches, daemons)
+    /// If not set, the frontend should use relative paths (same-origin requests)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ai_api_base_url: Option<String>,
 }
 
 #[utoipa::path(
@@ -72,6 +76,7 @@ pub async fn get_config(State(state): State<AppState>, _user: CurrentUser) -> im
         docs_url: metadata.docs_url.clone(),
         docs_jsonl_url: metadata.docs_jsonl_url.clone(),
         batches: batches_config,
+        ai_api_base_url: metadata.ai_api_base_url.clone(),
     };
 
     Json(response)
