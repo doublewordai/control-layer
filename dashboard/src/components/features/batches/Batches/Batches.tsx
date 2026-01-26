@@ -142,7 +142,7 @@ export function Batches({
     purpose: filePurpose,
     search: debouncedFileSearch.trim() || undefined,
     ...filesPagination.queryParams,
-    enabled: activeTab === "files",
+    enabled: activeTab === "files" || !!batchFileFilter,
   });
 
   // Paginated batches query - include analytics to avoid N+1 requests
