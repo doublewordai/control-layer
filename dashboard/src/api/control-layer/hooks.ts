@@ -1,5 +1,6 @@
+import { useEffect } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { dwctlApi } from "./client";
+import { dwctlApi, setAiApiBaseUrl } from "./client";
 import { queryKeys } from "./keys";
 import type {
   UserCreateRequest,
@@ -35,11 +36,21 @@ import type {
 
 // Config hooks
 export function useConfig() {
-  return useQuery({
+  const query = useQuery({
     queryKey: ["config"],
     queryFn: () => dwctlApi.config.get(),
     staleTime: 30 * 60 * 1000, // 30 minutes - config rarely changes
   });
+
+  // Update AI API base URL when config is fetched
+  // This allows runtime configuration of the AI API endpoint
+  useEffect(() => {
+    if (query.data?.ai_api_base_url !== undefined) {
+      setAiApiBaseUrl(query.data.ai_api_base_url);
+    }
+  }, [query.data?.ai_api_base_url]);
+
+  return query;
 }
 
 // Users hooks

@@ -16,18 +16,14 @@ WORKDIR /app
 # Install cargo-watch for auto-reloading in dev
 RUN cargo install cargo-watch
 
-# Add build arg for frontend
-ARG VITE_AI_API_BASE_URL=""
-
 # Copy workspace code (dwctl, dashboard)
 COPY Cargo.toml Cargo.lock ./
 COPY .sqlx/ .sqlx/
 COPY dwctl/ dwctl/
 COPY dashboard/ dashboard/
 
-# Build frontend with environment variable and copy to dwctl/static
+# Build frontend and copy to dwctl/static
 WORKDIR /app/dashboard
-ENV VITE_AI_API_BASE_URL=${VITE_AI_API_BASE_URL}
 RUN npm ci && npm run build
 WORKDIR /app
 RUN rm -rf dwctl/static && cp -r dashboard/dist dwctl/static

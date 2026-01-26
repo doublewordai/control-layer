@@ -509,6 +509,11 @@ pub struct Metadata {
 
     /// Custom HTML title for the dashboard (e.g., "ACME Corp Control Layer")
     pub title: Option<String>,
+
+    /// Base URL for AI API endpoints (files, batches, daemons)
+    /// If not set, the frontend uses relative paths (same-origin requests)
+    /// Example: "https://api.doubleword.ai"
+    pub ai_api_base_url: Option<String>,
 }
 
 impl Default for Metadata {
@@ -519,6 +524,7 @@ impl Default for Metadata {
             docs_url: "https://docs.doubleword.ai/control-layer".to_string(),
             docs_jsonl_url: None,
             title: None,
+            ai_api_base_url: None,
         }
     }
 }
