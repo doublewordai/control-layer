@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT u.id\n            FROM api_keys ak\n            JOIN users u ON ak.user_id = u.id\n            WHERE ak.secret = $1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "f20d5457b27a8853987e1fe40158fb5864f9c9161e93d018c7002919bcdc8343"
+}

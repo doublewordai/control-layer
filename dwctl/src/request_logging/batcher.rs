@@ -450,6 +450,9 @@ where
     }
 
     /// Batch lookup model info with tariffs.
+    ///
+    /// Fetches ALL tariffs (including expired ones) to support historical pricing
+    /// for batch requests that may have been created in the past.
     async fn batch_lookup_models_with_tariffs(&self, aliases: &[&str]) -> Result<HashMap<String, ModelInfo>, sqlx::Error> {
         let aliases_vec: Vec<String> = aliases.iter().map(|s| s.to_string()).collect();
 
@@ -458,12 +461,13 @@ where
             provider_name: Option<String>,
             tariff_purpose: Option<String>,
             tariff_valid_from: Option<DateTime<Utc>>,
+            tariff_valid_until: Option<DateTime<Utc>>,
             tariff_input_price: Option<Decimal>,
             tariff_output_price: Option<Decimal>,
             tariff_completion_window: Option<String>,
         }
 
-        // Query models with their tariffs in a single query
+        // Query models with ALL their tariffs (including expired) for historical pricing
         let rows: Vec<ModelRow> = sqlx::query_as!(
             ModelRow,
             r#"
@@ -472,12 +476,13 @@ where
                 ie.name as provider_name,
                 mt.api_key_purpose as tariff_purpose,
                 mt.valid_from as tariff_valid_from,
+                mt.valid_until as tariff_valid_until,
                 mt.input_price_per_token as tariff_input_price,
                 mt.output_price_per_token as tariff_output_price,
                 mt.completion_window as tariff_completion_window
             FROM deployed_models dm
             LEFT JOIN inference_endpoints ie ON dm.hosted_on = ie.id
-            LEFT JOIN model_tariffs mt ON mt.deployed_model_id = dm.id AND mt.valid_until IS NULL
+            LEFT JOIN model_tariffs mt ON mt.deployed_model_id = dm.id
             WHERE dm.alias = ANY($1)
             ORDER BY dm.alias, mt.valid_from DESC
             "#,
@@ -504,6 +509,7 @@ where
                 entry.tariffs.push(TariffInfo {
                     purpose: parse_api_key_purpose(&purpose),
                     effective_from: valid_from,
+                    valid_until: row.tariff_valid_until,
                     input_price_per_token: input_price,
                     output_price_per_token: output_price,
                     completion_window: row.tariff_completion_window,
@@ -519,8 +525,8 @@ where
     ///
     /// Implements fallback logic:
     /// 1. Try exact match (purpose + completion_window + timestamp)
-    /// 2. Fall back to purpose match without completion_window
-    /// 3. Fall back to realtime purpose
+    /// 2. Fall back to generic tariff for that purpose (completion_window = None)
+    /// 3. Fall back to realtime purpose (generic)
     fn find_best_tariff(
         &self,
         tariffs: &[TariffInfo],
@@ -530,10 +536,17 @@ where
     ) -> (Option<Decimal>, Option<Decimal>) {
         let purpose = api_key_purpose.unwrap_or(&ApiKeyPurpose::Realtime);
 
-        // Filter tariffs valid at timestamp
-        let valid_tariffs: Vec<_> = tariffs.iter().filter(|t| t.effective_from <= timestamp).collect();
+        // Filter tariffs valid at timestamp:
+        // effective_from <= timestamp AND (valid_until IS NULL OR valid_until > timestamp)
+        let valid_tariffs: Vec<_> = tariffs
+            .iter()
+            .filter(|t| {
+                t.effective_from <= timestamp
+                    && t.valid_until.map_or(true, |valid_until| valid_until > timestamp)
+            })
+            .collect();
 
-        // Try exact match with completion_window (for batch tariffs)
+        // Try exact match with completion_window (for batch tariffs with specific SLA)
         if let Some(cw) = completion_window
             && let Some(tariff) = valid_tariffs
                 .iter()
@@ -542,14 +555,20 @@ where
             return (Some(tariff.input_price_per_token), Some(tariff.output_price_per_token));
         }
 
-        // Try purpose match without completion_window
-        if let Some(tariff) = valid_tariffs.iter().find(|t| &t.purpose == purpose) {
+        // Try generic tariff for this purpose (completion_window = None)
+        // This ensures we don't accidentally match a different SLA tier
+        if let Some(tariff) = valid_tariffs
+            .iter()
+            .find(|t| &t.purpose == purpose && t.completion_window.is_none())
+        {
             return (Some(tariff.input_price_per_token), Some(tariff.output_price_per_token));
         }
 
-        // Fall back to realtime
+        // Fall back to generic realtime tariff
         if purpose != &ApiKeyPurpose::Realtime
-            && let Some(tariff) = valid_tariffs.iter().find(|t| t.purpose == ApiKeyPurpose::Realtime)
+            && let Some(tariff) = valid_tariffs
+                .iter()
+                .find(|t| t.purpose == ApiKeyPurpose::Realtime && t.completion_window.is_none())
         {
             return (Some(tariff.input_price_per_token), Some(tariff.output_price_per_token));
         }
@@ -879,6 +898,7 @@ struct ModelInfo {
 struct TariffInfo {
     purpose: ApiKeyPurpose,
     effective_from: DateTime<Utc>,
+    valid_until: Option<DateTime<Utc>>,
     input_price_per_token: Decimal,
     output_price_per_token: Decimal,
     completion_window: Option<String>,
@@ -980,5 +1000,673 @@ mod tests {
         assert_eq!(compute_request_origin(None, None), "api");
         assert_eq!(compute_request_origin(Some(&ApiKeyPurpose::Realtime), None), "api");
         assert_eq!(compute_request_origin(Some(&ApiKeyPurpose::Platform), None), "api");
+    }
+
+    /// Helper to create test tariffs
+    fn make_tariff(
+        purpose: ApiKeyPurpose,
+        effective_from: DateTime<Utc>,
+        valid_until: Option<DateTime<Utc>>,
+        input_price: &str,
+        output_price: &str,
+        completion_window: Option<&str>,
+    ) -> TariffInfo {
+        TariffInfo {
+            purpose,
+            effective_from,
+            valid_until,
+            input_price_per_token: Decimal::from_str(input_price).unwrap(),
+            output_price_per_token: Decimal::from_str(output_price).unwrap(),
+            completion_window: completion_window.map(|s| s.to_string()),
+        }
+    }
+
+    /// Helper to call find_best_tariff without needing a full batcher
+    fn find_tariff(
+        tariffs: &[TariffInfo],
+        api_key_purpose: Option<&ApiKeyPurpose>,
+        completion_window: Option<&str>,
+        timestamp: DateTime<Utc>,
+    ) -> (Option<Decimal>, Option<Decimal>) {
+        let purpose = api_key_purpose.unwrap_or(&ApiKeyPurpose::Realtime);
+
+        // Filter tariffs valid at timestamp
+        let valid_tariffs: Vec<_> = tariffs
+            .iter()
+            .filter(|t| {
+                t.effective_from <= timestamp
+                    && t.valid_until.map_or(true, |valid_until| valid_until > timestamp)
+            })
+            .collect();
+
+        // Try exact match with completion_window
+        if let Some(cw) = completion_window
+            && let Some(tariff) = valid_tariffs
+                .iter()
+                .find(|t| &t.purpose == purpose && t.completion_window.as_deref() == Some(cw))
+        {
+            return (Some(tariff.input_price_per_token), Some(tariff.output_price_per_token));
+        }
+
+        // Try generic tariff for this purpose
+        if let Some(tariff) = valid_tariffs
+            .iter()
+            .find(|t| &t.purpose == purpose && t.completion_window.is_none())
+        {
+            return (Some(tariff.input_price_per_token), Some(tariff.output_price_per_token));
+        }
+
+        // Fall back to generic realtime
+        if purpose != &ApiKeyPurpose::Realtime
+            && let Some(tariff) = valid_tariffs
+                .iter()
+                .find(|t| t.purpose == ApiKeyPurpose::Realtime && t.completion_window.is_none())
+        {
+            return (Some(tariff.input_price_per_token), Some(tariff.output_price_per_token));
+        }
+
+        (None, None)
+    }
+
+    #[test]
+    fn test_find_best_tariff_exact_match() {
+        let now = chrono::Utc::now();
+        let tariffs = vec![
+            make_tariff(ApiKeyPurpose::Realtime, now - chrono::Duration::days(1), None, "0.00010", "0.00020", None),
+        ];
+
+        let (input, output) = find_tariff(&tariffs, Some(&ApiKeyPurpose::Realtime), None, now);
+        assert_eq!(input, Some(Decimal::from_str("0.00010").unwrap()));
+        assert_eq!(output, Some(Decimal::from_str("0.00020").unwrap()));
+    }
+
+    #[test]
+    fn test_find_best_tariff_batch_vs_realtime() {
+        let now = chrono::Utc::now();
+        let tariffs = vec![
+            make_tariff(ApiKeyPurpose::Realtime, now - chrono::Duration::days(1), None, "0.00010", "0.00020", None),
+            make_tariff(ApiKeyPurpose::Batch, now - chrono::Duration::days(1), None, "0.00005", "0.00010", None),
+        ];
+
+        // Batch purpose should get batch pricing
+        let (input, output) = find_tariff(&tariffs, Some(&ApiKeyPurpose::Batch), None, now);
+        assert_eq!(input, Some(Decimal::from_str("0.00005").unwrap()));
+        assert_eq!(output, Some(Decimal::from_str("0.00010").unwrap()));
+
+        // Realtime purpose should get realtime pricing
+        let (input, output) = find_tariff(&tariffs, Some(&ApiKeyPurpose::Realtime), None, now);
+        assert_eq!(input, Some(Decimal::from_str("0.00010").unwrap()));
+        assert_eq!(output, Some(Decimal::from_str("0.00020").unwrap()));
+    }
+
+    #[test]
+    fn test_find_best_tariff_fallback_to_realtime() {
+        // When batch tariff is missing, should fall back to realtime
+        let now = chrono::Utc::now();
+        let tariffs = vec![
+            make_tariff(ApiKeyPurpose::Realtime, now - chrono::Duration::days(1), None, "0.00015", "0.00030", None),
+        ];
+
+        // Batch purpose with no batch tariff should fall back to realtime
+        let (input, output) = find_tariff(&tariffs, Some(&ApiKeyPurpose::Batch), None, now);
+        assert_eq!(input, Some(Decimal::from_str("0.00015").unwrap()));
+        assert_eq!(output, Some(Decimal::from_str("0.00030").unwrap()));
+    }
+
+    #[test]
+    fn test_find_best_tariff_historical_pricing() {
+        // Test that expired tariffs are not selected for current requests
+        // but ARE selected for historical timestamps
+        let now = chrono::Utc::now();
+        let old_tariff_start = now - chrono::Duration::days(30);
+        let old_tariff_end = now - chrono::Duration::days(10);
+        let new_tariff_start = now - chrono::Duration::days(10);
+
+        let tariffs = vec![
+            // Old tariff: valid from 30 days ago until 10 days ago
+            make_tariff(
+                ApiKeyPurpose::Realtime,
+                old_tariff_start,
+                Some(old_tariff_end),
+                "0.00020", // Old higher price
+                "0.00040",
+                None,
+            ),
+            // New tariff: valid from 10 days ago, still active
+            make_tariff(
+                ApiKeyPurpose::Realtime,
+                new_tariff_start,
+                None,
+                "0.00010", // New lower price
+                "0.00020",
+                None,
+            ),
+        ];
+
+        // Current request should use new pricing
+        let (input, output) = find_tariff(&tariffs, Some(&ApiKeyPurpose::Realtime), None, now);
+        assert_eq!(input, Some(Decimal::from_str("0.00010").unwrap()), "Current request should use new pricing");
+        assert_eq!(output, Some(Decimal::from_str("0.00020").unwrap()));
+
+        // Historical request (20 days ago) should use old pricing
+        let historical_time = now - chrono::Duration::days(20);
+        let (input, output) = find_tariff(&tariffs, Some(&ApiKeyPurpose::Realtime), None, historical_time);
+        assert_eq!(input, Some(Decimal::from_str("0.00020").unwrap()), "Historical request should use old pricing");
+        assert_eq!(output, Some(Decimal::from_str("0.00040").unwrap()));
+    }
+
+    #[test]
+    fn test_find_best_tariff_completion_window_exact_match() {
+        // Test that completion_window-specific tariffs are matched correctly
+        let now = chrono::Utc::now();
+        let tariffs = vec![
+            // Generic batch tariff (no completion_window)
+            make_tariff(ApiKeyPurpose::Batch, now - chrono::Duration::days(1), None, "0.00010", "0.00020", None),
+            // SLA-specific batch tariff for 24h window
+            make_tariff(
+                ApiKeyPurpose::Batch,
+                now - chrono::Duration::days(1),
+                None,
+                "0.00005", // Cheaper for 24h SLA
+                "0.00010",
+                Some("24h"),
+            ),
+        ];
+
+        // Request with 24h completion window should get the SLA-specific pricing
+        let (input, output) = find_tariff(&tariffs, Some(&ApiKeyPurpose::Batch), Some("24h"), now);
+        assert_eq!(input, Some(Decimal::from_str("0.00005").unwrap()), "24h SLA should get specific pricing");
+        assert_eq!(output, Some(Decimal::from_str("0.00010").unwrap()));
+
+        // Request without completion window should get generic batch pricing
+        let (input, output) = find_tariff(&tariffs, Some(&ApiKeyPurpose::Batch), None, now);
+        assert_eq!(input, Some(Decimal::from_str("0.00010").unwrap()), "No SLA should get generic pricing");
+        assert_eq!(output, Some(Decimal::from_str("0.00020").unwrap()));
+    }
+
+    #[test]
+    fn test_find_best_tariff_completion_window_fallback_to_generic() {
+        // Test that unknown completion_window falls back to generic tariff, not another SLA
+        let now = chrono::Utc::now();
+        let tariffs = vec![
+            // Generic batch tariff
+            make_tariff(ApiKeyPurpose::Batch, now - chrono::Duration::days(1), None, "0.00010", "0.00020", None),
+            // 24h SLA tariff
+            make_tariff(
+                ApiKeyPurpose::Batch,
+                now - chrono::Duration::days(1),
+                None,
+                "0.00005",
+                "0.00010",
+                Some("24h"),
+            ),
+            // 7d SLA tariff
+            make_tariff(
+                ApiKeyPurpose::Batch,
+                now - chrono::Duration::days(1),
+                None,
+                "0.00003",
+                "0.00006",
+                Some("7d"),
+            ),
+        ];
+
+        // Request with unknown "1h" SLA should fall back to generic, NOT to 24h or 7d
+        let (input, output) = find_tariff(&tariffs, Some(&ApiKeyPurpose::Batch), Some("1h"), now);
+        assert_eq!(
+            input,
+            Some(Decimal::from_str("0.00010").unwrap()),
+            "Unknown SLA should fall back to generic, not another SLA"
+        );
+        assert_eq!(output, Some(Decimal::from_str("0.00020").unwrap()));
+    }
+
+    #[test]
+    fn test_find_best_tariff_no_matching_tariff() {
+        let now = chrono::Utc::now();
+        let tariffs = vec![];
+
+        let (input, output) = find_tariff(&tariffs, Some(&ApiKeyPurpose::Realtime), None, now);
+        assert_eq!(input, None);
+        assert_eq!(output, None);
+    }
+
+    #[test]
+    fn test_find_best_tariff_future_tariff_not_used() {
+        // Tariff that starts in the future should not be selected
+        let now = chrono::Utc::now();
+        let tariffs = vec![make_tariff(
+            ApiKeyPurpose::Realtime,
+            now + chrono::Duration::days(1), // Starts tomorrow
+            None,
+            "0.00010",
+            "0.00020",
+            None,
+        )];
+
+        let (input, output) = find_tariff(&tariffs, Some(&ApiKeyPurpose::Realtime), None, now);
+        assert_eq!(input, None, "Future tariff should not be selected");
+        assert_eq!(output, None);
+    }
+
+    use rust_decimal::prelude::FromStr;
+}
+
+/// Integration tests for the batcher that require database access
+#[cfg(test)]
+mod integration_tests {
+    use super::*;
+    use crate::api::models::transactions::TransactionFilters;
+    use crate::api::models::users::Role;
+    use crate::db::handlers::credits::Credits;
+    use crate::db::handlers::Repository;
+    use crate::db::models::credits::CreditTransactionType;
+    use crate::test::utils::create_test_user;
+    use rust_decimal::prelude::FromStr;
+    use sqlx::PgPool;
+
+    /// Helper: Create a test model with endpoint
+    async fn create_test_model(pool: &PgPool, model_name: &str) -> crate::types::DeploymentId {
+        use crate::db::handlers::{Deployments, InferenceEndpoints};
+        use crate::db::models::{
+            deployments::DeploymentCreateDBRequest, inference_endpoints::InferenceEndpointCreateDBRequest,
+        };
+        use std::str::FromStr as _;
+
+        let user = create_test_user(pool, Role::StandardUser).await;
+
+        // Create endpoint
+        let mut conn = pool.acquire().await.unwrap();
+        let mut endpoints_repo = InferenceEndpoints::new(&mut conn);
+        let endpoint = endpoints_repo
+            .create(&InferenceEndpointCreateDBRequest {
+                created_by: user.id,
+                name: format!("test-endpoint-{}", Uuid::new_v4()),
+                description: None,
+                url: url::Url::from_str("https://api.test.com").unwrap(),
+                api_key: None,
+                model_filter: None,
+                auth_header_name: Some("Authorization".to_string()),
+                auth_header_prefix: Some("Bearer ".to_string()),
+            })
+            .await
+            .unwrap();
+
+        // Create deployment
+        let mut conn = pool.acquire().await.unwrap();
+        let mut deployments_repo = Deployments::new(&mut conn);
+        let deployment = deployments_repo
+            .create(&DeploymentCreateDBRequest {
+                created_by: user.id,
+                model_name: model_name.to_string(),
+                alias: model_name.to_string(),
+                description: None,
+                model_type: None,
+                capabilities: None,
+                hosted_on: Some(endpoint.id),
+                requests_per_second: None,
+                burst_size: None,
+                capacity: None,
+                batch_capacity: None,
+                provider_pricing: None,
+                is_composite: false,
+                lb_strategy: None,
+                fallback_enabled: None,
+                fallback_on_rate_limit: None,
+                fallback_on_status: None,
+                sanitize_responses: true,
+            })
+            .await
+            .unwrap();
+
+        deployment.id
+    }
+
+    /// Helper: Setup a tariff for a model
+    /// Note: Batch tariffs require a completion_window per database constraint
+    async fn setup_tariff(
+        pool: &PgPool,
+        deployed_model_id: crate::types::DeploymentId,
+        input_price: Decimal,
+        output_price: Decimal,
+        api_key_purpose: ApiKeyPurpose,
+    ) {
+        use crate::db::handlers::Tariffs;
+        use crate::db::models::tariffs::TariffCreateDBRequest;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut tariffs_repo = Tariffs::new(&mut conn);
+
+        // Batch tariffs require a completion_window
+        let completion_window = if api_key_purpose == ApiKeyPurpose::Batch {
+            Some("24h".to_string())
+        } else {
+            None
+        };
+
+        tariffs_repo
+            .create(&TariffCreateDBRequest {
+                deployed_model_id,
+                name: format!("{:?}_tariff", api_key_purpose),
+                api_key_purpose: Some(api_key_purpose),
+                input_price_per_token: input_price,
+                output_price_per_token: output_price,
+                valid_from: None,
+                completion_window,
+            })
+            .await
+            .unwrap();
+    }
+
+    /// Helper: Create a user with initial balance
+    async fn setup_user_with_balance(pool: &PgPool, balance: Decimal) -> Uuid {
+        use crate::db::handlers::credits::Credits;
+        use crate::db::models::credits::{CreditTransactionCreateDBRequest, CreditTransactionType};
+
+        let user = create_test_user(pool, Role::StandardUser).await;
+
+        if balance > Decimal::ZERO {
+            let mut conn = pool.acquire().await.unwrap();
+            let mut credits = Credits::new(&mut conn);
+            credits
+                .create_transaction(&CreditTransactionCreateDBRequest {
+                    user_id: user.id,
+                    transaction_type: CreditTransactionType::Purchase,
+                    amount: balance,
+                    source_id: format!("test-topup-{}", Uuid::new_v4()),
+                    description: Some("Test topup".to_string()),
+                    fusillade_batch_id: None,
+                })
+                .await
+                .unwrap();
+        }
+
+        user.id
+    }
+
+    /// Helper: Create an API key for a user
+    async fn create_api_key_for_user(pool: &PgPool, user_id: Uuid, purpose: ApiKeyPurpose) -> String {
+        use crate::db::handlers::api_keys::ApiKeys;
+        use crate::db::models::api_keys::ApiKeyCreateDBRequest;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut api_keys = ApiKeys::new(&mut conn);
+        let api_key = api_keys
+            .create(&ApiKeyCreateDBRequest {
+                user_id,
+                name: format!("test-key-{}", Uuid::new_v4()),
+                description: None,
+                purpose,
+                requests_per_second: None,
+                burst_size: None,
+            })
+            .await
+            .unwrap();
+
+        api_key.secret
+    }
+
+    /// Helper: Create a raw analytics record for testing
+    fn create_raw_record(
+        model: &str,
+        bearer_token: Option<String>,
+        prompt_tokens: i64,
+        completion_tokens: i64,
+    ) -> RawAnalyticsRecord {
+        RawAnalyticsRecord {
+            instance_id: Uuid::new_v4(),
+            correlation_id: rand::random::<i64>().abs(),
+            timestamp: chrono::Utc::now(),
+            method: "POST".to_string(),
+            uri: "/ai/v1/chat/completions".to_string(),
+            request_model: Some(model.to_string()),
+            response_model: Some(model.to_string()),
+            status_code: 200,
+            duration_ms: 100,
+            duration_to_first_byte_ms: Some(50),
+            prompt_tokens,
+            completion_tokens,
+            total_tokens: prompt_tokens + completion_tokens,
+            response_type: "chat_completion".to_string(),
+            server_address: "api.test.com".to_string(),
+            server_port: 443,
+            bearer_token,
+            fusillade_batch_id: None,
+            fusillade_request_id: None,
+            custom_id: None,
+            batch_completion_window: None,
+            batch_created_at: None,
+            batch_request_source: String::new(),
+        }
+    }
+
+    /// Run the batcher with given records and wait for completion
+    async fn run_batcher_with_records(pool: &PgPool, records: Vec<RawAnalyticsRecord>) {
+        let config = crate::test::utils::create_test_config();
+        let (batcher, sender) = AnalyticsBatcher::<crate::metrics::GenAiMetrics>::new(pool.clone(), config, None);
+
+        // Send all records
+        for record in records {
+            sender.send(record).await.unwrap();
+        }
+
+        // Drop sender to close channel
+        drop(sender);
+
+        // Run batcher until channel is drained
+        let shutdown = CancellationToken::new();
+        batcher.run(shutdown).await;
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_batcher_credit_deduction_successful(pool: PgPool) {
+        // Setup: Create model with tariff
+        let model_id = create_test_model(&pool, "gpt-4-test").await;
+        let input_price = Decimal::from_str("0.00001").unwrap();
+        let output_price = Decimal::from_str("0.00003").unwrap();
+        setup_tariff(&pool, model_id, input_price, output_price, ApiKeyPurpose::Realtime).await;
+
+        // Setup: User with $10.00 balance
+        let initial_balance = Decimal::from_str("10.00").unwrap();
+        let user_id = setup_user_with_balance(&pool, initial_balance).await;
+        let api_key = create_api_key_for_user(&pool, user_id, ApiKeyPurpose::Realtime).await;
+
+        // Create record: 1000 input tokens, 500 output tokens
+        // Expected cost: (1000 * 0.00001) + (500 * 0.00003) = 0.01 + 0.015 = 0.025
+        let record = create_raw_record("gpt-4-test", Some(api_key), 1000, 500);
+
+        // Run batcher
+        run_batcher_with_records(&pool, vec![record]).await;
+
+        // Verify: Balance should be deducted
+        let mut conn = pool.acquire().await.unwrap();
+        let mut credits = Credits::new(&mut conn);
+        let final_balance = credits.get_user_balance(user_id).await.unwrap();
+
+        let expected_cost = Decimal::from_str("0.025").unwrap();
+        let expected_balance = initial_balance - expected_cost;
+        assert_eq!(final_balance, expected_balance, "Balance should be deducted correctly");
+
+        // Verify: Transaction was created
+        let transactions = credits
+            .list_user_transactions(user_id, 0, 10, &TransactionFilters::default())
+            .await
+            .unwrap();
+        let usage_tx = transactions.iter().find(|tx| tx.transaction_type == CreditTransactionType::Usage);
+        assert!(usage_tx.is_some(), "Usage transaction should be created");
+        assert_eq!(usage_tx.unwrap().amount, expected_cost);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_batcher_different_tariffs_for_batch_and_realtime(pool: PgPool) {
+        // Setup: Create model with different tariffs for batch and realtime
+        let model_id = create_test_model(&pool, "gpt-4-turbo-test").await;
+
+        // Batch pricing: cheaper
+        setup_tariff(
+            &pool,
+            model_id,
+            Decimal::from_str("0.00005").unwrap(),
+            Decimal::from_str("0.00010").unwrap(),
+            ApiKeyPurpose::Batch,
+        )
+        .await;
+
+        // Realtime pricing: more expensive (2x)
+        setup_tariff(
+            &pool,
+            model_id,
+            Decimal::from_str("0.00010").unwrap(),
+            Decimal::from_str("0.00020").unwrap(),
+            ApiKeyPurpose::Realtime,
+        )
+        .await;
+
+        // Setup: User with balance
+        let user_id = setup_user_with_balance(&pool, Decimal::from_str("100.00").unwrap()).await;
+        let batch_key = create_api_key_for_user(&pool, user_id, ApiKeyPurpose::Batch).await;
+        let realtime_key = create_api_key_for_user(&pool, user_id, ApiKeyPurpose::Realtime).await;
+
+        // Create records: same tokens, different API keys
+        // Batch record needs completion_window to match the batch tariff
+        let mut batch_record = create_raw_record("gpt-4-turbo-test", Some(batch_key), 1000, 500);
+        batch_record.batch_completion_window = Some("24h".to_string());
+        let realtime_record = create_raw_record("gpt-4-turbo-test", Some(realtime_key), 1000, 500);
+
+        // Run batcher
+        run_batcher_with_records(&pool, vec![batch_record, realtime_record]).await;
+
+        // Expected costs:
+        // Batch: (1000 * 0.00005) + (500 * 0.00010) = 0.05 + 0.05 = 0.10
+        // Realtime: (1000 * 0.00010) + (500 * 0.00020) = 0.10 + 0.10 = 0.20
+        let expected_batch_cost = Decimal::from_str("0.10").unwrap();
+        let expected_realtime_cost = Decimal::from_str("0.20").unwrap();
+        let total_cost = expected_batch_cost + expected_realtime_cost;
+
+        // Verify balance
+        let mut conn = pool.acquire().await.unwrap();
+        let mut credits = Credits::new(&mut conn);
+        let final_balance = credits.get_user_balance(user_id).await.unwrap();
+        let expected_balance = Decimal::from_str("100.00").unwrap() - total_cost;
+        assert_eq!(final_balance, expected_balance, "Balance should reflect both charges");
+
+        // Verify transactions
+        let transactions = credits
+            .list_user_transactions(user_id, 0, 10, &TransactionFilters::default())
+            .await
+            .unwrap();
+        let usage_txs: Vec<_> = transactions
+            .iter()
+            .filter(|tx| tx.transaction_type == CreditTransactionType::Usage)
+            .collect();
+        assert_eq!(usage_txs.len(), 2, "Should have 2 usage transactions");
+
+        // Check that we have both amounts (order may vary)
+        let amounts: Vec<_> = usage_txs.iter().map(|tx| tx.amount).collect();
+        assert!(amounts.contains(&expected_batch_cost), "Should have batch cost transaction");
+        assert!(amounts.contains(&expected_realtime_cost), "Should have realtime cost transaction");
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_batcher_fallback_to_realtime_when_batch_tariff_missing(pool: PgPool) {
+        // Setup: Create model with ONLY realtime tariff
+        let model_id = create_test_model(&pool, "gpt-4-fallback-test").await;
+        let realtime_input = Decimal::from_str("0.00015").unwrap();
+        let realtime_output = Decimal::from_str("0.00030").unwrap();
+        setup_tariff(&pool, model_id, realtime_input, realtime_output, ApiKeyPurpose::Realtime).await;
+
+        // Setup: User with batch API key (no batch tariff exists)
+        let user_id = setup_user_with_balance(&pool, Decimal::from_str("100.00").unwrap()).await;
+        let batch_key = create_api_key_for_user(&pool, user_id, ApiKeyPurpose::Batch).await;
+
+        // Create batch record
+        let record = create_raw_record("gpt-4-fallback-test", Some(batch_key), 1000, 500);
+
+        // Run batcher
+        run_batcher_with_records(&pool, vec![record]).await;
+
+        // Expected: Should fall back to realtime pricing
+        // Cost: (1000 * 0.00015) + (500 * 0.00030) = 0.15 + 0.15 = 0.30
+        let expected_cost = Decimal::from_str("0.30").unwrap();
+
+        // Verify
+        let mut conn = pool.acquire().await.unwrap();
+        let mut credits = Credits::new(&mut conn);
+        let final_balance = credits.get_user_balance(user_id).await.unwrap();
+        let expected_balance = Decimal::from_str("100.00").unwrap() - expected_cost;
+        assert_eq!(final_balance, expected_balance, "Batch request should fall back to realtime pricing");
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_batcher_skip_deduction_when_no_pricing(pool: PgPool) {
+        // Setup: Create model WITHOUT any tariff
+        let _model_id = create_test_model(&pool, "gpt-4-no-tariff").await;
+
+        // Setup: User with balance
+        let initial_balance = Decimal::from_str("100.00").unwrap();
+        let user_id = setup_user_with_balance(&pool, initial_balance).await;
+        let api_key = create_api_key_for_user(&pool, user_id, ApiKeyPurpose::Realtime).await;
+
+        // Create record
+        let record = create_raw_record("gpt-4-no-tariff", Some(api_key), 1000, 500);
+
+        // Run batcher
+        run_batcher_with_records(&pool, vec![record]).await;
+
+        // Verify: Balance should NOT be deducted (no pricing)
+        let mut conn = pool.acquire().await.unwrap();
+        let mut credits = Credits::new(&mut conn);
+        let final_balance = credits.get_user_balance(user_id).await.unwrap();
+        assert_eq!(final_balance, initial_balance, "Balance should not change when no pricing configured");
+
+        // Verify: No usage transaction created
+        let transactions = credits
+            .list_user_transactions(user_id, 0, 10, &TransactionFilters::default())
+            .await
+            .unwrap();
+        let usage_txs: Vec<_> = transactions
+            .iter()
+            .filter(|tx| tx.transaction_type == CreditTransactionType::Usage)
+            .collect();
+        assert_eq!(usage_txs.len(), 0, "Should have no usage transactions");
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_batcher_skip_deduction_for_unauthenticated_requests(pool: PgPool) {
+        // Setup: Create model with tariff
+        let model_id = create_test_model(&pool, "gpt-4-unauth-test").await;
+        setup_tariff(
+            &pool,
+            model_id,
+            Decimal::from_str("0.00010").unwrap(),
+            Decimal::from_str("0.00020").unwrap(),
+            ApiKeyPurpose::Realtime,
+        )
+        .await;
+
+        // Create record without bearer token
+        let record = create_raw_record("gpt-4-unauth-test", None, 1000, 500);
+
+        // Run batcher - should not panic or create transactions
+        run_batcher_with_records(&pool, vec![record]).await;
+
+        // Verify: Analytics record was created
+        let count = sqlx::query_scalar!("SELECT COUNT(*) FROM http_analytics WHERE model = 'gpt-4-unauth-test'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, Some(1), "Analytics record should be created");
+
+        // Verify: No credit transaction (no user to charge)
+        let tx_count = sqlx::query_scalar!("SELECT COUNT(*) FROM credits_transactions")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(tx_count, Some(0), "No credit transactions for unauthenticated requests");
     }
 }

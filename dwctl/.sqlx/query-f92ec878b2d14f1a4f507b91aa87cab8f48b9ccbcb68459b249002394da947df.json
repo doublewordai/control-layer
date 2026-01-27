@@ -1,0 +1,25 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n\n        -- Unravel the list of group ids to check into a table\n        WITH incoming AS (\n            SELECT unnest($1::text[]) AS name\n        ),\n\n        -- Find the ids of groups that already exist with that name for this source\n        existing AS (\n            SELECT id, name\n            FROM groups\n            WHERE name IN (SELECT name FROM incoming)\n              AND source = $2\n        ),\n\n        -- Insert any non existing ones\n        inserted AS (\n            INSERT INTO groups (name, description, created_by, created_at, updated_at, source)\n            SELECT name, $4, $3, NOW(), NOW(), $2\n            FROM incoming i\n            WHERE NOT EXISTS (\n                SELECT 1 FROM groups g WHERE g.name = i.name\n            ) --NB THIS CURRENTLY MEANS YOU CANT HAVE THE SAME NAMES but different sources.\n            -- You could change the constraint to allow this, and then we wouldn't need to check every existing one for the name just the existing ones for that sso provider only.\n            RETURNING id, name\n        ),\n\n        -- Get the ids for the found existing, and the inserted ones\n        all_ids AS (\n            SELECT * FROM existing\n            UNION ALL\n            SELECT * FROM inserted\n        ),\n\n        -- Get ids of all the groups this user isn't a member of for this source - either they were\n        -- never members or they've been removed since being added.\n        orphan_ids AS (\n            SELECT id FROM groups g\n            WHERE g.source = $2\n              AND g.id NOT IN (SELECT id FROM all_ids)\n        ),\n\n        -- Remove memberships from groups the user shouldn't be in\n        deleted_user_groups AS (\n            DELETE FROM user_groups ug\n            USING orphan_ids o\n            WHERE ug.group_id = o.id\n            RETURNING ug.group_id\n        ),\n\n        -- Add memberships to groups the user should be in, if they're already in then just skip.\n        insert_user_groups AS (\n            INSERT INTO user_groups (user_id, group_id)\n            SELECT $3, g.id\n            FROM all_ids g\n            ON CONFLICT (user_id, group_id) DO NOTHING\n            RETURNING user_id, group_id\n        )\n\n        -- We want back the ids of the groups that this user is now in.\n        SELECT array_agg(id) AS member_group_ids\n        FROM all_ids\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "member_group_ids",
+        "type_info": "UuidArray"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "TextArray",
+        "Text",
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "f92ec878b2d14f1a4f507b91aa87cab8f48b9ccbcb68459b249002394da947df"
+}
