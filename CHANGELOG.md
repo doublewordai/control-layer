@@ -1,5 +1,21 @@
 # Changelog
 
+## [4.0.0](https://github.com/doublewordai/control-layer/compare/v3.3.1...v4.0.0) (2026-01-27)
+
+
+### ⚠ BREAKING CHANGES
+
+* File limits configuration has been reorganized.
+
+### Features
+
+* consolidate file limits config and add max_requests_per_file ([#617](https://github.com/doublewordai/control-layer/issues/617)) ([7bd0ee3](https://github.com/doublewordai/control-layer/commit/7bd0ee304bbb2cefb02afec85f230d824f9daf3c))
+
+
+### Bug Fixes
+
+* **deps:** update dependency lucide-react to ^0.563.0 ([#621](https://github.com/doublewordai/control-layer/issues/621)) ([52d8e8e](https://github.com/doublewordai/control-layer/commit/52d8e8ea9d5fe224c2ec9beaa5b26c91dcbd65b8))
+
 ## [3.3.1](https://github.com/doublewordai/control-layer/compare/v3.3.0...v3.3.1) (2026-01-27)
 
 
