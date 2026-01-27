@@ -2281,8 +2281,8 @@ mod tests {
         // Test the limiter directly with max_concurrent=1, max_waiting=1
         let config = FileLimitsConfig {
             max_concurrent_uploads: 1,
-            max_waiting_uploads: 1,   // Only allow 1 waiter
-            max_upload_wait_secs: 0,  // Reject immediately when can't acquire
+            max_waiting_uploads: 1,  // Only allow 1 waiter
+            max_upload_wait_secs: 0, // Reject immediately when can't acquire
             ..Default::default()
         };
         let limiter = Arc::new(UploadLimiter::new(&config).unwrap());

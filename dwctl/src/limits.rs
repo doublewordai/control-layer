@@ -62,7 +62,11 @@ impl UploadLimiter {
             semaphore: Arc::new(Semaphore::new(config.max_concurrent_uploads)),
             waiting_count: AtomicUsize::new(0),
             // 0 means unlimited waiting queue
-            max_waiting: if config.max_waiting_uploads == 0 { None } else { Some(config.max_waiting_uploads) },
+            max_waiting: if config.max_waiting_uploads == 0 {
+                None
+            } else {
+                Some(config.max_waiting_uploads)
+            },
             max_wait: Duration::from_secs(config.max_upload_wait_secs),
         })
     }
