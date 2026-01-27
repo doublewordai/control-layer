@@ -1,5 +1,17 @@
 # Changelog
 
+## [3.3.0](https://github.com/doublewordai/control-layer/compare/v3.2.0...v3.3.0) (2026-01-27)
+
+
+### Features
+
+* add configurable file upload concurrency limits ([#614](https://github.com/doublewordai/control-layer/issues/614)) ([67065a3](https://github.com/doublewordai/control-layer/commit/67065a36e8deb10554a3b9cf91a176f206e90496))
+
+
+### Bug Fixes
+
+* **deps:** update dependency lucide-react to ^0.563.0 ([#579](https://github.com/doublewordai/control-layer/issues/579)) ([ff714a2](https://github.com/doublewordai/control-layer/commit/ff714a23bb68d79118cd8d4b35b0576aa1948560))
+
 ## [3.2.0](https://github.com/doublewordai/control-layer/compare/v3.1.2...v3.2.0) (2026-01-27)
 
 
