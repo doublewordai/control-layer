@@ -28,13 +28,8 @@ use sqlx::{PgConnection, PgPool};
 use sqlx_pool_router::TestDbPools;
 use uuid::Uuid;
 
-/// Create an AppState with TestDbPools for proper read/write replica testing
-/// Use this in tests that need to manually construct AppState instead of using create_test_app
-async fn create_test_app_state(pool: PgPool) -> crate::AppState<TestDbPools> {
-    create_test_app_state_with_config(pool, create_test_config()).await
-}
-
 /// Create an AppState with TestDbPools and custom config
+/// Use this in tests that need to manually construct AppState instead of using create_test_app
 pub async fn create_test_app_state_with_config(pool: PgPool, config: crate::config::Config) -> crate::AppState<TestDbPools> {
     let test_pools = TestDbPools::new(pool.clone()).await.expect("Failed to create TestDbPools");
     let fusillade_pools = TestDbPools::new(pool.clone())
