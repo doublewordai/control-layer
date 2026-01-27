@@ -540,10 +540,7 @@ where
         // effective_from <= timestamp AND (valid_until IS NULL OR valid_until > timestamp)
         let valid_tariffs: Vec<_> = tariffs
             .iter()
-            .filter(|t| {
-                t.effective_from <= timestamp
-                    && t.valid_until.map_or(true, |valid_until| valid_until > timestamp)
-            })
+            .filter(|t| t.effective_from <= timestamp && t.valid_until.map_or(true, |valid_until| valid_until > timestamp))
             .collect();
 
         // Try exact match with completion_window (for batch tariffs with specific SLA)
@@ -1033,10 +1030,7 @@ mod tests {
         // Filter tariffs valid at timestamp
         let valid_tariffs: Vec<_> = tariffs
             .iter()
-            .filter(|t| {
-                t.effective_from <= timestamp
-                    && t.valid_until.map_or(true, |valid_until| valid_until > timestamp)
-            })
+            .filter(|t| t.effective_from <= timestamp && t.valid_until.map_or(true, |valid_until| valid_until > timestamp))
             .collect();
 
         // Try exact match with completion_window
@@ -1071,9 +1065,14 @@ mod tests {
     #[test]
     fn test_find_best_tariff_exact_match() {
         let now = chrono::Utc::now();
-        let tariffs = vec![
-            make_tariff(ApiKeyPurpose::Realtime, now - chrono::Duration::days(1), None, "0.00010", "0.00020", None),
-        ];
+        let tariffs = vec![make_tariff(
+            ApiKeyPurpose::Realtime,
+            now - chrono::Duration::days(1),
+            None,
+            "0.00010",
+            "0.00020",
+            None,
+        )];
 
         let (input, output) = find_tariff(&tariffs, Some(&ApiKeyPurpose::Realtime), None, now);
         assert_eq!(input, Some(Decimal::from_str("0.00010").unwrap()));
@@ -1084,8 +1083,22 @@ mod tests {
     fn test_find_best_tariff_batch_vs_realtime() {
         let now = chrono::Utc::now();
         let tariffs = vec![
-            make_tariff(ApiKeyPurpose::Realtime, now - chrono::Duration::days(1), None, "0.00010", "0.00020", None),
-            make_tariff(ApiKeyPurpose::Batch, now - chrono::Duration::days(1), None, "0.00005", "0.00010", None),
+            make_tariff(
+                ApiKeyPurpose::Realtime,
+                now - chrono::Duration::days(1),
+                None,
+                "0.00010",
+                "0.00020",
+                None,
+            ),
+            make_tariff(
+                ApiKeyPurpose::Batch,
+                now - chrono::Duration::days(1),
+                None,
+                "0.00005",
+                "0.00010",
+                None,
+            ),
         ];
 
         // Batch purpose should get batch pricing
@@ -1103,9 +1116,14 @@ mod tests {
     fn test_find_best_tariff_fallback_to_realtime() {
         // When batch tariff is missing, should fall back to realtime
         let now = chrono::Utc::now();
-        let tariffs = vec![
-            make_tariff(ApiKeyPurpose::Realtime, now - chrono::Duration::days(1), None, "0.00015", "0.00030", None),
-        ];
+        let tariffs = vec![make_tariff(
+            ApiKeyPurpose::Realtime,
+            now - chrono::Duration::days(1),
+            None,
+            "0.00015",
+            "0.00030",
+            None,
+        )];
 
         // Batch purpose with no batch tariff should fall back to realtime
         let (input, output) = find_tariff(&tariffs, Some(&ApiKeyPurpose::Batch), None, now);
@@ -1145,13 +1163,21 @@ mod tests {
 
         // Current request should use new pricing
         let (input, output) = find_tariff(&tariffs, Some(&ApiKeyPurpose::Realtime), None, now);
-        assert_eq!(input, Some(Decimal::from_str("0.00010").unwrap()), "Current request should use new pricing");
+        assert_eq!(
+            input,
+            Some(Decimal::from_str("0.00010").unwrap()),
+            "Current request should use new pricing"
+        );
         assert_eq!(output, Some(Decimal::from_str("0.00020").unwrap()));
 
         // Historical request (20 days ago) should use old pricing
         let historical_time = now - chrono::Duration::days(20);
         let (input, output) = find_tariff(&tariffs, Some(&ApiKeyPurpose::Realtime), None, historical_time);
-        assert_eq!(input, Some(Decimal::from_str("0.00020").unwrap()), "Historical request should use old pricing");
+        assert_eq!(
+            input,
+            Some(Decimal::from_str("0.00020").unwrap()),
+            "Historical request should use old pricing"
+        );
         assert_eq!(output, Some(Decimal::from_str("0.00040").unwrap()));
     }
 
@@ -1161,7 +1187,14 @@ mod tests {
         let now = chrono::Utc::now();
         let tariffs = vec![
             // Generic batch tariff (no completion_window)
-            make_tariff(ApiKeyPurpose::Batch, now - chrono::Duration::days(1), None, "0.00010", "0.00020", None),
+            make_tariff(
+                ApiKeyPurpose::Batch,
+                now - chrono::Duration::days(1),
+                None,
+                "0.00010",
+                "0.00020",
+                None,
+            ),
             // SLA-specific batch tariff for 24h window
             make_tariff(
                 ApiKeyPurpose::Batch,
@@ -1175,12 +1208,20 @@ mod tests {
 
         // Request with 24h completion window should get the SLA-specific pricing
         let (input, output) = find_tariff(&tariffs, Some(&ApiKeyPurpose::Batch), Some("24h"), now);
-        assert_eq!(input, Some(Decimal::from_str("0.00005").unwrap()), "24h SLA should get specific pricing");
+        assert_eq!(
+            input,
+            Some(Decimal::from_str("0.00005").unwrap()),
+            "24h SLA should get specific pricing"
+        );
         assert_eq!(output, Some(Decimal::from_str("0.00010").unwrap()));
 
         // Request without completion window should get generic batch pricing
         let (input, output) = find_tariff(&tariffs, Some(&ApiKeyPurpose::Batch), None, now);
-        assert_eq!(input, Some(Decimal::from_str("0.00010").unwrap()), "No SLA should get generic pricing");
+        assert_eq!(
+            input,
+            Some(Decimal::from_str("0.00010").unwrap()),
+            "No SLA should get generic pricing"
+        );
         assert_eq!(output, Some(Decimal::from_str("0.00020").unwrap()));
     }
 
@@ -1190,7 +1231,14 @@ mod tests {
         let now = chrono::Utc::now();
         let tariffs = vec![
             // Generic batch tariff
-            make_tariff(ApiKeyPurpose::Batch, now - chrono::Duration::days(1), None, "0.00010", "0.00020", None),
+            make_tariff(
+                ApiKeyPurpose::Batch,
+                now - chrono::Duration::days(1),
+                None,
+                "0.00010",
+                "0.00020",
+                None,
+            ),
             // 24h SLA tariff
             make_tariff(
                 ApiKeyPurpose::Batch,
@@ -1258,8 +1306,8 @@ mod integration_tests {
     use super::*;
     use crate::api::models::transactions::TransactionFilters;
     use crate::api::models::users::Role;
-    use crate::db::handlers::credits::Credits;
     use crate::db::handlers::Repository;
+    use crate::db::handlers::credits::Credits;
     use crate::db::models::credits::CreditTransactionType;
     use crate::test::utils::create_test_user;
     use rust_decimal::prelude::FromStr;
@@ -1268,9 +1316,7 @@ mod integration_tests {
     /// Helper: Create a test model with endpoint
     async fn create_test_model(pool: &PgPool, model_name: &str) -> crate::types::DeploymentId {
         use crate::db::handlers::{Deployments, InferenceEndpoints};
-        use crate::db::models::{
-            deployments::DeploymentCreateDBRequest, inference_endpoints::InferenceEndpointCreateDBRequest,
-        };
+        use crate::db::models::{deployments::DeploymentCreateDBRequest, inference_endpoints::InferenceEndpointCreateDBRequest};
         use std::str::FromStr as _;
 
         let user = create_test_user(pool, Role::StandardUser).await;
@@ -1407,12 +1453,7 @@ mod integration_tests {
     }
 
     /// Helper: Create a raw analytics record for testing
-    fn create_raw_record(
-        model: &str,
-        bearer_token: Option<String>,
-        prompt_tokens: i64,
-        completion_tokens: i64,
-    ) -> RawAnalyticsRecord {
+    fn create_raw_record(model: &str, bearer_token: Option<String>, prompt_tokens: i64, completion_tokens: i64) -> RawAnalyticsRecord {
         RawAnalyticsRecord {
             instance_id: Uuid::new_v4(),
             correlation_id: rand::random::<i64>().abs(),
@@ -1597,7 +1638,10 @@ mod integration_tests {
         let mut credits = Credits::new(&mut conn);
         let final_balance = credits.get_user_balance(user_id).await.unwrap();
         let expected_balance = Decimal::from_str("100.00").unwrap() - expected_cost;
-        assert_eq!(final_balance, expected_balance, "Batch request should fall back to realtime pricing");
+        assert_eq!(
+            final_balance, expected_balance,
+            "Batch request should fall back to realtime pricing"
+        );
     }
 
     #[sqlx::test]
@@ -1621,7 +1665,10 @@ mod integration_tests {
         let mut conn = pool.acquire().await.unwrap();
         let mut credits = Credits::new(&mut conn);
         let final_balance = credits.get_user_balance(user_id).await.unwrap();
-        assert_eq!(final_balance, initial_balance, "Balance should not change when no pricing configured");
+        assert_eq!(
+            final_balance, initial_balance,
+            "Balance should not change when no pricing configured"
+        );
 
         // Verify: No usage transaction created
         let transactions = credits
