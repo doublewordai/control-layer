@@ -807,11 +807,11 @@ pub struct LimitsConfig {
 pub struct FileUploadLimitsConfig {
     /// Maximum number of concurrent file uploads allowed system-wide.
     /// Set to 0 for unlimited (not recommended for production).
-    /// Default: 10
+    /// Default: 0 (unlimited)
     pub max_concurrent: usize,
     /// Maximum number of uploads that can wait in queue for a slot.
     /// When this limit is reached, new uploads receive HTTP 429 immediately.
-    /// Set to 0 for unlimited waiting (not recommended).
+    /// Set to 0 for unlimited waiting queue (not recommended).
     /// Default: 20
     pub max_waiting: usize,
     /// Maximum time in seconds to wait for an upload slot before returning HTTP 429.

@@ -2244,4 +2244,81 @@ mod tests {
             "Output file should be complete when batch has no pending/in-progress requests"
         );
     }
+
+    #[tokio::test]
+    async fn test_upload_rate_limiting_rejects_when_queue_full() {
+        use crate::config::FileUploadLimitsConfig;
+        use crate::limits::UploadLimiter;
+        use std::sync::Arc;
+
+        // Test the limiter directly with max_concurrent=1, max_waiting=1
+        let config = FileUploadLimitsConfig {
+            max_concurrent: 1,
+            max_waiting: 1,   // Only allow 1 waiter
+            max_wait_secs: 0, // Reject immediately when can't acquire
+        };
+        let limiter = Arc::new(UploadLimiter::new(&config).unwrap());
+
+        // Acquire the only permit
+        let _permit1 = limiter.acquire().await.unwrap();
+
+        // Second request joins the waiting queue (1 allowed)
+        let limiter_clone = limiter.clone();
+        let handle = tokio::spawn(async move { limiter_clone.acquire().await });
+
+        // Give time for the waiter to enter queue
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        // Third request should be rejected (queue full)
+        let result = limiter.acquire().await;
+        assert!(result.is_err(), "Third request should be rejected when queue is full");
+
+        if let Err(crate::errors::Error::TooManyRequests { message }) = result {
+            assert!(message.contains("Too many file uploads"));
+        } else {
+            panic!("Expected TooManyRequests error");
+        }
+
+        // Clean up
+        drop(_permit1);
+        let _ = handle.await;
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_upload_with_rate_limiter_configured(pool: PgPool) {
+        // Create app with rate limiting enabled
+        let mut config = create_test_config();
+        config.limits.file_uploads.max_concurrent = 10; // High enough to not block this test
+        config.limits.file_uploads.max_waiting = 20;
+        config.limits.file_uploads.max_wait_secs = 60;
+
+        let (app, _bg_services) = create_test_app_with_config(pool.clone(), config, false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        // Create a deployment and add to group so user has access to the model
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        // Create test JSONL content
+        let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}"#;
+
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test.jsonl");
+
+        // Upload should succeed when rate limiter is configured but not at capacity
+        let upload_response = app
+            .post("/ai/v1/files")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .multipart(
+                axum_test::multipart::MultipartForm::new()
+                    .add_text("purpose", "batch")
+                    .add_part("file", file_part),
+            )
+            .await;
+
+        upload_response.assert_status(axum::http::StatusCode::CREATED);
+    }
 }

@@ -42,8 +42,8 @@ pub struct UploadLimiter {
     semaphore: Arc<Semaphore>,
     /// Current number of requests waiting for a permit
     waiting_count: AtomicUsize,
-    /// Maximum allowed waiting requests
-    max_waiting: usize,
+    /// Maximum allowed waiting requests (None = unlimited)
+    max_waiting: Option<usize>,
     /// Maximum time to wait for a permit
     max_wait: Duration,
 }
@@ -52,6 +52,7 @@ impl UploadLimiter {
     /// Creates a new upload limiter from configuration.
     ///
     /// If `max_concurrent` is 0, returns `None` (unlimited uploads).
+    /// If `max_waiting` is 0, unlimited waiting is allowed.
     pub fn new(config: &FileUploadLimitsConfig) -> Option<Self> {
         if config.max_concurrent == 0 {
             return None;
@@ -60,7 +61,8 @@ impl UploadLimiter {
         Some(Self {
             semaphore: Arc::new(Semaphore::new(config.max_concurrent)),
             waiting_count: AtomicUsize::new(0),
-            max_waiting: config.max_waiting,
+            // 0 means unlimited waiting queue
+            max_waiting: if config.max_waiting == 0 { None } else { Some(config.max_waiting) },
             max_wait: Duration::from_secs(config.max_wait_secs),
         })
     }
@@ -84,12 +86,27 @@ impl UploadLimiter {
 
         // Check if we can join the waiting queue
         let current_waiting = self.waiting_count.fetch_add(1, Ordering::SeqCst);
-        if current_waiting >= self.max_waiting {
+        if let Some(max_waiting) = self.max_waiting
+            && current_waiting >= max_waiting
+        {
             // Queue is full, reject immediately
             self.waiting_count.fetch_sub(1, Ordering::SeqCst);
             return Err(Error::TooManyRequests {
                 message: "Too many file uploads in progress. Please retry later.".to_string(),
             });
+        }
+
+        // Optimization: try to acquire again now that we're in the waiting queue.
+        // A permit may have been released between the first try_acquire and incrementing
+        // waiting_count, allowing us to acquire immediately without waiting.
+        match self.semaphore.clone().try_acquire_owned() {
+            Ok(permit) => {
+                self.waiting_count.fetch_sub(1, Ordering::SeqCst);
+                return Ok(UploadPermit { _permit: permit });
+            }
+            Err(_) => {
+                // Still no permit available, proceed to wait
+            }
         }
 
         // Wait for a permit with timeout
@@ -264,6 +281,33 @@ mod tests {
 
         // Should be able to acquire again
         let result = limiter.acquire().await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_unlimited_waiting_queue() {
+        // max_waiting=0 means unlimited waiting queue
+        let config = test_config(1, 0, 5);
+        let limiter = Arc::new(UploadLimiter::new(&config).unwrap());
+
+        // Take the only slot
+        let permit1 = limiter.acquire().await.unwrap();
+
+        // Spawn multiple waiters - should all be allowed to wait
+        let mut handles = vec![];
+        for _ in 0..10 {
+            let limiter_clone = limiter.clone();
+            handles.push(tokio::spawn(async move { limiter_clone.acquire().await }));
+        }
+
+        // Give time for waiters to enter queue
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Release the permit - first waiter should succeed
+        drop(permit1);
+
+        // At least the first waiter should succeed
+        let result = handles.remove(0).await.unwrap();
         assert!(result.is_ok());
     }
 }
