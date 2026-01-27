@@ -232,8 +232,6 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           sbom: true
           provenance: true
-          build-args: |
-            VITE_AI_API_BASE_URL=${{ secrets.VITE_AI_API_BASE_URL }}
 
       - name: Record build time
         id: build-time-step
@@ -406,6 +404,26 @@ jobs:
               }
             })
             console.log(`Triggered deployment for version ${{ github.event.release.tag_name }}`)
+
+  notify-downstream:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [build]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Dispatch to downstream
+        uses: actions/github-script@v8
+        with:
+          github-token: ${{ secrets.DEPLOY_PAT }}
+          script: |
+            await github.rest.repos.createDispatchEvent({
+              owner: '${{ secrets.DEPLOY_TARGET_OWNER }}',
+              repo: '${{ secrets.DEPLOY_TARGET_REPO }}',
+              event_type: 'control-layer-main-push',
+              client_payload: {
+                sha: context.sha
+              }
+            })
 
   publish-crates:
     if: github.event_name == 'release' && !github.event.release.prerelease

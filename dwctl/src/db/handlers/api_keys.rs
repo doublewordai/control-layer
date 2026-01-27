@@ -1855,12 +1855,14 @@ mod tests {
             auth: Default::default(),
             enable_metrics: false,
             enable_request_logging: false,
+            enable_analytics: true,
             enable_otel_export: false,
             credits: Default::default(),
             batches: Default::default(),
             background_services: crate::config::BackgroundServicesConfig::default(),
             payment: None,
             sample_files: Default::default(),
+            limits: Default::default(),
         };
         crate::seed_database(&config.model_sources, &pool).await.unwrap();
 

@@ -160,10 +160,14 @@ pub struct BatchResponse {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<HashMap<String, String>>,
+
+    /// Aggregated analytics metrics (only included when requested via `include=analytics`)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub analytics: Option<BatchAnalytics>,
 }
 
 /// Aggregated analytics metrics for batch requests
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[schema(example = json!({
     "total_requests": 100,
     "total_prompt_tokens": 50000,
@@ -285,6 +289,10 @@ pub struct ListBatchesQuery {
 
     /// Search query to filter batches by endpoint or input filename (case-insensitive substring match)
     pub search: Option<String>,
+
+    /// Comma-separated list of related resources to include. Supported: "analytics"
+    #[param(example = "analytics")]
+    pub include: Option<String>,
 }
 
 /// Query parameters for batch results

@@ -25,6 +25,7 @@ pub struct DeploymentFilter {
     pub statuses: Option<Vec<ModelStatus>>,
     pub deleted: Option<bool>, // None = show all, Some(false) = show non-deleted only, Some(true) = show deleted only
     pub accessible_to: Option<UserId>, // None = show all deployments, Some(user_id) = show only deployments accessible to that user
+    pub group_ids: Option<Vec<crate::types::GroupId>>, // None = show all, Some(group_ids) = show only models in any of these groups
     pub aliases: Option<Vec<String>>,
     pub search: Option<String>,     // Case-insensitive substring search on alias and model_name
     pub is_composite: Option<bool>, // None = show all, Some(true) = composite only, Some(false) = non-composite only
@@ -39,6 +40,7 @@ impl DeploymentFilter {
             statuses: None,
             deleted: None,       // Default: show all models
             accessible_to: None, // Default: show all deployments
+            group_ids: None,     // Default: show all groups
             aliases: None,
             search: None,
             is_composite: None, // Default: show all models
@@ -57,6 +59,11 @@ impl DeploymentFilter {
 
     pub fn with_accessible_to(mut self, user_id: UserId) -> Self {
         self.accessible_to = Some(user_id);
+        self
+    }
+
+    pub fn with_groups(mut self, group_ids: Vec<crate::types::GroupId>) -> Self {
+        self.group_ids = Some(group_ids);
         self
     }
 
@@ -551,6 +558,16 @@ impl<'c> Repository for Deployments<'c> {
             query.push("))");
         }
 
+        // Add group filter if specified
+        if let Some(ref group_ids) = filter.group_ids
+            && !group_ids.is_empty()
+        {
+            query.push(" AND dm.id IN (");
+            query.push("SELECT dg.deployment_id FROM deployment_groups dg WHERE dg.group_id = ANY(");
+            query.push_bind(group_ids);
+            query.push("))");
+        }
+
         // Add search filter if specified (case-insensitive substring match on alias, model_name, or endpoint name)
         if let Some(ref search) = filter.search {
             let search_pattern = format!("%{}%", search.to_lowercase());
@@ -674,6 +691,16 @@ impl<'c> Deployments<'c> {
             query.push(" UNION SELECT '00000000-0000-0000-0000-000000000000'::uuid WHERE ");
             query.push_bind(user_id);
             query.push(" != '00000000-0000-0000-0000-000000000000'::uuid");
+            query.push("))");
+        }
+
+        // Add group filter if specified
+        if let Some(ref group_ids) = filter.group_ids
+            && !group_ids.is_empty()
+        {
+            query.push(" AND dm.id IN (");
+            query.push("SELECT dg.deployment_id FROM deployment_groups dg WHERE dg.group_id = ANY(");
+            query.push_bind(group_ids);
             query.push("))");
         }
 
@@ -2594,5 +2621,111 @@ mod tests {
             Err(DbError::InvalidModelField { field }) => assert_eq!(field, "alias"),
             _ => panic!("Expected InvalidModelField error for empty alias"),
         }
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_list_with_group_filter(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: base_url.clone(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
+        }];
+        crate::seed_database(&sources, &pool).await.unwrap();
+
+        let mut pool_conn = pool.acquire().await.unwrap();
+        let mut repo = Deployments::new(&mut pool_conn);
+        let mut group_conn = pool.acquire().await.unwrap();
+        let mut group_repo = Groups::new(&mut group_conn);
+        let user = create_test_user(&pool).await;
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        // Create three deployments
+        let mut model1_create = DeploymentCreateDBRequest::builder()
+            .created_by(user.id)
+            .model_name("group-model-1".to_string())
+            .alias("group-deployment-1".to_string())
+            .build();
+        model1_create.hosted_on = Some(test_endpoint_id);
+        let deployment1 = repo.create(&model1_create).await.unwrap();
+
+        let mut model2_create = DeploymentCreateDBRequest::builder()
+            .created_by(user.id)
+            .model_name("group-model-2".to_string())
+            .alias("group-deployment-2".to_string())
+            .build();
+        model2_create.hosted_on = Some(test_endpoint_id);
+        let deployment2 = repo.create(&model2_create).await.unwrap();
+
+        let mut model3_create = DeploymentCreateDBRequest::builder()
+            .created_by(user.id)
+            .model_name("group-model-3".to_string())
+            .alias("group-deployment-3".to_string())
+            .build();
+        model3_create.hosted_on = Some(test_endpoint_id);
+        let deployment3 = repo.create(&model3_create).await.unwrap();
+
+        // Create two groups
+        let group1_create = GroupCreateDBRequest {
+            name: "Production".to_string(),
+            description: Some("Production group".to_string()),
+            created_by: user.id,
+        };
+        let group1 = group_repo.create(&group1_create).await.unwrap();
+
+        let group2_create = GroupCreateDBRequest {
+            name: "Staging".to_string(),
+            description: Some("Staging group".to_string()),
+            created_by: user.id,
+        };
+        let group2 = group_repo.create(&group2_create).await.unwrap();
+
+        // Add deployment1 to group1 (production)
+        group_repo
+            .add_deployment_to_group(deployment1.id, group1.id, user.id)
+            .await
+            .unwrap();
+
+        // Add deployment2 to group2 (staging)
+        group_repo
+            .add_deployment_to_group(deployment2.id, group2.id, user.id)
+            .await
+            .unwrap();
+
+        // deployment3 has no groups
+
+        // Test 1: Filter by single group (production)
+        let filter = DeploymentFilter::new(0, 10).with_groups(vec![group1.id]);
+        let models = repo.list(&filter).await.unwrap();
+        assert_eq!(models.len(), 1);
+        assert!(models.iter().any(|m| m.id == deployment1.id));
+        assert!(!models.iter().any(|m| m.id == deployment2.id));
+        assert!(!models.iter().any(|m| m.id == deployment3.id));
+
+        // Test 2: Filter by multiple groups (production + staging)
+        let filter = DeploymentFilter::new(0, 10).with_groups(vec![group1.id, group2.id]);
+        let models = repo.list(&filter).await.unwrap();
+        assert_eq!(models.len(), 2);
+        assert!(models.iter().any(|m| m.id == deployment1.id));
+        assert!(models.iter().any(|m| m.id == deployment2.id));
+        assert!(!models.iter().any(|m| m.id == deployment3.id));
+
+        // Test 3: Filter by empty group list (should show all models)
+        let filter = DeploymentFilter::new(0, 10).with_groups(vec![]);
+        let models = repo.list(&filter).await.unwrap();
+        // Empty groups list is treated as no filter, so all models are returned
+        assert!(models.len() >= 3);
+
+        // Test 4: Count should also respect group filter
+        let filter = DeploymentFilter::new(0, 10).with_groups(vec![group1.id]);
+        let count = repo.count(&filter).await.unwrap();
+        assert_eq!(count, 1);
+
+        let filter = DeploymentFilter::new(0, 10).with_groups(vec![group1.id, group2.id]);
+        let count = repo.count(&filter).await.unwrap();
+        assert_eq!(count, 2);
     }
 }

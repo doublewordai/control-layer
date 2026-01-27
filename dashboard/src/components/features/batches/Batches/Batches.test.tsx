@@ -242,13 +242,10 @@ describe("Batches", () => {
         wrapper: createWrapper(),
       });
 
+      // On batches tab by default, title should be "Batch Requests"
+      expect(within(container).getByText("Batch Requests")).toBeInTheDocument();
       expect(
-        within(container).getByText("Batch Processing"),
-      ).toBeInTheDocument();
-      expect(
-        within(container).getByText(
-          "Upload files and create batches to process requests at scale",
-        ),
+        within(container).getByText("Create and manage batch requests"),
       ).toBeInTheDocument();
     });
 
@@ -287,6 +284,21 @@ describe("Batches", () => {
       // Verify both queries were called (not disabled)
       expect(useFilesSpy).toHaveBeenCalled();
       expect(useBatchesSpy).toHaveBeenCalled();
+    });
+
+    it("should request batches with include=analytics to avoid N+1 requests", () => {
+      const useBatchesSpy = vi.mocked(hooks.useBatches);
+
+      render(<Batches {...defaultProps} />, {
+        wrapper: createWrapper(),
+      });
+
+      // Verify useBatches is called with include: "analytics"
+      expect(useBatchesSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          include: "analytics",
+        }),
+      );
     });
 
     it("should show correct tab when starting on files tab", () => {

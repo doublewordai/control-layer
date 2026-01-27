@@ -46,6 +46,7 @@ data/
 dwctl/static/
 .dwctl_data/
 .neon
+.worktrees/
 
 # Extra lock files
 dashboard/pnpm-lock.yaml

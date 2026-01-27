@@ -12,6 +12,7 @@ use crate::{
 };
 use outlet_postgres::RequestFilter;
 use sqlx::PgPool;
+use sqlx_pool_router::{DbPools, PoolProvider};
 use tracing::info;
 use utils::{add_auth_headers, create_test_admin_user, create_test_config, create_test_user};
 
@@ -550,7 +551,8 @@ async fn test_request_logging_enabled(pool: PgPool) {
 
     // Get outlet_db from app_state to query logs
     let outlet_pool = app.app_state.outlet_db.clone().expect("outlet_db should exist");
-    let repository: outlet_postgres::RequestRepository<AiRequest, AiResponse> = outlet_postgres::RequestRepository::new(outlet_pool);
+    let repository: outlet_postgres::RequestRepository<DbPools, AiRequest, AiResponse> =
+        outlet_postgres::RequestRepository::new(outlet_pool);
 
     let (server, _drop_guard) = app.into_test_server();
 
@@ -576,11 +578,13 @@ async fn test_request_logging_disabled(pool: PgPool) {
     config.enable_request_logging = false;
 
     // Build router with request logging disabled
-    let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
+    let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(DbPools::new(pool.clone())));
+    let limiters = crate::limits::Limiters::new(&config.limits);
     let mut app_state = AppState::builder()
-        .db(crate::db::DbPools::new(pool.clone()))
+        .db(DbPools::new(pool.clone()))
         .config(config)
         .request_manager(request_manager)
+        .limiters(limiters)
         .build();
     let onwards_router = axum::Router::new(); // Empty onwards router for testing
     let router = super::build_router(&mut app_state, onwards_router)
@@ -687,7 +691,7 @@ async fn test_dedicated_databases_for_components(pool: PgPool) {
         "SELECT table_name FROM information_schema.tables
          WHERE table_schema = 'public' AND table_type = 'BASE TABLE'",
     )
-    .fetch_all(&outlet_pool)
+    .fetch_all(outlet_pool.read())
     .await
     .expect("Should list outlet tables");
     assert!(
@@ -708,7 +712,8 @@ async fn test_dedicated_databases_for_components(pool: PgPool) {
     );
 
     // Make a request and verify it gets logged to the dedicated outlet database
-    let repository: outlet_postgres::RequestRepository<AiRequest, AiResponse> = outlet_postgres::RequestRepository::new(outlet_pool);
+    let repository: outlet_postgres::RequestRepository<DbPools, AiRequest, AiResponse> =
+        outlet_postgres::RequestRepository::new(outlet_pool);
 
     let (server, bg_services) = app.into_test_server();
 
@@ -907,11 +912,13 @@ async fn test_build_router_with_metrics_disabled(pool: PgPool) {
     let mut config = create_test_config();
     config.enable_metrics = false;
 
-    let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
+    let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(DbPools::new(pool.clone())));
+    let limiters = crate::limits::Limiters::new(&config.limits);
     let mut app_state = AppState::builder()
-        .db(crate::db::DbPools::new(pool))
+        .db(DbPools::new(pool))
         .config(config)
         .request_manager(request_manager)
+        .limiters(limiters)
         .build();
 
     let onwards_router = axum::Router::new();
@@ -932,11 +939,13 @@ async fn test_build_router_with_metrics_enabled(pool: PgPool) {
     let mut config = create_test_config();
     config.enable_metrics = true;
 
-    let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
+    let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(DbPools::new(pool.clone())));
+    let limiters = crate::limits::Limiters::new(&config.limits);
     let mut app_state = AppState::builder()
-        .db(crate::db::DbPools::new(pool))
+        .db(DbPools::new(pool))
         .config(config)
         .request_manager(request_manager)
+        .limiters(limiters)
         .build();
 
     let onwards_router = axum::Router::new();
@@ -1426,18 +1435,16 @@ async fn test_component_weight_validation(pool: PgPool) {
 
 /// Test that read-only pool enforcement catches write operations.
 ///
-/// This demonstrates the test utility's ability to catch pool routing violations.
+/// This demonstrates sqlx_pool_router::TestDbPools' ability to catch pool routing violations.
 /// The replica pool is configured with `default_transaction_read_only = on`,
 /// so any write operations will fail with a PostgreSQL error.
 #[sqlx::test]
 async fn test_read_pool_enforces_readonly(pool: PgPool) {
-    // Create test pools with read-only enforcement on replica
-    let db_pools = utils::create_test_db_pools(pool).await;
-
-    // Verify the replica pool exists
-    assert!(db_pools.has_replica(), "Test pools should have a replica configured");
+    // Create test pools with read-only enforcement on replica using sqlx_pool_router
+    let db_pools = sqlx_pool_router::TestDbPools::new(pool).await.unwrap();
 
     // Try to execute a write operation on the read pool - this should fail
+    // TestDbPools creates a read-only replica by default
     let result = sqlx::query("CREATE TEMPORARY TABLE test_readonly_violation (id INT)")
         .execute(db_pools.read())
         .await;

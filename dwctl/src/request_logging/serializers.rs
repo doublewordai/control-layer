@@ -45,7 +45,7 @@ use crate::db::handlers::Credits;
 use crate::db::models::credits::{CreditTransactionCreateDBRequest, CreditTransactionType};
 use crate::request_logging::models::{AiRequest, AiResponse, ChatCompletionChunk, ParsedAIRequest};
 use crate::request_logging::utils::{extract_header_as_string, extract_header_as_uuid};
-use metrics::{counter, histogram};
+use metrics::counter;
 use outlet::{RequestData, ResponseData};
 use outlet_postgres::SerializationError;
 use rust_decimal::{Decimal, prelude::ToPrimitive};
@@ -53,7 +53,7 @@ use serde_json::Value;
 use sqlx::PgPool;
 use std::fmt;
 use std::str;
-use tracing::{Instrument, debug, error, info_span, instrument, warn};
+use tracing::{Instrument, debug, info_span, instrument, warn};
 use uuid::Uuid;
 
 use super::utils;
@@ -648,68 +648,44 @@ pub async fn store_analytics_record(
                     let mut conn = pool.acquire().await?;
                     let mut credits = Credits::new(&mut conn);
 
-                    // Get user balance to check for negative balance warning
-                    match credits.get_user_balance(user_id).await {
-                        Ok(balance) => {
-                            // Warn if this will result in negative balance
-                            if balance < total_cost {
-                                warn!(
-                                    user_id = %user_id,
-                                    current_balance = %balance,
-                                    cost = %total_cost,
-                                    "API usage will result in negative balance"
-                                );
-                            }
-
-                            // Create usage transaction referencing the analytics record
-                            // Include fusillade_batch_id to enable fast batch grouping in transactions list
-                            match credits
-                                .create_transaction(&CreditTransactionCreateDBRequest {
-                                    user_id,
-                                    transaction_type: CreditTransactionType::Usage,
-                                    amount: total_cost,
-                                    source_id: analytics_id.to_string(),
-                                    description: Some(format!(
-                                        "API usage: {} ({} input + {} output tokens)",
-                                        model, row.prompt_tokens, row.completion_tokens
-                                    )),
-                                    fusillade_batch_id: row.fusillade_batch_id,
-                                })
-                                .await
-                            {
-                                Ok(result) => {
-                                    debug!(
-                                        user_id = %user_id,
-                                        transaction_id = %result.id,
-                                        amount = %total_cost,
-                                        model = %model,
-                                        "Credits deducted for API usage"
-                                    );
-                                    let cents = (total_cost.to_f64().unwrap_or(0.0) * 100.0).round() as u64;
-                                    counter!(
-                                        "dwctl_credits_deducted_total",
-                                        "user_id" => user_id.to_string(),
-                                        "model" => model.to_string()
-                                    )
-                                    .increment(cents);
-                                }
-                                Err(e) => {
-                                    tracing::error!(
-                                        error = %e,
-                                        correlation_id = %row.correlation_id,
-                                        user_id = %user_id,
-                                        "Failed to create credit transaction for API usage"
-                                    );
-                                    counter!("dwctl_credits_deduction_errors_total").increment(1);
-                                }
-                            }
+                    // Create usage transaction referencing the analytics record
+                    // Include fusillade_batch_id to enable fast batch grouping in transactions list
+                    match credits
+                        .create_transaction(&CreditTransactionCreateDBRequest {
+                            user_id,
+                            transaction_type: CreditTransactionType::Usage,
+                            amount: total_cost,
+                            source_id: analytics_id.to_string(),
+                            description: Some(format!(
+                                "API usage: {} ({} input + {} output tokens)",
+                                model, row.prompt_tokens, row.completion_tokens
+                            )),
+                            fusillade_batch_id: row.fusillade_batch_id,
+                        })
+                        .await
+                    {
+                        Ok(result) => {
+                            debug!(
+                                user_id = %user_id,
+                                transaction_id = %result.id,
+                                amount = %total_cost,
+                                model = %model,
+                                "Credits deducted for API usage"
+                            );
+                            let cents = (total_cost.to_f64().unwrap_or(0.0) * 100.0).round() as u64;
+                            counter!(
+                                "dwctl_credits_deducted_total",
+                                "user_id" => user_id.to_string(),
+                                "model" => model.to_string()
+                            )
+                            .increment(cents);
                         }
                         Err(e) => {
                             tracing::error!(
                                 error = %e,
                                 correlation_id = %row.correlation_id,
                                 user_id = %user_id,
-                                "Failed to get user balance for credit deduction"
+                                "Failed to create credit transaction for API usage"
                             );
                             counter!("dwctl_credits_deduction_errors_total").increment(1);
                         }
@@ -859,120 +835,6 @@ impl From<&AiResponse> for TokenMetrics {
                 response_type: "other".to_string(),
                 response_model: None,
             },
-        }
-    }
-}
-
-pub struct AnalyticsResponseSerializer<M = crate::metrics::GenAiMetrics>
-where
-    M: crate::metrics::MetricsRecorder + Clone + 'static,
-{
-    pool: PgPool,
-    instance_id: Uuid,
-    config: Config,
-    metrics_recorder: Option<M>,
-}
-
-impl<M> AnalyticsResponseSerializer<M>
-where
-    M: crate::metrics::MetricsRecorder + Clone + 'static,
-{
-    /// Creates a new analytics response serializer.
-    ///
-    /// # Arguments
-    /// * `pool` - Database connection pool for storing analytics data
-    /// * `instance_id` - Unique identifier for this service instance
-    /// * `config` - Application configuration
-    /// * `metrics_recorder` - Optional metrics recorder
-    pub fn new(pool: PgPool, instance_id: Uuid, config: Config, metrics_recorder: Option<M>) -> Self {
-        Self {
-            pool,
-            instance_id,
-            config,
-            metrics_recorder,
-        }
-    }
-
-    /// Creates a serializer function that parses responses and stores analytics data.
-    ///
-    /// # Returns
-    /// A closure that implements the outlet-postgres serializer interface:
-    /// - Takes `RequestData` and `ResponseData` as input
-    /// - Returns parsed `AiResponse` or `SerializationError`
-    /// - Asynchronously stores analytics metrics to database
-    /// - Logs errors if analytics storage fails
-    ///
-    /// # Analytics Storage
-    /// Analytics are stored for ALL responses, including error responses (4xx, 5xx).
-    /// Even if the response cannot be parsed as a valid AI response, the request
-    /// metadata (status code, duration, model, user, etc.) is still recorded.
-    pub fn create_serializer(self) -> impl Fn(&RequestData, &ResponseData) -> Result<AiResponse, SerializationError> + Send + Sync {
-        move |request_data: &RequestData, response_data: &ResponseData| {
-            let serializer_span = info_span!(
-                "response_serializer",
-                correlation_id = request_data.correlation_id,
-                status = %response_data.status
-            );
-            let _guard = serializer_span.enter();
-
-            // Try to parse the response - may fail for error responses (4xx, 5xx)
-            let parse_result = parse_ai_response(request_data, response_data);
-
-            // Use parsed response for metrics, or fallback to Other for error responses
-            let metrics_response = match &parse_result {
-                Ok(response) => response.clone(),
-                Err(_) => AiResponse::Other(Value::Null),
-            };
-
-            // Basic metrics - extracted regardless of parse success
-            // This captures status_code, duration, model from request, etc.
-            let metrics = UsageMetrics::extract(self.instance_id, request_data, response_data, &metrics_response, &self.config);
-
-            // Auth information
-            let auth = Auth::from_request(request_data, &self.config);
-
-            // Clone data for async processing
-            let pool_clone = self.pool.clone();
-            let metrics_recorder_clone = self.metrics_recorder.clone();
-            let request_data_clone = request_data.clone();
-            let correlation_id = request_data.correlation_id;
-
-            // The write to the analytics table and metrics recording
-            // This runs for ALL responses, including errors
-            let async_span = info_span!("analytics_storage", correlation_id = correlation_id);
-            tokio::spawn(
-                async move {
-                    // Store to database - this enriches with user/pricing data and returns complete row
-                    let result = store_analytics_record(&pool_clone, &metrics, &auth, &request_data_clone).await;
-
-                    // Record analytics processing lag regardless of success/failure
-                    // This measures time from response completion to storage attempt completion
-                    let total_ms = chrono::Utc::now().signed_duration_since(metrics.timestamp).num_milliseconds();
-                    let lag_ms = total_ms - metrics.duration_ms;
-                    histogram!("dwctl_analytics_lag_seconds").record(lag_ms as f64 / 1000.0);
-
-                    match result {
-                        Ok(complete_row) => {
-                            // Record metrics using the complete row (called AFTER database write)
-                            if let Some(ref recorder) = metrics_recorder_clone {
-                                recorder.record_from_analytics(&complete_row).await;
-                            }
-                        }
-                        Err(e) => {
-                            error!(
-                                correlation_id = metrics.correlation_id,
-                                error = %e,
-                                "Failed to store analytics data"
-                            );
-                        }
-                    }
-                }
-                .instrument(async_span),
-            );
-
-            // Return the parse result - outlet-postgres will handle SerializationError
-            // by storing the fallback_data (base64 encoded response)
-            parse_result
         }
     }
 }

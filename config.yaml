@@ -251,6 +251,25 @@ batches:
     max_file_size: 2147483648 # 2 GB - maximum size for file uploads
     upload_buffer_size: 100 # Buffer size for file upload streams (default: 100)
     download_buffer_size: 100 # Buffer size for file download streams (default: 100)
+    # Database insertion batch size of request templates for file uploads
+    # Higher values improve throughput for large files but use more memory
+    # Reduce value if you encounter memory spike issues with many concurrent uploads
+    batch_insert_size: 5000
+
+# Resource limits configuration
+# Controls concurrency and rate limits to prevent resource exhaustion
+# limits:
+#   file_uploads:
+#     # Maximum concurrent file uploads allowed system-wide
+#     # Set to 0 for unlimited (default, not recommended for production)
+#     max_concurrent: 10
+#     # Maximum uploads that can wait in queue for a slot
+#     # When reached, new uploads receive HTTP 429 immediately
+#     # Set to 0 for unlimited waiting queue (not recommended)
+#     max_waiting: 20
+#     # Maximum seconds to wait for an upload slot before returning HTTP 429
+#     # Set to 0 to reject immediately when no slot is available
+#     max_wait_secs: 60
 
 # Background services configuration
 # Controls which background services run on this instance

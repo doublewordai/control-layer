@@ -4,6 +4,8 @@
 //!
 //! Repository methods are delegated to the fusillade/ crate.
 
+use sqlx_pool_router::PoolProvider;
+
 use crate::AppState;
 use crate::api::models::batches::{
     BatchAnalytics, BatchErrors, BatchListResponse, BatchObjectType, BatchResponse, BatchResultsQuery, CreateBatchRequest,
@@ -46,7 +48,9 @@ fn to_batch_response_with_email(batch: fusillade::Batch, creator_email: Option<&
     }
 
     // Determine OpenAI status from request counts
-    let is_finished = batch.pending_requests == 0 && batch.in_progress_requests == 0;
+    // A batch is only "finished" if it has started processing AND all requests are in terminal states
+    let has_started = batch.requests_started_at.is_some();
+    let is_finished = has_started && batch.pending_requests == 0 && batch.in_progress_requests == 0;
     let openai_status = if batch.cancelling_at.is_some() {
         // If cancelling_at is set, check if batch is finished
         if is_finished {
@@ -59,9 +63,27 @@ fn to_batch_response_with_email(batch: fusillade::Batch, creator_email: Option<&
     } else if batch.total_requests == 0 {
         "validating"
     } else if is_finished && batch.failed_requests == batch.total_requests {
-        "failed"
+        // Don't show "failed" until we're certain recovery is impossible
+        // Check if we're still within the SLA window
+        if chrono::Utc::now() < batch.expires_at {
+            // Within SLA - escalation might still recover these failures
+            "in_progress"
+        } else if batch.failed_at.is_none() {
+            // Past SLA but no failed_at timestamp - escalation may still be attempting recovery
+            "in_progress"
+        } else {
+            // Past SLA and failed_at is set - terminal failure confirmed
+            "failed"
+        }
     } else if is_finished {
-        "completed"
+        // All requests are in terminal state - check if output files are ready
+        if batch.completed_at.is_some() {
+            // Output files written, batch is truly completed
+            "completed"
+        } else {
+            // Requests done but still writing output files
+            "finalizing"
+        }
     } else {
         // Any batch that has been validated (total_requests > 0) but not finished
         // is considered "in_progress". This includes:
@@ -79,13 +101,30 @@ fn to_batch_response_with_email(batch: fusillade::Batch, creator_email: Option<&
     };
 
     // Terminal state timestamps from batch table
-    let finalizing_at = batch.finalizing_at.map(|dt| dt.timestamp());
+    // Only show finalizing_at when status is actually "finalizing" or later
+    let finalizing_at = if openai_status == "finalizing" || openai_status == "completed" {
+        batch.finalizing_at.map(|dt| dt.timestamp())
+    } else {
+        None
+    };
     let completed_at = batch.completed_at.map(|dt| dt.timestamp());
     let failed_at = batch.failed_at.map(|dt| dt.timestamp());
     let cancelled_at = batch.cancelled_at.map(|dt| dt.timestamp());
 
-    // Parse errors from JSON if present
-    let errors = batch.errors.and_then(|e| serde_json::from_value::<BatchErrors>(e).ok());
+    // Only show failure indicators if batch has terminally failed AND SLA has expired
+    // This prevents showing any failure information while escalation might still recover
+    let show_failures = batch.failed_at.is_some() && chrono::Utc::now() > batch.expires_at;
+
+    let errors = if show_failures {
+        // Terminal failure past SLA - show errors to user
+        batch.errors.and_then(|e| serde_json::from_value::<BatchErrors>(e).ok())
+    } else {
+        // Either:
+        // - No terminal failure yet (failed_at is None) - escalation might recover
+        // - Still within SLA window - escalation has time to recover
+        // In both cases, hide errors from user
+        None
+    };
 
     // Check if batch has expired
     let expired_at = if chrono::Utc::now() > batch.expires_at {
@@ -103,22 +142,26 @@ fn to_batch_response_with_email(batch: fusillade::Batch, creator_email: Option<&
         completion_window: batch.completion_window.clone(),
         status: openai_status.to_string(),
         output_file_id: batch.output_file_id.map(|id| id.0.to_string()),
+        // Always show error_file_id if it exists - the file content itself is filtered by fusillade
         error_file_id: batch.error_file_id.map(|id| id.0.to_string()),
         created_at: batch.created_at.timestamp(),
         in_progress_at,
         expires_at: Some(batch.expires_at.timestamp()),
         finalizing_at,
         completed_at,
-        failed_at,
+        // Hide failed_at timestamp until terminal failure past SLA
+        failed_at: if show_failures { failed_at } else { None },
         expired_at,
         cancelling_at: batch.cancelling_at.map(|dt| dt.timestamp()),
         cancelled_at,
+        // Hide failed count until terminal failure past SLA
         request_counts: RequestCounts {
             total: batch.total_requests,
             completed: batch.completed_requests,
-            failed: batch.failed_requests,
+            failed: if show_failures { batch.failed_requests } else { 0 },
         },
         metadata,
+        analytics: None,
     }
 }
 
@@ -147,8 +190,8 @@ The batch will begin processing immediately. Use `GET /batches/{batch_id}` to mo
     )
 )]
 #[tracing::instrument(skip(state, current_user, has_api_key), fields(user_id = %current_user.id, input_file_id = %req.input_file_id))]
-pub async fn create_batch(
-    State(state): State<AppState>,
+pub async fn create_batch<P: PoolProvider>(
+    State(state): State<AppState<P>>,
     current_user: RequiresPermission<resource::Batches, operation::CreateOwn>,
     has_api_key: crate::auth::current_user::HasApiKey,
     Json(req): Json<CreateBatchRequest>,
@@ -182,9 +225,10 @@ pub async fn create_batch(
     })?;
 
     // Verify file exists and user has access
+    // Use primary pool to avoid read-after-write consistency issues with replicas
     let file = state
         .request_manager
-        .get_file(fusillade::FileId(file_id))
+        .get_file_from_primary_pool(fusillade::FileId(file_id))
         .await
         .map_err(|_| Error::NotFound {
             resource: "File".to_string(),
@@ -261,8 +305,8 @@ Poll this endpoint to monitor progress. Results are streamed to `output_file_id`
     )
 )]
 #[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, batch_id = %batch_id_str))]
-pub async fn get_batch(
-    State(state): State<AppState>,
+pub async fn get_batch<P: PoolProvider>(
+    State(state): State<AppState<P>>,
     Path(batch_id_str): Path<String>,
     current_user: RequiresPermission<resource::Batches, operation::ReadOwn>,
 ) -> Result<Json<BatchResponse>> {
@@ -293,7 +337,7 @@ pub async fn get_batch(
     }
 
     // Fetch creator email for the response
-    let creator_email = fetch_creator_email(&state.db, &batch).await;
+    let creator_email = fetch_creator_email(state.db.read(), &batch).await;
     Ok(Json(to_batch_response_with_email(batch, creator_email.as_deref())))
 }
 
@@ -315,8 +359,8 @@ Analytics update in real-time as requests complete.",
     )
 )]
 #[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, batch_id = %batch_id_str))]
-pub async fn get_batch_analytics(
-    State(state): State<AppState>,
+pub async fn get_batch_analytics<P: PoolProvider>(
+    State(state): State<AppState<P>>,
     Path(batch_id_str): Path<String>,
     current_user: RequiresPermission<resource::Batches, operation::ReadOwn>,
 ) -> Result<Json<BatchAnalytics>> {
@@ -377,8 +421,8 @@ Supports pagination via `limit` and `skip` query parameters, and filtering by `c
     )
 )]
 #[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, batch_id = %batch_id_str, limit = ?query.pagination.limit, skip = ?query.pagination.skip))]
-pub async fn get_batch_results(
-    State(state): State<AppState>,
+pub async fn get_batch_results<P: PoolProvider>(
+    State(state): State<AppState<P>>,
     Path(batch_id_str): Path<String>,
     Query(query): Query<BatchResultsQuery>,
     current_user: RequiresPermission<resource::Batches, operation::ReadOwn>,
@@ -495,8 +539,8 @@ Pending requests will not be processed. Requests already in progress will comple
     )
 )]
 #[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, batch_id = %batch_id_str))]
-pub async fn cancel_batch(
-    State(state): State<AppState>,
+pub async fn cancel_batch<P: PoolProvider>(
+    State(state): State<AppState<P>>,
     Path(batch_id_str): Path<String>,
     current_user: RequiresPermission<resource::Batches, operation::UpdateOwn>,
 ) -> Result<Json<BatchResponse>> {
@@ -548,7 +592,7 @@ pub async fn cancel_batch(
     tracing::info!("Batch {} cancelled", batch_id);
 
     // Fetch creator email for the response
-    let creator_email = fetch_creator_email(&state.db, &batch).await;
+    let creator_email = fetch_creator_email(state.db.read(), &batch).await;
     Ok(Json(to_batch_response_with_email(batch, creator_email.as_deref())))
 }
 
@@ -571,8 +615,8 @@ This action cannot be undone. The input file is not deleted.",
     )
 )]
 #[tracing::instrument(skip(state, current_user), fields(batch_id = %batch_id_str))]
-pub async fn delete_batch(
-    State(state): State<AppState>,
+pub async fn delete_batch<P: PoolProvider>(
+    State(state): State<AppState<P>>,
     Path(batch_id_str): Path<String>,
     current_user: RequiresPermission<resource::Batches, operation::DeleteOwn>,
 ) -> Result<StatusCode> {
@@ -635,8 +679,8 @@ Failed requests are reset to pending and will be processed again. Use this after
     )
 )]
 #[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, batch_id = %batch_id_str))]
-pub async fn retry_failed_batch_requests(
-    State(state): State<AppState>,
+pub async fn retry_failed_batch_requests<P: PoolProvider>(
+    State(state): State<AppState<P>>,
     Path(batch_id_str): Path<String>,
     current_user: RequiresPermission<resource::Batches, operation::UpdateOwn>,
 ) -> Result<Json<BatchResponse>> {
@@ -666,28 +710,16 @@ pub async fn retry_failed_batch_requests(
         }
     }
 
-    // Get all requests for the batch
-    let requests = state
+    // Retry all failed requests for the batch in a single database operation
+    let retried_count = state
         .request_manager
-        .get_batch_requests(fusillade::BatchId(batch_id))
+        .retry_failed_requests_for_batch(fusillade::BatchId(batch_id))
         .await
         .map_err(|e| Error::Internal {
-            operation: format!("get batch requests: {}", e),
+            operation: format!("retry failed requests: {}", e),
         })?;
 
-    // Collect IDs of failed requests
-    let failed_request_ids: Vec<fusillade::RequestId> = requests
-        .iter()
-        .filter_map(|req| {
-            if matches!(req, fusillade::request::AnyRequest::Failed(_)) {
-                Some(req.id())
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    if failed_request_ids.is_empty() {
+    if retried_count == 0 {
         return Err(Error::BadRequest {
             message: "No failed requests to retry in this batch".to_string(),
         });
@@ -695,39 +727,8 @@ pub async fn retry_failed_batch_requests(
 
     tracing::info!(
         batch_id = %batch_id,
-        failed_count = failed_request_ids.len(),
-        "Retrying failed requests"
-    );
-
-    // Retry the failed requests
-    let results = state
-        .request_manager
-        .retry_failed_requests(failed_request_ids.clone())
-        .await
-        .map_err(|e| Error::Internal {
-            operation: format!("retry failed requests: {}", e),
-        })?;
-
-    // Check for any failures
-    let failed_retries: Vec<_> = results
-        .iter()
-        .enumerate()
-        .filter_map(|(i, r)| r.as_ref().err().map(|e| (i, e)))
-        .collect();
-
-    if !failed_retries.is_empty() {
-        tracing::warn!(
-            batch_id = %batch_id,
-            failed_retry_count = failed_retries.len(),
-            "Some requests failed to retry"
-        );
-    }
-
-    let successful_retries = results.iter().filter(|r| r.is_ok()).count();
-    tracing::info!(
-        batch_id = %batch_id,
-        retried_count = successful_retries,
-        "Successfully retried failed requests"
+        retried_count,
+        "Retried failed requests"
     );
 
     // Fetch updated batch to get latest status
@@ -741,7 +742,7 @@ pub async fn retry_failed_batch_requests(
         })?;
 
     // Fetch creator email for the response
-    let creator_email = fetch_creator_email(&state.db, &batch).await;
+    let creator_email = fetch_creator_email(state.db.read(), &batch).await;
     Ok(Json(to_batch_response_with_email(batch, creator_email.as_deref())))
 }
 
@@ -765,8 +766,8 @@ Use this for fine-grained control over which requests to retry, rather than retr
     )
 )]
 #[tracing::instrument(skip(state, current_user, req), fields(user_id = %current_user.id, batch_id = %batch_id_str))]
-pub async fn retry_specific_requests(
-    State(state): State<AppState>,
+pub async fn retry_specific_requests<P: PoolProvider>(
+    State(state): State<AppState<P>>,
     Path(batch_id_str): Path<String>,
     current_user: RequiresPermission<resource::Batches, operation::UpdateOwn>,
     Json(req): Json<RetryRequestsRequest>,
@@ -858,7 +859,7 @@ pub async fn retry_specific_requests(
         })?;
 
     // Fetch creator email for the response
-    let creator_email = fetch_creator_email(&state.db, &batch).await;
+    let creator_email = fetch_creator_email(state.db.read(), &batch).await;
     Ok(Json(to_batch_response_with_email(batch, creator_email.as_deref())))
 }
 
@@ -879,8 +880,8 @@ Use cursor-based pagination: pass `last_id` from the response as the `after` par
     )
 )]
 #[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, limit = ?query.pagination.limit, after = ?query.pagination.after))]
-pub async fn list_batches(
-    State(state): State<AppState>,
+pub async fn list_batches<P: PoolProvider>(
+    State(state): State<AppState<P>>,
     Query(query): Query<ListBatchesQuery>,
     current_user: RequiresPermission<resource::Batches, operation::ReadOwn>,
 ) -> Result<Json<BatchListResponse>> {
@@ -925,7 +926,7 @@ pub async fn list_batches(
 
     // Bulk fetch user emails
     let email_map: HashMap<String, String> = if !user_ids.is_empty() {
-        let mut conn = state.db.acquire().await.map_err(|e| Error::Internal {
+        let mut conn = state.db.read().acquire().await.map_err(|e| Error::Internal {
             operation: format!("acquire db connection: {}", e),
         })?;
         let users = Users::new(&mut conn).get_bulk(user_ids).await.map_err(|e| Error::Internal {
@@ -936,12 +937,37 @@ pub async fn list_batches(
         HashMap::new()
     };
 
-    // Convert batches to responses with email injection
+    // Parse include parameter
+    let includes: Vec<&str> = query
+        .include
+        .as_ref()
+        .map(|s| s.split(',').map(|s| s.trim()).collect())
+        .unwrap_or_default();
+    let include_analytics = includes.contains(&"analytics");
+
+    // Fetch analytics in bulk if requested
+    let analytics_map: HashMap<Uuid, BatchAnalytics> = if include_analytics && !batches.is_empty() {
+        let batch_ids: Vec<Uuid> = batches.iter().map(|b| b.id.0).collect();
+        crate::db::handlers::analytics::get_batches_analytics_bulk(state.db.read(), &batch_ids)
+            .await
+            .map_err(|e| Error::Internal {
+                operation: format!("fetch bulk batch analytics: {}", e),
+            })?
+    } else {
+        HashMap::new()
+    };
+
+    // Convert batches to responses with email injection and optional analytics
     let data: Vec<_> = batches
         .into_iter()
         .map(|batch| {
+            let batch_id = batch.id.0;
             let email = batch.created_by.as_ref().and_then(|id| email_map.get(id)).map(|s| s.as_str());
-            to_batch_response_with_email(batch, email)
+            let mut response = to_batch_response_with_email(batch, email);
+            if include_analytics {
+                response.analytics = analytics_map.get(&batch_id).cloned();
+            }
+            response
         })
         .collect();
 
@@ -961,6 +987,7 @@ mod tests {
     use crate::test::utils::*;
     use axum::http::StatusCode;
     use sqlx::PgPool;
+    use uuid::Uuid;
 
     #[sqlx::test]
     #[test_log::test]
@@ -1278,5 +1305,246 @@ mod tests {
             expires_at_dt,
             diff.num_seconds()
         );
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_list_batches_with_include_analytics(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        // Create a deployment and add to group so user has access to the model
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        // Upload a batch file
+        let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}"#;
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test-batch.jsonl");
+        let multipart = axum_test::multipart::MultipartForm::new()
+            .add_part("file", file_part)
+            .add_part("purpose", axum_test::multipart::Part::text("batch"));
+        let upload_resp = app
+            .post("/ai/v1/files")
+            .multipart(multipart)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        upload_resp.assert_status(StatusCode::CREATED);
+        let file: serde_json::Value = upload_resp.json();
+        let file_id = file["id"].as_str().unwrap();
+
+        // Create a batch
+        let create_req = CreateBatchRequest {
+            input_file_id: file_id.to_string(),
+            endpoint: "/v1/chat/completions".to_string(),
+            completion_window: "24h".to_string(),
+            metadata: None,
+        };
+
+        let create_resp = app
+            .post("/ai/v1/batches")
+            .json(&create_req)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        create_resp.assert_status(StatusCode::CREATED);
+
+        // List batches without include=analytics - analytics should not be present
+        let list_resp = app
+            .get("/ai/v1/batches")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        list_resp.assert_status_ok();
+        let list_result: serde_json::Value = list_resp.json();
+        assert!(list_result["data"].as_array().unwrap().len() >= 1);
+        // Without include=analytics, analytics field should be null/missing
+        let first_batch = &list_result["data"][0];
+        assert!(first_batch["analytics"].is_null());
+
+        // List batches with include=analytics - analytics should be present
+        let list_with_analytics_resp = app
+            .get("/ai/v1/batches?include=analytics")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        list_with_analytics_resp.assert_status_ok();
+        let list_with_analytics: serde_json::Value = list_with_analytics_resp.json();
+        assert!(list_with_analytics["data"].as_array().unwrap().len() >= 1);
+        // With include=analytics, analytics field should be an object (even if empty)
+        let first_batch_with_analytics = &list_with_analytics["data"][0];
+        assert!(first_batch_with_analytics["analytics"].is_object());
+        // Verify analytics has expected fields
+        let analytics = &first_batch_with_analytics["analytics"];
+        assert!(analytics["total_requests"].is_number());
+        assert!(analytics["total_prompt_tokens"].is_number());
+        assert!(analytics["total_completion_tokens"].is_number());
+        assert!(analytics["total_tokens"].is_number());
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_errors_hidden_until_sla_expires(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        let deployment = create_test_deployment(&pool, user.id, "test-model", "test-model").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        // Upload a batch file
+        let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"test-model","messages":[{"role":"user","content":"Test"}]}}"#;
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test.jsonl");
+        let multipart = axum_test::multipart::MultipartForm::new()
+            .add_part("file", file_part)
+            .add_part("purpose", axum_test::multipart::Part::text("batch"));
+        let upload_resp = app
+            .post("/ai/v1/files")
+            .multipart(multipart)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        upload_resp.assert_status(StatusCode::CREATED);
+        let file: serde_json::Value = upload_resp.json();
+        let file_id = file["id"].as_str().unwrap();
+
+        // Create batch
+        let create_req = CreateBatchRequest {
+            input_file_id: file_id.to_string(),
+            endpoint: "/v1/chat/completions".to_string(),
+            completion_window: "24h".to_string(),
+            metadata: None,
+        };
+
+        let resp = app
+            .post("/ai/v1/batches")
+            .json(&create_req)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        resp.assert_status(StatusCode::CREATED);
+        let batch: serde_json::Value = resp.json();
+        let batch_id = batch["id"].as_str().unwrap();
+        let batch_uuid = Uuid::parse_str(batch_id).unwrap();
+
+        // Scenario 1: Simulate errors exist but batch is still within SLA (no failed_at)
+        sqlx::query(
+            r#"
+            UPDATE fusillade.batches
+            SET errors = '{"object":"list","data":[{"code":"invalid_request","message":"Test error"}]}'::jsonb
+            WHERE id = $1
+            "#,
+        )
+        .bind(batch_uuid)
+        .execute(&pool)
+        .await
+        .expect("Failed to set errors");
+
+        // GET batch - errors should be HIDDEN (null) because within SLA
+        let get_resp = app
+            .get(&format!("/ai/v1/batches/{}", batch_id))
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        get_resp.assert_status(StatusCode::OK);
+        let batch_response: serde_json::Value = get_resp.json();
+
+        assert!(
+            batch_response["errors"].is_null(),
+            "Errors should be hidden when batch is within SLA (no failed_at set)"
+        );
+        // Note: error_file_id is always shown if it exists - the file content is filtered by fusillade
+        // In this test, error_file_id doesn't exist yet because we only set the errors field
+        assert!(
+            batch_response["failed_at"].is_null(),
+            "failed_at should be hidden when batch is within SLA"
+        );
+        assert_eq!(
+            batch_response["request_counts"]["failed"].as_i64().unwrap(),
+            0,
+            "Failed request count should be hidden (shown as 0) when within SLA"
+        );
+
+        // Scenario 2: Set failed_at but still within SLA - errors should STILL be hidden
+        sqlx::query(
+            r#"
+            UPDATE fusillade.batches
+            SET failed_at = NOW()
+            WHERE id = $1
+            "#,
+        )
+        .bind(batch_uuid)
+        .execute(&pool)
+        .await
+        .expect("Failed to set failed_at");
+
+        // GET batch - errors should STILL be HIDDEN because within SLA
+        let get_resp2 = app
+            .get(&format!("/ai/v1/batches/{}", batch_id))
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        get_resp2.assert_status(StatusCode::OK);
+        let batch_response2: serde_json::Value = get_resp2.json();
+
+        assert!(
+            batch_response2["errors"].is_null(),
+            "Errors should be hidden when failed_at is set but SLA has not expired"
+        );
+        // Note: error_file_id is shown if it exists (file content is filtered by fusillade)
+        // We don't assert on it here since it may or may not exist depending on batch processing
+        assert!(
+            batch_response2["failed_at"].is_null(),
+            "failed_at should be hidden until SLA expires"
+        );
+        assert_eq!(
+            batch_response2["request_counts"]["failed"].as_i64().unwrap(),
+            0,
+            "Failed request count should still be hidden even with failed_at set"
+        );
+
+        // Scenario 3: Expire the SLA AND have failed_at - NOW errors should be visible
+        sqlx::query(
+            r#"
+            UPDATE fusillade.batches
+            SET expires_at = NOW() - INTERVAL '1 hour'
+            WHERE id = $1
+            "#,
+        )
+        .bind(batch_uuid)
+        .execute(&pool)
+        .await
+        .expect("Failed to expire batch");
+
+        // GET batch - errors should NOW be VISIBLE
+        let get_resp3 = app
+            .get(&format!("/ai/v1/batches/{}", batch_id))
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        get_resp3.assert_status(StatusCode::OK);
+        let batch_response3: serde_json::Value = get_resp3.json();
+
+        assert!(
+            !batch_response3["errors"].is_null(),
+            "Errors should be visible when both failed_at is set AND SLA has expired"
+        );
+        assert_eq!(
+            batch_response3["errors"]["data"][0]["message"].as_str().unwrap(),
+            "Test error",
+            "Error message should match what we set"
+        );
+        // Note: error_file_id would be shown if it existed - fusillade creates it during processing
+        // This test manually sets errors without going through fusillade, so no error file exists
+        assert!(
+            !batch_response3["failed_at"].is_null(),
+            "failed_at should now be visible after SLA expires"
+        );
+        // Note: We can't easily verify the exact failed count since we didn't actually
+        // create failed requests in the DB (just set the errors field). But we verified
+        // it was hidden before, so the logic is working.
     }
 }

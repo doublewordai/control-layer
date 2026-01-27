@@ -10,6 +10,7 @@ use base64::Engine;
 use tracing::{debug, error, instrument};
 
 use crate::{AppState, static_assets};
+use sqlx_pool_router::PoolProvider;
 
 /// Default title used when no custom title is configured
 const DEFAULT_TITLE: &str = "Doubleword Control Layer";
@@ -22,7 +23,7 @@ fn inject_title(html: &str, title: Option<&str>) -> String {
 
 /// Serve embedded static assets with SPA fallback
 #[instrument(skip(state))]
-pub async fn serve_embedded_asset(State(state): State<AppState>, uri: Uri) -> impl IntoResponse {
+pub async fn serve_embedded_asset<P: PoolProvider + Clone>(State(state): State<AppState<P>>, uri: Uri) -> impl IntoResponse {
     let mut path = uri.path().trim_start_matches('/');
 
     // If path is empty or ends with /, serve index.html
@@ -99,7 +100,7 @@ pub async fn serve_embedded_asset(State(state): State<AppState>, uri: Uri) -> im
 
 /// SPA fallback handler - serves index.html for client-side routes
 #[instrument(skip(state), err)]
-pub async fn spa_fallback(State(state): State<AppState>, uri: Uri) -> Result<Html<String>, StatusCode> {
+pub async fn spa_fallback<P: PoolProvider + Clone>(State(state): State<AppState<P>>, uri: Uri) -> Result<Html<String>, StatusCode> {
     debug!("Hitting SPA fallback for: {}", uri.path());
 
     // Serve embedded index.html with injected title

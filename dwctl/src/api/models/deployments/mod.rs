@@ -25,6 +25,8 @@ pub struct ListModelsQuery {
     #[param(value_type = Option<String>, format = "uuid")]
     #[schema(value_type = Option<String>, format = "uuid")]
     pub endpoint: Option<InferenceEndpointId>,
+    /// Filter by group IDs (comma-separated UUIDs)
+    pub group: Option<String>,
     /// Include related data (comma-separated: "groups", "metrics", "status", "pricing", "endpoints")
     pub include: Option<String>,
     /// Show deleted models when true, non-deleted when false, all when not specified (admin only for deleted=true)

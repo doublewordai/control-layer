@@ -1,7 +1,7 @@
 import { useState, useEffect } from "react";
 import * as React from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
-import { useQueryClient, useQueries } from "@tanstack/react-query";
+import { useQueryClient } from "@tanstack/react-query";
 import {
   Upload,
   Play,
@@ -9,6 +9,7 @@ import {
   FileInput,
   FileCheck,
   AlertCircle,
+  X,
 } from "lucide-react";
 import { Button } from "../../../ui/button";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "../../../ui/tabs";
@@ -25,13 +26,11 @@ import { createBatchColumns } from "../BatchesTable/columns";
 import { useFiles, useBatches } from "../../../../api/control-layer/hooks";
 import { dwctlApi } from "../../../../api/control-layer/client";
 import type { FileObject, Batch } from "../types";
-import type {
-  BatchAnalytics,
-  FileCostEstimate,
-} from "../../../../api/control-layer/types";
+import type { BatchAnalytics } from "../../../../api/control-layer/types";
 import { useServerCursorPagination } from "../../../../hooks/useServerCursorPagination";
 import { useDebounce } from "../../../../hooks/useDebounce";
 import { useAuthorization } from "../../../../utils/authorization";
+import { useBootstrapContent } from "@/hooks/use-bootstrap-content";
 
 /**
  * Props for the Batches component.
@@ -122,10 +121,12 @@ export function Batches({
   // Pagination hooks with prefixed URL params for multi-table support
   const filesPagination = useServerCursorPagination({
     paramPrefix: "files",
+    defaultPageSize: 10,
   });
 
   const batchesPagination = useServerCursorPagination({
     paramPrefix: "batches",
+    defaultPageSize: 10,
   });
 
   // API queries
@@ -142,11 +143,13 @@ export function Batches({
     purpose: filePurpose,
     search: debouncedFileSearch.trim() || undefined,
     ...filesPagination.queryParams,
+    enabled: activeTab === "files" || !!batchFileFilter,
   });
 
-  // Paginated batches query
+  // Paginated batches query - include analytics to avoid N+1 requests
   const { data: batchesResponse, isLoading: batchesLoading } = useBatches({
     search: debouncedBatchSearch.trim() || undefined,
+    include: "analytics",
     ...batchesPagination.queryParams,
     // Always fetch to populate tab counts, but refetch interval is lower when not active
   });
@@ -174,51 +177,16 @@ export function Batches({
     return batches.filter((b) => b.input_file_id === batchFileFilter);
   }, [batches, batchFileFilter]);
 
-  // Fetch analytics for all batches in parallel
-  const analyticsQueries = useQueries({
-    queries: batches.map((batch) => ({
-      queryKey: ["batches", "analytics", batch.id],
-      queryFn: () => dwctlApi.batches.getAnalytics(batch.id),
-      staleTime: 5000, // 5 seconds
-      refetchInterval: 5000, // Refetch every 5 seconds for in-progress batches
-    })),
-  });
-
-  // Create a map of batch ID to analytics for easy lookup
+  // Create a map of batch ID to analytics for easy lookup (analytics are now embedded in batch response)
   const batchAnalyticsMap = React.useMemo(() => {
     const map = new Map<string, BatchAnalytics>();
-    batches.forEach((batch, index) => {
-      const analytics = analyticsQueries[index]?.data;
-      if (analytics) {
-        map.set(batch.id, analytics);
+    batches.forEach((batch) => {
+      if (batch.analytics) {
+        map.set(batch.id, batch.analytics);
       }
     });
     return map;
-  }, [batches, analyticsQueries]);
-
-  // Fetch file cost estimates for batch input files
-  const fileEstimateQueries = useQueries({
-    queries: files
-      .filter((file) => file.purpose === "batch")
-      .map((file) => ({
-        queryKey: ["files", "cost-estimate", file.id],
-        queryFn: () => dwctlApi.files.getCostEstimate(file.id),
-        staleTime: 60000, // 1 minute - cost estimates don't change frequently
-      })),
-  });
-
-  // Create a map of file ID to cost estimate for easy lookup
-  const fileEstimatesMap = React.useMemo(() => {
-    const map = new Map<string, FileCostEstimate>();
-    const batchFiles = files.filter((file) => file.purpose === "batch");
-    batchFiles.forEach((file, index) => {
-      const estimate = fileEstimateQueries[index]?.data;
-      if (estimate) {
-        map.set(file.id, estimate);
-      }
-    });
-    return map;
-  }, [files, fileEstimateQueries]);
+  }, [batches]);
 
   // Prefetch next page for files - only if user has already started paginating
   useEffect(() => {
@@ -413,7 +381,6 @@ export function Batches({
     onTriggerBatch: handleTriggerBatch,
     onViewBatches: handleFileClick,
     isFileInProgress,
-    fileEstimates: fileEstimatesMap,
   });
 
   const handleBatchClick = (batch: Batch) => {
@@ -435,6 +402,9 @@ export function Batches({
     showUserColumn: isPlatformManager,
   });
 
+  const bootstrapBanner = useBootstrapContent();
+  console.log("bootstrapBanner", bootstrapBanner);
+
   return (
     <div
       className="py-4 px-6"
@@ -453,10 +423,12 @@ export function Batches({
           {/* Left: Title */}
           <div className="shrink-0">
             <h1 className="text-3xl font-bold text-doubleword-neutral-900">
-              Batch Processing
+              {activeTab === "batches" ? "Batch Requests" : "Batch Files"}
             </h1>
             <p className="text-doubleword-neutral-600 mt-1">
-              Upload files and create batches to process requests at scale
+              {activeTab === "batches"
+                ? "Create and manage batch requests"
+                : "Upload and manage files for batch processing"}
             </p>
           </div>
 
@@ -504,6 +476,22 @@ export function Batches({
             </TabsList>
           </div>
         </div>
+
+        {/* Bootstrap Banner */}
+        {bootstrapBanner.content && !bootstrapBanner.isClosed && (
+          <div className="relative mb-6">
+            <div
+              dangerouslySetInnerHTML={{ __html: bootstrapBanner.content }}
+            />
+            <button
+              onClick={bootstrapBanner.close}
+              className="absolute top-3 right-3 rounded-sm opacity-50 transition-opacity hover:opacity-100 focus:ring-2 focus:ring-ring focus:ring-offset-2 focus:outline-hidden"
+              aria-label="Close banner"
+            >
+              <X className="h-4 w-4 text-doubleword-neutral-600" />
+            </button>
+          </div>
+        )}
 
         {/* Content */}
         <TabsContent value="batches" className="space-y-4">

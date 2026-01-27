@@ -142,6 +142,7 @@ mod email;
 mod error_enrichment;
 pub mod errors;
 mod leader_election;
+pub mod limits;
 mod metrics;
 mod openapi;
 mod payment_providers;
@@ -168,8 +169,10 @@ use crate::{
     db::models::{deployments::DeploymentCreateDBRequest, users::UserCreateDBRequest},
     metrics::GenAiMetrics,
     openapi::{AdminApiDoc, AiApiDoc},
-    request_logging::serializers::{AnalyticsResponseSerializer, parse_ai_request},
+    request_logging::serializers::{parse_ai_request, parse_ai_response},
 };
+use sqlx_pool_router::{DbPools, PoolProvider};
+
 use anyhow::Context;
 use auth::middleware::admin_ai_proxy_middleware;
 use axum::extract::DefaultBodyLimit;
@@ -182,7 +185,7 @@ use axum_prometheus::PrometheusMetricLayerBuilder;
 use bon::Builder;
 pub use config::Config;
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
-use outlet::{RequestLoggerConfig, RequestLoggerLayer};
+use outlet::{MultiHandler, RequestLoggerConfig, RequestLoggerLayer};
 use outlet_postgres::PostgresHandler;
 use request_logging::{AiResponse, ParsedAIRequest};
 use sqlx::{Executor, PgPool};
@@ -209,32 +212,41 @@ pub use types::{ApiKeyId, DeploymentId, GroupId, InferenceEndpointId, UserId};
 ///
 /// - `db`: Main PostgreSQL connection pool for application data
 /// - `config`: Application configuration loaded from environment/files
-/// - `outlet_db`: Optional connection pool for request logging (when enabled)
+/// - `outlet_db`: Optional connection pool for request logging (when enabled), uses same pool provider type as db
 /// - `metrics_recorder`: Optional Prometheus metrics recorder (when enabled)
 /// - `is_leader`: Whether this instance is the elected leader (for distributed deployments)
 /// - `request_manager`: Fusillade batch request manager for async processing
+/// - `limiters`: Resource limiters for protecting system capacity
 ///
 /// # Example
 ///
 /// ```ignore
+/// let limiters = limits::Limiters::new(&config.limits);
 /// let state = AppState::builder()
 ///     .db(db_pools)
 ///     .config(config)
 ///     .request_manager(request_manager)
+///     .limiters(limiters)
 ///     .build();
 /// ```
 #[derive(Clone, Builder)]
-pub struct AppState {
+pub struct AppState<P = DbPools>
+where
+    P: PoolProvider + Clone,
+{
     /// Database pools (primary + optional replica).
-    /// Implements `Deref<Target = PgPool>` for backwards compatibility.
     /// Use `.read()` for read-only queries, `.write()` for writes.
-    pub db: db::DbPools,
+    pub db: P,
     pub config: Config,
-    pub outlet_db: Option<PgPool>,
+    /// Outlet database pools for request logging. Always uses DbPools (production type).
+    /// In tests, this uses DbPools without read-only enforcement (outlet is write-heavy).
+    pub outlet_db: Option<DbPools>,
     pub metrics_recorder: Option<GenAiMetrics>,
     #[builder(default = false)]
     pub is_leader: bool,
-    pub request_manager: Arc<fusillade::PostgresRequestManager<db::DbPools, fusillade::ReqwestHttpClient>>,
+    pub request_manager: Arc<fusillade::PostgresRequestManager<P, fusillade::ReqwestHttpClient>>,
+    /// Resource limiters for protecting system capacity.
+    pub limiters: limits::Limiters,
 }
 
 /// Get the dwctl database migrator
@@ -498,28 +510,19 @@ pub async fn seed_database(sources: &[config::ModelSource], db: &PgPool) -> Resu
 async fn setup_database(
     config: &Config,
     pool: Option<PgPool>,
-) -> anyhow::Result<(
-    Option<db::embedded::EmbeddedDatabase>,
-    db::DbPools,
-    db::DbPools,
-    Option<db::DbPools>,
-)> {
-    // If a pool is provided (e.g., from tests), use it directly
+) -> anyhow::Result<(Option<db::embedded::EmbeddedDatabase>, DbPools, DbPools, Option<DbPools>)> {
+    // If a pool is provided (e.g., from tests), create a TestDbPools which will create a read-only replica
     let (embedded_db, pool, test_replica_pool) = if let Some(existing_pool) = pool {
-        info!("Using provided database pool");
+        info!("Using provided database pool with TestDbPools for read/write separation");
 
-        // In test mode, automatically create a read-only replica pool for testing
-        // This ensures all tests verify correct pool routing
-        #[cfg(test)]
-        let test_replica = {
-            info!("Creating read-only test replica pool for pool routing validation");
-            Some(test::utils::create_readonly_replica_pool(&existing_pool).await?)
-        };
+        // Create TestDbPools which creates a read-only replica for testing
+        let test_pools = sqlx_pool_router::TestDbPools::new(existing_pool.clone())
+            .await
+            .expect("Failed to create TestDbPools");
 
-        #[cfg(not(test))]
-        let test_replica = None;
-
-        (None, existing_pool, test_replica)
+        // Extract the write and read pools to create a DbPools with proper read/write separation
+        let replica_pool = test_pools.read().clone();
+        (None, existing_pool, Some(replica_pool))
     } else {
         // Database connection - handle both embedded and external
         let (_embedded_db, database_url) = match &config.database {
@@ -575,7 +578,7 @@ async fn setup_database(
     // Create replica pool if configured (or use test replica if in test mode)
     let db_pools = if let Some(test_replica) = test_replica_pool {
         info!("Using test replica pool with read-only enforcement");
-        db::DbPools::with_replica(pool, test_replica)
+        DbPools::with_replica(pool, test_replica)
     } else if let Some(replica_url) = config.database.external_replica_url() {
         info!("Setting up read replica pool");
         let replica_settings = config.database.main_replica_pool_settings();
@@ -595,9 +598,9 @@ async fn setup_database(
             })
             .connect(replica_url)
             .await?;
-        db::DbPools::with_replica(pool, replica_pool)
+        DbPools::with_replica(pool, replica_pool)
     } else {
-        db::DbPools::new(pool)
+        DbPools::new(pool)
     };
 
     // Get connection options from the main pool to create schema-based child pools
@@ -607,11 +610,15 @@ async fn setup_database(
     // Reuses connection URLs from main pool (both primary and replica if configured)
     // Sets search_path at the connection level (via PgConnectOptions) rather than using
     // after_connect hooks, ensuring it cannot be unset and works reliably with replicas
-    let create_schema_pool = |schema: String, opts: sqlx::postgres::PgConnectOptions, settings: &config::PoolSettings| {
+    // Uses eager connection (connect_with) to respect min_connections at startup
+    async fn create_schema_pool(
+        schema: String,
+        opts: sqlx::postgres::PgConnectOptions,
+        settings: &config::PoolSettings,
+    ) -> Result<sqlx::PgPool, sqlx::Error> {
         // Set search_path directly in connection options so PostgreSQL enforces it
         // This is more reliable than after_connect hooks, especially with replicas
         // The options() method formats as: "-c key=value"
-        // We need to create owned values that live long enough for the closure
         let search_path_key = "search_path".to_string();
         let search_path_value = schema.clone();
         info!("Setting search_path={} via connection options for schema pool", schema);
@@ -631,8 +638,9 @@ async fn setup_database(
             } else {
                 None
             })
-            .connect_lazy_with(opts_with_schema)
-    };
+            .connect_with(opts_with_schema)
+            .await
+    }
 
     // Setup fusillade batch processing pool
     info!("Setting up fusillade batch processing pool");
@@ -641,17 +649,18 @@ async fn setup_database(
             name, pool: pool_settings, ..
         } => {
             // Create primary pool using main's connection, with schema-specific search_path
-            let primary = create_schema_pool(name.clone(), main_connect_opts.clone(), pool_settings);
+            let primary = create_schema_pool(name.clone(), main_connect_opts.clone(), pool_settings).await?;
             primary.execute(&*format!("CREATE SCHEMA IF NOT EXISTS {name}")).await?;
 
             // Create replica pool if main has one configured (inherits main's replica connection)
-            if let Some(replica_opts) = db_pools.replica_connect_options() {
+            if db_pools.has_replica() {
                 info!("Setting up fusillade read replica (schema mode)");
+                let replica_opts = db_pools.read().connect_options().as_ref().clone();
                 let replica_pool_settings = config.database.fusillade().replica_pool_settings();
-                let replica = create_schema_pool(name.clone(), replica_opts, replica_pool_settings);
-                db::DbPools::with_replica(primary, replica)
+                let replica = create_schema_pool(name.clone(), replica_opts, replica_pool_settings).await?;
+                DbPools::with_replica(primary, replica)
             } else {
-                db::DbPools::new(primary)
+                DbPools::new(primary)
             }
         }
         config::ComponentDb::Dedicated {
@@ -697,9 +706,9 @@ async fn setup_database(
                     })
                     .connect(replica_url)
                     .await?;
-                db::DbPools::with_replica(primary, replica)
+                DbPools::with_replica(primary, replica)
             } else {
-                db::DbPools::new(primary)
+                DbPools::new(primary)
             }
         }
     };
@@ -713,17 +722,18 @@ async fn setup_database(
                 name, pool: pool_settings, ..
             } => {
                 // Create primary pool using main's connection, with schema-specific search_path
-                let primary = create_schema_pool(name.clone(), main_connect_opts.clone(), pool_settings);
+                let primary = create_schema_pool(name.clone(), main_connect_opts.clone(), pool_settings).await?;
                 primary.execute(&*format!("CREATE SCHEMA IF NOT EXISTS {name}")).await?;
 
                 // Create replica pool if main has one configured (inherits main's replica connection)
-                if let Some(replica_opts) = db_pools.replica_connect_options() {
+                if db_pools.has_replica() {
                     info!("Setting up outlet read replica (schema mode)");
+                    let replica_opts = db_pools.read().connect_options().as_ref().clone();
                     let replica_pool_settings = config.database.outlet().replica_pool_settings();
-                    let replica = create_schema_pool(name.clone(), replica_opts, replica_pool_settings);
-                    db::DbPools::with_replica(primary, replica)
+                    let replica = create_schema_pool(name.clone(), replica_opts, replica_pool_settings).await?;
+                    DbPools::with_replica(primary, replica)
                 } else {
-                    db::DbPools::new(primary)
+                    DbPools::new(primary)
                 }
             }
             config::ComponentDb::Dedicated {
@@ -769,9 +779,9 @@ async fn setup_database(
                         })
                         .connect(replica_url)
                         .await?;
-                    db::DbPools::with_replica(primary, replica)
+                    DbPools::with_replica(primary, replica)
                 } else {
-                    db::DbPools::new(primary)
+                    DbPools::new(primary)
                 }
             }
         };
@@ -873,36 +883,62 @@ fn create_cors_layer(config: &Config) -> anyhow::Result<CorsLayer> {
 /// Returns an error if CORS configuration is invalid or metrics initialization fails.
 #[instrument(skip_all)]
 pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyhow::Result<Router> {
-    // Setup request logging if enabled
-    let outlet_layer = if let Some(outlet_pool) = state.outlet_db.as_ref() {
-        // Initialize GenAI metrics BEFORE creating analytics serializer if metrics enabled
-        if state.config.enable_metrics {
+    // Setup request logging and/or analytics based on config flags
+    //
+    // These can be enabled independently:
+    // - enable_request_logging: stores raw request/response bodies via outlet-postgres
+    // - enable_analytics: stores analytics data, handles billing, records Prometheus metrics
+    //
+    // Both require the RequestLoggerLayer to capture request/response data, but use
+    // different handlers to process that data.
+    let request_logging_enabled = state.outlet_db.is_some() && state.config.enable_request_logging;
+    let analytics_enabled = state.config.enable_analytics;
+
+    let outlet_layer = if request_logging_enabled || analytics_enabled {
+        // Initialize GenAI metrics BEFORE creating analytics handler if metrics enabled
+        if state.config.enable_metrics && analytics_enabled {
             let gen_ai_registry = prometheus::Registry::new();
             let gen_ai_metrics =
                 GenAiMetrics::new(&gen_ai_registry).map_err(|e| anyhow::anyhow!("Failed to create GenAI metrics: {}", e))?;
             state.metrics_recorder = Some(gen_ai_metrics);
         }
 
-        let analytics_serializer = AnalyticsResponseSerializer::new(
-            (*state.db).clone(),
-            uuid::Uuid::new_v4(),
-            state.config.clone(),
-            state.metrics_recorder.clone(),
-        );
+        // Build handler chain based on config
+        let mut multi_handler = MultiHandler::new();
 
-        let postgres_handler = PostgresHandler::<ParsedAIRequest, AiResponse>::from_pool(outlet_pool.clone())
-            .await
-            .expect("Failed to create PostgresHandler for request logging")
-            .with_request_serializer(parse_ai_request)
-            .with_response_serializer(analytics_serializer.create_serializer());
+        // Add PostgresHandler for request logging if enabled
+        if request_logging_enabled {
+            let outlet_pool = state.outlet_db.as_ref().expect("outlet_db checked above");
+            let postgres_handler = PostgresHandler::<DbPools, ParsedAIRequest, AiResponse>::from_pool_provider(outlet_pool.clone())
+                .await
+                .expect("Failed to create PostgresHandler for request logging")
+                .with_request_serializer(parse_ai_request)
+                .with_response_serializer(parse_ai_response);
+            multi_handler = multi_handler.with(postgres_handler);
+        }
 
-        let outlet_config = RequestLoggerConfig {
-            capture_request_body: true,
-            capture_response_body: true,
-            path_filter: None, // No path filter needed - applied directly to ai_router
-        };
+        // Add AnalyticsHandler for analytics/billing if enabled
+        if analytics_enabled {
+            let analytics_handler = request_logging::AnalyticsHandler::new(
+                state.db.write().clone(),
+                uuid::Uuid::new_v4(),
+                state.config.clone(),
+                state.metrics_recorder.clone(),
+            );
+            multi_handler = multi_handler.with(analytics_handler);
+        }
 
-        Some(RequestLoggerLayer::new(outlet_config, postgres_handler))
+        // Only create layer if at least one handler is enabled (should always be true here)
+        if multi_handler.is_empty() {
+            None
+        } else {
+            let outlet_config = RequestLoggerConfig {
+                capture_request_body: true,
+                capture_response_body: true,
+                path_filter: None, // No path filter needed - applied directly to ai_router
+            };
+            Some(RequestLoggerLayer::new(outlet_config, multi_handler))
+        }
     } else {
         None
     };
@@ -1086,7 +1122,7 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
 
     // Apply error enrichment middleware to onwards router (before outlet logging)
     let onwards_router = onwards_router.layer(middleware::from_fn_with_state(
-        (*state.db).clone(),
+        state.db.write().clone(),
         error_enrichment::error_enrichment_middleware,
     ));
 
@@ -1196,7 +1232,7 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
 /// stop all background tasks. When dropped, the `drop_guard` will automatically cancel
 /// the shutdown token, signaling all tasks to stop.
 pub struct BackgroundServices {
-    request_manager: Arc<fusillade::PostgresRequestManager<db::DbPools, fusillade::ReqwestHttpClient>>,
+    request_manager: Arc<fusillade::PostgresRequestManager<DbPools, fusillade::ReqwestHttpClient>>,
     is_leader: bool,
     onwards_targets: onwards::target::Targets,
     #[cfg_attr(not(test), allow(dead_code))]
@@ -1322,11 +1358,12 @@ impl BackgroundTaskBuilder {
 /// Setup background services (probe scheduler, batch daemon, leader election, onwards integration)
 async fn setup_background_services(
     pool: PgPool,
-    fusillade_pools: db::DbPools,
+    fusillade_pools: DbPools,
     outlet_pool: Option<PgPool>,
     config: Config,
     shutdown_token: tokio_util::sync::CancellationToken,
 ) -> anyhow::Result<BackgroundServices> {
+    use fusillade::manager::postgres::BatchInsertStrategy;
     let drop_guard = shutdown_token.clone().drop_guard();
     // Track all background task handles for graceful shutdown
     let mut background_tasks = BackgroundTaskBuilder::new();
@@ -1388,7 +1425,10 @@ async fn setup_background_services(
                     .batch_daemon
                     .to_fusillade_config_with_limits(Some(model_capacity_limits.clone())),
             )
-            .with_download_buffer_size(config.batches.files.download_buffer_size),
+            .with_download_buffer_size(config.batches.files.download_buffer_size)
+            .with_batch_insert_strategy(BatchInsertStrategy::Batched {
+                batch_size: config.batches.files.batch_insert_size,
+            }),
     );
 
     let is_leader: bool;
@@ -1657,9 +1697,9 @@ pub struct Application {
     router: Router,
     app_state: AppState,
     config: Config,
-    db_pools: db::DbPools,
-    _fusillade_pools: db::DbPools,
-    _outlet_pools: Option<db::DbPools>,
+    db_pools: DbPools,
+    _fusillade_pools: DbPools,
+    _outlet_pools: Option<DbPools>,
     _embedded_db: Option<db::embedded::EmbeddedDatabase>,
     bg_services: BackgroundServices,
 }
@@ -1709,14 +1749,17 @@ impl Application {
             onwards::AppState::new(bg_services.onwards_targets.clone()).with_response_transform(onwards::create_openai_sanitizer());
         let onwards_router = onwards::build_router(onwards_app_state);
 
+        // Build resource limiters
+        let limiters = limits::Limiters::new(&config.limits);
+
         // Build app state and router
-        // Extract primary pool for outlet_db (via Deref)
         let mut app_state = AppState::builder()
             .db(db_pools.clone())
             .config(config.clone())
             .is_leader(bg_services.is_leader)
             .request_manager(bg_services.request_manager.clone())
-            .maybe_outlet_db(outlet_pools.as_ref().map(|p| (**p).clone()))
+            .maybe_outlet_db(outlet_pools.clone())
+            .limiters(limiters)
             .build();
 
         let router = build_router(&mut app_state, onwards_router).await?;

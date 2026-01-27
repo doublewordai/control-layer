@@ -71,6 +71,10 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use thiserror::Error as ThisError;
 
+/// Retry-After header value (in seconds) for 503 Service Unavailable responses
+/// when the database connection pool is exhausted.
+const POOL_EXHAUSTED_RETRY_AFTER_SECS: &str = "30";
+
 #[derive(ThisError, Debug)]
 pub enum Error {
     /// Authentication required but not provided
@@ -123,6 +127,10 @@ pub enum Error {
     /// User does not have access to the requested model
     #[error("Model access denied: {message}")]
     ModelAccessDenied { model_name: String, message: String },
+
+    /// Too many concurrent requests - rate limiting
+    #[error("Too many requests: {message}")]
+    TooManyRequests { message: String },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -146,6 +154,7 @@ impl Error {
                 DbError::CheckViolation { .. } => StatusCode::BAD_REQUEST,
                 DbError::ProtectedEntity { .. } => StatusCode::FORBIDDEN,
                 DbError::InvalidModelField { .. } => StatusCode::BAD_REQUEST,
+                DbError::PoolExhausted => StatusCode::SERVICE_UNAVAILABLE,
                 DbError::Other(_) => StatusCode::INTERNAL_SERVER_ERROR,
             },
             Error::Other(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -153,6 +162,7 @@ impl Error {
             Error::PayloadTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
             Error::InsufficientCredits { .. } => StatusCode::PAYMENT_REQUIRED,
             Error::ModelAccessDenied { .. } => StatusCode::FORBIDDEN,
+            Error::TooManyRequests { .. } => StatusCode::TOO_MANY_REQUESTS,
         }
     }
 
@@ -193,6 +203,7 @@ impl Error {
                     format!("Cannot {operation:?} {entity_type}: {reason}")
                 }
                 DbError::InvalidModelField { field } => format!("Field '{field}' must not be empty or whitespace"),
+                DbError::PoolExhausted => "Service temporarily overloaded, please retry".to_string(),
                 DbError::Other(_) => "Database error occurred".to_string(),
             },
             Error::Other(_) => "Internal server error".to_string(),
@@ -206,6 +217,7 @@ impl Error {
             }
             Error::InsufficientCredits { message, .. } => message.clone(),
             Error::ModelAccessDenied { message, .. } => message.clone(),
+            Error::TooManyRequests { message } => message.clone(),
         }
     }
 }
@@ -216,6 +228,9 @@ impl IntoResponse for Error {
         match &self {
             Error::Database(DbError::Other(_)) | Error::Internal { .. } | Error::Other(_) => {
                 tracing::error!("Internal service error: {:#}", self);
+            }
+            Error::Database(DbError::PoolExhausted) => {
+                tracing::warn!("Database connection pool exhausted - service overloaded");
             }
             Error::Database(_) => {
                 tracing::warn!("Database constraint error: {}", self);
@@ -235,6 +250,9 @@ impl IntoResponse for Error {
             Error::ModelAccessDenied { .. } => {
                 tracing::info!("Model access denied error: {}", self);
             }
+            Error::TooManyRequests { .. } => {
+                tracing::info!("Rate limit exceeded: {}", self);
+            }
         }
 
         let status = self.status_code();
@@ -253,6 +271,17 @@ impl IntoResponse for Error {
                 };
 
                 (status, axum::response::Json(body)).into_response()
+            }
+            // Handle pool exhaustion with Retry-After header
+            Error::Database(DbError::PoolExhausted) => {
+                use axum::http::header::RETRY_AFTER;
+                use serde_json::json;
+                let body = json!({
+                    "error": "service_unavailable",
+                    "message": self.user_message(),
+                    "retry_after_seconds": 30
+                });
+                (status, [(RETRY_AFTER, POOL_EXHAUSTED_RETRY_AFTER_SECS)], axum::response::Json(body)).into_response()
             }
             // Handle database unique violations with minimal structured JSON
             Error::Database(DbError::UniqueViolation { constraint, table, .. }) => {

@@ -1,5 +1,113 @@
 # Changelog
 
+## [3.3.0](https://github.com/doublewordai/control-layer/compare/v3.2.0...v3.3.0) (2026-01-27)
+
+
+### Features
+
+* add configurable file upload concurrency limits ([#614](https://github.com/doublewordai/control-layer/issues/614)) ([67065a3](https://github.com/doublewordai/control-layer/commit/67065a36e8deb10554a3b9cf91a176f206e90496))
+
+
+### Bug Fixes
+
+* **deps:** update dependency lucide-react to ^0.563.0 ([#579](https://github.com/doublewordai/control-layer/issues/579)) ([ff714a2](https://github.com/doublewordai/control-layer/commit/ff714a23bb68d79118cd8d4b35b0576aa1948560))
+
+## [3.2.0](https://github.com/doublewordai/control-layer/compare/v3.1.2...v3.2.0) (2026-01-27)
+
+
+### Features
+
+* Bootstrap content ([#611](https://github.com/doublewordai/control-layer/issues/611)) ([377e22d](https://github.com/doublewordai/control-layer/commit/377e22ddb39194467012260030be4774439f62e3))
+* upgrade fusillade to 2.3.0 ([#613](https://github.com/doublewordai/control-layer/issues/613)) ([28862ff](https://github.com/doublewordai/control-layer/commit/28862ff27d1c2d73eb954a9687f8b3b3755f06e9))
+
+
+### Bug Fixes
+
+* don't show errors before SLA completion  ([#606](https://github.com/doublewordai/control-layer/issues/606)) ([f76fa5f](https://github.com/doublewordai/control-layer/commit/f76fa5f570c23c65a79bf39962f521bd2fb8934b))
+
+## [3.1.2](https://github.com/doublewordai/control-layer/compare/v3.1.1...v3.1.2) (2026-01-26)
+
+
+### Bug Fixes
+
+* remove cost estimate column from files table ([#609](https://github.com/doublewordai/control-layer/issues/609)) ([1b31dc8](https://github.com/doublewordai/control-layer/commit/1b31dc8db7903209a57342769c257c2e6644560b))
+
+## [3.1.1](https://github.com/doublewordai/control-layer/compare/v3.1.0...v3.1.1) (2026-01-26)
+
+
+### Performance Improvements
+
+* defer files query until files tab is active on batches page ([#607](https://github.com/doublewordai/control-layer/issues/607)) ([d060328](https://github.com/doublewordai/control-layer/commit/d060328b22bf534e3e7ca35ecd9a28c955aad347))
+
+## [3.1.0](https://github.com/doublewordai/control-layer/compare/v3.0.1...v3.1.0) (2026-01-26)
+
+
+### Features
+
+* add include=analytics to batches list endpoint ([#602](https://github.com/doublewordai/control-layer/issues/602)) ([36f5ff1](https://github.com/doublewordai/control-layer/commit/36f5ff153ce5c21beba52d73d7dee89c595218b7))
+
+## [3.0.1](https://github.com/doublewordai/control-layer/compare/v3.0.0...v3.0.1) (2026-01-26)
+
+
+### Bug Fixes
+
+* use eager connection for schema pools to respect min_connections ([#600](https://github.com/doublewordai/control-layer/issues/600)) ([ac96ba0](https://github.com/doublewordai/control-layer/commit/ac96ba05fd32b4ba4e83efa3b53a164a8673ff49))
+
+## [3.0.0](https://github.com/doublewordai/control-layer/compare/v2.9.2...v3.0.0) (2026-01-26)
+
+
+### ⚠ BREAKING CHANGES
+
+* add runtime config for AI API base URL ([#595](https://github.com/doublewordai/control-layer/issues/595))
+
+### Features
+
+* add pool exhaustion error handling with 503 response ([#597](https://github.com/doublewordai/control-layer/issues/597)) ([80230ac](https://github.com/doublewordai/control-layer/commit/80230ac868b7d964a711f27bdbfc811124d2c388))
+* add runtime config for AI API base URL ([#595](https://github.com/doublewordai/control-layer/issues/595)) ([1bda2ff](https://github.com/doublewordai/control-layer/commit/1bda2ff519ee9fb4f29280fdee62df68cdfa4f3b))
+* decouple analytics/billing from request logging ([#596](https://github.com/doublewordai/control-layer/issues/596)) ([7846dac](https://github.com/doublewordai/control-layer/commit/7846dac137088ab51aa32a181c3dd7d3fe65e19e))
+
+
+### Bug Fixes
+
+* remove super-slow log statement in transaction writing ([#599](https://github.com/doublewordai/control-layer/issues/599)) ([443d0f4](https://github.com/doublewordai/control-layer/commit/443d0f46071b2092ea5c8d2875441f0a4defa2c5))
+
+## [2.9.2](https://github.com/doublewordai/control-layer/compare/v2.9.1...v2.9.2) (2026-01-24)
+
+
+### Bug Fixes
+
+* use get file from primary pool to avoid any internal lag and errors ([#591](https://github.com/doublewordai/control-layer/issues/591)) ([cfa56ef](https://github.com/doublewordai/control-layer/commit/cfa56ef9d8136304cff5205a5c4644dac2961009))
+
+## [2.9.1](https://github.com/doublewordai/control-layer/compare/v2.9.0...v2.9.1) (2026-01-23)
+
+
+### Bug Fixes
+
+* write pool for get file right after creation, due to tx race conditions ([#588](https://github.com/doublewordai/control-layer/issues/588)) ([3a2b35f](https://github.com/doublewordai/control-layer/commit/3a2b35f4e94f1a77cbf310150d6ac0c24ab02723))
+
+## [2.9.0](https://github.com/doublewordai/control-layer/compare/v2.8.0...v2.9.0) (2026-01-23)
+
+
+### Features
+
+* add model filtering by group ([#586](https://github.com/doublewordai/control-layer/issues/586)) ([0be0ef3](https://github.com/doublewordai/control-layer/commit/0be0ef336ef0bc5019cbc66fbcf8b92f2ce7b28e))
+
+## [2.8.0](https://github.com/doublewordai/control-layer/compare/v2.7.2...v2.8.0) (2026-01-23)
+
+
+### Features
+
+* batched inserts in fusillade ([#583](https://github.com/doublewordai/control-layer/issues/583)) ([98bc430](https://github.com/doublewordai/control-layer/commit/98bc430855aada8351226203a2ab11c935868d41))
+* speed up tests and simplify database handling, also add read and write pool for outlet ([#580](https://github.com/doublewordai/control-layer/issues/580)) ([51f25af](https://github.com/doublewordai/control-layer/commit/51f25aff0d14575c60867b67582eade80e902e9b))
+
+## [2.7.2](https://github.com/doublewordai/control-layer/compare/v2.7.1...v2.7.2) (2026-01-22)
+
+
+### Bug Fixes
+
+* handle search path at connection time rather then after ([aa9c796](https://github.com/doublewordai/control-layer/commit/aa9c79648fc5083ee56dacacb679b615dfc059b5))
+* make test go zoom, remove sleep behavior in as many unit tests as possible ([#575](https://github.com/doublewordai/control-layer/issues/575)) ([d0adb91](https://github.com/doublewordai/control-layer/commit/d0adb91d8b97d359d50eca1e328aac80f28c20f5))
+
 ## [2.7.1](https://github.com/doublewordai/control-layer/compare/v2.7.0...v2.7.1) (2026-01-21)
 
 
