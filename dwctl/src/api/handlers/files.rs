@@ -199,10 +199,11 @@ impl OpenAIBatchRequest {
 /// # Arguments
 /// * `endpoint` - Target endpoint for batch requests (e.g., "http://localhost:8080/ai")
 /// * `api_key` - API key to inject for request execution
-#[tracing::instrument(skip(multipart, api_key, accessible_models), fields(max_file_size, uploaded_by = ?uploaded_by, endpoint = %endpoint, buffer_size))]
+#[tracing::instrument(skip(multipart, api_key, accessible_models), fields(max_file_size, max_requests_per_file, uploaded_by = ?uploaded_by, endpoint = %endpoint, buffer_size))]
 fn create_file_stream(
     mut multipart: Multipart,
     max_file_size: u64,
+    max_requests_per_file: usize,
     uploaded_by: Option<String>,
     endpoint: String,
     api_key: String,
@@ -392,6 +393,18 @@ fn create_file_stream(
                                     match openai_req.to_internal(&endpoint, api_key.clone(), &accessible_models) {
                                         Ok(template) => {
                                             line_count += 1;
+
+                                            // Check request count limit (0 = unlimited)
+                                            if max_requests_per_file > 0 && line_count > max_requests_per_file as u64 {
+                                                let _ = tx
+                                                    .send(fusillade::FileStreamItem::Error(format!(
+                                                        "File exceeds maximum request limit: {} > {}",
+                                                        line_count, max_requests_per_file
+                                                    )))
+                                                    .await;
+                                                return;
+                                            }
+
                                             incomplete_line.clear();
                                             if tx.send(fusillade::FileStreamItem::Template(template)).await.is_err() {
                                                 return;
@@ -431,6 +444,18 @@ fn create_file_stream(
                                 Ok(openai_req) => match openai_req.to_internal(&endpoint, api_key.clone(), &accessible_models) {
                                     Ok(template) => {
                                         line_count += 1;
+
+                                        // Check request count limit (0 = unlimited)
+                                        if max_requests_per_file > 0 && line_count > max_requests_per_file as u64 {
+                                            let _ = tx
+                                                .send(fusillade::FileStreamItem::Error(format!(
+                                                    "File exceeds maximum request limit: {} > {}",
+                                                    line_count, max_requests_per_file
+                                                )))
+                                                .await;
+                                            return;
+                                        }
+
                                         if tx.send(fusillade::FileStreamItem::Template(template)).await.is_err() {
                                             return;
                                         }
@@ -525,7 +550,8 @@ pub async fn upload_file<P: PoolProvider>(
         None
     };
 
-    let max_file_size = state.config.batches.files.max_file_size;
+    let max_file_size = state.config.limits.files.max_file_size;
+    let max_requests_per_file = state.config.limits.files.max_requests_per_file;
     let uploaded_by = Some(current_user.id.to_string());
 
     // Get or create user-specific hidden batch API key for batch request execution
@@ -555,6 +581,7 @@ pub async fn upload_file<P: PoolProvider>(
     let file_stream = create_file_stream(
         multipart,
         max_file_size,
+        max_requests_per_file,
         uploaded_by,
         endpoint,
         user_api_key,
@@ -2247,15 +2274,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_upload_rate_limiting_rejects_when_queue_full() {
-        use crate::config::FileUploadLimitsConfig;
+        use crate::config::FileLimitsConfig;
         use crate::limits::UploadLimiter;
         use std::sync::Arc;
 
         // Test the limiter directly with max_concurrent=1, max_waiting=1
-        let config = FileUploadLimitsConfig {
-            max_concurrent: 1,
-            max_waiting: 1,   // Only allow 1 waiter
-            max_wait_secs: 0, // Reject immediately when can't acquire
+        let config = FileLimitsConfig {
+            max_concurrent_uploads: 1,
+            max_waiting_uploads: 1,   // Only allow 1 waiter
+            max_upload_wait_secs: 0,  // Reject immediately when can't acquire
+            ..Default::default()
         };
         let limiter = Arc::new(UploadLimiter::new(&config).unwrap());
 
@@ -2289,9 +2317,9 @@ mod tests {
     async fn test_upload_with_rate_limiter_configured(pool: PgPool) {
         // Create app with rate limiting enabled
         let mut config = create_test_config();
-        config.limits.file_uploads.max_concurrent = 10; // High enough to not block this test
-        config.limits.file_uploads.max_waiting = 20;
-        config.limits.file_uploads.max_wait_secs = 60;
+        config.limits.files.max_concurrent_uploads = 10; // High enough to not block this test
+        config.limits.files.max_waiting_uploads = 20;
+        config.limits.files.max_upload_wait_secs = 60;
 
         let (app, _bg_services) = create_test_app_with_config(pool.clone(), config, false).await;
         let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;

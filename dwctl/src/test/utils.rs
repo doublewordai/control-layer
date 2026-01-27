@@ -1,7 +1,7 @@
 //! Test utilities for integration testing
 use crate::config::{
-    BatchConfig, DaemonConfig, DaemonEnabled, FilesConfig, LeaderElectionConfig, NativeAuthConfig, OnwardsSyncConfig, PasswordConfig,
-    PoolSettings, ProbeSchedulerConfig, ProxyHeaderAuthConfig, SecurityConfig,
+    BatchConfig, DaemonConfig, DaemonEnabled, FileLimitsConfig, FilesConfig, LeaderElectionConfig, LimitsConfig, NativeAuthConfig,
+    OnwardsSyncConfig, PasswordConfig, PoolSettings, ProbeSchedulerConfig, ProxyHeaderAuthConfig, SecurityConfig,
 };
 use crate::db::handlers::inference_endpoints::{InferenceEndpointFilter, InferenceEndpoints};
 use crate::db::handlers::repository::Repository;
@@ -153,10 +153,7 @@ pub fn create_test_config() -> crate::config::Config {
         credits: crate::config::CreditsConfig::default(),
         batches: BatchConfig {
             enabled: true,
-            files: FilesConfig {
-                max_file_size: 1000 * 1024 * 1024, //1GB
-                ..Default::default()
-            },
+            files: FilesConfig::default(),
             ..Default::default()
         },
         background_services: crate::config::BackgroundServicesConfig {
@@ -170,7 +167,12 @@ pub fn create_test_config() -> crate::config::Config {
             ..Default::default()
         },
         sample_files: crate::sample_files::SampleFilesConfig::default(),
-        limits: crate::config::LimitsConfig::default(),
+        limits: LimitsConfig {
+            files: FileLimitsConfig {
+                max_file_size: 1000 * 1024 * 1024, // 1GB
+                ..Default::default()
+            },
+        },
     }
 }
 
