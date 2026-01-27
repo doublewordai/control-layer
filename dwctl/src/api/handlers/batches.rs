@@ -48,7 +48,9 @@ fn to_batch_response_with_email(batch: fusillade::Batch, creator_email: Option<&
     }
 
     // Determine OpenAI status from request counts
-    let is_finished = batch.pending_requests == 0 && batch.in_progress_requests == 0;
+    // A batch is only "finished" if it has started processing AND all requests are in terminal states
+    let has_started = batch.requests_started_at.is_some();
+    let is_finished = has_started && batch.pending_requests == 0 && batch.in_progress_requests == 0;
     let openai_status = if batch.cancelling_at.is_some() {
         // If cancelling_at is set, check if batch is finished
         if is_finished {
@@ -61,9 +63,27 @@ fn to_batch_response_with_email(batch: fusillade::Batch, creator_email: Option<&
     } else if batch.total_requests == 0 {
         "validating"
     } else if is_finished && batch.failed_requests == batch.total_requests {
-        "failed"
+        // Don't show "failed" until we're certain recovery is impossible
+        // Check if we're still within the SLA window
+        if chrono::Utc::now() < batch.expires_at {
+            // Within SLA - escalation might still recover these failures
+            "in_progress"
+        } else if batch.failed_at.is_none() {
+            // Past SLA but no failed_at timestamp - escalation may still be attempting recovery
+            "in_progress"
+        } else {
+            // Past SLA and failed_at is set - terminal failure confirmed
+            "failed"
+        }
     } else if is_finished {
-        "completed"
+        // All requests are in terminal state - check if output files are ready
+        if batch.completed_at.is_some() {
+            // Output files written, batch is truly completed
+            "completed"
+        } else {
+            // Requests done but still writing output files
+            "finalizing"
+        }
     } else {
         // Any batch that has been validated (total_requests > 0) but not finished
         // is considered "in_progress". This includes:
@@ -81,13 +101,30 @@ fn to_batch_response_with_email(batch: fusillade::Batch, creator_email: Option<&
     };
 
     // Terminal state timestamps from batch table
-    let finalizing_at = batch.finalizing_at.map(|dt| dt.timestamp());
+    // Only show finalizing_at when status is actually "finalizing" or later
+    let finalizing_at = if openai_status == "finalizing" || openai_status == "completed" {
+        batch.finalizing_at.map(|dt| dt.timestamp())
+    } else {
+        None
+    };
     let completed_at = batch.completed_at.map(|dt| dt.timestamp());
     let failed_at = batch.failed_at.map(|dt| dt.timestamp());
     let cancelled_at = batch.cancelled_at.map(|dt| dt.timestamp());
 
-    // Parse errors from JSON if present
-    let errors = batch.errors.and_then(|e| serde_json::from_value::<BatchErrors>(e).ok());
+    // Only show failure indicators if batch has terminally failed AND SLA has expired
+    // This prevents showing any failure information while escalation might still recover
+    let show_failures = batch.failed_at.is_some() && chrono::Utc::now() > batch.expires_at;
+
+    let errors = if show_failures {
+        // Terminal failure past SLA - show errors to user
+        batch.errors.and_then(|e| serde_json::from_value::<BatchErrors>(e).ok())
+    } else {
+        // Either:
+        // - No terminal failure yet (failed_at is None) - escalation might recover
+        // - Still within SLA window - escalation has time to recover
+        // In both cases, hide errors from user
+        None
+    };
 
     // Check if batch has expired
     let expired_at = if chrono::Utc::now() > batch.expires_at {
@@ -105,20 +142,23 @@ fn to_batch_response_with_email(batch: fusillade::Batch, creator_email: Option<&
         completion_window: batch.completion_window.clone(),
         status: openai_status.to_string(),
         output_file_id: batch.output_file_id.map(|id| id.0.to_string()),
+        // Always show error_file_id if it exists - the file content itself is filtered by fusillade
         error_file_id: batch.error_file_id.map(|id| id.0.to_string()),
         created_at: batch.created_at.timestamp(),
         in_progress_at,
         expires_at: Some(batch.expires_at.timestamp()),
         finalizing_at,
         completed_at,
-        failed_at,
+        // Hide failed_at timestamp until terminal failure past SLA
+        failed_at: if show_failures { failed_at } else { None },
         expired_at,
         cancelling_at: batch.cancelling_at.map(|dt| dt.timestamp()),
         cancelled_at,
+        // Hide failed count until terminal failure past SLA
         request_counts: RequestCounts {
             total: batch.total_requests,
             completed: batch.completed_requests,
-            failed: batch.failed_requests,
+            failed: if show_failures { batch.failed_requests } else { 0 },
         },
         metadata,
         analytics: None,
@@ -947,6 +987,7 @@ mod tests {
     use crate::test::utils::*;
     use axum::http::StatusCode;
     use sqlx::PgPool;
+    use uuid::Uuid;
 
     #[sqlx::test]
     #[test_log::test]
@@ -1341,5 +1382,169 @@ mod tests {
         assert!(analytics["total_prompt_tokens"].is_number());
         assert!(analytics["total_completion_tokens"].is_number());
         assert!(analytics["total_tokens"].is_number());
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_errors_hidden_until_sla_expires(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        let deployment = create_test_deployment(&pool, user.id, "test-model", "test-model").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        // Upload a batch file
+        let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"test-model","messages":[{"role":"user","content":"Test"}]}}"#;
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test.jsonl");
+        let multipart = axum_test::multipart::MultipartForm::new()
+            .add_part("file", file_part)
+            .add_part("purpose", axum_test::multipart::Part::text("batch"));
+        let upload_resp = app
+            .post("/ai/v1/files")
+            .multipart(multipart)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        upload_resp.assert_status(StatusCode::CREATED);
+        let file: serde_json::Value = upload_resp.json();
+        let file_id = file["id"].as_str().unwrap();
+
+        // Create batch
+        let create_req = CreateBatchRequest {
+            input_file_id: file_id.to_string(),
+            endpoint: "/v1/chat/completions".to_string(),
+            completion_window: "24h".to_string(),
+            metadata: None,
+        };
+
+        let resp = app
+            .post("/ai/v1/batches")
+            .json(&create_req)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        resp.assert_status(StatusCode::CREATED);
+        let batch: serde_json::Value = resp.json();
+        let batch_id = batch["id"].as_str().unwrap();
+        let batch_uuid = Uuid::parse_str(batch_id).unwrap();
+
+        // Scenario 1: Simulate errors exist but batch is still within SLA (no failed_at)
+        sqlx::query(
+            r#"
+            UPDATE fusillade.batches
+            SET errors = '{"object":"list","data":[{"code":"invalid_request","message":"Test error"}]}'::jsonb
+            WHERE id = $1
+            "#,
+        )
+        .bind(batch_uuid)
+        .execute(&pool)
+        .await
+        .expect("Failed to set errors");
+
+        // GET batch - errors should be HIDDEN (null) because within SLA
+        let get_resp = app
+            .get(&format!("/ai/v1/batches/{}", batch_id))
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        get_resp.assert_status(StatusCode::OK);
+        let batch_response: serde_json::Value = get_resp.json();
+
+        assert!(
+            batch_response["errors"].is_null(),
+            "Errors should be hidden when batch is within SLA (no failed_at set)"
+        );
+        // Note: error_file_id is always shown if it exists - the file content is filtered by fusillade
+        // In this test, error_file_id doesn't exist yet because we only set the errors field
+        assert!(
+            batch_response["failed_at"].is_null(),
+            "failed_at should be hidden when batch is within SLA"
+        );
+        assert_eq!(
+            batch_response["request_counts"]["failed"].as_i64().unwrap(),
+            0,
+            "Failed request count should be hidden (shown as 0) when within SLA"
+        );
+
+        // Scenario 2: Set failed_at but still within SLA - errors should STILL be hidden
+        sqlx::query(
+            r#"
+            UPDATE fusillade.batches
+            SET failed_at = NOW()
+            WHERE id = $1
+            "#,
+        )
+        .bind(batch_uuid)
+        .execute(&pool)
+        .await
+        .expect("Failed to set failed_at");
+
+        // GET batch - errors should STILL be HIDDEN because within SLA
+        let get_resp2 = app
+            .get(&format!("/ai/v1/batches/{}", batch_id))
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        get_resp2.assert_status(StatusCode::OK);
+        let batch_response2: serde_json::Value = get_resp2.json();
+
+        assert!(
+            batch_response2["errors"].is_null(),
+            "Errors should be hidden when failed_at is set but SLA has not expired"
+        );
+        // Note: error_file_id is shown if it exists (file content is filtered by fusillade)
+        // We don't assert on it here since it may or may not exist depending on batch processing
+        assert!(
+            batch_response2["failed_at"].is_null(),
+            "failed_at should be hidden until SLA expires"
+        );
+        assert_eq!(
+            batch_response2["request_counts"]["failed"].as_i64().unwrap(),
+            0,
+            "Failed request count should still be hidden even with failed_at set"
+        );
+
+        // Scenario 3: Expire the SLA AND have failed_at - NOW errors should be visible
+        sqlx::query(
+            r#"
+            UPDATE fusillade.batches
+            SET expires_at = NOW() - INTERVAL '1 hour'
+            WHERE id = $1
+            "#,
+        )
+        .bind(batch_uuid)
+        .execute(&pool)
+        .await
+        .expect("Failed to expire batch");
+
+        // GET batch - errors should NOW be VISIBLE
+        let get_resp3 = app
+            .get(&format!("/ai/v1/batches/{}", batch_id))
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        get_resp3.assert_status(StatusCode::OK);
+        let batch_response3: serde_json::Value = get_resp3.json();
+
+        assert!(
+            !batch_response3["errors"].is_null(),
+            "Errors should be visible when both failed_at is set AND SLA has expired"
+        );
+        assert_eq!(
+            batch_response3["errors"]["data"][0]["message"].as_str().unwrap(),
+            "Test error",
+            "Error message should match what we set"
+        );
+        // Note: error_file_id would be shown if it existed - fusillade creates it during processing
+        // This test manually sets errors without going through fusillade, so no error file exists
+        assert!(
+            !batch_response3["failed_at"].is_null(),
+            "failed_at should now be visible after SLA expires"
+        );
+        // Note: We can't easily verify the exact failed count since we didn't actually
+        // create failed requests in the DB (just set the errors field). But we verified
+        // it was hidden before, so the logic is working.
     }
 }

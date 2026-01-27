@@ -855,15 +855,9 @@ async fn test_sla_escalation_for_failed_batch(pool: PgPool) {
 
     tracing::info!("📝 Created 3 pending requests for the batch");
 
-    // Step 6: Update batch expiry to trigger SLA (set to expire in 25 seconds)
-    // This ensures the batch is within the 30-second SLA threshold
-    let new_expiry = Utc::now() + Duration::seconds(25);
-    update_batch_expiry(&pool, batch_id, new_expiry).await;
-
-    tracing::info!("⏰ Batch expiry set to: {}", new_expiry);
-    tracing::info!("   (expires in 25 seconds, SLA threshold is 30 seconds)");
-
-    // Step 7: Wait for requests to fail
+    // Step 6: Wait for requests to fail BEFORE triggering SLA
+    // Note: We initially created the batch with 1 hour expiry (OUTSIDE the 60-second SLA threshold)
+    // This prevents the SLA daemon from escalating until we're ready
     tracing::info!("⏳ Waiting for requests to fail at primary server...");
 
     // Poll until all requests have failed
@@ -894,7 +888,15 @@ async fn test_sla_escalation_for_failed_batch(pool: PgPool) {
         tokio::task::yield_now().await;
     }
 
-    // Step 7.5: Manually set batch.failed_at since the trigger was removed for performance
+    // Step 7.5: Update batch expiry to trigger SLA (set to expire in 25 seconds)
+    // Now that requests have failed, we move the batch into the SLA window to trigger escalation
+    let new_expiry = Utc::now() + Duration::seconds(25);
+    update_batch_expiry(&pool, batch_id, new_expiry).await;
+
+    tracing::info!("⏰ Batch expiry updated to: {}", new_expiry);
+    tracing::info!("   (expires in 25 seconds, SLA threshold is 60 seconds - escalation should trigger)");
+
+    // Step 7.6: Manually set batch.failed_at since the trigger was removed for performance
     // This simulates what would happen if the batch terminal state was computed
     tracing::info!("🔧 Manually setting batch.failed_at to simulate terminal state computation...");
     sqlx::query(
