@@ -401,18 +401,17 @@ fn create_file_stream(
                                     // Transform to internal format (includes model access validation)
                                     match openai_req.to_internal(&endpoint, api_key.clone(), &accessible_models) {
                                         Ok(template) => {
-                                            line_count += 1;
-
                                             // Check request count limit (0 = unlimited)
-                                            if config.max_requests_per_file > 0 && line_count > config.max_requests_per_file as u64 {
+                                            if config.max_requests_per_file > 0 && line_count >= config.max_requests_per_file as u64 {
                                                 let _ = tx
                                                     .send(fusillade::FileStreamItem::Error(format!(
-                                                        "File exceeds maximum request limit: {} > {}",
-                                                        line_count, config.max_requests_per_file
+                                                        "File exceeds maximum request limit of {}",
+                                                        config.max_requests_per_file
                                                     )))
                                                     .await;
                                                 return;
                                             }
+                                            line_count += 1;
 
                                             incomplete_line.clear();
                                             if tx.send(fusillade::FileStreamItem::Template(template)).await.is_err() {
@@ -452,18 +451,17 @@ fn create_file_stream(
                             match serde_json::from_str::<OpenAIBatchRequest>(trimmed) {
                                 Ok(openai_req) => match openai_req.to_internal(&endpoint, api_key.clone(), &accessible_models) {
                                     Ok(template) => {
-                                        line_count += 1;
-
                                         // Check request count limit (0 = unlimited)
-                                        if config.max_requests_per_file > 0 && line_count > config.max_requests_per_file as u64 {
+                                        if config.max_requests_per_file > 0 && line_count >= config.max_requests_per_file as u64 {
                                             let _ = tx
                                                 .send(fusillade::FileStreamItem::Error(format!(
-                                                    "File exceeds maximum request limit: {} > {}",
-                                                    line_count, config.max_requests_per_file
+                                                    "File exceeds maximum request limit of {}",
+                                                    config.max_requests_per_file
                                                 )))
                                                 .await;
                                             return;
                                         }
+                                        line_count += 1;
 
                                         if tx.send(fusillade::FileStreamItem::Template(template)).await.is_err() {
                                             return;
@@ -2339,6 +2337,87 @@ mod tests {
         let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test.jsonl");
 
         // Upload should succeed when rate limiter is configured but not at capacity
+        let upload_response = app
+            .post("/ai/v1/files")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .multipart(
+                axum_test::multipart::MultipartForm::new()
+                    .add_text("purpose", "batch")
+                    .add_part("file", file_part),
+            )
+            .await;
+
+        upload_response.assert_status(axum::http::StatusCode::CREATED);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_upload_rejects_file_exceeding_max_requests(pool: PgPool) {
+        // Create app with max_requests_per_file = 2
+        let mut config = create_test_config();
+        config.limits.files.max_requests_per_file = 2;
+
+        let (app, _bg_services) = create_test_app_with_config(pool.clone(), config, false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        // Create a deployment and add to group so user has access to the model
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        // Create JSONL content with 3 requests (exceeds limit of 2)
+        let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}
+{"custom_id":"request-2","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}
+{"custom_id":"request-3","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}"#;
+
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test.jsonl");
+
+        // Upload should fail because file has 3 requests but limit is 2
+        let upload_response = app
+            .post("/ai/v1/files")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .multipart(
+                axum_test::multipart::MultipartForm::new()
+                    .add_text("purpose", "batch")
+                    .add_part("file", file_part),
+            )
+            .await;
+
+        upload_response.assert_status(axum::http::StatusCode::BAD_REQUEST);
+        let body = upload_response.text();
+        assert!(
+            body.contains("maximum request limit"),
+            "Expected error about request limit, got: {}",
+            body
+        );
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_upload_allows_file_at_max_requests(pool: PgPool) {
+        // Create app with max_requests_per_file = 2
+        let mut config = create_test_config();
+        config.limits.files.max_requests_per_file = 2;
+
+        let (app, _bg_services) = create_test_app_with_config(pool.clone(), config, false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        // Create a deployment and add to group so user has access to the model
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        // Create JSONL content with exactly 2 requests (at the limit)
+        let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}
+{"custom_id":"request-2","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}"#;
+
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test.jsonl");
+
+        // Upload should succeed because file has exactly 2 requests (at the limit)
         let upload_response = app
             .post("/ai/v1/files")
             .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
