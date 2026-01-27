@@ -1078,11 +1078,14 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
     // Batches API routes (files + batches) - conditionally enabled under /ai/v1
     let batches_routes = if state.config.batches.enabled {
         // File upload route with custom body limit (other routes use default)
-        let file_upload_limit = state.config.batches.files.max_file_size;
-        let file_router = Router::new().route(
-            "/files",
-            post(api::handlers::files::upload_file).layer(DefaultBodyLimit::max(file_upload_limit as usize)),
-        );
+        // 0 = unlimited (disable body limit), otherwise set max size
+        let file_upload_limit = state.config.limits.files.max_file_size;
+        let body_limit_layer = if file_upload_limit == 0 {
+            DefaultBodyLimit::disable()
+        } else {
+            DefaultBodyLimit::max(file_upload_limit as usize)
+        };
+        let file_router = Router::new().route("/files", post(api::handlers::files::upload_file).layer(body_limit_layer));
 
         Some(
             Router::new()

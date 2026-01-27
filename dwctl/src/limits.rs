@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use crate::config::{FileUploadLimitsConfig, LimitsConfig};
+use crate::config::{FileLimitsConfig, LimitsConfig};
 use crate::errors::{Error, Result};
 
 /// Container for all resource limiters.
@@ -26,7 +26,7 @@ impl Limiters {
     /// Creates all limiters from configuration.
     pub fn new(config: &LimitsConfig) -> Self {
         Self {
-            file_uploads: UploadLimiter::new(&config.file_uploads).map(Arc::new),
+            file_uploads: UploadLimiter::new(&config.files).map(Arc::new),
         }
     }
 }
@@ -51,19 +51,23 @@ pub struct UploadLimiter {
 impl UploadLimiter {
     /// Creates a new upload limiter from configuration.
     ///
-    /// If `max_concurrent` is 0, returns `None` (unlimited uploads).
-    /// If `max_waiting` is 0, unlimited waiting is allowed.
-    pub fn new(config: &FileUploadLimitsConfig) -> Option<Self> {
-        if config.max_concurrent == 0 {
+    /// If `max_concurrent_uploads` is 0, returns `None` (unlimited uploads).
+    /// If `max_waiting_uploads` is 0, unlimited waiting is allowed.
+    pub fn new(config: &FileLimitsConfig) -> Option<Self> {
+        if config.max_concurrent_uploads == 0 {
             return None;
         }
 
         Some(Self {
-            semaphore: Arc::new(Semaphore::new(config.max_concurrent)),
+            semaphore: Arc::new(Semaphore::new(config.max_concurrent_uploads)),
             waiting_count: AtomicUsize::new(0),
             // 0 means unlimited waiting queue
-            max_waiting: if config.max_waiting == 0 { None } else { Some(config.max_waiting) },
-            max_wait: Duration::from_secs(config.max_wait_secs),
+            max_waiting: if config.max_waiting_uploads == 0 {
+                None
+            } else {
+                Some(config.max_waiting_uploads)
+            },
+            max_wait: Duration::from_secs(config.max_upload_wait_secs),
         })
     }
 
@@ -153,11 +157,12 @@ pub struct UploadPermit {
 mod tests {
     use super::*;
 
-    fn test_config(max_concurrent: usize, max_waiting: usize, max_wait_secs: u64) -> FileUploadLimitsConfig {
-        FileUploadLimitsConfig {
-            max_concurrent,
-            max_waiting,
-            max_wait_secs,
+    fn test_config(max_concurrent: usize, max_waiting: usize, max_wait_secs: u64) -> FileLimitsConfig {
+        FileLimitsConfig {
+            max_concurrent_uploads: max_concurrent,
+            max_waiting_uploads: max_waiting,
+            max_upload_wait_secs: max_wait_secs,
+            ..Default::default()
         }
     }
 
