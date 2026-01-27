@@ -1,5 +1,13 @@
 import { useState, useEffect, useMemo, useCallback } from "react";
-import { Play, AlertCircle, X, Upload, ExternalLink, Info, AlertTriangle } from "lucide-react";
+import {
+  Play,
+  AlertCircle,
+  X,
+  Upload,
+  ExternalLink,
+  Info,
+  AlertTriangle,
+} from "lucide-react";
 import {
   Dialog,
   DialogContent,
@@ -35,14 +43,9 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import { 
-  validateBatchFile, 
-  FILE_SIZE_LIMITS 
-} from "../../../utils/files";
+import { validateBatchFile, FILE_SIZE_LIMITS } from "../../../utils/files";
 
-import { 
-  formatBytes, 
-} from "../../../utils/formatters";
+import { formatBytes } from "../../../utils/formatters";
 
 interface CreateBatchModalProps {
   isOpen: boolean;
@@ -141,7 +144,7 @@ export function CreateBatchModal({
     // Cap at 95% to show there's still processing happening
     const cappedPercent = Math.min(percent, 95);
     setUploadProgress(cappedPercent);
-    
+
     // If we've reached 95%, mark as processing
     if (cappedPercent >= 95) {
       setIsProcessing(true);
@@ -318,11 +321,13 @@ export function CreateBatchModal({
 
   const isPending = createBatchMutation.isPending || isUploading;
 
-  const isLargeFile = fileToUpload && fileToUpload.size > FILE_SIZE_LIMITS.LARGE_FILE_WARNING_BYTES;
+  const isLargeFile =
+    fileToUpload &&
+    fileToUpload.size > FILE_SIZE_LIMITS.LARGE_FILE_WARNING_BYTES;
 
   return (
     <Dialog open={isOpen} onOpenChange={handleClose}>
-      <DialogContent className="sm:max-w-lg max-h-[90vh] overflow-hidden flex flex-col">        
+      <DialogContent className="sm:max-w-lg max-h-[90vh] overflow-hidden flex flex-col">
         <DialogHeader>
           <DialogTitle>Create New Batch</DialogTitle>
           <DialogDescription>
@@ -341,7 +346,9 @@ export function CreateBatchModal({
               "JSONL file"
             )}{" "}
             to create a batch.{" "}
-            <span className="font-semibold text-gray-900">Maximum file size: {FILE_SIZE_LIMITS.MAX_FILE_SIZE_MB}MB</span>
+            <span className="font-semibold text-gray-900">
+              Maximum file size: {FILE_SIZE_LIMITS.MAX_FILE_SIZE_MB}MB
+            </span>
           </DialogDescription>
         </DialogHeader>
 
@@ -349,13 +356,8 @@ export function CreateBatchModal({
           {error}
         </AlertBox>
 
-        <div 
-          className="flex-1 overflow-y-scroll pr-3 modal-scrollbar"
-          style={{
-            scrollbarGutter: 'stable',
-          }}
-        >
-          <div className="space-y-6 pr-1">
+        <div className="flex-1 overflow-y-auto modal-scrollbar">
+          <div className="space-y-6">
             {/* File Selection/Upload */}
             <div className="space-y-2">
               <Label>File Selection</Label>
@@ -371,9 +373,7 @@ export function CreateBatchModal({
                       <div className="flex gap-4 text-xs text-gray-600">
                         {fileToUpload ? (
                           <>
-                            <span>
-                              Size: {formatBytes(fileToUpload.size)}
-                            </span>
+                            <span>Size: {formatBytes(fileToUpload.size)}</span>
                             <span className="text-blue-600">
                               {isUploading ? "Uploading..." : "Ready to upload"}
                             </span>
@@ -406,20 +406,24 @@ export function CreateBatchModal({
                     <div className="space-y-1">
                       <div className="flex justify-between text-xs">
                         <span className="text-gray-600">
-                          {isProcessing ? "Processing on server..." : "Uploading..."}
+                          {isProcessing
+                            ? "Processing on server..."
+                            : "Uploading..."}
                         </span>
                         {!isProcessing && (
-                          <span className="text-gray-900 font-medium">{uploadProgress}%</span>
+                          <span className="text-gray-900 font-medium">
+                            {uploadProgress}%
+                          </span>
                         )}
                       </div>
                       <div className="h-2 bg-gray-200 rounded-full overflow-hidden">
                         <div
                           className="h-full rounded-full transition-all duration-150 ease-out bg-blue-600"
-                          style={{ 
+                          style={{
                             width: `${uploadProgress}%`,
                             ...(isProcessing && {
-                              animation: 'gentlePulse 3s ease-in-out infinite'
-                            })
+                              animation: "gentlePulse 3s ease-in-out infinite",
+                            }),
                           }}
                         />
                       </div>
@@ -515,7 +519,10 @@ export function CreateBatchModal({
                   <div className="text-sm text-amber-800">
                     <p className="font-medium mb-1">Large File Detected</p>
                     <p className="text-amber-700">
-                      This file is over {FILE_SIZE_LIMITS.LARGE_FILE_WARNING_MB}MB. Large files may take a while to upload depending on your connection speed. Please be patient and keep this window open until the upload completes.
+                      This file is over {FILE_SIZE_LIMITS.LARGE_FILE_WARNING_MB}
+                      MB. Large files may take a while to upload depending on
+                      your connection speed. Please be patient and keep this
+                      window open until the upload completes.
                     </p>
                   </div>
                 </div>
@@ -603,8 +610,9 @@ export function CreateBatchModal({
                         <Info className="w-3.5 h-3.5 text-gray-400 cursor-help" />
                       </TooltipTrigger>
                       <TooltipContent side="top" className="max-w-[250px]">
-                        Based on {completionWindow} SLA pricing and average output
-                        tokens for the requested model(s). Actual cost may vary.
+                        Based on {completionWindow} SLA pricing and average
+                        output tokens for the requested model(s). Actual cost
+                        may vary.
                       </TooltipContent>
                     </Tooltip>
                   </div>
@@ -646,18 +654,20 @@ export function CreateBatchModal({
                         setUploadProgress(0);
                         setIsProcessing(false);
                         try {
-                          const uploadedFile = await uploadMutation.mutateAsync({
-                            data: {
-                              file: fileToUpload,
-                              purpose: "batch",
-                              filename: filename || undefined,
-                              expires_after: {
-                                anchor: "created_at",
-                                seconds: expirationSeconds,
+                          const uploadedFile = await uploadMutation.mutateAsync(
+                            {
+                              data: {
+                                file: fileToUpload,
+                                purpose: "batch",
+                                filename: filename || undefined,
+                                expires_after: {
+                                  anchor: "created_at",
+                                  seconds: expirationSeconds,
+                                },
                               },
+                              onProgress: handleUploadProgress,
                             },
-                            onProgress: handleUploadProgress,
-                          });
+                          );
                           setSelectedFileId(uploadedFile.id);
                           toast.success(
                             `File "${filename || fileToUpload.name}" uploaded successfully`,

@@ -710,28 +710,16 @@ pub async fn retry_failed_batch_requests<P: PoolProvider>(
         }
     }
 
-    // Get all requests for the batch
-    let requests = state
+    // Retry all failed requests for the batch in a single database operation
+    let retried_count = state
         .request_manager
-        .get_batch_requests(fusillade::BatchId(batch_id))
+        .retry_failed_requests_for_batch(fusillade::BatchId(batch_id))
         .await
         .map_err(|e| Error::Internal {
-            operation: format!("get batch requests: {}", e),
+            operation: format!("retry failed requests: {}", e),
         })?;
 
-    // Collect IDs of failed requests
-    let failed_request_ids: Vec<fusillade::RequestId> = requests
-        .iter()
-        .filter_map(|req| {
-            if matches!(req, fusillade::request::AnyRequest::Failed(_)) {
-                Some(req.id())
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    if failed_request_ids.is_empty() {
+    if retried_count == 0 {
         return Err(Error::BadRequest {
             message: "No failed requests to retry in this batch".to_string(),
         });
@@ -739,39 +727,8 @@ pub async fn retry_failed_batch_requests<P: PoolProvider>(
 
     tracing::info!(
         batch_id = %batch_id,
-        failed_count = failed_request_ids.len(),
-        "Retrying failed requests"
-    );
-
-    // Retry the failed requests
-    let results = state
-        .request_manager
-        .retry_failed_requests(failed_request_ids.clone())
-        .await
-        .map_err(|e| Error::Internal {
-            operation: format!("retry failed requests: {}", e),
-        })?;
-
-    // Check for any failures
-    let failed_retries: Vec<_> = results
-        .iter()
-        .enumerate()
-        .filter_map(|(i, r)| r.as_ref().err().map(|e| (i, e)))
-        .collect();
-
-    if !failed_retries.is_empty() {
-        tracing::warn!(
-            batch_id = %batch_id,
-            failed_retry_count = failed_retries.len(),
-            "Some requests failed to retry"
-        );
-    }
-
-    let successful_retries = results.iter().filter(|r| r.is_ok()).count();
-    tracing::info!(
-        batch_id = %batch_id,
-        retried_count = successful_retries,
-        "Successfully retried failed requests"
+        retried_count,
+        "Retried failed requests"
     );
 
     // Fetch updated batch to get latest status

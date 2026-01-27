@@ -69,10 +69,10 @@ export function AppSidebar() {
   const [isSupportModalOpen, setIsSupportModalOpen] = useState(false);
 
   const allNavItems: NavItem[] = [
+    { path: "/batches", icon: Box, label: "Batches", demoOnly: false },
     { path: "/models", icon: Layers, label: "Models" },
     { path: "/endpoints", icon: Server, label: "Endpoints" },
     { path: "/playground", icon: Play, label: "Playground" },
-    { path: "/batches", icon: Box, label: "Batches", demoOnly: false },
     { path: "/analytics", icon: BarChart3, label: "Analytics" },
     { path: "/users-groups", icon: Users, label: "Users & Groups" },
     { path: "/api-keys", icon: Key, label: "API Keys" },
