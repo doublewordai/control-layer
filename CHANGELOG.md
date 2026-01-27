@@ -1,5 +1,12 @@
 # Changelog
 
+## [3.3.1](https://github.com/doublewordai/control-layer/compare/v3.3.0...v3.3.1) (2026-01-27)
+
+
+### Bug Fixes
+
+* sync package-lock.json with package.json ([fa3c491](https://github.com/doublewordai/control-layer/commit/fa3c491a0b25227af8bc9d3efbcb9b13717b28c8))
+
 ## [3.3.0](https://github.com/doublewordai/control-layer/compare/v3.2.0...v3.3.0) (2026-01-27)
 
 
