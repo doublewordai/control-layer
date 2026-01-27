@@ -94,7 +94,6 @@ pub struct RawAnalyticsRecord {
 
 /// Enriched data resolved during batch processing
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Fields stored for future metrics recording
 struct EnrichedRecord {
     raw: RawAnalyticsRecord,
     user_id: Option<Uuid>,
@@ -114,16 +113,17 @@ pub type AnalyticsSender = mpsc::Sender<RawAnalyticsRecord>;
 /// 1. Batching enrichment queries (user lookup, pricing lookup)
 /// 2. Batching INSERT operations (analytics, credits)
 /// 3. Using a single transaction for consistency
+/// 4. Retrying failed batches with exponential backoff
 pub struct AnalyticsBatcher<M = crate::metrics::GenAiMetrics>
 where
     M: MetricsRecorder + Clone + Send + Sync + 'static,
 {
     pool: PgPool,
-    #[allow(dead_code)]
-    config: Config,
     metrics_recorder: Option<M>,
     receiver: mpsc::Receiver<RawAnalyticsRecord>,
     batch_size: usize,
+    max_retries: u32,
+    retry_base_delay: std::time::Duration,
 }
 
 impl<M> AnalyticsBatcher<M>
@@ -146,13 +146,16 @@ where
         let (sender, receiver) = mpsc::channel(CHANNEL_BUFFER_SIZE);
 
         let batch_size = config.analytics.batch_size;
+        let max_retries = config.analytics.max_retries;
+        let retry_base_delay = std::time::Duration::from_millis(config.analytics.retry_base_delay_ms);
 
         let batcher = Self {
             pool,
-            config,
             metrics_recorder,
             receiver,
             batch_size,
+            max_retries,
+            retry_base_delay,
         };
 
         (batcher, sender)
@@ -169,7 +172,12 @@ where
     /// This minimizes latency at low load (single record → immediate write) while
     /// getting batching efficiency at high load (records queue while writing → bigger batch).
     pub async fn run(mut self, shutdown_token: CancellationToken) {
-        info!(max_batch_size = self.batch_size, "Analytics batcher started (write-through mode)");
+        info!(
+            max_batch_size = self.batch_size,
+            max_retries = self.max_retries,
+            retry_base_delay_ms = self.retry_base_delay.as_millis() as u64,
+            "Analytics batcher started (write-through mode with retry)"
+        );
 
         let mut buffer: Vec<RawAnalyticsRecord> = Vec::with_capacity(self.batch_size);
 
@@ -223,11 +231,11 @@ where
         }
     }
 
-    /// Flushes the buffer to the database.
+    /// Flushes the buffer to the database with retry on failure.
     ///
     /// This performs:
-    /// 1. Batch enrichment (user lookup, pricing lookup)
-    /// 2. Transactional write (analytics + credits)
+    /// 1. Batch enrichment (user lookup, pricing lookup) - no retry, data issues won't fix themselves
+    /// 2. Transactional write (analytics + credits) - retried with exponential backoff
     /// 3. Metrics recording
     async fn flush_batch(&self, buffer: &mut Vec<RawAnalyticsRecord>) {
         if buffer.is_empty() {
@@ -240,7 +248,7 @@ where
         async {
             let start = std::time::Instant::now();
 
-            // Phase 1: Batch enrich
+            // Phase 1: Batch enrich (no retry - enrichment failures are usually data issues)
             let enriched = match self.enrich_batch(buffer).await {
                 Ok(enriched) => enriched,
                 Err(e) => {
@@ -251,9 +259,44 @@ where
                 }
             };
 
-            // Phase 2: Transactional write (analytics + credits)
-            if let Err(e) = self.write_batch_transactional(&enriched).await {
-                error!(error = %e, batch_size = batch_size, "Failed to write analytics batch");
+            // Phase 2: Transactional write with retry
+            let mut last_error = None;
+            for attempt in 0..=self.max_retries {
+                match self.write_batch_transactional(&enriched).await {
+                    Ok(()) => {
+                        if attempt > 0 {
+                            debug!(attempt = attempt, batch_size = batch_size, "Batch write succeeded after retry");
+                            counter!("dwctl_analytics_batch_retries_total", "outcome" => "success").increment(1);
+                        }
+                        last_error = None;
+                        break;
+                    }
+                    Err(e) => {
+                        last_error = Some(e);
+                        if attempt < self.max_retries {
+                            let delay = self.retry_base_delay * 2u32.pow(attempt);
+                            warn!(
+                                error = %last_error.as_ref().unwrap(),
+                                attempt = attempt + 1,
+                                max_retries = self.max_retries,
+                                delay_ms = delay.as_millis() as u64,
+                                batch_size = batch_size,
+                                "Batch write failed, retrying"
+                            );
+                            counter!("dwctl_analytics_batch_retries_total", "outcome" => "retry").increment(1);
+                            tokio::time::sleep(delay).await;
+                        }
+                    }
+                }
+            }
+
+            if let Some(e) = last_error {
+                error!(
+                    error = %e,
+                    batch_size = batch_size,
+                    attempts = self.max_retries + 1,
+                    "Failed to write analytics batch after all retries, dropping batch"
+                );
                 counter!("dwctl_analytics_batch_errors_total", "phase" => "write").increment(1);
                 buffer.clear();
                 return;
@@ -589,17 +632,7 @@ where
             fusillade_request_ids.push(record.raw.fusillade_request_id);
             custom_ids.push(record.raw.custom_id.clone());
 
-            // Compute request_origin from enriched api_key_purpose and fusillade metadata
-            let request_origin = match (&record.api_key_purpose, &record.raw.fusillade_batch_id) {
-                // Any record with fusillade_batch_id is "fusillade"
-                (_, Some(_)) => "fusillade",
-                // Batch API keys without fusillade_batch_id are still "fusillade"
-                (Some(ApiKeyPurpose::Batch), None) => "fusillade",
-                // Playground keys are "frontend"
-                (Some(ApiKeyPurpose::Playground), _) => "frontend",
-                // Everything else is "api"
-                _ => "api",
-            };
+            let request_origin = compute_request_origin(record.api_key_purpose.as_ref(), record.raw.fusillade_batch_id);
             request_origins.push(request_origin.to_string());
 
             batch_slas.push(record.raw.batch_completion_window.clone().unwrap_or_default());
@@ -827,14 +860,8 @@ where
             fusillade_batch_id: record.raw.fusillade_batch_id,
             fusillade_request_id: record.raw.fusillade_request_id,
             custom_id: record.raw.custom_id.clone(),
-            // Compute request_origin from enriched api_key_purpose
-            request_origin: match (&record.api_key_purpose, &record.raw.fusillade_batch_id) {
-                (_, Some(_)) => "fusillade",
-                (Some(ApiKeyPurpose::Batch), None) => "fusillade",
-                (Some(ApiKeyPurpose::Playground), _) => "frontend",
-                _ => "api",
-            }
-            .to_string(),
+            request_origin: compute_request_origin(record.api_key_purpose.as_ref(), record.raw.fusillade_batch_id)
+                .to_string(),
             batch_sla: record.raw.batch_completion_window.clone().unwrap_or_default(),
             batch_request_source: record.raw.batch_request_source.clone(),
         }
@@ -865,6 +892,25 @@ fn parse_api_key_purpose(s: &str) -> ApiKeyPurpose {
         "batch" => ApiKeyPurpose::Batch,
         "playground" => ApiKeyPurpose::Playground,
         _ => ApiKeyPurpose::Realtime,
+    }
+}
+
+/// Compute request origin from API key purpose and fusillade batch ID.
+///
+/// Returns:
+/// - "fusillade" for any request with a fusillade_batch_id, or batch API keys
+/// - "frontend" for playground API keys
+/// - "api" for everything else
+fn compute_request_origin(api_key_purpose: Option<&ApiKeyPurpose>, fusillade_batch_id: Option<Uuid>) -> &'static str {
+    match (api_key_purpose, fusillade_batch_id) {
+        // Any record with fusillade_batch_id is "fusillade"
+        (_, Some(_)) => "fusillade",
+        // Batch API keys without fusillade_batch_id are still "fusillade"
+        (Some(ApiKeyPurpose::Batch), None) => "fusillade",
+        // Playground keys are "frontend"
+        (Some(ApiKeyPurpose::Playground), _) => "frontend",
+        // Everything else is "api"
+        _ => "api",
     }
 }
 
@@ -911,5 +957,26 @@ mod tests {
         assert_eq!(parse_api_key_purpose("playground"), ApiKeyPurpose::Playground);
         assert_eq!(parse_api_key_purpose("realtime"), ApiKeyPurpose::Realtime);
         assert_eq!(parse_api_key_purpose("unknown"), ApiKeyPurpose::Realtime);
+    }
+
+    #[test]
+    fn test_compute_request_origin() {
+        let batch_id = Uuid::new_v4();
+
+        // Any request with fusillade_batch_id is "fusillade"
+        assert_eq!(compute_request_origin(None, Some(batch_id)), "fusillade");
+        assert_eq!(compute_request_origin(Some(&ApiKeyPurpose::Realtime), Some(batch_id)), "fusillade");
+        assert_eq!(compute_request_origin(Some(&ApiKeyPurpose::Playground), Some(batch_id)), "fusillade");
+
+        // Batch API keys without fusillade_batch_id are still "fusillade"
+        assert_eq!(compute_request_origin(Some(&ApiKeyPurpose::Batch), None), "fusillade");
+
+        // Playground keys are "frontend"
+        assert_eq!(compute_request_origin(Some(&ApiKeyPurpose::Playground), None), "frontend");
+
+        // Everything else is "api"
+        assert_eq!(compute_request_origin(None, None), "api");
+        assert_eq!(compute_request_origin(Some(&ApiKeyPurpose::Realtime), None), "api");
+        assert_eq!(compute_request_origin(Some(&ApiKeyPurpose::Platform), None), "api");
     }
 }
