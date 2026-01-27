@@ -860,8 +860,7 @@ where
             fusillade_batch_id: record.raw.fusillade_batch_id,
             fusillade_request_id: record.raw.fusillade_request_id,
             custom_id: record.raw.custom_id.clone(),
-            request_origin: compute_request_origin(record.api_key_purpose.as_ref(), record.raw.fusillade_batch_id)
-                .to_string(),
+            request_origin: compute_request_origin(record.api_key_purpose.as_ref(), record.raw.fusillade_batch_id).to_string(),
             batch_sla: record.raw.batch_completion_window.clone().unwrap_or_default(),
             batch_request_source: record.raw.batch_request_source.clone(),
         }
@@ -966,7 +965,10 @@ mod tests {
         // Any request with fusillade_batch_id is "fusillade"
         assert_eq!(compute_request_origin(None, Some(batch_id)), "fusillade");
         assert_eq!(compute_request_origin(Some(&ApiKeyPurpose::Realtime), Some(batch_id)), "fusillade");
-        assert_eq!(compute_request_origin(Some(&ApiKeyPurpose::Playground), Some(batch_id)), "fusillade");
+        assert_eq!(
+            compute_request_origin(Some(&ApiKeyPurpose::Playground), Some(batch_id)),
+            "fusillade"
+        );
 
         // Batch API keys without fusillade_batch_id are still "fusillade"
         assert_eq!(compute_request_origin(Some(&ApiKeyPurpose::Batch), None), "fusillade");
