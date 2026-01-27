@@ -1,0 +1,269 @@
+//! Resource limiting for protecting system capacity.
+//!
+//! This module provides rate limiting and concurrency control mechanisms
+//! to prevent resource exhaustion under high load.
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
+
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+
+use crate::config::{FileUploadLimitsConfig, LimitsConfig};
+use crate::errors::{Error, Result};
+
+/// Container for all resource limiters.
+///
+/// This struct holds all the individual limiters used by the application.
+/// Add new limiters here as fields when implementing additional rate limiting.
+#[derive(Debug, Default, Clone)]
+pub struct Limiters {
+    /// Limiter for concurrent file uploads. None means unlimited.
+    pub file_uploads: Option<Arc<UploadLimiter>>,
+}
+
+impl Limiters {
+    /// Creates all limiters from configuration.
+    pub fn new(config: &LimitsConfig) -> Self {
+        Self {
+            file_uploads: UploadLimiter::new(&config.file_uploads).map(Arc::new),
+        }
+    }
+}
+
+/// Controls concurrent file upload capacity.
+///
+/// This limiter implements a bounded queue with configurable concurrency,
+/// waiting capacity, and timeout. When limits are exceeded, requests
+/// receive HTTP 429 (Too Many Requests).
+#[derive(Debug)]
+pub struct UploadLimiter {
+    /// Semaphore controlling max concurrent uploads
+    semaphore: Arc<Semaphore>,
+    /// Current number of requests waiting for a permit
+    waiting_count: AtomicUsize,
+    /// Maximum allowed waiting requests
+    max_waiting: usize,
+    /// Maximum time to wait for a permit
+    max_wait: Duration,
+}
+
+impl UploadLimiter {
+    /// Creates a new upload limiter from configuration.
+    ///
+    /// If `max_concurrent` is 0, returns `None` (unlimited uploads).
+    pub fn new(config: &FileUploadLimitsConfig) -> Option<Self> {
+        if config.max_concurrent == 0 {
+            return None;
+        }
+
+        Some(Self {
+            semaphore: Arc::new(Semaphore::new(config.max_concurrent)),
+            waiting_count: AtomicUsize::new(0),
+            max_waiting: config.max_waiting,
+            max_wait: Duration::from_secs(config.max_wait_secs),
+        })
+    }
+
+    /// Attempts to acquire a permit for file upload.
+    ///
+    /// Returns `Ok(UploadPermit)` if a slot is available or becomes available
+    /// within the timeout. Returns `Err(TooManyRequests)` if:
+    /// - The waiting queue is full (`max_waiting` reached)
+    /// - The timeout expires before a slot becomes available
+    pub async fn acquire(&self) -> Result<UploadPermit> {
+        // Try to acquire immediately without waiting
+        match self.semaphore.clone().try_acquire_owned() {
+            Ok(permit) => {
+                return Ok(UploadPermit { _permit: permit });
+            }
+            Err(_) => {
+                // No permit available, need to wait
+            }
+        }
+
+        // Check if we can join the waiting queue
+        let current_waiting = self.waiting_count.fetch_add(1, Ordering::SeqCst);
+        if current_waiting >= self.max_waiting {
+            // Queue is full, reject immediately
+            self.waiting_count.fetch_sub(1, Ordering::SeqCst);
+            return Err(Error::TooManyRequests {
+                message: "Too many file uploads in progress. Please retry later.".to_string(),
+            });
+        }
+
+        // Wait for a permit with timeout
+        let result = if self.max_wait.is_zero() {
+            // Zero timeout means reject immediately if not available
+            Err(Error::TooManyRequests {
+                message: "Too many file uploads in progress. Please retry later.".to_string(),
+            })
+        } else {
+            match tokio::time::timeout(self.max_wait, self.semaphore.clone().acquire_owned()).await {
+                Ok(Ok(permit)) => Ok(UploadPermit { _permit: permit }),
+                Ok(Err(_)) => {
+                    // Semaphore closed (shouldn't happen in normal operation)
+                    Err(Error::TooManyRequests {
+                        message: "Upload service temporarily unavailable.".to_string(),
+                    })
+                }
+                Err(_) => {
+                    // Timeout elapsed
+                    Err(Error::TooManyRequests {
+                        message: "Timed out waiting for upload slot. Please retry later.".to_string(),
+                    })
+                }
+            }
+        };
+
+        // Decrement waiting count regardless of outcome
+        self.waiting_count.fetch_sub(1, Ordering::SeqCst);
+
+        result
+    }
+}
+
+/// RAII guard that releases the upload permit when dropped.
+///
+/// This uses an owned permit so it can be held across await points
+/// and moved between tasks if needed.
+#[must_use]
+pub struct UploadPermit {
+    _permit: OwnedSemaphorePermit,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_config(max_concurrent: usize, max_waiting: usize, max_wait_secs: u64) -> FileUploadLimitsConfig {
+        FileUploadLimitsConfig {
+            max_concurrent,
+            max_waiting,
+            max_wait_secs,
+        }
+    }
+
+    #[test]
+    fn test_unlimited_returns_none() {
+        let config = test_config(0, 20, 60);
+        assert!(UploadLimiter::new(&config).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_acquire_when_available() {
+        let config = test_config(2, 10, 60);
+        let limiter = UploadLimiter::new(&config).unwrap();
+
+        // Should acquire immediately
+        let permit1 = limiter.acquire().await;
+        assert!(permit1.is_ok());
+
+        let permit2 = limiter.acquire().await;
+        assert!(permit2.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_acquire_waits_and_succeeds() {
+        let config = test_config(1, 10, 5);
+        let limiter = Arc::new(UploadLimiter::new(&config).unwrap());
+
+        // Take the only slot
+        let permit1 = limiter.acquire().await.unwrap();
+
+        // Spawn a task that will wait
+        let limiter_clone = limiter.clone();
+        let handle = tokio::spawn(async move { limiter_clone.acquire().await });
+
+        // Give time for the waiter to start waiting
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Release the permit
+        drop(permit1);
+
+        // Waiter should succeed
+        let result = handle.await.unwrap();
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_acquire_rejects_when_queue_full() {
+        let config = test_config(1, 1, 60);
+        let limiter = Arc::new(UploadLimiter::new(&config).unwrap());
+
+        // Take the only slot
+        let _permit1 = limiter.acquire().await.unwrap();
+
+        // First waiter joins queue
+        let limiter_clone = limiter.clone();
+        let _handle1 = tokio::spawn(async move { limiter_clone.acquire().await });
+
+        // Give time for waiter to enter queue
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Second waiter should be rejected (queue full)
+        let result = limiter.acquire().await;
+        assert!(result.is_err());
+        if let Err(Error::TooManyRequests { message }) = result {
+            assert!(message.contains("Too many file uploads"));
+        } else {
+            panic!("Expected TooManyRequests error");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_acquire_times_out() {
+        let config = test_config(1, 10, 1); // 1 second timeout
+        let limiter = Arc::new(UploadLimiter::new(&config).unwrap());
+
+        // Take the only slot and hold it
+        let _permit1 = limiter.acquire().await.unwrap();
+
+        // Try to acquire with timeout - should fail after 1 second
+        let start = std::time::Instant::now();
+        let result = limiter.acquire().await;
+        let elapsed = start.elapsed();
+
+        assert!(result.is_err());
+        assert!(elapsed >= Duration::from_secs(1));
+        assert!(elapsed < Duration::from_secs(2));
+
+        if let Err(Error::TooManyRequests { message }) = result {
+            assert!(message.contains("Timed out"));
+        } else {
+            panic!("Expected TooManyRequests error");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_zero_wait_rejects_immediately() {
+        let config = test_config(1, 10, 0); // 0 second timeout = reject immediately
+        let limiter = UploadLimiter::new(&config).unwrap();
+
+        // Take the only slot
+        let _permit1 = limiter.acquire().await.unwrap();
+
+        // Should reject immediately
+        let start = std::time::Instant::now();
+        let result = limiter.acquire().await;
+        let elapsed = start.elapsed();
+
+        assert!(result.is_err());
+        assert!(elapsed < Duration::from_millis(100)); // Should be nearly instant
+    }
+
+    #[tokio::test]
+    async fn test_permit_released_on_drop() {
+        let config = test_config(1, 10, 1);
+        let limiter = UploadLimiter::new(&config).unwrap();
+
+        {
+            let _permit = limiter.acquire().await.unwrap();
+            // permit dropped here
+        }
+
+        // Should be able to acquire again
+        let result = limiter.acquire().await;
+        assert!(result.is_ok());
+    }
+}

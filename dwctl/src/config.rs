@@ -157,6 +157,8 @@ pub struct Config {
     pub credits: CreditsConfig,
     /// Sample file generation configuration for new users
     pub sample_files: SampleFilesConfig,
+    /// Resource limits for protecting system capacity
+    pub limits: LimitsConfig,
 }
 
 /// Individual pool configuration with all SQLx parameters.
@@ -785,6 +787,50 @@ impl Default for FilesConfig {
     }
 }
 
+/// Resource limits for protecting system capacity.
+///
+/// These limits help prevent resource exhaustion under high load by rejecting
+/// requests that would exceed capacity rather than degrading performance for all users.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LimitsConfig {
+    /// File upload concurrency limits
+    pub file_uploads: FileUploadLimitsConfig,
+}
+
+/// File upload concurrency limits.
+///
+/// Controls how many file uploads can be processed concurrently to protect
+/// database connection pools and system resources.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FileUploadLimitsConfig {
+    /// Maximum number of concurrent file uploads allowed system-wide.
+    /// Set to 0 for unlimited (not recommended for production).
+    /// Default: 10
+    pub max_concurrent: usize,
+    /// Maximum number of uploads that can wait in queue for a slot.
+    /// When this limit is reached, new uploads receive HTTP 429 immediately.
+    /// Set to 0 for unlimited waiting (not recommended).
+    /// Default: 20
+    pub max_waiting: usize,
+    /// Maximum time in seconds to wait for an upload slot before returning HTTP 429.
+    /// Set to 0 to reject immediately when no slot is available.
+    /// Default: 60
+    pub max_wait_secs: u64,
+}
+
+impl Default for FileUploadLimitsConfig {
+    fn default() -> Self {
+        Self {
+            // 0 = unlimited (existing behavior)
+            max_concurrent: 0,
+            max_waiting: 20,
+            max_wait_secs: 60,
+        }
+    }
+}
+
 /// Batch API configuration.
 ///
 /// The batch API provides OpenAI-compatible batch processing endpoints for asynchronous
@@ -1178,6 +1224,7 @@ impl Default for Config {
             enable_otel_export: false,
             credits: CreditsConfig::default(),
             sample_files: SampleFilesConfig::default(),
+            limits: LimitsConfig::default(),
         }
     }
 }

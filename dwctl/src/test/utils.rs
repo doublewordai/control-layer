@@ -42,11 +42,13 @@ pub async fn create_test_app_state_with_config(pool: PgPool, config: crate::conf
         .expect("Failed to create fusillade TestDbPools");
 
     let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(fusillade_pools));
+    let limiters = crate::limits::Limiters::new(&config.limits);
 
     crate::AppState::builder()
         .db(test_pools)
-        .config(config)
+        .config(config.clone())
         .request_manager(request_manager)
+        .limiters(limiters)
         .build()
 }
 
@@ -173,6 +175,7 @@ pub fn create_test_config() -> crate::config::Config {
             ..Default::default()
         },
         sample_files: crate::sample_files::SampleFilesConfig::default(),
+        limits: crate::config::LimitsConfig::default(),
     }
 }
 

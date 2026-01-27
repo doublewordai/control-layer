@@ -579,10 +579,12 @@ async fn test_request_logging_disabled(pool: PgPool) {
 
     // Build router with request logging disabled
     let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(DbPools::new(pool.clone())));
+    let limiters = crate::limits::Limiters::new(&config.limits);
     let mut app_state = AppState::builder()
         .db(DbPools::new(pool.clone()))
         .config(config)
         .request_manager(request_manager)
+        .limiters(limiters)
         .build();
     let onwards_router = axum::Router::new(); // Empty onwards router for testing
     let router = super::build_router(&mut app_state, onwards_router)
@@ -911,10 +913,12 @@ async fn test_build_router_with_metrics_disabled(pool: PgPool) {
     config.enable_metrics = false;
 
     let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(DbPools::new(pool.clone())));
+    let limiters = crate::limits::Limiters::new(&config.limits);
     let mut app_state = AppState::builder()
         .db(DbPools::new(pool))
         .config(config)
         .request_manager(request_manager)
+        .limiters(limiters)
         .build();
 
     let onwards_router = axum::Router::new();
@@ -936,10 +940,12 @@ async fn test_build_router_with_metrics_enabled(pool: PgPool) {
     config.enable_metrics = true;
 
     let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(DbPools::new(pool.clone())));
+    let limiters = crate::limits::Limiters::new(&config.limits);
     let mut app_state = AppState::builder()
         .db(DbPools::new(pool))
         .config(config)
         .request_manager(request_manager)
+        .limiters(limiters)
         .build();
 
     let onwards_router = axum::Router::new();

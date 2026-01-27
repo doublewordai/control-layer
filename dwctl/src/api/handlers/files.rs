@@ -507,6 +507,7 @@ Each line must be a valid JSON object containing `custom_id`, `method`, `url`, a
         (status = 201, description = "File uploaded and validated successfully.", body = FileResponse),
         (status = 400, description = "Invalid file format, malformed JSON, missing required fields, or referencing an inaccessible model."),
         (status = 413, description = "File exceeds the maximum allowed size."),
+        (status = 429, description = "Too many concurrent uploads. Retry after a short delay."),
         (status = 500, description = "An unexpected error occurred. Retry the request or contact support if the issue persists.")
     )
 )]
@@ -516,6 +517,14 @@ pub async fn upload_file<P: PoolProvider>(
     current_user: RequiresPermission<resource::Files, operation::CreateOwn>,
     multipart: Multipart,
 ) -> Result<(StatusCode, Json<FileResponse>)> {
+    // Acquire upload permit (if limiter is configured)
+    // The permit is held for the duration of the upload to limit concurrency
+    let _permit = if let Some(ref limiter) = state.limiters.file_uploads {
+        Some(limiter.acquire().await?)
+    } else {
+        None
+    };
+
     let max_file_size = state.config.batches.files.max_file_size;
     let uploaded_by = Some(current_user.id.to_string());
 
