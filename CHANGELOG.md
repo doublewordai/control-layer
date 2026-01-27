@@ -1,5 +1,18 @@
 # Changelog
 
+## [3.2.0](https://github.com/doublewordai/control-layer/compare/v3.1.2...v3.2.0) (2026-01-27)
+
+
+### Features
+
+* Bootstrap content ([#611](https://github.com/doublewordai/control-layer/issues/611)) ([377e22d](https://github.com/doublewordai/control-layer/commit/377e22ddb39194467012260030be4774439f62e3))
+* upgrade fusillade to 2.3.0 ([#613](https://github.com/doublewordai/control-layer/issues/613)) ([28862ff](https://github.com/doublewordai/control-layer/commit/28862ff27d1c2d73eb954a9687f8b3b3755f06e9))
+
+
+### Bug Fixes
+
+* don't show errors before SLA completion  ([#606](https://github.com/doublewordai/control-layer/issues/606)) ([f76fa5f](https://github.com/doublewordai/control-layer/commit/f76fa5f570c23c65a79bf39962f521bd2fb8934b))
+
 ## [3.1.2](https://github.com/doublewordai/control-layer/compare/v3.1.1...v3.1.2) (2026-01-26)
 
 
