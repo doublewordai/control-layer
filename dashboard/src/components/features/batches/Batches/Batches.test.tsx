@@ -242,13 +242,10 @@ describe("Batches", () => {
         wrapper: createWrapper(),
       });
 
+      // On batches tab by default, title should be "Batch Requests"
+      expect(within(container).getByText("Batch Requests")).toBeInTheDocument();
       expect(
-        within(container).getByText("Batch Processing"),
-      ).toBeInTheDocument();
-      expect(
-        within(container).getByText(
-          "Upload files and create batches to process requests at scale",
-        ),
+        within(container).getByText("Create and manage batch requests"),
       ).toBeInTheDocument();
     });
 

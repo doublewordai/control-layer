@@ -17,7 +17,6 @@ import { Button } from "../../../ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "../../../ui/tooltip";
 import { formatBytes, formatTimestamp } from "../../../../utils";
 import type { FileObject } from "../types";
-import type { FileCostEstimate } from "../../../../api/control-layer/types";
 
 interface ColumnActions {
   onView: (file: FileObject) => void;
@@ -26,7 +25,6 @@ interface ColumnActions {
   onTriggerBatch: (file: FileObject) => void;
   onViewBatches: (file: FileObject) => void;
   isFileInProgress: (file: FileObject) => boolean;
-  fileEstimates: Map<string, FileCostEstimate>;
 }
 
 export const createFileColumns = (
@@ -156,87 +154,6 @@ export const createFileColumns = (
       const bytes = row.getValue("bytes") as number;
       return (
         <div className="text-right text-gray-700">{formatBytes(bytes)}</div>
-      );
-    },
-  },
-  {
-    id: "cost_estimate",
-    header: () => {
-      return (
-        <div className="flex items-center justify-end text-right font-medium">
-          Est. Cost
-        </div>
-      );
-    },
-    cell: ({ row }) => {
-      const file = row.original;
-
-      // Only show cost estimate for batch input files
-      if (file.purpose !== "batch") {
-        return <div className="text-right text-gray-400">—</div>;
-      }
-
-      // Get estimate from the map
-      const estimate = actions.fileEstimates.get(file.id);
-
-      if (!estimate) {
-        return <div className="text-right text-gray-400">—</div>;
-      }
-
-      const cost = parseFloat(estimate.total_estimated_cost);
-
-      // Format cost with appropriate precision
-      const formattedCost =
-        cost === 0
-          ? "$0.00"
-          : cost < 0.01
-            ? `$${cost.toFixed(4)}`
-            : `$${cost.toFixed(2)}`;
-
-      // Create tooltip content with per-model breakdown
-      const tooltipContent = (
-        <div className="space-y-1">
-          <div className="font-medium">Cost Estimate Breakdown (24hr SLA)</div>
-          <div className="text-xs space-y-0.5">
-            {estimate.models.map((model) => {
-              const modelCost = parseFloat(model.estimated_cost);
-              const formattedModelCost =
-                modelCost === 0
-                  ? "$0.00"
-                  : modelCost < 0.01
-                    ? `$${modelCost.toFixed(4)}`
-                    : `$${modelCost.toFixed(2)}`;
-
-              return (
-                <div key={model.model} className="flex justify-between gap-4">
-                  <span>{model.model}:</span>
-                  <span className="font-mono">{formattedModelCost}</span>
-                </div>
-              );
-            })}
-            <div className="pt-1 border-t border-gray-200 flex justify-between gap-4 font-medium">
-              <span>Total:</span>
-              <span className="font-mono">{formattedCost}</span>
-            </div>
-          </div>
-          <div className="text-xs text-gray-400 mt-2">
-            {estimate.total_requests} request
-            {estimate.total_requests !== 1 ? "s" : ""}
-          </div>
-        </div>
-      );
-
-      return (
-        <div className="text-right">
-          <Tooltip delayDuration={300}>
-            <TooltipTrigger asChild>
-              <span className="text-gray-700 font-mono cursor-help">
-                {formattedCost}
-              </span>
-            </TooltipTrigger>
-            <TooltipContent>{tooltipContent}</TooltipContent>
-          </Tooltip>
-        </div>
       );
     },
   },

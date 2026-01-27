@@ -1,5 +1,19 @@
 # Changelog
 
+## [3.1.2](https://github.com/doublewordai/control-layer/compare/v3.1.1...v3.1.2) (2026-01-26)
+
+
+### Bug Fixes
+
+* remove cost estimate column from files table ([#609](https://github.com/doublewordai/control-layer/issues/609)) ([1b31dc8](https://github.com/doublewordai/control-layer/commit/1b31dc8db7903209a57342769c257c2e6644560b))
+
+## [3.1.1](https://github.com/doublewordai/control-layer/compare/v3.1.0...v3.1.1) (2026-01-26)
+
+
+### Performance Improvements
+
+* defer files query until files tab is active on batches page ([#607](https://github.com/doublewordai/control-layer/issues/607)) ([d060328](https://github.com/doublewordai/control-layer/commit/d060328b22bf534e3e7ca35ecd9a28c955aad347))
+
 ## [3.1.0](https://github.com/doublewordai/control-layer/compare/v3.0.1...v3.1.0) (2026-01-26)
 
 
