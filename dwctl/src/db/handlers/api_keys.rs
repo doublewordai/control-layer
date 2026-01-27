@@ -1862,6 +1862,7 @@ mod tests {
             background_services: crate::config::BackgroundServicesConfig::default(),
             payment: None,
             sample_files: Default::default(),
+            limits: Default::default(),
         };
         crate::seed_database(&config.model_sources, &pool).await.unwrap();
 

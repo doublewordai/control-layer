@@ -142,6 +142,7 @@ mod email;
 mod error_enrichment;
 pub mod errors;
 mod leader_election;
+pub mod limits;
 mod metrics;
 mod openapi;
 mod payment_providers;
@@ -215,14 +216,17 @@ pub use types::{ApiKeyId, DeploymentId, GroupId, InferenceEndpointId, UserId};
 /// - `metrics_recorder`: Optional Prometheus metrics recorder (when enabled)
 /// - `is_leader`: Whether this instance is the elected leader (for distributed deployments)
 /// - `request_manager`: Fusillade batch request manager for async processing
+/// - `limiters`: Resource limiters for protecting system capacity
 ///
 /// # Example
 ///
 /// ```ignore
+/// let limiters = limits::Limiters::new(&config.limits);
 /// let state = AppState::builder()
 ///     .db(db_pools)
 ///     .config(config)
 ///     .request_manager(request_manager)
+///     .limiters(limiters)
 ///     .build();
 /// ```
 #[derive(Clone, Builder)]
@@ -241,6 +245,8 @@ where
     #[builder(default = false)]
     pub is_leader: bool,
     pub request_manager: Arc<fusillade::PostgresRequestManager<P, fusillade::ReqwestHttpClient>>,
+    /// Resource limiters for protecting system capacity.
+    pub limiters: limits::Limiters,
 }
 
 /// Get the dwctl database migrator
@@ -1743,6 +1749,9 @@ impl Application {
             onwards::AppState::new(bg_services.onwards_targets.clone()).with_response_transform(onwards::create_openai_sanitizer());
         let onwards_router = onwards::build_router(onwards_app_state);
 
+        // Build resource limiters
+        let limiters = limits::Limiters::new(&config.limits);
+
         // Build app state and router
         let mut app_state = AppState::builder()
             .db(db_pools.clone())
@@ -1750,6 +1759,7 @@ impl Application {
             .is_leader(bg_services.is_leader)
             .request_manager(bg_services.request_manager.clone())
             .maybe_outlet_db(outlet_pools.clone())
+            .limiters(limiters)
             .build();
 
         let router = build_router(&mut app_state, onwards_router).await?;

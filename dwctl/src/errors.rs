@@ -127,6 +127,10 @@ pub enum Error {
     /// User does not have access to the requested model
     #[error("Model access denied: {message}")]
     ModelAccessDenied { model_name: String, message: String },
+
+    /// Too many concurrent requests - rate limiting
+    #[error("Too many requests: {message}")]
+    TooManyRequests { message: String },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -158,6 +162,7 @@ impl Error {
             Error::PayloadTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
             Error::InsufficientCredits { .. } => StatusCode::PAYMENT_REQUIRED,
             Error::ModelAccessDenied { .. } => StatusCode::FORBIDDEN,
+            Error::TooManyRequests { .. } => StatusCode::TOO_MANY_REQUESTS,
         }
     }
 
@@ -212,6 +217,7 @@ impl Error {
             }
             Error::InsufficientCredits { message, .. } => message.clone(),
             Error::ModelAccessDenied { message, .. } => message.clone(),
+            Error::TooManyRequests { message } => message.clone(),
         }
     }
 }
@@ -243,6 +249,9 @@ impl IntoResponse for Error {
             }
             Error::ModelAccessDenied { .. } => {
                 tracing::info!("Model access denied error: {}", self);
+            }
+            Error::TooManyRequests { .. } => {
+                tracing::info!("Rate limit exceeded: {}", self);
             }
         }
 
