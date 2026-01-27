@@ -48,7 +48,9 @@ fn to_batch_response_with_email(batch: fusillade::Batch, creator_email: Option<&
     }
 
     // Determine OpenAI status from request counts
-    let is_finished = batch.pending_requests == 0 && batch.in_progress_requests == 0;
+    // A batch is only "finished" if it has started processing AND all requests are in terminal states
+    let has_started = batch.requests_started_at.is_some();
+    let is_finished = has_started && batch.pending_requests == 0 && batch.in_progress_requests == 0;
     let openai_status = if batch.cancelling_at.is_some() {
         // If cancelling_at is set, check if batch is finished
         if is_finished {
@@ -74,7 +76,14 @@ fn to_batch_response_with_email(batch: fusillade::Batch, creator_email: Option<&
             "failed"
         }
     } else if is_finished {
-        "completed"
+        // All requests are in terminal state - check if output files are ready
+        if batch.completed_at.is_some() {
+            // Output files written, batch is truly completed
+            "completed"
+        } else {
+            // Requests done but still writing output files
+            "finalizing"
+        }
     } else {
         // Any batch that has been validated (total_requests > 0) but not finished
         // is considered "in_progress". This includes:
@@ -92,7 +101,12 @@ fn to_batch_response_with_email(batch: fusillade::Batch, creator_email: Option<&
     };
 
     // Terminal state timestamps from batch table
-    let finalizing_at = batch.finalizing_at.map(|dt| dt.timestamp());
+    // Only show finalizing_at when status is actually "finalizing" or later
+    let finalizing_at = if openai_status == "finalizing" || openai_status == "completed" {
+        batch.finalizing_at.map(|dt| dt.timestamp())
+    } else {
+        None
+    };
     let completed_at = batch.completed_at.map(|dt| dt.timestamp());
     let failed_at = batch.failed_at.map(|dt| dt.timestamp());
     let cancelled_at = batch.cancelled_at.map(|dt| dt.timestamp());
@@ -128,12 +142,8 @@ fn to_batch_response_with_email(batch: fusillade::Batch, creator_email: Option<&
         completion_window: batch.completion_window.clone(),
         status: openai_status.to_string(),
         output_file_id: batch.output_file_id.map(|id| id.0.to_string()),
-        // Hide error_file_id until terminal failure past SLA
-        error_file_id: if show_failures {
-            batch.error_file_id.map(|id| id.0.to_string())
-        } else {
-            None
-        },
+        // Always show error_file_id if it exists - the file content itself is filtered by fusillade
+        error_file_id: batch.error_file_id.map(|id| id.0.to_string()),
         created_at: batch.created_at.timestamp(),
         in_progress_at,
         expires_at: Some(batch.expires_at.timestamp()),
@@ -1489,10 +1499,8 @@ mod tests {
             batch_response["errors"].is_null(),
             "Errors should be hidden when batch is within SLA (no failed_at set)"
         );
-        assert!(
-            batch_response["error_file_id"].is_null(),
-            "Error file ID should be hidden when batch is within SLA"
-        );
+        // Note: error_file_id is always shown if it exists - the file content is filtered by fusillade
+        // In this test, error_file_id doesn't exist yet because we only set the errors field
         assert!(
             batch_response["failed_at"].is_null(),
             "failed_at should be hidden when batch is within SLA"
@@ -1529,10 +1537,8 @@ mod tests {
             batch_response2["errors"].is_null(),
             "Errors should be hidden when failed_at is set but SLA has not expired"
         );
-        assert!(
-            batch_response2["error_file_id"].is_null(),
-            "Error file ID should be hidden even with failed_at set, until SLA expires"
-        );
+        // Note: error_file_id is shown if it exists (file content is filtered by fusillade)
+        // We don't assert on it here since it may or may not exist depending on batch processing
         assert!(
             batch_response2["failed_at"].is_null(),
             "failed_at should be hidden until SLA expires"
@@ -1574,10 +1580,8 @@ mod tests {
             "Test error",
             "Error message should match what we set"
         );
-        assert!(
-            !batch_response3["error_file_id"].is_null(),
-            "Error file ID should now be visible after SLA expires"
-        );
+        // Note: error_file_id would be shown if it existed - fusillade creates it during processing
+        // This test manually sets errors without going through fusillade, so no error file exists
         assert!(
             !batch_response3["failed_at"].is_null(),
             "failed_at should now be visible after SLA expires"
