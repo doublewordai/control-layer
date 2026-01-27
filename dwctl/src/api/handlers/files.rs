@@ -193,24 +193,33 @@ impl OpenAIBatchRequest {
     }
 }
 
+/// Configuration for file stream processing.
+#[derive(Debug)]
+struct FileStreamConfig {
+    /// Maximum file size in bytes (0 = unlimited)
+    max_file_size: u64,
+    /// Maximum number of requests per file (0 = unlimited)
+    max_requests_per_file: usize,
+    /// Channel buffer size for streaming
+    buffer_size: usize,
+}
+
 /// Helper function to create a stream of FileStreamItem from multipart upload
 /// This handles the entire multipart parsing inside the stream
 ///
 /// # Arguments
 /// * `endpoint` - Target endpoint for batch requests (e.g., "http://localhost:8080/ai")
 /// * `api_key` - API key to inject for request execution
-#[tracing::instrument(skip(multipart, api_key, accessible_models), fields(max_file_size, max_requests_per_file, uploaded_by = ?uploaded_by, endpoint = %endpoint, buffer_size))]
+#[tracing::instrument(skip(multipart, api_key, accessible_models), fields(config.max_file_size, config.max_requests_per_file, uploaded_by = ?uploaded_by, endpoint = %endpoint, config.buffer_size))]
 fn create_file_stream(
     mut multipart: Multipart,
-    max_file_size: u64,
-    max_requests_per_file: usize,
+    config: FileStreamConfig,
     uploaded_by: Option<String>,
     endpoint: String,
     api_key: String,
-    buffer_size: usize,
     accessible_models: HashSet<String>,
 ) -> Pin<Box<dyn Stream<Item = fusillade::FileStreamItem> + Send>> {
-    let (tx, rx) = mpsc::channel(buffer_size);
+    let (tx, rx) = mpsc::channel(config.buffer_size);
 
     tokio::spawn(async move {
         let mut total_size = 0i64;
@@ -268,12 +277,12 @@ fn create_file_stream(
                             line_count
                         );
 
-                        // Check size limit
-                        if total_size > max_file_size as i64 {
+                        // Check size limit (0 = unlimited)
+                        if config.max_file_size > 0 && total_size > config.max_file_size as i64 {
                             let _ = tx
                                 .send(fusillade::FileStreamItem::Error(format!(
                                     "File size exceeds maximum: {} > {}",
-                                    total_size, max_file_size
+                                    total_size, config.max_file_size
                                 )))
                                 .await;
                             return;
@@ -395,11 +404,11 @@ fn create_file_stream(
                                             line_count += 1;
 
                                             // Check request count limit (0 = unlimited)
-                                            if max_requests_per_file > 0 && line_count > max_requests_per_file as u64 {
+                                            if config.max_requests_per_file > 0 && line_count > config.max_requests_per_file as u64 {
                                                 let _ = tx
                                                     .send(fusillade::FileStreamItem::Error(format!(
                                                         "File exceeds maximum request limit: {} > {}",
-                                                        line_count, max_requests_per_file
+                                                        line_count, config.max_requests_per_file
                                                     )))
                                                     .await;
                                                 return;
@@ -446,11 +455,11 @@ fn create_file_stream(
                                         line_count += 1;
 
                                         // Check request count limit (0 = unlimited)
-                                        if max_requests_per_file > 0 && line_count > max_requests_per_file as u64 {
+                                        if config.max_requests_per_file > 0 && line_count > config.max_requests_per_file as u64 {
                                             let _ = tx
                                                 .send(fusillade::FileStreamItem::Error(format!(
                                                     "File exceeds maximum request limit: {} > {}",
-                                                    line_count, max_requests_per_file
+                                                    line_count, config.max_requests_per_file
                                                 )))
                                                 .await;
                                             return;
@@ -550,8 +559,11 @@ pub async fn upload_file<P: PoolProvider>(
         None
     };
 
-    let max_file_size = state.config.limits.files.max_file_size;
-    let max_requests_per_file = state.config.limits.files.max_requests_per_file;
+    let stream_config = FileStreamConfig {
+        max_file_size: state.config.limits.files.max_file_size,
+        max_requests_per_file: state.config.limits.files.max_requests_per_file,
+        buffer_size: state.config.batches.files.upload_buffer_size,
+    };
     let uploaded_by = Some(current_user.id.to_string());
 
     // Get or create user-specific hidden batch API key for batch request execution
@@ -578,16 +590,7 @@ pub async fn upload_file<P: PoolProvider>(
     drop(conn);
 
     // Create a stream that parses the multipart upload and yields FileStreamItems
-    let file_stream = create_file_stream(
-        multipart,
-        max_file_size,
-        max_requests_per_file,
-        uploaded_by,
-        endpoint,
-        user_api_key,
-        state.config.batches.files.upload_buffer_size,
-        accessible_models,
-    );
+    let file_stream = create_file_stream(multipart, stream_config, uploaded_by, endpoint, user_api_key, accessible_models);
 
     // Create file via request manager with streaming
     let created_file_id = state.request_manager.create_file_stream(file_stream).await.map_err(|e| match e {
