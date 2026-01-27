@@ -540,7 +540,7 @@ where
         // effective_from <= timestamp AND (valid_until IS NULL OR valid_until > timestamp)
         let valid_tariffs: Vec<_> = tariffs
             .iter()
-            .filter(|t| t.effective_from <= timestamp && t.valid_until.map_or(true, |valid_until| valid_until > timestamp))
+            .filter(|t| t.effective_from <= timestamp && t.valid_until.is_none_or(|valid_until| valid_until > timestamp))
             .collect();
 
         // Try exact match with completion_window (for batch tariffs with specific SLA)
@@ -1030,7 +1030,7 @@ mod tests {
         // Filter tariffs valid at timestamp
         let valid_tariffs: Vec<_> = tariffs
             .iter()
-            .filter(|t| t.effective_from <= timestamp && t.valid_until.map_or(true, |valid_until| valid_until > timestamp))
+            .filter(|t| t.effective_from <= timestamp && t.valid_until.is_none_or(|valid_until| valid_until > timestamp))
             .collect();
 
         // Try exact match with completion_window
