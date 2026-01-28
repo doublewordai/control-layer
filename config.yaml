@@ -322,26 +322,14 @@ background_services:
     status_log_interval_ms: 2000 # Interval for logging daemon status (set to null to disable)
 
     # SLA Daemon configuration
-    # Controls how the batch daemon handles SLA violations and escalations
-
-    # Model escalations: Map models to fallback models for SLA escalation
-    # When a request is at risk of missing its SLA, the daemon can create a racing
-    # escalated request using a different (typically faster/more reliable) model
+    # Route-at-claim-time model escalation
+    # When a batch is within `escalation_threshold_seconds` of expiry at claim time,
+    # the daemon routes requests to a different (typically faster) model.
+    # Batch API keys automatically have access to escalation models in the routing cache.
     # model_escalations:
-    #   gemma-3-27b-it:  # Original model
-    #     escalation_model: google/gemma-3-27b-it # Fallback model for escalation
-    #     escalation_api_key: SYSTEM_API_KEY  # Use backup API key with access
-
-    # sla_check_interval_seconds: 60  # How often to check for SLA violations (default: 60)
-
-    # sla_thresholds:
-    #   - name: api
-    #     threshold_seconds: 600  # Escalate when batch expires within 10 minutes
-    #     action: escalate
-    #     allowed_states:
-    #       - processing
-    #       - pending
-    #       - failed  # Can escalate even failed requests for recovery
+    #   gpt-4:  # Original model
+    #     escalation_model: o1-preview  # Route to this model when near expiry
+    #     escalation_threshold_seconds: 900  # Default: 900 (15 minutes before expiry)
 
   # Leader election - coordinates which instance runs leader-only services
   # When disabled, all instances run as leader (useful for single-instance deployments)

@@ -73,7 +73,6 @@ use figment::{
 };
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
-use tracing::warn;
 use url::Url;
 
 use crate::api::models::users::Role;
@@ -924,44 +923,16 @@ pub struct DaemonConfig {
     /// and returned to pending (milliseconds). This handles daemon crashes during execution. (default: 600000 = 10 minutes)
     pub processing_timeout_ms: u64,
 
-    /// Per-model configurations for SLA escalation
+    /// Per-model configurations for SLA escalation via route-at-claim-time.
+    /// When a request is claimed with less than `escalation_threshold_seconds` remaining
+    /// before batch expiry, it's routed to the `escalation_model` instead.
+    ///
     /// Parameters:
-    ///     * escalation_model: model to use instead of the original for escalations
-    ///     * escalation_api_key: optional env variable name for the escalation API key used to authenticate escalated requests.
-    ///       Note: different from fusillade config, we use an env var here for security so we can pass in API keys at runtime.
+    ///     * escalation_model: model to route to for late-stage requests
+    ///     * escalation_threshold_seconds: time before batch expiry to trigger routing (default: 900 = 15 minutes)
+    ///
+    /// Note: Batch API keys automatically have access to escalation models in the routing cache.
     pub model_escalations: HashMap<String, fusillade::ModelEscalationConfig>,
-
-    /// How often to check for batches approaching SLA deadlines (seconds)
-    pub sla_check_interval_seconds: u64,
-
-    /// SLA threshold configurations.
-    /// Each threshold defines a time limit and action to take when batches approach expiration.
-    /// The daemon will query the database once per threshold to find at-risk batches.
-    ///
-    /// Example: Two thresholds (warning at 1 hour, critical at 15 minutes)
-    /// ```
-    /// use fusillade::daemon::{SlaThreshold, SlaAction, SlaLogLevel};
-    /// use fusillade::request::RequestStateFilter;
-    ///
-    /// vec![
-    ///     SlaThreshold {
-    ///         name: "warning".to_string(),
-    ///         threshold_seconds: 3600,
-    ///         action: SlaAction::Log { level: SlaLogLevel::Warn },
-    ///         allowed_states: vec![RequestStateFilter::Pending],
-    ///     },
-    ///     SlaThreshold {
-    ///         name: "critical".to_string(),
-    ///         threshold_seconds: 900,
-    ///         action: SlaAction::Log { level: SlaLogLevel::Error },
-    ///         // Act on both pending and claimed requests for critical threshold
-    ///         allowed_states: vec![RequestStateFilter::Pending, RequestStateFilter::Claimed],
-    ///     },
-    /// ]
-    /// # ;
-    /// ```
-    #[serde(default)]
-    pub sla_thresholds: Vec<fusillade::SlaThreshold>,
 
     /// Batch table column names to include as request headers.
     /// These values are sent as `x-fusillade-batch-{column}` headers with each request.
@@ -1001,8 +972,6 @@ impl Default for DaemonConfig {
             processing_timeout_ms: 600000,
             batch_metadata_fields: default_batch_metadata_fields_dwctl(),
             model_escalations: HashMap::new(),
-            sla_check_interval_seconds: 60,
-            sla_thresholds: vec![],
         }
     }
 }
@@ -1017,22 +986,6 @@ impl DaemonConfig {
         &self,
         model_capacity_limits: Option<std::sync::Arc<dashmap::DashMap<String, usize>>>,
     ) -> fusillade::daemon::DaemonConfig {
-        // For security we pass in api keys as env vars. Here we read them into config passed to fusillade.
-        // If the env var is not set, we keep the original value (useful for testing).
-        let mut model_escalations_map = self.model_escalations.clone();
-        for (_, escalation) in model_escalations_map.iter_mut() {
-            if let Some(env_var_or_key) = escalation.escalation_api_key.as_ref().cloned() {
-                match std::env::var(&env_var_or_key) {
-                    Err(_) => {
-                        warn!("Model escalation configured with api_key - env var not found, using as literal value");
-                        // Keep the original value (could be a literal key for testing)
-                    }
-                    Ok(value) => {
-                        escalation.escalation_api_key = Some(value);
-                    }
-                }
-            }
-        }
         fusillade::daemon::DaemonConfig {
             claim_batch_size: self.claim_batch_size,
             default_model_concurrency: self.default_model_concurrency,
@@ -1048,9 +1001,7 @@ impl DaemonConfig {
             claim_timeout_ms: self.claim_timeout_ms,
             processing_timeout_ms: self.processing_timeout_ms,
             batch_metadata_fields: self.batch_metadata_fields.clone(),
-            model_escalations: Arc::new(DashMap::from_iter(model_escalations_map)),
-            sla_check_interval_seconds: self.sla_check_interval_seconds,
-            sla_thresholds: self.sla_thresholds.clone(),
+            model_escalations: Arc::new(DashMap::from_iter(self.model_escalations.clone())),
             ..Default::default()
         }
     }
