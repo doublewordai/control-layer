@@ -142,16 +142,14 @@ fn to_batch_response_with_email(batch: fusillade::Batch, creator_email: Option<&
         expires_at: Some(batch.expires_at.timestamp()),
         finalizing_at,
         completed_at,
-        // Hide failed_at timestamp until terminal failure past SLA
-        failed_at: if show_failures { failed_at } else { None },
+        failed_at,
         expired_at,
         cancelling_at: batch.cancelling_at.map(|dt| dt.timestamp()),
         cancelled_at,
-        // Hide failed count until terminal failure past SLA
         request_counts: RequestCounts {
             total: batch.total_requests,
             completed: batch.completed_requests,
-            failed: if show_failures { batch.failed_requests } else { 0 },
+            failed: batch.failed_requests,
         },
         metadata,
         analytics: None,
@@ -160,15 +158,14 @@ fn to_batch_response_with_email(batch: fusillade::Batch, creator_email: Option<&
 
 /// Helper to fetch just the expires_at timestamp for a batch from the database.
 /// This is used to determine the appropriate ErrorFilter before fetching the full batch.
+///
+/// Note: Uses unverified query since fusillade database is separate from dwctl database
+/// and SQLx prepare can only work with one database at a time.
 async fn get_batch_expires_at(db: &sqlx::PgPool, batch_id: Uuid) -> Result<chrono::DateTime<chrono::Utc>> {
-    let row = sqlx::query!(
-        r#"
-        SELECT expires_at
-        FROM fusillade.batches
-        WHERE id = $1
-        "#,
-        batch_id
+    let expires_at: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+        "SELECT expires_at FROM fusillade.batches WHERE id = $1"
     )
+    .bind(batch_id)
     .fetch_one(db)
     .await
     .map_err(|_| Error::NotFound {
@@ -176,7 +173,7 @@ async fn get_batch_expires_at(db: &sqlx::PgPool, batch_id: Uuid) -> Result<chron
         id: batch_id.to_string(),
     })?;
 
-    Ok(row.expires_at)
+    Ok(expires_at)
 }
 
 /// Helper to fetch creator email for a batch from the database
