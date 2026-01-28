@@ -1,0 +1,34 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT\n                model,\n                COUNT(*)::BIGINT as \"request_count!\",\n                SUM(body_byte_size)::BIGINT as \"total_body_bytes!\"\n            FROM request_templates\n            WHERE file_id = $1\n            GROUP BY model\n            ORDER BY model\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "model",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "request_count!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "total_body_bytes!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      null,
+      null
+    ]
+  },
+  "hash": "89b2bd2a19fcfc5b9138f50b462d86b6596e189459dde6c095c912c6810b7935"
+}

@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE batches\n            SET cancelling_at = NOW(),\n                cancelled_at = NOW()\n            WHERE file_id = $1\n              AND cancelling_at IS NULL\n              AND completed_at IS NULL\n              AND failed_at IS NULL\n              AND cancelled_at IS NULL\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "431c57e8419bc4c5b6ca3d245accf5697842a8c8e2151e853dc24358c5dd2c3e"
+}
