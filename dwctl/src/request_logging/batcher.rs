@@ -1769,4 +1769,65 @@ mod integration_tests {
             .unwrap();
         assert_eq!(tx_count, Some(0), "No credit transactions for unauthenticated requests");
     }
+
+    /// Test that the batcher sends pg_notify when a user's balance is depleted (crosses zero downward)
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_batcher_balance_depleted_notification(pool: PgPool) {
+        use sqlx::postgres::PgListener;
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        // Setup: Create model with tariff that will cost $0.025 per request (1000 input + 500 output tokens)
+        let model_id = create_test_model(&pool, "gpt-4-depletion-test").await;
+        let input_price = Decimal::from_str("0.00001").unwrap();
+        let output_price = Decimal::from_str("0.00003").unwrap();
+        setup_tariff(&pool, model_id, input_price, output_price, ApiKeyPurpose::Realtime).await;
+
+        // Setup: User with small balance that will be depleted by usage
+        // Balance: $0.01, Cost per request: $0.025 → will go negative
+        let initial_balance = Decimal::from_str("0.01").unwrap();
+        let user_id = setup_user_with_balance(&pool, initial_balance).await;
+        let api_key = create_api_key_for_user(&pool, user_id, ApiKeyPurpose::Realtime).await;
+
+        // Set up listener for auth_config_changed notifications BEFORE running batcher
+        let mut listener = PgListener::connect_with(&pool).await.expect("Failed to create listener");
+        listener.listen("auth_config_changed").await.expect("Failed to listen");
+
+        // Drain any notifications from setup (user went from 0 to positive during setup)
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        while timeout(Duration::from_millis(10), listener.try_recv()).await.is_ok() {}
+
+        // Create record that will deplete balance: cost = (1000 * 0.00001) + (500 * 0.00003) = $0.025
+        let record = create_raw_record("gpt-4-depletion-test", Some(api_key), 1000, 500);
+
+        // Run batcher - this should trigger balance depletion notification
+        run_batcher_with_records(&pool, vec![record]).await;
+
+        // Should receive notification for balance depletion
+        let notification = timeout(Duration::from_secs(2), listener.recv())
+            .await
+            .expect("Timeout waiting for balance depletion notification")
+            .expect("Failed to receive notification");
+
+        assert_eq!(notification.channel(), "auth_config_changed");
+
+        // Verify payload format: "credits_transactions:{epoch_micros}"
+        let payload = notification.payload();
+        assert!(
+            payload.starts_with("credits_transactions:"),
+            "Expected payload to start with 'credits_transactions:', got: {}",
+            payload
+        );
+
+        // Verify balance is actually negative
+        let mut conn = pool.acquire().await.unwrap();
+        let mut credits = Credits::new(&mut conn);
+        let final_balance = credits.get_user_balance(user_id).await.unwrap();
+        assert!(
+            final_balance < Decimal::ZERO,
+            "Balance should be negative after depletion, got: {}",
+            final_balance
+        );
+    }
 }
