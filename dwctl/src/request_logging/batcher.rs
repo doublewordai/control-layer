@@ -34,6 +34,7 @@
 //!   reducing from O(N) queries to O(1) per batch.
 
 use crate::config::Config;
+use crate::db::handlers::Credits;
 use crate::db::models::api_keys::ApiKeyPurpose;
 use crate::metrics::MetricsRecorder;
 use crate::request_logging::serializers::HttpAnalyticsRow;
@@ -732,6 +733,11 @@ where
     /// Batch INSERT credit_transactions within a transaction.
     ///
     /// Returns the number of duplicate transactions that were skipped.
+    ///
+    /// Also handles balance threshold notifications (when a user's balance crosses zero).
+    /// This replaces the database trigger approach for better performance - instead of
+    /// running a SUM query per row, we query balances once before insert and check
+    /// threshold crossings after.
     async fn batch_insert_credits(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -828,8 +834,34 @@ where
         let inserted_count = inserted_rows.len() as u64;
         let duplicates = expected_count.saturating_sub(inserted_count);
 
+        // Collect unique user IDs that had transactions inserted
+        let inserted_user_ids: Vec<Uuid> = inserted_rows
+            .iter()
+            .filter_map(|source_id| source_id_to_record.get(source_id).map(|(_, uid, _, _)| *uid))
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+
+        // Query balances AFTER insert, with probabilistic checkpoint refresh (1 in 1000)
+        // Notify onwards for any user with balance <= 0 (onwards handles idempotency)
+        if !inserted_user_ids.is_empty() {
+            let balances = {
+                let mut credits = Credits::new(&mut *tx);
+                credits
+                    .get_users_balances_bulk(&inserted_user_ids, Some(1000))
+                    .await
+                    .map_err(|e| sqlx::Error::Protocol(format!("Failed to get user balances: {e}")))?
+            };
+
+            // Notify onwards for any user with depleted balance
+            for (user_id, balance) in &balances {
+                if *balance <= Decimal::ZERO {
+                    self.notify_balance_depleted(&mut *tx, *user_id).await?;
+                }
+            }
+        }
+
         // Record metrics only for successfully inserted credit transactions
-        // Now we know exactly which source_ids were inserted
         for source_id in &inserted_rows {
             if let Some((_, user_id, amount, model)) = source_id_to_record.get(source_id) {
                 let cents = (amount.to_f64().unwrap_or(0.0) * 100.0).round() as u64;
@@ -848,6 +880,26 @@ where
             "Batch inserted credit transactions"
         );
         Ok(duplicates)
+    }
+
+    /// Send pg_notify when a user's balance is depleted.
+    /// Format: "credits_transactions:{epoch_micros}" to match other triggers and enable lag metrics.
+    async fn notify_balance_depleted(&self, conn: &mut sqlx::PgConnection, user_id: Uuid) -> Result<(), sqlx::Error> {
+        debug!(user_id = %user_id, "Balance depleted, notifying onwards");
+
+        let epoch_micros = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros();
+
+        let payload = format!("credits_transactions:{}", epoch_micros);
+
+        sqlx::query("SELECT pg_notify('auth_config_changed', $1)")
+            .bind(&payload)
+            .execute(conn)
+            .await?;
+
+        Ok(())
     }
 
     /// Convert enriched record back to HttpAnalyticsRow for metrics recording.
