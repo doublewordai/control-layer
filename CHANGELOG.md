@@ -1,5 +1,35 @@
 # Changelog
 
+## [5.0.1](https://github.com/doublewordai/control-layer/compare/v5.0.0...v5.0.1) (2026-01-28)
+
+
+### Bug Fixes
+
+* optimize balance threshold notifications for batch inserts ([#630](https://github.com/doublewordai/control-layer/issues/630)) ([9e39939](https://github.com/doublewordai/control-layer/commit/9e39939a321c29fdfc0d43c0331d10199dfa6d16))
+
+## [5.0.0](https://github.com/doublewordai/control-layer/compare/v4.1.0...v5.0.0) (2026-01-28)
+
+
+### ⚠ BREAKING CHANGES
+
+* update to fusillade 3.0.1 with route-at-claim-time escalation ([#627](https://github.com/doublewordai/control-layer/issues/627))
+
+### Features
+
+* update to fusillade 3.0.1 with route-at-claim-time escalation ([#627](https://github.com/doublewordai/control-layer/issues/627)) ([21ea357](https://github.com/doublewordai/control-layer/commit/21ea357561b88129c9436801adce1732f70e32aa))
+
+## [4.1.0](https://github.com/doublewordai/control-layer/compare/v4.0.0...v4.1.0) (2026-01-28)
+
+
+### Features
+
+* decouple analytics from request logging with write-through batching ([#603](https://github.com/doublewordai/control-layer/issues/603)) ([1869a3a](https://github.com/doublewordai/control-layer/commit/1869a3a9b0cf7525a22ce4dc213f4127282c6e46))
+
+
+### Bug Fixes
+
+* bump fusillade ([#626](https://github.com/doublewordai/control-layer/issues/626)) ([bf8ac6b](https://github.com/doublewordai/control-layer/commit/bf8ac6bd9f001b33f7f991f39bf737f879248c2f))
+
 ## [4.0.0](https://github.com/doublewordai/control-layer/compare/v3.3.1...v4.0.0) (2026-01-27)
 
 

@@ -923,21 +923,16 @@ pub struct DaemonConfig {
     /// and returned to pending (milliseconds). This handles daemon crashes during execution. (default: 600000 = 10 minutes)
     pub processing_timeout_ms: u64,
 
-    /// Per-model configurations for SLA escalation
-    /// Maps model name -> escalation config (e.g., "gpt-4" -> {escalation_model: "o1-preview", threshold: 900})
-    /// When a request is escalated, it's routed to the escalation_model.
+    /// Per-model configurations for SLA escalation via route-at-claim-time.
+    /// When a request is claimed with less than `escalation_threshold_seconds` remaining
+    /// before batch expiry, it's routed to the `escalation_model` instead.
+    ///
+    /// Parameters:
+    ///     * escalation_model: model to route to for late-stage requests
+    ///     * escalation_threshold_seconds: time before batch expiry to trigger routing (default: 900 = 15 minutes)
+    ///
+    /// Note: Batch API keys automatically have access to escalation models in the routing cache.
     pub model_escalations: HashMap<String, fusillade::ModelEscalationConfig>,
-
-    /// Interval for sending heartbeats to update daemon status in database (milliseconds)
-    pub heartbeat_interval_ms: u64,
-
-    /// Maximum number of stale requests to unclaim in a single poll cycle.
-    /// Limits database load when many requests become stale simultaneously (e.g., daemon crash).
-    pub unclaim_batch_size: usize,
-
-    /// Interval for polling database to check for cancelled batches (milliseconds)
-    /// Determines how quickly in-flight requests are aborted when their batch is cancelled
-    pub cancellation_poll_interval_ms: u64,
 
     /// Batch table column names to include as request headers.
     /// These values are sent as `x-fusillade-batch-{column}` headers with each request.
@@ -977,9 +972,6 @@ impl Default for DaemonConfig {
             processing_timeout_ms: 600000,
             batch_metadata_fields: default_batch_metadata_fields_dwctl(),
             model_escalations: HashMap::new(),
-            heartbeat_interval_ms: 60000,
-            unclaim_batch_size: 100,
-            cancellation_poll_interval_ms: 5000,
         }
     }
 }
@@ -1013,6 +1005,7 @@ impl DaemonConfig {
             unclaim_batch_size: self.unclaim_batch_size,
             cancellation_poll_interval_ms: self.cancellation_poll_interval_ms,
             batch_metadata_fields: self.batch_metadata_fields.clone(),
+            model_escalations: Arc::new(DashMap::from_iter(self.model_escalations.clone())),
             ..Default::default()
         }
     }
