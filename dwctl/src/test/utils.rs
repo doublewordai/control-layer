@@ -149,6 +149,7 @@ pub fn create_test_config() -> crate::config::Config {
         enable_metrics: false,
         enable_request_logging: false,
         enable_analytics: true,
+        analytics: crate::config::AnalyticsConfig::default(),
         enable_otel_export: false,
         credits: crate::config::CreditsConfig::default(),
         batches: BatchConfig {
