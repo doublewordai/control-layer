@@ -999,13 +999,9 @@ impl DaemonConfig {
             max_backoff_ms: self.max_backoff_ms,
             timeout_ms: self.timeout_ms,
             status_log_interval_ms: self.status_log_interval_ms,
-            heartbeat_interval_ms: self.heartbeat_interval_ms,
             claim_timeout_ms: self.claim_timeout_ms,
             processing_timeout_ms: self.processing_timeout_ms,
-            unclaim_batch_size: self.unclaim_batch_size,
-            cancellation_poll_interval_ms: self.cancellation_poll_interval_ms,
             batch_metadata_fields: self.batch_metadata_fields.clone(),
-            model_escalations: Arc::new(DashMap::from_iter(self.model_escalations.clone())),
             ..Default::default()
         }
     }

@@ -162,16 +162,14 @@ fn to_batch_response_with_email(batch: fusillade::Batch, creator_email: Option<&
 /// Note: Uses unverified query since fusillade database is separate from dwctl database
 /// and SQLx prepare can only work with one database at a time.
 async fn get_batch_expires_at(db: &sqlx::PgPool, batch_id: Uuid) -> Result<chrono::DateTime<chrono::Utc>> {
-    let expires_at: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
-        "SELECT expires_at FROM fusillade.batches WHERE id = $1"
-    )
-    .bind(batch_id)
-    .fetch_one(db)
-    .await
-    .map_err(|_| Error::NotFound {
-        resource: "Batch".to_string(),
-        id: batch_id.to_string(),
-    })?;
+    let expires_at: chrono::DateTime<chrono::Utc> = sqlx::query_scalar("SELECT expires_at FROM fusillade.batches WHERE id = $1")
+        .bind(batch_id)
+        .fetch_one(db)
+        .await
+        .map_err(|_| Error::NotFound {
+            resource: "Batch".to_string(),
+            id: batch_id.to_string(),
+        })?;
 
     Ok(expires_at)
 }
