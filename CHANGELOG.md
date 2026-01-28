@@ -1,5 +1,17 @@
 # Changelog
 
+## [4.1.0](https://github.com/doublewordai/control-layer/compare/v4.0.0...v4.1.0) (2026-01-28)
+
+
+### Features
+
+* decouple analytics from request logging with write-through batching ([#603](https://github.com/doublewordai/control-layer/issues/603)) ([1869a3a](https://github.com/doublewordai/control-layer/commit/1869a3a9b0cf7525a22ce4dc213f4127282c6e46))
+
+
+### Bug Fixes
+
+* bump fusillade ([#626](https://github.com/doublewordai/control-layer/issues/626)) ([bf8ac6b](https://github.com/doublewordai/control-layer/commit/bf8ac6bd9f001b33f7f991f39bf737f879248c2f))
+
 ## [4.0.0](https://github.com/doublewordai/control-layer/compare/v3.3.1...v4.0.0) (2026-01-27)
 
 
