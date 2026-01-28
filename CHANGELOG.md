@@ -1,5 +1,16 @@
 # Changelog
 
+## [5.0.0](https://github.com/doublewordai/control-layer/compare/v4.1.0...v5.0.0) (2026-01-28)
+
+
+### ⚠ BREAKING CHANGES
+
+* update to fusillade 3.0.1 with route-at-claim-time escalation ([#627](https://github.com/doublewordai/control-layer/issues/627))
+
+### Features
+
+* update to fusillade 3.0.1 with route-at-claim-time escalation ([#627](https://github.com/doublewordai/control-layer/issues/627)) ([21ea357](https://github.com/doublewordai/control-layer/commit/21ea357561b88129c9436801adce1732f70e32aa))
+
 ## [4.1.0](https://github.com/doublewordai/control-layer/compare/v4.0.0...v4.1.0) (2026-01-28)
 
 
