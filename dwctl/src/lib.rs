@@ -1315,7 +1315,8 @@ impl BackgroundServices {
             .ok_or_else(|| anyhow::anyhow!("Onwards sync not enabled"))?;
 
         // Use the same load function as the automatic sync
-        let new_targets = crate::sync::onwards_config::load_targets_from_db(pool).await?;
+        // Note: escalation_models is empty for tests - individual tests can set up their own
+        let new_targets = crate::sync::onwards_config::load_targets_from_db(pool, &[]).await?;
 
         // Send through the watch channel (same as automatic sync)
         sender
@@ -1379,8 +1380,22 @@ async fn setup_background_services(
     // Start onwards integration for proxying AI requests (if enabled)
     #[cfg_attr(not(test), allow(unused_variables))]
     let (initial_targets, onwards_sender) = if config.background_services.onwards_sync.enabled {
-        let (onwards_config_sync, initial_targets, onwards_stream) =
-            sync::onwards_config::OnwardsConfigSync::new_with_daemon_limits(pool.clone(), Some(model_capacity_limits.clone())).await?;
+        // Extract escalation model names from batch daemon config
+        // Batch API keys automatically get access to these models for SLA escalation
+        let escalation_models: Vec<String> = config
+            .background_services
+            .batch_daemon
+            .model_escalations
+            .values()
+            .map(|e| e.escalation_model.clone())
+            .collect();
+
+        let (onwards_config_sync, initial_targets, onwards_stream) = sync::onwards_config::OnwardsConfigSync::new_with_daemon_limits(
+            pool.clone(),
+            Some(model_capacity_limits.clone()),
+            escalation_models,
+        )
+        .await?;
 
         // Clone the sender before moving onwards_config_sync into the spawn (for manual sync)
         let sender = onwards_config_sync.sender();

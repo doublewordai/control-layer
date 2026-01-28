@@ -82,6 +82,8 @@ pub struct OnwardsConfigSync {
     sender: watch::Sender<Targets>,
     /// Shared map of model batch capacity limits for the daemon
     daemon_capacity_limits: Option<Arc<dashmap::DashMap<String, usize>>>,
+    /// Model aliases that batch API keys should have automatic access to (escalation targets)
+    escalation_models: Vec<String>,
 }
 
 #[derive(Default)]
@@ -94,17 +96,22 @@ impl OnwardsConfigSync {
     #[cfg(test)]
     #[instrument(skip(db))]
     pub async fn new(db: PgPool) -> Result<(Self, Targets, WatchTargetsStream), anyhow::Error> {
-        Self::new_with_daemon_limits(db, None).await
+        Self::new_with_daemon_limits(db, None, Vec::new()).await
     }
 
-    /// Creates a new OnwardsConfigSync with optional daemon capacity limits map
-    #[instrument(skip(db, daemon_capacity_limits))]
+    /// Creates a new OnwardsConfigSync with optional daemon capacity limits map and escalation models
+    ///
+    /// `escalation_models` - Model aliases that batch API keys should have automatic access to.
+    /// This enables batch processing to route requests to escalation models without needing
+    /// separate API key configuration.
+    #[instrument(skip(db, daemon_capacity_limits, escalation_models))]
     pub async fn new_with_daemon_limits(
         db: PgPool,
         daemon_capacity_limits: Option<Arc<dashmap::DashMap<String, usize>>>,
+        escalation_models: Vec<String>,
     ) -> Result<(Self, Targets, WatchTargetsStream), anyhow::Error> {
         // Load initial configuration (including composite models)
-        let initial_targets = load_targets_from_db(&db).await?;
+        let initial_targets = load_targets_from_db(&db, &escalation_models).await?;
 
         // If daemon limits are provided, populate them
         if let Some(ref limits) = daemon_capacity_limits {
@@ -118,6 +125,7 @@ impl OnwardsConfigSync {
             db,
             sender,
             daemon_capacity_limits,
+            escalation_models,
         };
         let stream = WatchTargetsStream::new(receiver);
 
@@ -191,7 +199,7 @@ impl OnwardsConfigSync {
 
                                 // Reload configuration from database (including composite models)
                                 last_reload_time = std::time::Instant::now();
-                                match load_targets_from_db(&self.db).await {
+                                match load_targets_from_db(&self.db, &self.escalation_models).await {
                                     Ok(new_targets) => {
                                         info!("Loaded {} targets from database", new_targets.targets.len());
                                         for entry in new_targets.targets.iter() {
@@ -776,12 +784,17 @@ fn convert_to_config_file(targets: Vec<OnwardsTarget>, composites: Vec<OnwardsCo
 }
 
 /// Loads the current targets configuration from the database (including composite models)
-#[tracing::instrument(skip(db))]
-pub async fn load_targets_from_db(db: &PgPool) -> Result<Targets, anyhow::Error> {
+///
+/// `escalation_models` - Model aliases that batch API keys should have automatic access to.
+/// This enables batch processing to route requests to escalation models without needing
+/// separate API key configuration.
+#[tracing::instrument(skip(db, escalation_models))]
+pub async fn load_targets_from_db(db: &PgPool, escalation_models: &[String]) -> Result<Targets, anyhow::Error> {
     let query_start = std::time::Instant::now();
     debug!("Loading onwards targets from database (with composite models)");
 
     // Load regular deployed models (existing logic)
+    // Note: We pass escalation_models to grant batch API keys access to escalation models
     let rows = sqlx::query!(
         r#"
         WITH user_balances AS (
@@ -828,17 +841,25 @@ pub async fn load_targets_from_db(db: &PgPool) -> Result<Targets, anyhow::Error>
                 ak.burst_size
             FROM api_keys ak
             WHERE (
+                -- System user always has access
                 ak.user_id = '00000000-0000-0000-0000-000000000000'
+                -- OR user is in a group assigned to this model
                 OR EXISTS (
                     SELECT 1 FROM user_groups ug
                     INNER JOIN deployment_groups dg ON ug.group_id = dg.group_id
                     WHERE dg.deployment_id = dm.id
                       AND ug.user_id = ak.user_id
                 )
+                -- OR model is in public group
                 OR EXISTS (
                     SELECT 1 FROM deployment_groups dg
                     WHERE dg.deployment_id = dm.id
                       AND dg.group_id = '00000000-0000-0000-0000-000000000000'
+                )
+                -- OR this is a batch API key and model is an escalation target
+                OR (
+                    ak.purpose = 'batch'
+                    AND dm.alias = ANY($1::text[])
                 )
             )
             AND (
@@ -860,7 +881,8 @@ pub async fn load_targets_from_db(db: &PgPool) -> Result<Targets, anyhow::Error>
         WHERE dm.deleted = FALSE
           AND dm.is_composite = FALSE
         ORDER BY dm.id, ak.id
-        "#
+        "#,
+        escalation_models
     )
     .fetch_all(db)
     .await?;
