@@ -142,14 +142,16 @@ fn to_batch_response_with_email(batch: fusillade::Batch, creator_email: Option<&
         expires_at: Some(batch.expires_at.timestamp()),
         finalizing_at,
         completed_at,
-        failed_at,
+        // Hide failed_at timestamp until terminal failure past SLA
+        failed_at: if show_failures { failed_at } else { None },
         expired_at,
         cancelling_at: batch.cancelling_at.map(|dt| dt.timestamp()),
         cancelled_at,
+        // Hide failed count until terminal failure past SLA
         request_counts: RequestCounts {
             total: batch.total_requests,
             completed: batch.completed_requests,
-            failed: batch.failed_requests,
+            failed: if show_failures { batch.failed_requests } else { 0 },
         },
         metadata,
         analytics: None,

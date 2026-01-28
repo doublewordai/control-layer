@@ -151,12 +151,17 @@ pub struct Config {
     ///
     /// When disabled, no analytics, billing, or GenAI metrics are recorded.
     pub enable_analytics: bool,
+    /// Analytics batching configuration
+    #[serde(default)]
+    pub analytics: AnalyticsConfig,
     /// Enable OpenTelemetry OTLP export for distributed tracing
     pub enable_otel_export: bool,
     /// Credit system configuration
     pub credits: CreditsConfig,
     /// Sample file generation configuration for new users
     pub sample_files: SampleFilesConfig,
+    /// Resource limits for protecting system capacity
+    pub limits: LimitsConfig,
 }
 
 /// Individual pool configuration with all SQLx parameters.
@@ -755,8 +760,6 @@ pub struct PasswordResetEmailConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct FilesConfig {
-    /// Maximum file size in bytes (default: 100MB)
-    pub max_file_size: u64,
     /// Default expiration time in seconds (default: 24 hours)
     pub default_expiry_seconds: i64,
     /// Minimum expiration time in seconds (default: 1 hour)
@@ -774,13 +777,66 @@ pub struct FilesConfig {
 impl Default for FilesConfig {
     fn default() -> Self {
         Self {
-            max_file_size: 100 * 1024 * 1024,      // 100MB
             default_expiry_seconds: 24 * 60 * 60,  // 24 hours
             min_expiry_seconds: 60 * 60,           // 1 hour
             max_expiry_seconds: 30 * 24 * 60 * 60, // 30 days
             upload_buffer_size: 100,
             download_buffer_size: 100,
             batch_insert_size: 5000,
+        }
+    }
+}
+
+/// Resource limits for protecting system capacity.
+///
+/// These limits help prevent resource exhaustion under high load by rejecting
+/// requests that would exceed capacity rather than degrading performance for all users.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LimitsConfig {
+    /// File limits (size, request count, and upload concurrency)
+    pub files: FileLimitsConfig,
+}
+
+/// File limits configuration.
+///
+/// Controls file size limits, request count limits, and upload concurrency
+/// to protect database connection pools and system resources.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FileLimitsConfig {
+    /// Maximum file size in bytes.
+    /// Set to 0 for unlimited (not recommended for production).
+    /// Default: 100MB
+    pub max_file_size: u64,
+    /// Maximum number of requests (JSONL lines) allowed per file.
+    /// Set to 0 for unlimited (not recommended for production).
+    /// Default: 0 (unlimited)
+    pub max_requests_per_file: usize,
+    /// Maximum number of concurrent file uploads allowed system-wide.
+    /// Set to 0 for unlimited (not recommended for production).
+    /// Default: 0 (unlimited)
+    pub max_concurrent_uploads: usize,
+    /// Maximum number of uploads that can wait in queue for a slot.
+    /// When this limit is reached, new uploads receive HTTP 429 immediately.
+    /// Set to 0 for unlimited waiting queue (not recommended).
+    /// Default: 20
+    pub max_waiting_uploads: usize,
+    /// Maximum time in seconds to wait for an upload slot before returning HTTP 429.
+    /// Set to 0 to reject immediately when no slot is available.
+    /// Default: 60
+    pub max_upload_wait_secs: u64,
+}
+
+impl Default for FileLimitsConfig {
+    fn default() -> Self {
+        Self {
+            max_file_size: 100 * 1024 * 1024, // 100MB
+            max_requests_per_file: 0,         // 0 = unlimited
+            // 0 = unlimited (existing behavior)
+            max_concurrent_uploads: 0,
+            max_waiting_uploads: 20,
+            max_upload_wait_secs: 60,
         }
     }
 }
@@ -1155,6 +1211,41 @@ impl Default for CreditsConfig {
     }
 }
 
+/// Analytics batching configuration.
+///
+/// The batcher uses a write-through strategy:
+/// 1. Block until at least one record arrives
+/// 2. Drain all available records (up to batch_size)
+/// 3. Write immediately (with retry on failure)
+///
+/// This minimizes latency at low load while getting batching efficiency at high load.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AnalyticsConfig {
+    /// Maximum number of records to write in a single batch.
+    /// At high load, records queue while writing, naturally forming larger batches.
+    /// Default: 100
+    pub batch_size: usize,
+    /// Maximum number of retry attempts for failed batch writes.
+    /// After all retries are exhausted, the batch is dropped and an error is logged.
+    /// Default: 3
+    pub max_retries: u32,
+    /// Base delay in milliseconds for exponential backoff between retries.
+    /// Actual delay is: base_delay * 2^attempt (e.g., 100ms, 200ms, 400ms for base=100).
+    /// Default: 100
+    pub retry_base_delay_ms: u64,
+}
+
+impl Default for AnalyticsConfig {
+    fn default() -> Self {
+        Self {
+            batch_size: 100,
+            max_retries: 3,
+            retry_base_delay_ms: 100,
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -1175,9 +1266,11 @@ impl Default for Config {
             enable_metrics: true,
             enable_request_logging: true,
             enable_analytics: true,
+            analytics: AnalyticsConfig::default(),
             enable_otel_export: false,
             credits: CreditsConfig::default(),
             sample_files: SampleFilesConfig::default(),
+            limits: LimitsConfig::default(),
         }
     }
 }
@@ -1467,12 +1560,8 @@ impl Config {
                 });
             }
 
-            // Validate file size limits are sensible
-            if self.batches.files.max_file_size == 0 {
-                return Err(Error::Internal {
-                    operation: "Config validation: max_file_size cannot be 0. Set a positive value in bytes (default: 100MB).".to_string(),
-                });
-            }
+            // Validate file size limits are sensible (0 = unlimited is allowed but not recommended)
+            // Note: max_file_size is now in limits.files, not batches.files
 
             // Validate expiry times are positive and in sensible order
             if self.batches.files.min_expiry_seconds <= 0 {
@@ -1806,19 +1895,6 @@ secret_key: "test-secret-key"
         let result = config.validate();
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("download_buffer_size cannot be 0"));
-    }
-
-    #[test]
-    fn test_max_file_size_zero_validation() {
-        let mut config = Config::default();
-        config.auth.native.enabled = true;
-        config.secret_key = Some("test-secret-key".to_string());
-        config.batches.enabled = true;
-        config.batches.files.max_file_size = 0;
-
-        let result = config.validate();
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("max_file_size cannot be 0"));
     }
 
     #[test]

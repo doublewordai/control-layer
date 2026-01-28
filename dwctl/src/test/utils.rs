@@ -1,7 +1,7 @@
 //! Test utilities for integration testing
 use crate::config::{
-    BatchConfig, DaemonConfig, DaemonEnabled, FilesConfig, LeaderElectionConfig, NativeAuthConfig, OnwardsSyncConfig, PasswordConfig,
-    PoolSettings, ProbeSchedulerConfig, ProxyHeaderAuthConfig, SecurityConfig,
+    BatchConfig, DaemonConfig, DaemonEnabled, FileLimitsConfig, FilesConfig, LeaderElectionConfig, LimitsConfig, NativeAuthConfig,
+    OnwardsSyncConfig, PasswordConfig, PoolSettings, ProbeSchedulerConfig, ProxyHeaderAuthConfig, SecurityConfig,
 };
 use crate::db::handlers::inference_endpoints::{InferenceEndpointFilter, InferenceEndpoints};
 use crate::db::handlers::repository::Repository;
@@ -28,13 +28,8 @@ use sqlx::{PgConnection, PgPool};
 use sqlx_pool_router::TestDbPools;
 use uuid::Uuid;
 
-/// Create an AppState with TestDbPools for proper read/write replica testing
-/// Use this in tests that need to manually construct AppState instead of using create_test_app
-async fn create_test_app_state(pool: PgPool) -> crate::AppState<TestDbPools> {
-    create_test_app_state_with_config(pool, create_test_config()).await
-}
-
 /// Create an AppState with TestDbPools and custom config
+/// Use this in tests that need to manually construct AppState instead of using create_test_app
 pub async fn create_test_app_state_with_config(pool: PgPool, config: crate::config::Config) -> crate::AppState<TestDbPools> {
     let test_pools = TestDbPools::new(pool.clone()).await.expect("Failed to create TestDbPools");
     let fusillade_pools = TestDbPools::new(pool.clone())
@@ -42,11 +37,13 @@ pub async fn create_test_app_state_with_config(pool: PgPool, config: crate::conf
         .expect("Failed to create fusillade TestDbPools");
 
     let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(fusillade_pools));
+    let limiters = crate::limits::Limiters::new(&config.limits);
 
     crate::AppState::builder()
         .db(test_pools)
-        .config(config)
+        .config(config.clone())
         .request_manager(request_manager)
+        .limiters(limiters)
         .build()
 }
 
@@ -152,14 +149,12 @@ pub fn create_test_config() -> crate::config::Config {
         enable_metrics: false,
         enable_request_logging: false,
         enable_analytics: true,
+        analytics: crate::config::AnalyticsConfig::default(),
         enable_otel_export: false,
         credits: crate::config::CreditsConfig::default(),
         batches: BatchConfig {
             enabled: true,
-            files: FilesConfig {
-                max_file_size: 1000 * 1024 * 1024, //1GB
-                ..Default::default()
-            },
+            files: FilesConfig::default(),
             ..Default::default()
         },
         background_services: crate::config::BackgroundServicesConfig {
@@ -173,6 +168,12 @@ pub fn create_test_config() -> crate::config::Config {
             ..Default::default()
         },
         sample_files: crate::sample_files::SampleFilesConfig::default(),
+        limits: LimitsConfig {
+            files: FileLimitsConfig {
+                max_file_size: 1000 * 1024 * 1024, // 1GB
+                ..Default::default()
+            },
+        },
     }
 }
 
