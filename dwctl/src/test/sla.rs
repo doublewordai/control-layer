@@ -14,7 +14,6 @@ use crate::{
     db::models::api_keys::ApiKeyPurpose,
 };
 use chrono::{Duration, Utc};
-use fusillade::daemon::SlaAction;
 use sqlx::{PgPool, Row};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -244,18 +243,14 @@ async fn test_sla_escalation_e2e(pool: PgPool) {
                 "test-model".to_string(),
                 fusillade::ModelEscalationConfig {
                     escalation_model: "test-model-escalation".to_string(),
-                    escalation_api_key: None, // Use same API key for escalation
+                    escalation_threshold_seconds: 30, // Escalate if batch expires within 30 seconds
                 },
             );
             map
         },
-        sla_check_interval_seconds: 1, // Check every second
-        sla_thresholds: vec![fusillade::SlaThreshold {
-            name: "test-sla".to_string(),
-            threshold_seconds: 30, // Escalate if batch expires within 30 seconds
-            action: SlaAction::Escalate,
-            allowed_states: vec![fusillade::RequestStateFilter::Pending, fusillade::RequestStateFilter::Processing],
-        }],
+        heartbeat_interval_ms: 1000,
+        unclaim_batch_size: 100,
+        cancellation_poll_interval_ms: 1000,
         batch_metadata_fields: vec!["id".to_string(), "created_by".to_string()],
     };
 
@@ -709,30 +704,21 @@ async fn test_sla_escalation_for_failed_batch(pool: PgPool) {
         claim_timeout_ms: 5000,
         processing_timeout_ms: 10000,
         status_log_interval_ms: None, // Disable status logging to prevent lazy failed_at computation
-        // Configure model escalation for SLA with API key override
+        // Configure model escalation for SLA
         model_escalations: {
             let mut map = HashMap::new();
             map.insert(
                 "test-model-fail".to_string(),
                 fusillade::ModelEscalationConfig {
                     escalation_model: "test-model-fail-escalation".to_string(),
-                    escalation_api_key: Some(escalation_api_key.clone()), // Use platform manager API key for escalation
+                    escalation_threshold_seconds: 60, // Escalate if batch expires within 60 seconds
                 },
             );
             map
         },
-        sla_check_interval_seconds: 2, // Check every 2 seconds
-        sla_thresholds: vec![fusillade::SlaThreshold {
-            name: "test-sla-failed".to_string(),
-            threshold_seconds: 60, // Escalate if batch expires within 60 seconds
-            action: SlaAction::Escalate,
-            // IMPORTANT: Include Failed state to allow escalation of failed requests
-            allowed_states: vec![
-                fusillade::RequestStateFilter::Pending,
-                fusillade::RequestStateFilter::Processing,
-                fusillade::RequestStateFilter::Failed, // ← Key: allow escalation of failed requests
-            ],
-        }],
+        heartbeat_interval_ms: 2000,
+        unclaim_batch_size: 100,
+        cancellation_poll_interval_ms: 1000,
         batch_metadata_fields: vec!["id".to_string(), "created_by".to_string()],
     };
 

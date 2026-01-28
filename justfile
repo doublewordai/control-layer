@@ -102,6 +102,7 @@ db-setup:
     echo "Creating databases..."
     PGPASSWORD="$DB_PASS" psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d postgres -c "CREATE DATABASE dwctl;" 2>/dev/null || echo "  - dwctl database already exists"
     PGPASSWORD="$DB_PASS" psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d postgres -c "CREATE DATABASE fusillade;" 2>/dev/null || echo "  - fusillade database already exists"
+    createuser -s postgres 2>/dev/null || echo "  - postgres user already exists"
 
     # Write .env files for sqlx compile-time verification
     echo "Writing .env files..."
