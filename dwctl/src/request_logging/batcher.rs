@@ -468,18 +468,19 @@ where
         }
 
         // Query models with ALL their tariffs (including expired) for historical pricing
+        // Note: Column aliases use "?" suffix to force nullable for LEFT JOIN columns
         let rows: Vec<ModelRow> = sqlx::query_as!(
             ModelRow,
             r#"
             SELECT
                 dm.alias,
-                ie.name as provider_name,
-                mt.api_key_purpose as tariff_purpose,
-                mt.valid_from as tariff_valid_from,
-                mt.valid_until as tariff_valid_until,
-                mt.input_price_per_token as tariff_input_price,
-                mt.output_price_per_token as tariff_output_price,
-                mt.completion_window as tariff_completion_window
+                ie.name as "provider_name?",
+                mt.api_key_purpose as "tariff_purpose?",
+                mt.valid_from as "tariff_valid_from?",
+                mt.valid_until as "tariff_valid_until?",
+                mt.input_price_per_token as "tariff_input_price?",
+                mt.output_price_per_token as "tariff_output_price?",
+                mt.completion_window as "tariff_completion_window?"
             FROM deployed_models dm
             LEFT JOIN inference_endpoints ie ON dm.hosted_on = ie.id
             LEFT JOIN model_tariffs mt ON mt.deployed_model_id = dm.id
