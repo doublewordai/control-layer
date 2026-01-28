@@ -1,5 +1,14 @@
+# Dependency planner stage
+FROM lukemathwalker/cargo-chef:latest-rust-1.93.0-slim AS chef
+WORKDIR /app
+
+FROM chef AS planner
+COPY Cargo.toml Cargo.lock ./
+COPY dwctl/ dwctl/
+RUN cargo chef prepare --recipe-path recipe.json
+
 # Backend build stage
-FROM rust:1.93.0-slim AS backend-builder
+FROM chef AS builder
 
 # Install build dependencies including Node.js
 RUN apt-get update && apt-get install -y \
@@ -10,36 +19,23 @@ RUN apt-get update && apt-get install -y \
     && apt-get install -y nodejs \
     && rm -rf /var/lib/apt/lists/*
 
-# Create app directory
-WORKDIR /app
+# Build dependencies (cached unless Cargo.toml/Cargo.lock change)
+COPY --from=planner /app/recipe.json recipe.json
+RUN cargo chef cook --release --recipe-path recipe.json
 
-# Install cargo-watch for auto-reloading in dev
-RUN cargo install cargo-watch
-
-# Copy workspace code (dwctl, dashboard)
-COPY Cargo.toml Cargo.lock ./
-COPY .sqlx/ .sqlx/
-COPY dwctl/ dwctl/
+# Build frontend
 COPY dashboard/ dashboard/
-
-# Build frontend and copy to dwctl/static
 WORKDIR /app/dashboard
 RUN npm ci && npm run build
 WORKDIR /app
-RUN rm -rf dwctl/static && cp -r dashboard/dist dwctl/static
 
-# Build from workspace root with embedded database (target dir will be at /app/target)
+# Copy source and build
+COPY .sqlx/ .sqlx/
+COPY Cargo.toml Cargo.lock ./
+COPY dwctl/ dwctl/
+RUN rm -rf dwctl/static && cp -r dashboard/dist dwctl/static
 ENV SQLX_OFFLINE=true
 RUN cargo build --release -p dwctl
-
-# Development stage
-FROM backend-builder AS dev
-
-# Expose port
-EXPOSE 3001
-
-# Default command for development: doesn't rebuild the frontend on changes
-CMD ["cargo", "watch", "-w", "dwctl/src", "-x", "run -p dwctl"]
 
 # Runtime stage
 FROM ubuntu:24.04
@@ -55,8 +51,8 @@ RUN apt-get update && apt-get install -y \
 # Set working directory
 WORKDIR /app
 
-# Copy the binary from backend builder stage (frontend is already embedded in the binary)
-COPY --from=backend-builder /app/target/release/dwctl /app/dwctl
+# Copy the binary from builder stage (frontend is already embedded in the binary)
+COPY --from=builder /app/target/release/dwctl /app/dwctl
 
 # Change ownership of the app directory to the ubuntu user
 RUN chown -R ubuntu:ubuntu /app
