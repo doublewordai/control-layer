@@ -30,7 +30,7 @@ use axum::{
     http::StatusCode,
 };
 use chrono::Utc;
-use fusillade::Storage;
+use fusillade::{ErrorFilter, Storage};
 use futures::StreamExt;
 use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
@@ -826,12 +826,38 @@ pub async fn get_file_content<P: PoolProvider>(
         }
     }
 
+    // Determine ErrorFilter based on file purpose and batch SLA status
+    let error_filter = if matches!(file.purpose, Some(fusillade::batch::Purpose::BatchError)) {
+        // For error files, check the batch SLA status
+        let batch = state
+            .request_manager
+            .get_batch_by_output_file_id(fusillade::FileId(file_id), fusillade::batch::OutputFileType::Error)
+            .await
+            .map_err(|e| Error::Internal {
+                operation: format!("get batch by error file: {}", e),
+            })?;
+
+        if let Some(batch) = batch {
+            // Use SLA-based filtering: OnlyNonRetriable before SLA, All after SLA
+            if chrono::Utc::now() < batch.expires_at {
+                ErrorFilter::OnlyNonRetriable
+            } else {
+                ErrorFilter::All
+            }
+        } else {
+            ErrorFilter::All
+        }
+    } else {
+        // For non-error files (input, output), show all content
+        ErrorFilter::All
+    };
+
     // Stream the file content as JSONL, starting from offset
     let offset = query.pagination.skip.unwrap_or(0) as usize;
     let search = query.search.clone();
     let content_stream = state
         .request_manager
-        .get_file_content_stream(fusillade::FileId(file_id), offset, search);
+        .get_file_content_stream(fusillade::FileId(file_id), offset, search, error_filter);
 
     // Apply limit if specified, fetching one extra to detect if there are more results
     let requested_limit = query.pagination.limit.map(|l| l as usize);
@@ -869,7 +895,7 @@ pub async fn get_file_content<P: PoolProvider>(
             if let Some(batch) = batch {
                 let status = state
                     .request_manager
-                    .get_batch_status(batch.id)
+                    .get_batch_status(batch.id, ErrorFilter::All)
                     .await
                     .map_err(|e| Error::Internal {
                         operation: format!("get batch status: {}", e),
@@ -890,7 +916,7 @@ pub async fn get_file_content<P: PoolProvider>(
             if let Some(batch) = batch {
                 let status = state
                     .request_manager
-                    .get_batch_status(batch.id)
+                    .get_batch_status(batch.id, ErrorFilter::All)
                     .await
                     .map_err(|e| Error::Internal {
                         operation: format!("get batch status: {}", e),

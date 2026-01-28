@@ -20,11 +20,23 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
 };
-use fusillade::Storage;
+use fusillade::{ErrorFilter, Storage};
 use futures::StreamExt;
 use std::collections::HashMap;
 use std::pin::Pin;
 use uuid::Uuid;
+
+/// Determine which ErrorFilter to use based on whether the batch SLA has expired.
+///
+/// Before SLA expiry: Use OnlyNonRetriable (only show non-retriable errors - permanent failures)
+/// After SLA expiry: Use All (show all errors including retriable ones)
+fn error_filter_for_sla(expires_at: chrono::DateTime<chrono::Utc>) -> ErrorFilter {
+    if chrono::Utc::now() < expires_at {
+        ErrorFilter::OnlyNonRetriable
+    } else {
+        ErrorFilter::All
+    }
+}
 
 /// Helper function to convert fusillade Batch to OpenAI BatchResponse
 ///
@@ -47,6 +59,9 @@ fn to_batch_response_with_email(batch: fusillade::Batch, creator_email: Option<&
             .insert("created_by_email".to_string(), email.to_string());
     }
 
+    // Note: batch.failed_requests is already filtered based on the ErrorFilter
+    // passed to get_batch (OnlyNonRetriable before SLA, All after SLA)
+
     // Determine OpenAI status from request counts
     // A batch is only "finished" if it has started processing AND all requests are in terminal states
     let has_started = batch.requests_started_at.is_some();
@@ -63,18 +78,8 @@ fn to_batch_response_with_email(batch: fusillade::Batch, creator_email: Option<&
     } else if batch.total_requests == 0 {
         "validating"
     } else if is_finished && batch.failed_requests == batch.total_requests {
-        // Don't show "failed" until we're certain recovery is impossible
-        // Check if we're still within the SLA window
-        if chrono::Utc::now() < batch.expires_at {
-            // Within SLA - escalation might still recover these failures
-            "in_progress"
-        } else if batch.failed_at.is_none() {
-            // Past SLA but no failed_at timestamp - escalation may still be attempting recovery
-            "in_progress"
-        } else {
-            // Past SLA and failed_at is set - terminal failure confirmed
-            "failed"
-        }
+        // All requests failed (batch.failed_requests already filtered by ErrorFilter)
+        "failed"
     } else if is_finished {
         // All requests are in terminal state - check if output files are ready
         if batch.completed_at.is_some() {
@@ -111,20 +116,8 @@ fn to_batch_response_with_email(batch: fusillade::Batch, creator_email: Option<&
     let failed_at = batch.failed_at.map(|dt| dt.timestamp());
     let cancelled_at = batch.cancelled_at.map(|dt| dt.timestamp());
 
-    // Only show failure indicators if batch has terminally failed AND SLA has expired
-    // This prevents showing any failure information while escalation might still recover
-    let show_failures = batch.failed_at.is_some() && chrono::Utc::now() > batch.expires_at;
-
-    let errors = if show_failures {
-        // Terminal failure past SLA - show errors to user
-        batch.errors.and_then(|e| serde_json::from_value::<BatchErrors>(e).ok())
-    } else {
-        // Either:
-        // - No terminal failure yet (failed_at is None) - escalation might recover
-        // - Still within SLA window - escalation has time to recover
-        // In both cases, hide errors from user
-        None
-    };
+    // Convert batch-level errors (validation errors, system errors, etc.)
+    let errors = batch.errors.and_then(|e| serde_json::from_value::<BatchErrors>(e).ok());
 
     // Check if batch has expired
     let expired_at = if chrono::Utc::now() > batch.expires_at {
@@ -149,20 +142,39 @@ fn to_batch_response_with_email(batch: fusillade::Batch, creator_email: Option<&
         expires_at: Some(batch.expires_at.timestamp()),
         finalizing_at,
         completed_at,
-        // Hide failed_at timestamp until terminal failure past SLA
-        failed_at: if show_failures { failed_at } else { None },
+        failed_at,
         expired_at,
         cancelling_at: batch.cancelling_at.map(|dt| dt.timestamp()),
         cancelled_at,
-        // Hide failed count until terminal failure past SLA
         request_counts: RequestCounts {
             total: batch.total_requests,
             completed: batch.completed_requests,
-            failed: if show_failures { batch.failed_requests } else { 0 },
+            failed: batch.failed_requests,
         },
         metadata,
         analytics: None,
     }
+}
+
+/// Helper to fetch just the expires_at timestamp for a batch from the database.
+/// This is used to determine the appropriate ErrorFilter before fetching the full batch.
+async fn get_batch_expires_at(db: &sqlx::PgPool, batch_id: Uuid) -> Result<chrono::DateTime<chrono::Utc>> {
+    let row = sqlx::query!(
+        r#"
+        SELECT expires_at
+        FROM fusillade.batches
+        WHERE id = $1
+        "#,
+        batch_id
+    )
+    .fetch_one(db)
+    .await
+    .map_err(|_| Error::NotFound {
+        resource: "Batch".to_string(),
+        id: batch_id.to_string(),
+    })?;
+
+    Ok(row.expires_at)
 }
 
 /// Helper to fetch creator email for a batch from the database
@@ -314,10 +326,14 @@ pub async fn get_batch<P: PoolProvider>(
         message: "Invalid batch ID format".to_string(),
     })?;
 
-    // Get batch
+    // Determine which ErrorFilter to use based on SLA status
+    let expires_at = get_batch_expires_at(state.db.read(), batch_id).await?;
+    let error_filter = error_filter_for_sla(expires_at);
+
+    // Get batch with SLA-appropriate error filtering
     let batch = state
         .request_manager
-        .get_batch(fusillade::BatchId(batch_id))
+        .get_batch(fusillade::BatchId(batch_id), error_filter)
         .await
         .map_err(|_| Error::NotFound {
             resource: "Batch".to_string(),
@@ -368,10 +384,14 @@ pub async fn get_batch_analytics<P: PoolProvider>(
         message: "Invalid batch ID format".to_string(),
     })?;
 
+    // Determine which ErrorFilter to use based on SLA status
+    let expires_at = get_batch_expires_at(state.db.read(), batch_id).await?;
+    let error_filter = error_filter_for_sla(expires_at);
+
     // Get batch first to verify it exists and check permissions
     let batch = state
         .request_manager
-        .get_batch(fusillade::BatchId(batch_id))
+        .get_batch(fusillade::BatchId(batch_id), error_filter)
         .await
         .map_err(|_| Error::NotFound {
             resource: "Batch".to_string(),
@@ -431,10 +451,14 @@ pub async fn get_batch_results<P: PoolProvider>(
         message: "Invalid batch ID format".to_string(),
     })?;
 
+    // Determine which ErrorFilter to use based on SLA status
+    let expires_at = get_batch_expires_at(state.db.read(), batch_id).await?;
+    let error_filter = error_filter_for_sla(expires_at);
+
     // Get batch first to verify it exists and check permissions
     let batch = state
         .request_manager
-        .get_batch(fusillade::BatchId(batch_id))
+        .get_batch(fusillade::BatchId(batch_id), error_filter)
         .await
         .map_err(|_| Error::NotFound {
             resource: "Batch".to_string(),
@@ -459,7 +483,7 @@ pub async fn get_batch_results<P: PoolProvider>(
     let status = query.status.clone();
     let results_stream = state
         .request_manager
-        .get_batch_results_stream(fusillade::BatchId(batch_id), offset, search, status);
+        .get_batch_results_stream(fusillade::BatchId(batch_id), offset, search, status, error_filter);
 
     // Apply limit if specified, fetching one extra to detect if there are more results
     let requested_limit = query.pagination.limit.map(|l| l as usize);
@@ -548,10 +572,14 @@ pub async fn cancel_batch<P: PoolProvider>(
         message: "Invalid batch ID format".to_string(),
     })?;
 
+    // Determine which ErrorFilter to use based on SLA status
+    let expires_at = get_batch_expires_at(state.db.read(), batch_id).await?;
+    let error_filter = error_filter_for_sla(expires_at);
+
     // Get batch first to verify it exists
     let batch = state
         .request_manager
-        .get_batch(fusillade::BatchId(batch_id))
+        .get_batch(fusillade::BatchId(batch_id), error_filter)
         .await
         .map_err(|_| Error::NotFound {
             resource: "Batch".to_string(),
@@ -579,10 +607,14 @@ pub async fn cancel_batch<P: PoolProvider>(
             operation: format!("cancel batch: {}", e),
         })?;
 
+    // Determine which ErrorFilter to use based on SLA status
+    let expires_at = get_batch_expires_at(state.db.read(), batch_id).await?;
+    let error_filter = error_filter_for_sla(expires_at);
+
     // Fetch updated batch to get latest status
     let batch = state
         .request_manager
-        .get_batch(fusillade::BatchId(batch_id))
+        .get_batch(fusillade::BatchId(batch_id), error_filter)
         .await
         .map_err(|_| Error::NotFound {
             resource: "Batch".to_string(),
@@ -624,10 +656,14 @@ pub async fn delete_batch<P: PoolProvider>(
         message: "Invalid batch ID format".to_string(),
     })?;
 
+    // Determine which ErrorFilter to use based on SLA status
+    let expires_at = get_batch_expires_at(state.db.read(), batch_id).await?;
+    let error_filter = error_filter_for_sla(expires_at);
+
     // Get batch first to verify it exists and check ownership
     let batch = state
         .request_manager
-        .get_batch(fusillade::BatchId(batch_id))
+        .get_batch(fusillade::BatchId(batch_id), error_filter)
         .await
         .map_err(|_| Error::NotFound {
             resource: "Batch".to_string(),
@@ -688,10 +724,14 @@ pub async fn retry_failed_batch_requests<P: PoolProvider>(
         message: "Invalid batch ID format".to_string(),
     })?;
 
+    // Determine which ErrorFilter to use based on SLA status
+    let expires_at = get_batch_expires_at(state.db.read(), batch_id).await?;
+    let error_filter = error_filter_for_sla(expires_at);
+
     // Get batch first to verify it exists
     let batch = state
         .request_manager
-        .get_batch(fusillade::BatchId(batch_id))
+        .get_batch(fusillade::BatchId(batch_id), error_filter)
         .await
         .map_err(|_| Error::NotFound {
             resource: "Batch".to_string(),
@@ -731,10 +771,14 @@ pub async fn retry_failed_batch_requests<P: PoolProvider>(
         "Retried failed requests"
     );
 
+    // Determine which ErrorFilter to use based on SLA status
+    let expires_at = get_batch_expires_at(state.db.read(), batch_id).await?;
+    let error_filter = error_filter_for_sla(expires_at);
+
     // Fetch updated batch to get latest status
     let batch = state
         .request_manager
-        .get_batch(fusillade::BatchId(batch_id))
+        .get_batch(fusillade::BatchId(batch_id), error_filter)
         .await
         .map_err(|_| Error::NotFound {
             resource: "Batch".to_string(),
@@ -776,10 +820,14 @@ pub async fn retry_specific_requests<P: PoolProvider>(
         message: "Invalid batch ID format".to_string(),
     })?;
 
+    // Determine which ErrorFilter to use based on SLA status
+    let expires_at = get_batch_expires_at(state.db.read(), batch_id).await?;
+    let error_filter = error_filter_for_sla(expires_at);
+
     // Get batch first to verify it exists
     let batch = state
         .request_manager
-        .get_batch(fusillade::BatchId(batch_id))
+        .get_batch(fusillade::BatchId(batch_id), error_filter)
         .await
         .map_err(|_| Error::NotFound {
             resource: "Batch".to_string(),
@@ -848,10 +896,14 @@ pub async fn retry_specific_requests<P: PoolProvider>(
         "Successfully retried specific requests"
     );
 
+    // Determine which ErrorFilter to use based on SLA status
+    let expires_at = get_batch_expires_at(state.db.read(), batch_id).await?;
+    let error_filter = error_filter_for_sla(expires_at);
+
     // Fetch updated batch to get latest status
     let batch = state
         .request_manager
-        .get_batch(fusillade::BatchId(batch_id))
+        .get_batch(fusillade::BatchId(batch_id), error_filter)
         .await
         .map_err(|_| Error::NotFound {
             resource: "Batch".to_string(),
@@ -899,9 +951,11 @@ pub async fn list_batches<P: PoolProvider>(
     let created_by = if can_read_all { None } else { Some(current_user.id.to_string()) };
 
     // Fetch batches with ownership filtering, search, and cursor-based pagination
+    // Note: List view uses ErrorFilter::All since batches have different SLA states.
+    // Individual batch endpoints filter based on their specific SLA status.
     let batches = state
         .request_manager
-        .list_batches(created_by, query.search.clone(), after, limit + 1) // Fetch one extra to determine has_more
+        .list_batches(created_by, query.search.clone(), after, limit + 1, ErrorFilter::All) // Fetch one extra to determine has_more
         .await
         .map_err(|e| Error::Internal {
             operation: format!("list batches: {}", e),
@@ -945,9 +999,11 @@ pub async fn list_batches<P: PoolProvider>(
         .unwrap_or_default();
     let include_analytics = includes.contains(&"analytics");
 
+    // Collect batch IDs for bulk operations
+    let batch_ids: Vec<Uuid> = batches.iter().map(|b| b.id.0).collect();
+
     // Fetch analytics in bulk if requested
     let analytics_map: HashMap<Uuid, BatchAnalytics> = if include_analytics && !batches.is_empty() {
-        let batch_ids: Vec<Uuid> = batches.iter().map(|b| b.id.0).collect();
         crate::db::handlers::analytics::get_batches_analytics_bulk(state.db.read(), &batch_ids)
             .await
             .map_err(|e| Error::Internal {
@@ -961,11 +1017,13 @@ pub async fn list_batches<P: PoolProvider>(
     let data: Vec<_> = batches
         .into_iter()
         .map(|batch| {
-            let batch_id = batch.id.0;
             let email = batch.created_by.as_ref().and_then(|id| email_map.get(id)).map(|s| s.as_str());
             let mut response = to_batch_response_with_email(batch, email);
             if include_analytics {
-                response.analytics = analytics_map.get(&batch_id).cloned();
+                let batch_id = response.id.parse::<Uuid>().ok();
+                if let Some(id) = batch_id {
+                    response.analytics = analytics_map.get(&id).cloned();
+                }
             }
             response
         })
@@ -1452,23 +1510,23 @@ mod tests {
         get_resp.assert_status(StatusCode::OK);
         let batch_response: serde_json::Value = get_resp.json();
 
-        assert!(
-            batch_response["errors"].is_null(),
-            "Errors should be hidden when batch is within SLA (no failed_at set)"
-        );
-        // Note: error_file_id is always shown if it exists - the file content is filtered by fusillade
-        // In this test, error_file_id doesn't exist yet because we only set the errors field
+        // Batch-level errors (validation/system errors) are now always shown
+        // The hiding logic has been removed as it was causing more issues than it solved
+        assert!(!batch_response["errors"].is_null(), "Batch-level errors are now always shown");
+        // failed_at is also shown now (hiding logic removed)
         assert!(
             batch_response["failed_at"].is_null(),
-            "failed_at should be hidden when batch is within SLA"
+            "failed_at should still be null since we didn't set it yet"
         );
+        // Failed request count uses failed_requests_non_retriable before SLA
+        // (which is 0 in this test since we have no actual failed requests)
         assert_eq!(
             batch_response["request_counts"]["failed"].as_i64().unwrap(),
             0,
-            "Failed request count should be hidden (shown as 0) when within SLA"
+            "Failed request count is 0 (no actual failed requests, only batch-level errors)"
         );
 
-        // Scenario 2: Set failed_at but still within SLA - errors should STILL be hidden
+        // Scenario 2: Set failed_at - now this will be shown
         sqlx::query(
             r#"
             UPDATE fusillade.batches
@@ -1481,7 +1539,7 @@ mod tests {
         .await
         .expect("Failed to set failed_at");
 
-        // GET batch - errors should STILL be HIDDEN because within SLA
+        // GET batch - errors are now shown, hiding logic removed
         let get_resp2 = app
             .get(&format!("/ai/v1/batches/{}", batch_id))
             .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
@@ -1491,19 +1549,19 @@ mod tests {
         let batch_response2: serde_json::Value = get_resp2.json();
 
         assert!(
-            batch_response2["errors"].is_null(),
-            "Errors should be hidden when failed_at is set but SLA has not expired"
+            !batch_response2["errors"].is_null(),
+            "Batch-level errors are now always shown (hiding logic removed)"
         );
-        // Note: error_file_id is shown if it exists (file content is filtered by fusillade)
-        // We don't assert on it here since it may or may not exist depending on batch processing
+        // failed_at is now shown since we set it
         assert!(
-            batch_response2["failed_at"].is_null(),
-            "failed_at should be hidden until SLA expires"
+            !batch_response2["failed_at"].is_null(),
+            "failed_at is now shown (hiding logic removed)"
         );
+        // Failed count still 0 since we have no actual failed requests
         assert_eq!(
             batch_response2["request_counts"]["failed"].as_i64().unwrap(),
             0,
-            "Failed request count should still be hidden even with failed_at set"
+            "Failed request count is 0 (no actual failed requests)"
         );
 
         // Scenario 3: Expire the SLA AND have failed_at - NOW errors should be visible

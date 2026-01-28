@@ -381,7 +381,7 @@ pub async fn delete_user<P: PoolProvider>(
     Path(user_id): Path<UserId>,
     current_user: RequiresPermission<resource::Users, operation::DeleteAll>,
 ) -> Result<StatusCode> {
-    use fusillade::Storage;
+    use fusillade::{ErrorFilter, Storage};
 
     // Prevent self-deletion
     if user_id == current_user.id {
@@ -394,7 +394,7 @@ pub async fn delete_user<P: PoolProvider>(
     let user_id_str = user_id.to_string();
     let batches = state
         .request_manager
-        .list_batches(Some(user_id_str.clone()), None, None, i64::MAX)
+        .list_batches(Some(user_id_str.clone()), None, None, i64::MAX, ErrorFilter::All)
         .await
         .map_err(|_| Error::NotFound {
             resource: "Batch".to_string(),
