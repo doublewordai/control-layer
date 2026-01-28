@@ -1,5 +1,12 @@
 # Changelog
 
+## [5.0.1](https://github.com/doublewordai/control-layer/compare/v5.0.0...v5.0.1) (2026-01-28)
+
+
+### Bug Fixes
+
+* optimize balance threshold notifications for batch inserts ([#630](https://github.com/doublewordai/control-layer/issues/630)) ([9e39939](https://github.com/doublewordai/control-layer/commit/9e39939a321c29fdfc0d43c0331d10199dfa6d16))
+
 ## [5.0.0](https://github.com/doublewordai/control-layer/compare/v4.1.0...v5.0.0) (2026-01-28)
 
 
