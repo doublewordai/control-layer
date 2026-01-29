@@ -145,23 +145,6 @@ fn to_batch_response_with_email(batch: fusillade::Batch, creator_email: Option<&
 }
 
 /// Helper to fetch just the expires_at timestamp for a batch from the database.
-/// This validates the batch exists and is used for permission checking.
-///
-/// Note: Uses unverified query since fusillade database is separate from dwctl database
-/// and SQLx prepare can only work with one database at a time.
-async fn get_batch_expires_at(db: &sqlx::PgPool, batch_id: Uuid) -> Result<chrono::DateTime<chrono::Utc>> {
-    let expires_at: chrono::DateTime<chrono::Utc> = sqlx::query_scalar("SELECT expires_at FROM fusillade.batches WHERE id = $1")
-        .bind(batch_id)
-        .fetch_one(db)
-        .await
-        .map_err(|_| Error::NotFound {
-            resource: "Batch".to_string(),
-            id: batch_id.to_string(),
-        })?;
-
-    Ok(expires_at)
-}
-
 /// Helper to fetch creator email for a batch from the database
 async fn fetch_creator_email(db: &sqlx::PgPool, batch: &fusillade::Batch) -> Option<String> {
     let created_by = batch.created_by.as_ref()?;
@@ -311,9 +294,6 @@ pub async fn get_batch<P: PoolProvider>(
         message: "Invalid batch ID format".to_string(),
     })?;
 
-    // Check batch exists and get SLA status for permission check
-    let _expires_at = get_batch_expires_at(state.db.read(), batch_id).await?;
-
     // Get batch with SLA-appropriate error filtering (hide retriable errors before SLA expiry)
     let batch = state
         .request_manager
@@ -367,9 +347,6 @@ pub async fn get_batch_analytics<P: PoolProvider>(
     let batch_id = Uuid::parse_str(&batch_id_str).map_err(|_| Error::BadRequest {
         message: "Invalid batch ID format".to_string(),
     })?;
-
-    // Check batch exists and get SLA status for permission check
-    let _expires_at = get_batch_expires_at(state.db.read(), batch_id).await?;
 
     // Get batch first to verify it exists and check permissions
     // Hide retriable errors before SLA expiry
@@ -434,9 +411,6 @@ pub async fn get_batch_results<P: PoolProvider>(
     let batch_id = Uuid::parse_str(&batch_id_str).map_err(|_| Error::BadRequest {
         message: "Invalid batch ID format".to_string(),
     })?;
-
-    // Check batch exists and get SLA status for permission check
-    let _expires_at = get_batch_expires_at(state.db.read(), batch_id).await?;
 
     // Get batch first to verify it exists and check permissions
     // Hide retriable errors before SLA expiry
@@ -557,9 +531,6 @@ pub async fn cancel_batch<P: PoolProvider>(
         message: "Invalid batch ID format".to_string(),
     })?;
 
-    // Check batch exists and get SLA status
-    let _expires_at = get_batch_expires_at(state.db.read(), batch_id).await?;
-
     // Get batch first to verify it exists
     // Hide retriable errors before SLA expiry
     let batch = state
@@ -591,9 +562,6 @@ pub async fn cancel_batch<P: PoolProvider>(
         .map_err(|e| Error::Internal {
             operation: format!("cancel batch: {}", e),
         })?;
-
-    // Check batch exists and get SLA status
-    let _expires_at = get_batch_expires_at(state.db.read(), batch_id).await?;
 
     // Fetch updated batch to get latest status
     // Hide retriable errors before SLA expiry
@@ -640,9 +608,6 @@ pub async fn delete_batch<P: PoolProvider>(
     let batch_id = Uuid::parse_str(&batch_id_str).map_err(|_| Error::BadRequest {
         message: "Invalid batch ID format".to_string(),
     })?;
-
-    // Check batch exists and get SLA status
-    let _expires_at = get_batch_expires_at(state.db.read(), batch_id).await?;
 
     // Get batch first to verify it exists and check ownership
     // Hide retriable errors before SLA expiry
@@ -709,9 +674,6 @@ pub async fn retry_failed_batch_requests<P: PoolProvider>(
         message: "Invalid batch ID format".to_string(),
     })?;
 
-    // Check batch exists and get SLA status
-    let _expires_at = get_batch_expires_at(state.db.read(), batch_id).await?;
-
     // Get batch first to verify it exists
     // Hide retriable errors before SLA expiry
     let batch = state
@@ -755,9 +717,6 @@ pub async fn retry_failed_batch_requests<P: PoolProvider>(
         retried_count,
         "Retried failed requests"
     );
-
-    // Check batch exists and get SLA status
-    let _expires_at = get_batch_expires_at(state.db.read(), batch_id).await?;
 
     // Fetch updated batch to get latest status
     // Hide retriable errors before SLA expiry
@@ -804,9 +763,6 @@ pub async fn retry_specific_requests<P: PoolProvider>(
     let batch_id = Uuid::parse_str(&batch_id_str).map_err(|_| Error::BadRequest {
         message: "Invalid batch ID format".to_string(),
     })?;
-
-    // Check batch exists and get SLA status
-    let _expires_at = get_batch_expires_at(state.db.read(), batch_id).await?;
 
     // Get batch first to verify it exists
     // Hide retriable errors before SLA expiry
@@ -880,9 +836,6 @@ pub async fn retry_specific_requests<P: PoolProvider>(
         retried_count = successful_retries,
         "Successfully retried specific requests"
     );
-
-    // Check batch exists and get SLA status
-    let _expires_at = get_batch_expires_at(state.db.read(), batch_id).await?;
 
     // Fetch updated batch to get latest status
     // Hide retriable errors before SLA expiry
