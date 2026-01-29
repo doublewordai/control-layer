@@ -74,6 +74,13 @@ export const queryKeys = {
       ["requests", "aggregateByUser", model, startDate, endDate] as const,
   },
 
+  // Monitoring
+  monitoring: {
+    all: ["monitoring"] as const,
+    pendingRequestCounts: () =>
+      ["monitoring", "pendingRequestCounts"] as const,
+  },
+
   // Files
   files: {
     all: ["files"] as const,

@@ -601,6 +601,15 @@ export function useRequestsAggregateByUser(
   });
 }
 
+export function usePendingRequestCounts(options?: { enabled?: boolean }) {
+  return useQuery({
+    queryKey: queryKeys.monitoring.pendingRequestCounts(),
+    queryFn: () => dwctlApi.monitoring.getPendingRequestCounts(),
+    enabled: options?.enabled ?? true,
+    refetchInterval: 15000,
+  });
+}
+
 // Authentication hooks
 export function useRegistrationInfo() {
   return useQuery({

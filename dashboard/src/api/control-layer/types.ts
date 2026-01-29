@@ -678,6 +678,12 @@ export interface RequestsAggregateResponse {
   time_series: TimeSeriesPoint[];
 }
 
+// Monitoring: pending request counts grouped by model and completion window (SLA)
+export type PendingRequestCountsByModelAndWindow = Record<
+  string,
+  Record<string, number>
+>;
+
 // User usage statistics for a specific model
 export interface UserUsage {
   user_id?: string;
