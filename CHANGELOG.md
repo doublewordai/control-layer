@@ -1,5 +1,12 @@
 # Changelog
 
+## [5.0.2](https://github.com/doublewordai/control-layer/compare/v5.0.1...v5.0.2) (2026-01-29)
+
+
+### Bug Fixes
+
+* **batches:** use fusillade sla based error filtering from dwctl handlers ([#624](https://github.com/doublewordai/control-layer/issues/624)) ([8812d06](https://github.com/doublewordai/control-layer/commit/8812d06f0ac9b069075290e6325d74802d41738e))
+
 ## [5.0.1](https://github.com/doublewordai/control-layer/compare/v5.0.0...v5.0.1) (2026-01-28)
 
 
