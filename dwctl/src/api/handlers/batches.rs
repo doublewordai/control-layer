@@ -144,8 +144,8 @@ fn to_batch_response_with_email(batch: fusillade::Batch, creator_email: Option<&
     }
 }
 
-/// Helper to fetch just the expires_at timestamp for a batch from the database.
-/// Helper to fetch creator email for a batch from the database
+/// Helper to fetch creator email for a batch from the database.
+///
 async fn fetch_creator_email(db: &sqlx::PgPool, batch: &fusillade::Batch) -> Option<String> {
     let created_by = batch.created_by.as_ref()?;
     let user_id = Uuid::parse_str(created_by).ok()?;
