@@ -1662,7 +1662,10 @@ mod tests {
         for (i, &request_id) in request_ids.iter().enumerate().take(3) {
             sqlx::query!(
                 "UPDATE fusillade.requests SET state = 'failed', error = $1, failed_at = NOW(), is_retriable_error = true WHERE id = $2",
-                format!(r#"{{"error":{{"message":"Retriable error {}","type":"server_error","code":"internal_error"}}}}"#, i),
+                format!(
+                    r#"{{"error":{{"message":"Retriable error {}","type":"server_error","code":"internal_error"}}}}"#,
+                    i
+                ),
                 request_id
             )
             .execute(&pool)
@@ -1674,7 +1677,10 @@ mod tests {
         for (i, &request_id) in request_ids.iter().enumerate().skip(3).take(2) {
             sqlx::query!(
                 "UPDATE fusillade.requests SET state = 'failed', error = $1, failed_at = NOW(), is_retriable_error = false WHERE id = $2",
-                format!(r#"{{"error":{{"message":"Non-retriable error {}","type":"invalid_request_error","code":"invalid_api_key"}}}}"#, i),
+                format!(
+                    r#"{{"error":{{"message":"Non-retriable error {}","type":"invalid_request_error","code":"invalid_api_key"}}}}"#,
+                    i
+                ),
                 request_id
             )
             .execute(&pool)
@@ -1795,7 +1801,10 @@ mod tests {
         for (i, &request_id) in request_ids.iter().enumerate().take(2) {
             sqlx::query!(
                 "UPDATE fusillade.requests SET state = 'failed', error = $1, failed_at = NOW(), is_retriable_error = true WHERE id = $2",
-                format!(r#"{{"error":{{"message":"Retriable error {}","type":"server_error","code":"internal_error"}}}}"#, i),
+                format!(
+                    r#"{{"error":{{"message":"Retriable error {}","type":"server_error","code":"internal_error"}}}}"#,
+                    i
+                ),
                 request_id
             )
             .execute(&pool)

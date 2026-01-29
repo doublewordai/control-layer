@@ -871,9 +871,10 @@ pub async fn get_file_content<P: PoolProvider>(
     // Stream the file content as JSONL, starting from offset
     let offset = query.pagination.skip.unwrap_or(0) as usize;
     let search = query.search.clone();
-    let content_stream = state
-        .request_manager
-        .get_file_content_stream(fusillade::FileId(file_id), offset, search, hide_retriable_before_sla);
+    let content_stream =
+        state
+            .request_manager
+            .get_file_content_stream(fusillade::FileId(file_id), offset, search, hide_retriable_before_sla);
 
     // Apply limit if specified, fetching one extra to detect if there are more results
     let requested_limit = query.pagination.limit.map(|l| l as usize);
