@@ -194,8 +194,7 @@ use std::sync::{Arc, OnceLock};
 use tokio::net::TcpListener;
 use tower::Layer;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
-use axum_otel::{AxumOtelSpanCreator, AxumOtelOnResponse, AxumOtelOnFailure};
-use tracing::{Level, debug, info, instrument};
+use tracing::{debug, info, instrument};
 use utoipa::OpenApi;
 use utoipa_scalar::{Scalar, Servable};
 use uuid::Uuid;
@@ -1218,13 +1217,18 @@ pub async fn build_router(
             .layer(prometheus_layer);
     }
 
-    // Add tracing layer with OTel semantic conventions
-    let router = router.layer(
-        TraceLayer::new_for_http()
-            .make_span_with(AxumOtelSpanCreator::new().level(Level::INFO))
-            .on_response(AxumOtelOnResponse::new().level(Level::INFO))
-            .on_failure(AxumOtelOnFailure::new()),
-    );
+    // Add tracing layer with OTel-compatible span names
+    let router = router.layer(TraceLayer::new_for_http().make_span_with(
+        |request: &http::Request<_>| {
+            let span_name = format!("{} {}", request.method(), request.uri().path());
+            tracing::info_span!(
+                "request",
+                otel.name = %span_name,
+                method = %request.method(),
+                uri = %request.uri(),
+            )
+        },
+    ));
 
     Ok(router)
 }
