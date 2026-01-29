@@ -106,7 +106,7 @@ db-setup:
 
     # Write .env files for sqlx compile-time verification
     echo "Writing .env files..."
-    echo "DATABASE_URL=postgres://$DB_USER:$DB_PASS@$DB_HOST:$DB_PORT/dwctl?options=-c%20search_path%3Dfusillade%2Cpublic" > dwctl/.env
+    echo "DATABASE_URL=postgres://$DB_USER:$DB_PASS@$DB_HOST:$DB_PORT/dwctl?options=-c%20search_path%3Dpublic" > dwctl/.env
 
     # Run migrations
     echo "Running migrations..."
@@ -122,7 +122,7 @@ db-setup:
     echo "✅ Database setup complete!"
     echo ""
     echo "Database URLs configured:"
-    echo "  dwctl:     postgres://$DB_USER:$DB_PASS@$DB_HOST:$DB_PORT/dwctl?options=-c%20search_path%3Dfusillade%2Cpublic"
+    echo "  dwctl:     postgres://$DB_USER:$DB_PASS@$DB_HOST:$DB_PORT/dwctl?options=-c%20search_path%3Dpublic"
 
 # Start the full development stack with hot reload
 #
