@@ -20,7 +20,7 @@ embedded-db = ["dep:postgresql_embedded"]
 [dependencies]
 axum = { version = "0.8", features = ["multipart"] }
 
-fusillade = "3.0.1"
+fusillade = "4.0.0"
 
 tokio = { version = "1.0", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
