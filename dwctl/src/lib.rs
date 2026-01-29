@@ -1224,6 +1224,7 @@ pub async fn build_router(
             tracing::info_span!(
                 "request",
                 otel.name = %span_name,
+                otel.kind = "Server",
                 method = %request.method(),
                 uri = %request.uri(),
             )
