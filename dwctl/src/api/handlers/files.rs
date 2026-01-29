@@ -30,7 +30,7 @@ use axum::{
     http::StatusCode,
 };
 use chrono::Utc;
-use fusillade::{ErrorFilter, Storage};
+use fusillade::Storage;
 use futures::StreamExt;
 use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
@@ -863,38 +863,17 @@ pub async fn get_file_content<P: PoolProvider>(
         }
     }
 
-    // Determine ErrorFilter based on file purpose and batch SLA status
-    let error_filter = if matches!(file.purpose, Some(fusillade::batch::Purpose::BatchError)) {
-        // For error files, check the batch SLA status
-        let batch = state
-            .request_manager
-            .get_batch_by_output_file_id(fusillade::FileId(file_id), fusillade::batch::OutputFileType::Error)
-            .await
-            .map_err(|e| Error::Internal {
-                operation: format!("get batch by error file: {}", e),
-            })?;
-
-        if let Some(batch) = batch {
-            // Use SLA-based filtering: OnlyNonRetriable before SLA, All after SLA
-            if chrono::Utc::now() < batch.expires_at {
-                ErrorFilter::OnlyNonRetriable
-            } else {
-                ErrorFilter::All
-            }
-        } else {
-            ErrorFilter::All
-        }
-    } else {
-        // For non-error files (input, output), show all content
-        ErrorFilter::All
-    };
+    // Determine whether to hide retriable errors based on file purpose
+    // For error files: hide retriable errors before SLA expiry (per-batch logic in database)
+    // For non-error files (input, output): show all content (false)
+    let hide_retriable_before_sla = matches!(file.purpose, Some(fusillade::batch::Purpose::BatchError));
 
     // Stream the file content as JSONL, starting from offset
     let offset = query.pagination.skip.unwrap_or(0) as usize;
     let search = query.search.clone();
     let content_stream = state
         .request_manager
-        .get_file_content_stream(fusillade::FileId(file_id), offset, search, error_filter);
+        .get_file_content_stream(fusillade::FileId(file_id), offset, search, hide_retriable_before_sla);
 
     // Apply limit if specified, fetching one extra to detect if there are more results
     let requested_limit = query.pagination.limit.map(|l| l as usize);
@@ -932,7 +911,7 @@ pub async fn get_file_content<P: PoolProvider>(
             if let Some(batch) = batch {
                 let status = state
                     .request_manager
-                    .get_batch_status(batch.id, ErrorFilter::All)
+                    .get_batch_status(batch.id, false)
                     .await
                     .map_err(|e| Error::Internal {
                         operation: format!("get batch status: {}", e),
@@ -953,7 +932,7 @@ pub async fn get_file_content<P: PoolProvider>(
             if let Some(batch) = batch {
                 let status = state
                     .request_manager
-                    .get_batch_status(batch.id, ErrorFilter::All)
+                    .get_batch_status(batch.id, false)
                     .await
                     .map_err(|e| Error::Internal {
                         operation: format!("get batch status: {}", e),
