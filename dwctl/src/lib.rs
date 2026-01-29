@@ -1217,16 +1217,26 @@ pub async fn build_router(
             .layer(prometheus_layer);
     }
 
-    // Add tracing layer with OTel-compatible span names
+    // Add tracing layer with OTel-compatible span names and HTTP semantic conventions
     let router = router.layer(TraceLayer::new_for_http().make_span_with(
         |request: &http::Request<_>| {
-            let span_name = format!("{} {}", request.method(), request.uri().path());
+            let path = request.uri().path();
+            let span_name = format!("{} {}", request.method(), path);
+            let api_type = if path.starts_with("/ai/") {
+                "ai_proxy"
+            } else if path.starts_with("/admin/") {
+                "admin"
+            } else {
+                "other"
+            };
             tracing::info_span!(
                 "request",
                 otel.name = %span_name,
                 otel.kind = "Server",
-                method = %request.method(),
-                uri = %request.uri(),
+                api.type = api_type,
+                http.request.method = %request.method(),
+                url.path = path,
+                url.query = request.uri().query().unwrap_or(""),
             )
         },
     ));
