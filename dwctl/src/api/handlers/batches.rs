@@ -1002,13 +1002,11 @@ pub async fn list_batches<P: PoolProvider>(
     let data: Vec<_> = batches
         .into_iter()
         .map(|batch| {
+            let batch_id = batch.id; // Capture UUID before the move
             let email = batch.created_by.as_ref().and_then(|id| email_map.get(id)).map(|s| s.as_str());
             let mut response = to_batch_response_with_email(batch, email);
             if include_analytics {
-                let batch_id = response.id.parse::<Uuid>().ok();
-                if let Some(id) = batch_id {
-                    response.analytics = analytics_map.get(&id).cloned();
-                }
+                response.analytics = analytics_map.get(&batch_id).cloned();
             }
             response
         })
