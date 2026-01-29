@@ -102,10 +102,11 @@ db-setup:
     echo "Creating databases..."
     PGPASSWORD="$DB_PASS" psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d postgres -c "CREATE DATABASE dwctl;" 2>/dev/null || echo "  - dwctl database already exists"
     PGPASSWORD="$DB_PASS" psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d postgres -c "CREATE DATABASE fusillade;" 2>/dev/null || echo "  - fusillade database already exists"
+    createuser -s postgres 2>/dev/null || echo "  - postgres user already exists"
 
     # Write .env files for sqlx compile-time verification
     echo "Writing .env files..."
-    echo "DATABASE_URL=postgres://$DB_USER:$DB_PASS@$DB_HOST:$DB_PORT/dwctl?options=-c%20search_path%3Dfusillade%2Cpublic" > dwctl/.env
+    echo "DATABASE_URL=postgres://$DB_USER:$DB_PASS@$DB_HOST:$DB_PORT/dwctl?options=-c%20search_path%3Dpublic" > dwctl/.env
 
     # Run migrations
     echo "Running migrations..."
@@ -121,7 +122,7 @@ db-setup:
     echo "✅ Database setup complete!"
     echo ""
     echo "Database URLs configured:"
-    echo "  dwctl:     postgres://$DB_USER:$DB_PASS@$DB_HOST:$DB_PORT/dwctl?options=-c%20search_path%3Dfusillade%2Cpublic"
+    echo "  dwctl:     postgres://$DB_USER:$DB_PASS@$DB_HOST:$DB_PORT/dwctl?options=-c%20search_path%3Dpublic"
 
 # Start the full development stack with hot reload
 #
