@@ -45,8 +45,8 @@
 //!   because `tracing-opentelemetry` clones the tracer (not the provider), so we must keep our own
 //!   reference to ensure proper shutdown and span flushing. See opentelemetry-rust#1961.
 
-use opentelemetry::trace::TracerProvider as _; // Trait for .tracer() method
 use opentelemetry::KeyValue;
+use opentelemetry::trace::TracerProvider as _; // Trait for .tracer() method
 use opentelemetry_otlp::{Protocol, WithExportConfig, WithHttpConfig};
 use opentelemetry_sdk::trace::SdkTracerProvider; // Renamed from TracerProvider in 0.29
 use std::collections::HashMap;
@@ -188,9 +188,9 @@ fn create_otlp_tracer() -> anyhow::Result<opentelemetry_sdk::trace::Tracer> {
 ///
 /// Should be called before application exit to flush any pending spans
 pub fn shutdown_telemetry() {
-    if let Some(provider) = TRACER_PROVIDER.get() {
-        if let Err(e) = provider.shutdown() {
-            tracing::error!("Failed to shutdown tracer provider: {}", e);
-        }
+    if let Some(provider) = TRACER_PROVIDER.get()
+        && let Err(e) = provider.shutdown()
+    {
+        tracing::error!("Failed to shutdown tracer provider: {}", e);
     }
 }

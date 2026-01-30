@@ -552,8 +552,8 @@ async fn setup_database(
         };
 
         let main_settings = config.database.main_pool_settings();
-        let connect_opts = PgConnectOptions::from_str(&database_url)?
-            .log_slow_statements(log::LevelFilter::Warn, std::time::Duration::from_millis(100));
+        let connect_opts =
+            PgConnectOptions::from_str(&database_url)?.log_slow_statements(log::LevelFilter::Warn, std::time::Duration::from_millis(100));
         let pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(main_settings.max_connections)
             .min_connections(main_settings.min_connections)
@@ -582,8 +582,8 @@ async fn setup_database(
     } else if let Some(replica_url) = config.database.external_replica_url() {
         info!("Setting up read replica pool");
         let replica_settings = config.database.main_replica_pool_settings();
-        let replica_opts = PgConnectOptions::from_str(replica_url)?
-            .log_slow_statements(log::LevelFilter::Warn, std::time::Duration::from_millis(100));
+        let replica_opts =
+            PgConnectOptions::from_str(replica_url)?.log_slow_statements(log::LevelFilter::Warn, std::time::Duration::from_millis(100));
         let replica_pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(replica_settings.max_connections)
             .min_connections(replica_settings.min_connections)
@@ -672,8 +672,8 @@ async fn setup_database(
             ..
         } => {
             info!("Using dedicated database for fusillade");
-            let connect_opts = PgConnectOptions::from_str(url)?
-                .log_slow_statements(log::LevelFilter::Warn, std::time::Duration::from_millis(100));
+            let connect_opts =
+                PgConnectOptions::from_str(url)?.log_slow_statements(log::LevelFilter::Warn, std::time::Duration::from_millis(100));
             let primary = sqlx::postgres::PgPoolOptions::new()
                 .max_connections(pool_settings.max_connections)
                 .min_connections(pool_settings.min_connections)
@@ -749,8 +749,8 @@ async fn setup_database(
                 ..
             } => {
                 info!("Using dedicated database for outlet");
-                let connect_opts = PgConnectOptions::from_str(url)?
-                    .log_slow_statements(log::LevelFilter::Warn, std::time::Duration::from_millis(100));
+                let connect_opts =
+                    PgConnectOptions::from_str(url)?.log_slow_statements(log::LevelFilter::Warn, std::time::Duration::from_millis(100));
                 let primary = sqlx::postgres::PgPoolOptions::new()
                     .max_connections(pool_settings.max_connections)
                     .min_connections(pool_settings.min_connections)
@@ -1218,28 +1218,26 @@ pub async fn build_router(
     }
 
     // Add tracing layer with OTel-compatible span names and HTTP semantic conventions
-    let router = router.layer(TraceLayer::new_for_http().make_span_with(
-        |request: &http::Request<_>| {
-            let path = request.uri().path();
-            let span_name = format!("{} {}", request.method(), path);
-            let api_type = if path.starts_with("/ai/") {
-                "ai_proxy"
-            } else if path.starts_with("/admin/") {
-                "admin"
-            } else {
-                "other"
-            };
-            tracing::info_span!(
-                "request",
-                otel.name = %span_name,
-                otel.kind = "Server",
-                api.type = api_type,
-                http.request.method = %request.method(),
-                url.path = path,
-                url.query = request.uri().query().unwrap_or(""),
-            )
-        },
-    ));
+    let router = router.layer(TraceLayer::new_for_http().make_span_with(|request: &http::Request<_>| {
+        let path = request.uri().path();
+        let span_name = format!("{} {}", request.method(), path);
+        let api_type = if path.starts_with("/ai/") {
+            "ai_proxy"
+        } else if path.starts_with("/admin/") {
+            "admin"
+        } else {
+            "other"
+        };
+        tracing::info_span!(
+            "request",
+            otel.name = %span_name,
+            otel.kind = "Server",
+            api.type = api_type,
+            http.request.method = %request.method(),
+            url.path = path,
+            url.query = request.uri().query().unwrap_or(""),
+        )
+    }));
 
     Ok(router)
 }
