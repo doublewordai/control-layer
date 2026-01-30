@@ -42,6 +42,7 @@ pub mod groups;
 pub mod inference_endpoints;
 pub mod payments;
 pub mod probes;
+pub mod queue;
 pub mod requests;
 pub mod static_assets;
 pub mod transactions;
