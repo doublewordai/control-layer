@@ -310,14 +310,12 @@ impl<'c> Repository for Users<'c> {
         // Soft delete with GDPR-compliant data scrubbing
         // We scrub all personal information but keep the record for referential integrity
         let scrubbed_email = format!("deleted-{}@deleted.local", id);
-        let scrubbed_username = format!("deleted-{}", id);
 
         let result = sqlx::query!(
             r#"
             UPDATE users
             SET
                 email = $1,
-                username = $2,
                 display_name = NULL,
                 avatar_url = NULL,
                 password_hash = NULL,
@@ -325,10 +323,9 @@ impl<'c> Repository for Users<'c> {
                 payment_provider_id = NULL,
                 is_deleted = true,
                 updated_at = NOW()
-            WHERE id = $3 AND is_deleted = false
+            WHERE id = $2 AND is_deleted = false
             "#,
             scrubbed_email,
-            scrubbed_username,
             id
         )
         .execute(&mut *self.db)
