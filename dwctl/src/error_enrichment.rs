@@ -48,7 +48,7 @@ struct ChatRequest {
 /// Currently handles:
 /// - 403 Forbidden errors (likely insufficient credits) → enriched with balance
 /// - 403 Forbidden errors (likely model access denied) → enriched with model name
-#[instrument(skip_all, fields(path = %request.uri().path(), method = %request.method()))]
+#[instrument(skip_all, fields(http.request.method = %request.method(), url.path = %request.uri().path(), url.query = request.uri().query().unwrap_or("")))]
 pub async fn error_enrichment_middleware(State(pool): State<PgPool>, request: Request<Body>, next: Next) -> Response<Body> {
     // Extract API key from request headers before passing to onwards
     let api_key = request
