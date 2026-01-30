@@ -1,3 +1,9 @@
 [workspace]
 members = ["dwctl"]
 resolver = "2"
+
+[patch.crates-io]
+sqlx-pool-router = { path = "../sqlx-pool-router" }
+outlet = { path = "../outlet" }
+outlet-postgres = { path = "../outlet-postgres" }
+fusillade = { path = "../fusillade" }

@@ -19,7 +19,7 @@ embedded-db = ["dep:postgresql_embedded"]
 
 [dependencies]
 axum = { version = "0.8", features = ["multipart"] }
-fusillade = "4.0.0"
+fusillade = { path = "../../fusillade" }
 tokio = { version = "1.0", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = "0.7"
@@ -122,10 +122,9 @@ async-stripe-webhook = { version = "1.0.0-rc.0", features = [
 ] }
 async-stripe-types = { version = "1.0.0-rc.0" }
 rustls = { version = "0.23", features = ["aws-lc-rs"] }
-async-stripe-billing = { version = "1.0.0-rc.0", features = [
-  "billing_portal_session",
-] }
-sqlx-pool-router = "0.2.0"
+async-stripe-billing = { version = "1.0.0-rc.0", features = ["billing_portal_session"] }
+sqlx-pool-router = { path = "../../sqlx-pool-router", features = ["sqlx-tracing"] }
+sqlx-tracing = { path = "../../sqlx-tracing", features = ["postgres"] }
 
 [dev-dependencies]
 axum-test = { version = "18.4.1" }
