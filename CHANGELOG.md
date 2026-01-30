@@ -1,5 +1,13 @@
 # Changelog
 
+## [5.0.3](https://github.com/doublewordai/control-layer/compare/v5.0.2...v5.0.3) (2026-01-30)
+
+
+### Bug Fixes
+
+* 100 pagination ([#638](https://github.com/doublewordai/control-layer/issues/638)) ([dc06510](https://github.com/doublewordai/control-layer/commit/dc06510a3ef3c2d63ba303d10b737ff3f0752dec))
+* don't query all deployments in file estimate ([#641](https://github.com/doublewordai/control-layer/issues/641)) ([ce9b2a5](https://github.com/doublewordai/control-layer/commit/ce9b2a55da4597a152380c3ecd63b02832665303))
+
 ## [5.0.2](https://github.com/doublewordai/control-layer/compare/v5.0.1...v5.0.2) (2026-01-29)
 
 
