@@ -6,7 +6,7 @@ use crate::{
     AppState,
     api::models::{
         groups::GroupResponse,
-        pagination::{MAX_LIMIT, PaginatedResponse},
+        pagination::PaginatedResponse,
         users::{CurrentUser, GetUserQuery, ListUsersQuery, UserCreate, UserResponse, UserUpdate},
     },
     auth::permissions::{self as permissions, RequiresPermission, can_read_all_resources, can_read_own_resource, operation, resource},
