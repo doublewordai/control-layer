@@ -1,12 +1,13 @@
 //! HTTP handlers for authentication endpoints.
 
+use sqlx_pool_router::PoolProvider;
+
 use axum::{
     Json,
     extract::{Path, State},
 };
 use uuid::Uuid;
 
-use sqlx_pool_router::PoolProvider;
 
 use crate::{
     AppState,
@@ -42,7 +43,7 @@ use crate::{
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn get_registration_info<P: PoolProvider>(State(state): State<AppState<P>>) -> Result<Json<RegistrationInfo>, Error> {
+pub async fn get_registration_info(State(state): State<AppState>) -> Result<Json<RegistrationInfo>, Error> {
     Ok(Json(RegistrationInfo {
         enabled: state.config.auth.native.enabled && state.config.auth.native.allow_registration,
         message: if state.config.auth.native.enabled && state.config.auth.native.allow_registration {
@@ -70,8 +71,8 @@ pub async fn get_registration_info<P: PoolProvider>(State(state): State<AppState
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn register<P: PoolProvider>(
-    State(state): State<AppState<P>>,
+pub async fn register(
+    State(state): State<AppState>,
     Json(request): Json<RegisterRequest>,
 ) -> Result<RegisterResponse, Error> {
     // Check if native auth is enabled
@@ -192,7 +193,7 @@ pub async fn register<P: PoolProvider>(
 /// This function is called asynchronously after user registration to avoid
 /// blocking the registration response. Failures are logged but don't affect
 /// the user creation.
-async fn create_sample_files_for_new_user<P: PoolProvider>(state: &AppState<P>, user_id: Uuid) -> Result<(), Error> {
+async fn create_sample_files_for_new_user(state: &AppState, user_id: Uuid) -> Result<(), Error> {
     use crate::db::handlers::deployments::DeploymentFilter;
     use crate::sample_files;
 
@@ -250,7 +251,7 @@ async fn create_sample_files_for_new_user<P: PoolProvider>(state: &AppState<P>, 
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn get_login_info<P: PoolProvider>(State(state): State<AppState<P>>) -> Result<Json<LoginInfo>, Error> {
+pub async fn get_login_info(State(state): State<AppState>) -> Result<Json<LoginInfo>, Error> {
     Ok(Json(LoginInfo {
         enabled: state.config.auth.native.enabled,
         message: if state.config.auth.native.enabled {
@@ -277,7 +278,7 @@ pub async fn get_login_info<P: PoolProvider>(State(state): State<AppState<P>>) -
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn login<P: PoolProvider>(State(state): State<AppState<P>>, Json(request): Json<LoginRequest>) -> Result<LoginResponse, Error> {
+pub async fn login(State(state): State<AppState>, Json(request): Json<LoginRequest>) -> Result<LoginResponse, Error> {
     // Check if native auth is enabled
     if !state.config.auth.native.enabled {
         return Err(Error::BadRequest {
@@ -346,7 +347,7 @@ pub async fn login<P: PoolProvider>(State(state): State<AppState<P>>, Json(reque
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn logout<P: PoolProvider>(State(state): State<AppState<P>>) -> Result<LogoutResponse, Error> {
+pub async fn logout(State(state): State<AppState>) -> Result<LogoutResponse, Error> {
     // Create expired cookie to clear session
     let cookie = format!(
         "{}=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0",
@@ -377,8 +378,8 @@ pub async fn logout<P: PoolProvider>(State(state): State<AppState<P>>) -> Result
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn request_password_reset<P: PoolProvider>(
-    State(state): State<AppState<P>>,
+pub async fn request_password_reset(
+    State(state): State<AppState>,
     Json(request): Json<PasswordResetRequest>,
 ) -> Result<Json<PasswordResetResponse>, Error> {
     // Check if native auth is enabled
@@ -433,8 +434,8 @@ pub async fn request_password_reset<P: PoolProvider>(
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn confirm_password_reset<P: PoolProvider>(
-    State(state): State<AppState<P>>,
+pub async fn confirm_password_reset(
+    State(state): State<AppState>,
     Path(token_id): Path<Uuid>,
     Json(request): Json<PasswordResetConfirmRequest>,
 ) -> Result<Json<PasswordResetResponse>, Error> {
@@ -534,8 +535,8 @@ pub async fn confirm_password_reset<P: PoolProvider>(
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn change_password<P: PoolProvider>(
-    State(state): State<AppState<P>>,
+pub async fn change_password(
+    State(state): State<AppState>,
     current_user: CurrentUser,
     Json(request): Json<ChangePasswordRequest>,
 ) -> Result<Json<AuthSuccessResponse>, Error> {

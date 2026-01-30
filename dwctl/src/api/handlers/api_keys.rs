@@ -1,5 +1,7 @@
 //! HTTP handlers for API key management endpoints.
 
+use sqlx_pool_router::PoolProvider;
+
 use crate::api::models::api_keys::ListApiKeysQuery;
 use crate::{
     AppState,
@@ -17,7 +19,6 @@ use crate::{
     errors::{Error, Result},
     types::{ApiKeyId, Operation, Permission, Resource, UserIdOrCurrent},
 };
-use sqlx_pool_router::PoolProvider;
 
 use axum::{
     extract::{Path, Query, State},
@@ -53,8 +54,8 @@ use sqlx::Acquire;
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn create_user_api_key<P: PoolProvider>(
-    State(state): State<AppState<P>>,
+pub async fn create_user_api_key(
+    State(state): State<AppState>,
     Path(user_id): Path<UserIdOrCurrent>,
     current_user: CurrentUser,
     Json(data): Json<ApiKeyCreate>,
@@ -142,8 +143,8 @@ pub async fn create_user_api_key<P: PoolProvider>(
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn list_user_api_keys<P: PoolProvider>(
-    State(state): State<AppState<P>>,
+pub async fn list_user_api_keys(
+    State(state): State<AppState>,
     Path(user_id): Path<UserIdOrCurrent>,
     Query(query): Query<ListApiKeysQuery>,
     // Can't use RequiresPermission here because we need conditional logic for own vs other users
@@ -228,8 +229,8 @@ pub async fn list_user_api_keys<P: PoolProvider>(
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn get_user_api_key<P: PoolProvider>(
-    State(state): State<AppState<P>>,
+pub async fn get_user_api_key(
+    State(state): State<AppState>,
     Path((user_id, api_key_id)): Path<(UserIdOrCurrent, ApiKeyId)>,
     // Can't use RequiresPermission here because we need conditional logic for own vs other users
     current_user: CurrentUser,
@@ -307,8 +308,8 @@ pub async fn get_user_api_key<P: PoolProvider>(
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn delete_user_api_key<P: PoolProvider>(
-    State(state): State<AppState<P>>,
+pub async fn delete_user_api_key(
+    State(state): State<AppState>,
     Path((user_id, api_key_id)): Path<(UserIdOrCurrent, ApiKeyId)>,
     // Can't use RequiresPermission here because we need conditional logic for own vs other users
     current_user: CurrentUser,

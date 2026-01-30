@@ -64,6 +64,8 @@
 //! The frontend should handle errors gracefully - if manual processing fails,
 //! the webhook will eventually process the payment automatically.
 
+use sqlx_pool_router::PoolProvider;
+
 use axum::{
     Json,
     extract::State,
@@ -72,7 +74,6 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use sqlx_pool_router::PoolProvider;
 
 use crate::{AppState, api::models::users::CurrentUser, payment_providers};
 
@@ -101,8 +102,8 @@ pub struct PaymentQuery {
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn create_payment<P: PoolProvider>(
-    State(state): State<AppState<P>>,
+pub async fn create_payment(
+    State(state): State<AppState>,
     user: CurrentUser,
     axum::extract::Query(query): axum::extract::Query<PaymentQuery>,
 ) -> Result<Response, StatusCode> {
@@ -196,8 +197,8 @@ pub async fn create_payment<P: PoolProvider>(
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn process_payment<P: PoolProvider>(
-    State(state): State<AppState<P>>,
+pub async fn process_payment(
+    State(state): State<AppState>,
     axum::extract::Path(id): axum::extract::Path<String>,
     _user: CurrentUser,
 ) -> Result<Response, StatusCode> {
@@ -268,8 +269,8 @@ pub async fn process_payment<P: PoolProvider>(
     ),
 )]
 #[tracing::instrument(skip_all)]
-pub async fn webhook_handler<P: PoolProvider>(
-    State(state): State<AppState<P>>,
+pub async fn webhook_handler(
+    State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     body: String,
 ) -> StatusCode {
@@ -333,8 +334,8 @@ pub async fn webhook_handler<P: PoolProvider>(
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn create_billing_portal_session<P: PoolProvider>(
-    State(state): State<AppState<P>>,
+pub async fn create_billing_portal_session(
+    State(state): State<AppState>,
     user: CurrentUser,
 ) -> Result<Response, StatusCode> {
     // Get payment provider from config

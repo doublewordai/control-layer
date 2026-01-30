@@ -25,16 +25,15 @@ use crate::{
 };
 use axum_test::TestServer;
 use sqlx::{PgConnection, PgPool};
-use sqlx_pool_router::TestDbPools;
+use sqlx_pool_router::TracedDbPools;
 use uuid::Uuid;
 
-/// Create an AppState with TestDbPools and custom config
+/// Create an AppState with TracedDbPools and custom config
 /// Use this in tests that need to manually construct AppState instead of using create_test_app
-pub async fn create_test_app_state_with_config(pool: PgPool, config: crate::config::Config) -> crate::AppState<TestDbPools> {
-    let test_pools = TestDbPools::new(pool.clone()).await.expect("Failed to create TestDbPools");
-    let fusillade_pools = TestDbPools::new(pool.clone())
-        .await
-        .expect("Failed to create fusillade TestDbPools");
+pub async fn create_test_app_state_with_config(pool: PgPool, config: crate::config::Config) -> crate::AppState {
+    let traced_pool = sqlx_tracing::Pool::from(pool.clone());
+    let test_pools = TracedDbPools::new(traced_pool);
+    let fusillade_pools = TracedDbPools::new(sqlx_tracing::Pool::from(pool.clone()));
 
     let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(fusillade_pools));
     let limiters = crate::limits::Limiters::new(&config.limits);

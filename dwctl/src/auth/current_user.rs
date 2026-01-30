@@ -1,5 +1,7 @@
 //! User extraction from request authentication.
 
+use sqlx_pool_router::PoolProvider;
+
 use crate::db::errors::DbError;
 use crate::{
     AppState,
@@ -9,7 +11,6 @@ use crate::{
     errors::{Error, Result},
 };
 use axum::{extract::FromRequestParts, http::request::Parts};
-use sqlx::PgPool;
 use tracing::{debug, instrument, trace};
 
 /// Extract user from JWT session cookie if present and valid
@@ -21,7 +22,7 @@ use tracing::{debug, instrument, trace};
 async fn try_jwt_session_auth(
     parts: &axum::http::request::Parts,
     config: &crate::config::Config,
-    db: &PgPool,
+    db: &sqlx_tracing::Pool<sqlx::Postgres>,
 ) -> Option<Result<CurrentUser>> {
     let cookie_header = parts.headers.get(axum::http::header::COOKIE)?;
 
@@ -91,7 +92,7 @@ async fn try_jwt_session_auth(
 async fn try_proxy_header_auth(
     parts: &axum::http::request::Parts,
     config: &crate::config::Config,
-    db: &PgPool,
+    db: &sqlx_tracing::Pool<sqlx::Postgres>,
 ) -> Option<Result<CurrentUser>> {
     tracing::trace!("Trying proxy header auth, config: {:?}", config.auth.proxy_header);
     // Extract external_user_id from header_name (required)
@@ -228,7 +229,10 @@ async fn try_proxy_header_auth(
 /// - Some(Ok(user)): Valid API key found and user authenticated
 /// - Some(Err(error)): Bearer token present but invalid or insufficient permissions
 #[instrument(skip(parts, db))]
-async fn try_api_key_auth(parts: &axum::http::request::Parts, db: &PgPool) -> Option<Result<CurrentUser>> {
+async fn try_api_key_auth(
+    parts: &axum::http::request::Parts,
+    db: &sqlx_tracing::Pool<sqlx::Postgres>,
+) -> Option<Result<CurrentUser>> {
     // Extract Authorization header
     let auth_header = match parts.headers.get(axum::http::header::AUTHORIZATION) {
         Some(header) => header,
@@ -355,11 +359,11 @@ impl FromRequestParts<AppState> for HasApiKey {
     }
 }
 
-impl<P: sqlx_pool_router::PoolProvider + Clone + Send + Sync> FromRequestParts<crate::AppState<P>> for CurrentUser {
+impl FromRequestParts<crate::AppState> for CurrentUser {
     type Rejection = Error;
 
     #[instrument(skip(parts, state))]
-    async fn from_request_parts(parts: &mut Parts, state: &crate::AppState<P>) -> Result<Self> {
+    async fn from_request_parts(parts: &mut Parts, state: &crate::AppState) -> Result<Self> {
         // Try all authentication methods and accumulate results
         // Each method returns Option<Result<CurrentUser>>:
         // - None means the auth method is not applicable (no credentials present)

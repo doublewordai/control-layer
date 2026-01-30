@@ -85,8 +85,8 @@ fn db_component_to_response(c: DeploymentComponentDBResponse) -> ModelComponentR
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn list_deployed_models<P: PoolProvider>(
-    State(state): State<AppState<P>>,
+pub async fn list_deployed_models(
+    State(state): State<AppState>,
     Query(query): Query<ListModelsQuery>,
     // Lots of conditional logic here, so no logic in extractor
     current_user: CurrentUser,
@@ -295,8 +295,8 @@ pub async fn list_deployed_models<P: PoolProvider>(
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn create_deployed_model<P: PoolProvider>(
-    State(state): State<AppState<P>>,
+pub async fn create_deployed_model(
+    State(state): State<AppState>,
     current_user: RequiresPermission<resource::Models, operation::CreateAll>,
     Json(create): Json<DeployedModelCreate>,
 ) -> Result<Json<DeployedModelResponse>> {
@@ -385,8 +385,8 @@ pub async fn create_deployed_model<P: PoolProvider>(
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn update_deployed_model<P: PoolProvider>(
-    State(state): State<AppState<P>>,
+pub async fn update_deployed_model(
+    State(state): State<AppState>,
     Path(deployment_id): Path<DeploymentId>,
     current_user: RequiresPermission<resource::Models, operation::UpdateAll>,
     Json(update): Json<DeployedModelUpdate>,
@@ -498,8 +498,8 @@ pub async fn update_deployed_model<P: PoolProvider>(
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn get_deployed_model<P: PoolProvider>(
-    State(state): State<AppState<P>>,
+pub async fn get_deployed_model(
+    State(state): State<AppState>,
     Path(deployment_id): Path<DeploymentId>,
     Query(query): Query<GetModelQuery>,
     current_user: CurrentUser,
@@ -664,8 +664,8 @@ pub async fn get_deployed_model<P: PoolProvider>(
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn delete_deployed_model<P: PoolProvider>(
-    State(state): State<AppState<P>>,
+pub async fn delete_deployed_model(
+    State(state): State<AppState>,
     Path(deployment_id): Path<DeploymentId>,
     _: RequiresPermission<resource::Models, operation::DeleteAll>,
 ) -> Result<Json<String>> {
@@ -707,8 +707,8 @@ use crate::db::models::deployments::DeploymentComponentCreateDBRequest;
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn get_model_components<P: PoolProvider>(
-    State(state): State<AppState<P>>,
+pub async fn get_model_components(
+    State(state): State<AppState>,
     Path(id): Path<DeploymentId>,
     _: RequiresPermission<resource::CompositeModels, operation::ReadAll>,
 ) -> Result<Json<Vec<ModelComponentResponse>>> {
@@ -763,8 +763,8 @@ pub async fn get_model_components<P: PoolProvider>(
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn add_model_component<P: PoolProvider>(
-    State(state): State<AppState<P>>,
+pub async fn add_model_component(
+    State(state): State<AppState>,
     Path((id, component_id)): Path<(DeploymentId, DeploymentId)>,
     _: RequiresPermission<resource::CompositeModels, operation::UpdateAll>,
     Json(body): Json<ModelComponentCreate>,
@@ -848,8 +848,8 @@ pub async fn add_model_component<P: PoolProvider>(
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn update_model_component<P: PoolProvider>(
-    State(state): State<AppState<P>>,
+pub async fn update_model_component(
+    State(state): State<AppState>,
     Path((id, component_id)): Path<(DeploymentId, DeploymentId)>,
     _: RequiresPermission<resource::CompositeModels, operation::UpdateAll>,
     Json(body): Json<ModelComponentUpdate>,
@@ -900,8 +900,8 @@ pub async fn update_model_component<P: PoolProvider>(
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn remove_model_component<P: PoolProvider>(
-    State(state): State<AppState<P>>,
+pub async fn remove_model_component(
+    State(state): State<AppState>,
     Path((id, component_id)): Path<(DeploymentId, DeploymentId)>,
     _: RequiresPermission<resource::CompositeModels, operation::UpdateAll>,
 ) -> Result<Json<String>> {

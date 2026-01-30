@@ -51,8 +51,8 @@ use tracing::error;
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn list_users<P: PoolProvider>(
-    State(state): State<AppState<P>>,
+pub async fn list_users(
+    State(state): State<AppState>,
     Query(query): Query<ListUsersQuery>,
     current_user: CurrentUser,
     _: RequiresPermission<resource::Users, operation::ReadAll>,
@@ -178,8 +178,8 @@ pub async fn list_users<P: PoolProvider>(
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn get_user<P: PoolProvider>(
-    State(state): State<AppState<P>>,
+pub async fn get_user(
+    State(state): State<AppState>,
     Path(user_id): Path<UserIdOrCurrent>,
     Query(query): Query<GetUserQuery>,
     // Can't use RequiresPermission here because we need conditional logic for own vs other users
@@ -267,8 +267,8 @@ pub async fn get_user<P: PoolProvider>(
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn create_user<P: PoolProvider>(
-    State(state): State<AppState<P>>,
+pub async fn create_user(
+    State(state): State<AppState>,
     _: RequiresPermission<resource::Users, operation::CreateAll>,
     Json(user_data): Json<UserCreate>,
 ) -> Result<(StatusCode, Json<UserResponse>)> {
@@ -312,8 +312,8 @@ pub async fn create_user<P: PoolProvider>(
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn update_user<P: PoolProvider>(
-    State(state): State<AppState<P>>,
+pub async fn update_user(
+    State(state): State<AppState>,
     Path(user_id): Path<UserId>,
     current_user: CurrentUser,
     Json(user_data): Json<UserUpdate>,
@@ -376,8 +376,8 @@ pub async fn update_user<P: PoolProvider>(
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn delete_user<P: PoolProvider>(
-    State(state): State<AppState<P>>,
+pub async fn delete_user(
+    State(state): State<AppState>,
     Path(user_id): Path<UserId>,
     current_user: RequiresPermission<resource::Users, operation::DeleteAll>,
 ) -> Result<StatusCode> {
@@ -395,7 +395,7 @@ pub async fn delete_user<P: PoolProvider>(
     let user_id_str = user_id.to_string();
     let batches = state
         .request_manager
-        .list_batches(Some(user_id_str.clone()), None, None, i64::MAX, false)
+        .list_batches(Some(user_id_str.clone()), None, None, i64::MAX)
         .await
         .map_err(|_| Error::NotFound {
             resource: "Batch".to_string(),

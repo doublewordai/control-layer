@@ -171,7 +171,7 @@ use crate::{
     openapi::{AdminApiDoc, AiApiDoc},
     request_logging::serializers::{parse_ai_request, parse_ai_response},
 };
-use sqlx_pool_router::{DbPools, PoolProvider};
+use sqlx_pool_router::{DbPools, PoolProvider, TracedDbPools};
 
 use anyhow::Context;
 use auth::middleware::admin_ai_proxy_middleware;
@@ -228,21 +228,17 @@ pub use types::{ApiKeyId, DeploymentId, GroupId, InferenceEndpointId, UserId};
 ///     .build();
 /// ```
 #[derive(Clone, Builder)]
-pub struct AppState<P = DbPools>
-where
-    P: PoolProvider + Clone,
-{
-    /// Database pools (primary + optional replica).
+pub struct AppState {
+    /// Database pools (primary + optional replica) with OpenTelemetry tracing.
     /// Use `.read()` for read-only queries, `.write()` for writes.
-    pub db: P,
+    pub db: TracedDbPools,
     pub config: Config,
-    /// Outlet database pools for request logging. Always uses DbPools (production type).
-    /// In tests, this uses DbPools without read-only enforcement (outlet is write-heavy).
+    /// Outlet database pools for request logging. Uses non-traced DbPools.
     pub outlet_db: Option<DbPools>,
     pub metrics_recorder: Option<GenAiMetrics>,
     #[builder(default = false)]
     pub is_leader: bool,
-    pub request_manager: Arc<fusillade::PostgresRequestManager<P, fusillade::ReqwestHttpClient>>,
+    pub request_manager: Arc<fusillade::PostgresRequestManager<TracedDbPools, fusillade::ReqwestHttpClient>>,
     /// Resource limiters for protecting system capacity.
     pub limiters: limits::Limiters,
 }
@@ -498,6 +494,20 @@ pub async fn seed_database(sources: &[config::ModelSource], db: &PgPool) -> Resu
     debug!("Database seeded successfully");
 
     Ok(())
+}
+
+/// Convert `DbPools` to `TracedDbPools` by wrapping the inner pools with tracing.
+///
+/// This enables OpenTelemetry tracing for all database operations while preserving
+/// the read/write pool separation.
+fn to_traced_pools(db_pools: &DbPools) -> TracedDbPools {
+    let primary_traced = sqlx_tracing::Pool::from(db_pools.write().clone());
+    if db_pools.has_replica() {
+        let replica_traced = sqlx_tracing::Pool::from(db_pools.read().clone());
+        TracedDbPools::with_replica(primary_traced, replica_traced)
+    } else {
+        TracedDbPools::new(primary_traced)
+    }
 }
 
 /// Setup database connections, run migrations, and initialize data
@@ -1132,8 +1142,9 @@ pub async fn build_router(
     let fallback = get(api::handlers::static_assets::serve_embedded_asset).fallback(get(api::handlers::static_assets::spa_fallback));
 
     // Apply error enrichment middleware to onwards router (before outlet logging)
+    // Deref to get underlying PgPool from traced pool
     let onwards_router = onwards_router.layer(middleware::from_fn_with_state(
-        state.db.write().clone(),
+        std::ops::Deref::deref(state.db.write()).clone(),
         error_enrichment::error_enrichment_middleware,
     ));
 
@@ -1259,7 +1270,7 @@ pub async fn build_router(
 /// stop all background tasks. When dropped, the `drop_guard` will automatically cancel
 /// the shutdown token, signaling all tasks to stop.
 pub struct BackgroundServices {
-    request_manager: Arc<fusillade::PostgresRequestManager<DbPools, fusillade::ReqwestHttpClient>>,
+    request_manager: Arc<fusillade::PostgresRequestManager<TracedDbPools, fusillade::ReqwestHttpClient>>,
     is_leader: bool,
     onwards_targets: onwards::target::Targets,
     #[cfg_attr(not(test), allow(dead_code))]
@@ -1388,7 +1399,7 @@ impl BackgroundTaskBuilder {
 /// Setup background services (probe scheduler, batch daemon, leader election, onwards integration)
 async fn setup_background_services(
     pool: PgPool,
-    fusillade_pools: DbPools,
+    fusillade_pools: TracedDbPools,
     outlet_pool: Option<PgPool>,
     config: Config,
     shutdown_token: tokio_util::sync::CancellationToken,
@@ -1459,7 +1470,8 @@ async fn setup_background_services(
     let probe_scheduler = probes::ProbeScheduler::new(pool.clone(), config.clone());
 
     // Clone fusillade pools for metrics before moving into request manager
-    let fusillade_pool_for_metrics = fusillade_pools.write().clone();
+    // Deref through sqlx_tracing::Pool to get the underlying PgPool
+    let fusillade_pool_for_metrics: PgPool = std::ops::Deref::deref(fusillade_pools.write()).clone();
 
     // Initialize the fusillade request manager (for batch processing)
     let request_manager = Arc::new(
@@ -1802,12 +1814,16 @@ impl Application {
             None
         };
 
+        // Convert pools to traced versions for app state and fusillade
+        let traced_db_pools = to_traced_pools(&db_pools);
+        let traced_fusillade_pools = to_traced_pools(&fusillade_pools);
+
         // Setup background services (onwards integration, probe scheduler, batch daemon, leader election)
         // Note: Must use primary pool (via Deref) because onwards sync uses LISTEN/NOTIFY
         // which requires direct database connection to primary (not through PgBouncer transaction pooling)
         let bg_services = setup_background_services(
             (*db_pools).clone(),
-            fusillade_pools.clone(),
+            traced_fusillade_pools,
             outlet_pools.as_ref().map(|p| (**p).clone()),
             config.clone(),
             shutdown_token.clone(),
@@ -1825,7 +1841,7 @@ impl Application {
 
         // Build app state and router
         let mut app_state = AppState::builder()
-            .db(db_pools.clone())
+            .db(traced_db_pools)
             .config(config.clone())
             .is_leader(bg_services.is_leader)
             .request_manager(bg_services.request_manager.clone())

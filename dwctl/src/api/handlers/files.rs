@@ -544,8 +544,8 @@ Each line must be a valid JSON object containing `custom_id`, `method`, `url`, a
     )
 )]
 #[tracing::instrument(skip(state, current_user, multipart), fields(user_id = %current_user.id))]
-pub async fn upload_file<P: PoolProvider>(
-    State(state): State<AppState<P>>,
+pub async fn upload_file(
+    State(state): State<AppState>,
     current_user: RequiresPermission<resource::Files, operation::CreateOwn>,
     multipart: Multipart,
 ) -> Result<(StatusCode, Json<FileResponse>)> {
@@ -658,8 +658,8 @@ Use cursor-based pagination: pass `last_id` from the response as the `after` par
     )
 )]
 #[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, limit = ?query.pagination.limit, order = %query.order))]
-pub async fn list_files<P: PoolProvider>(
-    State(state): State<AppState<P>>,
+pub async fn list_files(
+    State(state): State<AppState>,
     Query(query): Query<ListFilesQuery>,
     current_user: RequiresPermission<resource::Files, operation::ReadOwn>,
 ) -> Result<Json<FileListResponse>> {
@@ -759,8 +759,8 @@ pub async fn list_files<P: PoolProvider>(
     )
 )]
 #[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, file_id = %file_id_str))]
-pub async fn get_file<P: PoolProvider>(
-    State(state): State<AppState<P>>,
+pub async fn get_file(
+    State(state): State<AppState>,
     Path(file_id_str): Path<String>,
     current_user: RequiresPermission<resource::Files, operation::ReadOwn>,
 ) -> Result<Json<FileResponse>> {
@@ -828,8 +828,8 @@ For input files, returns the original request templates. For output files, retur
     )
 )]
 #[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, file_id = %file_id_str, limit = ?query.pagination.limit, offset = ?query.pagination.skip))]
-pub async fn get_file_content<P: PoolProvider>(
-    State(state): State<AppState<P>>,
+pub async fn get_file_content(
+    State(state): State<AppState>,
     Path(file_id_str): Path<String>,
     Query(query): Query<FileContentQuery>,
     current_user: RequiresPermission<resource::Files, operation::ReadOwn>,
@@ -864,17 +864,13 @@ pub async fn get_file_content<P: PoolProvider>(
     }
 
     // Determine whether to hide retriable errors based on file purpose
-    // For error files: hide retriable errors before SLA expiry (per-batch logic in database)
-    // For non-error files (input, output): show all content (false)
-    let hide_retriable_before_sla = matches!(file.purpose, Some(fusillade::batch::Purpose::BatchError));
-
     // Stream the file content as JSONL, starting from offset
     let offset = query.pagination.skip.unwrap_or(0) as usize;
     let search = query.search.clone();
     let content_stream =
         state
             .request_manager
-            .get_file_content_stream(fusillade::FileId(file_id), offset, search, hide_retriable_before_sla);
+            .get_file_content_stream(fusillade::FileId(file_id), offset, search);
 
     // Apply limit if specified, fetching one extra to detect if there are more results
     let requested_limit = query.pagination.limit.map(|l| l as usize);
@@ -912,7 +908,7 @@ pub async fn get_file_content<P: PoolProvider>(
             if let Some(batch) = batch {
                 let status = state
                     .request_manager
-                    .get_batch_status(batch.id, false)
+                    .get_batch_status(batch.id)
                     .await
                     .map_err(|e| Error::Internal {
                         operation: format!("get batch status: {}", e),
@@ -933,7 +929,7 @@ pub async fn get_file_content<P: PoolProvider>(
             if let Some(batch) = batch {
                 let status = state
                     .request_manager
-                    .get_batch_status(batch.id, false)
+                    .get_batch_status(batch.id)
                     .await
                     .map_err(|e| Error::Internal {
                         operation: format!("get batch status: {}", e),
@@ -1026,8 +1022,8 @@ Deleting a file also deletes any batches that were created from it. This action 
     )
 )]
 #[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, file_id = %file_id_str))]
-pub async fn delete_file<P: PoolProvider>(
-    State(state): State<AppState<P>>,
+pub async fn delete_file(
+    State(state): State<AppState>,
     Path(file_id_str): Path<String>,
     current_user: RequiresPermission<resource::Files, operation::DeleteOwn>,
 ) -> Result<Json<FileDeleteResponse>> {
@@ -1093,8 +1089,8 @@ Returns a breakdown by model including estimated input/output tokens and cost. U
     )
 )]
 #[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, file_id = %file_id_str, completion_window = ?query.completion_window))]
-pub async fn get_file_cost_estimate<P: PoolProvider>(
-    State(state): State<AppState<P>>,
+pub async fn get_file_cost_estimate(
+    State(state): State<AppState>,
     Path(file_id_str): Path<String>,
     Query(query): Query<FileCostEstimateQuery>,
     current_user: RequiresPermission<resource::Files, operation::ReadOwn>,

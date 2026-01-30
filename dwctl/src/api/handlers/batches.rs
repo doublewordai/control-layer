@@ -146,7 +146,7 @@ fn to_batch_response_with_email(batch: fusillade::Batch, creator_email: Option<&
 
 /// Helper to fetch creator email for a batch from the database.
 ///
-async fn fetch_creator_email(db: &sqlx::PgPool, batch: &fusillade::Batch) -> Option<String> {
+async fn fetch_creator_email(db: &sqlx_tracing::Pool<sqlx::Postgres>, batch: &fusillade::Batch) -> Option<String> {
     let created_by = batch.created_by.as_ref()?;
     let user_id = Uuid::parse_str(created_by).ok()?;
     let mut conn = db.acquire().await.ok()?;
@@ -170,8 +170,8 @@ The batch will begin processing immediately. Use `GET /batches/{batch_id}` to mo
     )
 )]
 #[tracing::instrument(skip(state, current_user, has_api_key), fields(user_id = %current_user.id, input_file_id = %req.input_file_id))]
-pub async fn create_batch<P: PoolProvider>(
-    State(state): State<AppState<P>>,
+pub async fn create_batch(
+    State(state): State<AppState>,
     current_user: RequiresPermission<resource::Batches, operation::CreateOwn>,
     has_api_key: crate::auth::current_user::HasApiKey,
     Json(req): Json<CreateBatchRequest>,
@@ -285,8 +285,8 @@ Poll this endpoint to monitor progress. Results are streamed to `output_file_id`
     )
 )]
 #[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, batch_id = %batch_id_str))]
-pub async fn get_batch<P: PoolProvider>(
-    State(state): State<AppState<P>>,
+pub async fn get_batch(
+    State(state): State<AppState>,
     Path(batch_id_str): Path<String>,
     current_user: RequiresPermission<resource::Batches, operation::ReadOwn>,
 ) -> Result<Json<BatchResponse>> {
@@ -297,7 +297,7 @@ pub async fn get_batch<P: PoolProvider>(
     // Get batch with SLA-appropriate error filtering (hide retriable errors before SLA expiry)
     let batch = state
         .request_manager
-        .get_batch(fusillade::BatchId(batch_id), true)
+        .get_batch(fusillade::BatchId(batch_id))
         .await
         .map_err(|_| Error::NotFound {
             resource: "Batch".to_string(),
@@ -339,8 +339,8 @@ Analytics update in real-time as requests complete.",
     )
 )]
 #[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, batch_id = %batch_id_str))]
-pub async fn get_batch_analytics<P: PoolProvider>(
-    State(state): State<AppState<P>>,
+pub async fn get_batch_analytics(
+    State(state): State<AppState>,
     Path(batch_id_str): Path<String>,
     current_user: RequiresPermission<resource::Batches, operation::ReadOwn>,
 ) -> Result<Json<BatchAnalytics>> {
@@ -352,7 +352,7 @@ pub async fn get_batch_analytics<P: PoolProvider>(
     // Hide retriable errors before SLA expiry
     let batch = state
         .request_manager
-        .get_batch(fusillade::BatchId(batch_id), true)
+        .get_batch(fusillade::BatchId(batch_id))
         .await
         .map_err(|_| Error::NotFound {
             resource: "Batch".to_string(),
@@ -402,8 +402,8 @@ Supports pagination via `limit` and `skip` query parameters, and filtering by `c
     )
 )]
 #[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, batch_id = %batch_id_str, limit = ?query.pagination.limit, skip = ?query.pagination.skip))]
-pub async fn get_batch_results<P: PoolProvider>(
-    State(state): State<AppState<P>>,
+pub async fn get_batch_results(
+    State(state): State<AppState>,
     Path(batch_id_str): Path<String>,
     Query(query): Query<BatchResultsQuery>,
     current_user: RequiresPermission<resource::Batches, operation::ReadOwn>,
@@ -416,7 +416,7 @@ pub async fn get_batch_results<P: PoolProvider>(
     // Hide retriable errors before SLA expiry
     let batch = state
         .request_manager
-        .get_batch(fusillade::BatchId(batch_id), true)
+        .get_batch(fusillade::BatchId(batch_id))
         .await
         .map_err(|_| Error::NotFound {
             resource: "Batch".to_string(),
@@ -442,7 +442,7 @@ pub async fn get_batch_results<P: PoolProvider>(
     let status = query.status.clone();
     let results_stream = state
         .request_manager
-        .get_batch_results_stream(fusillade::BatchId(batch_id), offset, search, status, true);
+        .get_batch_results_stream(fusillade::BatchId(batch_id), offset, search, status);
 
     // Apply limit if specified, fetching one extra to detect if there are more results
     let requested_limit = query.pagination.limit.map(|l| l as usize);
@@ -522,8 +522,8 @@ Pending requests will not be processed. Requests already in progress will comple
     )
 )]
 #[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, batch_id = %batch_id_str))]
-pub async fn cancel_batch<P: PoolProvider>(
-    State(state): State<AppState<P>>,
+pub async fn cancel_batch(
+    State(state): State<AppState>,
     Path(batch_id_str): Path<String>,
     current_user: RequiresPermission<resource::Batches, operation::UpdateOwn>,
 ) -> Result<Json<BatchResponse>> {
@@ -535,7 +535,7 @@ pub async fn cancel_batch<P: PoolProvider>(
     // Hide retriable errors before SLA expiry
     let batch = state
         .request_manager
-        .get_batch(fusillade::BatchId(batch_id), true)
+        .get_batch(fusillade::BatchId(batch_id))
         .await
         .map_err(|_| Error::NotFound {
             resource: "Batch".to_string(),
@@ -567,7 +567,7 @@ pub async fn cancel_batch<P: PoolProvider>(
     // Hide retriable errors before SLA expiry
     let batch = state
         .request_manager
-        .get_batch(fusillade::BatchId(batch_id), true)
+        .get_batch(fusillade::BatchId(batch_id))
         .await
         .map_err(|_| Error::NotFound {
             resource: "Batch".to_string(),
@@ -600,8 +600,8 @@ This action cannot be undone. The input file is not deleted.",
     )
 )]
 #[tracing::instrument(skip(state, current_user), fields(batch_id = %batch_id_str))]
-pub async fn delete_batch<P: PoolProvider>(
-    State(state): State<AppState<P>>,
+pub async fn delete_batch(
+    State(state): State<AppState>,
     Path(batch_id_str): Path<String>,
     current_user: RequiresPermission<resource::Batches, operation::DeleteOwn>,
 ) -> Result<StatusCode> {
@@ -613,7 +613,7 @@ pub async fn delete_batch<P: PoolProvider>(
     // Hide retriable errors before SLA expiry
     let batch = state
         .request_manager
-        .get_batch(fusillade::BatchId(batch_id), true)
+        .get_batch(fusillade::BatchId(batch_id))
         .await
         .map_err(|_| Error::NotFound {
             resource: "Batch".to_string(),
@@ -665,8 +665,8 @@ Failed requests are reset to pending and will be processed again. Use this after
     )
 )]
 #[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, batch_id = %batch_id_str))]
-pub async fn retry_failed_batch_requests<P: PoolProvider>(
-    State(state): State<AppState<P>>,
+pub async fn retry_failed_batch_requests(
+    State(state): State<AppState>,
     Path(batch_id_str): Path<String>,
     current_user: RequiresPermission<resource::Batches, operation::UpdateOwn>,
 ) -> Result<Json<BatchResponse>> {
@@ -678,7 +678,7 @@ pub async fn retry_failed_batch_requests<P: PoolProvider>(
     // Hide retriable errors before SLA expiry
     let batch = state
         .request_manager
-        .get_batch(fusillade::BatchId(batch_id), true)
+        .get_batch(fusillade::BatchId(batch_id))
         .await
         .map_err(|_| Error::NotFound {
             resource: "Batch".to_string(),
@@ -722,7 +722,7 @@ pub async fn retry_failed_batch_requests<P: PoolProvider>(
     // Hide retriable errors before SLA expiry
     let batch = state
         .request_manager
-        .get_batch(fusillade::BatchId(batch_id), true)
+        .get_batch(fusillade::BatchId(batch_id))
         .await
         .map_err(|_| Error::NotFound {
             resource: "Batch".to_string(),
@@ -754,8 +754,8 @@ Use this for fine-grained control over which requests to retry, rather than retr
     )
 )]
 #[tracing::instrument(skip(state, current_user, req), fields(user_id = %current_user.id, batch_id = %batch_id_str))]
-pub async fn retry_specific_requests<P: PoolProvider>(
-    State(state): State<AppState<P>>,
+pub async fn retry_specific_requests(
+    State(state): State<AppState>,
     Path(batch_id_str): Path<String>,
     current_user: RequiresPermission<resource::Batches, operation::UpdateOwn>,
     Json(req): Json<RetryRequestsRequest>,
@@ -768,7 +768,7 @@ pub async fn retry_specific_requests<P: PoolProvider>(
     // Hide retriable errors before SLA expiry
     let batch = state
         .request_manager
-        .get_batch(fusillade::BatchId(batch_id), true)
+        .get_batch(fusillade::BatchId(batch_id))
         .await
         .map_err(|_| Error::NotFound {
             resource: "Batch".to_string(),
@@ -841,7 +841,7 @@ pub async fn retry_specific_requests<P: PoolProvider>(
     // Hide retriable errors before SLA expiry
     let batch = state
         .request_manager
-        .get_batch(fusillade::BatchId(batch_id), true)
+        .get_batch(fusillade::BatchId(batch_id))
         .await
         .map_err(|_| Error::NotFound {
             resource: "Batch".to_string(),
@@ -870,8 +870,8 @@ Use cursor-based pagination: pass `last_id` from the response as the `after` par
     )
 )]
 #[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, limit = ?query.pagination.limit, after = ?query.pagination.after))]
-pub async fn list_batches<P: PoolProvider>(
-    State(state): State<AppState<P>>,
+pub async fn list_batches(
+    State(state): State<AppState>,
     Query(query): Query<ListBatchesQuery>,
     current_user: RequiresPermission<resource::Batches, operation::ReadOwn>,
 ) -> Result<Json<BatchListResponse>> {
@@ -893,7 +893,7 @@ pub async fn list_batches<P: PoolProvider>(
     // using SQL CASE expressions (hide retriable errors before each batch's SLA expiry)
     let batches = state
         .request_manager
-        .list_batches(created_by, query.search.clone(), after, limit + 1, true) // Fetch one extra to determine has_more
+        .list_batches(created_by, query.search.clone(), after, limit + 1) // Fetch one extra to determine has_more
         .await
         .map_err(|e| Error::Internal {
             operation: format!("list batches: {}", e),

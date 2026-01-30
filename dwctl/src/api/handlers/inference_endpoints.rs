@@ -81,8 +81,8 @@ impl FetchModels for MockFetchModels {
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn list_inference_endpoints<P: PoolProvider>(
-    State(state): State<AppState<P>>,
+pub async fn list_inference_endpoints(
+    State(state): State<AppState>,
     Query(query): Query<ListEndpointsQuery>,
     _: RequiresPermission<resource::Endpoints, operation::ReadAll>,
 ) -> Result<Json<Vec<InferenceEndpointResponse>>> {
@@ -119,8 +119,8 @@ pub async fn list_inference_endpoints<P: PoolProvider>(
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn get_inference_endpoint<P: PoolProvider>(
-    State(state): State<AppState<P>>,
+pub async fn get_inference_endpoint(
+    State(state): State<AppState>,
     Path(id): Path<InferenceEndpointId>,
     _: RequiresPermission<resource::Endpoints, operation::ReadAll>,
 ) -> Result<Json<InferenceEndpointResponse>> {
@@ -161,8 +161,8 @@ pub async fn get_inference_endpoint<P: PoolProvider>(
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn update_inference_endpoint<P: PoolProvider>(
-    State(state): State<AppState<P>>,
+pub async fn update_inference_endpoint(
+    State(state): State<AppState>,
     Path(id): Path<InferenceEndpointId>,
     _: RequiresPermission<resource::Endpoints, operation::UpdateAll>,
     Json(update): Json<InferenceEndpointUpdate>,
@@ -238,7 +238,8 @@ pub async fn update_inference_endpoint<P: PoolProvider>(
         let endpoint = repo.update(id, &db_request).await?;
 
         // Perform background sync after successful update
-        match endpoint_sync::synchronize_endpoint(endpoint.id, state.db.write().clone()).await {
+        // Deref through sqlx_tracing::Pool to get underlying PgPool
+        match endpoint_sync::synchronize_endpoint(endpoint.id, std::ops::Deref::deref(state.db.write()).clone()).await {
             Ok(sync_result) => {
                 tracing::info!(
                     "Auto-sync after endpoint {} update: {} changes made",
@@ -276,8 +277,8 @@ pub async fn update_inference_endpoint<P: PoolProvider>(
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn validate_inference_endpoint<P: PoolProvider>(
-    State(state): State<AppState<P>>,
+pub async fn validate_inference_endpoint(
+    State(state): State<AppState>,
     _: RequiresPermission<resource::Endpoints, operation::UpdateAll>,
     Json(validate_request): Json<InferenceEndpointValidate>,
 ) -> Result<Json<InferenceEndpointValidateResponse>> {
@@ -352,8 +353,8 @@ pub async fn validate_inference_endpoint<P: PoolProvider>(
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn create_inference_endpoint<P: PoolProvider>(
-    State(state): State<AppState<P>>,
+pub async fn create_inference_endpoint(
+    State(state): State<AppState>,
     current_user: RequiresPermission<resource::Endpoints, operation::CreateAll>,
     Json(create_request): Json<InferenceEndpointCreate>,
 ) -> Result<(StatusCode, Json<InferenceEndpointResponse>)> {
@@ -460,8 +461,8 @@ pub async fn create_inference_endpoint<P: PoolProvider>(
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn delete_inference_endpoint<P: PoolProvider>(
-    State(state): State<AppState<P>>,
+pub async fn delete_inference_endpoint(
+    State(state): State<AppState>,
     Path(id): Path<InferenceEndpointId>,
     _: RequiresPermission<resource::Endpoints, operation::DeleteAll>,
 ) -> Result<StatusCode> {
@@ -560,13 +561,14 @@ async fn validate_endpoint_connection(
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn synchronize_endpoint<P: PoolProvider>(
-    State(state): State<AppState<P>>,
+pub async fn synchronize_endpoint(
+    State(state): State<AppState>,
     Path(id): Path<InferenceEndpointId>,
     _: RequiresPermission<resource::Endpoints, operation::UpdateAll>,
 ) -> Result<Json<endpoint_sync::EndpointSyncResponse>> {
     // Perform synchronization
-    let response = endpoint_sync::synchronize_endpoint(id, state.db.write().clone()).await?;
+    // Deref through sqlx_tracing::Pool to get underlying PgPool
+    let response = endpoint_sync::synchronize_endpoint(id, std::ops::Deref::deref(state.db.write()).clone()).await?;
 
     tracing::info!("Successfully synchronized endpoint {} with {} changes", id, response.changes_made);
     Ok(Json(response))

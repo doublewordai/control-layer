@@ -1,5 +1,7 @@
 //! Authentication middleware for HTTP requests.
 
+use sqlx_pool_router::PoolProvider;
+
 use crate::{
     api::models::users::CurrentUser,
     db::{handlers::api_keys::ApiKeys, models::api_keys::ApiKeyPurpose},
@@ -17,8 +19,8 @@ use tracing::{debug, trace};
 
 /// Implementation for admin_ai_proxy_middleware. Since we only modify the request, in this
 /// middleware we can just return it from the implementation.
-pub(crate) async fn admin_ai_proxy<P: sqlx_pool_router::PoolProvider + Clone>(
-    state: crate::AppState<P>,
+pub(crate) async fn admin_ai_proxy(
+    state: crate::AppState,
     mut request: Request,
 ) -> Result<Request, Error> {
     let uri = request.uri().clone();
@@ -98,8 +100,8 @@ pub(crate) async fn admin_ai_proxy<P: sqlx_pool_router::PoolProvider + Clone>(
 
 /// Middleware that routes /admin/api/v1/ai requests to /ai with system authentication
 /// Only allows requests if the X-Doubleword-User header is set and the user has access to the requested model
-pub async fn admin_ai_proxy_middleware<P: sqlx_pool_router::PoolProvider + Clone>(
-    State(state): State<crate::AppState<P>>,
+pub async fn admin_ai_proxy_middleware(
+    State(state): State<crate::AppState>,
     request: Request,
     next: Next,
 ) -> Result<Response, Error> {

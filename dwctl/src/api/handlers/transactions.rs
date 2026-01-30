@@ -50,8 +50,8 @@ use uuid::Uuid;
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn create_transaction<P: PoolProvider>(
-    State(state): State<AppState<P>>,
+pub async fn create_transaction(
+    State(state): State<AppState>,
     _perm: RequiresPermission<resource::Credits, operation::CreateAll>,
     Json(data): Json<CreditTransactionCreate>,
 ) -> Result<(StatusCode, Json<CreditTransactionResponse>)> {
@@ -103,8 +103,8 @@ pub async fn create_transaction<P: PoolProvider>(
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn get_transaction<P: PoolProvider>(
-    State(state): State<AppState<P>>,
+pub async fn get_transaction(
+    State(state): State<AppState>,
     Path(transaction_id): Path<Uuid>,
     current_user: CurrentUser,
 ) -> Result<Json<CreditTransactionResponse>> {
@@ -161,8 +161,8 @@ pub async fn get_transaction<P: PoolProvider>(
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn list_transactions<P: PoolProvider>(
-    State(state): State<AppState<P>>,
+pub async fn list_transactions(
+    State(state): State<AppState>,
     Query(query): Query<ListTransactionsQuery>,
     current_user: CurrentUser,
 ) -> Result<Json<TransactionListResponse>> {

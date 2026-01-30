@@ -46,8 +46,8 @@ use axum::{
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn list_groups<P: PoolProvider>(
-    State(state): State<AppState<P>>,
+pub async fn list_groups(
+    State(state): State<AppState>,
     Query(query): Query<ListGroupsQuery>,
     _: RequiresPermission<resource::Groups, operation::ReadAll>,
 ) -> Result<Json<PaginatedResponse<GroupResponse>>> {
@@ -201,8 +201,8 @@ pub async fn list_groups<P: PoolProvider>(
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn create_group<P: PoolProvider>(
-    State(state): State<AppState<P>>,
+pub async fn create_group(
+    State(state): State<AppState>,
     current_user: RequiresPermission<resource::Groups, operation::CreateAll>,
     Json(create): Json<GroupCreate>,
 ) -> Result<(StatusCode, Json<GroupResponse>)> {
@@ -235,8 +235,8 @@ pub async fn create_group<P: PoolProvider>(
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn get_group<P: PoolProvider>(
-    State(state): State<AppState<P>>,
+pub async fn get_group(
+    State(state): State<AppState>,
     Path(group_id): Path<GroupId>,
     _: RequiresPermission<resource::Groups, operation::ReadAll>,
 ) -> Result<Json<GroupResponse>> {
@@ -275,8 +275,8 @@ pub async fn get_group<P: PoolProvider>(
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn update_group<P: PoolProvider>(
-    State(state): State<AppState<P>>,
+pub async fn update_group(
+    State(state): State<AppState>,
     Path(group_id): Path<GroupId>,
     _: RequiresPermission<resource::Groups, operation::UpdateAll>,
     Json(update): Json<GroupUpdate>,
@@ -310,8 +310,8 @@ pub async fn update_group<P: PoolProvider>(
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn delete_group<P: PoolProvider>(
-    State(state): State<AppState<P>>,
+pub async fn delete_group(
+    State(state): State<AppState>,
     Path(group_id): Path<GroupId>,
     _: RequiresPermission<resource::Groups, operation::DeleteAll>,
 ) -> Result<StatusCode> {
@@ -349,8 +349,8 @@ pub async fn delete_group<P: PoolProvider>(
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn add_user_to_group<P: PoolProvider>(
-    State(state): State<AppState<P>>,
+pub async fn add_user_to_group(
+    State(state): State<AppState>,
     Path((group_id, user_id)): Path<(GroupId, UserId)>,
     _: RequiresPermission<resource::Groups, operation::UpdateAll>,
 ) -> Result<StatusCode> {
@@ -382,8 +382,8 @@ pub async fn add_user_to_group<P: PoolProvider>(
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn remove_user_from_group<P: PoolProvider>(
-    State(state): State<AppState<P>>,
+pub async fn remove_user_from_group(
+    State(state): State<AppState>,
     Path((group_id, user_id)): Path<(GroupId, UserId)>,
     _: RequiresPermission<resource::Groups, operation::UpdateAll>,
 ) -> Result<StatusCode> {
@@ -414,8 +414,8 @@ pub async fn remove_user_from_group<P: PoolProvider>(
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn add_group_to_user<P: PoolProvider>(
-    State(state): State<AppState<P>>,
+pub async fn add_group_to_user(
+    State(state): State<AppState>,
     Path((user_id, group_id)): Path<(UserId, GroupId)>,
     _: RequiresPermission<resource::Users, operation::UpdateAll>,
 ) -> Result<StatusCode> {
@@ -447,8 +447,8 @@ pub async fn add_group_to_user<P: PoolProvider>(
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn remove_group_from_user<P: PoolProvider>(
-    State(state): State<AppState<P>>,
+pub async fn remove_group_from_user(
+    State(state): State<AppState>,
     Path((user_id, group_id)): Path<(UserId, GroupId)>,
     _: RequiresPermission<resource::Users, operation::UpdateAll>,
 ) -> Result<StatusCode> {
@@ -479,8 +479,8 @@ pub async fn remove_group_from_user<P: PoolProvider>(
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn get_group_users<P: PoolProvider>(
-    State(state): State<AppState<P>>,
+pub async fn get_group_users(
+    State(state): State<AppState>,
     Path(group_id): Path<GroupId>,
     _: RequiresPermission<resource::Users, operation::ReadAll>,
 ) -> Result<Json<Vec<UserId>>> {
@@ -514,8 +514,8 @@ pub async fn get_group_users<P: PoolProvider>(
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn get_user_groups<P: PoolProvider>(
-    State(state): State<AppState<P>>,
+pub async fn get_user_groups(
+    State(state): State<AppState>,
     Path(user_id): Path<UserId>,
     current_user: CurrentUser,
 ) -> Result<Json<Vec<GroupResponse>>> {
@@ -580,8 +580,8 @@ pub async fn get_user_groups<P: PoolProvider>(
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn add_deployment_to_group<P: PoolProvider>(
-    State(state): State<AppState<P>>,
+pub async fn add_deployment_to_group(
+    State(state): State<AppState>,
     Path((group_id, deployment_id)): Path<(GroupId, DeploymentId)>,
     current_user: RequiresPermission<resource::Groups, operation::UpdateAll>,
 ) -> Result<StatusCode> {
@@ -612,8 +612,8 @@ pub async fn add_deployment_to_group<P: PoolProvider>(
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn remove_deployment_from_group<P: PoolProvider>(
-    State(state): State<AppState<P>>,
+pub async fn remove_deployment_from_group(
+    State(state): State<AppState>,
     Path((group_id, deployment_id)): Path<(GroupId, DeploymentId)>,
     _: RequiresPermission<resource::Groups, operation::UpdateAll>,
 ) -> Result<StatusCode> {
@@ -644,8 +644,8 @@ pub async fn remove_deployment_from_group<P: PoolProvider>(
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn get_group_deployments<P: PoolProvider>(
-    State(state): State<AppState<P>>,
+pub async fn get_group_deployments(
+    State(state): State<AppState>,
     Path(group_id): Path<GroupId>,
     _: RequiresPermission<resource::Groups, operation::ReadAll>,
 ) -> Result<Json<Vec<DeploymentId>>> {
@@ -676,8 +676,8 @@ pub async fn get_group_deployments<P: PoolProvider>(
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn get_deployment_groups<P: PoolProvider>(
-    State(state): State<AppState<P>>,
+pub async fn get_deployment_groups(
+    State(state): State<AppState>,
     Path(deployment_id): Path<DeploymentId>,
     _: RequiresPermission<resource::Groups, operation::ReadAll>,
 ) -> Result<Json<Vec<GroupId>>> {

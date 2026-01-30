@@ -1,5 +1,7 @@
 //! HTTP handlers for health probe endpoints.
 
+use sqlx_pool_router::PoolProvider;
+
 use crate::AppState;
 use crate::api::models::probes::{
     CreateProbe, ProbeStatistics, ProbesQuery, ResultsQuery, StatsQuery, TestProbeRequest, UpdateProbeRequest,
@@ -42,7 +44,7 @@ pub async fn create_probe(
     _: RequiresPermission<resource::Probes, operation::CreateAll>,
     Json(probe): Json<CreateProbe>,
 ) -> Result<(StatusCode, Json<Probe>), Error> {
-    let created = ProbeManager::create_probe(&state.db, probe).await?;
+    let created = ProbeManager::create_probe(&*state.db.write(), probe).await?;
     Ok((StatusCode::CREATED, Json(created)))
 }
 
@@ -74,8 +76,8 @@ pub async fn list_probes(
     Query(query): Query<ProbesQuery>,
 ) -> Result<Json<Vec<Probe>>, Error> {
     let probes = match query.status.as_deref() {
-        Some("active") => ProbeManager::list_active_probes(&state.db).await?,
-        _ => ProbeManager::list_probes(&state.db).await?,
+        Some("active") => ProbeManager::list_active_probes(&*state.db.write()).await?,
+        _ => ProbeManager::list_probes(&*state.db.write()).await?,
     };
     Ok(Json(probes))
 }
@@ -108,7 +110,7 @@ pub async fn get_probe(
     _: RequiresPermission<resource::Probes, operation::ReadAll>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Probe>, Error> {
-    let probe = ProbeManager::get_probe(&state.db, id).await?;
+    let probe = ProbeManager::get_probe(&*state.db.write(), id).await?;
     Ok(Json(probe))
 }
 
@@ -140,7 +142,7 @@ pub async fn delete_probe(
     _: RequiresPermission<resource::Probes, operation::DeleteAll>,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, Error> {
-    ProbeManager::delete_probe(&state.db, id).await?;
+    ProbeManager::delete_probe(&*state.db.write(), id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -172,7 +174,7 @@ pub async fn activate_probe(
     _: RequiresPermission<resource::Probes, operation::UpdateAll>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Probe>, Error> {
-    let probe = ProbeManager::activate_probe(&state.db, id).await?;
+    let probe = ProbeManager::activate_probe(&*state.db.write(), id).await?;
     Ok(Json(probe))
 }
 
@@ -204,7 +206,7 @@ pub async fn deactivate_probe(
     _: RequiresPermission<resource::Probes, operation::UpdateAll>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Probe>, Error> {
-    let probe = ProbeManager::deactivate_probe(&state.db, id).await?;
+    let probe = ProbeManager::deactivate_probe(&*state.db.write(), id).await?;
     Ok(Json(probe))
 }
 
@@ -239,7 +241,7 @@ pub async fn update_probe(
     Path(id): Path<Uuid>,
     Json(update): Json<UpdateProbeRequest>,
 ) -> Result<Json<Probe>, Error> {
-    let probe = ProbeManager::update_probe(&state.db, id, update).await?;
+    let probe = ProbeManager::update_probe(&*state.db.write(), id, update).await?;
     Ok(Json(probe))
 }
 
@@ -271,7 +273,7 @@ pub async fn execute_probe(
     _: RequiresPermission<resource::Probes, operation::UpdateAll>,
     Path(id): Path<Uuid>,
 ) -> Result<(StatusCode, Json<ProbeResult>), Error> {
-    let result = ProbeManager::execute_probe(&state.db, id, &state.config).await?;
+    let result = ProbeManager::execute_probe(&*state.db.write(), id, &state.config).await?;
     Ok((StatusCode::CREATED, Json(result)))
 }
 
@@ -310,7 +312,7 @@ pub async fn test_probe(
         (None, None, None)
     };
 
-    let result = ProbeManager::test_probe(&state.db, deployment_id, &state.config, http_method, request_path, request_body).await?;
+    let result = ProbeManager::test_probe(&*state.db.write(), deployment_id, &state.config, http_method, request_path, request_body).await?;
     Ok((StatusCode::OK, Json(result)))
 }
 
@@ -344,7 +346,7 @@ pub async fn get_probe_results(
     Path(id): Path<Uuid>,
     Query(query): Query<ResultsQuery>,
 ) -> Result<Json<Vec<ProbeResult>>, Error> {
-    let results = ProbeManager::get_probe_results(&state.db, id, query.start_time, query.end_time, query.limit).await?;
+    let results = ProbeManager::get_probe_results(&*state.db.write(), id, query.start_time, query.end_time, query.limit).await?;
     Ok(Json(results))
 }
 
@@ -378,7 +380,7 @@ pub async fn get_statistics(
     Path(id): Path<Uuid>,
     Query(query): Query<StatsQuery>,
 ) -> Result<Json<ProbeStatistics>, Error> {
-    let stats = ProbeManager::get_statistics(&state.db, id, query.start_time, query.end_time).await?;
+    let stats = ProbeManager::get_statistics(&*state.db.write(), id, query.start_time, query.end_time).await?;
     Ok(Json(stats))
 }
 
