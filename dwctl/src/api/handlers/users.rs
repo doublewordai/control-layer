@@ -430,6 +430,7 @@ pub async fn delete_user<P: PoolProvider>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::models::pagination::MAX_LIMIT;
     use crate::api::models::users::Role;
     use crate::db::handlers::{Credits, Groups, Repository};
     use crate::db::models::{credits::CreditTransactionCreateDBRequest, groups::GroupCreateDBRequest};
