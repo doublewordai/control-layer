@@ -238,7 +238,7 @@ pub struct AppState {
     pub metrics_recorder: Option<GenAiMetrics>,
     #[builder(default = false)]
     pub is_leader: bool,
-    pub request_manager: Arc<fusillade::PostgresRequestManager<TracedDbPools, fusillade::ReqwestHttpClient>>,
+    pub request_manager: Arc<fusillade::PostgresRequestManager<fusillade::ReqwestHttpClient>>,
     /// Resource limiters for protecting system capacity.
     pub limiters: limits::Limiters,
 }
@@ -1270,7 +1270,7 @@ pub async fn build_router(
 /// stop all background tasks. When dropped, the `drop_guard` will automatically cancel
 /// the shutdown token, signaling all tasks to stop.
 pub struct BackgroundServices {
-    request_manager: Arc<fusillade::PostgresRequestManager<TracedDbPools, fusillade::ReqwestHttpClient>>,
+    request_manager: Arc<fusillade::PostgresRequestManager<fusillade::ReqwestHttpClient>>,
     is_leader: bool,
     onwards_targets: onwards::target::Targets,
     #[cfg_attr(not(test), allow(dead_code))]
