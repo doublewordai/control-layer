@@ -6,7 +6,7 @@ use crate::{
     AppState,
     api::models::{
         groups::GroupResponse,
-        pagination::PaginatedResponse,
+        pagination::{MAX_LIMIT, PaginatedResponse},
         users::{CurrentUser, GetUserQuery, ListUsersQuery, UserCreate, UserResponse, UserUpdate},
     },
     auth::permissions::{self as permissions, RequiresPermission, can_read_all_resources, can_read_own_resource, operation, resource},
@@ -587,8 +587,8 @@ mod tests {
 
         response.assert_status_ok();
         let paginated: PaginatedResponse<UserResponse> = response.json();
-        assert!(paginated.data.len() <= 100); // Should be capped at MAX_LIMIT (100)
-        assert_eq!(paginated.limit, 100); // Limit should be clamped
+        assert!(paginated.data.len() <= MAX_LIMIT as usize); // Should be capped at MAX_LIMIT
+        assert_eq!(paginated.limit, MAX_LIMIT); // Limit should be clamped
     }
 
     #[sqlx::test]

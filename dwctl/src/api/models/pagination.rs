@@ -11,7 +11,8 @@ use utoipa::{IntoParams, ToSchema};
 pub const DEFAULT_LIMIT: i64 = 10;
 
 /// Maximum number of items that can be requested per page.
-pub const MAX_LIMIT: i64 = 100;
+/// Set to 101 to support cursor pagination's N+1 pattern for detecting next page.
+pub const MAX_LIMIT: i64 = 101;
 
 /// Standard pagination parameters for admin API list endpoints.
 ///
@@ -88,7 +89,8 @@ impl<T: ToSchema> PaginatedResponse<T> {
 pub const DEFAULT_CURSOR_LIMIT: i64 = 20;
 
 /// Maximum limit for cursor-based pagination.
-pub const MAX_CURSOR_LIMIT: i64 = 100;
+/// Set to 101 to support the N+1 pattern for detecting next page.
+pub const MAX_CURSOR_LIMIT: i64 = 101;
 
 /// Cursor-based pagination parameters for OpenAI-compatible endpoints.
 ///
