@@ -1129,16 +1129,38 @@ pub async fn get_file_cost_estimate<P: PoolProvider>(
         }
     }
 
-    // Fetch all deployments and their pricing information upfront
+    // Get aggregated template statistics first to know which models are in the file
+    let template_stats = state
+        .request_manager
+        .get_file_template_stats(fusillade::FileId(file_id))
+        .await
+        .map_err(|e| Error::Internal {
+            operation: format!("get file template stats: {}", e),
+        })?;
+
+    // Convert to the format needed for cost calculation
+    let mut model_stats: HashMap<String, (i64, i64)> = HashMap::new(); // (request_count, input_tokens)
+
+    for stat in &template_stats {
+        // Estimate input tokens: body size in bytes / 4
+        let estimated_input_tokens = stat.total_body_bytes / 4;
+        model_stats.insert(stat.model.clone(), (stat.request_count, estimated_input_tokens));
+    }
+
+    // Get the list of models actually used in this file
+    let models_in_file: Vec<String> = template_stats.iter().map(|s| s.model.clone()).collect();
+
     let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut deployments_repo = Deployments::new(&mut conn);
 
+    // Only fetch deployments for models in the file
     let filter = DeploymentFilter::new(0, 1000)
         .with_statuses(vec![ModelStatus::Active])
         .with_deleted(false);
     let all_deployments = deployments_repo.list(&filter).await.map_err(Error::Database)?;
 
     // Build a lookup map of model alias -> (deployment, avg_output_tokens, model_type)
+    // Only for models that are actually in the file
     let mut model_info: HashMap<
         String,
         (
@@ -1149,6 +1171,12 @@ pub async fn get_file_cost_estimate<P: PoolProvider>(
     > = HashMap::new();
 
     for deployment in all_deployments {
+        // Skip deployments not used in this file
+        if !models_in_file.contains(&deployment.alias) {
+            model_info.insert(deployment.alias.clone(), (deployment.clone(), None, deployment.model_type.clone()));
+            continue;
+        }
+
         // Query http_analytics for last 100 responses to get average output token count
         let avg_output_tokens: Option<i64> = sqlx::query_scalar(
             r#"
@@ -1174,24 +1202,6 @@ pub async fn get_file_cost_estimate<P: PoolProvider>(
             deployment.alias.clone(),
             (deployment.clone(), avg_output_tokens, deployment.model_type.clone()),
         );
-    }
-
-    // Get aggregated template statistics (optimized single query)
-    let template_stats = state
-        .request_manager
-        .get_file_template_stats(fusillade::FileId(file_id))
-        .await
-        .map_err(|e| Error::Internal {
-            operation: format!("get file template stats: {}", e),
-        })?;
-
-    // Convert to the format needed for cost calculation
-    let mut model_stats: HashMap<String, (i64, i64)> = HashMap::new(); // (request_count, input_tokens)
-
-    for stat in template_stats {
-        // Estimate input tokens: body size in bytes / 4
-        let estimated_input_tokens = stat.total_body_bytes / 4;
-        model_stats.insert(stat.model, (stat.request_count, estimated_input_tokens));
     }
 
     let mut total_cost = Decimal::ZERO;
