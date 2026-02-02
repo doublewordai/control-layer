@@ -29,19 +29,12 @@
 
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::{Protocol, WithExportConfig, WithHttpConfig};
-use opentelemetry_sdk::trace::SdkTracerProvider;
+pub use opentelemetry_sdk::trace::SdkTracerProvider;
 use std::collections::HashMap;
-use std::sync::OnceLock;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-
-/// Global tracer provider reference for shutdown.
-///
-/// We store our own reference to call `.shutdown()` directly, ensuring all pending
-/// spans are flushed before application exit.
-static TRACER_PROVIDER: OnceLock<SdkTracerProvider> = OnceLock::new();
 
 /// Initialize tracing with optional OpenTelemetry support
 ///
@@ -51,13 +44,16 @@ static TRACER_PROVIDER: OnceLock<SdkTracerProvider> = OnceLock::new();
 ///
 /// Parameters:
 /// - `enable_otel_export`: If true, attempts to configure OTLP export using environment variables
-pub fn init_telemetry(enable_otel_export: bool) -> anyhow::Result<()> {
+///
+/// Returns the tracer provider if OTLP export was successfully enabled. The caller should
+/// store this and call `provider.shutdown()` before application exit to flush pending spans.
+pub fn init_telemetry(enable_otel_export: bool) -> anyhow::Result<Option<SdkTracerProvider>> {
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     if enable_otel_export {
         // Try to create OTLP tracer - if env vars aren't set, this will fail gracefully
         match create_otlp_tracer() {
-            Ok(tracer) => {
+            Ok((tracer, provider)) => {
                 // Build subscriber with both fmt and OpenTelemetry layers
                 tracing_subscriber::registry()
                     .with(env_filter)
@@ -66,6 +62,7 @@ pub fn init_telemetry(enable_otel_export: bool) -> anyhow::Result<()> {
                     .try_init()?;
 
                 info!("Telemetry initialized with OTLP export enabled");
+                return Ok(Some(provider));
             }
             Err(e) => {
                 // If OTLP setup fails, just use fmt layer without OpenTelemetry
@@ -87,7 +84,7 @@ pub fn init_telemetry(enable_otel_export: bool) -> anyhow::Result<()> {
         info!("Telemetry initialized (OTLP export disabled)");
     }
 
-    Ok(())
+    Ok(None)
 }
 
 /// Create an OpenTelemetry tracer with OTLP exporter
@@ -98,7 +95,9 @@ pub fn init_telemetry(enable_otel_export: bool) -> anyhow::Result<()> {
 /// - OTEL_EXPORTER_OTLP_PROTOCOL
 /// - OTEL_EXPORTER_OTLP_HEADERS
 /// - OTEL_SERVICE_NAME
-fn create_otlp_tracer() -> anyhow::Result<opentelemetry_sdk::trace::Tracer> {
+///
+/// Returns both the tracer and provider. The provider must be retained for shutdown.
+fn create_otlp_tracer() -> anyhow::Result<(opentelemetry_sdk::trace::Tracer, SdkTracerProvider)> {
     // Get service name from env or use default
     let service_name = std::env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| "dwctl".to_string());
 
@@ -153,19 +152,5 @@ fn create_otlp_tracer() -> anyhow::Result<opentelemetry_sdk::trace::Tracer> {
 
     let tracer = tracer_provider.tracer(service_name);
 
-    // Store provider reference for shutdown - required to flush pending spans on exit
-    let _ = TRACER_PROVIDER.set(tracer_provider);
-
-    Ok(tracer)
-}
-
-/// Shutdown the global tracer provider gracefully
-///
-/// Should be called before application exit to flush any pending spans
-pub fn shutdown_telemetry() {
-    if let Some(provider) = TRACER_PROVIDER.get() {
-        if let Err(e) = provider.shutdown() {
-            tracing::error!("Failed to shutdown tracer provider: {}", e);
-        }
-    }
+    Ok((tracer, tracer_provider))
 }

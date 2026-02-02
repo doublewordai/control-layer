@@ -50,7 +50,7 @@ pub async fn create_test_app_state_with_config(pool: PgPool, config: crate::conf
 pub async fn create_test_app(pool: PgPool, _enable_sync: bool) -> (TestServer, crate::BackgroundServices) {
     let config = create_test_config();
 
-    let app = crate::Application::new_with_pool(config, Some(pool))
+    let app = crate::Application::new_with_pool(config, Some(pool), None)
         .await
         .expect("Failed to create application");
 
@@ -63,7 +63,7 @@ pub async fn create_test_app_with_config(
     config: crate::config::Config,
     _enable_sync: bool,
 ) -> (TestServer, crate::BackgroundServices) {
-    let app = crate::Application::new_with_pool(config, Some(pool))
+    let app = crate::Application::new_with_pool(config, Some(pool), None)
         .await
         .expect("Failed to create application");
 
@@ -106,6 +106,7 @@ pub fn create_test_config() -> crate::config::Config {
                 replica_pool: None,
             },
         },
+        slow_statement_threshold_ms: 1000,
         host: "127.0.0.1".to_string(),
         port: 0,
         admin_email: "admin@test.com".to_string(),

@@ -1507,7 +1507,7 @@ mod tests {
             panic!("Expected File transport in test config");
         };
 
-        let app = crate::Application::new_with_pool(config, Some(pool.clone()))
+        let app = crate::Application::new_with_pool(config, Some(pool.clone()), None)
             .await
             .expect("Failed to create application");
 
@@ -1658,7 +1658,7 @@ mod tests {
         let mut config = create_test_config();
         config.auth.native.enabled = true;
 
-        let app = crate::Application::new_with_pool(config, Some(pool.clone()))
+        let app = crate::Application::new_with_pool(config, Some(pool.clone()), None)
             .await
             .expect("Failed to create application");
 
@@ -1738,7 +1738,7 @@ mod tests {
         let mut config = create_test_config();
         config.auth.native.enabled = true;
 
-        let app = crate::Application::new_with_pool(config, Some(pool.clone()))
+        let app = crate::Application::new_with_pool(config, Some(pool.clone()), None)
             .await
             .expect("Failed to create application");
 
@@ -1797,7 +1797,7 @@ mod tests {
         let mut config = create_test_config();
         config.auth.native.enabled = true;
 
-        let app = crate::Application::new_with_pool(config, Some(pool.clone()))
+        let app = crate::Application::new_with_pool(config, Some(pool.clone()), None)
             .await
             .expect("Failed to create application");
 
@@ -1848,7 +1848,7 @@ mod tests {
         config.auth.native.enabled = true;
         config.auth.native.password.min_length = 10;
 
-        let app = crate::Application::new_with_pool(config, Some(pool.clone()))
+        let app = crate::Application::new_with_pool(config, Some(pool.clone()), None)
             .await
             .expect("Failed to create application");
 
@@ -1908,7 +1908,7 @@ mod tests {
         config.auth.native.enabled = true;
         config.auth.native.password.max_length = 20;
 
-        let app = crate::Application::new_with_pool(config, Some(pool.clone()))
+        let app = crate::Application::new_with_pool(config, Some(pool.clone()), None)
             .await
             .expect("Failed to create application");
 
@@ -1967,7 +1967,7 @@ mod tests {
         let mut config = create_test_config();
         config.auth.native.enabled = false; // Disabled!
 
-        let app = crate::Application::new_with_pool(config, Some(pool.clone()))
+        let app = crate::Application::new_with_pool(config, Some(pool.clone()), None)
             .await
             .expect("Failed to create application");
 

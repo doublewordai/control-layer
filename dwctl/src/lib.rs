@@ -1760,6 +1760,7 @@ pub struct Application {
     _fusillade_pools: DbPools,
     _outlet_pools: Option<DbPools>,
     _embedded_db: Option<db::embedded::EmbeddedDatabase>,
+    _tracer_provider: Option<telemetry::SdkTracerProvider>,
     bg_services: BackgroundServices,
 }
 
@@ -1768,15 +1769,22 @@ impl Application {
     ///
     /// If `pool` is provided, it will be used directly instead of creating a new connection.
     /// This is useful for tests where sqlx::test provides a pool.
-    pub async fn new(config: Config) -> anyhow::Result<Self> {
-        Self::new_with_pool(config, None).await
+    pub async fn new(
+        config: Config,
+        tracer_provider: Option<telemetry::SdkTracerProvider>,
+    ) -> anyhow::Result<Self> {
+        Self::new_with_pool(config, None, tracer_provider).await
     }
 
     /// Create a new application instance with an existing database pool
     ///
     /// This method is primarily for tests where sqlx::test provides a pool.
     /// For production use, prefer [`Application::new`] which will create its own pool.
-    pub async fn new_with_pool(config: Config, pool: Option<PgPool>) -> anyhow::Result<Self> {
+    pub async fn new_with_pool(
+        config: Config,
+        pool: Option<PgPool>,
+        tracer_provider: Option<telemetry::SdkTracerProvider>,
+    ) -> anyhow::Result<Self> {
         debug!("Starting control layer with configuration: {:#?}", config);
 
         // Setup database connections, run migrations, and initialize data
@@ -1847,6 +1855,7 @@ impl Application {
             _fusillade_pools: fusillade_pools,
             _outlet_pools: outlet_pools,
             _embedded_db,
+            _tracer_provider: tracer_provider,
             bg_services,
         })
     }
@@ -1901,9 +1910,13 @@ impl Application {
         info!("Closing database connections...");
         self.db_pools.close().await;
 
-        // Shutdown telemetry
-        info!("Shutting down telemetry...");
-        telemetry::shutdown_telemetry();
+        // Shutdown telemetry to flush pending spans
+        if let Some(provider) = self._tracer_provider.take() {
+            info!("Shutting down telemetry...");
+            if let Err(e) = provider.shutdown() {
+                tracing::error!("Failed to shutdown tracer provider: {}", e);
+            }
+        }
 
         // Clean up embedded database if it exists
         if let Some(embedded_db) = self._embedded_db {
