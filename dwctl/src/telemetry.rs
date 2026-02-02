@@ -31,10 +31,17 @@ use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::{Protocol, WithExportConfig, WithHttpConfig};
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use std::collections::HashMap;
+use std::sync::OnceLock;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
+
+/// Global tracer provider reference for shutdown.
+///
+/// We store our own reference to call `.shutdown()` directly, ensuring all pending
+/// spans are flushed before application exit.
+static TRACER_PROVIDER: OnceLock<SdkTracerProvider> = OnceLock::new();
 
 /// Initialize tracing with optional OpenTelemetry support
 ///
@@ -146,5 +153,19 @@ fn create_otlp_tracer() -> anyhow::Result<opentelemetry_sdk::trace::Tracer> {
 
     let tracer = tracer_provider.tracer(service_name);
 
+    // Store provider reference for shutdown - required to flush pending spans on exit
+    let _ = TRACER_PROVIDER.set(tracer_provider);
+
     Ok(tracer)
+}
+
+/// Shutdown the global tracer provider gracefully
+///
+/// Should be called before application exit to flush any pending spans
+pub fn shutdown_telemetry() {
+    if let Some(provider) = TRACER_PROVIDER.get() {
+        if let Err(e) = provider.shutdown() {
+            tracing::error!("Failed to shutdown tracer provider: {}", e);
+        }
+    }
 }
