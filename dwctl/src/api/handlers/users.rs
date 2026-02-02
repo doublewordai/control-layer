@@ -430,6 +430,7 @@ pub async fn delete_user<P: PoolProvider>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::models::pagination::MAX_LIMIT;
     use crate::api::models::users::Role;
     use crate::db::handlers::{Credits, Groups, Repository};
     use crate::db::models::{credits::CreditTransactionCreateDBRequest, groups::GroupCreateDBRequest};
@@ -587,8 +588,8 @@ mod tests {
 
         response.assert_status_ok();
         let paginated: PaginatedResponse<UserResponse> = response.json();
-        assert!(paginated.data.len() <= 100); // Should be capped at MAX_LIMIT (100)
-        assert_eq!(paginated.limit, 100); // Limit should be clamped
+        assert!(paginated.data.len() <= MAX_LIMIT as usize); // Should be capped at MAX_LIMIT
+        assert_eq!(paginated.limit, MAX_LIMIT); // Limit should be clamped
     }
 
     #[sqlx::test]
