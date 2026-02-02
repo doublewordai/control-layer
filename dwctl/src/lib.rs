@@ -1901,10 +1901,6 @@ impl Application {
         info!("Closing database connections...");
         self.db_pools.close().await;
 
-        // Shutdown telemetry
-        info!("Shutting down telemetry...");
-        telemetry::shutdown_telemetry();
-
         // Clean up embedded database if it exists
         if let Some(embedded_db) = self._embedded_db {
             info!("Shutting down embedded database...");

@@ -26,42 +26,15 @@
 //! export OTEL_EXPORTER_OTLP_ENDPOINT="https://otlp-gateway.example.com/otlp"
 //! export OTEL_EXPORTER_OTLP_HEADERS="Authorization=Basic%20<token>"
 //! ```
-//!
-//! ## OpenTelemetry SDK 0.29 Changes
-//!
-//! This module uses opentelemetry_sdk 0.29+ which has several API changes from earlier versions:
-//!
-//! - **TracerProvider renamed**: `TracerProvider` is now `SdkTracerProvider` to distinguish the SDK
-//!   implementation from the trait.
-//!
-//! - **Resource builder pattern**: `Resource::new(vec![...])` replaced with
-//!   `Resource::builder().with_attribute(...).build()` for clearer construction.
-//!
-//! - **Batch exporter simplified**: `with_batch_exporter(exporter, runtime)` no longer requires
-//!   the runtime parameter - the SDK handles async internally.
-//!
-//! - **Shutdown handling**: `opentelemetry::global::shutdown_tracer_provider()` was removed in 0.28+.
-//!   We now store the provider in a `OnceLock` and call `.shutdown()` directly. This is required
-//!   because `tracing-opentelemetry` clones the tracer (not the provider), so we must keep our own
-//!   reference to ensure proper shutdown and span flushing. See opentelemetry-rust#1961.
 
-use opentelemetry::KeyValue;
-use opentelemetry::trace::TracerProvider as _; // Trait for .tracer() method
+use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::{Protocol, WithExportConfig, WithHttpConfig};
-use opentelemetry_sdk::trace::SdkTracerProvider; // Renamed from TracerProvider in 0.29
+use opentelemetry_sdk::trace::SdkTracerProvider;
 use std::collections::HashMap;
-use std::sync::OnceLock;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-
-/// Global tracer provider reference for shutdown.
-///
-/// Required since opentelemetry 0.28+ removed `global::shutdown_tracer_provider()`.
-/// We store our own reference to call `.shutdown()` directly, ensuring all pending
-/// spans are flushed before application exit.
-static TRACER_PROVIDER: OnceLock<SdkTracerProvider> = OnceLock::new();
 
 /// Initialize tracing with optional OpenTelemetry support
 ///
@@ -162,35 +135,16 @@ fn create_otlp_tracer() -> anyhow::Result<opentelemetry_sdk::trace::Tracer> {
         .build()?;
 
     // Create tracer provider with resource
-    // - SdkTracerProvider::builder() is the 0.29+ API (was TracerProvider::builder())
-    let tracer_provider = SdkTracerProvider::builder()
-        .with_batch_exporter(exporter)
-        .with_resource(
-            opentelemetry_sdk::Resource::builder()
-                .with_attribute(KeyValue::new("service.name", service_name.clone()))
-                .build(),
-        )
+    let resource = opentelemetry_sdk::Resource::builder()
+        .with_service_name(service_name.clone())
         .build();
 
-    // Get a tracer from the provider - this is what tracing-opentelemetry uses
+    let tracer_provider = SdkTracerProvider::builder()
+        .with_batch_exporter(exporter)
+        .with_resource(resource)
+        .build();
+
     let tracer = tracer_provider.tracer(service_name);
 
-    // Store provider reference for shutdown. This is critical because:
-    // 1. global::shutdown_tracer_provider() was removed in 0.28+
-    // 2. tracing-opentelemetry clones the Tracer, not the Provider
-    // 3. Without our own reference, we can't flush pending spans on shutdown
-    let _ = TRACER_PROVIDER.set(tracer_provider);
-
     Ok(tracer)
-}
-
-/// Shutdown the global tracer provider gracefully
-///
-/// Should be called before application exit to flush any pending spans
-pub fn shutdown_telemetry() {
-    if let Some(provider) = TRACER_PROVIDER.get()
-        && let Err(e) = provider.shutdown()
-    {
-        tracing::error!("Failed to shutdown tracer provider: {}", e);
-    }
 }
