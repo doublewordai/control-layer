@@ -98,7 +98,7 @@ pub async fn list_users<P: PoolProvider>(
     // If includes billing AND user has permission, create balances_map
     let balances_map = if includes.contains(&"billing") && can_view_billing {
         let mut credits_repo = Credits::new(&mut conn);
-        Some(credits_repo.get_users_balances_bulk(&user_ids).await?)
+        Some(credits_repo.get_users_balances_bulk(&user_ids, None).await?)
     } else {
         None
     };
@@ -142,7 +142,7 @@ pub async fn list_users<P: PoolProvider>(
 
         // If includes billing
         if let Some(balances_map) = &balances_map {
-            let balance = balances_map.get(&response_user.id).cloned().unwrap_or(0.0);
+            let balance = balances_map.get(&response_user.id).and_then(|b| b.to_f64()).unwrap_or(0.0);
             response_user = response_user.with_credit_balance(balance);
         }
 
@@ -391,10 +391,11 @@ pub async fn delete_user<P: PoolProvider>(
     }
 
     // Cancel all active batches for this user before deletion
+    // Use false for hide_retriable_before_sla since this is an admin operation, not user-facing
     let user_id_str = user_id.to_string();
     let batches = state
         .request_manager
-        .list_batches(Some(user_id_str.clone()), None, None, i64::MAX)
+        .list_batches(Some(user_id_str.clone()), None, None, i64::MAX, false)
         .await
         .map_err(|_| Error::NotFound {
             resource: "Batch".to_string(),
@@ -429,6 +430,7 @@ pub async fn delete_user<P: PoolProvider>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::models::pagination::MAX_LIMIT;
     use crate::api::models::users::Role;
     use crate::db::handlers::{Credits, Groups, Repository};
     use crate::db::models::{credits::CreditTransactionCreateDBRequest, groups::GroupCreateDBRequest};
@@ -586,8 +588,8 @@ mod tests {
 
         response.assert_status_ok();
         let paginated: PaginatedResponse<UserResponse> = response.json();
-        assert!(paginated.data.len() <= 100); // Should be capped at MAX_LIMIT (100)
-        assert_eq!(paginated.limit, 100); // Limit should be clamped
+        assert!(paginated.data.len() <= MAX_LIMIT as usize); // Should be capped at MAX_LIMIT
+        assert_eq!(paginated.limit, MAX_LIMIT); // Limit should be clamped
     }
 
     #[sqlx::test]

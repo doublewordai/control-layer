@@ -247,14 +247,35 @@ batches:
     # - "48h"  # Uncomment to allow 48 hour SLA
 
   # Files configuration for batch file uploads/downloads
+  # NOTE: max_file_size has moved to limits.files.max_file_size
   files:
-    max_file_size: 2147483648 # 2 GB - maximum size for file uploads
     upload_buffer_size: 100 # Buffer size for file upload streams (default: 100)
     download_buffer_size: 100 # Buffer size for file download streams (default: 100)
     # Database insertion batch size of request templates for file uploads
     # Higher values improve throughput for large files but use more memory
     # Reduce value if you encounter memory spike issues with many concurrent uploads
     batch_insert_size: 5000
+
+# Resource limits configuration
+# Controls file size, request count, and concurrency limits to prevent resource exhaustion
+# limits:
+#   files:
+#     # Maximum file size in bytes (default: 100MB)
+#     # Set to 0 for unlimited (not recommended for production)
+#     max_file_size: 104857600
+#     # Maximum number of requests (JSONL lines) per file
+#     # Set to 0 for unlimited (default, not recommended for production)
+#     max_requests_per_file: 50000
+#     # Maximum concurrent file uploads allowed system-wide
+#     # Set to 0 for unlimited (default, not recommended for production)
+#     max_concurrent_uploads: 10
+#     # Maximum uploads that can wait in queue for a slot
+#     # When reached, new uploads receive HTTP 429 immediately
+#     # Set to 0 for unlimited waiting queue (not recommended)
+#     max_waiting_uploads: 20
+#     # Maximum seconds to wait for an upload slot before returning HTTP 429
+#     # Set to 0 to reject immediately when no slot is available
+#     max_upload_wait_secs: 60
 
 # Background services configuration
 # Controls which background services run on this instance
@@ -301,26 +322,14 @@ background_services:
     status_log_interval_ms: 2000 # Interval for logging daemon status (set to null to disable)
 
     # SLA Daemon configuration
-    # Controls how the batch daemon handles SLA violations and escalations
-
-    # Model escalations: Map models to fallback models for SLA escalation
-    # When a request is at risk of missing its SLA, the daemon can create a racing
-    # escalated request using a different (typically faster/more reliable) model
+    # Route-at-claim-time model escalation
+    # When a batch is within `escalation_threshold_seconds` of expiry at claim time,
+    # the daemon routes requests to a different (typically faster) model.
+    # Batch API keys automatically have access to escalation models in the routing cache.
     # model_escalations:
-    #   gemma-3-27b-it:  # Original model
-    #     escalation_model: google/gemma-3-27b-it # Fallback model for escalation
-    #     escalation_api_key: SYSTEM_API_KEY  # Use backup API key with access
-
-    # sla_check_interval_seconds: 60  # How often to check for SLA violations (default: 60)
-
-    # sla_thresholds:
-    #   - name: api
-    #     threshold_seconds: 600  # Escalate when batch expires within 10 minutes
-    #     action: escalate
-    #     allowed_states:
-    #       - processing
-    #       - pending
-    #       - failed  # Can escalate even failed requests for recovery
+    #   gpt-4:  # Original model
+    #     escalation_model: o1-preview  # Route to this model when near expiry
+    #     escalation_threshold_seconds: 900  # Default: 900 (15 minutes before expiry)
 
   # Leader election - coordinates which instance runs leader-only services
   # When disabled, all instances run as leader (useful for single-instance deployments)

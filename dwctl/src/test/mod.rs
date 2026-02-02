@@ -576,16 +576,19 @@ async fn test_request_logging_disabled(pool: PgPool) {
     // Create test config with request logging disabled
     let mut config = crate::test::utils::create_test_config();
     config.enable_request_logging = false;
+    config.enable_analytics = false; // Disable to avoid spawning background batcher task
 
     // Build router with request logging disabled
     let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(DbPools::new(pool.clone())));
+    let limiters = crate::limits::Limiters::new(&config.limits);
     let mut app_state = AppState::builder()
         .db(DbPools::new(pool.clone()))
         .config(config)
         .request_manager(request_manager)
+        .limiters(limiters)
         .build();
     let onwards_router = axum::Router::new(); // Empty onwards router for testing
-    let router = super::build_router(&mut app_state, onwards_router)
+    let router = super::build_router(&mut app_state, onwards_router, None, None)
         .await
         .expect("Failed to build router");
 
@@ -909,16 +912,19 @@ async fn test_openapi_json_endpoints() {
 async fn test_build_router_with_metrics_disabled(pool: PgPool) {
     let mut config = create_test_config();
     config.enable_metrics = false;
+    config.enable_analytics = false; // Disable to avoid spawning background batcher task
 
     let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(DbPools::new(pool.clone())));
+    let limiters = crate::limits::Limiters::new(&config.limits);
     let mut app_state = AppState::builder()
         .db(DbPools::new(pool))
         .config(config)
         .request_manager(request_manager)
+        .limiters(limiters)
         .build();
 
     let onwards_router = axum::Router::new();
-    let router = super::build_router(&mut app_state, onwards_router)
+    let router = super::build_router(&mut app_state, onwards_router, None, None)
         .await
         .expect("Failed to build router");
     let server = axum_test::TestServer::new(router).expect("Failed to create test server");
@@ -934,16 +940,19 @@ async fn test_build_router_with_metrics_disabled(pool: PgPool) {
 async fn test_build_router_with_metrics_enabled(pool: PgPool) {
     let mut config = create_test_config();
     config.enable_metrics = true;
+    config.enable_analytics = false; // Disable to avoid spawning background batcher task
 
     let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(DbPools::new(pool.clone())));
+    let limiters = crate::limits::Limiters::new(&config.limits);
     let mut app_state = AppState::builder()
         .db(DbPools::new(pool))
         .config(config)
         .request_manager(request_manager)
+        .limiters(limiters)
         .build();
 
     let onwards_router = axum::Router::new();
-    let router = super::build_router(&mut app_state, onwards_router)
+    let router = super::build_router(&mut app_state, onwards_router, None, None)
         .await
         .expect("Failed to build router");
     let server = axum_test::TestServer::new(router).expect("Failed to create test server");

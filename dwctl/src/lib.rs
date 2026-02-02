@@ -142,6 +142,7 @@ mod email;
 mod error_enrichment;
 pub mod errors;
 mod leader_election;
+pub mod limits;
 mod metrics;
 mod openapi;
 mod payment_providers;
@@ -215,14 +216,17 @@ pub use types::{ApiKeyId, DeploymentId, GroupId, InferenceEndpointId, UserId};
 /// - `metrics_recorder`: Optional Prometheus metrics recorder (when enabled)
 /// - `is_leader`: Whether this instance is the elected leader (for distributed deployments)
 /// - `request_manager`: Fusillade batch request manager for async processing
+/// - `limiters`: Resource limiters for protecting system capacity
 ///
 /// # Example
 ///
 /// ```ignore
+/// let limiters = limits::Limiters::new(&config.limits);
 /// let state = AppState::builder()
 ///     .db(db_pools)
 ///     .config(config)
 ///     .request_manager(request_manager)
+///     .limiters(limiters)
 ///     .build();
 /// ```
 #[derive(Clone, Builder)]
@@ -241,6 +245,8 @@ where
     #[builder(default = false)]
     pub is_leader: bool,
     pub request_manager: Arc<fusillade::PostgresRequestManager<P, fusillade::ReqwestHttpClient>>,
+    /// Resource limiters for protecting system capacity.
+    pub limiters: limits::Limiters,
 }
 
 /// Get the dwctl database migrator
@@ -867,6 +873,8 @@ fn create_cors_layer(config: &Config) -> anyhow::Result<CorsLayer> {
 ///
 /// - `state`: Mutable application state (metrics recorder may be initialized here)
 /// - `onwards_router`: Pre-configured router for AI request proxying
+/// - `analytics_sender`: Optional sender for analytics records (from background services)
+/// - `metrics_recorder`: Optional GenAI metrics recorder (created before background services)
 ///
 /// # Returns
 ///
@@ -876,7 +884,12 @@ fn create_cors_layer(config: &Config) -> anyhow::Result<CorsLayer> {
 ///
 /// Returns an error if CORS configuration is invalid or metrics initialization fails.
 #[instrument(skip_all)]
-pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyhow::Result<Router> {
+pub async fn build_router(
+    state: &mut AppState,
+    onwards_router: Router,
+    analytics_sender: Option<request_logging::batcher::AnalyticsSender>,
+    metrics_recorder: Option<GenAiMetrics>,
+) -> anyhow::Result<Router> {
     // Setup request logging and/or analytics based on config flags
     //
     // These can be enabled independently:
@@ -889,13 +902,8 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
     let analytics_enabled = state.config.enable_analytics;
 
     let outlet_layer = if request_logging_enabled || analytics_enabled {
-        // Initialize GenAI metrics BEFORE creating analytics handler if metrics enabled
-        if state.config.enable_metrics && analytics_enabled {
-            let gen_ai_registry = prometheus::Registry::new();
-            let gen_ai_metrics =
-                GenAiMetrics::new(&gen_ai_registry).map_err(|e| anyhow::anyhow!("Failed to create GenAI metrics: {}", e))?;
-            state.metrics_recorder = Some(gen_ai_metrics);
-        }
+        // Store the metrics recorder in state (created earlier in Application::new)
+        state.metrics_recorder = metrics_recorder;
 
         // Build handler chain based on config
         let mut multi_handler = MultiHandler::new();
@@ -912,13 +920,9 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
         }
 
         // Add AnalyticsHandler for analytics/billing if enabled
-        if analytics_enabled {
-            let analytics_handler = request_logging::AnalyticsHandler::new(
-                state.db.write().clone(),
-                uuid::Uuid::new_v4(),
-                state.config.clone(),
-                state.metrics_recorder.clone(),
-            );
+        // The batcher is spawned in setup_background_services and managed by BackgroundServices
+        if let Some(sender) = analytics_sender {
+            let analytics_handler = request_logging::AnalyticsHandler::new(sender, uuid::Uuid::new_v4(), state.config.clone());
             multi_handler = multi_handler.with(analytics_handler);
         }
 
@@ -1077,11 +1081,14 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
     // Batches API routes (files + batches) - conditionally enabled under /ai/v1
     let batches_routes = if state.config.batches.enabled {
         // File upload route with custom body limit (other routes use default)
-        let file_upload_limit = state.config.batches.files.max_file_size;
-        let file_router = Router::new().route(
-            "/files",
-            post(api::handlers::files::upload_file).layer(DefaultBodyLimit::max(file_upload_limit as usize)),
-        );
+        // 0 = unlimited (disable body limit), otherwise set max size
+        let file_upload_limit = state.config.limits.files.max_file_size;
+        let body_limit_layer = if file_upload_limit == 0 {
+            DefaultBodyLimit::disable()
+        } else {
+            DefaultBodyLimit::max(file_upload_limit as usize)
+        };
+        let file_router = Router::new().route("/files", post(api::handlers::files::upload_file).layer(body_limit_layer));
 
         Some(
             Router::new()
@@ -1236,6 +1243,8 @@ pub struct BackgroundServices {
     onwards_targets: onwards::target::Targets,
     #[cfg_attr(not(test), allow(dead_code))]
     onwards_sender: Option<tokio::sync::watch::Sender<onwards::target::Targets>>,
+    /// Sender for analytics records (if analytics is enabled)
+    analytics_sender: Option<request_logging::batcher::AnalyticsSender>,
     // JoinSet is cancel-safe - can be polled in select! without losing tasks
     background_tasks: tokio::task::JoinSet<anyhow::Result<()>>,
     // Map task IDs to names for logging
@@ -1311,7 +1320,8 @@ impl BackgroundServices {
             .ok_or_else(|| anyhow::anyhow!("Onwards sync not enabled"))?;
 
         // Use the same load function as the automatic sync
-        let new_targets = crate::sync::onwards_config::load_targets_from_db(pool).await?;
+        // Note: escalation_models is empty for tests - individual tests can set up their own
+        let new_targets = crate::sync::onwards_config::load_targets_from_db(pool, &[]).await?;
 
         // Send through the watch channel (same as automatic sync)
         sender
@@ -1361,6 +1371,7 @@ async fn setup_background_services(
     outlet_pool: Option<PgPool>,
     config: Config,
     shutdown_token: tokio_util::sync::CancellationToken,
+    metrics_recorder: Option<GenAiMetrics>,
 ) -> anyhow::Result<BackgroundServices> {
     use fusillade::manager::postgres::BatchInsertStrategy;
     let drop_guard = shutdown_token.clone().drop_guard();
@@ -1374,8 +1385,22 @@ async fn setup_background_services(
     // Start onwards integration for proxying AI requests (if enabled)
     #[cfg_attr(not(test), allow(unused_variables))]
     let (initial_targets, onwards_sender) = if config.background_services.onwards_sync.enabled {
-        let (onwards_config_sync, initial_targets, onwards_stream) =
-            sync::onwards_config::OnwardsConfigSync::new_with_daemon_limits(pool.clone(), Some(model_capacity_limits.clone())).await?;
+        // Extract escalation model names from batch daemon config
+        // Batch API keys automatically get access to these models for SLA escalation
+        let escalation_models: Vec<String> = config
+            .background_services
+            .batch_daemon
+            .model_escalations
+            .values()
+            .map(|e| e.escalation_model.clone())
+            .collect();
+
+        let (onwards_config_sync, initial_targets, onwards_stream) = sync::onwards_config::OnwardsConfigSync::new_with_daemon_limits(
+            pool.clone(),
+            Some(model_capacity_limits.clone()),
+            escalation_models,
+        )
+        .await?;
 
         // Clone the sender before moving onwards_config_sync into the spawn (for manual sync)
         let sender = onwards_config_sync.sender();
@@ -1663,6 +1688,21 @@ async fn setup_background_services(
         });
     }
 
+    // Start analytics batcher if enabled
+    let analytics_sender = if config.enable_analytics {
+        let (batcher, sender) = request_logging::AnalyticsBatcher::new(pool.clone(), config.clone(), metrics_recorder);
+
+        let batcher_shutdown = shutdown_token.clone();
+        background_tasks.spawn("analytics-batcher", async move {
+            batcher.run(batcher_shutdown).await;
+            Ok(())
+        });
+
+        Some(sender)
+    } else {
+        None
+    };
+
     let (background_tasks, task_names) = background_tasks.into_parts();
 
     Ok(BackgroundServices {
@@ -1670,6 +1710,7 @@ async fn setup_background_services(
         is_leader,
         onwards_targets: initial_targets,
         onwards_sender,
+        analytics_sender,
         background_tasks,
         task_names,
         shutdown_token,
@@ -1731,6 +1772,15 @@ impl Application {
         // Create a shutdown token for coordinating graceful shutdown of background tasks
         let shutdown_token = tokio_util::sync::CancellationToken::new();
 
+        // Create GenAI metrics recorder if both metrics and analytics are enabled
+        // This is created here (before background services) so the analytics batcher can use it
+        let metrics_recorder = if config.enable_metrics && config.enable_analytics {
+            let gen_ai_registry = prometheus::Registry::new();
+            Some(GenAiMetrics::new(&gen_ai_registry).map_err(|e| anyhow::anyhow!("Failed to create GenAI metrics: {}", e))?)
+        } else {
+            None
+        };
+
         // Setup background services (onwards integration, probe scheduler, batch daemon, leader election)
         // Note: Must use primary pool (via Deref) because onwards sync uses LISTEN/NOTIFY
         // which requires direct database connection to primary (not through PgBouncer transaction pooling)
@@ -1740,6 +1790,7 @@ impl Application {
             outlet_pools.as_ref().map(|p| (**p).clone()),
             config.clone(),
             shutdown_token.clone(),
+            metrics_recorder.clone(),
         )
         .await?;
 
@@ -1748,6 +1799,9 @@ impl Application {
             onwards::AppState::new(bg_services.onwards_targets.clone()).with_response_transform(onwards::create_openai_sanitizer());
         let onwards_router = onwards::build_router(onwards_app_state);
 
+        // Build resource limiters
+        let limiters = limits::Limiters::new(&config.limits);
+
         // Build app state and router
         let mut app_state = AppState::builder()
             .db(db_pools.clone())
@@ -1755,9 +1809,16 @@ impl Application {
             .is_leader(bg_services.is_leader)
             .request_manager(bg_services.request_manager.clone())
             .maybe_outlet_db(outlet_pools.clone())
+            .limiters(limiters)
             .build();
 
-        let router = build_router(&mut app_state, onwards_router).await?;
+        let router = build_router(
+            &mut app_state,
+            onwards_router,
+            bg_services.analytics_sender.clone(),
+            metrics_recorder,
+        )
+        .await?;
 
         Ok(Self {
             router,

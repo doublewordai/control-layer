@@ -193,23 +193,33 @@ impl OpenAIBatchRequest {
     }
 }
 
+/// Configuration for file stream processing.
+#[derive(Debug)]
+struct FileStreamConfig {
+    /// Maximum file size in bytes (0 = unlimited)
+    max_file_size: u64,
+    /// Maximum number of requests per file (0 = unlimited)
+    max_requests_per_file: usize,
+    /// Channel buffer size for streaming
+    buffer_size: usize,
+}
+
 /// Helper function to create a stream of FileStreamItem from multipart upload
 /// This handles the entire multipart parsing inside the stream
 ///
 /// # Arguments
 /// * `endpoint` - Target endpoint for batch requests (e.g., "http://localhost:8080/ai")
 /// * `api_key` - API key to inject for request execution
-#[tracing::instrument(skip(multipart, api_key, accessible_models), fields(max_file_size, uploaded_by = ?uploaded_by, endpoint = %endpoint, buffer_size))]
+#[tracing::instrument(skip(multipart, api_key, accessible_models), fields(config.max_file_size, config.max_requests_per_file, uploaded_by = ?uploaded_by, endpoint = %endpoint, config.buffer_size))]
 fn create_file_stream(
     mut multipart: Multipart,
-    max_file_size: u64,
+    config: FileStreamConfig,
     uploaded_by: Option<String>,
     endpoint: String,
     api_key: String,
-    buffer_size: usize,
     accessible_models: HashSet<String>,
 ) -> Pin<Box<dyn Stream<Item = fusillade::FileStreamItem> + Send>> {
-    let (tx, rx) = mpsc::channel(buffer_size);
+    let (tx, rx) = mpsc::channel(config.buffer_size);
 
     tokio::spawn(async move {
         let mut total_size = 0i64;
@@ -267,12 +277,12 @@ fn create_file_stream(
                             line_count
                         );
 
-                        // Check size limit
-                        if total_size > max_file_size as i64 {
+                        // Check size limit (0 = unlimited)
+                        if config.max_file_size > 0 && total_size > config.max_file_size as i64 {
                             let _ = tx
                                 .send(fusillade::FileStreamItem::Error(format!(
                                     "File size exceeds maximum: {} > {}",
-                                    total_size, max_file_size
+                                    total_size, config.max_file_size
                                 )))
                                 .await;
                             return;
@@ -391,7 +401,18 @@ fn create_file_stream(
                                     // Transform to internal format (includes model access validation)
                                     match openai_req.to_internal(&endpoint, api_key.clone(), &accessible_models) {
                                         Ok(template) => {
+                                            // Check request count limit (0 = unlimited)
+                                            if config.max_requests_per_file > 0 && line_count >= config.max_requests_per_file as u64 {
+                                                let _ = tx
+                                                    .send(fusillade::FileStreamItem::Error(format!(
+                                                        "File exceeds maximum request limit of {}",
+                                                        config.max_requests_per_file
+                                                    )))
+                                                    .await;
+                                                return;
+                                            }
                                             line_count += 1;
+
                                             incomplete_line.clear();
                                             if tx.send(fusillade::FileStreamItem::Template(template)).await.is_err() {
                                                 return;
@@ -430,7 +451,18 @@ fn create_file_stream(
                             match serde_json::from_str::<OpenAIBatchRequest>(trimmed) {
                                 Ok(openai_req) => match openai_req.to_internal(&endpoint, api_key.clone(), &accessible_models) {
                                     Ok(template) => {
+                                        // Check request count limit (0 = unlimited)
+                                        if config.max_requests_per_file > 0 && line_count >= config.max_requests_per_file as u64 {
+                                            let _ = tx
+                                                .send(fusillade::FileStreamItem::Error(format!(
+                                                    "File exceeds maximum request limit of {}",
+                                                    config.max_requests_per_file
+                                                )))
+                                                .await;
+                                            return;
+                                        }
                                         line_count += 1;
+
                                         if tx.send(fusillade::FileStreamItem::Template(template)).await.is_err() {
                                             return;
                                         }
@@ -507,6 +539,7 @@ Each line must be a valid JSON object containing `custom_id`, `method`, `url`, a
         (status = 201, description = "File uploaded and validated successfully.", body = FileResponse),
         (status = 400, description = "Invalid file format, malformed JSON, missing required fields, or referencing an inaccessible model."),
         (status = 413, description = "File exceeds the maximum allowed size."),
+        (status = 429, description = "Too many concurrent uploads. Retry after a short delay."),
         (status = 500, description = "An unexpected error occurred. Retry the request or contact support if the issue persists.")
     )
 )]
@@ -516,7 +549,19 @@ pub async fn upload_file<P: PoolProvider>(
     current_user: RequiresPermission<resource::Files, operation::CreateOwn>,
     multipart: Multipart,
 ) -> Result<(StatusCode, Json<FileResponse>)> {
-    let max_file_size = state.config.batches.files.max_file_size;
+    // Acquire upload permit (if limiter is configured)
+    // The permit is held for the duration of the upload to limit concurrency
+    let _permit = if let Some(ref limiter) = state.limiters.file_uploads {
+        Some(limiter.acquire().await?)
+    } else {
+        None
+    };
+
+    let stream_config = FileStreamConfig {
+        max_file_size: state.config.limits.files.max_file_size,
+        max_requests_per_file: state.config.limits.files.max_requests_per_file,
+        buffer_size: state.config.batches.files.upload_buffer_size,
+    };
     let uploaded_by = Some(current_user.id.to_string());
 
     // Get or create user-specific hidden batch API key for batch request execution
@@ -543,15 +588,7 @@ pub async fn upload_file<P: PoolProvider>(
     drop(conn);
 
     // Create a stream that parses the multipart upload and yields FileStreamItems
-    let file_stream = create_file_stream(
-        multipart,
-        max_file_size,
-        uploaded_by,
-        endpoint,
-        user_api_key,
-        state.config.batches.files.upload_buffer_size,
-        accessible_models,
-    );
+    let file_stream = create_file_stream(multipart, stream_config, uploaded_by, endpoint, user_api_key, accessible_models);
 
     // Create file via request manager with streaming
     let created_file_id = state.request_manager.create_file_stream(file_stream).await.map_err(|e| match e {
@@ -826,12 +863,18 @@ pub async fn get_file_content<P: PoolProvider>(
         }
     }
 
+    // Determine whether to hide retriable errors based on file purpose
+    // For error files: hide retriable errors before SLA expiry (per-batch logic in database)
+    // For non-error files (input, output): show all content (false)
+    let hide_retriable_before_sla = matches!(file.purpose, Some(fusillade::batch::Purpose::BatchError));
+
     // Stream the file content as JSONL, starting from offset
     let offset = query.pagination.skip.unwrap_or(0) as usize;
     let search = query.search.clone();
-    let content_stream = state
-        .request_manager
-        .get_file_content_stream(fusillade::FileId(file_id), offset, search);
+    let content_stream =
+        state
+            .request_manager
+            .get_file_content_stream(fusillade::FileId(file_id), offset, search, hide_retriable_before_sla);
 
     // Apply limit if specified, fetching one extra to detect if there are more results
     let requested_limit = query.pagination.limit.map(|l| l as usize);
@@ -869,7 +912,7 @@ pub async fn get_file_content<P: PoolProvider>(
             if let Some(batch) = batch {
                 let status = state
                     .request_manager
-                    .get_batch_status(batch.id)
+                    .get_batch_status(batch.id, false)
                     .await
                     .map_err(|e| Error::Internal {
                         operation: format!("get batch status: {}", e),
@@ -890,7 +933,7 @@ pub async fn get_file_content<P: PoolProvider>(
             if let Some(batch) = batch {
                 let status = state
                     .request_manager
-                    .get_batch_status(batch.id)
+                    .get_batch_status(batch.id, false)
                     .await
                     .map_err(|e| Error::Internal {
                         operation: format!("get batch status: {}", e),
@@ -1086,16 +1129,38 @@ pub async fn get_file_cost_estimate<P: PoolProvider>(
         }
     }
 
-    // Fetch all deployments and their pricing information upfront
+    // Get aggregated template statistics first to know which models are in the file
+    let template_stats = state
+        .request_manager
+        .get_file_template_stats(fusillade::FileId(file_id))
+        .await
+        .map_err(|e| Error::Internal {
+            operation: format!("get file template stats: {}", e),
+        })?;
+
+    // Convert to the format needed for cost calculation
+    let mut model_stats: HashMap<String, (i64, i64)> = HashMap::new(); // (request_count, input_tokens)
+
+    for stat in &template_stats {
+        // Estimate input tokens: body size in bytes / 4
+        let estimated_input_tokens = stat.total_body_bytes / 4;
+        model_stats.insert(stat.model.clone(), (stat.request_count, estimated_input_tokens));
+    }
+
+    // Get the list of models actually used in this file
+    let models_in_file: Vec<String> = template_stats.iter().map(|s| s.model.clone()).collect();
+
     let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut deployments_repo = Deployments::new(&mut conn);
 
+    // Only fetch deployments for models in the file
     let filter = DeploymentFilter::new(0, 1000)
         .with_statuses(vec![ModelStatus::Active])
         .with_deleted(false);
     let all_deployments = deployments_repo.list(&filter).await.map_err(Error::Database)?;
 
     // Build a lookup map of model alias -> (deployment, avg_output_tokens, model_type)
+    // Only for models that are actually in the file
     let mut model_info: HashMap<
         String,
         (
@@ -1106,6 +1171,12 @@ pub async fn get_file_cost_estimate<P: PoolProvider>(
     > = HashMap::new();
 
     for deployment in all_deployments {
+        // Skip deployments not used in this file
+        if !models_in_file.contains(&deployment.alias) {
+            model_info.insert(deployment.alias.clone(), (deployment.clone(), None, deployment.model_type.clone()));
+            continue;
+        }
+
         // Query http_analytics for last 100 responses to get average output token count
         let avg_output_tokens: Option<i64> = sqlx::query_scalar(
             r#"
@@ -1131,24 +1202,6 @@ pub async fn get_file_cost_estimate<P: PoolProvider>(
             deployment.alias.clone(),
             (deployment.clone(), avg_output_tokens, deployment.model_type.clone()),
         );
-    }
-
-    // Get aggregated template statistics (optimized single query)
-    let template_stats = state
-        .request_manager
-        .get_file_template_stats(fusillade::FileId(file_id))
-        .await
-        .map_err(|e| Error::Internal {
-            operation: format!("get file template stats: {}", e),
-        })?;
-
-    // Convert to the format needed for cost calculation
-    let mut model_stats: HashMap<String, (i64, i64)> = HashMap::new(); // (request_count, input_tokens)
-
-    for stat in template_stats {
-        // Estimate input tokens: body size in bytes / 4
-        let estimated_input_tokens = stat.total_body_bytes / 4;
-        model_stats.insert(stat.model, (stat.request_count, estimated_input_tokens));
     }
 
     let mut total_cost = Decimal::ZERO;
@@ -2234,5 +2287,164 @@ mod tests {
             Some("false"),
             "Output file should be complete when batch has no pending/in-progress requests"
         );
+    }
+
+    #[tokio::test]
+    async fn test_upload_rate_limiting_rejects_when_queue_full() {
+        use crate::config::FileLimitsConfig;
+        use crate::limits::UploadLimiter;
+        use std::sync::Arc;
+
+        // Test the limiter directly with max_concurrent=1, max_waiting=1
+        let config = FileLimitsConfig {
+            max_concurrent_uploads: 1,
+            max_waiting_uploads: 1,  // Only allow 1 waiter
+            max_upload_wait_secs: 0, // Reject immediately when can't acquire
+            ..Default::default()
+        };
+        let limiter = Arc::new(UploadLimiter::new(&config).unwrap());
+
+        // Acquire the only permit
+        let _permit1 = limiter.acquire().await.unwrap();
+
+        // Second request joins the waiting queue (1 allowed)
+        let limiter_clone = limiter.clone();
+        let handle = tokio::spawn(async move { limiter_clone.acquire().await });
+
+        // Give time for the waiter to enter queue
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        // Third request should be rejected (queue full)
+        let result = limiter.acquire().await;
+        assert!(result.is_err(), "Third request should be rejected when queue is full");
+
+        if let Err(crate::errors::Error::TooManyRequests { message }) = result {
+            assert!(message.contains("Too many file uploads"));
+        } else {
+            panic!("Expected TooManyRequests error");
+        }
+
+        // Clean up
+        drop(_permit1);
+        let _ = handle.await;
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_upload_with_rate_limiter_configured(pool: PgPool) {
+        // Create app with rate limiting enabled
+        let mut config = create_test_config();
+        config.limits.files.max_concurrent_uploads = 10; // High enough to not block this test
+        config.limits.files.max_waiting_uploads = 20;
+        config.limits.files.max_upload_wait_secs = 60;
+
+        let (app, _bg_services) = create_test_app_with_config(pool.clone(), config, false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        // Create a deployment and add to group so user has access to the model
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        // Create test JSONL content
+        let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}"#;
+
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test.jsonl");
+
+        // Upload should succeed when rate limiter is configured but not at capacity
+        let upload_response = app
+            .post("/ai/v1/files")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .multipart(
+                axum_test::multipart::MultipartForm::new()
+                    .add_text("purpose", "batch")
+                    .add_part("file", file_part),
+            )
+            .await;
+
+        upload_response.assert_status(axum::http::StatusCode::CREATED);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_upload_rejects_file_exceeding_max_requests(pool: PgPool) {
+        // Create app with max_requests_per_file = 2
+        let mut config = create_test_config();
+        config.limits.files.max_requests_per_file = 2;
+
+        let (app, _bg_services) = create_test_app_with_config(pool.clone(), config, false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        // Create a deployment and add to group so user has access to the model
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        // Create JSONL content with 3 requests (exceeds limit of 2)
+        let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}
+{"custom_id":"request-2","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}
+{"custom_id":"request-3","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}"#;
+
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test.jsonl");
+
+        // Upload should fail because file has 3 requests but limit is 2
+        let upload_response = app
+            .post("/ai/v1/files")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .multipart(
+                axum_test::multipart::MultipartForm::new()
+                    .add_text("purpose", "batch")
+                    .add_part("file", file_part),
+            )
+            .await;
+
+        upload_response.assert_status(axum::http::StatusCode::BAD_REQUEST);
+        let body = upload_response.text();
+        assert!(
+            body.contains("maximum request limit"),
+            "Expected error about request limit, got: {}",
+            body
+        );
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_upload_allows_file_at_max_requests(pool: PgPool) {
+        // Create app with max_requests_per_file = 2
+        let mut config = create_test_config();
+        config.limits.files.max_requests_per_file = 2;
+
+        let (app, _bg_services) = create_test_app_with_config(pool.clone(), config, false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        // Create a deployment and add to group so user has access to the model
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        // Create JSONL content with exactly 2 requests (at the limit)
+        let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}
+{"custom_id":"request-2","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}"#;
+
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test.jsonl");
+
+        // Upload should succeed because file has exactly 2 requests (at the limit)
+        let upload_response = app
+            .post("/ai/v1/files")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .multipart(
+                axum_test::multipart::MultipartForm::new()
+                    .add_text("purpose", "batch")
+                    .add_part("file", file_part),
+            )
+            .await;
+
+        upload_response.assert_status(axum::http::StatusCode::CREATED);
     }
 }

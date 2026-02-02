@@ -1,0 +1,27 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO credits_transactions (user_id, transaction_type, amount, source_id, description, fusillade_batch_id)\n            SELECT * FROM UNNEST(\n                $1::uuid[], $2::text[], $3::numeric[], $4::text[], $5::text[], $6::uuid[]\n            )\n            ON CONFLICT (source_id) DO NOTHING\n            RETURNING source_id\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "source_id",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray",
+        "TextArray",
+        "NumericArray",
+        "TextArray",
+        "TextArray",
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "0b2f89f884748e00e3dfff19fbe6384235a0b432e275ca6427c169de095839d8"
+}

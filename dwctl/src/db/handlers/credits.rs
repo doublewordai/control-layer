@@ -10,7 +10,7 @@ use crate::{
 };
 use chrono::{DateTime, Utc};
 use rand::random;
-use rust_decimal::{Decimal, prelude::ToPrimitive};
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgConnection};
 use std::collections::HashMap;
@@ -102,6 +102,9 @@ impl<'c> Credits<'c> {
     ///
     /// This is a lock-free append-only INSERT. Balance is calculated on read via checkpoints.
     /// Probabilistically refreshes the checkpoint (1 in CHECKPOINT_REFRESH_PROBABILITY chance).
+    ///
+    /// For admin_grant and purchase transactions that bring a user's balance from <= 0 to > 0,
+    /// sends a pg_notify to trigger onwards cache reload (re-enabling the user's API access).
     #[instrument(skip(self, request), fields(user_id = %abbrev_uuid(&request.user_id), transaction_type = ?request.transaction_type, amount = %request.amount), err)]
     pub async fn create_transaction(&mut self, request: &CreditTransactionCreateDBRequest) -> Result<CreditTransactionDBResponse> {
         // Lock-free INSERT - no advisory lock, no balance calculation
@@ -126,6 +129,21 @@ impl<'c> Credits<'c> {
 
         trace!("Created transaction {} for user_id {}", transaction.id, request.user_id);
 
+        // For credit-adding transactions (admin_grant, purchase), check if we crossed zero upward
+        // This re-enables users who were blocked due to depleted balance
+        if matches!(
+            request.transaction_type,
+            CreditTransactionType::AdminGrant | CreditTransactionType::Purchase
+        ) {
+            let (balance_after, _) = self.calculate_balance_with_seq(request.user_id).await?;
+            let balance_before = balance_after - request.amount;
+
+            if balance_before <= Decimal::ZERO && balance_after > Decimal::ZERO {
+                trace!("Balance crossed zero upward for user_id {}, notifying onwards", request.user_id);
+                self.notify_balance_restored(request.user_id).await?;
+            }
+        }
+
         // Probabilistically refresh checkpoint (1 in N chance)
         // This amortizes checkpoint maintenance across writes
         if random::<u32>().is_multiple_of(CHECKPOINT_REFRESH_PROBABILITY) {
@@ -137,6 +155,26 @@ impl<'c> Credits<'c> {
         }
 
         Ok(CreditTransactionDBResponse::from(transaction))
+    }
+
+    /// Send pg_notify when a user's balance is restored (crosses zero upward).
+    /// Format: "credits_transactions:{epoch_micros}" to match other triggers and enable lag metrics.
+    async fn notify_balance_restored(&mut self, user_id: UserId) -> Result<()> {
+        trace!("Balance restored for user_id {}, notifying onwards", user_id);
+
+        let epoch_micros = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros();
+
+        let payload = format!("credits_transactions:{}", epoch_micros);
+
+        sqlx::query("SELECT pg_notify('auth_config_changed', $1)")
+            .bind(&payload)
+            .execute(&mut *self.db)
+            .await?;
+
+        Ok(())
     }
 
     /// Calculate balance using checkpoint + delta, returning both balance and latest transaction seq.
@@ -212,13 +250,79 @@ impl<'c> Credits<'c> {
     }
 
     /// Get balances for multiple users using checkpoint + delta calculation.
+    ///
+    /// Optionally refreshes checkpoints probabilistically (1 in `checkpoint_refresh_probability`
+    /// chance per user). Pass `None` to skip checkpoint refresh.
     #[instrument(skip(self, user_ids), fields(count = user_ids.len()), err)]
-    pub async fn get_users_balances_bulk(&mut self, user_ids: &[UserId]) -> Result<HashMap<UserId, f64>> {
+    pub async fn get_users_balances_bulk(
+        &mut self,
+        user_ids: &[UserId],
+        checkpoint_refresh_probability: Option<u32>,
+    ) -> Result<HashMap<UserId, Decimal>> {
+        if user_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        // Probabilistically select users for checkpoint refresh
+        let users_to_refresh: Vec<UserId> = match checkpoint_refresh_probability {
+            Some(prob) if prob > 0 => user_ids.iter().filter(|_| random::<u32>().is_multiple_of(prob)).copied().collect(),
+            _ => Vec::new(),
+        };
+
+        let mut balances_map = HashMap::with_capacity(user_ids.len());
+
+        // Refresh checkpoints for selected users - this also returns their balances
+        if !users_to_refresh.is_empty() {
+            let refreshed_balances = self.refresh_checkpoints_bulk(&users_to_refresh).await?;
+            balances_map.extend(refreshed_balances);
+        }
+
+        // Query balances for remaining users (those not refreshed)
+        let remaining_users: Vec<UserId> = user_ids.iter().filter(|id| !balances_map.contains_key(id)).copied().collect();
+
+        if !remaining_users.is_empty() {
+            let rows = sqlx::query!(
+                r#"
+                SELECT
+                    u.user_id as "user_id!",
+                    COALESCE(c.balance, 0) + COALESCE(delta.sum, 0) as "balance!"
+                FROM unnest($1::uuid[]) AS u(user_id)
+                LEFT JOIN user_balance_checkpoints c ON c.user_id = u.user_id
+                LEFT JOIN LATERAL (
+                    SELECT SUM(
+                        CASE WHEN transaction_type IN ('admin_grant', 'purchase') THEN amount ELSE -amount END
+                    ) as sum
+                    FROM credits_transactions t
+                    WHERE t.user_id = u.user_id
+                    AND t.seq > COALESCE(c.checkpoint_seq, 0)
+                ) delta ON true
+                "#,
+                &remaining_users
+            )
+            .fetch_all(&mut *self.db)
+            .await?;
+
+            for row in rows {
+                balances_map.insert(row.user_id, row.balance);
+            }
+        }
+
+        Ok(balances_map)
+    }
+
+    /// Refresh checkpoints for multiple users and return their balances.
+    async fn refresh_checkpoints_bulk(&mut self, user_ids: &[UserId]) -> Result<HashMap<UserId, Decimal>> {
+        if user_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
         let rows = sqlx::query!(
             r#"
+            INSERT INTO user_balance_checkpoints (user_id, checkpoint_seq, balance)
             SELECT
-                u.user_id as "user_id!",
-                COALESCE(c.balance, 0) + COALESCE(delta.sum, 0) as "balance!"
+                u.user_id,
+                latest.seq,
+                COALESCE(c.balance, 0) + COALESCE(delta.sum, 0)
             FROM unnest($1::uuid[]) AS u(user_id)
             LEFT JOIN user_balance_checkpoints c ON c.user_id = u.user_id
             LEFT JOIN LATERAL (
@@ -229,24 +333,29 @@ impl<'c> Credits<'c> {
                 WHERE t.user_id = u.user_id
                 AND t.seq > COALESCE(c.checkpoint_seq, 0)
             ) delta ON true
+            LEFT JOIN LATERAL (
+                SELECT MAX(seq) as seq
+                FROM credits_transactions t
+                WHERE t.user_id = u.user_id
+            ) latest ON true
+            WHERE latest.seq IS NOT NULL
+            ON CONFLICT (user_id) DO UPDATE SET
+                checkpoint_seq = EXCLUDED.checkpoint_seq,
+                balance = EXCLUDED.balance,
+                updated_at = NOW()
+            RETURNING user_id, balance
             "#,
             user_ids
         )
         .fetch_all(&mut *self.db)
         .await?;
 
-        let mut balances_map = HashMap::new();
+        let mut balances = HashMap::with_capacity(rows.len());
         for row in rows {
-            balances_map.insert(
-                row.user_id,
-                row.balance.to_f64().unwrap_or_else(|| {
-                    error!("Failed to convert balance to f64 for user_id {}", row.user_id);
-                    0.0
-                }),
-            );
+            balances.insert(row.user_id, row.balance);
         }
 
-        Ok(balances_map)
+        Ok(balances)
     }
 
     /// List transactions for a specific user with pagination and optional filters
@@ -1353,135 +1462,6 @@ mod tests {
         assert_eq!(transactions.len(), 1);
     }
 
-    /// This test is to check the performance of creating transactions under concurrent load. If one thread
-    /// reads the balance while another is writing, it could lead to incorrect balances as the first one that
-    /// is committed wins and the second calculated its balance based on stale data.
-    #[sqlx::test]
-    #[test_log::test]
-    async fn test_balance_threshold_notification_triggers(pool: PgPool) {
-        use sqlx::postgres::PgListener;
-        use std::time::Duration;
-        use tokio::time::timeout;
-
-        let user_id = create_test_user(&pool).await;
-
-        // Setup a listener for auth_config_changed notifications
-        let mut listener = PgListener::connect_with(&pool).await.expect("Failed to create listener");
-        listener
-            .listen("auth_config_changed")
-            .await
-            .expect("Failed to listen to auth_config_changed");
-
-        // Test 1: Going from 0 to positive (SHOULD trigger - crossing zero threshold)
-        // This enables API keys when user gets their first credits
-        {
-            let mut conn = pool.acquire().await.expect("Failed to acquire connection");
-            let mut credits = Credits::new(&mut conn);
-
-            let request = CreditTransactionCreateDBRequest::admin_grant(
-                user_id,
-                user_id,
-                Decimal::from_str("100.0").unwrap(),
-                Some("Initial grant".to_string()),
-            );
-            credits.create_transaction(&request).await.expect("Failed to create transaction");
-        }
-
-        // Should receive notification
-        let notification = timeout(Duration::from_secs(2), listener.recv())
-            .await
-            .expect("Timeout waiting for notification")
-            .expect("Failed to receive notification");
-
-        assert_eq!(notification.channel(), "auth_config_changed");
-
-        let payload: serde_json::Value = serde_json::from_str(notification.payload()).expect("Failed to parse notification payload");
-
-        assert_eq!(payload["user_id"], user_id.to_string());
-        assert_eq!(payload["threshold_crossed"], "zero");
-        assert_eq!(payload["old_balance"].as_f64().unwrap(), 0.0);
-        assert_eq!(payload["new_balance"].as_f64().unwrap(), 100.0);
-
-        // Test 2: Going from positive to negative (crossing zero threshold downward - SHOULD trigger)
-        {
-            let mut conn = pool.acquire().await.expect("Failed to acquire connection");
-            let mut credits = Credits::new(&mut conn);
-
-            let request = CreditTransactionCreateDBRequest {
-                user_id,
-                transaction_type: CreditTransactionType::Usage,
-                amount: Decimal::from_str("150.0").unwrap(),
-                source_id: Uuid::new_v4().to_string(), // Mimics request ID from http_analytics
-                description: Some("Usage that crosses zero".to_string()),
-                fusillade_batch_id: None,
-            };
-            credits.create_transaction(&request).await.expect("Failed to create transaction");
-        }
-
-        // Should receive notification
-        let notification = timeout(Duration::from_secs(2), listener.recv())
-            .await
-            .expect("Timeout waiting for notification")
-            .expect("Failed to receive notification");
-
-        assert_eq!(notification.channel(), "auth_config_changed");
-
-        // Parse the JSON payload
-        let payload: serde_json::Value = serde_json::from_str(notification.payload()).expect("Failed to parse notification payload");
-
-        assert_eq!(payload["user_id"], user_id.to_string());
-        assert_eq!(payload["threshold_crossed"], "zero");
-        assert_eq!(payload["old_balance"].as_f64().unwrap(), 100.0);
-        assert_eq!(payload["new_balance"].as_f64().unwrap(), -50.0);
-
-        // Test 3: Going from negative to positive (crossing zero threshold upward - SHOULD trigger)
-        {
-            let mut conn = pool.acquire().await.expect("Failed to acquire connection");
-            let mut credits = Credits::new(&mut conn);
-
-            let request = CreditTransactionCreateDBRequest::admin_grant(
-                user_id,
-                user_id,
-                Decimal::from_str("100.0").unwrap(),
-                Some("Grant that crosses zero".to_string()),
-            );
-            credits.create_transaction(&request).await.expect("Failed to create transaction");
-        }
-
-        // Should receive notification
-        let notification = timeout(Duration::from_secs(2), listener.recv())
-            .await
-            .expect("Timeout waiting for notification")
-            .expect("Failed to receive notification");
-
-        assert_eq!(notification.channel(), "auth_config_changed");
-
-        let payload: serde_json::Value = serde_json::from_str(notification.payload()).expect("Failed to parse notification payload");
-
-        assert_eq!(payload["user_id"], user_id.to_string());
-        assert_eq!(payload["threshold_crossed"], "zero");
-        assert_eq!(payload["old_balance"].as_f64().unwrap(), -50.0);
-        assert_eq!(payload["new_balance"].as_f64().unwrap(), 50.0);
-
-        // Test 4: Staying in positive range (should NOT trigger)
-        {
-            let mut conn = pool.acquire().await.expect("Failed to acquire connection");
-            let mut credits = Credits::new(&mut conn);
-
-            let request = CreditTransactionCreateDBRequest::admin_grant(
-                user_id,
-                user_id,
-                Decimal::from_str("50.0").unwrap(),
-                Some("Another grant".to_string()),
-            );
-            credits.create_transaction(&request).await.expect("Failed to create transaction");
-        }
-
-        // Try to receive notification with short timeout - should NOT receive one
-        let result = timeout(Duration::from_millis(500), listener.recv()).await;
-        assert!(result.is_err(), "Should NOT receive notification when staying in positive range");
-    }
-
     /// Test that concurrent transactions correctly update the balance.
     /// With the checkpoint-based system, we verify that:
     /// 1. All concurrent transactions are created successfully
@@ -1566,6 +1546,90 @@ mod tests {
             Decimal::from_str("1250.0").unwrap(),
             "Expected 1250.0 but got {}",
             final_balance
+        );
+    }
+
+    /// Test that admin_grant crossing zero upward sends pg_notify
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_balance_restored_notification_on_admin_grant(pool: PgPool) {
+        use sqlx::postgres::PgListener;
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let user_id = create_test_user(&pool).await;
+
+        // Set up listener for auth_config_changed notifications
+        let mut listener = PgListener::connect_with(&pool).await.expect("Failed to create listener");
+        listener.listen("auth_config_changed").await.expect("Failed to listen");
+
+        // Create initial negative balance by granting then using more
+        {
+            let mut conn = pool.acquire().await.expect("Failed to acquire connection");
+            let mut credits = Credits::new(&mut conn);
+
+            // Grant 10 credits
+            let grant = CreditTransactionCreateDBRequest::admin_grant(
+                user_id,
+                user_id,
+                Decimal::from_str("10.0").unwrap(),
+                Some("Initial grant".to_string()),
+            );
+            credits.create_transaction(&grant).await.expect("Failed to grant");
+        }
+
+        // Drain any notifications from the initial grant (user went from 0 to positive)
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        while timeout(Duration::from_millis(10), listener.try_recv()).await.is_ok() {}
+
+        // Use 15 credits to go negative
+        {
+            let mut conn = pool.acquire().await.expect("Failed to acquire connection");
+            let mut credits = Credits::new(&mut conn);
+
+            let usage = CreditTransactionCreateDBRequest {
+                user_id,
+                transaction_type: CreditTransactionType::Usage,
+                amount: Decimal::from_str("15.0").unwrap(),
+                source_id: Uuid::new_v4().to_string(),
+                description: Some("Usage to go negative".to_string()),
+                fusillade_batch_id: None,
+            };
+            credits.create_transaction(&usage).await.expect("Failed to use");
+        }
+
+        // Drain any notifications (usage doesn't trigger notification via this path)
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        while timeout(Duration::from_millis(10), listener.try_recv()).await.is_ok() {}
+
+        // Now grant credits to cross zero upward - this SHOULD trigger notification
+        {
+            let mut conn = pool.acquire().await.expect("Failed to acquire connection");
+            let mut credits = Credits::new(&mut conn);
+
+            let grant = CreditTransactionCreateDBRequest::admin_grant(
+                user_id,
+                user_id,
+                Decimal::from_str("20.0").unwrap(),
+                Some("Grant to restore balance".to_string()),
+            );
+            credits.create_transaction(&grant).await.expect("Failed to grant");
+        }
+
+        // Should receive notification for crossing zero upward
+        let notification = timeout(Duration::from_secs(2), listener.recv())
+            .await
+            .expect("Timeout waiting for notification")
+            .expect("Failed to receive notification");
+
+        assert_eq!(notification.channel(), "auth_config_changed");
+
+        // Verify payload format: "credits_transactions:{epoch_micros}"
+        let payload = notification.payload();
+        assert!(
+            payload.starts_with("credits_transactions:"),
+            "Expected payload to start with 'credits_transactions:', got: {}",
+            payload
         );
     }
 

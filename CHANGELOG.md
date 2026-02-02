@@ -1,5 +1,85 @@
 # Changelog
 
+## [5.0.3](https://github.com/doublewordai/control-layer/compare/v5.0.2...v5.0.3) (2026-01-30)
+
+
+### Bug Fixes
+
+* 100 pagination ([#638](https://github.com/doublewordai/control-layer/issues/638)) ([dc06510](https://github.com/doublewordai/control-layer/commit/dc06510a3ef3c2d63ba303d10b737ff3f0752dec))
+* don't query all deployments in file estimate ([#641](https://github.com/doublewordai/control-layer/issues/641)) ([ce9b2a5](https://github.com/doublewordai/control-layer/commit/ce9b2a55da4597a152380c3ecd63b02832665303))
+
+## [5.0.2](https://github.com/doublewordai/control-layer/compare/v5.0.1...v5.0.2) (2026-01-29)
+
+
+### Bug Fixes
+
+* **batches:** use fusillade sla based error filtering from dwctl handlers ([#624](https://github.com/doublewordai/control-layer/issues/624)) ([8812d06](https://github.com/doublewordai/control-layer/commit/8812d06f0ac9b069075290e6325d74802d41738e))
+
+## [5.0.1](https://github.com/doublewordai/control-layer/compare/v5.0.0...v5.0.1) (2026-01-28)
+
+
+### Bug Fixes
+
+* optimize balance threshold notifications for batch inserts ([#630](https://github.com/doublewordai/control-layer/issues/630)) ([9e39939](https://github.com/doublewordai/control-layer/commit/9e39939a321c29fdfc0d43c0331d10199dfa6d16))
+
+## [5.0.0](https://github.com/doublewordai/control-layer/compare/v4.1.0...v5.0.0) (2026-01-28)
+
+
+### ⚠ BREAKING CHANGES
+
+* update to fusillade 3.0.1 with route-at-claim-time escalation ([#627](https://github.com/doublewordai/control-layer/issues/627))
+
+### Features
+
+* update to fusillade 3.0.1 with route-at-claim-time escalation ([#627](https://github.com/doublewordai/control-layer/issues/627)) ([21ea357](https://github.com/doublewordai/control-layer/commit/21ea357561b88129c9436801adce1732f70e32aa))
+
+## [4.1.0](https://github.com/doublewordai/control-layer/compare/v4.0.0...v4.1.0) (2026-01-28)
+
+
+### Features
+
+* decouple analytics from request logging with write-through batching ([#603](https://github.com/doublewordai/control-layer/issues/603)) ([1869a3a](https://github.com/doublewordai/control-layer/commit/1869a3a9b0cf7525a22ce4dc213f4127282c6e46))
+
+
+### Bug Fixes
+
+* bump fusillade ([#626](https://github.com/doublewordai/control-layer/issues/626)) ([bf8ac6b](https://github.com/doublewordai/control-layer/commit/bf8ac6bd9f001b33f7f991f39bf737f879248c2f))
+
+## [4.0.0](https://github.com/doublewordai/control-layer/compare/v3.3.1...v4.0.0) (2026-01-27)
+
+
+### ⚠ BREAKING CHANGES
+
+* File limits configuration has been reorganized.
+
+### Features
+
+* consolidate file limits config and add max_requests_per_file ([#617](https://github.com/doublewordai/control-layer/issues/617)) ([7bd0ee3](https://github.com/doublewordai/control-layer/commit/7bd0ee304bbb2cefb02afec85f230d824f9daf3c))
+
+
+### Bug Fixes
+
+* **deps:** update dependency lucide-react to ^0.563.0 ([#621](https://github.com/doublewordai/control-layer/issues/621)) ([52d8e8e](https://github.com/doublewordai/control-layer/commit/52d8e8ea9d5fe224c2ec9beaa5b26c91dcbd65b8))
+
+## [3.3.1](https://github.com/doublewordai/control-layer/compare/v3.3.0...v3.3.1) (2026-01-27)
+
+
+### Bug Fixes
+
+* sync package-lock.json with package.json ([fa3c491](https://github.com/doublewordai/control-layer/commit/fa3c491a0b25227af8bc9d3efbcb9b13717b28c8))
+
+## [3.3.0](https://github.com/doublewordai/control-layer/compare/v3.2.0...v3.3.0) (2026-01-27)
+
+
+### Features
+
+* add configurable file upload concurrency limits ([#614](https://github.com/doublewordai/control-layer/issues/614)) ([67065a3](https://github.com/doublewordai/control-layer/commit/67065a36e8deb10554a3b9cf91a176f206e90496))
+
+
+### Bug Fixes
+
+* **deps:** update dependency lucide-react to ^0.563.0 ([#579](https://github.com/doublewordai/control-layer/issues/579)) ([ff714a2](https://github.com/doublewordai/control-layer/commit/ff714a23bb68d79118cd8d4b35b0576aa1948560))
+
 ## [3.2.0](https://github.com/doublewordai/control-layer/compare/v3.1.2...v3.2.0) (2026-01-27)
 
 

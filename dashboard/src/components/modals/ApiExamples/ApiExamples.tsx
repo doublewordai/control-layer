@@ -195,23 +195,27 @@ async function runBatch() {
 runBatch();`;
     } else {
       return `# Step 1: Upload a batch input file
-curl -X POST "${getBaseUrl()}/files" \\
+FILE_ID=$(curl -s -X POST "${getBaseUrl()}/files" \\
   -H "Authorization: Bearer ${keyValue}" \\
   -F "purpose=batch" \\
-  -F "file=@batch_requests.jsonl"
+  -F "file=@batch_requests.jsonl" | jq -r '.id')
 
-# Step 2: Create a batch job (use file ID from step 1)
-curl -X POST "${getBaseUrl()}/batches" \\
+echo "File ID: $FILE_ID"
+
+# Step 2: Create a batch job (uses file ID from step 1)
+BATCH_ID=$(curl -s -X POST "${getBaseUrl()}/batches" \\
   -H "Content-Type: application/json" \\
   -H "Authorization: Bearer ${keyValue}" \\
   -d '{
-    "input_file_id": "file-abc123",
+    "input_file_id": "'"$FILE_ID"'",
     "endpoint": "/v1/chat/completions",
     "completion_window": "24h"
-  }'
+  }' | jq -r '.id')
 
-# Step 3: Check batch status (use batch ID from step 2)
-curl "${getBaseUrl()}/batches/batch_abc123" \\
+echo "Batch ID: $BATCH_ID"
+
+# Step 3: Check batch status (uses batch ID from step 2)
+curl -s "${getBaseUrl()}/batches/$BATCH_ID" \\
   -H "Authorization: Bearer ${keyValue}"`;
     }
   };
