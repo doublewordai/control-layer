@@ -509,6 +509,8 @@ async fn setup_database(
     config: &Config,
     pool: Option<PgPool>,
 ) -> anyhow::Result<(Option<db::embedded::EmbeddedDatabase>, DbPools, DbPools, Option<DbPools>)> {
+    let slow_threshold = std::time::Duration::from_millis(config.slow_statement_threshold_ms);
+
     // If a pool is provided (e.g., from tests), create a TestDbPools which will create a read-only replica
     let (embedded_db, pool, test_replica_pool) = if let Some(existing_pool) = pool {
         info!("Using provided database pool with TestDbPools for read/write separation");
@@ -552,8 +554,7 @@ async fn setup_database(
         };
 
         let main_settings = config.database.main_pool_settings();
-        let connect_opts =
-            PgConnectOptions::from_str(&database_url)?.log_slow_statements(log::LevelFilter::Warn, std::time::Duration::from_millis(100));
+        let connect_opts = PgConnectOptions::from_str(&database_url)?.log_slow_statements(log::LevelFilter::Warn, slow_threshold);
         let pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(main_settings.max_connections)
             .min_connections(main_settings.min_connections)
@@ -582,8 +583,7 @@ async fn setup_database(
     } else if let Some(replica_url) = config.database.external_replica_url() {
         info!("Setting up read replica pool");
         let replica_settings = config.database.main_replica_pool_settings();
-        let replica_opts =
-            PgConnectOptions::from_str(replica_url)?.log_slow_statements(log::LevelFilter::Warn, std::time::Duration::from_millis(100));
+        let replica_opts = PgConnectOptions::from_str(replica_url)?.log_slow_statements(log::LevelFilter::Warn, slow_threshold);
         let replica_pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(replica_settings.max_connections)
             .min_connections(replica_settings.min_connections)
@@ -673,7 +673,7 @@ async fn setup_database(
         } => {
             info!("Using dedicated database for fusillade");
             let connect_opts =
-                PgConnectOptions::from_str(url)?.log_slow_statements(log::LevelFilter::Warn, std::time::Duration::from_millis(100));
+                PgConnectOptions::from_str(url)?.log_slow_statements(log::LevelFilter::Warn, slow_threshold);
             let primary = sqlx::postgres::PgPoolOptions::new()
                 .max_connections(pool_settings.max_connections)
                 .min_connections(pool_settings.min_connections)
@@ -695,7 +695,7 @@ async fn setup_database(
                 info!("Setting up fusillade read replica");
                 let replica_pool_settings = config.database.fusillade().replica_pool_settings();
                 let replica_opts = PgConnectOptions::from_str(replica_url)?
-                    .log_slow_statements(log::LevelFilter::Warn, std::time::Duration::from_millis(100));
+                    .log_slow_statements(log::LevelFilter::Warn, slow_threshold);
                 let replica = sqlx::postgres::PgPoolOptions::new()
                     .max_connections(replica_pool_settings.max_connections)
                     .min_connections(replica_pool_settings.min_connections)
@@ -750,7 +750,7 @@ async fn setup_database(
             } => {
                 info!("Using dedicated database for outlet");
                 let connect_opts =
-                    PgConnectOptions::from_str(url)?.log_slow_statements(log::LevelFilter::Warn, std::time::Duration::from_millis(100));
+                    PgConnectOptions::from_str(url)?.log_slow_statements(log::LevelFilter::Warn, slow_threshold);
                 let primary = sqlx::postgres::PgPoolOptions::new()
                     .max_connections(pool_settings.max_connections)
                     .min_connections(pool_settings.min_connections)
@@ -772,7 +772,7 @@ async fn setup_database(
                     info!("Setting up outlet read replica");
                     let replica_pool_settings = config.database.outlet().replica_pool_settings();
                     let replica_opts = PgConnectOptions::from_str(replica_url)?
-                        .log_slow_statements(log::LevelFilter::Warn, std::time::Duration::from_millis(100));
+                        .log_slow_statements(log::LevelFilter::Warn, slow_threshold);
                     let replica = sqlx::postgres::PgPoolOptions::new()
                         .max_connections(replica_pool_settings.max_connections)
                         .min_connections(replica_pool_settings.min_connections)
@@ -1900,6 +1900,10 @@ impl Application {
         // Close database connections
         info!("Closing database connections...");
         self.db_pools.close().await;
+
+        // Shutdown telemetry
+        info!("Shutting down telemetry...");
+        telemetry::shutdown_telemetry();
 
         // Clean up embedded database if it exists
         if let Some(embedded_db) = self._embedded_db {

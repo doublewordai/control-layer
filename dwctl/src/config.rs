@@ -116,6 +116,8 @@ pub struct Config {
     pub database_replica_url: Option<String>,
     /// Database configuration - either embedded or external PostgreSQL
     pub database: DatabaseConfig,
+    /// Threshold in milliseconds for logging slow SQL statements (default: 1000ms)
+    pub slow_statement_threshold_ms: u64,
     /// Email address for the initial admin user (created on first startup)
     pub admin_email: String,
     /// Password for the initial admin user (optional, can be set via environment)
@@ -1205,6 +1207,7 @@ impl Default for Config {
             database_url: None, // Deprecated field
             database_replica_url: None,
             database: DatabaseConfig::default(),
+            slow_statement_threshold_ms: 1000,
             admin_email: "test@doubleword.ai".to_string(),
             admin_password: Some("hunter2".to_string()),
             secret_key: None,
