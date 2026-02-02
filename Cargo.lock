@@ -1476,6 +1476,7 @@ dependencies = [
  "humantime-serde",
  "jsonwebtoken",
  "lettre",
+ "log",
  "metrics",
  "metrics-exporter-prometheus",
  "mime_guess",
