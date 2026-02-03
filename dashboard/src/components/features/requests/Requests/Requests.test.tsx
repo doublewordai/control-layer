@@ -102,12 +102,25 @@ const modelsHandler = http.get("/admin/api/v1/models", () => {
   });
 });
 
+// Add handler for monitoring pending request counts endpoint
+const pendingRequestCountsHandler = http.get(
+  "/admin/api/v1/monitoring/pending-request-counts",
+  () => {
+    return HttpResponse.json({
+      "claude-sonnet-3.5": { "1h": 0, "24h": 0 },
+      "gpt-4": { "1h": 0, "24h": 0 },
+      "gpt-3.5-turbo": { "1h": 0, "24h": 0 },
+    });
+  },
+);
+
 // Setup MSW server with all handlers
 const server = setupServer(
   ...handlers,
   requestsAnalyticsHandler,
   requestsHandler,
   modelsHandler,
+  pendingRequestCountsHandler,
 );
 
 beforeAll(() => server.listen({ onUnhandledRequest: "error" }));

@@ -45,11 +45,11 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Initialize telemetry (tracing + optional OpenTelemetry)
-    telemetry::init_telemetry(config.enable_otel_export)?;
+    let tracer_provider = telemetry::init_telemetry(config.enable_otel_export)?;
 
     tracing::debug!("{:?}", args);
 
     // Run the application with graceful shutdown on SIGTERM/Ctrl+C
     let shutdown = shutdown_signal();
-    Application::new(config).await?.serve(shutdown).await
+    Application::new(config, tracer_provider).await?.serve(shutdown).await
 }

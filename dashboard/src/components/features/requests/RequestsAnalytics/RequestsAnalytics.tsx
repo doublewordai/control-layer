@@ -12,7 +12,11 @@ import {
   PieChart,
   Sector,
 } from "recharts";
-import { useRequestsAggregate, useModels } from "../../../../api/control-layer";
+import {
+  usePendingRequestCounts,
+  useRequestsAggregate,
+  useModels,
+} from "../../../../api/control-layer";
 import { Card, CardContent, CardHeader, CardTitle } from "../../../ui/card";
 import {
   HoverCard,
@@ -42,6 +46,12 @@ export function RequestsAnalytics({
   );
   const { data: allModelsData } = useRequestsAggregate(undefined, dateRange);
   const { data: modelsData } = useModels();
+
+  const {
+    data: pendingCounts,
+    isLoading: pendingCountsLoading,
+    error: pendingCountsError,
+  } = usePendingRequestCounts({ enabled: !!selectedModel });
 
   // Initialize all React hooks at the top
   const [activeModel, setActiveModel] = React.useState("");
@@ -96,6 +106,17 @@ export function RequestsAnalytics({
     selectedModel && modelsData
       ? modelsData.data.find((model) => model.model_name === selectedModel)
       : null;
+
+  const selectedModelPendingCounts =
+    selectedModel && pendingCounts ? pendingCounts[selectedModel] : undefined;
+  const pending1h =
+    selectedModelPendingCounts?.["1h"] ??
+    selectedModelPendingCounts?.["1hr"] ??
+    0;
+  const pending24h =
+    selectedModelPendingCounts?.["24h"] ??
+    selectedModelPendingCounts?.["24hr"] ??
+    0;
 
   // Show loading state
   if (isLoading) {
@@ -209,6 +230,51 @@ export function RequestsAnalytics({
 
   return (
     <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+      {/* Pending Queue Card - only show when a model is selected */}
+      {selectedModel && (
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-sm flex items-center gap-1">
+              Pending Queue (SLA)
+              <HoverCard openDelay={100} closeDelay={100}>
+                <HoverCardTrigger asChild>
+                  <Info className="h-3 w-3 text-muted-foreground " />
+                </HoverCardTrigger>
+                <HoverCardContent className="w-80">
+                  <p className="text-sm">
+                    Shows how many batch requests are currently waiting for the
+                    selected model, grouped by completion window (SLA).
+                  </p>
+                </HoverCardContent>
+              </HoverCard>
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="flex justify-center items-center min-h-32">
+            {pendingCountsLoading ? (
+              <p className="text-doubleword-neutral-600">Loading...</p>
+            ) : pendingCountsError ? (
+              <p className="text-doubleword-neutral-600">Unavailable</p>
+            ) : (
+              <>
+                <div className="text-center">
+                  <p className="text-sm text-doubleword-neutral-600">1 hr</p>
+                  <div className="text-3xl font-bold">
+                    {pending1h.toLocaleString()}
+                  </div>
+                </div>
+                <div className="w-px bg-border mx-4"></div>
+                <div className="text-center">
+                  <p className="text-sm text-doubleword-neutral-600">24 hr</p>
+                  <div className="text-3xl font-bold">
+                    {pending24h.toLocaleString()}
+                  </div>
+                </div>
+              </>
+            )}
+          </CardContent>
+        </Card>
+      )}
+
       {/* Gateway Traffic Card */}
       <Card>
         <CardHeader>

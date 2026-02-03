@@ -99,10 +99,10 @@
 //!     let config = Config::load(&args)?;
 //!
 //!     // Initialize telemetry (structured logging and optional OpenTelemetry)
-//!     dwctl::telemetry::init_telemetry(config.enable_otel_export)?;
+//!     let tracer_provider = dwctl::telemetry::init_telemetry(config.enable_otel_export)?;
 //!
 //!     // Create and start the application
-//!     let app = Application::new(config).await?;
+//!     let app = Application::new(config, tracer_provider).await?;
 //!
 //!     // Run with graceful shutdown on Ctrl+C
 //!     app.serve(async {
@@ -188,15 +188,13 @@ use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 use outlet::{MultiHandler, RequestLoggerConfig, RequestLoggerLayer};
 use outlet_postgres::PostgresHandler;
 use request_logging::{AiResponse, ParsedAIRequest};
-use sqlx::{Executor, PgPool};
+use sqlx::{ConnectOptions, Executor, PgPool, postgres::PgConnectOptions};
+use std::str::FromStr;
 use std::sync::{Arc, OnceLock};
 use tokio::net::TcpListener;
 use tower::Layer;
-use tower_http::{
-    cors::CorsLayer,
-    trace::{DefaultMakeSpan, DefaultOnRequest, DefaultOnResponse, TraceLayer},
-};
-use tracing::{Level, debug, info, instrument};
+use tower_http::{cors::CorsLayer, trace::TraceLayer};
+use tracing::{debug, info, instrument};
 use utoipa::OpenApi;
 use utoipa_scalar::{Scalar, Servable};
 use uuid::Uuid;
@@ -511,6 +509,8 @@ async fn setup_database(
     config: &Config,
     pool: Option<PgPool>,
 ) -> anyhow::Result<(Option<db::embedded::EmbeddedDatabase>, DbPools, DbPools, Option<DbPools>)> {
+    let slow_threshold = std::time::Duration::from_millis(config.slow_statement_threshold_ms);
+
     // If a pool is provided (e.g., from tests), create a TestDbPools which will create a read-only replica
     let (embedded_db, pool, test_replica_pool) = if let Some(existing_pool) = pool {
         info!("Using provided database pool with TestDbPools for read/write separation");
@@ -554,6 +554,7 @@ async fn setup_database(
         };
 
         let main_settings = config.database.main_pool_settings();
+        let connect_opts = PgConnectOptions::from_str(&database_url)?.log_slow_statements(log::LevelFilter::Warn, slow_threshold);
         let pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(main_settings.max_connections)
             .min_connections(main_settings.min_connections)
@@ -568,7 +569,7 @@ async fn setup_database(
             } else {
                 None
             })
-            .connect(&database_url)
+            .connect_with(connect_opts)
             .await?;
         (_embedded_db, pool, None)
     };
@@ -582,6 +583,7 @@ async fn setup_database(
     } else if let Some(replica_url) = config.database.external_replica_url() {
         info!("Setting up read replica pool");
         let replica_settings = config.database.main_replica_pool_settings();
+        let replica_opts = PgConnectOptions::from_str(replica_url)?.log_slow_statements(log::LevelFilter::Warn, slow_threshold);
         let replica_pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(replica_settings.max_connections)
             .min_connections(replica_settings.min_connections)
@@ -596,7 +598,7 @@ async fn setup_database(
             } else {
                 None
             })
-            .connect(replica_url)
+            .connect_with(replica_opts)
             .await?;
         DbPools::with_replica(pool, replica_pool)
     } else {
@@ -670,6 +672,7 @@ async fn setup_database(
             ..
         } => {
             info!("Using dedicated database for fusillade");
+            let connect_opts = PgConnectOptions::from_str(url)?.log_slow_statements(log::LevelFilter::Warn, slow_threshold);
             let primary = sqlx::postgres::PgPoolOptions::new()
                 .max_connections(pool_settings.max_connections)
                 .min_connections(pool_settings.min_connections)
@@ -684,12 +687,13 @@ async fn setup_database(
                 } else {
                     None
                 })
-                .connect(url)
+                .connect_with(connect_opts)
                 .await?;
 
             if let Some(replica_url) = replica_url {
                 info!("Setting up fusillade read replica");
                 let replica_pool_settings = config.database.fusillade().replica_pool_settings();
+                let replica_opts = PgConnectOptions::from_str(replica_url)?.log_slow_statements(log::LevelFilter::Warn, slow_threshold);
                 let replica = sqlx::postgres::PgPoolOptions::new()
                     .max_connections(replica_pool_settings.max_connections)
                     .min_connections(replica_pool_settings.min_connections)
@@ -704,7 +708,7 @@ async fn setup_database(
                     } else {
                         None
                     })
-                    .connect(replica_url)
+                    .connect_with(replica_opts)
                     .await?;
                 DbPools::with_replica(primary, replica)
             } else {
@@ -743,6 +747,7 @@ async fn setup_database(
                 ..
             } => {
                 info!("Using dedicated database for outlet");
+                let connect_opts = PgConnectOptions::from_str(url)?.log_slow_statements(log::LevelFilter::Warn, slow_threshold);
                 let primary = sqlx::postgres::PgPoolOptions::new()
                     .max_connections(pool_settings.max_connections)
                     .min_connections(pool_settings.min_connections)
@@ -757,12 +762,13 @@ async fn setup_database(
                     } else {
                         None
                     })
-                    .connect(url)
+                    .connect_with(connect_opts)
                     .await?;
 
                 if let Some(replica_url) = replica_url {
                     info!("Setting up outlet read replica");
                     let replica_pool_settings = config.database.outlet().replica_pool_settings();
+                    let replica_opts = PgConnectOptions::from_str(replica_url)?.log_slow_statements(log::LevelFilter::Warn, slow_threshold);
                     let replica = sqlx::postgres::PgPoolOptions::new()
                         .max_connections(replica_pool_settings.max_connections)
                         .min_connections(replica_pool_settings.min_connections)
@@ -777,7 +783,7 @@ async fn setup_database(
                         } else {
                             None
                         })
-                        .connect(replica_url)
+                        .connect_with(replica_opts)
                         .await?;
                     DbPools::with_replica(primary, replica)
                 } else {
@@ -1069,7 +1075,12 @@ pub async fn build_router(
         .route("/probes/{id}/deactivate", patch(api::handlers::probes::deactivate_probe))
         .route("/probes/{id}/execute", post(api::handlers::probes::execute_probe))
         .route("/probes/{id}/results", get(api::handlers::probes::get_probe_results))
-        .route("/probes/{id}/statistics", get(api::handlers::probes::get_statistics));
+        .route("/probes/{id}/statistics", get(api::handlers::probes::get_statistics))
+        // Queue monitoring
+        .route(
+            "/monitoring/pending-request-counts",
+            get(api::handlers::queue::get_pending_request_counts),
+        );
 
     let api_routes_with_state = api_routes.with_state(state.clone());
 
@@ -1207,13 +1218,27 @@ pub async fn build_router(
             .layer(prometheus_layer);
     }
 
-    // Add tracing layer
-    let router = router.layer(
-        TraceLayer::new_for_http()
-            .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
-            .on_request(DefaultOnRequest::new().level(Level::INFO))
-            .on_response(DefaultOnResponse::new().level(Level::INFO)),
-    );
+    // Add tracing layer with OTel-compatible span names and HTTP semantic conventions
+    let router = router.layer(TraceLayer::new_for_http().make_span_with(|request: &http::Request<_>| {
+        let path = request.uri().path();
+        let span_name = format!("{} {}", request.method(), path);
+        let api_type = if path.starts_with("/ai/") {
+            "ai_proxy"
+        } else if path.starts_with("/admin/") {
+            "admin"
+        } else {
+            "other"
+        };
+        tracing::info_span!(
+            "request",
+            otel.name = %span_name,
+            otel.kind = "Server",
+            api.type = api_type,
+            http.request.method = %request.method(),
+            url.path = path,
+            url.query = request.uri().query().unwrap_or(""),
+        )
+    }));
 
     Ok(router)
 }
@@ -1736,6 +1761,7 @@ pub struct Application {
     _fusillade_pools: DbPools,
     _outlet_pools: Option<DbPools>,
     _embedded_db: Option<db::embedded::EmbeddedDatabase>,
+    _tracer_provider: Option<telemetry::SdkTracerProvider>,
     bg_services: BackgroundServices,
 }
 
@@ -1744,15 +1770,19 @@ impl Application {
     ///
     /// If `pool` is provided, it will be used directly instead of creating a new connection.
     /// This is useful for tests where sqlx::test provides a pool.
-    pub async fn new(config: Config) -> anyhow::Result<Self> {
-        Self::new_with_pool(config, None).await
+    pub async fn new(config: Config, tracer_provider: Option<telemetry::SdkTracerProvider>) -> anyhow::Result<Self> {
+        Self::new_with_pool(config, None, tracer_provider).await
     }
 
     /// Create a new application instance with an existing database pool
     ///
     /// This method is primarily for tests where sqlx::test provides a pool.
     /// For production use, prefer [`Application::new`] which will create its own pool.
-    pub async fn new_with_pool(config: Config, pool: Option<PgPool>) -> anyhow::Result<Self> {
+    pub async fn new_with_pool(
+        config: Config,
+        pool: Option<PgPool>,
+        tracer_provider: Option<telemetry::SdkTracerProvider>,
+    ) -> anyhow::Result<Self> {
         debug!("Starting control layer with configuration: {:#?}", config);
 
         // Setup database connections, run migrations, and initialize data
@@ -1823,6 +1853,7 @@ impl Application {
             _fusillade_pools: fusillade_pools,
             _outlet_pools: outlet_pools,
             _embedded_db,
+            _tracer_provider: tracer_provider,
             bg_services,
         })
     }
@@ -1877,9 +1908,13 @@ impl Application {
         info!("Closing database connections...");
         self.db_pools.close().await;
 
-        // Shutdown telemetry
-        info!("Shutting down telemetry...");
-        telemetry::shutdown_telemetry();
+        // Shutdown telemetry to flush pending spans
+        if let Some(provider) = self._tracer_provider.take() {
+            info!("Shutting down telemetry...");
+            if let Err(e) = provider.shutdown() {
+                tracing::error!("Failed to shutdown tracer provider: {}", e);
+            }
+        }
 
         // Clean up embedded database if it exists
         if let Some(embedded_db) = self._embedded_db {

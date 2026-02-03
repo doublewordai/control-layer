@@ -1,6 +1,6 @@
 [package]
 name = "dwctl"
-version = "5.0.2"
+version = "5.0.3"
 edition = "2024"
 description = "The Doubleword Control Layer - A self-hostable observability and analytics platform for LLM applications"
 license = "MIT OR Apache-2.0"
@@ -19,7 +19,7 @@ embedded-db = ["dep:postgresql_embedded"]
 
 [dependencies]
 axum = { version = "0.8", features = ["multipart"] }
-fusillade = "4.0.0"
+fusillade = { version="5.0.0" }
 tokio = { version = "1.0", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = "0.7"
@@ -36,16 +36,17 @@ serde_json = "1.0"
 uuid = { version = "1.0", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 anyhow = "1.0"
+log = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # OpenTelemetry
-opentelemetry = "0.27"
-opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.27", features = [
+opentelemetry = "0.31.0"
+opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.31", features = [
   "http-proto",
   "reqwest-client",
 ] }
-tracing-opentelemetry = "0.28"
+tracing-opentelemetry = "0.32.1"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "fs", "trace"] }
 async-trait = "0.1"
@@ -73,14 +74,14 @@ jsonwebtoken = "9.0"
 argon2 = "0.5"
 base64 = "0.22"
 bytes = "1.5"
-onwards = "0.11.1"
+onwards = "0.11.2"
 thiserror = "2.0.14"
 axum-prometheus = "0.10"
 # Metrics facade and exporter (same versions as axum-prometheus uses)
 metrics = "0.24"
 metrics-exporter-prometheus = "0.18"
-outlet = "0.4.5"
-outlet-postgres = "0.4.5"
+outlet = "0.5.1"
+outlet-postgres = "0.4.6"
 async-openai = { version = "0.29.2", default-features = false }
 brotli = "8.0"
 lettre = { version = "0.11", features = [
