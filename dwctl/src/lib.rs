@@ -99,10 +99,10 @@
 //!     let config = Config::load(&args)?;
 //!
 //!     // Initialize telemetry (structured logging and optional OpenTelemetry)
-//!     dwctl::telemetry::init_telemetry(config.enable_otel_export)?;
+//!     let tracer_provider = dwctl::telemetry::init_telemetry(config.enable_otel_export)?;
 //!
 //!     // Create and start the application
-//!     let app = Application::new(config).await?;
+//!     let app = Application::new(config, tracer_provider).await?;
 //!
 //!     // Run with graceful shutdown on Ctrl+C
 //!     app.serve(async {
@@ -672,8 +672,7 @@ async fn setup_database(
             ..
         } => {
             info!("Using dedicated database for fusillade");
-            let connect_opts =
-                PgConnectOptions::from_str(url)?.log_slow_statements(log::LevelFilter::Warn, slow_threshold);
+            let connect_opts = PgConnectOptions::from_str(url)?.log_slow_statements(log::LevelFilter::Warn, slow_threshold);
             let primary = sqlx::postgres::PgPoolOptions::new()
                 .max_connections(pool_settings.max_connections)
                 .min_connections(pool_settings.min_connections)
@@ -694,8 +693,7 @@ async fn setup_database(
             if let Some(replica_url) = replica_url {
                 info!("Setting up fusillade read replica");
                 let replica_pool_settings = config.database.fusillade().replica_pool_settings();
-                let replica_opts = PgConnectOptions::from_str(replica_url)?
-                    .log_slow_statements(log::LevelFilter::Warn, slow_threshold);
+                let replica_opts = PgConnectOptions::from_str(replica_url)?.log_slow_statements(log::LevelFilter::Warn, slow_threshold);
                 let replica = sqlx::postgres::PgPoolOptions::new()
                     .max_connections(replica_pool_settings.max_connections)
                     .min_connections(replica_pool_settings.min_connections)
@@ -749,8 +747,7 @@ async fn setup_database(
                 ..
             } => {
                 info!("Using dedicated database for outlet");
-                let connect_opts =
-                    PgConnectOptions::from_str(url)?.log_slow_statements(log::LevelFilter::Warn, slow_threshold);
+                let connect_opts = PgConnectOptions::from_str(url)?.log_slow_statements(log::LevelFilter::Warn, slow_threshold);
                 let primary = sqlx::postgres::PgPoolOptions::new()
                     .max_connections(pool_settings.max_connections)
                     .min_connections(pool_settings.min_connections)
@@ -771,8 +768,7 @@ async fn setup_database(
                 if let Some(replica_url) = replica_url {
                     info!("Setting up outlet read replica");
                     let replica_pool_settings = config.database.outlet().replica_pool_settings();
-                    let replica_opts = PgConnectOptions::from_str(replica_url)?
-                        .log_slow_statements(log::LevelFilter::Warn, slow_threshold);
+                    let replica_opts = PgConnectOptions::from_str(replica_url)?.log_slow_statements(log::LevelFilter::Warn, slow_threshold);
                     let replica = sqlx::postgres::PgPoolOptions::new()
                         .max_connections(replica_pool_settings.max_connections)
                         .min_connections(replica_pool_settings.min_connections)
@@ -1769,10 +1765,7 @@ impl Application {
     ///
     /// If `pool` is provided, it will be used directly instead of creating a new connection.
     /// This is useful for tests where sqlx::test provides a pool.
-    pub async fn new(
-        config: Config,
-        tracer_provider: Option<telemetry::SdkTracerProvider>,
-    ) -> anyhow::Result<Self> {
+    pub async fn new(config: Config, tracer_provider: Option<telemetry::SdkTracerProvider>) -> anyhow::Result<Self> {
         Self::new_with_pool(config, None, tracer_provider).await
     }
 
