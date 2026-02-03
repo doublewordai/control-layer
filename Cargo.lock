@@ -1446,7 +1446,7 @@ checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
 name = "dwctl"
-version = "6.1.0"
+version = "5.0.3"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -1472,6 +1472,7 @@ dependencies = [
  "figment",
  "fusillade",
  "futures",
+ "hmac",
  "humantime",
  "humantime-serde",
  "jsonwebtoken",
@@ -1480,9 +1481,7 @@ dependencies = [
  "metrics",
  "metrics-exporter-prometheus",
  "mime_guess",
- "minijinja",
  "moka",
- "multer",
  "once_cell",
  "onwards",
  "opentelemetry",
@@ -1503,6 +1502,7 @@ dependencies = [
  "serde_urlencoded",
  "serde_with",
  "serial_test",
+ "sha2",
  "sqlx",
  "sqlx-pool-router",
  "tempfile",
@@ -1812,9 +1812,9 @@ checksum = "e6d5a32815ae3f33302d95fdcb2ce17862f8c65363dcfd29360480ba1001fc9c"
 
 [[package]]
 name = "fusillade"
-version = "5.2.0"
+version = "5.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f1d388279eb30a5fa3fe3e582d1b888aeb1b6b78cec6a6a755ef8c3f8d280357"
+checksum = "648671300d0f0c247ac8fbbd1dd0a6e6f96cd40e3ebd0af6e3d55629b16013c5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2856,15 +2856,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "minijinja"
-version = "2.15.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b479616bb6f0779fb0f3964246beda02d4b01144e1b0d5519616e012ccc2a245"
-dependencies = [
- "serde",
-]
-
-[[package]]
 name = "minimal-lexical"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3290,6 +3281,7 @@ dependencies = [
  "prost",
  "reqwest 0.12.28",
  "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]
@@ -3324,9 +3316,9 @@ dependencies = [
 
 [[package]]
 name = "outlet"
-version = "0.5.2"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5d484da44ecf98edcf2664301db1a2109baf78f108727997f590b5485bad22d7"
+checksum = "95108e61364885ef15285280920cb7d15651597d3b824b726c43c8aef7133172"
 dependencies = [
  "anyhow",
  "axum",
@@ -4118,6 +4110,7 @@ dependencies = [
  "base64",
  "bytes",
  "encoding_rs",
+ "futures-channel",
  "futures-core",
  "futures-util",
  "h2",

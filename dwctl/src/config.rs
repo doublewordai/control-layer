@@ -1117,6 +1117,8 @@ pub struct BackgroundServicesConfig {
     pub pool_metrics: PoolMetricsSamplerConfig,
     /// Configuration for batch completion email notifications
     pub notifications: NotificationsConfig,
+    /// Configuration for webhook delivery service
+    pub webhooks: WebhookConfig,
 }
 
 /// Database pool metrics sampling configuration.
@@ -1170,6 +1172,34 @@ pub struct ProbeSchedulerConfig {
 impl Default for ProbeSchedulerConfig {
     fn default() -> Self {
         Self { enabled: true }
+    }
+}
+
+/// Webhook delivery service configuration.
+///
+/// The webhook service delivers Standard Webhooks-compliant notifications
+/// for batch terminal state events (completed, failed, cancelled).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WebhookConfig {
+    /// Enable webhook delivery service (default: true)
+    pub enabled: bool,
+    /// HTTP timeout for webhook deliveries in seconds (default: 30)
+    pub timeout_secs: u64,
+    /// Maximum retry attempts before marking delivery as exhausted (default: 7)
+    pub max_retries: i32,
+    /// Number of consecutive failures before disabling a webhook (default: 10)
+    pub circuit_breaker_threshold: i32,
+}
+
+impl Default for WebhookConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            timeout_secs: 30,
+            max_retries: 7,
+            circuit_breaker_threshold: 10,
+        }
     }
 }
 

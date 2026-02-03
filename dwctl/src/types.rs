@@ -115,6 +115,7 @@ pub enum Resource {
     Probes,
     Files,
     Batches,
+    Webhooks,
     System,
 }
 

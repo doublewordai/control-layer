@@ -154,6 +154,7 @@ mod static_assets;
 mod sync;
 pub mod telemetry;
 mod types;
+pub mod webhooks;
 
 // Test modules
 #[cfg(test)]
@@ -986,6 +987,26 @@ pub async fn build_router(
             "/users/{user_id}/api-keys/{id}",
             delete(api::handlers::api_keys::delete_user_api_key),
         )
+        // Webhooks as user sub-resources
+        .route("/users/{user_id}/webhooks", get(api::handlers::webhooks::list_webhooks))
+        .route("/users/{user_id}/webhooks", post(api::handlers::webhooks::create_webhook))
+        .route("/users/{user_id}/webhooks/{webhook_id}", get(api::handlers::webhooks::get_webhook))
+        .route(
+            "/users/{user_id}/webhooks/{webhook_id}",
+            patch(api::handlers::webhooks::update_webhook),
+        )
+        .route(
+            "/users/{user_id}/webhooks/{webhook_id}",
+            delete(api::handlers::webhooks::delete_webhook),
+        )
+        .route(
+            "/users/{user_id}/webhooks/{webhook_id}/rotate-secret",
+            post(api::handlers::webhooks::rotate_secret),
+        )
+        .route(
+            "/users/{user_id}/webhooks/{webhook_id}/test",
+            post(api::handlers::webhooks::test_webhook),
+        )
         // User-group relationships
         .route("/users/{user_id}/groups", get(api::handlers::groups::get_user_groups))
         .route("/users/{user_id}/groups/{group_id}", post(api::handlers::groups::add_group_to_user))
@@ -1782,6 +1803,21 @@ async fn setup_background_services(
     } else {
         None
     };
+
+    // Start webhook delivery service if enabled
+    if config.background_services.webhooks.enabled {
+        let webhook_config = webhooks::service::WebhookServiceConfig {
+            enabled: config.background_services.webhooks.enabled,
+            timeout_secs: config.background_services.webhooks.timeout_secs,
+            max_retries: config.background_services.webhooks.max_retries,
+            circuit_breaker_threshold: config.background_services.webhooks.circuit_breaker_threshold,
+        };
+        let webhook_service = webhooks::WebhookDeliveryService::new(pool.clone(), webhook_config);
+        let webhook_shutdown = shutdown_token.clone();
+        background_tasks.spawn("webhook-delivery", async move { webhook_service.start(webhook_shutdown).await });
+    } else {
+        info!("Webhook delivery service disabled by configuration");
+    }
 
     let (background_tasks, task_names) = background_tasks.into_parts();
 
