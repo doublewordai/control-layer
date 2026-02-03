@@ -1837,6 +1837,7 @@ mod tests {
                 fusillade: crate::config::default_fusillade_component(),
                 outlet: crate::config::default_outlet_component(),
             },
+            slow_statement_threshold_ms: 1000,
             admin_email: "admin@example.org".to_string(),
             admin_password: None,
             secret_key: None,

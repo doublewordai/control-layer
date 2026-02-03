@@ -54,7 +54,7 @@ async fn test_e2e_ai_proxy_with_mocked_inference(pool: PgPool) {
     config.background_services.onwards_sync.enabled = true;
     config.enable_request_logging = true;
 
-    let app = crate::Application::new_with_pool(config, Some(pool.clone()))
+    let app = crate::Application::new_with_pool(config, Some(pool.clone()), None)
         .await
         .expect("Failed to create application");
     let (server, bg_services) = app.into_test_server();
@@ -545,7 +545,7 @@ async fn test_request_logging_enabled(pool: PgPool) {
     config.background_services.leader_election.enabled = false;
 
     // Create application using proper setup (which will create outlet_db)
-    let app = crate::Application::new_with_pool(config, Some(pool))
+    let app = crate::Application::new_with_pool(config, Some(pool), None)
         .await
         .expect("Failed to create application");
 
@@ -662,7 +662,7 @@ async fn test_dedicated_databases_for_components(pool: PgPool) {
     };
 
     // Create application - this will run migrations on the dedicated databases
-    let app = crate::Application::new_with_pool(config, Some(pool.clone()))
+    let app = crate::Application::new_with_pool(config, Some(pool.clone()), None)
         .await
         .expect("Failed to create application with dedicated databases");
 
