@@ -1324,6 +1324,15 @@ export const handlers = [
     return HttpResponse.json(result);
   }),
 
+  // Monitoring: pending request counts
+  http.get("/admin/api/v1/monitoring/pending-request-counts", () => {
+    // Demo mode: static example data (real data comes from fusillade)
+    return HttpResponse.json({
+      "claude-sonnet-3.5": { "1h": 2, "24h": 7 },
+      "gpt-4": { "1h": 1, "24h": 3 },
+    });
+  }),
+
   // Transactions API
   http.get("/admin/api/v1/transactions", ({ request }) => {
     const url = new URL(request.url);

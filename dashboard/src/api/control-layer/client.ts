@@ -26,6 +26,7 @@ import type {
   ListAnalyticsResponse,
   ListRequestsQuery,
   RequestsAggregateResponse,
+  PendingRequestCountsByModelAndWindow,
   ModelUserUsageResponse,
   AuthResponse,
   LoginRequest,
@@ -1488,6 +1489,20 @@ const daemonsApi = {
   },
 };
 
+const monitoringApi = {
+  async getPendingRequestCounts(): Promise<PendingRequestCountsByModelAndWindow> {
+    const response = await fetch(
+      "/admin/api/v1/monitoring/pending-request-counts",
+    );
+    if (!response.ok) {
+      throw new Error(
+        `Failed to fetch pending request counts: ${response.status}`,
+      );
+    }
+    return response.json();
+  },
+};
+
 // Main nested API object
 export const dwctlApi = {
   users: userApi,
@@ -1496,6 +1511,7 @@ export const dwctlApi = {
   groups: groupApi,
   config: configApi,
   requests: requestsApi,
+  monitoring: monitoringApi,
   auth: authApi,
   cost: costApi,
   payments: paymentsApi,

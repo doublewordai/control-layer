@@ -1075,7 +1075,12 @@ pub async fn build_router(
         .route("/probes/{id}/deactivate", patch(api::handlers::probes::deactivate_probe))
         .route("/probes/{id}/execute", post(api::handlers::probes::execute_probe))
         .route("/probes/{id}/results", get(api::handlers::probes::get_probe_results))
-        .route("/probes/{id}/statistics", get(api::handlers::probes::get_statistics));
+        .route("/probes/{id}/statistics", get(api::handlers::probes::get_statistics))
+        // Queue monitoring
+        .route(
+            "/monitoring/pending-request-counts",
+            get(api::handlers::queue::get_pending_request_counts),
+        );
 
     let api_routes_with_state = api_routes.with_state(state.clone());
 
