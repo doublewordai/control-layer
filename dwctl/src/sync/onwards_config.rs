@@ -310,9 +310,12 @@ struct OnwardsCompositeModel {
 }
 
 /// Loads composite models with their components and API keys from the database
-#[tracing::instrument(skip(db))]
-async fn load_composite_models_from_db(db: &PgPool) -> Result<Vec<OnwardsCompositeModel>, anyhow::Error> {
-    debug!("Loading composite models from database");
+#[tracing::instrument(skip(db, escalation_models))]
+async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]) -> Result<Vec<OnwardsCompositeModel>, anyhow::Error> {
+    debug!(
+        "Loading composite models from database (escalation_models: {:?})",
+        escalation_models
+    );
 
     // Query composite models (deployed_models with is_composite = TRUE) with their components
     let component_rows = sqlx::query!(
@@ -406,6 +409,11 @@ async fn load_composite_models_from_db(db: &PgPool) -> Result<Vec<OnwardsComposi
                     WHERE dg.deployment_id = cm.id
                       AND dg.group_id = '00000000-0000-0000-0000-000000000000'
                 )
+                -- OR this is a batch API key and composite model is an escalation target
+                OR (
+                    ak.purpose = 'batch'
+                    AND cm.alias = ANY($1::text[])
+                )
             )
             -- Require positive balance (system user always passes)
             AND (
@@ -419,7 +427,8 @@ async fn load_composite_models_from_db(db: &PgPool) -> Result<Vec<OnwardsComposi
         WHERE cm.is_composite = TRUE
           AND cm.deleted = FALSE
         ORDER BY cm.id, ak.id
-        "#
+        "#,
+        escalation_models
     )
     .fetch_all(db)
     .await?;
@@ -925,8 +934,8 @@ pub async fn load_targets_from_db(db: &PgPool, escalation_models: &[String]) -> 
     let targets: Vec<_> = targets_map.into_values().collect();
     info!("Loaded {} deployed models", targets.len());
 
-    // Load composite models
-    let composites = load_composite_models_from_db(db).await?;
+    // Load composite models (pass escalation_models to grant batch API keys access)
+    let composites = load_composite_models_from_db(db, escalation_models).await?;
 
     // Convert to ConfigFile format
     let config = convert_to_config_file(targets, composites);
@@ -1178,6 +1187,159 @@ mod tests {
             notification.payload().contains("model_tariffs"),
             "Notification should reference model_tariffs table"
         );
+    }
+
+    #[sqlx::test]
+    /// Test that batch API keys get automatic access to composite escalation targets
+    async fn test_batch_api_key_access_to_composite_escalation_target(pool: sqlx::PgPool) {
+        use std::str::FromStr;
+
+        use onwards::auth::ConstantTimeString;
+
+        use crate::Role;
+        use crate::db::handlers::{Deployments, InferenceEndpoints, Repository, api_keys::ApiKeys};
+        use crate::db::models::{
+            api_keys::{ApiKeyCreateDBRequest, ApiKeyPurpose},
+            deployments::{DeploymentCreateDBRequest, LoadBalancingStrategy},
+            inference_endpoints::InferenceEndpointCreateDBRequest,
+        };
+
+        // Create test user
+        let test_user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+
+        // Grant credits to the user (required for API key access)
+        sqlx::query!(
+            r#"
+            INSERT INTO credits_transactions (user_id, amount, transaction_type, source_id, balance_after, description)
+            VALUES ($1, 1000000, 'admin_grant', 'test-grant', 1000000, 'Test credits for API key access')
+            "#,
+            test_user.id
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Create test endpoint
+        let mut endpoint_tx = pool.begin().await.unwrap();
+        let mut endpoints_repo = InferenceEndpoints::new(&mut endpoint_tx);
+        let endpoint = endpoints_repo
+            .create(&InferenceEndpointCreateDBRequest {
+                created_by: test_user.id,
+                name: "test-endpoint".to_string(),
+                description: None,
+                url: url::Url::from_str("https://api.test.com").unwrap(),
+                api_key: None,
+                model_filter: None,
+                auth_header_name: Some("Authorization".to_string()),
+                auth_header_prefix: Some("Bearer ".to_string()),
+            })
+            .await
+            .unwrap();
+        endpoint_tx.commit().await.unwrap();
+
+        // Create component model (regular deployment)
+        let mut component_tx = pool.begin().await.unwrap();
+        let mut deployments_repo = Deployments::new(&mut component_tx);
+        let component_model = deployments_repo
+            .create(&DeploymentCreateDBRequest {
+                created_by: test_user.id,
+                model_name: "gpt-4".to_string(),
+                alias: "gpt-4-component".to_string(),
+                description: None,
+                model_type: None,
+                capabilities: None,
+                hosted_on: Some(endpoint.id),
+                requests_per_second: None,
+                burst_size: None,
+                capacity: None,
+                batch_capacity: None,
+                provider_pricing: None,
+                is_composite: false,
+                lb_strategy: None,
+                fallback_enabled: None,
+                fallback_on_rate_limit: None,
+                fallback_on_status: None,
+                sanitize_responses: true,
+            })
+            .await
+            .unwrap();
+        component_tx.commit().await.unwrap();
+
+        // Create composite model with escalation alias
+        let composite_alias = "escalation-composite".to_string();
+        let mut composite_tx = pool.begin().await.unwrap();
+        let mut deployments_repo = Deployments::new(&mut composite_tx);
+        let composite_model = deployments_repo
+            .create(&DeploymentCreateDBRequest {
+                created_by: test_user.id,
+                model_name: "composite-model".to_string(),
+                alias: composite_alias.clone(),
+                description: Some("Composite escalation target".to_string()),
+                model_type: None,
+                capabilities: None,
+                hosted_on: None, // Composite models have no direct endpoint
+                requests_per_second: None,
+                burst_size: None,
+                capacity: None,
+                batch_capacity: None,
+                provider_pricing: None,
+                is_composite: true,
+                lb_strategy: Some(LoadBalancingStrategy::WeightedRandom),
+                fallback_enabled: Some(true),
+                fallback_on_rate_limit: Some(true),
+                fallback_on_status: Some(vec![429, 500, 502, 503, 504]),
+                sanitize_responses: true,
+            })
+            .await
+            .unwrap();
+        composite_tx.commit().await.unwrap();
+
+        // Link component to composite model
+        sqlx::query!(
+            r#"
+            INSERT INTO deployed_model_components (composite_model_id, deployed_model_id, weight, sort_order, enabled)
+            VALUES ($1, $2, 100, 0, TRUE)
+            "#,
+            composite_model.id,
+            component_model.id,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Create batch-purpose API key
+        let mut api_key_tx = pool.begin().await.unwrap();
+        let mut api_keys_repo = ApiKeys::new(&mut api_key_tx);
+        let batch_api_key = api_keys_repo
+            .create(&ApiKeyCreateDBRequest {
+                user_id: test_user.id,
+                name: "batch-key".to_string(),
+                description: None,
+                purpose: ApiKeyPurpose::Batch,
+                requests_per_second: None,
+                burst_size: None,
+            })
+            .await
+            .unwrap();
+        api_key_tx.commit().await.unwrap();
+
+        // Load targets with composite alias in escalation_models
+        let escalation_models = vec![composite_alias.clone()];
+        let targets = super::load_targets_from_db(&pool, &escalation_models).await.unwrap();
+
+        // Find the composite model in targets (DashMap)
+        let composite_target = targets.targets.get(&composite_alias).expect("Composite model should be in targets");
+
+        // Access the ProviderPool from the DashMap entry
+        let pool_spec = composite_target.value();
+
+        // Verify batch API key has access
+        // Keys are stored as ConstantTimeString in onwards
+        let batch_key_ct = ConstantTimeString::from(batch_api_key.secret.clone());
+        let keys = pool_spec.keys().expect("Composite model should have keys");
+        let has_batch_key = keys.iter().any(|k| k == &batch_key_ct);
+
+        assert!(has_batch_key, "Batch API key should have access to composite escalation target");
     }
 
     /// Regression test: onwards_config should reconnect after connection loss
