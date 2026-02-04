@@ -27,14 +27,70 @@
 //! export OTEL_EXPORTER_OTLP_HEADERS="Authorization=Basic%20<token>"
 //! ```
 
-use opentelemetry::trace::TracerProvider as _;
+use opentelemetry::trace::{TraceContextExt, TracerProvider as _};
 use opentelemetry_otlp::{Protocol, WithExportConfig, WithHttpConfig};
 pub use opentelemetry_sdk::trace::SdkTracerProvider;
 use std::collections::HashMap;
+use std::fmt;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::fmt::format::{FormatEvent, FormatFields};
+use tracing_subscriber::fmt::FmtContext;
+use tracing_subscriber::fmt::time::FormatTime;
 use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::util::SubscriberInitExt;
+
+/// Compact log formatter that includes the OpenTelemetry trace ID when available.
+///
+/// Output format:
+/// ```text
+/// 2026-02-04T11:04:11.353Z  INFO trace_id=abc123def456 request:delete_batch: dwctl::api::handlers::batches: Batch deleted
+/// ```
+///
+/// When no OTel context is active (e.g. startup logs), the trace_id is omitted.
+struct CompactWithTraceId;
+
+impl<S, N> FormatEvent<S, N> for CompactWithTraceId
+where
+    S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+    N: for<'a> FormatFields<'a> + 'static,
+{
+    fn format_event(
+        &self,
+        ctx: &FmtContext<'_, S, N>,
+        mut writer: tracing_subscriber::fmt::format::Writer<'_>,
+        event: &tracing::Event<'_>,
+    ) -> fmt::Result {
+        // Timestamp
+        tracing_subscriber::fmt::time::SystemTime
+            .format_time(&mut writer)?;
+
+        // Level
+        let level = *event.metadata().level();
+        write!(writer, " {level:>5}")?;
+
+        // Trace ID from OTel context (only when active)
+        let otel_ctx = opentelemetry::Context::current();
+        let span_ctx = otel_ctx.span().span_context();
+        if span_ctx.is_valid() {
+            write!(writer, " trace_id={}", span_ctx.trace_id())?;
+        }
+
+        // Span chain (compact: names only, no fields)
+        if let Some(scope) = ctx.event_scope() {
+            write!(writer, " ")?;
+            for span in scope.from_root() {
+                write!(writer, "{}:", span.name())?;
+            }
+        }
+
+        // Target and message
+        write!(writer, " {}: ", event.metadata().target())?;
+        ctx.format_fields(writer.by_ref(), event)?;
+        writeln!(writer)
+    }
+}
 
 /// Initialize tracing with optional OpenTelemetry support
 ///
@@ -57,7 +113,7 @@ pub fn init_telemetry(enable_otel_export: bool) -> anyhow::Result<Option<SdkTrac
                 // Build subscriber with both fmt and OpenTelemetry layers
                 tracing_subscriber::registry()
                     .with(env_filter)
-                    .with(tracing_subscriber::fmt::layer().compact())
+                    .with(tracing_subscriber::fmt::layer().event_format(CompactWithTraceId))
                     .with(tracing_opentelemetry::layer().with_tracer(tracer))
                     .try_init()?;
 
@@ -68,7 +124,7 @@ pub fn init_telemetry(enable_otel_export: bool) -> anyhow::Result<Option<SdkTrac
                 // If OTLP setup fails, just use fmt layer without OpenTelemetry
                 tracing_subscriber::registry()
                     .with(env_filter)
-                    .with(tracing_subscriber::fmt::layer().compact())
+                    .with(tracing_subscriber::fmt::layer().event_format(CompactWithTraceId))
                     .try_init()?;
 
                 info!("Telemetry initialized without OTLP export: {}", e);
@@ -78,7 +134,7 @@ pub fn init_telemetry(enable_otel_export: bool) -> anyhow::Result<Option<SdkTrac
         // OTLP export disabled - use only console logging
         tracing_subscriber::registry()
             .with(env_filter)
-            .with(tracing_subscriber::fmt::layer().compact())
+            .with(tracing_subscriber::fmt::layer().event_format(CompactWithTraceId))
             .try_init()?;
 
         info!("Telemetry initialized (OTLP export disabled)");
