@@ -77,6 +77,11 @@
         "ordinal": 14,
         "name": "is_internal",
         "type_info": "Bool"
+      },
+      {
+        "ordinal": 15,
+        "name": "batch_notifications_enabled",
+        "type_info": "Bool"
       }
     ],
     "parameters": {
@@ -98,6 +103,7 @@
       true,
       true,
       true,
+      false,
       false,
       false
     ]
