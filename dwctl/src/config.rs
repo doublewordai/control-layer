@@ -1039,6 +1039,36 @@ impl Default for LeaderElectionConfig {
     }
 }
 
+/// Batch completion notification configuration.
+///
+/// When enabled, polls for completed/failed/cancelled batches and sends email notifications
+/// to batch creators. Safe to run on all replicas — uses atomic `notification_sent_at` claim
+/// to prevent duplicate emails.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NotificationsConfig {
+    /// Enable batch completion notifications (default: false)
+    pub enabled: bool,
+    /// How often to poll for completed batches (default: 30s)
+    #[serde(with = "humantime_serde")]
+    pub poll_interval: Duration,
+    /// Hide retriable errors before SLA expiry in notification counts (default: true)
+    pub hide_retriable_before_sla: bool,
+    /// Base URL for dashboard links in notification emails
+    pub dashboard_url: String,
+}
+
+impl Default for NotificationsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            poll_interval: Duration::from_secs(30),
+            hide_retriable_before_sla: true,
+            dashboard_url: "http://localhost:3001".to_string(),
+        }
+    }
+}
+
 /// Background services configuration.
 ///
 /// Controls which background services are enabled on this instance.
@@ -1055,6 +1085,8 @@ pub struct BackgroundServicesConfig {
     pub leader_election: LeaderElectionConfig,
     /// Configuration for database pool metrics sampling
     pub pool_metrics: PoolMetricsSamplerConfig,
+    /// Configuration for batch completion email notifications
+    pub notifications: NotificationsConfig,
 }
 
 /// Database pool metrics sampling configuration.

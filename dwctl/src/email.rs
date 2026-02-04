@@ -9,6 +9,19 @@ use std::path::Path;
 
 use crate::{config::Config, errors::Error};
 
+pub struct BatchCompletionInfo {
+    pub batch_id: String,
+    pub endpoint: String,
+    pub status: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub finished_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub total_requests: i64,
+    pub completed_requests: i64,
+    pub failed_requests: i64,
+    pub canceled_requests: i64,
+    pub dashboard_link: String,
+}
+
 pub struct EmailService {
     transport: EmailTransport,
     from_email: String,
@@ -134,6 +147,84 @@ impl EmailService {
         Ok(())
     }
 
+    pub async fn send_batch_completion_email(
+        &self,
+        to_email: &str,
+        to_name: Option<&str>,
+        info: &BatchCompletionInfo,
+    ) -> Result<(), Error> {
+        let subject = format!("Batch {} — {}", &info.batch_id[..8.min(info.batch_id.len())], info.status);
+        let body = self.create_batch_completion_body(to_name, info);
+        self.send_email(to_email, to_name, &subject, &body).await
+    }
+
+    fn create_batch_completion_body(&self, to_name: Option<&str>, info: &BatchCompletionInfo) -> String {
+        let greeting = if let Some(name) = to_name {
+            format!("Hello {name},")
+        } else {
+            "Hello,".to_string()
+        };
+
+        let created_at = info.created_at.format("%Y-%m-%d %H:%M UTC").to_string();
+        let finished_at = info
+            .finished_at
+            .map_or("—".to_string(), |t| t.format("%Y-%m-%d %H:%M UTC").to_string());
+
+        format!(
+            r#"<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Batch {status}</title>
+    <style>
+        body {{ font-family: Arial, sans-serif; line-height: 1.6; color: #333; }}
+        .container {{ max-width: 600px; margin: 0 auto; padding: 20px; }}
+        table {{ border-collapse: collapse; width: 100%; margin: 16px 0; }}
+        th, td {{ text-align: left; padding: 8px 12px; border-bottom: 1px solid #eee; }}
+        th {{ color: #666; font-weight: normal; width: 160px; }}
+        .footer {{ margin-top: 30px; font-size: 12px; color: #666; }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h2>Batch {status}</h2>
+
+        <p>{greeting}</p>
+
+        <p>Your batch has finished processing with status: <strong>{status}</strong>.</p>
+
+        <table>
+            <tr><th>Batch ID</th><td>{batch_id}</td></tr>
+            <tr><th>Endpoint</th><td>{endpoint}</td></tr>
+            <tr><th>Created</th><td>{created_at}</td></tr>
+            <tr><th>Finished</th><td>{finished_at}</td></tr>
+            <tr><th>Total requests</th><td>{total}</td></tr>
+            <tr><th>Completed</th><td>{completed}</td></tr>
+            <tr><th>Failed</th><td>{failed}</td></tr>
+            <tr><th>Cancelled</th><td>{cancelled}</td></tr>
+        </table>
+
+        <p><a href="{dashboard_link}">View batch in dashboard</a></p>
+
+        <div class="footer">
+            <p>This is an automated message, please do not reply to this email.</p>
+        </div>
+    </div>
+</body>
+</html>"#,
+            status = info.status,
+            batch_id = info.batch_id,
+            endpoint = info.endpoint,
+            created_at = created_at,
+            finished_at = finished_at,
+            total = info.total_requests,
+            completed = info.completed_requests,
+            failed = info.failed_requests,
+            cancelled = info.canceled_requests,
+            dashboard_link = info.dashboard_link,
+        )
+    }
+
     fn create_password_reset_body(&self, to_name: Option<&str>, reset_link: &str) -> String {
         let greeting = if let Some(name) = to_name {
             format!("Hello {name},")
@@ -214,5 +305,33 @@ mod tests {
 
         assert!(body.contains("Hello,"));
         assert!(body.contains("https://example.com/reset?token=abc123"));
+    }
+
+    #[tokio::test]
+    async fn test_batch_completion_email_body() {
+        let config = create_test_config();
+        let email_service = EmailService::new(&config).unwrap();
+
+        let info = BatchCompletionInfo {
+            batch_id: "abcd1234-5678-90ab-cdef-1234567890ab".to_string(),
+            endpoint: "/v1/chat/completions".to_string(),
+            status: "completed".to_string(),
+            created_at: chrono::Utc::now(),
+            finished_at: Some(chrono::Utc::now()),
+            total_requests: 100,
+            completed_requests: 98,
+            failed_requests: 2,
+            canceled_requests: 0,
+            dashboard_link: "https://example.com/batches/abcd1234".to_string(),
+        };
+
+        let body = email_service.create_batch_completion_body(Some("Alice"), &info);
+
+        assert!(body.contains("Hello Alice,"));
+        assert!(body.contains("completed"));
+        assert!(body.contains("/v1/chat/completions"));
+        assert!(body.contains("100"));
+        assert!(body.contains("98"));
+        assert!(body.contains("https://example.com/batches/abcd1234"));
     }
 }
