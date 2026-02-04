@@ -369,6 +369,7 @@ pub struct DeploymentCreateDBRequest {
     pub burst_size: Option<i32>,
     pub capacity: Option<i32>,
     pub batch_capacity: Option<i32>,
+    pub throughput: Option<f32>,
     // Provider/downstream pricing
     pub provider_pricing: Option<ProviderPricing>,
     // Composite model fields
@@ -402,6 +403,7 @@ impl DeploymentCreateDBRequest {
                 .maybe_burst_size(standard.burst_size)
                 .maybe_capacity(standard.capacity)
                 .maybe_batch_capacity(standard.batch_capacity)
+                .maybe_throughput(standard.throughput)
                 .maybe_provider_pricing(standard.provider_pricing)
                 .is_composite(false)
                 .build(),
@@ -416,6 +418,7 @@ impl DeploymentCreateDBRequest {
                 .maybe_burst_size(composite.burst_size)
                 .maybe_capacity(composite.capacity)
                 .maybe_batch_capacity(composite.batch_capacity)
+                .maybe_throughput(composite.throughput)
                 .is_composite(true)
                 .lb_strategy(composite.lb_strategy)
                 .fallback_enabled(composite.fallback_enabled)
@@ -442,6 +445,7 @@ pub struct DeploymentUpdateDBRequest {
     pub burst_size: Option<Option<i32>>,
     pub capacity: Option<Option<i32>>,
     pub batch_capacity: Option<Option<i32>>,
+    pub throughput: Option<Option<f32>>,
     // Provider pricing updates
     pub provider_pricing: Option<ProviderPricingUpdate>,
     // Composite model fields (only applicable when is_composite = true)
@@ -464,6 +468,7 @@ impl From<DeployedModelUpdate> for DeploymentUpdateDBRequest {
             .maybe_burst_size(update.burst_size)
             .maybe_capacity(update.capacity)
             .maybe_batch_capacity(update.batch_capacity)
+            .maybe_throughput(update.throughput)
             .maybe_provider_pricing(update.provider_pricing)
             .maybe_lb_strategy(update.lb_strategy)
             .maybe_fallback_enabled(update.fallback_enabled)
@@ -513,6 +518,8 @@ pub struct DeploymentDBResponse {
     pub burst_size: Option<i32>,
     pub capacity: Option<i32>,
     pub batch_capacity: Option<i32>,
+    /// Throughput in requests/second for batch SLA capacity calculations
+    pub throughput: Option<f32>,
     // Provider/downstream pricing
     pub provider_pricing: Option<ProviderPricing>,
     // Composite model fields

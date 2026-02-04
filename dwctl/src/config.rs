@@ -858,6 +858,10 @@ pub struct BatchConfig {
     pub allowed_completion_windows: Vec<String>,
     /// Files configuration for batch file uploads/downloads
     pub files: FilesConfig,
+    /// Default throughput (requests/second) for models without explicit throughput configured.
+    /// Used for SLA capacity calculations when accepting new batches.
+    /// Default: 50.0 req/s
+    pub default_throughput: f32,
 }
 
 impl Default for BatchConfig {
@@ -866,6 +870,7 @@ impl Default for BatchConfig {
             enabled: true,
             allowed_completion_windows: vec!["24h".to_string()],
             files: FilesConfig::default(),
+            default_throughput: 50.0,
         }
     }
 }
