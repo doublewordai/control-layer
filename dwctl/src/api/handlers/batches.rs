@@ -221,7 +221,7 @@ pub async fn create_batch<P: PoolProvider>(
     if !has_read_all {
         // Verify user owns the file
         let user_id_str = current_user.id.to_string();
-        if file.uploaded_by.as_deref() != Some(&user_id_str) {
+        if file.uploaded_by.as_deref() != Some(user_id_str.as_str()) {
             use crate::types::{Operation, Permission};
             return Err(Error::InsufficientPermissions {
                 required: Permission::Allow(Resource::Files, Operation::ReadAll),
