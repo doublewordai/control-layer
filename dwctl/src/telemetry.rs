@@ -57,7 +57,7 @@ pub fn init_telemetry(enable_otel_export: bool) -> anyhow::Result<Option<SdkTrac
                 // Build subscriber with both fmt and OpenTelemetry layers
                 tracing_subscriber::registry()
                     .with(env_filter)
-                    .with(tracing_subscriber::fmt::layer())
+                    .with(tracing_subscriber::fmt::layer().compact())
                     .with(tracing_opentelemetry::layer().with_tracer(tracer))
                     .try_init()?;
 
@@ -68,7 +68,7 @@ pub fn init_telemetry(enable_otel_export: bool) -> anyhow::Result<Option<SdkTrac
                 // If OTLP setup fails, just use fmt layer without OpenTelemetry
                 tracing_subscriber::registry()
                     .with(env_filter)
-                    .with(tracing_subscriber::fmt::layer())
+                    .with(tracing_subscriber::fmt::layer().compact())
                     .try_init()?;
 
                 info!("Telemetry initialized without OTLP export: {}", e);
@@ -78,7 +78,7 @@ pub fn init_telemetry(enable_otel_export: bool) -> anyhow::Result<Option<SdkTrac
         // OTLP export disabled - use only console logging
         tracing_subscriber::registry()
             .with(env_filter)
-            .with(tracing_subscriber::fmt::layer())
+            .with(tracing_subscriber::fmt::layer().compact())
             .try_init()?;
 
         info!("Telemetry initialized (OTLP export disabled)");
