@@ -310,9 +310,12 @@ struct OnwardsCompositeModel {
 }
 
 /// Loads composite models with their components and API keys from the database
-#[tracing::instrument(skip(db))]
-async fn load_composite_models_from_db(db: &PgPool) -> Result<Vec<OnwardsCompositeModel>, anyhow::Error> {
-    debug!("Loading composite models from database");
+#[tracing::instrument(skip(db, escalation_models))]
+async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]) -> Result<Vec<OnwardsCompositeModel>, anyhow::Error> {
+    debug!(
+        "Loading composite models from database (escalation_models: {:?})",
+        escalation_models
+    );
 
     // Query composite models (deployed_models with is_composite = TRUE) with their components
     let component_rows = sqlx::query!(
@@ -406,6 +409,11 @@ async fn load_composite_models_from_db(db: &PgPool) -> Result<Vec<OnwardsComposi
                     WHERE dg.deployment_id = cm.id
                       AND dg.group_id = '00000000-0000-0000-0000-000000000000'
                 )
+                -- OR this is a batch API key and composite model is an escalation target
+                OR (
+                    ak.purpose = 'batch'
+                    AND cm.alias = ANY($1::text[])
+                )
             )
             -- Require positive balance (system user always passes)
             AND (
@@ -419,7 +427,8 @@ async fn load_composite_models_from_db(db: &PgPool) -> Result<Vec<OnwardsComposi
         WHERE cm.is_composite = TRUE
           AND cm.deleted = FALSE
         ORDER BY cm.id, ak.id
-        "#
+        "#,
+        escalation_models
     )
     .fetch_all(db)
     .await?;
@@ -925,8 +934,8 @@ pub async fn load_targets_from_db(db: &PgPool, escalation_models: &[String]) -> 
     let targets: Vec<_> = targets_map.into_values().collect();
     info!("Loaded {} deployed models", targets.len());
 
-    // Load composite models
-    let composites = load_composite_models_from_db(db).await?;
+    // Load composite models (pass escalation_models to grant batch API keys access)
+    let composites = load_composite_models_from_db(db, escalation_models).await?;
 
     // Convert to ConfigFile format
     let config = convert_to_config_file(targets, composites);
