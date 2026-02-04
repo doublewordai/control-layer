@@ -26,9 +26,11 @@ use crate::errors::{Error, Result};
 use crate::types::Resource;
 use axum::{
     Json,
+    body::Body,
     extract::{Multipart, Path, Query, State},
     http::StatusCode,
 };
+use bytes::Bytes;
 use chrono::Utc;
 use fusillade::Storage;
 use futures::StreamExt;
@@ -868,39 +870,11 @@ pub async fn get_file_content<P: PoolProvider>(
     // For non-error files (input, output): show all content (false)
     let hide_retriable_before_sla = matches!(file.purpose, Some(fusillade::batch::Purpose::BatchError));
 
-    // Stream the file content as JSONL, starting from offset
-    let offset = query.pagination.skip.unwrap_or(0) as usize;
-    let search = query.search.clone();
-    let content_stream =
-        state
-            .request_manager
-            .get_file_content_stream(fusillade::FileId(file_id), offset, search, hide_retriable_before_sla);
-
-    // Apply limit if specified, fetching one extra to detect if there are more results
-    let requested_limit = query.pagination.limit.map(|l| l as usize);
-    let fetch_limit = requested_limit.map(|l| l + 1); // Fetch one extra to check for more results
-
-    let content_stream: Pin<Box<dyn Stream<Item = fusillade::Result<fusillade::FileContentItem>> + Send>> = if let Some(limit) = fetch_limit
-    {
-        Box::pin(content_stream.take(limit))
-    } else {
-        Box::pin(content_stream)
-    };
-
-    // Collect items to determine if we need to truncate and set headers
-    let items: Vec<_> = content_stream.collect().await;
-
-    // Check if there's more paginated data currently available
-    let has_more_paginated = if let Some(req_limit) = requested_limit {
-        items.len() > req_limit
-    } else {
-        false // No limit means we fetched everything currently available
-    };
-
     // For BatchOutput and BatchError files, check if the batch is still running
-    // (which means more data may be written to this file in the future)
-    let file_may_receive_more_data = match file.purpose {
-        Some(fusillade::batch::Purpose::Batch) => false, // Input files are static
+    // (which means more data may be written to this file in the future).
+    // Also capture the expected content count for streaming X-Last-Line.
+    let (file_may_receive_more_data, file_content_count) = match file.purpose {
+        Some(fusillade::batch::Purpose::Batch) => (false, None), // Input files: count unknown without query
         Some(fusillade::batch::Purpose::BatchOutput) => {
             let batch = state
                 .request_manager
@@ -917,9 +891,10 @@ pub async fn get_file_content<P: PoolProvider>(
                     .map_err(|e| Error::Internal {
                         operation: format!("get batch status: {}", e),
                     })?;
-                status.pending_requests > 0 || status.in_progress_requests > 0
+                let still_processing = status.pending_requests > 0 || status.in_progress_requests > 0;
+                (still_processing, Some(status.completed_requests as usize))
             } else {
-                false
+                (false, None)
             }
         }
         Some(fusillade::batch::Purpose::BatchError) => {
@@ -938,74 +913,124 @@ pub async fn get_file_content<P: PoolProvider>(
                     .map_err(|e| Error::Internal {
                         operation: format!("get batch status: {}", e),
                     })?;
-                status.pending_requests > 0 || status.in_progress_requests > 0
+                let still_processing = status.pending_requests > 0 || status.in_progress_requests > 0;
+                (still_processing, Some(status.failed_requests as usize))
             } else {
-                false
+                (false, None)
             }
         }
-        None => false, // Shouldn't happen, but assume complete
+        None => (false, None), // Shouldn't happen, but assume complete
     };
 
-    let has_more = has_more_paginated || file_may_receive_more_data;
+    // Stream the file content as JSONL, starting from offset
+    let offset = query.pagination.skip.unwrap_or(0) as usize;
+    let search = query.search.clone();
+    let requested_limit = query.pagination.limit.map(|l| l as usize);
 
-    // Truncate to requested limit if we fetched extra
-    let items_to_return = if let Some(req_limit) = requested_limit {
-        items.into_iter().take(req_limit).collect::<Vec<_>>()
-    } else {
-        items
-    };
-
-    let line_count = items_to_return.len();
-    let last_line = offset + line_count;
-
-    // Convert FileContentItem to JSONL (one per line)
-    let mut jsonl_lines = Vec::new();
-    for content_result in items_to_return {
-        let json_line = content_result
-            .and_then(|content_item| {
-                // Handle different content types
-                match content_item {
-                    fusillade::FileContentItem::Template(template) => {
-                        // Transform to OpenAI format (drops api_key, endpoint)
-                        OpenAIBatchRequest::from_internal(&template)
-                            .map_err(|e| fusillade::FusilladeError::Other(anyhow::anyhow!("Failed to transform to OpenAI format: {:?}", e)))
-                            .and_then(|openai_req| {
-                                serde_json::to_string(&openai_req)
-                                    .map(|json| format!("{}\n", json))
-                                    .map_err(|e| fusillade::FusilladeError::Other(anyhow::anyhow!("JSON serialization failed: {}", e)))
-                            })
-                    }
-                    fusillade::FileContentItem::Output(output) => {
-                        // Already in OpenAI format, just serialize
-                        serde_json::to_string(&output)
+    // Helper to serialize FileContentItem to JSON line
+    fn serialize_content_item(content_item: fusillade::FileContentItem) -> fusillade::Result<String> {
+        match content_item {
+            fusillade::FileContentItem::Template(template) => {
+                // Transform to OpenAI format (drops api_key, endpoint)
+                OpenAIBatchRequest::from_internal(&template)
+                    .map_err(|e| fusillade::FusilladeError::Other(anyhow::anyhow!("Failed to transform to OpenAI format: {:?}", e)))
+                    .and_then(|openai_req| {
+                        serde_json::to_string(&openai_req)
                             .map(|json| format!("{}\n", json))
                             .map_err(|e| fusillade::FusilladeError::Other(anyhow::anyhow!("JSON serialization failed: {}", e)))
-                    }
-                    fusillade::FileContentItem::Error(error) => {
-                        // Already in OpenAI format, just serialize
-                        serde_json::to_string(&error)
-                            .map(|json| format!("{}\n", json))
-                            .map_err(|e| fusillade::FusilladeError::Other(anyhow::anyhow!("JSON serialization failed: {}", e)))
-                    }
-                }
-            })
-            .map_err(|e| Error::Internal {
-                operation: format!("serialize content: {}", e),
-            })?;
-        jsonl_lines.push(json_line);
+                    })
+            }
+            fusillade::FileContentItem::Output(output) => serde_json::to_string(&output)
+                .map(|json| format!("{}\n", json))
+                .map_err(|e| fusillade::FusilladeError::Other(anyhow::anyhow!("JSON serialization failed: {}", e))),
+            fusillade::FileContentItem::Error(error) => serde_json::to_string(&error)
+                .map(|json| format!("{}\n", json))
+                .map_err(|e| fusillade::FusilladeError::Other(anyhow::anyhow!("JSON serialization failed: {}", e))),
+        }
     }
 
-    let jsonl_content = jsonl_lines.join("");
+    if let Some(limit) = requested_limit {
+        // Pagination case: buffer only N+1 items to check for more pages
+        let content_stream =
+            state
+                .request_manager
+                .get_file_content_stream(fusillade::FileId(file_id), offset, search, hide_retriable_before_sla);
 
-    let mut response = axum::response::Response::new(axum::body::Body::from(jsonl_content));
-    response
-        .headers_mut()
-        .insert("content-type", "application/x-ndjson".parse().unwrap());
-    response.headers_mut().insert("X-Incomplete", has_more.to_string().parse().unwrap());
-    response.headers_mut().insert("X-Last-Line", last_line.to_string().parse().unwrap());
-    *response.status_mut() = StatusCode::OK;
+        let mut buffer: Vec<_> = content_stream.take(limit + 1).collect().await;
+        let has_more_pages = buffer.len() > limit;
+        buffer.truncate(limit);
 
-    Ok(response)
+        let line_count = buffer.len();
+        let last_line = offset + line_count;
+        let has_more = has_more_pages || file_may_receive_more_data;
+
+        // Serialize buffered items
+        let mut jsonl_lines = Vec::new();
+        for content_result in buffer {
+            let json_line = content_result.and_then(serialize_content_item).map_err(|e| Error::Internal {
+                operation: format!("serialize content: {}", e),
+            })?;
+            jsonl_lines.push(json_line);
+        }
+
+        let jsonl_content = jsonl_lines.join("");
+
+        let mut response = axum::response::Response::new(Body::from(jsonl_content));
+        response
+            .headers_mut()
+            .insert("content-type", "application/x-ndjson".parse().unwrap());
+        response.headers_mut().insert("X-Incomplete", has_more.to_string().parse().unwrap());
+        response.headers_mut().insert("X-Last-Line", last_line.to_string().parse().unwrap());
+        *response.status_mut() = StatusCode::OK;
+
+        Ok(response)
+    } else {
+        // Unlimited case: true streaming to avoid OOM on large result sets
+        //
+        // Derive expected count from batch status when available, so we can
+        // set X-Last-Line before streaming. Search filters make the count
+        // unknown, so we skip X-Last-Line in that case.
+        let expected_count = if search.is_none() {
+            file_content_count.map(|c| c.saturating_sub(offset))
+        } else {
+            None
+        };
+
+        let content_stream =
+            state
+                .request_manager
+                .get_file_content_stream(fusillade::FileId(file_id), offset, search, hide_retriable_before_sla);
+
+        // Limit stream to expected count so X-Last-Line is accurate
+        let content_stream: Pin<Box<dyn Stream<Item = fusillade::Result<fusillade::FileContentItem>> + Send>> =
+            if let Some(count) = expected_count {
+                Box::pin(content_stream.take(count))
+            } else {
+                Box::pin(content_stream)
+            };
+
+        let body_stream = content_stream.map(|result| {
+            result
+                .and_then(|item| serialize_content_item(item).map(Bytes::from))
+                .map_err(|e| std::io::Error::other(e.to_string()))
+        });
+
+        let body = Body::from_stream(body_stream);
+        let mut response = axum::response::Response::new(body);
+        response
+            .headers_mut()
+            .insert("content-type", "application/x-ndjson".parse().unwrap());
+        response
+            .headers_mut()
+            .insert("X-Incomplete", file_may_receive_more_data.to_string().parse().unwrap());
+        if let Some(count) = expected_count {
+            let last_line = offset + count;
+            response.headers_mut().insert("X-Last-Line", last_line.to_string().parse().unwrap());
+        }
+        *response.status_mut() = StatusCode::OK;
+
+        Ok(response)
+    }
 }
 
 #[utoipa::path(
