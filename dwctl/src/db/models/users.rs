@@ -70,4 +70,5 @@ pub struct UserDBResponse {
     pub password_hash: Option<String>,
     pub external_user_id: Option<String>,
     pub payment_provider_id: Option<String>,
+    pub batch_notifications_enabled: bool,
 }
