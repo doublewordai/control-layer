@@ -169,7 +169,7 @@ The batch will begin processing immediately. Use `GET /batches/{batch_id}` to mo
         (status = 500, description = "An unexpected error occurred. Retry the request or contact support if the issue persists.")
     )
 )]
-#[tracing::instrument(skip(state, current_user, has_api_key), fields(user_id = %current_user.id, input_file_id = %req.input_file_id))]
+#[tracing::instrument(skip_all, fields(user_id = %current_user.id, input_file_id = %req.input_file_id))]
 pub async fn create_batch<P: PoolProvider>(
     State(state): State<AppState<P>>,
     current_user: RequiresPermission<resource::Batches, operation::CreateOwn>,
@@ -221,7 +221,7 @@ pub async fn create_batch<P: PoolProvider>(
     if !has_read_all {
         // Verify user owns the file
         let user_id_str = current_user.id.to_string();
-        if file.uploaded_by.as_deref() != Some(&user_id_str) {
+        if file.uploaded_by.as_deref() != Some(user_id_str.as_str()) {
             use crate::types::{Operation, Permission};
             return Err(Error::InsufficientPermissions {
                 required: Permission::Allow(Resource::Files, Operation::ReadAll),
@@ -284,7 +284,7 @@ Poll this endpoint to monitor progress. Results are streamed to `output_file_id`
         ("batch_id" = String, Path, description = "The batch ID returned when the batch was created.")
     )
 )]
-#[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, batch_id = %batch_id_str))]
+#[tracing::instrument(skip_all, fields(user_id = %current_user.id, batch_id = %batch_id_str))]
 pub async fn get_batch<P: PoolProvider>(
     State(state): State<AppState<P>>,
     Path(batch_id_str): Path<String>,
@@ -338,7 +338,7 @@ Analytics update in real-time as requests complete.",
         ("batch_id" = String, Path, description = "The batch ID returned when the batch was created.")
     )
 )]
-#[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, batch_id = %batch_id_str))]
+#[tracing::instrument(skip_all, fields(user_id = %current_user.id, batch_id = %batch_id_str))]
 pub async fn get_batch_analytics<P: PoolProvider>(
     State(state): State<AppState<P>>,
     Path(batch_id_str): Path<String>,
@@ -401,7 +401,7 @@ Supports pagination via `limit` and `skip` query parameters, and filtering by `c
         BatchResultsQuery
     )
 )]
-#[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, batch_id = %batch_id_str, limit = ?query.pagination.limit, skip = ?query.pagination.skip))]
+#[tracing::instrument(skip_all, fields(user_id = %current_user.id, batch_id = %batch_id_str))]
 pub async fn get_batch_results<P: PoolProvider>(
     State(state): State<AppState<P>>,
     Path(batch_id_str): Path<String>,
@@ -521,7 +521,7 @@ Pending requests will not be processed. Requests already in progress will comple
         ("batch_id" = String, Path, description = "The batch ID returned when the batch was created.")
     )
 )]
-#[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, batch_id = %batch_id_str))]
+#[tracing::instrument(skip_all, fields(user_id = %current_user.id, batch_id = %batch_id_str))]
 pub async fn cancel_batch<P: PoolProvider>(
     State(state): State<AppState<P>>,
     Path(batch_id_str): Path<String>,
@@ -599,7 +599,7 @@ This action cannot be undone. The input file is not deleted.",
         ("batch_id" = String, Path, description = "The batch ID returned when the batch was created.")
     )
 )]
-#[tracing::instrument(skip(state, current_user), fields(batch_id = %batch_id_str))]
+#[tracing::instrument(skip_all, fields(user_id = %current_user.id, batch_id = %batch_id_str))]
 pub async fn delete_batch<P: PoolProvider>(
     State(state): State<AppState<P>>,
     Path(batch_id_str): Path<String>,
@@ -664,7 +664,7 @@ Failed requests are reset to pending and will be processed again. Use this after
         ("batch_id" = String, Path, description = "The batch ID returned when the batch was created.")
     )
 )]
-#[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, batch_id = %batch_id_str))]
+#[tracing::instrument(skip_all, fields(user_id = %current_user.id, batch_id = %batch_id_str))]
 pub async fn retry_failed_batch_requests<P: PoolProvider>(
     State(state): State<AppState<P>>,
     Path(batch_id_str): Path<String>,
@@ -753,7 +753,7 @@ Use this for fine-grained control over which requests to retry, rather than retr
         ("batch_id" = String, Path, description = "The batch ID returned when the batch was created.")
     )
 )]
-#[tracing::instrument(skip(state, current_user, req), fields(user_id = %current_user.id, batch_id = %batch_id_str))]
+#[tracing::instrument(skip_all, fields(user_id = %current_user.id, batch_id = %batch_id_str))]
 pub async fn retry_specific_requests<P: PoolProvider>(
     State(state): State<AppState<P>>,
     Path(batch_id_str): Path<String>,
@@ -869,7 +869,7 @@ Use cursor-based pagination: pass `last_id` from the response as the `after` par
         ListBatchesQuery
     )
 )]
-#[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, limit = ?query.pagination.limit, after = ?query.pagination.after))]
+#[tracing::instrument(skip_all, fields(user_id = %current_user.id))]
 pub async fn list_batches<P: PoolProvider>(
     State(state): State<AppState<P>>,
     Query(query): Query<ListBatchesQuery>,
