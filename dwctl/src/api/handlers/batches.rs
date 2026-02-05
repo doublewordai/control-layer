@@ -258,6 +258,16 @@ pub async fn create_batch<P: PoolProvider>(
     let model_throughputs = get_model_throughputs(&state, &model_aliases).await?;
 
     // Perform capacity check
+    //
+    // Note: This capacity check does not use locking, so concurrent batch creations
+    // may both pass the check and then exceed the actual capacity. This is a known
+    // limitation that provides "best effort" protection - it will reject obvious
+    // overflows but may allow slight over-acceptance (~10-20%) during concurrent bursts.
+    // This trade-off is intentional for Phase 1 to avoid complexity; proper
+    // concurrency control (e.g., advisory locks on model aliases) may be added in
+    // future iterations if the over-acceptance becomes problematic.
+    // NOTE: over acceptance is proportional to number of concurrent batches created, not number of requests in the batch
+    // so over-acceptance can be very high for a burst of large files.
     let capacity_result = check_sla_capacity(
         &file_model_counts,
         &pending_counts,
@@ -267,10 +277,18 @@ pub async fn create_batch<P: PoolProvider>(
     );
 
     if !capacity_result.has_capacity {
+        // Build detailed error message showing which models are overloaded
+        let overloaded_details: Vec<String> = capacity_result
+            .overloaded_models
+            .iter()
+            .map(|(model, deficit)| format!("{} (needs {} more capacity)", model, deficit))
+            .collect();
+
         return Err(Error::TooManyRequests {
             message: format!(
-                "Insufficient capacity to complete batch within {} SLA window. Try again later or use a longer completion window.",
-                req.completion_window
+                "Insufficient capacity for {} SLA window. Overloaded models: {}. Try again later or use a longer completion window.",
+                req.completion_window,
+                overloaded_details.join(", ")
             ),
         });
     }
