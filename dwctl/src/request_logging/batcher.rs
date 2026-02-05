@@ -1407,6 +1407,7 @@ mod integration_tests {
                 burst_size: None,
                 capacity: None,
                 batch_capacity: None,
+                throughput: None,
                 provider_pricing: None,
                 is_composite: false,
                 lb_strategy: None,

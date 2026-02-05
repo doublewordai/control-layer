@@ -858,6 +858,36 @@ pub struct BatchConfig {
     pub allowed_completion_windows: Vec<String>,
     /// Files configuration for batch file uploads/downloads
     pub files: FilesConfig,
+    /// Default throughput (requests/second) for models without explicit throughput configured.
+    /// Used for SLA capacity calculations when accepting new batches.
+    /// If not specified or null, defaults to 50.0 req/s.
+    /// Must be positive (> 0) when specified.
+    #[serde(default = "default_batch_throughput", deserialize_with = "deserialize_positive_throughput")]
+    pub default_throughput: f32,
+}
+
+fn default_batch_throughput() -> f32 {
+    50.0
+}
+
+/// Custom deserializer that validates throughput is positive, with null/missing defaulting to 50.0
+fn deserialize_positive_throughput<'de, D>(deserializer: D) -> Result<f32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+
+    // First, try to deserialize as Option<f32> to handle null
+    let opt: Option<f32> = Option::deserialize(deserializer)?;
+
+    match opt {
+        None => Ok(default_batch_throughput()), // null or missing -> use default
+        Some(value) if value <= 0.0 => Err(D::Error::custom(format!(
+            "default_throughput must be positive (> 0), got {}",
+            value
+        ))),
+        Some(value) => Ok(value),
+    }
 }
 
 impl Default for BatchConfig {
@@ -866,6 +896,7 @@ impl Default for BatchConfig {
             enabled: true,
             allowed_completion_windows: vec!["24h".to_string()],
             files: FilesConfig::default(),
+            default_throughput: default_batch_throughput(),
         }
     }
 }
@@ -1979,5 +2010,159 @@ secret_key: "test-secret-key"
         let result = config.validate();
         assert!(result.is_err()); // Should fail because batches API needs valid download_buffer_size
         assert!(result.unwrap_err().to_string().contains("download_buffer_size cannot be 0"));
+    }
+
+    #[test]
+    fn test_default_throughput_default_value() {
+        let config = Config::default();
+        assert_eq!(config.batches.default_throughput, 50.0);
+    }
+
+    #[test]
+    fn test_default_throughput_yaml_override() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+batches:
+  default_throughput: 100.0
+"#,
+            )?;
+
+            let args = Args {
+                config: "test.yaml".to_string(),
+                validate: false,
+            };
+
+            let config = Config::load(&args)?;
+            assert_eq!(config.batches.default_throughput, 100.0);
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_default_throughput_null_uses_default() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+batches:
+  default_throughput: null
+"#,
+            )?;
+
+            let args = Args {
+                config: "test.yaml".to_string(),
+                validate: false,
+            };
+
+            let config = Config::load(&args)?;
+            assert_eq!(config.batches.default_throughput, 50.0); // Should use default
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_default_throughput_missing_uses_default() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+batches:
+  enabled: true
+"#,
+            )?;
+
+            let args = Args {
+                config: "test.yaml".to_string(),
+                validate: false,
+            };
+
+            let config = Config::load(&args)?;
+            assert_eq!(config.batches.default_throughput, 50.0); // Should use default
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_default_throughput_zero_rejected() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+batches:
+  default_throughput: 0
+"#,
+            )?;
+
+            let args = Args {
+                config: "test.yaml".to_string(),
+                validate: false,
+            };
+
+            let result = Config::load(&args);
+            assert!(result.is_err());
+            let err = result.unwrap_err().to_string();
+            assert!(err.contains("default_throughput must be positive"));
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_default_throughput_negative_rejected() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+batches:
+  default_throughput: -10.0
+"#,
+            )?;
+
+            let args = Args {
+                config: "test.yaml".to_string(),
+                validate: false,
+            };
+
+            let result = Config::load(&args);
+            assert!(result.is_err());
+            let err = result.unwrap_err().to_string();
+            assert!(err.contains("default_throughput must be positive"));
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_default_throughput_env_override() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+"#,
+            )?;
+
+            jail.set_env("DWCTL_BATCHES__DEFAULT_THROUGHPUT", "75.5");
+
+            let args = Args {
+                config: "test.yaml".to_string(),
+                validate: false,
+            };
+
+            let config = Config::load(&args)?;
+            assert_eq!(config.batches.default_throughput, 75.5);
+
+            Ok(())
+        });
     }
 }

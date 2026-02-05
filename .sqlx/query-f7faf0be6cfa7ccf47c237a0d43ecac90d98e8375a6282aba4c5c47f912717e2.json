@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT alias, throughput\n            FROM deployed_models\n            WHERE alias = ANY($1)\n              AND deleted = false\n              AND throughput IS NOT NULL\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "alias",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "throughput",
+        "type_info": "Float4"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      false,
+      true
+    ]
+  },
+  "hash": "f7faf0be6cfa7ccf47c237a0d43ecac90d98e8375a6282aba4c5c47f912717e2"
+}

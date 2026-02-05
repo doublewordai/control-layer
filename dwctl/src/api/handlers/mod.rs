@@ -44,6 +44,7 @@ pub mod payments;
 pub mod probes;
 pub mod queue;
 pub mod requests;
+pub mod sla_capacity;
 pub mod static_assets;
 pub mod transactions;
 pub mod users;
