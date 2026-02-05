@@ -718,9 +718,9 @@ mod tests {
     fn test_capacity_check_1h_window_independent_of_24h_pending() {
         // Key test: 24h pending should NOT affect 1h capacity check
         // This simulates the scenario where 24h queue is saturated but 1h queue is empty
-        
+
         let file_model_counts = HashMap::from([("gpt-4".to_string(), 300)]); // 300 requests
-        
+
         // 24h queue is saturated with 80000 requests, but 1h queue has 0
         let pending_counts = HashMap::from([(
             "gpt-4".to_string(),
@@ -729,7 +729,7 @@ mod tests {
                 ("1h".to_string(), 0),      // Empty 1h queue
             ]),
         )]);
-        
+
         // Throughput of 1.0 req/s:
         // - 1h capacity = 3600
         // - 24h capacity = 86400
@@ -737,18 +737,21 @@ mod tests {
 
         // Check 1h window: should only consider 1h pending (0), NOT 24h pending
         let result_1h = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 1.0, "1h");
-        
+
         // 300 + 0 = 300 < 3600, should PASS
-        assert!(result_1h.has_capacity, "1h batch should be accepted when 1h queue is empty, regardless of 24h queue");
+        assert!(
+            result_1h.has_capacity,
+            "1h batch should be accepted when 1h queue is empty, regardless of 24h queue"
+        );
         assert!(result_1h.overloaded_models.is_empty());
     }
 
     #[test]
     fn test_capacity_check_24h_window_independent_of_1h_pending() {
         // Reverse test: 1h pending should NOT affect 24h capacity check
-        
+
         let file_model_counts = HashMap::from([("gpt-4".to_string(), 50000)]);
-        
+
         // 1h queue is saturated, but 24h queue has room
         let pending_counts = HashMap::from([(
             "gpt-4".to_string(),
@@ -757,12 +760,12 @@ mod tests {
                 ("24h".to_string(), 10000), // Plenty of room in 24h queue
             ]),
         )]);
-        
+
         let model_throughputs = HashMap::from([("gpt-4".to_string(), 1.0)]);
 
         // Check 24h window: should only consider 24h pending (10000)
         let result_24h = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 1.0, "24h");
-        
+
         // 50000 + 10000 = 60000 < 86400, should PASS
         assert!(result_24h.has_capacity, "24h batch should be accepted based on 24h queue only");
     }
@@ -771,15 +774,15 @@ mod tests {
     fn test_capacity_check_1h_saturated_24h_empty() {
         // 1h queue saturated, 24h queue empty
         let file_model_counts = HashMap::from([("gpt-4".to_string(), 1000)]);
-        
+
         let pending_counts = HashMap::from([(
             "gpt-4".to_string(),
             HashMap::from([
-                ("1h".to_string(), 3000),  // Near capacity for 1h
-                ("24h".to_string(), 0),    // Empty 24h queue
+                ("1h".to_string(), 3000), // Near capacity for 1h
+                ("24h".to_string(), 0),   // Empty 24h queue
             ]),
         )]);
-        
+
         let model_throughputs = HashMap::from([("gpt-4".to_string(), 1.0)]);
 
         // 1h check: 1000 + 3000 = 4000 > 3600, should FAIL
@@ -798,18 +801,15 @@ mod tests {
         // 0.1 req/s:
         // - 1h capacity = 0.1 * 3600 = 360
         // - 24h capacity = 0.1 * 86400 = 8640
-        
+
         let file_model_counts = HashMap::from([("model".to_string(), 1000)]);
-        
+
         // 24h queue is full (8000), but 1h queue is empty
         let pending_counts = HashMap::from([(
             "model".to_string(),
-            HashMap::from([
-                ("24h".to_string(), 8000),
-                ("1h".to_string(), 0),
-            ]),
+            HashMap::from([("24h".to_string(), 8000), ("1h".to_string(), 0)]),
         )]);
-        
+
         let model_throughputs = HashMap::from([("model".to_string(), 0.1)]);
 
         // 1h check: 1000 + 0 = 1000 > 360 (1h capacity), should FAIL due to 1h capacity limit
@@ -827,9 +827,9 @@ mod tests {
     fn test_capacity_check_low_throughput_small_batch_accepted() {
         // With 0.1 req/s, 1h capacity = 360
         // A small batch of 300 should be accepted when 1h queue is empty
-        
+
         let file_model_counts = HashMap::from([("model".to_string(), 300)]);
-        
+
         let pending_counts = HashMap::from([(
             "model".to_string(),
             HashMap::from([
@@ -837,7 +837,7 @@ mod tests {
                 ("1h".to_string(), 0),     // Empty 1h queue
             ]),
         )]);
-        
+
         let model_throughputs = HashMap::from([("model".to_string(), 0.1)]);
 
         // 1h check: 300 + 0 = 300 < 360, should PASS
@@ -849,7 +849,7 @@ mod tests {
     fn test_capacity_check_missing_window_in_pending_counts() {
         // If a window doesn't exist in pending_counts, it should be treated as 0
         let file_model_counts = HashMap::from([("gpt-4".to_string(), 1000)]);
-        
+
         // Only 24h pending exists, no 1h key
         let pending_counts = HashMap::from([(
             "gpt-4".to_string(),
@@ -857,7 +857,7 @@ mod tests {
                 ("24h".to_string(), 80000), // Only 24h
             ]),
         )]);
-        
+
         let model_throughputs = HashMap::from([("gpt-4".to_string(), 1.0)]);
 
         // 1h check: 1h pending is missing, should default to 0
