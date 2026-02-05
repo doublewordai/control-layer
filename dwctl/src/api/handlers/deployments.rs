@@ -335,7 +335,7 @@ pub async fn create_deployed_model<P: PoolProvider>(
 
     let mut tx = state.db.write().begin().await.map_err(|e| Error::Database(e.into()))?;
 
-    // Validate endpoint exists (only for standard models) - do this FIRST
+    // Validate endpoint exists (only for standard models)
     if let Some(endpoint_id) = hosted_on {
         let mut endpoints_repo = InferenceEndpoints::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
         if endpoints_repo.get_by_id(endpoint_id).await?.is_none() {
