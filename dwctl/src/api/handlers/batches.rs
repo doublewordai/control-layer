@@ -232,7 +232,6 @@ pub async fn create_batch<P: PoolProvider>(
         }
     }
 
-    // === SLA Capacity Check ===
     // Get per-model request counts from the file
     let file_stats = state
         .request_manager
@@ -277,22 +276,28 @@ pub async fn create_batch<P: PoolProvider>(
     );
 
     if !capacity_result.has_capacity {
-        // Build detailed error message showing which models are overloaded
         let overloaded_details: Vec<String> = capacity_result
             .overloaded_models
             .iter()
             .map(|(model, deficit)| format!("{} (needs {} more capacity)", model, deficit))
             .collect();
+        tracing::warn!(
+            completion_window = %req.completion_window,
+            overloaded_models = %overloaded_details.join(", "),
+            "Batch rejected due to insufficient SLA capacity"
+        );
+
+        // User-facing message: only list model names, no capacity details
+        let model_names: Vec<&str> = capacity_result.overloaded_models.keys().map(|model| model.as_str()).collect();
 
         return Err(Error::TooManyRequests {
             message: format!(
-                "Insufficient capacity for {} SLA window. Overloaded models: {}. Try again later or use a longer completion window.",
+                "Insufficient capacity for {} SLA window. The following models are currently at capacity: {}. Try again later or use a longer completion window.",
                 req.completion_window,
-                overloaded_details.join(", ")
+                model_names.join(", ")
             ),
         });
     }
-    // === End SLA Capacity Check ===
 
     // Determine request_source from authentication method
     // - API key present -> "api"
