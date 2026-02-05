@@ -323,7 +323,7 @@ impl IntoResponse for Error {
                 let body = json!({
                     "error": "too_many_requests",
                     "message": message,
-                    "retry_after_seconds": 60
+                    "retry_after_seconds": 30
                 });
 
                 (status, [(RETRY_AFTER, retry_after_secs)], axum::response::Json(body)).into_response()
