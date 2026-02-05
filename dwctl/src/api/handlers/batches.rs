@@ -1727,4 +1727,139 @@ mod tests {
         response.assert_header("X-Incomplete", "false"); // no more pages, batch complete
         response.assert_header("X-Last-Line", &num_requests.to_string());
     }
+
+    /// Test that X-Incomplete reflects batch processing status, not just pagination.
+    ///
+    /// When a batch still has pending/in-progress requests, X-Incomplete should be
+    /// true even on the last page of currently available results (or unlimited download).
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_batch_results_x_incomplete_while_still_processing(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        let deployment = create_test_deployment(&pool, user.id, "test-model-endpoint", "test-model").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        let file_id = Uuid::new_v4();
+        let batch_id = Uuid::new_v4();
+        let num_completed = 5;
+        let num_pending = 3;
+        let total = num_completed + num_pending;
+
+        sqlx::query(
+            "INSERT INTO fusillade.files (id, name, status, created_at, updated_at) VALUES ($1, 'test.jsonl', 'processed', NOW(), NOW())",
+        )
+        .bind(file_id)
+        .execute(&pool)
+        .await
+        .expect("Failed to create file");
+
+        sqlx::query(
+            "INSERT INTO fusillade.batches (id, created_by, file_id, endpoint, completion_window, expires_at, created_at, total_requests) VALUES ($1, $2, $3, '/v1/chat/completions', '24h', NOW() + interval '24 hours', NOW(), $4)",
+        )
+        .bind(batch_id)
+        .bind(user.id.to_string())
+        .bind(file_id)
+        .bind(total as i32)
+        .execute(&pool)
+        .await
+        .expect("Failed to create batch");
+
+        // Create completed requests
+        for i in 0..num_completed {
+            let template_id = Uuid::new_v4();
+            let request_id = Uuid::new_v4();
+            let custom_id = format!("req-{}", i);
+            let body = serde_json::json!({"model": "test-model", "messages": [{"role": "user", "content": format!("Test {}", i)}]});
+            let response_body = serde_json::json!({
+                "id": format!("chatcmpl-{}", i),
+                "choices": [{"message": {"content": format!("Response {}", i)}}]
+            });
+
+            sqlx::query(
+                "INSERT INTO fusillade.request_templates (id, file_id, model, api_key, endpoint, path, body, custom_id, method) VALUES ($1, $2, 'test-model', 'test-key', 'http://test', '/v1/chat/completions', $3, $4, 'POST')",
+            )
+            .bind(template_id)
+            .bind(file_id)
+            .bind(serde_json::to_string(&body).unwrap())
+            .bind(&custom_id)
+            .execute(&pool)
+            .await
+            .expect("Failed to create template");
+
+            sqlx::query(
+                "INSERT INTO fusillade.requests (id, batch_id, template_id, model, state, response_status, response_body, created_at, completed_at) VALUES ($1, $2, $3, 'test-model', 'completed', 200, $4, NOW(), NOW())",
+            )
+            .bind(request_id)
+            .bind(batch_id)
+            .bind(template_id)
+            .bind(serde_json::to_string(&response_body).unwrap())
+            .execute(&pool)
+            .await
+            .expect("Failed to create completed request");
+        }
+
+        // Create pending requests (no response yet)
+        for i in num_completed..total {
+            let template_id = Uuid::new_v4();
+            let request_id = Uuid::new_v4();
+            let custom_id = format!("req-{}", i);
+            let body = serde_json::json!({"model": "test-model", "messages": [{"role": "user", "content": format!("Test {}", i)}]});
+
+            sqlx::query(
+                "INSERT INTO fusillade.request_templates (id, file_id, model, api_key, endpoint, path, body, custom_id, method) VALUES ($1, $2, 'test-model', 'test-key', 'http://test', '/v1/chat/completions', $3, $4, 'POST')",
+            )
+            .bind(template_id)
+            .bind(file_id)
+            .bind(serde_json::to_string(&body).unwrap())
+            .bind(&custom_id)
+            .execute(&pool)
+            .await
+            .expect("Failed to create template");
+
+            sqlx::query(
+                "INSERT INTO fusillade.requests (id, batch_id, template_id, model, state, created_at) VALUES ($1, $2, $3, 'test-model', 'pending', NOW())",
+            )
+            .bind(request_id)
+            .bind(batch_id)
+            .bind(template_id)
+            .execute(&pool)
+            .await
+            .expect("Failed to create pending request");
+        }
+
+        let auth = add_auth_headers(&user);
+
+        // Unlimited download: X-Incomplete should be true because batch is still processing
+        let response = app
+            .get(&format!("/ai/v1/batches/{}/results", batch_id))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+
+        response.assert_status(StatusCode::OK);
+        response.assert_header("X-Incomplete", "true");
+
+        let body = response.text();
+        let lines: Vec<&str> = body.trim().lines().collect();
+        // Results include all requests (completed + pending)
+        assert_eq!(lines.len(), total, "Should return all request results");
+
+        // Paginated last page: even though no more pages, X-Incomplete should still be true
+        let response = app
+            .get(&format!("/ai/v1/batches/{}/results?limit={}", batch_id, total))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+
+        response.assert_status(StatusCode::OK);
+        response.assert_header("X-Incomplete", "true");
+
+        let body = response.text();
+        let lines: Vec<&str> = body.trim().lines().collect();
+        assert_eq!(lines.len(), total, "Should return all request results");
+    }
 }

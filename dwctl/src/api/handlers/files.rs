@@ -2472,4 +2472,147 @@ mod tests {
 
         upload_response.assert_status(axum::http::StatusCode::CREATED);
     }
+
+    /// Regression test for streaming file content (output files).
+    ///
+    /// Previously, get_file_content collected ALL items into memory before
+    /// sending the response. This test verifies that:
+    /// 1. Unlimited downloads (no limit param) return all results correctly
+    /// 2. Unlimited responses use streaming (no content-length header)
+    /// 3. Paginated downloads return correct subset and headers
+    /// 4. Each line is valid JSON
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_file_content_streaming(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        // Build a file with many requests
+        let num_requests = 30;
+        let jsonl_lines: Vec<String> = (0..num_requests)
+            .map(|i| {
+                format!(
+                    r#"{{"custom_id":"req-{}","method":"POST","url":"/v1/chat/completions","body":{{"model":"gpt-4","messages":[{{"role":"user","content":"Test {}"}}]}}}}"#,
+                    i, i
+                )
+            })
+            .collect();
+        let jsonl_content = jsonl_lines.join("\n") + "\n";
+
+        // Upload
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes().to_vec()).file_name("test.jsonl");
+        let upload_response = app
+            .post("/ai/v1/files")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .multipart(
+                axum_test::multipart::MultipartForm::new()
+                    .add_text("purpose", "batch")
+                    .add_part("file", file_part),
+            )
+            .await;
+
+        upload_response.assert_status(axum::http::StatusCode::CREATED);
+        let file: FileResponse = upload_response.json();
+
+        // Create batch to get an output file
+        let batch_response = app
+            .post("/ai/v1/batches")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .json(&serde_json::json!({
+                "input_file_id": file.id,
+                "endpoint": "/v1/chat/completions",
+                "completion_window": "24h"
+            }))
+            .await;
+
+        batch_response.assert_status(axum::http::StatusCode::CREATED);
+        let batch: serde_json::Value = batch_response.json();
+        let batch_id_str = batch["id"].as_str().expect("Should have id");
+        let output_file_id = batch["output_file_id"].as_str().expect("Should have output_file_id");
+
+        // Complete all requests so the output file has content
+        let batch_uuid_str = batch_id_str.strip_prefix("batch_").unwrap_or(batch_id_str);
+        let batch_uuid = Uuid::parse_str(batch_uuid_str).expect("Valid batch UUID");
+
+        sqlx::query(
+            r#"
+            UPDATE fusillade.requests
+            SET state = 'completed', response_status = 200,
+                response_body = '{"choices":[{"message":{"content":"ok"}}]}',
+                completed_at = NOW()
+            WHERE batch_id = $1
+            "#,
+        )
+        .bind(batch_uuid)
+        .execute(&pool)
+        .await
+        .expect("Failed to complete requests");
+
+        let auth = add_auth_headers(&user);
+
+        // Test 1: Unlimited download (streaming path)
+        let response = app
+            .get(&format!("/ai/v1/files/{}/content", output_file_id))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+
+        response.assert_status(axum::http::StatusCode::OK);
+        response.assert_header("content-type", "application/x-ndjson");
+        response.assert_header("X-Incomplete", "false");
+        // Streaming responses must not have content-length (regression guard)
+        assert!(
+            response.headers().get("content-length").is_none(),
+            "Unlimited download should be streamed without content-length"
+        );
+
+        let body = response.text();
+        let lines: Vec<&str> = body.trim().lines().collect();
+        assert_eq!(lines.len(), num_requests, "Should return all {} results", num_requests);
+
+        // Verify each line is valid JSON
+        for line in &lines {
+            let item: serde_json::Value = serde_json::from_str(line).expect("Each line should be valid JSON");
+            assert!(item.get("custom_id").is_some(), "Each result should have custom_id");
+        }
+
+        // Test 2: Paginated download (buffered path)
+        let page_size = 10;
+        let response = app
+            .get(&format!("/ai/v1/files/{}/content?limit={}", output_file_id, page_size))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+
+        response.assert_status(axum::http::StatusCode::OK);
+        response.assert_header("X-Incomplete", "true"); // more pages exist
+        response.assert_header("X-Last-Line", &page_size.to_string());
+
+        let body = response.text();
+        let lines: Vec<&str> = body.trim().lines().collect();
+        assert_eq!(lines.len(), page_size, "Should return exactly {} results", page_size);
+
+        // Test 3: Last page should have X-Incomplete=false
+        let response = app
+            .get(&format!(
+                "/ai/v1/files/{}/content?limit={}&skip={}",
+                output_file_id,
+                page_size,
+                num_requests - page_size
+            ))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+
+        response.assert_status(axum::http::StatusCode::OK);
+        response.assert_header("X-Incomplete", "false"); // no more pages, batch complete
+        response.assert_header("X-Last-Line", &num_requests.to_string());
+    }
 }
