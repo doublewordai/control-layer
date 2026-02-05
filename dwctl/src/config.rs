@@ -2011,4 +2011,158 @@ secret_key: "test-secret-key"
         assert!(result.is_err()); // Should fail because batches API needs valid download_buffer_size
         assert!(result.unwrap_err().to_string().contains("download_buffer_size cannot be 0"));
     }
+
+    #[test]
+    fn test_default_throughput_default_value() {
+        let config = Config::default();
+        assert_eq!(config.batches.default_throughput, 50.0);
+    }
+
+    #[test]
+    fn test_default_throughput_yaml_override() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+batches:
+  default_throughput: 100.0
+"#,
+            )?;
+
+            let args = Args {
+                config: "test.yaml".to_string(),
+                validate: false,
+            };
+
+            let config = Config::load(&args)?;
+            assert_eq!(config.batches.default_throughput, 100.0);
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_default_throughput_null_uses_default() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+batches:
+  default_throughput: null
+"#,
+            )?;
+
+            let args = Args {
+                config: "test.yaml".to_string(),
+                validate: false,
+            };
+
+            let config = Config::load(&args)?;
+            assert_eq!(config.batches.default_throughput, 50.0); // Should use default
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_default_throughput_missing_uses_default() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+batches:
+  enabled: true
+"#,
+            )?;
+
+            let args = Args {
+                config: "test.yaml".to_string(),
+                validate: false,
+            };
+
+            let config = Config::load(&args)?;
+            assert_eq!(config.batches.default_throughput, 50.0); // Should use default
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_default_throughput_zero_rejected() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+batches:
+  default_throughput: 0
+"#,
+            )?;
+
+            let args = Args {
+                config: "test.yaml".to_string(),
+                validate: false,
+            };
+
+            let result = Config::load(&args);
+            assert!(result.is_err());
+            let err = result.unwrap_err().to_string();
+            assert!(err.contains("default_throughput must be positive"));
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_default_throughput_negative_rejected() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+batches:
+  default_throughput: -10.0
+"#,
+            )?;
+
+            let args = Args {
+                config: "test.yaml".to_string(),
+                validate: false,
+            };
+
+            let result = Config::load(&args);
+            assert!(result.is_err());
+            let err = result.unwrap_err().to_string();
+            assert!(err.contains("default_throughput must be positive"));
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_default_throughput_env_override() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+"#,
+            )?;
+
+            jail.set_env("DWCTL_BATCHES__DEFAULT_THROUGHPUT", "75.5");
+
+            let args = Args {
+                config: "test.yaml".to_string(),
+                validate: false,
+            };
+
+            let config = Config::load(&args)?;
+            assert_eq!(config.batches.default_throughput, 75.5);
+
+            Ok(())
+        });
+    }
 }
