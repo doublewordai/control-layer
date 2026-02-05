@@ -860,17 +860,17 @@ pub struct BatchConfig {
     pub files: FilesConfig,
     /// Default throughput (requests/second) for models without explicit throughput configured.
     /// Used for SLA capacity calculations when accepting new batches.
-    /// If not specified or null, defaults to 50.0 req/s.
+    /// If not specified or null, defaults to 100.0 req/s. This is quite high, in favour of over-acceptance.
     /// Must be positive (> 0) when specified.
     #[serde(default = "default_batch_throughput", deserialize_with = "deserialize_positive_throughput")]
     pub default_throughput: f32,
 }
 
 fn default_batch_throughput() -> f32 {
-    50.0
+    100.0
 }
 
-/// Custom deserializer that validates throughput is positive, with null/missing defaulting to 50.0
+/// Custom deserializer that validates throughput is positive, with null/missing defaulting to 100.0
 fn deserialize_positive_throughput<'de, D>(deserializer: D) -> Result<f32, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -2015,7 +2015,7 @@ secret_key: "test-secret-key"
     #[test]
     fn test_default_throughput_default_value() {
         let config = Config::default();
-        assert_eq!(config.batches.default_throughput, 50.0);
+        assert_eq!(config.batches.default_throughput, 100.0);
     }
 
     #[test]
@@ -2060,7 +2060,7 @@ batches:
             };
 
             let config = Config::load(&args)?;
-            assert_eq!(config.batches.default_throughput, 50.0); // Should use default
+            assert_eq!(config.batches.default_throughput, 100.0); // Should use default
 
             Ok(())
         });
@@ -2084,7 +2084,7 @@ batches:
             };
 
             let config = Config::load(&args)?;
-            assert_eq!(config.batches.default_throughput, 50.0); // Should use default
+            assert_eq!(config.batches.default_throughput, 100.0); // Should use default
 
             Ok(())
         });
