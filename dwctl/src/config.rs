@@ -1060,7 +1060,7 @@ impl Default for LeaderElectionConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct NotificationsConfig {
-    /// Enable batch completion notifications (default: false)
+    /// Enable batch completion notifications (default: true)
     pub enabled: bool,
     /// How often to poll for completed batches (default: 30s)
     #[serde(with = "humantime_serde")]
@@ -1074,7 +1074,7 @@ pub struct NotificationsConfig {
 impl Default for NotificationsConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             poll_interval: Duration::from_secs(30),
             hide_retriable_before_sla: true,
             dashboard_url: "http://localhost:3001".to_string(),
