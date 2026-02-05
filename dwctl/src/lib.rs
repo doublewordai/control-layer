@@ -194,7 +194,9 @@ use std::sync::{Arc, OnceLock};
 use tokio::net::TcpListener;
 use tower::Layer;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
+use opentelemetry::trace::TraceContextExt;
 use tracing::{debug, info, instrument};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 use utoipa::OpenApi;
 use utoipa_scalar::{Scalar, Servable};
 use uuid::Uuid;
@@ -1219,28 +1221,42 @@ pub async fn build_router(
     }
 
     // Add tracing layer with OTel-compatible span names and HTTP semantic conventions
-    let router = router.layer(TraceLayer::new_for_http().make_span_with(|request: &http::Request<_>| {
-        let path = request.uri().path();
-        let span_name = format!("{} {}", request.method(), path);
-        let api_type = if path.starts_with("/ai/") {
-            "ai_proxy"
-        } else if path.starts_with("/admin/") {
-            "admin"
-        } else {
-            "other"
-        };
-        tracing::info_span!(
-            "request",
-            otel.name = %span_name,
-            otel.kind = "Server",
-            api.type = api_type,
-            http.request.method = %request.method(),
-            url.path = path,
-            url.query = request.uri().query().unwrap_or(""),
-        )
-    }));
+    let router = router
+        .layer(middleware::from_fn(inject_trace_id))
+        .layer(TraceLayer::new_for_http().make_span_with(|request: &http::Request<_>| {
+            let path = request.uri().path();
+            let span_name = format!("{} {}", request.method(), path);
+            let api_type = if path.starts_with("/ai/") {
+                "ai_proxy"
+            } else if path.starts_with("/admin/") {
+                "admin"
+            } else {
+                "other"
+            };
+            tracing::info_span!(
+                "request",
+                trace_id = tracing::field::Empty,
+                otel.name = %span_name,
+                otel.kind = "Server",
+                api.type = api_type,
+                http.request.method = %request.method(),
+                url.path = path,
+                url.query = request.uri().query().unwrap_or(""),
+            )
+        }));
 
     Ok(router)
+}
+
+/// Middleware that records the OpenTelemetry trace ID on the current span,
+/// making it visible in fmt log output for Loki → Tempo correlation.
+async fn inject_trace_id(request: axum::extract::Request, next: middleware::Next) -> axum::response::Response {
+    let span = tracing::Span::current();
+    let sc = span.context().span().span_context().clone();
+    if sc.is_valid() {
+        span.record("trace_id", tracing::field::display(sc.trace_id()));
+    }
+    next.run(request).await
 }
 
 /// Container for background services and their lifecycle management.
