@@ -1094,7 +1094,11 @@ pub async fn build_router(
             DefaultBodyLimit::disable()
         } else {
             // Add 10KB overhead for multipart encoding (headers, boundaries, etc.)
-            DefaultBodyLimit::max((file_upload_limit + 10 * 1024) as usize)
+            const MULTIPART_OVERHEAD: u64 = 10 * 1024;
+            let body_limit_u64 = file_upload_limit.saturating_add(MULTIPART_OVERHEAD);
+            // Clamp to usize::MAX to avoid truncation when converting to usize
+            let body_limit = usize::try_from(body_limit_u64).unwrap_or(usize::MAX);
+            DefaultBodyLimit::max(body_limit)
         };
         let file_router = Router::new().route("/files", post(api::handlers::files::upload_file).layer(body_limit_layer));
 

@@ -40,6 +40,9 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
+// Note: We import multer directly to get typed error matching for body limit errors.
+// axum's multipart wraps multer, and checking error variants is more robust than string matching.
+use axum::extract::multipart::MultipartError;
 /// OpenAI Batch API request format
 /// See: https://platform.openai.com/docs/api-reference/batch
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -118,7 +121,7 @@ impl OpenAIBatchRequest {
     /// * `api_key` - The API key to inject for request execution
     /// * `accessible_models` - Set of model aliases the user can access
     #[tracing::instrument(skip(self, api_key, accessible_models), fields(custom_id = %self.custom_id, method = %self.method, url = %self.url))]
-    fn to_internal(&self, endpoint: &str, api_key: String, accessible_models: &HashSet<String>) -> Result<fusillade::RequestTemplateInput> {
+    fn to_internal(&self, endpoint: &str, api_key: &str, accessible_models: &HashSet<String>) -> Result<fusillade::RequestTemplateInput> {
         // Validate custom_id is safe for HTTP headers
         validate_custom_id(&self.custom_id)?;
 
@@ -170,7 +173,7 @@ impl OpenAIBatchRequest {
             path: self.url.clone(),
             body,
             model,
-            api_key,
+            api_key: api_key.to_string(),
         })
     }
 
@@ -274,6 +277,42 @@ impl FileUploadError {
     }
 }
 
+/// Check if an error (or any error in its source chain) is a body/stream length limit error.
+/// This is more robust than string matching as it checks the actual error types.
+fn is_length_limit_error(err: &(dyn std::error::Error + 'static)) -> bool {
+    // First check the error itself
+    if let Some(multer_err) = err.downcast_ref::<multer::Error>()
+        && matches!(multer_err, multer::Error::StreamSizeExceeded { .. })
+    {
+        return true;
+    }
+
+    // Check if it's an axum MultipartError wrapping a multer error
+    if let Some(multipart_err) = err.downcast_ref::<MultipartError>()
+        // MultipartError's source is the underlying multer::Error
+        && let Some(source) = std::error::Error::source(multipart_err)
+        && let Some(multer_err) = source.downcast_ref::<multer::Error>()
+        && matches!(multer_err, multer::Error::StreamSizeExceeded { .. })
+    {
+        return true;
+    }
+
+    // Walk the error chain as fallback
+    let mut source = std::error::Error::source(err);
+    while let Some(inner) = source {
+        if let Some(multer_err) = inner.downcast_ref::<multer::Error>()
+            && matches!(multer_err, multer::Error::StreamSizeExceeded { .. })
+        {
+            return true;
+        }
+        source = std::error::Error::source(inner);
+    }
+
+    // Final fallback: string matching (for future-proofing if error types change)
+    let err_str = err.to_string();
+    err_str.contains("length limit exceeded") || err_str.contains("body limit")
+}
+
 /// Result from create_file_stream: the stream and an error slot.
 /// If the stream aborts, check the error slot for the typed error.
 type FileStreamResult = (
@@ -306,8 +345,8 @@ fn create_file_stream(
     tokio::spawn(async move {
         let mut total_size = 0u64;
         let mut line_count = 0u64;
-        let mut incomplete_line = String::new();
-        let mut incomplete_utf8_bytes = Vec::new(); // Buffer for incomplete UTF-8 sequences at chunk boundaries
+        let mut incomplete_line = String::with_capacity(1024);
+        let mut incomplete_utf8_bytes = Vec::with_capacity(4);
         let mut metadata = fusillade::FileMetadata {
             uploaded_by,
             ..Default::default()
@@ -329,9 +368,8 @@ fn create_file_stream(
                 Ok(Some(field)) => field,
                 Ok(None) => break, // No more fields
                 Err(e) => {
-                    // Check if this is a body limit error
-                    let err_str = e.to_string();
-                    if err_str.contains("length limit exceeded") || err_str.contains("body limit") {
+                    // Check if this is a body limit error using typed matching
+                    if is_length_limit_error(&e) {
                         abort!(FileUploadError::FileTooLarge { max: config.max_file_size });
                     } else {
                         abort!(FileUploadError::StreamInterrupted {
@@ -341,9 +379,9 @@ fn create_file_stream(
                 }
             };
 
-            let field_name = field.name().unwrap_or("").to_string();
+            let field_name = field.name().unwrap_or("");
 
-            match field_name.as_str() {
+            match field_name {
                 "purpose" => {
                     if let Ok(value) = field.text().await {
                         metadata.purpose = Some(value);
@@ -477,7 +515,7 @@ fn create_file_stream(
                                     match serde_json::from_str::<OpenAIBatchRequest>(trimmed) {
                                         Ok(openai_req) => {
                                             // Transform to internal format (includes model access validation)
-                                            match openai_req.to_internal(&endpoint, api_key.clone(), &accessible_models) {
+                                            match openai_req.to_internal(&endpoint, &api_key, &accessible_models) {
                                                 Ok(template) => {
                                                     line_count += 1;
                                                     incomplete_line.clear();
@@ -522,22 +560,8 @@ fn create_file_stream(
                                     "File upload stream error"
                                 );
 
-                                // Walk the error chain to find the root cause
-                                // We're specifically looking for "length limit exceeded" which indicates
-                                // the body limit was hit (from axum's DefaultBodyLimit)
-                                let mut is_length_limit_error = false;
-                                let mut source = std::error::Error::source(&e);
-                                while let Some(err) = source {
-                                    let err_str = err.to_string();
-                                    if err_str.contains("length limit exceeded") {
-                                        is_length_limit_error = true;
-                                        break;
-                                    }
-                                    source = std::error::Error::source(err);
-                                }
-
-                                if is_length_limit_error {
-                                    // This is a body limit error - convert to FileTooLarge
+                                // Check if this is a body limit error using typed matching
+                                if is_length_limit_error(&e) {
                                     abort!(FileUploadError::FileTooLarge { max: config.max_file_size });
                                 } else {
                                     // Genuine stream error
@@ -560,7 +584,7 @@ fn create_file_stream(
                             }
 
                             match serde_json::from_str::<OpenAIBatchRequest>(trimmed) {
-                                Ok(openai_req) => match openai_req.to_internal(&endpoint, api_key.clone(), &accessible_models) {
+                                Ok(openai_req) => match openai_req.to_internal(&endpoint, &api_key, &accessible_models) {
                                     Ok(template) => {
                                         line_count += 1;
                                         if tx.send(fusillade::FileStreamItem::Template(template)).await.is_err() {
@@ -591,7 +615,7 @@ fn create_file_stream(
                         }
                     }
 
-                    // Check if file is empty  (no templates parsed)
+                    // Check if file is empty (no templates parsed)
                     if line_count == 0 {
                         abort!(FileUploadError::EmptyFile);
                     }
@@ -639,7 +663,7 @@ Each line must be a valid JSON object containing `custom_id`, `method`, `url`, a
     ),
     responses(
         (status = 201, description = "File uploaded and validated successfully.", body = FileResponse),
-        (status = 400, description = "Invalid file format, malformed JSON, missing required fields, or referencing an inaccessible model."),
+        (status = 400, description = "Invalid file format, malformed JSON, missing required fields, etc."),
         (status = 403, description = "Model referenced in the file is not configured or not accessible to your account."),
         (status = 413, description = "File exceeds the maximum allowed size."),
         (status = 429, description = "Too many concurrent uploads. Retry after a short delay."),
@@ -666,11 +690,14 @@ pub async fn upload_file<P: PoolProvider>(
     // This avoids streaming a large file only to reject it later.
     // Note: Content-Length may be absent (chunked encoding) or spoofed,
     // so we still verify during streaming.
+    // We add 10KB overhead for multipart encoding (boundaries, headers) to match
+    // the DefaultBodyLimit layer configuration in lib.rs.
+    const MULTIPART_OVERHEAD: u64 = 10 * 1024;
     if max_file_size > 0
         && let Some(content_length) = request.headers().get(axum::http::header::CONTENT_LENGTH)
         && let Ok(length_str) = content_length.to_str()
         && let Ok(length) = length_str.parse::<u64>()
-        && length > max_file_size
+        && length > max_file_size.saturating_add(MULTIPART_OVERHEAD)
     {
         return Err(Error::PayloadTooLarge {
             message: format!("File exceeds the maximum allowed size of {} bytes", max_file_size),
@@ -2726,9 +2753,10 @@ mod tests {
 
         let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
 
-        // Create content that exceeds 1KB to trigger early rejection via Content-Length
-        // In test_upload_content_length_early_rejection, change:
-        let large_content = "x".repeat(2000);
+        // The early rejection check allows max_file_size + 10KB overhead for multipart encoding.
+        // With a 1KB limit, we need Content-Length > 1000 + 10240 = 11240 bytes.
+        // Use 15KB of content to guarantee rejection via the early Content-Length check.
+        let large_content = "x".repeat(15 * 1024);
         let file_part = axum_test::multipart::Part::bytes(large_content.into_bytes()).file_name("test.jsonl");
 
         let upload_response = app

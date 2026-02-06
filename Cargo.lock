@@ -1481,6 +1481,7 @@ dependencies = [
  "metrics-exporter-prometheus",
  "mime_guess",
  "moka",
+ "multer",
  "once_cell",
  "onwards",
  "opentelemetry",
