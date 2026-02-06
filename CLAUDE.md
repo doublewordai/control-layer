@@ -111,6 +111,18 @@ just ci rust
 just ci ts
 ```
 
+### Pull Request Titles
+
+Use conventional-commit style for PR titles so CI title checks pass:
+
+```text
+type(scope): short description
+```
+
+Examples:
+- `fix(batch): support /v1/responses in batch endpoint allowlist`
+- `feat(dashboard): add usage breakdown chart`
+
 ### Database Management
 
 ```bash
