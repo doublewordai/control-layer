@@ -923,9 +923,9 @@ pub async fn get_file_content<P: PoolProvider>(
     };
 
     // Stream the file content as JSONL, starting from offset
-    let offset = query.pagination.skip.unwrap_or(0) as usize;
+    let offset = query.pagination.skip() as usize;
     let search = query.search.clone();
-    let requested_limit = query.pagination.limit.map(|l| l as usize);
+    let requested_limit = query.pagination.limit.map(|_| query.pagination.limit() as usize);
 
     // Helper to serialize FileContentItem to JSON line
     fn serialize_content_item(content_item: fusillade::FileContentItem) -> fusillade::Result<String> {

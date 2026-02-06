@@ -444,10 +444,10 @@ pub async fn get_batch_results<P: PoolProvider>(
 
     // Stream the batch results as JSONL
     // Hide retriable errors before SLA expiry
-    let offset = query.pagination.skip.unwrap_or(0) as usize;
+    let offset = query.pagination.skip() as usize;
     let search = query.search.clone();
     let status = query.status.clone();
-    let requested_limit = query.pagination.limit.map(|l| l as usize);
+    let requested_limit = query.pagination.limit.map(|_| query.pagination.limit() as usize);
 
     if let Some(limit) = requested_limit {
         // Pagination case: buffer only N+1 items to check for more pages
