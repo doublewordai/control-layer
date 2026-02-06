@@ -720,6 +720,8 @@ pub struct EmailConfig {
     pub from_name: String,
     /// Password reset email configuration
     pub password_reset: PasswordResetEmailConfig,
+    /// Who to set the reply to field from
+    pub reply_to: Option<String>,
 }
 
 /// Email transport configuration - either SMTP or file-based for testing.
@@ -1350,6 +1352,7 @@ impl Default for EmailConfig {
             from_email: "noreply@example.com".to_string(),
             from_name: "Control Layer".to_string(),
             password_reset: PasswordResetEmailConfig::default(),
+            reply_to: None,
         }
     }
 }

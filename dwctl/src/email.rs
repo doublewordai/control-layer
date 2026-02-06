@@ -27,6 +27,7 @@ pub struct EmailService {
     from_email: String,
     from_name: String,
     base_url: String,
+    reply_to: Option<String>,
 }
 
 enum EmailTransport {
@@ -82,6 +83,7 @@ impl EmailService {
             from_email: email_config.from_email.clone(),
             from_name: email_config.from_name.clone(),
             base_url: email_config.password_reset.base_url.clone(),
+            reply_to: email_config.reply_to.clone()
         })
     }
 
@@ -119,16 +121,24 @@ impl EmailService {
             operation: format!("parse to email: {e}"),
         })?;
 
-        // Build message
-        let message = Message::builder()
+        let mut builder = Message::builder()
             .from(from)
             .to(to)
             .subject(subject)
-            .header(ContentType::TEXT_HTML)
-            .body(body.to_string())
-            .map_err(|e| Error::Internal {
-                operation: format!("build email message: {e}"),
-            })?;
+            .header(ContentType::TEXT_HTML);
+
+        if let Some(ref reply_to_email) = self.reply_to {
+            let reply_to = format!("{} <{reply_to_email}>", self.from_name)
+                .parse::<Mailbox>()
+                .map_err(|e| Error::Internal {
+                    operation: format!("parse reply-to email: {e}"),
+                })?;
+            builder = builder.reply_to(reply_to);
+        }
+
+        let message = builder.body(body.to_string()).map_err(|e| Error::Internal {
+            operation: format!("build email message: {e}"),
+        })?;
 
         // Send based on transport type
         match &self.transport {
