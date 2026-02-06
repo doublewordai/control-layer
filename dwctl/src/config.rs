@@ -856,6 +856,9 @@ pub struct BatchConfig {
     /// These define the maximum time from batch creation to completion.
     /// Default: vec!["24h".to_string()]
     pub allowed_completion_windows: Vec<String>,
+    /// Allowed OpenAI-compatible URL paths for batch requests.
+    /// These paths are validated during file upload and batch creation.
+    pub allowed_url_paths: Vec<String>,
     /// Files configuration for batch file uploads/downloads
     pub files: FilesConfig,
 }
@@ -865,6 +868,13 @@ impl Default for BatchConfig {
         Self {
             enabled: true,
             allowed_completion_windows: vec!["24h".to_string()],
+            allowed_url_paths: vec![
+                "/v1/chat/completions".to_string(),
+                "/v1/completions".to_string(),
+                "/v1/embeddings".to_string(),
+                "/v1/moderations".to_string(),
+                "/v1/responses".to_string(),
+            ],
             files: FilesConfig::default(),
         }
     }
@@ -1506,6 +1516,13 @@ impl Config {
 
         // Validate batches API-specific configuration (only if batches API is enabled)
         if self.batches.enabled {
+            if self.batches.allowed_url_paths.is_empty() {
+                return Err(Error::Internal {
+                    operation: "Config validation: batches.allowed_url_paths cannot be empty. Add at least one supported URL path."
+                        .to_string(),
+                });
+            }
+
             // upload_buffer_size is only used during file uploads (batches API specific)
             if self.batches.files.upload_buffer_size == 0 {
                 return Err(Error::Internal {
