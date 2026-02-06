@@ -252,7 +252,6 @@ batches:
     - "/v1/chat/completions"
     - "/v1/completions"
     - "/v1/embeddings"
-    - "/v1/moderations"
     - "/v1/responses"
 
   # Files configuration for batch file uploads/downloads
