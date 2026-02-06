@@ -297,6 +297,9 @@ fn create_file_stream(
     accessible_models: HashSet<String>,
 ) -> FileStreamResult {
     let (tx, rx) = mpsc::channel(config.buffer_size);
+    // std::sync::Mutex is appropriate here because:
+    // 1. Lock is held only briefly (no await points while locked)
+    // 2. No contention (only writer is spawned task, only reader is error handler)
     let error_slot: Arc<Mutex<Option<FileUploadError>>> = Arc::new(Mutex::new(None));
     let error_slot_clone = Arc::clone(&error_slot);
 
@@ -321,7 +324,23 @@ fn create_file_stream(
         }
 
         // Parse multipart fields
-        while let Ok(Some(field)) = multipart.next_field().await {
+        loop {
+            let field = match multipart.next_field().await {
+                Ok(Some(field)) => field,
+                Ok(None) => break, // No more fields
+                Err(e) => {
+                    // Check if this is a body limit error
+                    let err_str = e.to_string();
+                    if err_str.contains("length limit exceeded") || err_str.contains("body limit") {
+                        abort!(FileUploadError::FileTooLarge { max: config.max_file_size });
+                    } else {
+                        abort!(FileUploadError::StreamInterrupted {
+                            message: format!("Multipart parsing failed: {}", e),
+                        });
+                    }
+                }
+            };
+
             let field_name = field.name().unwrap_or("").to_string();
 
             match field_name.as_str() {
@@ -577,7 +596,13 @@ fn create_file_stream(
                         abort!(FileUploadError::EmptyFile);
                     }
 
-                    metadata.size_bytes = Some(total_size as i64);
+                    metadata.size_bytes = match i64::try_from(total_size) {
+                        Ok(size) => Some(size),
+                        Err(_) => {
+                            // File size exceeds i64::MAX (~9.2 exabytes) - treat as too large
+                            abort!(FileUploadError::FileTooLarge { max: config.max_file_size });
+                        }
+                    };
                     file_processed = true;
 
                     // Continue processing remaining fields (metadata after file)
@@ -2765,5 +2790,40 @@ mod tests {
 
         // Should get 413 Payload Too Large (not 500 or confusing error)
         upload_response.assert_status(axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_upload_invalid_utf8(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+
+        // Create content with invalid UTF-8 bytes
+        // 0xFF 0xFE is not valid UTF-8
+        let mut content = b"{\"custom_id\":\"req-1\",\"method\":\"POST\",\"url\":\"/v1/chat/completions\",\"body\":{\"model\":\"gpt-4\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello ".to_vec();
+        content.extend_from_slice(&[0xFF, 0xFE]); // Invalid UTF-8
+        content.extend_from_slice(b"\"}]}}");
+
+        let file_part = axum_test::multipart::Part::bytes(content).file_name("test.jsonl");
+
+        let upload_response = app
+            .post("/ai/v1/files")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .multipart(
+                axum_test::multipart::MultipartForm::new()
+                    .add_text("purpose", "batch")
+                    .add_part("file", file_part),
+            )
+            .await;
+
+        // Should reject with 400 Bad Request for invalid UTF-8
+        upload_response.assert_status(axum::http::StatusCode::BAD_REQUEST);
+        let body = upload_response.text();
+        assert!(
+            body.contains("UTF-8") || body.contains("utf-8") || body.contains("encoding"),
+            "Expected error about UTF-8, got: {}",
+            body
+        );
     }
 }
