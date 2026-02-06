@@ -212,7 +212,7 @@ enum FileUploadError {
     /// HTTP stream was interrupted (connection dropped, body limit exceeded, etc.)
     StreamInterrupted { message: String },
     /// File exceeds the configured maximum size
-    FileTooLarge { size: u64, max: u64 },
+    FileTooLarge { max: u64 },
     /// File contains too many requests
     TooManyRequests { count: usize, max: usize },
     /// Invalid JSON on a specific line
@@ -239,7 +239,7 @@ impl FileUploadError {
                     operation: format!("upload file: {}", message),
                 }
             }
-            FileUploadError::FileTooLarge { size: _, max } => Error::PayloadTooLarge {
+            FileUploadError::FileTooLarge { max } => Error::PayloadTooLarge {
                 message: format!("File exceeds the maximum allowed size of {} bytes", max),
             },
             FileUploadError::TooManyRequests { count, max } => Error::BadRequest {
@@ -369,10 +369,7 @@ fn create_file_stream(
 
                                 // Check size limit (0 = unlimited)
                                 if config.max_file_size > 0 && total_size > config.max_file_size {
-                                    abort!(FileUploadError::FileTooLarge {
-                                        size: total_size,
-                                        max: config.max_file_size,
-                                    });
+                                    abort!(FileUploadError::FileTooLarge { max: config.max_file_size });
                                 }
 
                                 // Combine incomplete UTF-8 bytes from previous chunk with current chunk
@@ -452,7 +449,7 @@ fn create_file_stream(
                                     // Check request count limit before parsing (0 = unlimited)
                                     if config.max_requests_per_file > 0 && line_count >= config.max_requests_per_file as u64 {
                                         abort!(FileUploadError::TooManyRequests {
-                                            count: config.max_requests_per_file + 1,
+                                            count: (line_count + 1).try_into().unwrap_or(usize::MAX),
                                             max: config.max_requests_per_file,
                                         });
                                     }
@@ -522,10 +519,7 @@ fn create_file_stream(
 
                                 if is_length_limit_error {
                                     // This is a body limit error - convert to FileTooLarge
-                                    abort!(FileUploadError::FileTooLarge {
-                                        size: total_size, // Current size when limit was hit
-                                        max: config.max_file_size,
-                                    });
+                                    abort!(FileUploadError::FileTooLarge { max: config.max_file_size });
                                 } else {
                                     // Genuine stream error
                                     abort!(FileUploadError::StreamInterrupted { message: e.to_string() });
@@ -541,7 +535,7 @@ fn create_file_stream(
                             // Check request count limit
                             if config.max_requests_per_file > 0 && line_count >= config.max_requests_per_file as u64 {
                                 abort!(FileUploadError::TooManyRequests {
-                                    count: config.max_requests_per_file + 1,
+                                    count: (line_count + 1).try_into().unwrap_or(usize::MAX),
                                     max: config.max_requests_per_file,
                                 });
                             }
@@ -621,6 +615,7 @@ Each line must be a valid JSON object containing `custom_id`, `method`, `url`, a
     responses(
         (status = 201, description = "File uploaded and validated successfully.", body = FileResponse),
         (status = 400, description = "Invalid file format, malformed JSON, missing required fields, or referencing an inaccessible model."),
+        (status = 403, description = "Model referenced in the file is not configured or not accessible to your account."),
         (status = 413, description = "File exceeds the maximum allowed size."),
         (status = 429, description = "Too many concurrent uploads. Retry after a short delay."),
         (status = 500, description = "An unexpected error occurred. Retry the request or contact support if the issue persists.")
@@ -646,18 +641,15 @@ pub async fn upload_file<P: PoolProvider>(
     // This avoids streaming a large file only to reject it later.
     // Note: Content-Length may be absent (chunked encoding) or spoofed,
     // so we still verify during streaming.
-    if max_file_size > 0 {
-        if let Some(content_length) = request.headers().get(axum::http::header::CONTENT_LENGTH) {
-            if let Ok(length_str) = content_length.to_str() {
-                if let Ok(length) = length_str.parse::<u64>() {
-                    if length > max_file_size {
-                        return Err(Error::PayloadTooLarge {
-                            message: format!("File exceeds the maximum allowed size of {} bytes", max_file_size),
-                        });
-                    }
-                }
-            }
-        }
+    if max_file_size > 0
+        && let Some(content_length) = request.headers().get(axum::http::header::CONTENT_LENGTH)
+        && let Ok(length_str) = content_length.to_str()
+        && let Ok(length) = length_str.parse::<u64>()
+        && length > max_file_size
+    {
+        return Err(Error::PayloadTooLarge {
+            message: format!("File exceeds the maximum allowed size of {} bytes", max_file_size),
+        });
     }
 
     // Extract multipart from request body
@@ -1531,11 +1523,11 @@ mod tests {
             )
             .await;
 
-        // Should reject with 400 Bad Request due to model access denied
-        upload_response.assert_status(axum::http::StatusCode::BAD_REQUEST);
+        // Should reject with 403 Forbidden due to model access denied
+        upload_response.assert_status(axum::http::StatusCode::FORBIDDEN);
         let error_body = upload_response.text();
         assert!(error_body.contains("Model"));
-        assert!(error_body.contains("has not been configured or is not available to user."));
+        assert!(error_body.contains("has not been configured or is not available to user"));
     }
 
     #[sqlx::test]
@@ -2523,7 +2515,7 @@ mod tests {
         upload_response.assert_status(axum::http::StatusCode::BAD_REQUEST);
         let body = upload_response.text();
         assert!(
-            body.contains("maximum request limit"),
+            body.contains("exceeds the maximum of"),
             "Expected error about request limit, got: {}",
             body
         );
@@ -2564,5 +2556,214 @@ mod tests {
             .await;
 
         upload_response.assert_status(axum::http::StatusCode::CREATED);
+    }
+
+    #[test]
+    fn test_file_upload_error_into_http_error_stream_interrupted() {
+        let err = super::FileUploadError::StreamInterrupted {
+            message: "connection reset".to_string(),
+        };
+        let http_err = err.into_http_error();
+        match http_err {
+            crate::errors::Error::Internal { operation } => {
+                assert!(operation.contains("connection reset"));
+            }
+            _ => panic!("Expected Internal error"),
+        }
+    }
+
+    #[test]
+    fn test_file_upload_error_into_http_error_file_too_large() {
+        let err = super::FileUploadError::FileTooLarge { max: 100_000_000 };
+        let http_err = err.into_http_error();
+        match http_err {
+            crate::errors::Error::PayloadTooLarge { message } => {
+                assert!(message.contains("100000000"));
+                // Should NOT contain the partial size
+                assert!(!message.contains("200000000"));
+            }
+            _ => panic!("Expected PayloadTooLarge error"),
+        }
+    }
+
+    #[test]
+    fn test_file_upload_error_into_http_error_too_many_requests() {
+        let err = super::FileUploadError::TooManyRequests { count: 1001, max: 1000 };
+        let http_err = err.into_http_error();
+        match http_err {
+            crate::errors::Error::BadRequest { message } => {
+                assert!(message.contains("1001"));
+                assert!(message.contains("1000"));
+            }
+            _ => panic!("Expected BadRequest error"),
+        }
+    }
+
+    #[test]
+    fn test_file_upload_error_into_http_error_invalid_json() {
+        let err = super::FileUploadError::InvalidJson {
+            line: 42,
+            error: "expected comma".to_string(),
+        };
+        let http_err = err.into_http_error();
+        match http_err {
+            crate::errors::Error::BadRequest { message } => {
+                assert!(message.contains("line 42"));
+                assert!(message.contains("expected comma"));
+            }
+            _ => panic!("Expected BadRequest error"),
+        }
+    }
+
+    #[test]
+    fn test_file_upload_error_into_http_error_invalid_utf8() {
+        let err = super::FileUploadError::InvalidUtf8 {
+            line: 5,
+            byte_offset: 128,
+            error: "invalid byte sequence".to_string(),
+        };
+        let http_err = err.into_http_error();
+        match http_err {
+            crate::errors::Error::BadRequest { message } => {
+                assert!(message.contains("line 5"));
+                assert!(message.contains("byte offset 128"));
+            }
+            _ => panic!("Expected BadRequest error"),
+        }
+    }
+
+    #[test]
+    fn test_file_upload_error_into_http_error_no_file() {
+        let err = super::FileUploadError::NoFile;
+        let http_err = err.into_http_error();
+        match http_err {
+            crate::errors::Error::BadRequest { message } => {
+                assert!(message.contains("No file field"));
+            }
+            _ => panic!("Expected BadRequest error"),
+        }
+    }
+
+    #[test]
+    fn test_file_upload_error_into_http_error_empty_file() {
+        let err = super::FileUploadError::EmptyFile;
+        let http_err = err.into_http_error();
+        match http_err {
+            crate::errors::Error::BadRequest { message } => {
+                assert!(message.contains("no valid request templates"));
+            }
+            _ => panic!("Expected BadRequest error"),
+        }
+    }
+
+    #[test]
+    fn test_file_upload_error_into_http_error_model_access_denied() {
+        let error = super::FileUploadError::ModelAccessDenied {
+            model: "gpt-5".to_string(),
+            line: 42,
+        };
+        let http_error = error.into_http_error();
+        match http_error {
+            crate::errors::Error::ModelAccessDenied { model_name, message } => {
+                assert_eq!(model_name, "gpt-5");
+                assert!(message.contains("42"));
+                assert!(message.contains("gpt-5"));
+            }
+            _ => panic!("Expected ModelAccessDenied error, got {:?}", http_error),
+        }
+    }
+
+    #[test]
+    fn test_file_upload_error_into_http_error_validation_error() {
+        let err = super::FileUploadError::ValidationError {
+            line: 3,
+            message: "custom_id too long".to_string(),
+        };
+        let http_err = err.into_http_error();
+        match http_err {
+            crate::errors::Error::BadRequest { message } => {
+                assert!(message.contains("Line 3"));
+                assert!(message.contains("custom_id too long"));
+            }
+            _ => panic!("Expected BadRequest error"),
+        }
+    }
+
+    /// Test that Content-Length header triggers early rejection for oversized files
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_upload_content_length_early_rejection(pool: PgPool) {
+        // Create app with a small file size limit
+        let mut config = create_test_config();
+        config.limits.files.max_file_size = 1000; // 1KB limit
+
+        let (app, _bg_services) = create_test_app_with_config(pool.clone(), config, false).await;
+
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+
+        // Create content that exceeds 1KB to trigger early rejection via Content-Length
+        // In test_upload_content_length_early_rejection, change:
+        let large_content = "x".repeat(2000);
+        let file_part = axum_test::multipart::Part::bytes(large_content.into_bytes()).file_name("test.jsonl");
+
+        let upload_response = app
+            .post("/ai/v1/files")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .multipart(
+                axum_test::multipart::MultipartForm::new()
+                    .add_part("file", file_part)
+                    .add_text("purpose", "batch"),
+            )
+            .await;
+
+        // Should get 413 Payload Too Large
+        upload_response.assert_status(axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+        let body = upload_response.text();
+        assert!(body.contains("exceeds the maximum allowed size"));
+    }
+
+    /// Test that files exceeding size limit during streaming return 413
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_upload_streaming_size_limit_returns_413(pool: PgPool) {
+        // Use a limit large enough for multipart overhead but small enough
+        // that our test content will exceed it during streaming
+        let mut config = create_test_config();
+        config.limits.files.max_file_size = 5000; // 5KB file limit
+
+        let (app, _bg_services) = create_test_app_with_config(pool.clone(), config, false).await;
+
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        // Create content that will exceed 5KB limit during streaming
+        // Each line is ~150 bytes, so 50 lines is ~7.5KB which exceeds 5KB limit
+        let mut lines = Vec::new();
+        for i in 0..50 {
+            lines.push(format!(
+                r#"{{"custom_id":"req-{}","method":"POST","url":"/v1/chat/completions","body":{{"model":"gpt-4","messages":[{{"role":"user","content":"Hello world number {}"}}]}}}}"#,
+                i, i
+            ));
+        }
+        let large_content = lines.join("\n");
+        let file_part = axum_test::multipart::Part::bytes(large_content.into_bytes()).file_name("test.jsonl");
+
+        let upload_response = app
+            .post("/ai/v1/files")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .multipart(
+                axum_test::multipart::MultipartForm::new()
+                    .add_part("file", file_part)
+                    .add_text("purpose", "batch"),
+            )
+            .await;
+
+        // Should get 413 Payload Too Large (not 500 or confusing error)
+        upload_response.assert_status(axum::http::StatusCode::PAYLOAD_TOO_LARGE);
     }
 }

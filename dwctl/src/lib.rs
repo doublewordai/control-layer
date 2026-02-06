@@ -1093,7 +1093,8 @@ pub async fn build_router(
         let body_limit_layer = if file_upload_limit == 0 {
             DefaultBodyLimit::disable()
         } else {
-            DefaultBodyLimit::max(file_upload_limit as usize)
+            // Add 10KB overhead for multipart encoding (headers, boundaries, etc.)
+            DefaultBodyLimit::max((file_upload_limit + 10 * 1024) as usize)
         };
         let file_router = Router::new().route("/files", post(api::handlers::files::upload_file).layer(body_limit_layer));
 
