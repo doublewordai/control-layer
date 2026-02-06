@@ -123,6 +123,26 @@ Examples:
 - `fix(batch): support /v1/responses in batch endpoint allowlist`
 - `feat(dashboard): add usage breakdown chart`
 
+### Branching Workflow
+
+Before starting any new feature/fix, start from latest `main`.
+
+1. Check whether the current workspace is dirty:
+```bash
+git status --short
+```
+2. If clean, update and branch from `main`:
+```bash
+git checkout main
+git pull
+git checkout -b <new-branch>
+```
+3. If dirty (especially with changes you did not make), do not build new work on top of it. Prefer a fresh git worktree from `main`:
+```bash
+git fetch origin
+git worktree add ../control-layer-<task> origin/main -b <new-branch>
+```
+
 ### Database Management
 
 ```bash
