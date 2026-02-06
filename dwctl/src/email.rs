@@ -1,5 +1,6 @@
 //! Email service for sending password reset emails and notifications.
 
+use fusillade::batch::BatchOutcome;
 use lettre::{
     AsyncFileTransport, AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor,
     message::{Mailbox, header::ContentType},
@@ -12,13 +13,12 @@ use crate::{config::Config, errors::Error};
 pub struct BatchCompletionInfo {
     pub batch_id: String,
     pub endpoint: String,
-    pub status: String,
+    pub outcome: BatchOutcome,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub finished_at: Option<chrono::DateTime<chrono::Utc>>,
     pub total_requests: i64,
     pub completed_requests: i64,
     pub failed_requests: i64,
-    pub canceled_requests: i64,
     pub dashboard_link: String,
 }
 
@@ -153,7 +153,12 @@ impl EmailService {
         to_name: Option<&str>,
         info: &BatchCompletionInfo,
     ) -> Result<(), Error> {
-        let subject = format!("Batch {} — {}", &info.batch_id[..8.min(info.batch_id.len())], info.status);
+        let status_text = match info.outcome {
+            BatchOutcome::Completed => "completed",
+            BatchOutcome::PartiallyCompleted => "completed with errors",
+            BatchOutcome::Failed => "failed",
+        };
+        let subject = format!("Batch {} — {}", &info.batch_id[..8.min(info.batch_id.len())], status_text);
         let body = self.create_batch_completion_body(to_name, info);
         self.send_email(to_email, to_name, &subject, &body).await
     }
@@ -170,12 +175,34 @@ impl EmailService {
             .finished_at
             .map_or("—".to_string(), |t| t.format("%Y-%m-%d %H:%M UTC").to_string());
 
+        let (title, message) = match info.outcome {
+            BatchOutcome::Completed => (
+                "Batch completed",
+                "Your batch has finished processing successfully."
+            ),
+            BatchOutcome::PartiallyCompleted => (
+                "Batch completed with errors",
+                "Your batch has finished processing, but some requests failed."
+            ),
+            BatchOutcome::Failed => (
+                "Batch failed",
+                "Your batch has finished processing, but all requests failed."
+            ),
+        };
+
+        // Only show failed row if there were failures
+        let failed_row = if info.failed_requests > 0 {
+            format!("<tr><th>Failed</th><td>{}</td></tr>", info.failed_requests)
+        } else {
+            String::new()
+        };
+
         format!(
             r#"<!DOCTYPE html>
 <html>
 <head>
     <meta charset="utf-8">
-    <title>Batch {status}</title>
+    <title>{title}</title>
     <style>
         body {{ font-family: Arial, sans-serif; line-height: 1.6; color: #333; }}
         .container {{ max-width: 600px; margin: 0 auto; padding: 20px; }}
@@ -187,11 +214,11 @@ impl EmailService {
 </head>
 <body>
     <div class="container">
-        <h2>Batch {status}</h2>
+        <h2>{title}</h2>
 
         <p>{greeting}</p>
 
-        <p>Your batch has finished processing with status: <strong>{status}</strong>.</p>
+        <p>{message}</p>
 
         <table>
             <tr><th>Batch ID</th><td>{batch_id}</td></tr>
@@ -200,8 +227,7 @@ impl EmailService {
             <tr><th>Finished</th><td>{finished_at}</td></tr>
             <tr><th>Total requests</th><td>{total}</td></tr>
             <tr><th>Completed</th><td>{completed}</td></tr>
-            <tr><th>Failed</th><td>{failed}</td></tr>
-            <tr><th>Cancelled</th><td>{cancelled}</td></tr>
+            {failed_row}
         </table>
 
         <p><a href="{dashboard_link}">View batch in dashboard</a></p>
@@ -212,15 +238,15 @@ impl EmailService {
     </div>
 </body>
 </html>"#,
-            status = info.status,
+            title = title,
+            message = message,
             batch_id = info.batch_id,
             endpoint = info.endpoint,
             created_at = created_at,
             finished_at = finished_at,
             total = info.total_requests,
             completed = info.completed_requests,
-            failed = info.failed_requests,
-            cancelled = info.canceled_requests,
+            failed_row = failed_row,
             dashboard_link = info.dashboard_link,
         )
     }
@@ -308,30 +334,78 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_batch_completion_email_body() {
+    async fn test_batch_completion_email_body_completed() {
         let config = create_test_config();
         let email_service = EmailService::new(&config).unwrap();
 
         let info = BatchCompletionInfo {
             batch_id: "abcd1234-5678-90ab-cdef-1234567890ab".to_string(),
             endpoint: "/v1/chat/completions".to_string(),
-            status: "completed".to_string(),
+            outcome: BatchOutcome::Completed,
             created_at: chrono::Utc::now(),
             finished_at: Some(chrono::Utc::now()),
             total_requests: 100,
-            completed_requests: 98,
-            failed_requests: 2,
-            canceled_requests: 0,
+            completed_requests: 100,
+            failed_requests: 0,
             dashboard_link: "https://example.com/batches/abcd1234".to_string(),
         };
 
         let body = email_service.create_batch_completion_body(Some("Alice"), &info);
 
         assert!(body.contains("Hello Alice,"));
-        assert!(body.contains("completed"));
+        assert!(body.contains("Batch completed"));
+        assert!(body.contains("finished processing successfully"));
         assert!(body.contains("/v1/chat/completions"));
         assert!(body.contains("100"));
-        assert!(body.contains("98"));
+        assert!(!body.contains("Failed")); // No failed row when 0 failures
         assert!(body.contains("https://example.com/batches/abcd1234"));
+    }
+
+    #[tokio::test]
+    async fn test_batch_completion_email_body_partially_completed() {
+        let config = create_test_config();
+        let email_service = EmailService::new(&config).unwrap();
+
+        let info = BatchCompletionInfo {
+            batch_id: "abcd1234-5678-90ab-cdef-1234567890ab".to_string(),
+            endpoint: "/v1/chat/completions".to_string(),
+            outcome: BatchOutcome::PartiallyCompleted,
+            created_at: chrono::Utc::now(),
+            finished_at: Some(chrono::Utc::now()),
+            total_requests: 100,
+            completed_requests: 98,
+            failed_requests: 2,
+            dashboard_link: "https://example.com/batches/abcd1234".to_string(),
+        };
+
+        let body = email_service.create_batch_completion_body(Some("Alice"), &info);
+
+        assert!(body.contains("Batch completed with errors"));
+        assert!(body.contains("some requests failed"));
+        assert!(body.contains("<th>Failed</th><td>2</td>"));
+    }
+
+    #[tokio::test]
+    async fn test_batch_completion_email_body_failed() {
+        let config = create_test_config();
+        let email_service = EmailService::new(&config).unwrap();
+
+        let info = BatchCompletionInfo {
+            batch_id: "abcd1234-5678-90ab-cdef-1234567890ab".to_string(),
+            endpoint: "/v1/chat/completions".to_string(),
+            outcome: BatchOutcome::Failed,
+            created_at: chrono::Utc::now(),
+            finished_at: Some(chrono::Utc::now()),
+            total_requests: 100,
+            completed_requests: 0,
+            failed_requests: 100,
+            dashboard_link: "https://example.com/batches/abcd1234".to_string(),
+        };
+
+        let body = email_service.create_batch_completion_body(Some("Alice"), &info);
+
+        assert!(body.contains("Batch failed"));
+        assert!(body.contains("all requests failed"));
+        assert!(body.contains("<th>Failed</th><td>100</td>"));
     }
 }

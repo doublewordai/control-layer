@@ -47,7 +47,7 @@ pub async fn run_notification_poller(
             }
         }
 
-        match request_manager.poll_completed_batches(config.hide_retriable_before_sla).await {
+        match request_manager.poll_completed_batches().await {
             Ok(batches) => {
                 if !batches.is_empty() {
                     tracing::info!(count = batches.len(), "Found batches needing notification");
@@ -88,18 +88,15 @@ pub async fn run_notification_poller(
                         continue;
                     }
 
-                    // Determine status
-                    let status = if batch.cancelled_at.is_some() {
-                        "cancelled"
-                    } else if batch.completed_at.is_some() {
-                        "completed"
-                    } else if batch.failed_at.is_some() {
-                        "failed"
-                    } else {
-                        "completed"
+                    let outcome = match batch.outcome() {
+                        Some(o) => o,
+                        None => {
+                            tracing::warn!(batch_id = %batch_id_str, "Batch has no outcome, skipping notification");
+                            continue;
+                        }
                     };
 
-                    let finished_at = batch.completed_at.or(batch.failed_at).or(batch.cancelled_at);
+                    let finished_at = batch.completed_at.or(batch.failed_at);
 
                     let full_batch_id = format!("{}", *batch.id);
                     let dashboard_link = format!("{}/batches/{}", config.dashboard_url.trim_end_matches('/'), full_batch_id);
@@ -107,13 +104,12 @@ pub async fn run_notification_poller(
                     let info = BatchCompletionInfo {
                         batch_id: full_batch_id,
                         endpoint: batch.endpoint.clone(),
-                        status: status.to_string(),
+                        outcome,
                         created_at: batch.created_at,
                         finished_at,
                         total_requests: batch.total_requests,
                         completed_requests: batch.completed_requests,
                         failed_requests: batch.failed_requests,
-                        canceled_requests: batch.canceled_requests,
                         dashboard_link,
                     };
 
@@ -131,7 +127,7 @@ pub async fn run_notification_poller(
                         tracing::info!(
                             batch_id = %batch_id_str,
                             email = %email,
-                            status = %status,
+                            outcome = ?outcome,
                             "Sent batch completion notification"
                         );
                     }
