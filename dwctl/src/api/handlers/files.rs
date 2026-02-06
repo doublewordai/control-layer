@@ -69,16 +69,13 @@ impl std::str::FromStr for AllowedHttpMethod {
     }
 }
 
-/// Allowed URL paths for batch requests
-const ALLOWED_URL_PATHS: &[&str] = &["/v1/chat/completions", "/v1/completions", "/v1/embeddings"];
-
-fn validate_url_path(url: &str) -> Result<()> {
-    if !ALLOWED_URL_PATHS.contains(&url) {
+fn validate_url_path(url: &str, allowed_url_paths: &[String]) -> Result<()> {
+    if !allowed_url_paths.iter().any(|path| path == url) {
         return Err(Error::BadRequest {
             message: format!(
                 "Unsupported URL path '{}'. Allowed paths are: {}",
                 url,
-                ALLOWED_URL_PATHS.join(", ")
+                allowed_url_paths.join(", ")
             ),
         });
     }
@@ -118,7 +115,13 @@ impl OpenAIBatchRequest {
     /// * `api_key` - The API key to inject for request execution
     /// * `accessible_models` - Set of model aliases the user can access
     #[tracing::instrument(skip(self, api_key, accessible_models), fields(custom_id = %self.custom_id, method = %self.method, url = %self.url))]
-    fn to_internal(&self, endpoint: &str, api_key: String, accessible_models: &HashSet<String>) -> Result<fusillade::RequestTemplateInput> {
+    fn to_internal(
+        &self,
+        endpoint: &str,
+        api_key: String,
+        accessible_models: &HashSet<String>,
+        allowed_url_paths: &[String],
+    ) -> Result<fusillade::RequestTemplateInput> {
         // Validate custom_id is safe for HTTP headers
         validate_custom_id(&self.custom_id)?;
 
@@ -126,7 +129,7 @@ impl OpenAIBatchRequest {
         let _validated_method = self.method.parse::<AllowedHttpMethod>()?;
 
         // Validate URL path
-        validate_url_path(&self.url)?;
+        validate_url_path(&self.url, allowed_url_paths)?;
 
         // Extract model from body if present
         let model = self
@@ -218,6 +221,7 @@ fn create_file_stream(
     endpoint: String,
     api_key: String,
     accessible_models: HashSet<String>,
+    allowed_url_paths: Vec<String>,
 ) -> Pin<Box<dyn Stream<Item = fusillade::FileStreamItem> + Send>> {
     let (tx, rx) = mpsc::channel(config.buffer_size);
 
@@ -399,7 +403,7 @@ fn create_file_stream(
                             match serde_json::from_str::<OpenAIBatchRequest>(trimmed) {
                                 Ok(openai_req) => {
                                     // Transform to internal format (includes model access validation)
-                                    match openai_req.to_internal(&endpoint, api_key.clone(), &accessible_models) {
+                                    match openai_req.to_internal(&endpoint, api_key.clone(), &accessible_models, &allowed_url_paths) {
                                         Ok(template) => {
                                             // Check request count limit (0 = unlimited)
                                             if config.max_requests_per_file > 0 && line_count >= config.max_requests_per_file as u64 {
@@ -449,31 +453,33 @@ fn create_file_stream(
                         let trimmed = incomplete_line.trim();
                         if !trimmed.is_empty() {
                             match serde_json::from_str::<OpenAIBatchRequest>(trimmed) {
-                                Ok(openai_req) => match openai_req.to_internal(&endpoint, api_key.clone(), &accessible_models) {
-                                    Ok(template) => {
-                                        // Check request count limit (0 = unlimited)
-                                        if config.max_requests_per_file > 0 && line_count >= config.max_requests_per_file as u64 {
+                                Ok(openai_req) => {
+                                    match openai_req.to_internal(&endpoint, api_key.clone(), &accessible_models, &allowed_url_paths) {
+                                        Ok(template) => {
+                                            // Check request count limit (0 = unlimited)
+                                            if config.max_requests_per_file > 0 && line_count >= config.max_requests_per_file as u64 {
+                                                let _ = tx
+                                                    .send(fusillade::FileStreamItem::Error(format!(
+                                                        "File exceeds maximum request limit of {}",
+                                                        config.max_requests_per_file
+                                                    )))
+                                                    .await;
+                                                return;
+                                            }
+                                            line_count += 1;
+
+                                            if tx.send(fusillade::FileStreamItem::Template(template)).await.is_err() {
+                                                return;
+                                            }
+                                        }
+                                        Err(e) => {
                                             let _ = tx
-                                                .send(fusillade::FileStreamItem::Error(format!(
-                                                    "File exceeds maximum request limit of {}",
-                                                    config.max_requests_per_file
-                                                )))
+                                                .send(fusillade::FileStreamItem::Error(format!("Failed to transform final line: {:?}", e)))
                                                 .await;
                                             return;
                                         }
-                                        line_count += 1;
-
-                                        if tx.send(fusillade::FileStreamItem::Template(template)).await.is_err() {
-                                            return;
-                                        }
                                     }
-                                    Err(e) => {
-                                        let _ = tx
-                                            .send(fusillade::FileStreamItem::Error(format!("Failed to transform final line: {:?}", e)))
-                                            .await;
-                                        return;
-                                    }
-                                },
+                                }
                                 Err(e) => {
                                     let _ = tx
                                         .send(fusillade::FileStreamItem::Error(format!("Invalid JSON on final line: {}", e)))
@@ -588,7 +594,15 @@ pub async fn upload_file<P: PoolProvider>(
     drop(conn);
 
     // Create a stream that parses the multipart upload and yields FileStreamItems
-    let file_stream = create_file_stream(multipart, stream_config, uploaded_by, endpoint, user_api_key, accessible_models);
+    let file_stream = create_file_stream(
+        multipart,
+        stream_config,
+        uploaded_by,
+        endpoint,
+        user_api_key,
+        accessible_models,
+        state.config.batches.allowed_url_paths.clone(),
+    );
 
     // Create file via request manager with streaming
     let created_file_id = state.request_manager.create_file_stream(file_stream).await.map_err(|e| match e {
@@ -1960,6 +1974,36 @@ mod tests {
         assert!(error_body.contains("/api/completions"));
         assert!(error_body.contains("/v1/chat/completions"));
         assert!(error_body.contains("/v1/embeddings"));
+        assert!(error_body.contains("/v1/responses"));
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_upload_accepts_responses_url_path(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/v1/responses","body":{"model":"gpt-4","input":"Hello"}}"#;
+
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test-batch.jsonl");
+
+        let upload_response = app
+            .post("/ai/v1/files")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .multipart(
+                axum_test::multipart::MultipartForm::new()
+                    .add_text("purpose", "batch")
+                    .add_part("file", file_part),
+            )
+            .await;
+
+        upload_response.assert_status(axum::http::StatusCode::CREATED);
     }
 
     #[sqlx::test]

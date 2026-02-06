@@ -246,6 +246,15 @@ batches:
     # - "12h"  # Uncomment to allow 12 hour SLA
     # - "48h"  # Uncomment to allow 48 hour SLA
 
+  # Allowed OpenAI-compatible URL paths for batch requests.
+  # This is used by both /files upload validation and /batches endpoint validation.
+  allowed_url_paths:
+    - "/v1/chat/completions"
+    - "/v1/completions"
+    - "/v1/embeddings"
+    - "/v1/moderations"
+    - "/v1/responses"
+
   # Files configuration for batch file uploads/downloads
   # NOTE: max_file_size has moved to limits.files.max_file_size
   files:
