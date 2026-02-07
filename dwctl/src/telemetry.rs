@@ -51,29 +51,16 @@ pub fn init_telemetry(enable_otel_export: bool) -> anyhow::Result<Option<SdkTrac
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     if enable_otel_export {
-        // Try to create OTLP tracer - if env vars aren't set, this will fail gracefully
-        match create_otlp_tracer() {
-            Ok((tracer, provider)) => {
-                // Build subscriber with both fmt and OpenTelemetry layers
-                tracing_subscriber::registry()
-                    .with(env_filter)
-                    .with(tracing_subscriber::fmt::layer().compact())
-                    .with(tracing_opentelemetry::layer().with_tracer(tracer))
-                    .try_init()?;
+        let (tracer, provider) = create_otlp_tracer()?;
 
-                info!("Telemetry initialized with OTLP export enabled");
-                return Ok(Some(provider));
-            }
-            Err(e) => {
-                // If OTLP setup fails, just use fmt layer without OpenTelemetry
-                tracing_subscriber::registry()
-                    .with(env_filter)
-                    .with(tracing_subscriber::fmt::layer().compact())
-                    .try_init()?;
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(tracing_subscriber::fmt::layer().compact())
+            .with(tracing_opentelemetry::layer().with_tracer(tracer))
+            .try_init()?;
 
-                info!("Telemetry initialized without OTLP export: {}", e);
-            }
-        }
+        info!("Telemetry initialized with OTLP export enabled");
+        return Ok(Some(provider));
     } else {
         // OTLP export disabled - use only console logging
         tracing_subscriber::registry()
@@ -153,4 +140,18 @@ fn create_otlp_tracer() -> anyhow::Result<(opentelemetry_sdk::trace::Tracer, Sdk
     let tracer = tracer_provider.tracer(service_name);
 
     Ok((tracer, tracer_provider))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn otlp_tracer_builds_with_http_client() {
+        let (_, provider) = create_otlp_tracer().expect(
+            "OTLP tracer failed to build - likely a feature flag conflict \
+             (reqwest-client vs reqwest-blocking-client)",
+        );
+        provider.shutdown().ok();
+    }
 }
