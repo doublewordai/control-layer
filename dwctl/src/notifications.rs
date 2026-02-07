@@ -52,7 +52,8 @@ pub async fn run_notification_poller(
                 if !batches.is_empty() {
                     tracing::info!(count = batches.len(), "Found batches needing notification");
                 }
-                for batch in batches {
+                for notif in batches {
+                    let batch = &notif.batch;
                     let batch_id_str = batch.id.to_string();
                     let created_by = match &batch.created_by {
                         Some(id) => id.clone(),
@@ -98,19 +99,20 @@ pub async fn run_notification_poller(
 
                     let finished_at = batch.completed_at.or(batch.failed_at);
 
-                    let full_batch_id = format!("{}", *batch.id);
-                    let dashboard_link = format!("{}/batches/{}", config.dashboard_url.trim_end_matches('/'), full_batch_id);
-
                     let info = BatchCompletionInfo {
-                        batch_id: full_batch_id,
+                        batch_id: format!("{}", *batch.id),
                         endpoint: batch.endpoint.clone(),
+                        model: notif.model.clone(),
                         outcome,
                         created_at: batch.created_at,
                         finished_at,
                         total_requests: batch.total_requests,
                         completed_requests: batch.completed_requests,
                         failed_requests: batch.failed_requests,
-                        dashboard_link,
+                        dashboard_url: config.dashboard_url.clone(),
+                        completion_window: batch.completion_window.clone(),
+                        filename: notif.input_file_name.clone(),
+                        description: notif.input_file_description.clone(),
                     };
 
                     if let Err(e) = email_service
