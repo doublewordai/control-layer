@@ -6,6 +6,7 @@
 
 use sqlx_pool_router::PoolProvider;
 
+use super::sla_capacity::check_sla_capacity;
 use crate::AppState;
 use crate::api::models::batches::{
     BatchAnalytics, BatchErrors, BatchListResponse, BatchObjectType, BatchResponse, BatchResultsQuery, CreateBatchRequest,
@@ -169,7 +170,7 @@ The batch will begin processing immediately. Use `GET /batches/{batch_id}` to mo
         (status = 500, description = "An unexpected error occurred. Retry the request or contact support if the issue persists.")
     )
 )]
-#[tracing::instrument(skip(state, current_user, has_api_key), fields(user_id = %current_user.id, input_file_id = %req.input_file_id))]
+#[tracing::instrument(skip_all, fields(user_id = %current_user.id, input_file_id = %req.input_file_id))]
 pub async fn create_batch<P: PoolProvider>(
     State(state): State<AppState<P>>,
     current_user: RequiresPermission<resource::Batches, operation::CreateOwn>,
@@ -221,7 +222,7 @@ pub async fn create_batch<P: PoolProvider>(
     if !has_read_all {
         // Verify user owns the file
         let user_id_str = current_user.id.to_string();
-        if file.uploaded_by.as_deref() != Some(&user_id_str) {
+        if file.uploaded_by.as_deref() != Some(user_id_str.as_str()) {
             use crate::types::{Operation, Permission};
             return Err(Error::InsufficientPermissions {
                 required: Permission::Allow(Resource::Files, Operation::ReadAll),
@@ -229,6 +230,73 @@ pub async fn create_batch<P: PoolProvider>(
                 resource: format!("batch using file {}", req.input_file_id),
             });
         }
+    }
+
+    // Get per-model request counts from the file
+    let file_stats = state
+        .request_manager
+        .get_file_template_stats(fusillade::FileId(file_id))
+        .await
+        .map_err(|e| Error::Internal {
+            operation: format!("get file template stats: {}", e),
+        })?;
+
+    let file_model_counts: HashMap<String, i64> = file_stats.iter().map(|s| (s.model.clone(), s.request_count)).collect();
+
+    // Get pending counts by model and completion window
+    let pending_counts = state
+        .request_manager
+        .get_pending_request_counts_by_model_and_completion_window()
+        .await
+        .map_err(|e| Error::Internal {
+            operation: format!("get pending counts: {}", e),
+        })?;
+
+    // Get model throughputs from database
+    let model_aliases: Vec<String> = file_model_counts.keys().cloned().collect();
+    let model_throughputs = get_model_throughputs(&state, &model_aliases).await?;
+
+    // Perform capacity check
+    //
+    // Note: This capacity check does not use locking, so concurrent batch creations
+    // may both pass the check and then exceed the actual capacity. This is a known
+    // limitation that provides "best effort" protection - it will reject obvious
+    // overflows but may allow slight over-acceptance (~10-20%) during concurrent bursts.
+    // This trade-off is intentional for Phase 1 to avoid complexity; proper
+    // concurrency control (e.g., advisory locks on model aliases) may be added in
+    // future iterations if the over-acceptance becomes problematic.
+    // NOTE: over acceptance is proportional to number of concurrent batches created, not number of requests in the batch
+    // so over-acceptance can be very high for a burst of large files.
+    let capacity_result = check_sla_capacity(
+        &file_model_counts,
+        &pending_counts,
+        &model_throughputs,
+        state.config.batches.default_throughput,
+        &req.completion_window,
+    );
+
+    if !capacity_result.has_capacity {
+        let overloaded_details: Vec<String> = capacity_result
+            .overloaded_models
+            .iter()
+            .map(|(model, deficit)| format!("{} (needs {} more capacity)", model, deficit))
+            .collect();
+        tracing::warn!(
+            completion_window = %req.completion_window,
+            overloaded_models = %overloaded_details.join(", "),
+            "Batch rejected due to insufficient SLA capacity"
+        );
+
+        // User-facing message: only list model names, no capacity details
+        let model_names: Vec<&str> = capacity_result.overloaded_models.keys().map(|model| model.as_str()).collect();
+
+        return Err(Error::TooManyRequests {
+            message: format!(
+                "Insufficient capacity for {} SLA window. The following models are currently at capacity: {}. Try again later or use a longer completion window.",
+                req.completion_window,
+                model_names.join(", ")
+            ),
+        });
     }
 
     // Determine request_source from authentication method
@@ -267,6 +335,22 @@ pub async fn create_batch<P: PoolProvider>(
     ))
 }
 
+/// Get throughput values for the given model aliases from the database
+async fn get_model_throughputs<P: PoolProvider>(state: &AppState<P>, model_aliases: &[String]) -> Result<HashMap<String, f32>> {
+    use crate::db::handlers::deployments::Deployments;
+
+    let mut conn = state.db.read().acquire().await.map_err(|e| Error::Internal {
+        operation: format!("get db connection: {}", e),
+    })?;
+
+    Deployments::new(&mut conn)
+        .get_throughputs_by_aliases(model_aliases)
+        .await
+        .map_err(|e| Error::Internal {
+            operation: format!("get model throughputs: {}", e),
+        })
+}
+
 #[utoipa::path(
     get,
     path = "/batches/{batch_id}",
@@ -284,7 +368,7 @@ Poll this endpoint to monitor progress. Results are streamed to `output_file_id`
         ("batch_id" = String, Path, description = "The batch ID returned when the batch was created.")
     )
 )]
-#[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, batch_id = %batch_id_str))]
+#[tracing::instrument(skip_all, fields(user_id = %current_user.id, batch_id = %batch_id_str))]
 pub async fn get_batch<P: PoolProvider>(
     State(state): State<AppState<P>>,
     Path(batch_id_str): Path<String>,
@@ -338,7 +422,7 @@ Analytics update in real-time as requests complete.",
         ("batch_id" = String, Path, description = "The batch ID returned when the batch was created.")
     )
 )]
-#[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, batch_id = %batch_id_str))]
+#[tracing::instrument(skip_all, fields(user_id = %current_user.id, batch_id = %batch_id_str))]
 pub async fn get_batch_analytics<P: PoolProvider>(
     State(state): State<AppState<P>>,
     Path(batch_id_str): Path<String>,
@@ -401,7 +485,7 @@ Supports pagination via `limit` and `skip` query parameters, and filtering by `c
         BatchResultsQuery
     )
 )]
-#[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, batch_id = %batch_id_str, limit = ?query.pagination.limit, skip = ?query.pagination.skip))]
+#[tracing::instrument(skip_all, fields(user_id = %current_user.id, batch_id = %batch_id_str))]
 pub async fn get_batch_results<P: PoolProvider>(
     State(state): State<AppState<P>>,
     Path(batch_id_str): Path<String>,
@@ -521,7 +605,7 @@ Pending requests will not be processed. Requests already in progress will comple
         ("batch_id" = String, Path, description = "The batch ID returned when the batch was created.")
     )
 )]
-#[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, batch_id = %batch_id_str))]
+#[tracing::instrument(skip_all, fields(user_id = %current_user.id, batch_id = %batch_id_str))]
 pub async fn cancel_batch<P: PoolProvider>(
     State(state): State<AppState<P>>,
     Path(batch_id_str): Path<String>,
@@ -599,7 +683,7 @@ This action cannot be undone. The input file is not deleted.",
         ("batch_id" = String, Path, description = "The batch ID returned when the batch was created.")
     )
 )]
-#[tracing::instrument(skip(state, current_user), fields(batch_id = %batch_id_str))]
+#[tracing::instrument(skip_all, fields(user_id = %current_user.id, batch_id = %batch_id_str))]
 pub async fn delete_batch<P: PoolProvider>(
     State(state): State<AppState<P>>,
     Path(batch_id_str): Path<String>,
@@ -664,7 +748,7 @@ Failed requests are reset to pending and will be processed again. Use this after
         ("batch_id" = String, Path, description = "The batch ID returned when the batch was created.")
     )
 )]
-#[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, batch_id = %batch_id_str))]
+#[tracing::instrument(skip_all, fields(user_id = %current_user.id, batch_id = %batch_id_str))]
 pub async fn retry_failed_batch_requests<P: PoolProvider>(
     State(state): State<AppState<P>>,
     Path(batch_id_str): Path<String>,
@@ -753,7 +837,7 @@ Use this for fine-grained control over which requests to retry, rather than retr
         ("batch_id" = String, Path, description = "The batch ID returned when the batch was created.")
     )
 )]
-#[tracing::instrument(skip(state, current_user, req), fields(user_id = %current_user.id, batch_id = %batch_id_str))]
+#[tracing::instrument(skip_all, fields(user_id = %current_user.id, batch_id = %batch_id_str))]
 pub async fn retry_specific_requests<P: PoolProvider>(
     State(state): State<AppState<P>>,
     Path(batch_id_str): Path<String>,
@@ -869,7 +953,7 @@ Use cursor-based pagination: pass `last_id` from the response as the `after` par
         ListBatchesQuery
     )
 )]
-#[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, limit = ?query.pagination.limit, after = ?query.pagination.after))]
+#[tracing::instrument(skip_all, fields(user_id = %current_user.id))]
 pub async fn list_batches<P: PoolProvider>(
     State(state): State<AppState<P>>,
     Query(query): Query<ListBatchesQuery>,

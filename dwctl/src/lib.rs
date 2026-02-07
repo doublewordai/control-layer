@@ -459,6 +459,7 @@ pub async fn seed_database(sources: &[config::ModelSource], db: &PgPool) -> Resu
                             burst_size: None,
                             capacity: None,
                             batch_capacity: None,
+                            throughput: None,
                             tariffs: None,
                             provider_pricing: None,
                         }),

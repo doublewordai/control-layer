@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, model_name, alias, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, sanitize_responses FROM deployed_models WHERE id = ANY($1)",
+  "query": "SELECT id, model_name, alias, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, sanitize_responses FROM deployed_models WHERE id = $1",
   "describe": {
     "columns": [
       {
@@ -90,63 +90,68 @@
       },
       {
         "ordinal": 17,
+        "name": "throughput",
+        "type_info": "Float4"
+      },
+      {
+        "ordinal": 18,
         "name": "downstream_pricing_mode",
         "type_info": "Varchar"
       },
       {
-        "ordinal": 18,
+        "ordinal": 19,
         "name": "downstream_input_price_per_token",
         "type_info": "Numeric"
       },
       {
-        "ordinal": 19,
+        "ordinal": 20,
         "name": "downstream_output_price_per_token",
         "type_info": "Numeric"
       },
       {
-        "ordinal": 20,
+        "ordinal": 21,
         "name": "downstream_hourly_rate",
         "type_info": "Numeric"
       },
       {
-        "ordinal": 21,
+        "ordinal": 22,
         "name": "downstream_input_token_cost_ratio",
         "type_info": "Numeric"
       },
       {
-        "ordinal": 22,
+        "ordinal": 23,
         "name": "is_composite",
         "type_info": "Bool"
       },
       {
-        "ordinal": 23,
+        "ordinal": 24,
         "name": "lb_strategy",
         "type_info": "Varchar"
       },
       {
-        "ordinal": 24,
+        "ordinal": 25,
         "name": "fallback_enabled",
         "type_info": "Bool"
       },
       {
-        "ordinal": 25,
+        "ordinal": 26,
         "name": "fallback_on_rate_limit",
         "type_info": "Bool"
       },
       {
-        "ordinal": 26,
+        "ordinal": 27,
         "name": "fallback_on_status",
         "type_info": "Int4Array"
       },
       {
-        "ordinal": 27,
+        "ordinal": 28,
         "name": "sanitize_responses",
         "type_info": "Bool"
       }
     ],
     "parameters": {
       "Left": [
-        "UuidArray"
+        "Uuid"
       ]
     },
     "nullable": [
@@ -172,6 +177,7 @@
       true,
       true,
       true,
+      true,
       false,
       true,
       true,
@@ -180,5 +186,5 @@
       false
     ]
   },
-  "hash": "1510f81cc773620c0410ae7609aee9340c31854453139df001ef7c6118a589fa"
+  "hash": "ab6fbeab0f758cd1ef35a56f3d839e5dbd6d6366b8dcf10759b8bea8f5f99819"
 }

@@ -129,6 +129,8 @@ pub struct StandardModelCreate {
     pub capacity: Option<i32>,
     /// Maximum number of concurrent batch requests allowed for this model (null = defaults to capacity or no limit)
     pub batch_capacity: Option<i32>,
+    /// Throughput in requests/second for batch SLA capacity calculations (null = use config default)
+    pub throughput: Option<f32>,
     /// Provider/downstream pricing details (admin only)
     pub provider_pricing: Option<ProviderPricing>,
     /// Tariffs for this model - if provided, these will be created as active tariffs
@@ -156,6 +158,8 @@ pub struct CompositeModelCreate {
     pub capacity: Option<i32>,
     /// Maximum number of concurrent batch requests allowed for this model (null = defaults to capacity or no limit)
     pub batch_capacity: Option<i32>,
+    /// Throughput in requests/second for batch SLA capacity calculations (null = use config default)
+    pub throughput: Option<f32>,
     /// Tariffs for this model - if provided, these will be created as active tariffs
     pub tariffs: Option<Vec<TariffDefinition>>,
     /// Load balancing strategy (defaults to weighted_random)
@@ -202,6 +206,9 @@ pub struct DeployedModelUpdate {
     /// Maximum concurrent batch requests (null = no change, Some(None) = remove limit, Some(Some(n)) = set limit)
     #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
     pub batch_capacity: Option<Option<i32>>,
+    /// Throughput in requests/second for batch SLA capacity (null = no change, Some(None) = use default, Some(Some(n)) = set)
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
+    pub throughput: Option<Option<f32>>,
     /// Provider/downstream pricing details partial updates (null = no change, Some(pricing_update) = partial update)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_pricing: Option<ProviderPricingUpdate>,
@@ -277,6 +284,9 @@ pub struct DeployedModelResponse {
     /// Maximum number of concurrent batch requests allowed for this model (null = defaults to capacity or no limit)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub batch_capacity: Option<i32>,
+    /// Throughput in requests/second for batch SLA capacity calculations (null = use config default)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub throughput: Option<f32>,
     /// Groups that have access to this model (only included if requested)
     /// Note: no_recursion is important! utoipa will panic at runtime, because it overflows the
     /// stack trying to follow the relationship.
@@ -345,6 +355,7 @@ impl From<DeploymentDBResponse> for DeployedModelResponse {
             burst_size: db.burst_size,
             capacity: db.capacity,
             batch_capacity: db.batch_capacity,
+            throughput: db.throughput,
             groups: None,           // By default, relationships are not included
             metrics: None,          // By default, metrics are not included
             status: None,           // By default, probe status is not included
@@ -397,6 +408,7 @@ impl DeployedModelResponse {
     pub fn mask_capacity(mut self) -> Self {
         self.capacity = None;
         self.batch_capacity = None;
+        self.throughput = None;
         self
     }
 

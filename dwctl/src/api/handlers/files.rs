@@ -543,7 +543,7 @@ Each line must be a valid JSON object containing `custom_id`, `method`, `url`, a
         (status = 500, description = "An unexpected error occurred. Retry the request or contact support if the issue persists.")
     )
 )]
-#[tracing::instrument(skip(state, current_user, multipart), fields(user_id = %current_user.id))]
+#[tracing::instrument(skip_all, fields(user_id = %current_user.id))]
 pub async fn upload_file<P: PoolProvider>(
     State(state): State<AppState<P>>,
     current_user: RequiresPermission<resource::Files, operation::CreateOwn>,
@@ -657,7 +657,7 @@ Use cursor-based pagination: pass `last_id` from the response as the `after` par
         ListFilesQuery
     )
 )]
-#[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, limit = ?query.pagination.limit, order = %query.order))]
+#[tracing::instrument(skip_all, fields(user_id = %current_user.id))]
 pub async fn list_files<P: PoolProvider>(
     State(state): State<AppState<P>>,
     Query(query): Query<ListFilesQuery>,
@@ -758,7 +758,7 @@ pub async fn list_files<P: PoolProvider>(
         ("file_id" = String, Path, description = "The file ID returned when the file was uploaded.")
     )
 )]
-#[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, file_id = %file_id_str))]
+#[tracing::instrument(skip_all, fields(user_id = %current_user.id, file_id = %file_id_str))]
 pub async fn get_file<P: PoolProvider>(
     State(state): State<AppState<P>>,
     Path(file_id_str): Path<String>,
@@ -827,7 +827,7 @@ For input files, returns the original request templates. For output files, retur
         FileContentQuery
     )
 )]
-#[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, file_id = %file_id_str, limit = ?query.pagination.limit, offset = ?query.pagination.skip))]
+#[tracing::instrument(skip_all, fields(user_id = %current_user.id, file_id = %file_id_str))]
 pub async fn get_file_content<P: PoolProvider>(
     State(state): State<AppState<P>>,
     Path(file_id_str): Path<String>,
@@ -1025,7 +1025,7 @@ Deleting a file also deletes any batches that were created from it. This action 
         ("file_id" = String, Path, description = "The file ID returned when the file was uploaded.")
     )
 )]
-#[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, file_id = %file_id_str))]
+#[tracing::instrument(skip_all, fields(user_id = %current_user.id, file_id = %file_id_str))]
 pub async fn delete_file<P: PoolProvider>(
     State(state): State<AppState<P>>,
     Path(file_id_str): Path<String>,
@@ -1092,7 +1092,7 @@ Returns a breakdown by model including estimated input/output tokens and cost. U
         FileCostEstimateQuery
     )
 )]
-#[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, file_id = %file_id_str, completion_window = ?query.completion_window))]
+#[tracing::instrument(skip_all, fields(user_id = %current_user.id, file_id = %file_id_str))]
 pub async fn get_file_cost_estimate<P: PoolProvider>(
     State(state): State<AppState<P>>,
     Path(file_id_str): Path<String>,

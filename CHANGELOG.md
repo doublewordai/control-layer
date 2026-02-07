@@ -1,5 +1,28 @@
 # Changelog
 
+## [6.0.0](https://github.com/doublewordai/control-layer/compare/v5.0.3...v6.0.0) (2026-02-04)
+
+
+### ⚠ BREAKING CHANGES
+
+* add queue monitoring endpoint for pending request counts ([#636](https://github.com/doublewordai/control-layer/issues/636))
+
+### Features
+
+* add queue monitoring endpoint for pending request counts ([#636](https://github.com/doublewordai/control-layer/issues/636)) ([54829c5](https://github.com/doublewordai/control-layer/commit/54829c544fc5fe68ddc9d5d52f6bc443e092eeb7))
+* Improve tracing interconnectedness, make labels consistent ([#642](https://github.com/doublewordai/control-layer/issues/642)) ([1a2a60f](https://github.com/doublewordai/control-layer/commit/1a2a60fd60614aa932f448041680189fe9caf87f))
+
+
+### Bug Fixes
+
+* pass escalations models into composite models query to give batch API keys access ([#657](https://github.com/doublewordai/control-layer/issues/657)) ([8cb42bf](https://github.com/doublewordai/control-layer/commit/8cb42bf97e8e4b41400eb7cfce4e849ca76b139b))
+* tracing verbosity ([#656](https://github.com/doublewordai/control-layer/issues/656)) ([9b5c95e](https://github.com/doublewordai/control-layer/commit/9b5c95e141992534411964a9d3600ad6324b15f7))
+
+
+### Performance Improvements
+
+* use cargo-chef for Docker build caching ([#632](https://github.com/doublewordai/control-layer/issues/632)) ([bc06586](https://github.com/doublewordai/control-layer/commit/bc06586321e65b87ea639da1a5ccb96fbefad3e9))
+
 ## [5.0.3](https://github.com/doublewordai/control-layer/compare/v5.0.2...v5.0.3) (2026-01-30)
 
 
