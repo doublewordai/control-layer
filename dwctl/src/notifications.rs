@@ -131,10 +131,7 @@ pub async fn run_notification_poller(
                     };
 
                     let name = user.display_name.as_deref().unwrap_or(&user.username);
-                    if let Err(e) = email_service
-                        .send_batch_completion_email(&user.email, Some(name), &info)
-                        .await
-                    {
+                    if let Err(e) = email_service.send_batch_completion_email(&user.email, Some(name), &info).await {
                         tracing::warn!(
                             batch_id = %batch_id_str,
                             email = %user.email,
