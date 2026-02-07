@@ -72,7 +72,7 @@ pub async fn run_notification_poller(
                         }
                     };
 
-                    let (email, display_name, notifications_enabled) = match get_user_info(&dwctl_pool, user_id).await {
+                    let (email, display_name, username, notifications_enabled) = match get_user_info(&dwctl_pool, user_id).await {
                         Ok(Some(info)) => info,
                         Ok(None) => {
                             tracing::debug!(batch_id = %batch_id_str, user_id = %user_id, "Creator not found, skipping notification");
@@ -115,8 +115,9 @@ pub async fn run_notification_poller(
                         description: notif.input_file_description.clone(),
                     };
 
+                    let name = display_name.unwrap_or(username);
                     if let Err(e) = email_service
-                        .send_batch_completion_email(&email, display_name.as_deref(), &info)
+                        .send_batch_completion_email(&email, Some(&name), &info)
                         .await
                     {
                         tracing::warn!(
@@ -142,15 +143,15 @@ pub async fn run_notification_poller(
     }
 }
 
-/// Look up a user's email, display name, and notification preference by their UUID.
-async fn get_user_info(pool: &PgPool, user_id: Uuid) -> Result<Option<(String, Option<String>, bool)>, Error> {
+/// Look up a user's email, display name, username, and notification preference by their UUID.
+async fn get_user_info(pool: &PgPool, user_id: Uuid) -> Result<Option<(String, Option<String>, String, bool)>, Error> {
     let mut conn = pool.acquire().await.map_err(|e| Error::Internal {
         operation: format!("acquire connection for user lookup: {e}"),
     })?;
 
     let mut users = Users::new(&mut conn);
     match users.get_by_id(user_id).await {
-        Ok(Some(user)) => Ok(Some((user.email, user.display_name, user.batch_notifications_enabled))),
+        Ok(Some(user)) => Ok(Some((user.email, user.display_name, user.username, user.batch_notifications_enabled))),
         Ok(None) => Ok(None),
         Err(e) => Err(Error::Internal {
             operation: format!("look up user {user_id}: {e}"),

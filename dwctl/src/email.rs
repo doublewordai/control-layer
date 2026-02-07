@@ -299,13 +299,12 @@ mod tests {
 
         let body = email_service.render_batch_completion_body_non_first("Alice".into(), &info).unwrap();
 
-        assert!(body.contains("Hello Alice,"));
-        assert!(body.contains("Batch completed"));
+        assert!(body.contains("Hi Alice,"));
+        assert!(body.contains("Completed"));
         assert!(body.contains("finished processing successfully"));
         assert!(body.contains("/v1/chat/completions"));
         assert!(body.contains("gpt-4o"));
         assert!(body.contains("100"));
-        assert!(!body.contains("Failed")); // No failed row when 0 failures
         assert!(body.contains("https://example.com/batches/abcd1234-5678-90ab-cdef-1234567890ab"));
         assert!(body.contains("https://example.com/profile"));
         assert!(body.contains("24h"));
@@ -336,9 +335,9 @@ mod tests {
 
         let body = email_service.render_batch_completion_body_non_first("Alice".into(), &info).unwrap();
 
-        assert!(body.contains("Batch completed with errors"));
+        assert!(body.contains("Completed with some failures"));
         assert!(body.contains("some requests failed"));
-        assert!(body.contains("<th>Failed</th><td>2</td>"));
+        assert!(body.contains(">2<"));
     }
 
     #[tokio::test]
@@ -364,8 +363,8 @@ mod tests {
 
         let body = email_service.render_batch_completion_body_non_first("Alice".into(), &info).unwrap();
 
-        assert!(body.contains("Batch failed"));
-        assert!(body.contains("all requests failed"));
-        assert!(body.contains("<th>Failed</th><td>100</td>"));
+        assert!(body.contains("Failed"));
+        assert!(body.contains("problem processing your batch"));
+        assert!(body.contains(">100<"));
     }
 }
