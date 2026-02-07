@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            UPDATE users SET\n                display_name = COALESCE($2, display_name),\n                avatar_url = COALESCE($3, avatar_url),\n                password_hash = COALESCE($4, password_hash),\n                updated_at = NOW()\n            WHERE id = $1\n            RETURNING *\n            ",
+  "query": "\n            UPDATE users SET\n                display_name = COALESCE($2, display_name),\n                avatar_url = COALESCE($3, avatar_url),\n                password_hash = COALESCE($4, password_hash),\n                batch_notifications_enabled = COALESCE($5, batch_notifications_enabled),\n                updated_at = NOW()\n            WHERE id = $1\n            RETURNING *\n            ",
   "describe": {
     "columns": [
       {
@@ -89,7 +89,8 @@
         "Uuid",
         "Varchar",
         "Varchar",
-        "Text"
+        "Text",
+        "Bool"
       ]
     },
     "nullable": [
@@ -111,5 +112,5 @@
       false
     ]
   },
-  "hash": "370386c627cf888c4aa7100163482dc4fe8be6df3d88e589447671f6c6d130d0"
+  "hash": "1c23ef983dc9efce0721dc39c6dcc0aa931e860e294bce36a63f8a9e2e1cfe5b"
 }
