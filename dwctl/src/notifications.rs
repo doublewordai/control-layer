@@ -4,6 +4,7 @@
 //! to batch creators. Uses atomic `notification_sent_at` claiming to prevent duplicate
 //! emails across replicas.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use fusillade::manager::postgres::PostgresRequestManager;
@@ -15,6 +16,7 @@ use uuid::Uuid;
 use crate::config::NotificationsConfig;
 use crate::db::handlers::repository::Repository;
 use crate::db::handlers::users::Users;
+use crate::db::models::users::UserDBResponse;
 use crate::email::{BatchCompletionInfo, EmailService};
 use crate::errors::Error;
 
@@ -49,9 +51,27 @@ pub async fn run_notification_poller(
 
         match request_manager.poll_completed_batches().await {
             Ok(batches) => {
-                if !batches.is_empty() {
-                    tracing::info!(count = batches.len(), "Found batches needing notification");
+                if batches.is_empty() {
+                    continue;
                 }
+                tracing::info!(count = batches.len(), "Found batches needing notification");
+
+                // Collect unique creator user IDs and bulk-fetch from dwctl
+                let user_ids: Vec<Uuid> = batches
+                    .iter()
+                    .filter_map(|n| n.batch.created_by.as_ref()?.parse().ok())
+                    .collect::<std::collections::HashSet<_>>()
+                    .into_iter()
+                    .collect();
+
+                let users_by_id = match bulk_get_users(&dwctl_pool, user_ids).await {
+                    Ok(map) => map,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Failed to bulk-fetch users for notifications");
+                        continue;
+                    }
+                };
+
                 for notif in batches {
                     let batch = &notif.batch;
                     let batch_id_str = batch.id.to_string();
@@ -63,7 +83,6 @@ pub async fn run_notification_poller(
                         }
                     };
 
-                    // Look up creator's email from dwctl users table
                     let user_id: Uuid = match created_by.parse() {
                         Ok(id) => id,
                         Err(_) => {
@@ -72,19 +91,15 @@ pub async fn run_notification_poller(
                         }
                     };
 
-                    let (email, display_name, username, notifications_enabled) = match get_user_info(&dwctl_pool, user_id).await {
-                        Ok(Some(info)) => info,
-                        Ok(None) => {
+                    let user = match users_by_id.get(&user_id) {
+                        Some(u) => u,
+                        None => {
                             tracing::debug!(batch_id = %batch_id_str, user_id = %user_id, "Creator not found, skipping notification");
-                            continue;
-                        }
-                        Err(e) => {
-                            tracing::warn!(batch_id = %batch_id_str, error = %e, "Failed to look up creator, skipping notification");
                             continue;
                         }
                     };
 
-                    if !notifications_enabled {
+                    if !user.batch_notifications_enabled {
                         tracing::debug!(batch_id = %batch_id_str, user_id = %user_id, "User has notifications disabled, skipping");
                         continue;
                     }
@@ -115,21 +130,21 @@ pub async fn run_notification_poller(
                         description: notif.input_file_description.clone(),
                     };
 
-                    let name = display_name.unwrap_or(username);
+                    let name = user.display_name.as_deref().unwrap_or(&user.username);
                     if let Err(e) = email_service
-                        .send_batch_completion_email(&email, Some(&name), &info)
+                        .send_batch_completion_email(&user.email, Some(name), &info)
                         .await
                     {
                         tracing::warn!(
                             batch_id = %batch_id_str,
-                            email = %email,
+                            email = %user.email,
                             error = %e,
                             "Failed to send batch completion email"
                         );
                     } else {
                         tracing::info!(
                             batch_id = %batch_id_str,
-                            email = %email,
+                            email = %user.email,
                             outcome = ?outcome,
                             "Sent batch completion notification"
                         );
@@ -143,18 +158,14 @@ pub async fn run_notification_poller(
     }
 }
 
-/// Look up a user's email, display name, username, and notification preference by their UUID.
-async fn get_user_info(pool: &PgPool, user_id: Uuid) -> Result<Option<(String, Option<String>, String, bool)>, Error> {
+/// Bulk-fetch users by their UUIDs in a single query.
+async fn bulk_get_users(pool: &PgPool, user_ids: Vec<Uuid>) -> Result<HashMap<Uuid, UserDBResponse>, Error> {
     let mut conn = pool.acquire().await.map_err(|e| Error::Internal {
         operation: format!("acquire connection for user lookup: {e}"),
     })?;
 
     let mut users = Users::new(&mut conn);
-    match users.get_by_id(user_id).await {
-        Ok(Some(user)) => Ok(Some((user.email, user.display_name, user.username, user.batch_notifications_enabled))),
-        Ok(None) => Ok(None),
-        Err(e) => Err(Error::Internal {
-            operation: format!("look up user {user_id}: {e}"),
-        }),
-    }
+    users.get_bulk(user_ids).await.map_err(|e| Error::Internal {
+        operation: format!("bulk-fetch users: {e}"),
+    })
 }
