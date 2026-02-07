@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        body {
+            font-family: system-ui, -apple-system, 'Segoe UI', sans-serif;
+            background: #E5E3D6;
+            margin: 0;
+            padding: 40px 20px;
+            color: #262626;
+            -webkit-font-smoothing: antialiased;
+        }
+        .card {
+            max-width: 560px;
+            margin: 0 auto;
+            background: #fff;
+            border-radius: 10px;
+            overflow: hidden;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.08), 0 8px 30px rgba(0,0,0,0.04);
+        }
+        .status-bar {
+            height: 4px;
+            background: {{ header_color }};
+        }
+        .header {
+            padding: 28px 32px 24px;
+            background: #262626;
+        }
+        .header .subtitle {
+            margin: 0 0 6px;
+            font-size: 13px;
+            font-weight: 400;
+            color: rgba(255,255,255,0.5);
+            letter-spacing: 0.04em;
+            text-transform: uppercase;
+        }
+        .header h1 {
+            margin: 0;
+            font-size: 22px;
+            font-weight: 700;
+            color: {{ header_color }};
+            letter-spacing: -0.01em;
+        }
+        .content {
+            padding: 32px;
+        }
+        .greeting {
+            margin: 0 0 4px;
+            font-size: 15px;
+            color: #262626;
+        }
+        .outcome-message {
+            margin: 0 0 24px;
+            font-size: 15px;
+            color: #555;
+            line-height: 1.5;
+        }
+        .details {
+            border: 1px solid #E5E3D6;
+            border-radius: 8px;
+            overflow: hidden;
+            margin-bottom: 24px;
+        }
+        .detail-section {
+            padding: 0 20px;
+        }
+        .detail-section + .detail-section {
+            border-top: 1px solid #E5E3D6;
+        }
+        .row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 11px 0;
+            border-bottom: 1px solid #f0efe8;
+        }
+        .row:last-child {
+            border-bottom: none;
+        }
+        .label {
+            color: #666;
+            font-size: 13px;
+        }
+        .value {
+            color: #262626;
+            font-family: ui-monospace, 'SF Mono', 'Cascadia Code', monospace;
+            font-size: 13px;
+            text-align: right;
+            max-width: 60%;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .stats {
+            display: flex;
+            text-align: center;
+            margin-bottom: 24px;
+            border-radius: 8px;
+            overflow: hidden;
+            border: 1px solid #E5E3D6;
+        }
+        .stat {
+            flex: 1;
+            padding: 18px 12px;
+        }
+        .stat + .stat {
+            border-left: 1px solid #E5E3D6;
+        }
+        .stat-value {
+            font-size: 28px;
+            font-weight: 700;
+            letter-spacing: -0.02em;
+        }
+        .stat-label {
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+            color: #666;
+            margin-top: 4px;
+        }
+        .stat.success { background: #f6faf6; }
+        .stat.success .stat-value { color: #16a34a; }
+        .stat.failed { background: #fdf6f6; }
+        .stat.failed .stat-value { color: #dc2626; }
+        .stat.total { background: #faf9f6; }
+        .stat.total .stat-value { color: #262626; }
+        .btn {
+            display: block;
+            text-align: center;
+            padding: 14px;
+            background: #FF6767;
+            color: #fff;
+            text-decoration: none;
+            border-radius: 8px;
+            font-weight: 600;
+            font-size: 14px;
+            letter-spacing: 0.01em;
+            transition: background 0.15s;
+        }
+        .footer {
+            margin-top: 28px;
+            padding-top: 20px;
+            border-top: 1px solid #E5E3D6;
+            font-size: 12px;
+            color: #aaa;
+            text-align: center;
+            line-height: 1.6;
+        }
+        .footer a {
+            color: #FF6767;
+            text-decoration: none;
+        }
+    </style>
+</head>
+<body>
+<div class="card">
+    <div class="status-bar"></div>
+    <div class="header">
+        <p class="subtitle">Batch Processing</p>
+        <h1>{{ outcome_icon }} {{ outcome_label }}</h1>
+    </div>
+    <div class="content">
+        <p class="greeting">Hi {{ to_name }},</p>
+        <p class="outcome-message">{{ outcome_message }}</p>
+
+        <div class="details">
+            <div class="detail-section">
+                <div class="row"><span class="label">Batch ID</span><span class="value">{{ batch_id }}</span></div>
+            </div>
+            <div class="detail-section">
+                {% if filename %}<div class="row"><span class="label">File</span><span class="value">{{ filename }}</span></div>{% endif %}
+                {% if description %}<div class="row"><span class="label">Description</span><span class="value">{{ description }}</span></div>{% endif %}
+            </div>
+            <div class="detail-section">
+                <div class="row"><span class="label">Model</span><span class="value">{{ model }}</span></div>
+                <div class="row"><span class="label">Endpoint</span><span class="value">{{ endpoint }}</span></div>
+            </div>
+            <div class="detail-section">
+                <div class="row"><span class="label">Created</span><span class="value">{{ created_at }}</span></div>
+                <div class="row"><span class="label">Finished</span><span class="value">{{ finished_at }}</span></div>
+                <div class="row"><span class="label">Duration / SLA</span><span class="value">{{ duration }} / {{ completion_window }}</span></div>
+            </div>
+        </div>
+
+        <div class="stats">
+            <div class="stat success"><div class="stat-value">{{ completed_requests }}</div><div class="stat-label">Completed</div></div>
+            <div class="stat failed"><div class="stat-value">{{ failed_requests }}</div><div class="stat-label">Failed</div></div>
+            <div class="stat total"><div class="stat-value">{{ total_requests }}</div><div class="stat-label">Total</div></div>
+        </div>
+
+        <a href="{{ dashboard_link }}" class="btn">View Batch in Dashboard &#8594;</a>
+
+        <div class="footer">
+            You're receiving this because you opted in to batch completion notifications.<br>
+            <a href="{{ profile_link }}">Manage notification preferences</a>
+        </div>
+    </div>
+</div>
+</body>
+</html>
