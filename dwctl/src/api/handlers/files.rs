@@ -278,39 +278,49 @@ impl FileUploadError {
 }
 
 /// Check if an error (or any error in its source chain) is a body/stream length limit error.
-/// This is more robust than string matching as it checks the actual error types.
+/// Checks for typed multer errors first, then falls back to string matching at each
+/// level of the error chain to catch http_body_util::LengthLimitError.
 fn is_length_limit_error(err: &(dyn std::error::Error + 'static)) -> bool {
-    // First check the error itself
+    // Helper to check error message for length limit indicators
+    fn message_indicates_length_limit(msg: &str) -> bool {
+        let lower = msg.to_lowercase();
+        lower.contains("length limit") || lower.contains("body limit") || lower.contains("payload too large")
+    }
+
+    // Check the top-level error
     if let Some(multer_err) = err.downcast_ref::<multer::Error>()
         && matches!(multer_err, multer::Error::StreamSizeExceeded { .. })
     {
         return true;
     }
-
-    // Check if it's an axum MultipartError wrapping a multer error
     if let Some(multipart_err) = err.downcast_ref::<MultipartError>()
-        // MultipartError's source is the underlying multer::Error
         && let Some(source) = std::error::Error::source(multipart_err)
         && let Some(multer_err) = source.downcast_ref::<multer::Error>()
         && matches!(multer_err, multer::Error::StreamSizeExceeded { .. })
     {
         return true;
     }
+    if message_indicates_length_limit(&err.to_string()) {
+        return true;
+    }
 
-    // Walk the error chain as fallback
+    // Walk the entire error chain
     let mut source = std::error::Error::source(err);
     while let Some(inner) = source {
+        // Check for typed multer error
         if let Some(multer_err) = inner.downcast_ref::<multer::Error>()
             && matches!(multer_err, multer::Error::StreamSizeExceeded { .. })
         {
             return true;
         }
+        // Check error message at this level
+        if message_indicates_length_limit(&inner.to_string()) {
+            return true;
+        }
         source = std::error::Error::source(inner);
     }
 
-    // Final fallback: string matching (for future-proofing if error types change)
-    let err_str = err.to_string();
-    err_str.contains("length limit exceeded") || err_str.contains("body limit")
+    false
 }
 
 /// Result from create_file_stream: the stream and an error slot.
