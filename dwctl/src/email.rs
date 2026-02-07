@@ -1,14 +1,14 @@
 //! Email service for sending password reset emails and notifications.
 
+use crate::{config::Config, errors::Error};
 use fusillade::batch::BatchOutcome;
 use lettre::{
     AsyncFileTransport, AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor,
     message::{Mailbox, header::ContentType},
     transport::smtp::authentication::Credentials,
 };
+use minijinja::{Environment, context};
 use std::path::Path;
-use minijinja::{context, Environment};
-use crate::{config::Config, errors::Error};
 
 pub struct BatchCompletionInfo {
     pub batch_id: String,
@@ -87,7 +87,7 @@ impl EmailService {
             from_email: email_config.from_email.clone(),
             from_name: email_config.from_name.clone(),
             base_url: email_config.password_reset.base_url.clone(),
-            reply_to: email_config.reply_to.clone()
+            reply_to: email_config.reply_to.clone(),
         })
     }
 
@@ -102,8 +102,9 @@ impl EmailService {
 
         let subject = "Password Reset Request";
         let name = to_name.unwrap_or("User");
-        let body = self.render_password_reset_body(name, &reset_link)
-            .map_err(|e| Error::Internal { operation: format!("render email template: {e}") })?;
+        let body = self.render_password_reset_body(name, &reset_link).map_err(|e| Error::Internal {
+            operation: format!("render email template: {e}"),
+        })?;
 
         self.send_email(to_email, to_name, subject, &body).await
     }
@@ -127,11 +128,7 @@ impl EmailService {
             operation: format!("parse to email: {e}"),
         })?;
 
-        let mut builder = Message::builder()
-            .from(from)
-            .to(to)
-            .subject(subject)
-            .header(ContentType::TEXT_HTML);
+        let mut builder = Message::builder().from(from).to(to).subject(subject).header(ContentType::TEXT_HTML);
 
         if let Some(ref reply_to_email) = self.reply_to {
             let reply_to = format!("{} <{reply_to_email}>", self.from_name)
@@ -176,8 +173,11 @@ impl EmailService {
         };
         let subject = format!("Batch {} — {}", &info.batch_id[..8.min(info.batch_id.len())], status_text);
         let name = to_name.unwrap_or("User");
-        let body = self.render_batch_completion_body_non_first(name.to_string(), info)
-            .map_err(|e| Error::Internal { operation: format!("render email template: {e}") })?;
+        let body = self
+            .render_batch_completion_body_non_first(name.to_string(), info)
+            .map_err(|e| Error::Internal {
+                operation: format!("render email template: {e}"),
+            })?;
         self.send_email(to_email, to_name, &subject, &body).await
     }
 
@@ -187,47 +187,55 @@ impl EmailService {
 
         let (outcome_label, outcome_icon, header_color, outcome_message) = match info.outcome {
             BatchOutcome::Completed => ("Completed", "✓", "#16a34a", "Your batch has finished processing successfully."),
-            BatchOutcome::PartiallyCompleted => ("Completed with some failures", "⚠", "#d97706", "Your batch has finished processing, but some requests failed."),
+            BatchOutcome::PartiallyCompleted => (
+                "Completed with some failures",
+                "⚠",
+                "#d97706",
+                "Your batch has finished processing, but some requests failed.",
+            ),
             BatchOutcome::Failed => ("Failed", "✗", "#dc2626", "There was a problem processing your batch."),
         };
 
-        let duration = info.finished_at.map(|finished| {
-            let dur = finished - info.created_at;
-            let total_secs = dur.num_seconds();
-            if total_secs < 60 {
-                format!("{total_secs}s")
-            } else if total_secs < 3600 {
-                format!("{}m {}s", total_secs / 60, total_secs % 60)
-            } else {
-                format!("{}h {}m", total_secs / 3600, (total_secs % 3600) / 60)
-            }
-        }).unwrap_or_default();
+        let duration = info
+            .finished_at
+            .map(|finished| {
+                let dur = finished - info.created_at;
+                let total_secs = dur.num_seconds();
+                if total_secs < 60 {
+                    format!("{total_secs}s")
+                } else if total_secs < 3600 {
+                    format!("{}m {}s", total_secs / 60, total_secs % 60)
+                } else {
+                    format!("{}h {}m", total_secs / 3600, (total_secs % 3600) / 60)
+                }
+            })
+            .unwrap_or_default();
 
         let base = info.dashboard_url.trim_end_matches('/');
         let dashboard_link = format!("{base}/batches/{}", info.batch_id);
         let profile_link = format!("{base}/profile");
 
         env.get_template("email")?.render(context! {
-        to_name,
-        batch_id => &info.batch_id,
-        model => &info.model,
-        endpoint => &info.endpoint,
-        outcome_label,
-        outcome_icon,
-        outcome_message,
-        header_color,
-        created_at => info.created_at.format("%b %d, %Y %H:%M UTC").to_string(),
-        finished_at => info.finished_at.map(|t| t.format("%b %d, %Y %H:%M UTC").to_string()).unwrap_or_default(),
-        duration,
-        completed_requests => info.completed_requests,
-        failed_requests => info.failed_requests,
-        total_requests => info.total_requests,
-        dashboard_link,
-        profile_link,
-        completion_window => &info.completion_window,
-        filename => info.filename.as_deref().unwrap_or(""),
-        description => info.description.as_deref().unwrap_or(""),
-    })
+            to_name,
+            batch_id => &info.batch_id,
+            model => &info.model,
+            endpoint => &info.endpoint,
+            outcome_label,
+            outcome_icon,
+            outcome_message,
+            header_color,
+            created_at => info.created_at.format("%b %d, %Y %H:%M UTC").to_string(),
+            finished_at => info.finished_at.map(|t| t.format("%b %d, %Y %H:%M UTC").to_string()).unwrap_or_default(),
+            duration,
+            completed_requests => info.completed_requests,
+            failed_requests => info.failed_requests,
+            total_requests => info.total_requests,
+            dashboard_link,
+            profile_link,
+            completion_window => &info.completion_window,
+            filename => info.filename.as_deref().unwrap_or(""),
+            description => info.description.as_deref().unwrap_or(""),
+        })
     }
 
     fn render_password_reset_body(&self, to_name: &str, reset_link: &str) -> Result<String, minijinja::Error> {
@@ -258,7 +266,9 @@ mod tests {
         let config = create_test_config();
         let email_service = EmailService::new(&config).unwrap();
 
-        let body = email_service.render_password_reset_body("John Doe", "https://example.com/reset?token=abc123").unwrap();
+        let body = email_service
+            .render_password_reset_body("John Doe", "https://example.com/reset?token=abc123")
+            .unwrap();
 
         assert!(body.contains("Hello John Doe,"));
         assert!(body.contains("https://example.com/reset?token=abc123"));
@@ -270,7 +280,9 @@ mod tests {
         let config = create_test_config();
         let email_service = EmailService::new(&config).unwrap();
 
-        let body = email_service.render_password_reset_body("User", "https://example.com/reset?token=abc123").unwrap();
+        let body = email_service
+            .render_password_reset_body("User", "https://example.com/reset?token=abc123")
+            .unwrap();
 
         assert!(body.contains("Hello User,"));
         assert!(body.contains("https://example.com/reset?token=abc123"));
