@@ -126,6 +126,7 @@ async-stripe-billing = { version = "1.0.0-rc.0", features = [
   "billing_portal_session",
 ] }
 sqlx-pool-router = "0.2.0"
+minijinja = "2.15.1"
 
 [dev-dependencies]
 axum-test = { version = "18.4.1" }
