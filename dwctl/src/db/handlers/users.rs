@@ -359,6 +359,7 @@ impl<'c> Repository for Users<'c> {
                 display_name = COALESCE($2, display_name),
                 avatar_url = COALESCE($3, avatar_url),
                 password_hash = COALESCE($4, password_hash),
+                batch_notifications_enabled = COALESCE($5, batch_notifications_enabled),
                 updated_at = NOW()
             WHERE id = $1
             RETURNING *
@@ -367,6 +368,7 @@ impl<'c> Repository for Users<'c> {
                 request.display_name,
                 request.avatar_url,
                 request.password_hash,
+                request.batch_notifications_enabled,
             )
             .fetch_optional(&mut *tx)
             .await?
@@ -744,6 +746,7 @@ mod tests {
             avatar_url: None,
             roles: Some(vec![Role::RequestViewer]), // Intentionally omitting StandardUser
             password_hash: None,
+            batch_notifications_enabled: None,
         };
 
         let updated_user = repo.update(created_user.id, &update_request).await.unwrap();
@@ -760,6 +763,7 @@ mod tests {
             avatar_url: None,
             roles: Some(vec![]), // Empty roles
             password_hash: None,
+            batch_notifications_enabled: None,
         };
 
         let updated_user = repo.update(created_user.id, &update_request).await.unwrap();

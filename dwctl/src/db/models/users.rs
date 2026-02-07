@@ -41,6 +41,7 @@ pub struct UserUpdateDBRequest {
     pub avatar_url: Option<String>,
     pub roles: Option<Vec<Role>>,
     pub password_hash: Option<String>,
+    pub batch_notifications_enabled: Option<bool>,
 }
 
 impl UserUpdateDBRequest {
@@ -50,6 +51,7 @@ impl UserUpdateDBRequest {
             avatar_url: update.avatar_url,
             roles: update.roles,
             password_hash: None, // Regular updates don't include password changes
+            batch_notifications_enabled: update.batch_notifications_enabled,
         }
     }
 }

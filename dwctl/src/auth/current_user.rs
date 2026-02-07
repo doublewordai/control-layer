@@ -1054,6 +1054,7 @@ mod tests {
             avatar_url: None,
             roles: Some(vec![Role::StandardUser, Role::PlatformManager]),
             password_hash: None,
+            batch_notifications_enabled: None,
         };
         users_repo.update(user.id, &update).await.unwrap();
 

@@ -58,6 +58,8 @@ pub struct UserUpdate {
     pub avatar_url: Option<String>,
     /// New set of roles (replaces all existing roles; null to keep unchanged)
     pub roles: Option<Vec<Role>>,
+    /// Whether to receive email notifications when batches complete (null to keep unchanged)
+    pub batch_notifications_enabled: Option<bool>,
 }
 
 /// Full user details returned by the API.
@@ -104,6 +106,8 @@ pub struct UserResponse {
     /// relied on `payment_provider_id` should instead use this boolean flag and store or
     /// manage any provider-specific identifiers on their own side.
     pub has_payment_provider_id: bool,
+    /// Whether the user receives email notifications when batches complete
+    pub batch_notifications_enabled: bool,
 }
 
 /// Query parameters for listing users
@@ -170,6 +174,7 @@ impl From<UserDBResponse> for UserResponse {
             groups: None,         // By default, relationships are not included
             credit_balance: None, // By default, credit balances are not included
             has_payment_provider_id: db.payment_provider_id.is_some(),
+            batch_notifications_enabled: db.batch_notifications_enabled,
         }
     }
 }
