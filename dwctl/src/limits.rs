@@ -12,6 +12,15 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use crate::config::{FileLimitsConfig, LimitsConfig};
 use crate::errors::{Error, Result};
 
+/// Overhead allowance for multipart encoding (headers, boundaries, field metadata).
+/// This is added to max_file_size when configuring body limits to account for
+/// the multipart framing around the actual file content.
+///
+/// Used by:
+/// - `lib.rs`: DefaultBodyLimit layer configuration
+/// - `files.rs`: Early Content-Length header rejection check
+pub const MULTIPART_OVERHEAD: u64 = 10 * 1024; // 10KB
+
 /// Container for all resource limiters.
 ///
 /// This struct holds all the individual limiters used by the application.

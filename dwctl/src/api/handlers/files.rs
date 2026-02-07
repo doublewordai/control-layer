@@ -42,7 +42,8 @@ use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 // Note: We import multer directly to get typed error matching for body limit errors.
 // axum's multipart wraps multer, and checking error variants is more robust than string matching.
-use axum::extract::multipart::MultipartError;
+use crate::limits::MULTIPART_OVERHEAD;
+use axum::extract::rejection::LengthLimitError;
 /// OpenAI Batch API request format
 /// See: https://platform.openai.com/docs/api-reference/batch
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -278,49 +279,46 @@ impl FileUploadError {
 }
 
 /// Check if an error (or any error in its source chain) is a body/stream length limit error.
-/// Checks for typed multer errors first, then falls back to string matching at each
-/// level of the error chain to catch http_body_util::LengthLimitError.
+/// Uses typed error matching via downcasting, with string-based fallback for wrapped errors.
 fn is_length_limit_error(err: &(dyn std::error::Error + 'static)) -> bool {
-    // Helper to check error message for length limit indicators
-    fn message_indicates_length_limit(msg: &str) -> bool {
-        let lower = msg.to_lowercase();
-        lower.contains("length limit") || lower.contains("body limit") || lower.contains("payload too large")
+    // Check for axum's LengthLimitError directly
+    if err.downcast_ref::<LengthLimitError>().is_some() {
+        return true;
     }
 
-    // Check the top-level error
+    // Check for multer stream/field size exceeded
     if let Some(multer_err) = err.downcast_ref::<multer::Error>()
-        && matches!(multer_err, multer::Error::StreamSizeExceeded { .. })
+        && is_multer_length_limit(multer_err)
     {
-        return true;
-    }
-    if let Some(multipart_err) = err.downcast_ref::<MultipartError>()
-        && let Some(source) = std::error::Error::source(multipart_err)
-        && let Some(multer_err) = source.downcast_ref::<multer::Error>()
-        && matches!(multer_err, multer::Error::StreamSizeExceeded { .. })
-    {
-        return true;
-    }
-    if message_indicates_length_limit(&err.to_string()) {
         return true;
     }
 
-    // Walk the entire error chain
-    let mut source = std::error::Error::source(err);
-    while let Some(inner) = source {
-        // Check for typed multer error
-        if let Some(multer_err) = inner.downcast_ref::<multer::Error>()
-            && matches!(multer_err, multer::Error::StreamSizeExceeded { .. })
-        {
-            return true;
-        }
-        // Check error message at this level
-        if message_indicates_length_limit(&inner.to_string()) {
-            return true;
-        }
-        source = std::error::Error::source(inner);
+    // String-based fallback: check error message for length limit indicators.
+    // This catches cases where the error is wrapped in a way that prevents downcasting
+    // (e.g., http_body_util::LengthLimitError wrapped in Box<dyn Error>).
+    let err_string = err.to_string().to_lowercase();
+    if err_string.contains("length limit exceeded") {
+        return true;
+    }
+
+    // Recursively check the source chain
+    if let Some(source) = std::error::Error::source(err) {
+        return is_length_limit_error(source);
     }
 
     false
+}
+
+/// Check if a multer error indicates a length/size limit was exceeded.
+fn is_multer_length_limit(err: &multer::Error) -> bool {
+    match err {
+        multer::Error::StreamSizeExceeded { .. } | multer::Error::FieldSizeExceeded { .. } => true,
+        multer::Error::StreamReadFailed(boxed) => {
+            // Recursively check the boxed error using the main function
+            is_length_limit_error(boxed.as_ref())
+        }
+        _ => false,
+    }
 }
 
 /// Result from create_file_stream: the stream and an error slot.
@@ -702,7 +700,6 @@ pub async fn upload_file<P: PoolProvider>(
     // so we still verify during streaming.
     // We add 10KB overhead for multipart encoding (boundaries, headers) to match
     // the DefaultBodyLimit layer configuration in lib.rs.
-    const MULTIPART_OVERHEAD: u64 = 10 * 1024;
     if max_file_size > 0
         && let Some(content_length) = request.headers().get(axum::http::header::CONTENT_LENGTH)
         && let Ok(length_str) = content_length.to_str()
@@ -2863,5 +2860,25 @@ mod tests {
             "Expected error about UTF-8, got: {}",
             body
         );
+    }
+
+    #[test]
+    fn test_multer_error_variants_exist() {
+        // If multer removes/renames these, this won't compile
+        let _stream_size = multer::Error::StreamSizeExceeded { limit: 0 };
+        let _field_size = multer::Error::FieldSizeExceeded {
+            limit: 0,
+            field_name: None,
+        };
+        let _stream_read = multer::Error::StreamReadFailed(Box::new(std::io::Error::new(std::io::ErrorKind::Other, "test")));
+    }
+
+    /// Compile-time test: Ensure axum's LengthLimitError exists.
+    #[test]
+    fn test_axum_length_limit_error_exists() {
+        use super::LengthLimitError;
+        // Verify it implements Error (required for downcast_ref)
+        fn assert_error<T: std::error::Error + 'static>() {}
+        assert_error::<LengthLimitError>();
     }
 }
