@@ -247,6 +247,7 @@ export interface User {
   auth_source: AuthSource;
   credit_balance?: number; // User's balance in dollars (backend field name is credit_balance)
   has_payment_provider_id: boolean; // Whether the user has a payment provider customer ID set
+  batch_notifications_enabled: boolean; // Whether the user receives batch completion emails
 }
 
 export interface ApiKey {
@@ -341,6 +342,7 @@ export interface UserUpdateRequest {
   display_name?: string;
   avatar_url?: string;
   roles?: Role[];
+  batch_notifications_enabled?: boolean;
 }
 
 export interface GroupUpdateRequest {
