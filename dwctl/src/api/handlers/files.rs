@@ -243,9 +243,19 @@ impl FileUploadError {
                     operation: format!("upload file: {}", message),
                 }
             }
-            FileUploadError::FileTooLarge { max } => Error::PayloadTooLarge {
-                message: format!("File exceeds the maximum allowed size of {} bytes", max),
-            },
+            FileUploadError::FileTooLarge { max } => {
+                if max == 0 {
+                    // max_file_size=0 means unlimited, so this error shouldn't occur
+                    // in normal operation. Treat as internal error.
+                    Error::Internal {
+                        operation: "upload file: unexpected size limit error with unlimited file size configured".to_string(),
+                    }
+                } else {
+                    Error::PayloadTooLarge {
+                        message: format!("File exceeds the maximum allowed size of {} bytes", max),
+                    }
+                }
+            }
             FileUploadError::TooManyRequests { count, max } => Error::BadRequest {
                 message: format!("File contains {} requests, which exceeds the maximum of {}", count, max),
             },
