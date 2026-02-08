@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Your Batch Results Are Ready</title>
+</head>
+<body style="margin: 0; padding: 0; background-color: #f4f4f5; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">
+    <tr>
+        <td align="center" style="padding: 40px 20px;">
+            <table role="presentation" width="600" cellspacing="0" cellpadding="0" border="0" style="background-color: #ffffff; border-radius: 12px; box-shadow: 0 4px 6px rgba(0, 0, 0, 0.05);">
+
+                <!-- Header -->
+                <tr>
+                    <td style="padding: 40px 40px 30px 40px;">
+                        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">
+                            <tr>
+                                <td>
+                                    <span style="display: inline-block; background-color: #dcfce7; color: #166534; font-size: 13px; font-weight: 600; padding: 6px 12px; border-radius: 20px;">&#10003; Batch Complete</span>
+                                </td>
+                            </tr>
+                            <tr>
+                                <td style="padding-top: 20px;">
+                                    <h1 style="margin: 0; font-size: 24px; font-weight: 600; color: #18181b;">Your results are ready!</h1>
+                                </td>
+                            </tr>
+                            <tr>
+                                <td style="padding-top: 12px;">
+                                    <p style="margin: 0; font-size: 16px; color: #52525b; line-height: 1.6;">Hi {{ to_name }}, your batch has finished processing successfully.</p>
+                                </td>
+                            </tr>
+                        </table>
+                    </td>
+                </tr>
+
+                <!-- Retrieve Results Section -->
+                <tr>
+                    <td style="padding: 0 40px 30px 40px;">
+                        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="background-color: #fafafa; border-radius: 8px; border: 1px solid #e4e4e7;">
+                            <tr>
+                                <td style="padding: 24px;">
+                                    <h2 style="margin: 0 0 16px 0; font-size: 16px; font-weight: 600; color: #18181b;">To retrieve your results:</h2>
+                                    <ul style="margin: 0; padding-left: 20px; color: #52525b; font-size: 15px; line-height: 1.8;">
+                                        <li><a href="{{ dashboard_link }}" style="color: #2563eb; text-decoration: none;">View your batch</a> in the dashboard, or <a href="https://docs.doubleword.ai/batches/getting-started-with-batched-api" style="color: #2563eb; text-decoration: none;">follow the guide</a> to fetch results via the API</li>
+                                        <li>You can also start consuming results before the full batch completes &mdash; we support partial result downloads as jobs run</li>
+                                    </ul>
+                                </td>
+                            </tr>
+                        </table>
+                    </td>
+                </tr>
+
+                <!-- Quick Links Section -->
+                <tr>
+                    <td style="padding: 0 40px 30px 40px;">
+                        <h2 style="margin: 0 0 20px 0; font-size: 16px; font-weight: 600; color: #18181b;">Your next batch (3 quick links):</h2>
+
+                        <!-- Link Card 1 -->
+                        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="margin-bottom: 12px;">
+                            <tr>
+                                <td style="background-color: #ffffff; border: 1px solid #e4e4e7; border-radius: 8px; padding: 20px;">
+                                    <a href="https://docs.doubleword.ai/batches/getting-started-with-batched-api" style="text-decoration: none;">
+                                        <h3 style="margin: 0 0 6px 0; font-size: 15px; font-weight: 600; color: #2563eb;">Run another batch in minutes &#8594;</h3>
+                                        <p style="margin: 0; font-size: 14px; color: #71717a; line-height: 1.5;">Try a different dataset, SLA or simply scale up the one you just ran with a larger dataset.</p>
+                                    </a>
+                                </td>
+                            </tr>
+                        </table>
+
+                        <!-- Link Card 2 -->
+                        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="margin-bottom: 12px;">
+                            <tr>
+                                <td style="background-color: #ffffff; border: 1px solid #e4e4e7; border-radius: 8px; padding: 20px;">
+                                    <a href="https://docs.doubleword.ai/batches/autobatcher" style="text-decoration: none;">
+                                        <h3 style="margin: 0 0 6px 0; font-size: 15px; font-weight: 600; color: #2563eb;">Autobatcher (Python SDK) &#8594;</h3>
+                                        <p style="margin: 0; font-size: 14px; color: #71717a; line-height: 1.5;">Already using a real-time API? This helps you migrate existing workflows to batch with minimal code changes.</p>
+                                    </a>
+                                </td>
+                            </tr>
+                        </table>
+
+                        <!-- Link Card 3 -->
+                        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">
+                            <tr>
+                                <td style="background-color: #ffffff; border: 1px solid #e4e4e7; border-radius: 8px; padding: 20px;">
+                                    <a href="https://docs.doubleword.ai/batches/example-daily-research-digest" style="text-decoration: none;">
+                                        <h3 style="margin: 0 0 6px 0; font-size: 15px; font-weight: 600; color: #2563eb;">Example: Daily Research Paper Digest &#8594;</h3>
+                                        <p style="margin: 0; font-size: 14px; color: #71717a; line-height: 1.5;">A complete project you can copy, plus a real cost comparison (&asymp; $1.20 on Doubleword vs &asymp; $80 on Anthropic for the same workflow).</p>
+                                    </a>
+                                </td>
+                            </tr>
+                        </table>
+                    </td>
+                </tr>
+
+                <!-- Divider -->
+                <tr>
+                    <td style="padding: 0 40px;">
+                        <hr style="border: none; border-top: 1px solid #e4e4e7; margin: 0;">
+                    </td>
+                </tr>
+
+                <!-- Feedback Section -->
+                <tr>
+                    <td style="padding: 30px 40px;">
+                        <p style="margin: 0; font-size: 15px; color: #52525b; line-height: 1.6;">If anything about your first run was confusing or didn't work as expected, <a href="mailto:{{ reply_to }}" style="color: #2563eb; text-decoration: none;">let me know</a> &mdash; it directly shapes what we build next.</p>
+                    </td>
+                </tr>
+
+                <!-- Footer -->
+                <tr>
+                    <td style="padding: 0 40px 40px 40px;">
+                        <p style="margin: 0; font-size: 15px; color: #18181b;">Best,<br><span style="color: #71717a;">{{ from_name }}</span></p>
+                    </td>
+                </tr>
+
+            </table>
+
+            <!-- Email Footer -->
+            <table role="presentation" width="600" cellspacing="0" cellpadding="0" border="0">
+                <tr>
+                    <td align="center" style="padding: 30px 40px;">
+                        <p style="margin: 0; font-size: 13px; color: #a1a1aa;">You're receiving this because you ran a batch on Doubleword.</p>
+                    </td>
+                </tr>
+            </table>
+
+        </td>
+    </tr>
+</table>
+</body>
+</html>

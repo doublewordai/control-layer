@@ -56,6 +56,7 @@ struct User {
     pub is_deleted: bool,
     pub is_internal: bool,
     pub batch_notifications_enabled: bool,
+    pub first_batch_email_sent: bool,
 }
 
 pub struct Users<'c> {
@@ -79,6 +80,7 @@ impl From<(Vec<Role>, User)> for UserDBResponse {
             external_user_id: user.external_user_id,
             payment_provider_id: user.payment_provider_id,
             batch_notifications_enabled: user.batch_notifications_enabled,
+            first_batch_email_sent: user.first_batch_email_sent,
         }
     }
 }
@@ -164,11 +166,12 @@ impl<'c> Repository for Users<'c> {
                 u.is_deleted,
                 u.is_internal,
                 u.batch_notifications_enabled,
+                u.first_batch_email_sent,
                 ARRAY_AGG(ur.role) FILTER (WHERE ur.role IS NOT NULL) as "roles: Vec<Role>"
             FROM users u
             LEFT JOIN user_roles ur ON ur.user_id = u.id
             WHERE u.id = $1 AND u.id != '00000000-0000-0000-0000-000000000000' AND u.is_deleted = false
-            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id, u.is_deleted, u.is_internal, u.batch_notifications_enabled
+            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id, u.is_deleted, u.is_internal, u.batch_notifications_enabled, u.first_batch_email_sent
             "#,
             id
         )
@@ -193,6 +196,7 @@ impl<'c> Repository for Users<'c> {
                 is_deleted: row.is_deleted,
                 is_internal: row.is_internal,
                 batch_notifications_enabled: row.batch_notifications_enabled,
+                first_batch_email_sent: row.first_batch_email_sent,
             };
 
             let roles = row.roles.unwrap_or_default();
@@ -229,11 +233,12 @@ impl<'c> Repository for Users<'c> {
                 u.is_deleted,
                 u.is_internal,
                 u.batch_notifications_enabled,
+                u.first_batch_email_sent,
                 ARRAY_AGG(ur.role) FILTER (WHERE ur.role IS NOT NULL) as "roles: Vec<Role>"
             FROM users u
             LEFT JOIN user_roles ur ON ur.user_id = u.id
             WHERE u.id = ANY($1) AND u.id != '00000000-0000-0000-0000-000000000000' AND u.is_deleted = false
-            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id, u.is_deleted, u.is_internal, u.batch_notifications_enabled
+            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id, u.is_deleted, u.is_internal, u.batch_notifications_enabled, u.first_batch_email_sent
             "#,
             ids.as_slice()
         )
@@ -260,6 +265,7 @@ impl<'c> Repository for Users<'c> {
                 is_deleted: row.is_deleted,
                 is_internal: row.is_internal,
                 batch_notifications_enabled: row.batch_notifications_enabled,
+                first_batch_email_sent: row.first_batch_email_sent,
             };
 
             let roles = row.roles.unwrap_or_default();
@@ -634,6 +640,18 @@ impl<'c> Users<'c> {
         // to avoid race condition with onwards sync
 
         Ok((user, was_created))
+    }
+
+    /// Mark that the first-batch welcome email has been sent for a user.
+    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
+    pub async fn mark_first_batch_email_sent(&mut self, user_id: UserId) -> Result<()> {
+        sqlx::query!(
+            "UPDATE users SET first_batch_email_sent = true WHERE id = $1",
+            user_id
+        )
+        .execute(&mut *self.db)
+        .await?;
+        Ok(())
     }
 
     /// Set the payment provider ID for a user if it's not already set
