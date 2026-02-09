@@ -1466,7 +1466,7 @@ checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
 name = "dwctl"
-version = "6.0.0"
+version = "6.1.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -1502,6 +1502,7 @@ dependencies = [
  "mime_guess",
  "minijinja",
  "moka",
+ "multer",
  "once_cell",
  "onwards",
  "opentelemetry",
@@ -3332,7 +3333,6 @@ dependencies = [
  "prost",
  "reqwest 0.12.28",
  "thiserror 2.0.18",
- "tracing",
 ]
 
 [[package]]
@@ -4144,7 +4144,6 @@ dependencies = [
  "base64",
  "bytes",
  "encoding_rs",
- "futures-channel",
  "futures-core",
  "futures-util",
  "h2",

@@ -1845,6 +1845,8 @@ impl Application {
     ) -> anyhow::Result<Self> {
         debug!("Starting control layer with configuration: {:#?}", config);
 
+        crypto::ensure_crypto_provider();
+
         // Setup database connections, run migrations, and initialize data
         let (_embedded_db, db_pools, fusillade_pools, outlet_pools) = setup_database(&config, pool).await?;
 
