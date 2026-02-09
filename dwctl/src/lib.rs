@@ -186,6 +186,7 @@ use axum_prometheus::PrometheusMetricLayerBuilder;
 use bon::Builder;
 pub use config::Config;
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
+use opentelemetry::trace::TraceContextExt;
 use outlet::{MultiHandler, RequestLoggerConfig, RequestLoggerLayer};
 use outlet_postgres::PostgresHandler;
 use request_logging::{AiResponse, ParsedAIRequest};
@@ -196,6 +197,7 @@ use tokio::net::TcpListener;
 use tower::Layer;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing::{debug, info, instrument};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 use utoipa::OpenApi;
 use utoipa_scalar::{Scalar, Servable};
 use uuid::Uuid;
@@ -1094,7 +1096,11 @@ pub async fn build_router(
         let body_limit_layer = if file_upload_limit == 0 {
             DefaultBodyLimit::disable()
         } else {
-            DefaultBodyLimit::max(file_upload_limit as usize)
+            // Add overhead for multipart encoding (headers, boundaries, etc.)
+            let body_limit_u64 = file_upload_limit.saturating_add(limits::MULTIPART_OVERHEAD);
+            // Clamp to usize::MAX to avoid truncation when converting to usize
+            let body_limit = usize::try_from(body_limit_u64).unwrap_or(usize::MAX);
+            DefaultBodyLimit::max(body_limit)
         };
         let file_router = Router::new().route("/files", post(api::handlers::files::upload_file).layer(body_limit_layer));
 
@@ -1221,28 +1227,42 @@ pub async fn build_router(
     }
 
     // Add tracing layer with OTel-compatible span names and HTTP semantic conventions
-    let router = router.layer(TraceLayer::new_for_http().make_span_with(|request: &http::Request<_>| {
-        let path = request.uri().path();
-        let span_name = format!("{} {}", request.method(), path);
-        let api_type = if path.starts_with("/ai/") {
-            "ai_proxy"
-        } else if path.starts_with("/admin/") {
-            "admin"
-        } else {
-            "other"
-        };
-        tracing::info_span!(
-            "request",
-            otel.name = %span_name,
-            otel.kind = "Server",
-            api.type = api_type,
-            http.request.method = %request.method(),
-            url.path = path,
-            url.query = request.uri().query().unwrap_or(""),
-        )
-    }));
+    let router = router
+        .layer(middleware::from_fn(inject_trace_id))
+        .layer(TraceLayer::new_for_http().make_span_with(|request: &http::Request<_>| {
+            let path = request.uri().path();
+            let span_name = format!("{} {}", request.method(), path);
+            let api_type = if path.starts_with("/ai/") {
+                "ai_proxy"
+            } else if path.starts_with("/admin/") {
+                "admin"
+            } else {
+                "other"
+            };
+            tracing::info_span!(
+                "request",
+                trace_id = tracing::field::Empty,
+                otel.name = %span_name,
+                otel.kind = "Server",
+                api.type = api_type,
+                http.request.method = %request.method(),
+                url.path = path,
+                url.query = request.uri().query().unwrap_or(""),
+            )
+        }));
 
     Ok(router)
+}
+
+/// Middleware that records the OpenTelemetry trace ID on the current span,
+/// making it visible in fmt log output for Loki → Tempo correlation.
+async fn inject_trace_id(request: axum::extract::Request, next: middleware::Next) -> axum::response::Response {
+    let span = tracing::Span::current();
+    let sc = span.context().span().span_context().clone();
+    if sc.is_valid() {
+        span.record("trace_id", tracing::field::display(sc.trace_id()));
+    }
+    next.run(request).await
 }
 
 /// Container for background services and their lifecycle management.

@@ -1,5 +1,19 @@
 # Changelog
 
+## [6.1.0](https://github.com/doublewordai/control-layer/compare/v6.0.0...v6.1.0) (2026-02-09)
+
+
+### Features
+
+* batch acceptance criteria (part 1) ([#658](https://github.com/doublewordai/control-layer/issues/658)) ([61a3f93](https://github.com/doublewordai/control-layer/commit/61a3f93bf156eb34d4efd29b34b779a9efa53a39))
+
+
+### Bug Fixes
+
+* better handling of large file errors ([#669](https://github.com/doublewordai/control-layer/issues/669)) ([fe44b81](https://github.com/doublewordai/control-layer/commit/fe44b81f09c047e4ad35c2839e06b8ff62ecf905))
+* bump fusillade to 5.1.0 ([#672](https://github.com/doublewordai/control-layer/issues/672)) ([c6cda1e](https://github.com/doublewordai/control-layer/commit/c6cda1ee72e406879dfda2128c64e283a6148b42))
+* default throughput ([#665](https://github.com/doublewordai/control-layer/issues/665)) ([606a114](https://github.com/doublewordai/control-layer/commit/606a1142fec0ae17adad796fc8237fa1e6d8ca38))
+
 ## [6.0.0](https://github.com/doublewordai/control-layer/compare/v5.0.3...v6.0.0) (2026-02-04)
 
 
