@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useMemo } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { dwctlApi, setAiApiBaseUrl } from "./client";
 import { queryKeys } from "./keys";
@@ -32,6 +32,8 @@ import type {
   Endpoint,
   AddComponentRequest,
   UpdateComponentRequest,
+  ModelMetrics,
+  ModelsInclude,
 } from "./types";
 
 // Config hooks
@@ -144,6 +146,47 @@ export function useModels(options?: ModelsQuery) {
       return data;
     },
   });
+}
+
+/**
+ * Fetches model metrics separately from the main models query.
+ * Returns a Map<modelId, ModelMetrics> for efficient lookup.
+ *
+ * Does NOT seed individual model caches, since its response only contains
+ * metrics and would overwrite richer cached data from the main query.
+ */
+export function useModelsMetrics(
+  options?: Omit<ModelsQuery, "include"> & { enabled?: boolean },
+) {
+  const { enabled = true, ...queryOptions } = options || {};
+
+  const query = useQuery({
+    queryKey: queryKeys.models.metrics(queryOptions),
+    queryFn: () =>
+      dwctlApi.models.list({
+        ...queryOptions,
+        include: "metrics" as ModelsInclude,
+      }),
+    enabled,
+    staleTime: 30 * 1000,
+  });
+
+  const metricsMap = useMemo(() => {
+    const map = new Map<string, ModelMetrics>();
+    if (query.data?.data) {
+      for (const model of query.data.data) {
+        if (model.metrics) {
+          map.set(model.id, model.metrics);
+        }
+      }
+    }
+    return map;
+  }, [query.data]);
+
+  return {
+    ...query,
+    metricsMap,
+  };
 }
 
 export function useModel(id: string, options?: { include?: string }) {
