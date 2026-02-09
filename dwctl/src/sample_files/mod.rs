@@ -167,6 +167,7 @@ mod tests {
             burst_size: None,
             capacity: None,
             batch_capacity: None,
+            throughput: None,
             status: crate::db::models::deployments::ModelStatus::Active,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),

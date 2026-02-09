@@ -1139,6 +1139,7 @@ mod tests {
                 burst_size: None,
                 capacity: None,
                 batch_capacity: None,
+                throughput: None,
                 provider_pricing: None,
                 // Composite model fields (regular model = not composite)
                 is_composite: false,
@@ -1252,6 +1253,7 @@ mod tests {
                 burst_size: None,
                 capacity: None,
                 batch_capacity: None,
+                throughput: None,
                 provider_pricing: None,
                 is_composite: false,
                 lb_strategy: None,
@@ -1281,6 +1283,7 @@ mod tests {
                 burst_size: None,
                 capacity: None,
                 batch_capacity: None,
+                throughput: None,
                 provider_pricing: None,
                 is_composite: true,
                 lb_strategy: Some(LoadBalancingStrategy::WeightedRandom),

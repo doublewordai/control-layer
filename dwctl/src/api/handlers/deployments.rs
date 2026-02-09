@@ -301,24 +301,35 @@ pub async fn create_deployed_model<P: PoolProvider>(
     Json(create): Json<DeployedModelCreate>,
 ) -> Result<Json<DeployedModelResponse>> {
     // Extract common fields and variant-specific data
-    let (model_name, alias, hosted_on, tariffs) = match &create {
+    let (model_name, alias, hosted_on, tariffs, throughput) = match &create {
         DeployedModelCreate::Standard(s) => (
             s.model_name.trim(),
             s.alias.as_deref().unwrap_or(s.model_name.trim()).trim(),
             Some(s.hosted_on),
             s.tariffs.clone(),
+            s.throughput,
         ),
         DeployedModelCreate::Composite(c) => (
             c.model_name.trim(),
             c.alias.as_deref().unwrap_or(c.model_name.trim()).trim(),
             None,
             c.tariffs.clone(),
+            c.throughput,
         ),
     };
 
     if model_name.is_empty() || alias.is_empty() {
         return Err(Error::BadRequest {
             message: "Model name and alias must not be empty or whitespace".to_string(),
+        });
+    }
+
+    // Validate throughput is positive if provided
+    if let Some(t) = throughput
+        && t <= 0.0
+    {
+        return Err(Error::BadRequest {
+            message: format!("throughput must be positive (> 0), got {}", t),
         });
     }
 
@@ -392,6 +403,14 @@ pub async fn update_deployed_model<P: PoolProvider>(
     Json(update): Json<DeployedModelUpdate>,
 ) -> Result<Json<DeployedModelResponse>> {
     let has_system_access = has_permission(&current_user, resource::Models.into(), operation::SystemAccess.into());
+
+    if let Some(Some(t)) = update.throughput
+        && t <= 0.0
+    {
+        return Err(Error::BadRequest {
+            message: format!("throughput must be positive (> 0), got {}", t),
+        });
+    }
 
     let mut tx = state.db.write().begin().await.map_err(|e| Error::Database(e.into()))?;
     let mut repo = Deployments::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);

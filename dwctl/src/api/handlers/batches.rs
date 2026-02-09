@@ -6,6 +6,7 @@
 
 use sqlx_pool_router::PoolProvider;
 
+use super::sla_capacity::check_sla_capacity;
 use crate::AppState;
 use crate::api::models::batches::{
     BatchAnalytics, BatchErrors, BatchListResponse, BatchObjectType, BatchResponse, BatchResultsQuery, CreateBatchRequest,
@@ -231,6 +232,73 @@ pub async fn create_batch<P: PoolProvider>(
         }
     }
 
+    // Get per-model request counts from the file
+    let file_stats = state
+        .request_manager
+        .get_file_template_stats(fusillade::FileId(file_id))
+        .await
+        .map_err(|e| Error::Internal {
+            operation: format!("get file template stats: {}", e),
+        })?;
+
+    let file_model_counts: HashMap<String, i64> = file_stats.iter().map(|s| (s.model.clone(), s.request_count)).collect();
+
+    // Get pending counts by model and completion window
+    let pending_counts = state
+        .request_manager
+        .get_pending_request_counts_by_model_and_completion_window()
+        .await
+        .map_err(|e| Error::Internal {
+            operation: format!("get pending counts: {}", e),
+        })?;
+
+    // Get model throughputs from database
+    let model_aliases: Vec<String> = file_model_counts.keys().cloned().collect();
+    let model_throughputs = get_model_throughputs(&state, &model_aliases).await?;
+
+    // Perform capacity check
+    //
+    // Note: This capacity check does not use locking, so concurrent batch creations
+    // may both pass the check and then exceed the actual capacity. This is a known
+    // limitation that provides "best effort" protection - it will reject obvious
+    // overflows but may allow slight over-acceptance (~10-20%) during concurrent bursts.
+    // This trade-off is intentional for Phase 1 to avoid complexity; proper
+    // concurrency control (e.g., advisory locks on model aliases) may be added in
+    // future iterations if the over-acceptance becomes problematic.
+    // NOTE: over acceptance is proportional to number of concurrent batches created, not number of requests in the batch
+    // so over-acceptance can be very high for a burst of large files.
+    let capacity_result = check_sla_capacity(
+        &file_model_counts,
+        &pending_counts,
+        &model_throughputs,
+        state.config.batches.default_throughput,
+        &req.completion_window,
+    );
+
+    if !capacity_result.has_capacity {
+        let overloaded_details: Vec<String> = capacity_result
+            .overloaded_models
+            .iter()
+            .map(|(model, deficit)| format!("{} (needs {} more capacity)", model, deficit))
+            .collect();
+        tracing::warn!(
+            completion_window = %req.completion_window,
+            overloaded_models = %overloaded_details.join(", "),
+            "Batch rejected due to insufficient SLA capacity"
+        );
+
+        // User-facing message: only list model names, no capacity details
+        let model_names: Vec<&str> = capacity_result.overloaded_models.keys().map(|model| model.as_str()).collect();
+
+        return Err(Error::TooManyRequests {
+            message: format!(
+                "Insufficient capacity for {} SLA window. The following models are currently at capacity: {}. Try again later or use a longer completion window.",
+                req.completion_window,
+                model_names.join(", ")
+            ),
+        });
+    }
+
     // Determine request_source from authentication method
     // - API key present -> "api"
     // - No API key (cookie auth) -> "frontend"
@@ -265,6 +333,22 @@ pub async fn create_batch<P: PoolProvider>(
         StatusCode::CREATED,
         Json(to_batch_response_with_email(batch, Some(&current_user.email))),
     ))
+}
+
+/// Get throughput values for the given model aliases from the database
+async fn get_model_throughputs<P: PoolProvider>(state: &AppState<P>, model_aliases: &[String]) -> Result<HashMap<String, f32>> {
+    use crate::db::handlers::deployments::Deployments;
+
+    let mut conn = state.db.read().acquire().await.map_err(|e| Error::Internal {
+        operation: format!("get db connection: {}", e),
+    })?;
+
+    Deployments::new(&mut conn)
+        .get_throughputs_by_aliases(model_aliases)
+        .await
+        .map_err(|e| Error::Internal {
+            operation: format!("get model throughputs: {}", e),
+        })
 }
 
 #[utoipa::path(

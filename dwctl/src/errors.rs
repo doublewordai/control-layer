@@ -313,6 +313,21 @@ impl IntoResponse for Error {
 
                 (status, axum::response::Json(body)).into_response()
             }
+            Error::TooManyRequests { message } => {
+                use axum::http::header::RETRY_AFTER;
+                use serde_json::json;
+
+                // Suggest retry after 60 seconds for capacity-based rejections
+                let retry_after_secs = "60";
+
+                let body = json!({
+                    "error": "too_many_requests",
+                    "message": message,
+                    "retry_after_seconds": 30
+                });
+
+                (status, [(RETRY_AFTER, retry_after_secs)], axum::response::Json(body)).into_response()
+            }
             _ => {
                 // For all other errors, return simple text message (unchanged)
                 let user_message = self.user_message();
