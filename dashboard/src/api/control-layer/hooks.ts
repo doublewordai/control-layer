@@ -238,7 +238,10 @@ export function useCreateModel() {
 }
 
 // Composite model component hooks
-export function useModelComponents(modelId: string, options?: { enabled?: boolean }) {
+export function useModelComponents(
+  modelId: string,
+  options?: { enabled?: boolean },
+) {
   return useQuery({
     queryKey: queryKeys.models.components(modelId),
     queryFn: () => dwctlApi.models.components.list(modelId),
