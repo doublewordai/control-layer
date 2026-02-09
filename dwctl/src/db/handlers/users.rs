@@ -645,12 +645,9 @@ impl<'c> Users<'c> {
     /// Mark that the first-batch welcome email has been sent for a user.
     #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
     pub async fn mark_first_batch_email_sent(&mut self, user_id: UserId) -> Result<()> {
-        sqlx::query!(
-            "UPDATE users SET first_batch_email_sent = true WHERE id = $1",
-            user_id
-        )
-        .execute(&mut *self.db)
-        .await?;
+        sqlx::query!("UPDATE users SET first_batch_email_sent = true WHERE id = $1", user_id)
+            .execute(&mut *self.db)
+            .await?;
         Ok(())
     }
 

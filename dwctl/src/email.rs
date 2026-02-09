@@ -179,7 +179,11 @@ impl EmailService {
             BatchOutcome::Failed => "failed",
         };
         let subject = if first_batch {
-            format!("Your first batch {} — {}", &info.batch_id[..8.min(info.batch_id.len())], status_text)
+            format!(
+                "Your first batch {} — {}",
+                &info.batch_id[..8.min(info.batch_id.len())],
+                status_text
+            )
         } else {
             format!("Batch {} — {}", &info.batch_id[..8.min(info.batch_id.len())], status_text)
         };
@@ -192,7 +196,12 @@ impl EmailService {
         self.send_email(to_email, to_name, &subject, &body).await
     }
 
-    pub fn render_batch_completion_body(&self, to_name: String, info: &BatchCompletionInfo, first_batch: bool) -> Result<String, minijinja::Error> {
+    pub fn render_batch_completion_body(
+        &self,
+        to_name: String,
+        info: &BatchCompletionInfo,
+        first_batch: bool,
+    ) -> Result<String, minijinja::Error> {
         let mut env = Environment::new();
         if first_batch {
             env.add_template("email", include_str!("../../email_templates/first_batch.html"))?;
