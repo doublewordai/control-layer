@@ -1,7 +1,13 @@
 //! Email service for sending password reset emails and notifications.
 
 use crate::{config::Config, errors::Error};
-use fusillade::batch::BatchOutcome;
+/// Outcome of a completed batch for notification purposes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchOutcome {
+    Completed,
+    PartiallyCompleted,
+    Failed,
+}
 use lettre::{
     AsyncFileTransport, AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor,
     message::{Mailbox, header::ContentType},
@@ -165,25 +171,43 @@ impl EmailService {
         to_email: &str,
         to_name: Option<&str>,
         info: &BatchCompletionInfo,
+        first_batch: bool,
     ) -> Result<(), Error> {
         let status_text = match info.outcome {
             BatchOutcome::Completed => "completed",
             BatchOutcome::PartiallyCompleted => "completed with errors",
             BatchOutcome::Failed => "failed",
         };
-        let subject = format!("Batch {} — {}", &info.batch_id[..8.min(info.batch_id.len())], status_text);
+        let subject = if first_batch {
+            format!(
+                "Your first batch {} — {}",
+                &info.batch_id[..8.min(info.batch_id.len())],
+                status_text
+            )
+        } else {
+            format!("Batch {} — {}", &info.batch_id[..8.min(info.batch_id.len())], status_text)
+        };
         let name = to_name.unwrap_or("User");
         let body = self
-            .render_batch_completion_body_non_first(name.to_string(), info)
+            .render_batch_completion_body(name.to_string(), info, first_batch)
             .map_err(|e| Error::Internal {
                 operation: format!("render email template: {e}"),
             })?;
         self.send_email(to_email, to_name, &subject, &body).await
     }
 
-    pub fn render_batch_completion_body_non_first(&self, to_name: String, info: &BatchCompletionInfo) -> Result<String, minijinja::Error> {
+    pub fn render_batch_completion_body(
+        &self,
+        to_name: String,
+        info: &BatchCompletionInfo,
+        first_batch: bool,
+    ) -> Result<String, minijinja::Error> {
         let mut env = Environment::new();
-        env.add_template("email", include_str!("../../email_templates/batch_complete.html"))?;
+        if first_batch {
+            env.add_template("email", include_str!("../../email_templates/first_batch.html"))?;
+        } else {
+            env.add_template("email", include_str!("../../email_templates/batch_complete.html"))?;
+        }
 
         let (outcome_label, outcome_icon, header_color, outcome_message) = match info.outcome {
             BatchOutcome::Completed => ("Completed", "✓", "#16a34a", "Your batch has finished processing successfully."),
@@ -235,6 +259,8 @@ impl EmailService {
             completion_window => &info.completion_window,
             filename => info.filename.as_deref().unwrap_or(""),
             description => info.description.as_deref().unwrap_or(""),
+            from_name => &self.from_name,
+            reply_to => self.reply_to.as_deref().unwrap_or(&self.from_email),
         })
     }
 
@@ -289,6 +315,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_first_batch_email_body_completed() {
+        let config = create_test_config();
+        let email_service = EmailService::new(&config).unwrap();
+
+        let info = BatchCompletionInfo {
+            batch_id: "abcd1234-5678-90ab-cdef-1234567890ab".to_string(),
+            endpoint: "/v1/chat/completions".to_string(),
+            model: "gpt-4o".to_string(),
+            outcome: BatchOutcome::Completed,
+            created_at: chrono::Utc::now(),
+            finished_at: Some(chrono::Utc::now()),
+            total_requests: 50,
+            completed_requests: 50,
+            failed_requests: 0,
+            dashboard_url: "https://example.com".to_string(),
+            completion_window: "24h".to_string(),
+            filename: Some("first-run.jsonl".to_string()),
+            description: None,
+        };
+
+        let body = email_service.render_batch_completion_body("Bob".into(), &info, true).unwrap();
+
+        assert!(body.contains("Hi Bob,"));
+        assert!(body.contains("Your results are ready!"));
+        assert!(body.contains("https://example.com/batches/abcd1234-5678-90ab-cdef-1234567890ab"));
+        assert!(body.contains("Batch Complete"));
+        assert!(body.contains("Run another batch"));
+        assert!(body.contains("Autobatcher"));
+        assert!(body.contains("let me know"));
+    }
+
+    #[tokio::test]
     async fn test_batch_completion_email_body_completed() {
         let config = create_test_config();
         let email_service = EmailService::new(&config).unwrap();
@@ -309,7 +367,7 @@ mod tests {
             description: Some("Weekly report generation".to_string()),
         };
 
-        let body = email_service.render_batch_completion_body_non_first("Alice".into(), &info).unwrap();
+        let body = email_service.render_batch_completion_body("Alice".into(), &info, false).unwrap();
 
         assert!(body.contains("Hi Alice,"));
         assert!(body.contains("Completed"));
@@ -345,7 +403,7 @@ mod tests {
             description: None,
         };
 
-        let body = email_service.render_batch_completion_body_non_first("Alice".into(), &info).unwrap();
+        let body = email_service.render_batch_completion_body("Alice".into(), &info, false).unwrap();
 
         assert!(body.contains("Completed with some failures"));
         assert!(body.contains("some requests failed"));
@@ -373,7 +431,7 @@ mod tests {
             description: None,
         };
 
-        let body = email_service.render_batch_completion_body_non_first("Alice".into(), &info).unwrap();
+        let body = email_service.render_batch_completion_body("Alice".into(), &info, false).unwrap();
 
         assert!(body.contains("Failed"));
         assert!(body.contains("problem processing your batch"));

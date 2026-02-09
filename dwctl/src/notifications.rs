@@ -4,7 +4,6 @@
 //! to batch creators. Uses atomic `notification_sent_at` claiming to prevent duplicate
 //! emails across replicas.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use fusillade::manager::postgres::PostgresRequestManager;
@@ -16,9 +15,7 @@ use uuid::Uuid;
 use crate::config::NotificationsConfig;
 use crate::db::handlers::repository::Repository;
 use crate::db::handlers::users::Users;
-use crate::db::models::users::UserDBResponse;
-use crate::email::{BatchCompletionInfo, EmailService};
-use crate::errors::Error;
+use crate::email::{BatchCompletionInfo, BatchOutcome, EmailService};
 
 pub async fn run_notification_poller(
     config: NotificationsConfig,
@@ -64,11 +61,22 @@ pub async fn run_notification_poller(
                     .into_iter()
                     .collect();
 
-                let users_by_id = match bulk_get_users(&dwctl_pool, user_ids).await {
-                    Ok(map) => map,
+                let mut conn = match dwctl_pool.acquire().await {
+                    Ok(c) => c,
                     Err(e) => {
-                        tracing::warn!(error = %e, "Failed to bulk-fetch users for notifications");
+                        tracing::warn!(error = %e, "Failed to acquire connection for notifications");
                         continue;
+                    }
+                };
+
+                let users_by_id = {
+                    let mut users = Users::new(&mut conn);
+                    match users.get_bulk(user_ids).await {
+                        Ok(map) => map,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "Failed to bulk-fetch users for notifications");
+                            continue;
+                        }
                     }
                 };
 
@@ -99,18 +107,24 @@ pub async fn run_notification_poller(
                         }
                     };
 
-                    if !user.batch_notifications_enabled {
+                    let outcome = if batch.completed_at.is_none() && batch.failed_at.is_none() {
+                        tracing::warn!(batch_id = %batch_id_str, "Batch has no outcome, skipping notification");
+                        continue;
+                    } else if batch.failed_requests == 0 {
+                        BatchOutcome::Completed
+                    } else if batch.completed_requests == 0 {
+                        BatchOutcome::Failed
+                    } else {
+                        BatchOutcome::PartiallyCompleted
+                    };
+
+                    // First-batch email only applies to successful batches
+                    let is_first_batch = !user.first_batch_email_sent && outcome == BatchOutcome::Completed;
+
+                    if !is_first_batch && !user.batch_notifications_enabled {
                         tracing::debug!(batch_id = %batch_id_str, user_id = %user_id, "User has notifications disabled, skipping");
                         continue;
                     }
-
-                    let outcome = match batch.outcome() {
-                        Some(o) => o,
-                        None => {
-                            tracing::warn!(batch_id = %batch_id_str, "Batch has no outcome, skipping notification");
-                            continue;
-                        }
-                    };
 
                     let finished_at = batch.completed_at.or(batch.failed_at);
 
@@ -131,11 +145,17 @@ pub async fn run_notification_poller(
                     };
 
                     let name = user.display_name.as_deref().unwrap_or(&user.username);
-                    if let Err(e) = email_service.send_batch_completion_email(&user.email, Some(name), &info).await {
+
+                    let send_result = email_service
+                        .send_batch_completion_email(&user.email, Some(name), &info, is_first_batch)
+                        .await;
+
+                    if let Err(e) = send_result {
                         tracing::warn!(
                             batch_id = %batch_id_str,
                             email = %user.email,
                             error = %e,
+                            first_batch = is_first_batch,
                             "Failed to send batch completion email"
                         );
                     } else {
@@ -143,8 +163,20 @@ pub async fn run_notification_poller(
                             batch_id = %batch_id_str,
                             email = %user.email,
                             outcome = ?outcome,
+                            first_batch = is_first_batch,
                             "Sent batch completion notification"
                         );
+
+                        if is_first_batch {
+                            let mut users = Users::new(&mut conn);
+                            if let Err(e) = users.mark_first_batch_email_sent(user_id).await {
+                                tracing::warn!(
+                                    user_id = %user_id,
+                                    error = %e,
+                                    "Failed to mark first batch email as sent"
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -153,16 +185,4 @@ pub async fn run_notification_poller(
             }
         }
     }
-}
-
-/// Bulk-fetch users by their UUIDs in a single query.
-async fn bulk_get_users(pool: &PgPool, user_ids: Vec<Uuid>) -> Result<HashMap<Uuid, UserDBResponse>, Error> {
-    let mut conn = pool.acquire().await.map_err(|e| Error::Internal {
-        operation: format!("acquire connection for user lookup: {e}"),
-    })?;
-
-    let mut users = Users::new(&mut conn);
-    users.get_bulk(user_ids).await.map_err(|e| Error::Internal {
-        operation: format!("bulk-fetch users: {e}"),
-    })
 }
