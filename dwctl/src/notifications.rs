@@ -6,7 +6,6 @@
 
 use std::sync::Arc;
 
-use fusillade::batch::BatchOutcome;
 use fusillade::manager::postgres::PostgresRequestManager;
 use sqlx::PgPool;
 use sqlx_pool_router::DbPools;
@@ -16,7 +15,7 @@ use uuid::Uuid;
 use crate::config::NotificationsConfig;
 use crate::db::handlers::repository::Repository;
 use crate::db::handlers::users::Users;
-use crate::email::{BatchCompletionInfo, EmailService};
+use crate::email::{BatchCompletionInfo, BatchOutcome, EmailService};
 
 pub async fn run_notification_poller(
     config: NotificationsConfig,
@@ -108,12 +107,15 @@ pub async fn run_notification_poller(
                         }
                     };
 
-                    let outcome = match batch.outcome() {
-                        Some(o) => o,
-                        None => {
-                            tracing::warn!(batch_id = %batch_id_str, "Batch has no outcome, skipping notification");
-                            continue;
-                        }
+                    let outcome = if batch.completed_at.is_none() && batch.failed_at.is_none() {
+                        tracing::warn!(batch_id = %batch_id_str, "Batch has no outcome, skipping notification");
+                        continue;
+                    } else if batch.failed_requests == 0 {
+                        BatchOutcome::Completed
+                    } else if batch.completed_requests == 0 {
+                        BatchOutcome::Failed
+                    } else {
+                        BatchOutcome::PartiallyCompleted
                     };
 
                     // First-batch email only applies to successful batches

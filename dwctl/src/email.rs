@@ -1,7 +1,13 @@
 //! Email service for sending password reset emails and notifications.
 
 use crate::{config::Config, errors::Error};
-use fusillade::batch::BatchOutcome;
+/// Outcome of a completed batch for notification purposes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchOutcome {
+    Completed,
+    PartiallyCompleted,
+    Failed,
+}
 use lettre::{
     AsyncFileTransport, AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor,
     message::{Mailbox, header::ContentType},
