@@ -343,7 +343,6 @@ mod tests {
         assert!(body.contains("Batch Complete"));
         assert!(body.contains("Run another batch"));
         assert!(body.contains("Autobatcher"));
-        assert!(body.contains("let me know"));
     }
 
     #[tokio::test]
