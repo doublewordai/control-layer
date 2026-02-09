@@ -1805,12 +1805,12 @@ async fn setup_background_services(
     };
 
     // Start webhook delivery service if enabled
-    if config.background_services.webhooks.enabled {
+    if config.background_services.notifications.webhooks.enabled {
+        let wh = &config.background_services.notifications.webhooks;
         let webhook_config = webhooks::service::WebhookServiceConfig {
-            enabled: config.background_services.webhooks.enabled,
-            timeout_secs: config.background_services.webhooks.timeout_secs,
-            max_retries: config.background_services.webhooks.max_retries,
-            circuit_breaker_threshold: config.background_services.webhooks.circuit_breaker_threshold,
+            timeout_secs: wh.timeout_secs,
+            max_retries: wh.max_retries,
+            circuit_breaker_threshold: wh.circuit_breaker_threshold,
         };
         let webhook_service = webhooks::WebhookDeliveryService::new(pool.clone(), webhook_config);
         let webhook_shutdown = shutdown_token.clone();

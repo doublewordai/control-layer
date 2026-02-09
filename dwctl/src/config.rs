@@ -1087,6 +1087,9 @@ pub struct NotificationsConfig {
     pub poll_interval: Duration,
     /// Base URL for dashboard links in notification emails
     pub dashboard_url: String,
+    /// Webhook delivery configuration for Standard Webhooks-compliant
+    /// notifications for batch terminal state events (completed, failed, cancelled).
+    pub webhooks: WebhookConfig,
 }
 
 impl Default for NotificationsConfig {
@@ -1095,6 +1098,7 @@ impl Default for NotificationsConfig {
             enabled: true,
             poll_interval: Duration::from_secs(30),
             dashboard_url: "http://localhost:3001".to_string(),
+            webhooks: WebhookConfig::default(),
         }
     }
 }
@@ -1115,10 +1119,8 @@ pub struct BackgroundServicesConfig {
     pub leader_election: LeaderElectionConfig,
     /// Configuration for database pool metrics sampling
     pub pool_metrics: PoolMetricsSamplerConfig,
-    /// Configuration for batch completion email notifications
+    /// Configuration for batch completion notifications (email + webhooks)
     pub notifications: NotificationsConfig,
-    /// Configuration for webhook delivery service
-    pub webhooks: WebhookConfig,
 }
 
 /// Database pool metrics sampling configuration.

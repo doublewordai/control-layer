@@ -27,8 +27,6 @@ const MAX_PENDING_DELIVERIES: i64 = 100;
 /// Configuration for the webhook delivery service.
 #[derive(Debug, Clone)]
 pub struct WebhookServiceConfig {
-    /// Whether the service is enabled
-    pub enabled: bool,
     /// HTTP timeout for webhook deliveries
     pub timeout_secs: u64,
     /// Maximum retry attempts (default: 7)
@@ -40,7 +38,6 @@ pub struct WebhookServiceConfig {
 impl Default for WebhookServiceConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
             timeout_secs: 30,
             max_retries: 7,
             circuit_breaker_threshold: 10,
@@ -84,11 +81,6 @@ impl WebhookDeliveryService {
     /// This runs the retry loop for failed deliveries.
     #[instrument(skip(self, shutdown_token), err)]
     pub async fn start(self, shutdown_token: CancellationToken) -> anyhow::Result<()> {
-        if !self.config.enabled {
-            info!("Webhook delivery service is disabled");
-            return Ok(());
-        }
-
         info!("Starting webhook delivery service (retry loop)");
         let service = Arc::new(self);
         service.run_retry_loop(shutdown_token).await;
