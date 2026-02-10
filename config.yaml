@@ -9,7 +9,7 @@ port: 3001
 
 # Base URL where the dashboard is accessible
 # Used for password reset links, payment redirect URLs, and batch notification emails
-dashboard_url: "http://localhost:3001"
+dashboard_url: "http://localhost:5173"
 
 # Database configuration
 database:

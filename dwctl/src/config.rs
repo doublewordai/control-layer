@@ -1217,7 +1217,7 @@ impl Default for Config {
         Self {
             host: "0.0.0.0".to_string(),
             port: 3001,
-            dashboard_url: "http://localhost:3001".to_string(),
+            dashboard_url: "http://localhost:5173".to_string(),
             database_url: None, // Deprecated field
             database_replica_url: None,
             database: DatabaseConfig::default(),
