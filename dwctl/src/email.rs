@@ -117,31 +117,24 @@ impl EmailService {
 
     async fn send_email(&self, to_email: &str, to_name: Option<&str>, subject: &str, body: &str) -> Result<(), Error> {
         // Create from mailbox
-        let from = format!("{} <{}>", self.from_name, self.from_email)
-            .parse::<Mailbox>()
-            .map_err(|e| Error::Internal {
-                operation: format!("parse from email: {e}"),
-            })?;
+        let from_address = self.from_email.parse().map_err(|e| Error::Internal {
+            operation: format!("Failed to parse from email: {e}"),
+        })?;
+        let from = Mailbox::new(Some(self.from_name.clone()), from_address);
 
         // Create to mailbox
-        let to = if let Some(name) = to_name {
-            format!("{name} <{to_email}>")
-        } else {
-            to_email.to_string()
-        }
-        .parse::<Mailbox>()
-        .map_err(|e| Error::Internal {
-            operation: format!("parse to email: {e}"),
+        let to_address = to_email.parse().map_err(|e| Error::Internal {
+            operation: format!("Failed to parse to email: {e}"),
         })?;
+        let to = Mailbox::new(to_name.map(|n| n.to_string()), to_address);
 
         let mut builder = Message::builder().from(from).to(to).subject(subject).header(ContentType::TEXT_HTML);
 
         if let Some(ref reply_to_email) = self.reply_to {
-            let reply_to = format!("{} <{reply_to_email}>", self.from_name)
-                .parse::<Mailbox>()
-                .map_err(|e| Error::Internal {
-                    operation: format!("parse reply-to email: {e}"),
-                })?;
+            let reply_to_address = reply_to_email.parse().map_err(|e| Error::Internal {
+                operation: format!("Failed to parse reply-to email: {e}"),
+            })?;
+            let reply_to = Mailbox::new(Some(self.from_name.clone()), reply_to_address);
             builder = builder.reply_to(reply_to);
         }
 
@@ -179,11 +172,7 @@ impl EmailService {
             BatchOutcome::Failed => "failed",
         };
         let subject = if first_batch {
-            format!(
-                "Your first batch {} — {}",
-                &info.batch_id[..8.min(info.batch_id.len())],
-                status_text
-            )
+            format!("Your first Doubleword batch has {status_text}")
         } else {
             format!("Batch {} — {}", &info.batch_id[..8.min(info.batch_id.len())], status_text)
         };
@@ -407,6 +396,46 @@ mod tests {
         assert!(body.contains("Completed with some failures"));
         assert!(body.contains("some requests failed"));
         assert!(body.contains(">2<"));
+    }
+
+    /// Exercises the full send_email path (mailbox construction + message build + file transport)
+    /// with various name/email combinations that could trip up RFC 5322 parsing.
+    #[tokio::test]
+    async fn test_send_email_with_various_recipient_names() {
+        let config = create_test_config();
+        let email_service = EmailService::new(&config).unwrap();
+
+        let cases: Vec<(Option<&str>, &str)> = vec![
+            // Normal name
+            (Some("Alice Smith"), "alice@example.com"),
+            // No display name
+            (None, "alice@example.com"),
+            // Email address as display name (the bug that hit production)
+            (Some("josh.cowan@doubleword.ai"), "josh.cowan@doubleword.ai"),
+            // Name with special RFC 5322 characters
+            (Some("O'Brien, James"), "james@example.com"),
+            // Name with parentheses
+            (Some("Alice (Engineering)"), "alice@example.com"),
+            // Name with quotes
+            (Some("Alice \"The Boss\" Smith"), "alice@example.com"),
+            // Unicode name
+            (Some("Müller, François"), "francois@example.com"),
+            // Single word
+            (Some("admin"), "admin@example.com"),
+            // Empty string display name
+            (Some(""), "alice@example.com"),
+        ];
+
+        for (name, email) in cases {
+            let result = email_service
+                .send_email(email, name, "Test Subject", "<p>Hello</p>")
+                .await;
+            assert!(
+                result.is_ok(),
+                "send_email failed for name={name:?}, email={email:?}: {:?}",
+                result.unwrap_err()
+            );
+        }
     }
 
     #[tokio::test]

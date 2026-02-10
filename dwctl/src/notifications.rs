@@ -159,7 +159,7 @@ pub async fn run_notification_poller(
                             "Failed to send batch completion email"
                         );
                     } else {
-                        tracing::info!(
+                        tracing::debug!(
                             batch_id = %batch_id_str,
                             email = %user.email,
                             outcome = ?outcome,
