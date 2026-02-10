@@ -39,7 +39,7 @@ pub struct WebhookUpdate {
 }
 
 /// Response for a webhook (secret hidden except on create/rotate).
-#[derive(Debug, Clone, Serialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct WebhookResponse {
     #[schema(value_type = String, format = "uuid")]
     pub id: WebhookId,
@@ -78,7 +78,7 @@ impl From<Webhook> for WebhookResponse {
 }
 
 /// Response for webhook create/rotate that includes the secret (shown only once).
-#[derive(Debug, Clone, Serialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct WebhookWithSecretResponse {
     #[schema(value_type = String, format = "uuid")]
     pub id: WebhookId,
