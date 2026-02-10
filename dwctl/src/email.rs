@@ -1,4 +1,4 @@
-//! Email service for sending password reset emails and notifications.
+//! Email service for sending password reset emails and notifications
 
 use crate::{config::Config, errors::Error};
 /// Outcome of a completed batch for notification purposes.
