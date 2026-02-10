@@ -1226,29 +1226,77 @@ pub async fn build_router(
     }
 
     // Add tracing layer with OTel-compatible span names and HTTP semantic conventions
+    // Reference: https://opentelemetry.io/docs/specs/semconv/http/http-spans/
     let router = router
         .layer(middleware::from_fn(inject_trace_id))
-        .layer(TraceLayer::new_for_http().make_span_with(|request: &http::Request<_>| {
-            let path = request.uri().path();
-            let span_name = format!("{} {}", request.method(), path);
-            let api_type = if path.starts_with("/ai/") {
-                "ai_proxy"
-            } else if path.starts_with("/admin/") {
-                "admin"
-            } else {
-                "other"
-            };
-            tracing::info_span!(
-                "request",
-                trace_id = tracing::field::Empty,
-                otel.name = %span_name,
-                otel.kind = "Server",
-                api.type = api_type,
-                http.request.method = %request.method(),
-                url.path = path,
-                url.query = request.uri().query().unwrap_or(""),
-            )
-        }));
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(|request: &http::Request<_>| {
+                    let path = request.uri().path();
+                    let route = request
+                        .extensions()
+                        .get::<axum::extract::MatchedPath>()
+                        .map(|mp| mp.as_str().to_owned());
+                    let span_name = if let Some(ref route) = route {
+                        format!("{} {}", request.method(), route)
+                    } else {
+                        format!("{} {}", request.method(), path)
+                    };
+                    let api_type = if path.starts_with("/ai/") {
+                        "ai_proxy"
+                    } else if path.starts_with("/admin/") {
+                        "admin"
+                    } else {
+                        "other"
+                    };
+                    tracing::info_span!(
+                        "request",
+                        trace_id = tracing::field::Empty,
+                        otel.name = %span_name,
+                        otel.kind = "Server",
+                        otel.status_code = tracing::field::Empty,
+                        api.type = api_type,
+                        http.request.method = %request.method(),
+                        http.route = route.as_deref().unwrap_or(""),
+                        http.response.status_code = tracing::field::Empty,
+                        url.path = path,
+                        url.query = request.uri().query().unwrap_or(""),
+                        error.type = tracing::field::Empty,
+                    )
+                })
+                .on_response(
+                    |response: &http::Response<_>,
+                     latency: std::time::Duration,
+                     span: &tracing::Span| {
+                        let status = response.status().as_u16();
+                        span.record("http.response.status_code", status);
+                        if status >= 500 {
+                            span.record("otel.status_code", "ERROR");
+                            span.record("error.type", status.to_string().as_str());
+                        } else if status >= 400 {
+                            span.record("error.type", status.to_string().as_str());
+                        }
+                        tracing::info!(
+                            http.response.status_code = status,
+                            latency_ms = latency.as_millis() as u64,
+                            "finished processing request"
+                        );
+                    },
+                )
+                .on_failure(
+                    |error: tower_http::classify::ServerErrorsFailureClass,
+                     latency: std::time::Duration,
+                     span: &tracing::Span| {
+                        span.record("otel.status_code", "ERROR");
+                        span.record("error.type", tracing::field::display(&error));
+                        tracing::error!(
+                            error = %error,
+                            latency_ms = latency.as_millis() as u64,
+                            "request failed"
+                        );
+                    },
+                ),
+        );
 
     Ok(router)
 }
