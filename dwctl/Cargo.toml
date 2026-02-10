@@ -42,7 +42,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # OpenTelemetry
 opentelemetry = "0.31.0"
 opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.31", features = [
+opentelemetry-otlp = { version = "0.31", default-features = false, features = [
   "http-proto",
   "reqwest-client",
 ] }
@@ -80,7 +80,7 @@ axum-prometheus = "0.10"
 # Metrics facade and exporter (same versions as axum-prometheus uses)
 metrics = "0.24"
 metrics-exporter-prometheus = "0.18"
-outlet = "0.5.1"
+outlet = "0.5.2"
 outlet-postgres = "0.4.6"
 async-openai = { version = "0.29.2", default-features = false }
 brotli = "8.0"
