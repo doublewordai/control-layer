@@ -1439,10 +1439,18 @@ async fn setup_background_services(
 
         // Start the onwards configuration listener
         let onwards_shutdown = shutdown_token.clone();
+        let fallback_interval = config.background_services.onwards_sync.fallback_interval_seconds;
         background_tasks.spawn("onwards-config-sync", async move {
-            info!("Starting onwards configuration listener");
+            info!(
+                "Starting onwards configuration listener (fallback sync every {}s)",
+                fallback_interval
+            );
+            let sync_config = sync::onwards_config::SyncConfig {
+                status_tx: None,
+                fallback_interval_seconds: fallback_interval,
+            };
             onwards_config_sync
-                .start(Default::default(), onwards_shutdown)
+                .start(sync_config, onwards_shutdown)
                 .await
                 .context("Onwards configuration listener failed")
         });

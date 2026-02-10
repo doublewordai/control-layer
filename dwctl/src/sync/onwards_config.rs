@@ -88,7 +88,12 @@ pub struct OnwardsConfigSync {
 
 #[derive(Default)]
 pub struct SyncConfig {
-    status_tx: Option<mpsc::Sender<SyncStatus>>,
+    pub status_tx: Option<mpsc::Sender<SyncStatus>>,
+    /// Fallback sync interval in seconds (default: 10)
+    ///
+    /// Provides periodic full syncs independent of LISTEN/NOTIFY to guarantee eventual consistency.
+    /// Set to 0 to disable fallback sync (not recommended).
+    pub fallback_interval_seconds: u64,
 }
 
 impl OnwardsConfigSync {
@@ -144,6 +149,13 @@ impl OnwardsConfigSync {
         let mut last_reload_time = std::time::Instant::now();
         const MIN_RELOAD_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
+        // Fallback sync interval (0 = disabled)
+        let fallback_interval = if config.fallback_interval_seconds > 0 {
+            Some(std::time::Duration::from_secs(config.fallback_interval_seconds))
+        } else {
+            None
+        };
+
         'outer: loop {
             if let Some(tx) = &config.status_tx {
                 tx.send(SyncStatus::Connecting).await?;
@@ -156,6 +168,10 @@ impl OnwardsConfigSync {
                 tx.send(SyncStatus::Connected).await?;
             }
             info!("Started onwards configuration listener");
+
+            // Create fallback sync timer (if enabled)
+            let mut fallback_timer = fallback_interval.map(tokio::time::interval);
+
             // Listen for notifications with graceful shutdown
             loop {
                 tokio::select! {
@@ -258,6 +274,51 @@ impl OnwardsConfigSync {
                                     return Err(e.into());
                                 }
                                 break;
+                            }
+                        }
+                    }
+
+                    // Fallback periodic sync (if enabled)
+                    _ = async {
+                        match &mut fallback_timer {
+                            Some(timer) => timer.tick().await,
+                            None => std::future::pending().await, // Never resolve if disabled
+                        }
+                    } => {
+                        debug!("Fallback periodic sync triggered");
+
+                        // Skip if we just reloaded via notification (debounce)
+                        if last_reload_time.elapsed() < MIN_RELOAD_INTERVAL {
+                            debug!("Skipping fallback sync due to recent notification-triggered reload");
+                            continue;
+                        }
+
+                        last_reload_time = std::time::Instant::now();
+                        match load_targets_from_db(&self.db, &self.escalation_models).await {
+                            Ok(new_targets) => {
+                                info!("Fallback sync: loaded {} targets from database", new_targets.targets.len());
+
+                                // Update daemon capacity limits if configured
+                                if let Some(ref limits) = self.daemon_capacity_limits
+                                    && let Err(e) = update_daemon_capacity_limits(&self.db, limits).await {
+                                        error!("Failed to update daemon capacity limits: {}", e);
+                                    }
+
+                                // Send update through watch channel
+                                if let Err(e) = self.sender.send(new_targets) {
+                                    error!("Failed to send targets update: {}", e);
+                                    // If all receivers are dropped, we can exit
+                                    break;
+                                }
+
+                                // Record metric for fallback sync
+                                metrics::counter!("dwctl_cache_sync_total", "source" => "fallback").increment(1);
+                                info!("Fallback sync: updated onwards configuration successfully");
+                            }
+                            Err(e) => {
+                                error!("Fallback sync: failed to load targets from database: {}", e);
+                                metrics::counter!("dwctl_cache_sync_errors_total", "source" => "fallback").increment(1);
+                                // Continue - fallback sync errors shouldn't crash the service
                             }
                         }
                     }
@@ -1357,6 +1418,7 @@ mod tests {
         let (status_tx, mut status_rx) = mpsc::channel(10);
         let config = SyncConfig {
             status_tx: Some(status_tx),
+            fallback_interval_seconds: 10,
         };
         let shutdown_token = CancellationToken::new();
         let mut sync_handle = tokio::spawn({
