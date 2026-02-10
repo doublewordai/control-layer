@@ -44,7 +44,9 @@ use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use sqlx::PgPool;
 use std::collections::HashMap;
-use tokio::sync::mpsc;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::{RwLock, mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, error, info, info_span, trace, warn};
 use uuid::Uuid;
@@ -125,6 +127,11 @@ where
     batch_size: usize,
     max_retries: u32,
     retry_base_delay: std::time::Duration,
+    /// Global rate limiter for onwards sync notifications.
+    /// Tracks the last time we triggered an onwards sync to prevent storms.
+    last_onwards_sync_notification: Arc<RwLock<Instant>>,
+    /// Minimum interval between onwards sync notifications (from config).
+    onwards_sync_notification_interval: Duration,
 }
 
 impl<M> AnalyticsBatcher<M>
@@ -149,6 +156,7 @@ where
         let batch_size = config.analytics.batch_size;
         let max_retries = config.analytics.max_retries;
         let retry_base_delay = std::time::Duration::from_millis(config.analytics.retry_base_delay_ms);
+        let onwards_sync_notification_interval = Duration::from_secs(config.analytics.balance_notification_interval_seconds);
 
         let batcher = Self {
             pool,
@@ -157,6 +165,8 @@ where
             batch_size,
             max_retries,
             retry_base_delay,
+            last_onwards_sync_notification: Arc::new(RwLock::new(Instant::now() - onwards_sync_notification_interval)),
+            onwards_sync_notification_interval,
         };
 
         (batcher, sender)
@@ -843,7 +853,7 @@ where
             .collect();
 
         // Query balances AFTER insert, with probabilistic checkpoint refresh (1 in 1000)
-        // Notify onwards for any user with balance <= 0 (onwards handles idempotency)
+        // Notify onwards for any user with balance <= 0 (rate-limited to prevent storms)
         if !inserted_user_ids.is_empty() {
             let balances = {
                 let mut credits = Credits::new(&mut *tx);
@@ -853,11 +863,14 @@ where
                     .map_err(|e| sqlx::Error::Protocol(format!("Failed to get user balances: {e}")))?
             };
 
-            // Notify onwards for any user with depleted balance
-            for (user_id, balance) in &balances {
-                if *balance <= Decimal::ZERO {
-                    self.notify_balance_depleted(&mut *tx, *user_id).await?;
-                }
+            // Notify onwards if any user has depleted balance (globally rate-limited)
+            let depleted_users: Vec<Uuid> = balances
+                .iter()
+                .filter_map(|(user_id, balance)| if *balance <= Decimal::ZERO { Some(*user_id) } else { None })
+                .collect();
+
+            if !depleted_users.is_empty() && self.should_notify_onwards_sync().await {
+                self.notify_onwards_sync(&mut *tx, &depleted_users).await?;
             }
         }
 
@@ -882,10 +895,33 @@ where
         Ok(duplicates)
     }
 
-    /// Send pg_notify when a user's balance is depleted.
+    /// Check if we should trigger an onwards sync notification (globally rate-limited).
+    ///
+    /// The onwards sync reloads ALL user data, so we rate-limit globally rather than per-user.
+    /// When users have depleted balances and continue making requests, we would otherwise
+    /// trigger a sync on every batch. This rate limiter ensures we only sync once per interval.
+    async fn should_notify_onwards_sync(&self) -> bool {
+        let now = Instant::now();
+        let mut last_notification = self.last_onwards_sync_notification.write().await;
+
+        if now.duration_since(*last_notification) >= self.onwards_sync_notification_interval {
+            *last_notification = now;
+            counter!("dwctl_onwards_sync_notifications_total", "action" => "sent").increment(1);
+            true
+        } else {
+            trace!("Rate limiting onwards sync notification");
+            counter!("dwctl_onwards_sync_notifications_total", "action" => "rate_limited").increment(1);
+            false
+        }
+    }
+
+    /// Send pg_notify to trigger onwards sync when users have depleted balances.
     /// Format: "credits_transactions:{epoch_micros}" to match other triggers and enable lag metrics.
-    async fn notify_balance_depleted(&self, conn: &mut sqlx::PgConnection, user_id: Uuid) -> Result<(), sqlx::Error> {
-        debug!(user_id = %user_id, "Balance depleted, notifying onwards");
+    async fn notify_onwards_sync(&self, conn: &mut sqlx::PgConnection, depleted_users: &[Uuid]) -> Result<(), sqlx::Error> {
+        debug!(
+            depleted_count = depleted_users.len(),
+            "Depleted balances detected, notifying onwards sync"
+        );
 
         let epoch_micros = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

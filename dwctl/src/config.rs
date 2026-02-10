@@ -1117,11 +1117,19 @@ impl Default for PoolMetricsSamplerConfig {
 pub struct OnwardsSyncConfig {
     /// Enable onwards config sync service (default: true)
     pub enabled: bool,
+    /// Fallback sync interval in seconds (default: 10)
+    ///
+    /// Even when LISTEN/NOTIFY is working, this provides periodic full syncs to guarantee
+    /// eventual consistency. Prevents issues from dropped notifications or connection problems.
+    pub fallback_interval_seconds: u64,
 }
 
 impl Default for OnwardsSyncConfig {
     fn default() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            fallback_interval_seconds: 10,
+        }
     }
 }
 
@@ -1218,6 +1226,14 @@ pub struct AnalyticsConfig {
     /// Actual delay is: base_delay * 2^attempt (e.g., 100ms, 200ms, 400ms for base=100).
     /// Default: 100
     pub retry_base_delay_ms: u64,
+    /// Minimum interval in seconds between balance depletion notifications per user.
+    ///
+    /// When a user's balance goes negative, we send a pg_notify to invalidate their API keys.
+    /// This rate limit prevents notification storms when users continue making requests
+    /// with negative balances. Each user can trigger at most one notification per interval.
+    ///
+    /// Default: 5 seconds
+    pub balance_notification_interval_seconds: u64,
 }
 
 impl Default for AnalyticsConfig {
@@ -1226,6 +1242,7 @@ impl Default for AnalyticsConfig {
             batch_size: 100,
             max_retries: 3,
             retry_base_delay_ms: 100,
+            balance_notification_interval_seconds: 5,
         }
     }
 }
