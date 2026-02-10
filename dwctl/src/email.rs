@@ -26,7 +26,6 @@ pub struct BatchCompletionInfo {
     pub total_requests: i64,
     pub completed_requests: i64,
     pub failed_requests: i64,
-    pub dashboard_url: String,
     pub completion_window: String,
     pub filename: Option<String>,
     pub description: Option<String>,
@@ -235,7 +234,7 @@ impl EmailService {
             })
             .unwrap_or_default();
 
-        let base = info.dashboard_url.trim_end_matches('/');
+        let base = self.base_url.trim_end_matches('/');
         let dashboard_link = format!("{base}/batches/{}", info.batch_id);
         let profile_link = format!("{base}/profile");
 
@@ -329,7 +328,7 @@ mod tests {
             total_requests: 50,
             completed_requests: 50,
             failed_requests: 0,
-            dashboard_url: "https://example.com".to_string(),
+
             completion_window: "24h".to_string(),
             filename: Some("first-run.jsonl".to_string()),
             description: None,
@@ -339,7 +338,7 @@ mod tests {
 
         assert!(body.contains("Hi Bob,"));
         assert!(body.contains("Your results are ready!"));
-        assert!(body.contains("https://example.com/batches/abcd1234-5678-90ab-cdef-1234567890ab"));
+        assert!(body.contains("http://localhost:3001/batches/abcd1234-5678-90ab-cdef-1234567890ab"));
         assert!(body.contains("Batch Complete"));
         assert!(body.contains("Run another batch"));
         assert!(body.contains("Autobatcher"));
@@ -360,7 +359,7 @@ mod tests {
             total_requests: 100,
             completed_requests: 100,
             failed_requests: 0,
-            dashboard_url: "https://example.com".to_string(),
+
             completion_window: "24h".to_string(),
             filename: Some("input.jsonl".to_string()),
             description: Some("Weekly report generation".to_string()),
@@ -374,8 +373,8 @@ mod tests {
         assert!(body.contains("/v1/chat/completions"));
         assert!(body.contains("gpt-4o"));
         assert!(body.contains("100"));
-        assert!(body.contains("https://example.com/batches/abcd1234-5678-90ab-cdef-1234567890ab"));
-        assert!(body.contains("https://example.com/profile"));
+        assert!(body.contains("http://localhost:3001/batches/abcd1234-5678-90ab-cdef-1234567890ab"));
+        assert!(body.contains("http://localhost:3001/profile"));
         assert!(body.contains("24h"));
         assert!(body.contains("input.jsonl"));
         assert!(body.contains("Weekly report generation"));
@@ -396,7 +395,7 @@ mod tests {
             total_requests: 100,
             completed_requests: 98,
             failed_requests: 2,
-            dashboard_url: "https://example.com".to_string(),
+
             completion_window: "24h".to_string(),
             filename: Some("input.jsonl".to_string()),
             description: None,
@@ -424,7 +423,7 @@ mod tests {
             total_requests: 100,
             completed_requests: 0,
             failed_requests: 100,
-            dashboard_url: "https://example.com".to_string(),
+
             completion_window: "24h".to_string(),
             filename: None,
             description: None,

@@ -1067,8 +1067,6 @@ pub struct NotificationsConfig {
     /// How often to poll for completed batches (default: 30s)
     #[serde(with = "humantime_serde")]
     pub poll_interval: Duration,
-    /// Base URL for dashboard links in notification emails
-    pub dashboard_url: String,
 }
 
 impl Default for NotificationsConfig {
@@ -1076,7 +1074,6 @@ impl Default for NotificationsConfig {
         Self {
             enabled: true,
             poll_interval: Duration::from_secs(30),
-            dashboard_url: "http://localhost:3001".to_string(),
         }
     }
 }

@@ -138,7 +138,6 @@ pub async fn run_notification_poller(
                         total_requests: batch.total_requests,
                         completed_requests: batch.completed_requests,
                         failed_requests: batch.failed_requests,
-                        dashboard_url: config.dashboard_url.clone(),
                         completion_window: batch.completion_window.clone(),
                         filename: notif.input_file_name.clone(),
                         description: notif.input_file_description.clone(),

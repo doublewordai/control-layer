@@ -275,9 +275,9 @@ dependencies = [
 
 [[package]]
 name = "async-stripe"
-version = "1.0.0-rc.0"
+version = "1.0.0-rc.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "25b44bf612e77ab96a4715f1ee36684863fc080ad0ad7ad0fbc2f25180e34565"
+checksum = "4c6aaa2c8bfd6bf27ce8cee9dde8add5022adace89d47fa36f3b25beb8398c9d"
 dependencies = [
  "async-stripe-client-core",
  "async-stripe-shared",
@@ -392,9 +392,9 @@ dependencies = [
 
 [[package]]
 name = "async-stripe-payment"
-version = "1.0.0-rc.0"
+version = "1.0.0-rc.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b4eb60a4c294ec3a44190596796228bf0c9442162fb53923c057c0780cc52e74"
+checksum = "e4225f470aefe8b4d72e0571640cd7b1136c00a642764ad10aed7510c3ae4556"
 dependencies = [
  "async-stripe-client-core",
  "async-stripe-shared",
@@ -422,9 +422,9 @@ dependencies = [
 
 [[package]]
 name = "async-stripe-terminal"
-version = "1.0.0-rc.0"
+version = "1.0.0-rc.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "735eb669c8e3b56e341868775cafab14c32898dfbfe631c3a5acc04518104dae"
+checksum = "d2c7fc72d547a5bc7b221db1cf62f236a9b2e0e46634175a876f6f8227664c0f"
 dependencies = [
  "async-stripe-client-core",
  "async-stripe-shared",
@@ -438,9 +438,9 @@ dependencies = [
 
 [[package]]
 name = "async-stripe-treasury"
-version = "1.0.0-rc.0"
+version = "1.0.0-rc.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e8006ca9985b0f0c6d5b56b94e78b1dd37d7e2d74fe340cc1f527f0305ff2519"
+checksum = "091c128d8695a54747f3a06fd2ab895071cadc4b981a86f9ac213d066209b9aa"
 dependencies = [
  "async-stripe-client-core",
  "async-stripe-shared",
@@ -466,9 +466,9 @@ dependencies = [
 
 [[package]]
 name = "async-stripe-webhook"
-version = "1.0.0-rc.0"
+version = "1.0.0-rc.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "43499409c03b7c950f85d1a5c8e5dc2e13cceef338d05d3b7b073cfdcb601e5e"
+checksum = "3daef54fbcc3446320b0443606193f564142e40103d9c478c30ffaeb84a418a6"
 dependencies = [
  "async-stripe-billing",
  "async-stripe-checkout",
@@ -1466,7 +1466,7 @@ checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
 name = "dwctl"
-version = "6.1.0"
+version = "5.0.3"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -2728,9 +2728,9 @@ dependencies = [
 
 [[package]]
 name = "libc"
-version = "0.2.180"
+version = "0.2.181"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bcc35a38544a891a5f7c865aca548a982ccb3b8650a5b06d0fd33a10283c56fc"
+checksum = "459427e2af2b9c839b132acb702a1c654d95e10f8c326bfc2ad11310e458b1c5"
 
 [[package]]
 name = "libm"
@@ -3333,6 +3333,7 @@ dependencies = [
  "prost",
  "reqwest 0.12.28",
  "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]
@@ -4144,6 +4145,7 @@ dependencies = [
  "base64",
  "bytes",
  "encoding_rs",
+ "futures-channel",
  "futures-core",
  "futures-util",
  "h2",
@@ -5320,12 +5322,12 @@ checksum = "591ef38edfb78ca4771ee32cf494cb8771944bee237a9b91fc9c1424ac4b777b"
 
 [[package]]
 name = "tempfile"
-version = "3.24.0"
+version = "3.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "655da9c7eb6305c55742045d5a8d2037996d61d8de95806335c7c86ce0f82e9c"
+checksum = "0136791f7c95b1f6dd99f9cc786b91bb81c3800b639b3478e561ddb7be95e5f1"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.1",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
