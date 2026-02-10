@@ -92,7 +92,7 @@ impl EmailService {
             from_email: email_config.from_email.clone(),
             from_name: email_config.from_name.clone(),
             base_url: config.dashboard_url.clone(),
-            reply_to: email_config.reply_to.clone()
+            reply_to: email_config.reply_to.clone(),
         })
     }
 
