@@ -7,6 +7,10 @@
 host: "0.0.0.0"
 port: 3001
 
+# Base URL where the dashboard is accessible
+# Used for password reset links, payment redirect URLs, and batch notification emails
+dashboard_url: "http://localhost:3001"
+
 # Database configuration
 database:
   # Configure connectivity to an external postgres database here
@@ -106,7 +110,6 @@ secret_key: insecure-change-in-production
 # For production, configure Stripe or another provider
 payment:
   dummy:
-    host_url: "http://localhost:5173"
     amount: 100.00
 
 # Model sources - inference endpoints to connect to
@@ -162,7 +165,6 @@ auth:
       from_name: "Control Layer"
       password_reset:
         token_expiry: "30m" # How long reset tokens are valid
-        base_url: "http://localhost:3001" # Frontend URL for reset links
 
   # Proxy header authentication
   # Accepts user identity from HTTP headers set by an upstream authentication proxy
