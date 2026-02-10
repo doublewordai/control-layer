@@ -68,7 +68,7 @@ impl EmailService {
             transport,
             from_email: email_config.from_email.clone(),
             from_name: email_config.from_name.clone(),
-            base_url: email_config.password_reset.base_url.clone(),
+            base_url: config.dashboard_url.clone(),
         })
     }
 

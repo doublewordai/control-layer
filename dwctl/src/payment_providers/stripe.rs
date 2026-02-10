@@ -394,7 +394,6 @@ mod tests {
             api_key: "sk_test_fake".to_string(),
             price_id: "price_fake".to_string(),
             webhook_secret: "whsec_fake".to_string(),
-            host_url: None,
             enable_invoice_creation: false,
         };
         let provider = StripeProvider::from(config);
@@ -411,7 +410,6 @@ mod tests {
             api_key: "sk_test_fake".to_string(),
             price_id: "price_fake".to_string(),
             webhook_secret: "whsec_fake".to_string(),
-            host_url: None,
             enable_invoice_creation: true,
         };
         let provider = StripeProvider::from(config);
@@ -444,7 +442,6 @@ mod tests {
             api_key: "sk_test_fake".to_string(),
             price_id: "price_fake".to_string(),
             webhook_secret: "whsec_fake".to_string(),
-            host_url: None,
             enable_invoice_creation: false,
         };
         let provider = StripeProvider::from(config);

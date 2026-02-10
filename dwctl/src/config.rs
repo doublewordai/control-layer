@@ -107,6 +107,9 @@ pub struct Config {
     pub host: String,
     /// HTTP server port to bind to
     pub port: u16,
+    /// Base URL where the dashboard is accessible (e.g., "https://app.example.com")
+    /// Used for password reset links, payment redirect URLs, and batch notification emails.
+    pub dashboard_url: String,
     /// Deprecated: Use `database` field instead. Kept for backward compatibility.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub database_url: Option<String>,
@@ -450,23 +453,11 @@ pub enum PaymentConfig {
     /// - `DWCTL_PAYMENT__STRIPE__API_KEY` - Stripe secret API key
     /// - `DWCTL_PAYMENT__STRIPE__WEBHOOK_SECRET` - Webhook signing secret
     /// - `DWCTL_PAYMENT__STRIPE__PRICE_ID` - Price ID for the payment product
-    /// - `DWCTL_PAYMENT__STRIPE__HOST_URL` - Base URL for redirect URLs (e.g., "https://app.example.com")
     Stripe(StripeConfig),
     /// Dummy payment provider for testing
     /// Set configuration via:
     /// - `DWCTL_PAYMENT__DUMMY__AMOUNT` - Amount to add (defaults to $50)
-    /// - `DWCTL_PAYMENT__DUMMY__HOST_URL` - Base URL for redirect URLs (e.g., "https://app.example.com")
     Dummy(DummyConfig),
-}
-
-impl PaymentConfig {
-    /// Get the host URL configured for this payment provider
-    pub fn host_url(&self) -> Option<&str> {
-        match self {
-            PaymentConfig::Stripe(config) => config.host_url.as_deref(),
-            PaymentConfig::Dummy(config) => config.host_url.as_deref(),
-        }
-    }
 }
 
 /// Stripe payment configuration.
@@ -478,9 +469,6 @@ pub struct StripeConfig {
     pub webhook_secret: String,
     /// Stripe price ID for the payment (starts with price_)
     pub price_id: String,
-    /// Base URL for redirect URLs (e.g., "https://app.example.com")
-    /// This is used to construct success/cancel URLs for checkout sessions
-    pub host_url: Option<String>,
     /// Whether to enable invoice creation for checkout sessions (default: false)
     #[serde(default)]
     pub enable_invoice_creation: bool,
@@ -491,10 +479,6 @@ pub struct StripeConfig {
 pub struct DummyConfig {
     /// Amount to add in dollars (required)
     pub amount: rust_decimal::Decimal,
-    /// Base URL for redirect URLs (e.g., "https://app.example.com")
-    /// This is used to construct success/cancel URLs for checkout sessions
-    #[serde(default)]
-    pub host_url: Option<String>,
 }
 
 /// Frontend metadata displayed in the UI.
@@ -753,8 +737,6 @@ pub struct PasswordResetEmailConfig {
     /// How long reset tokens are valid
     #[serde(with = "humantime_serde")]
     pub token_expiry: Duration,
-    /// Base URL for reset links (e.g., <https://app.example.com>)
-    pub base_url: String,
 }
 
 /// File upload/download configuration for batch processing.
@@ -1235,6 +1217,7 @@ impl Default for Config {
         Self {
             host: "0.0.0.0".to_string(),
             port: 3001,
+            dashboard_url: "http://localhost:5173".to_string(),
             database_url: None, // Deprecated field
             database_replica_url: None,
             database: DatabaseConfig::default(),
@@ -1367,8 +1350,7 @@ impl Default for EmailTransportConfig {
 impl Default for PasswordResetEmailConfig {
     fn default() -> Self {
         Self {
-            token_expiry: Duration::from_secs(30 * 60),    // 30 minutes
-            base_url: "http://localhost:3001".to_string(), // Frontend URL
+            token_expiry: Duration::from_secs(30 * 60), // 30 minutes
         }
     }
 }
