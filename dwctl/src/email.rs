@@ -426,9 +426,7 @@ mod tests {
         ];
 
         for (name, email) in cases {
-            let result = email_service
-                .send_email(email, name, "Test Subject", "<p>Hello</p>")
-                .await;
+            let result = email_service.send_email(email, name, "Test Subject", "<p>Hello</p>").await;
             assert!(
                 result.is_ok(),
                 "send_email failed for name={name:?}, email={email:?}: {:?}",
