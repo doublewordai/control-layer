@@ -1121,6 +1121,10 @@ pub struct OnwardsSyncConfig {
     ///
     /// Even when LISTEN/NOTIFY is working, this provides periodic full syncs to guarantee
     /// eventual consistency. Prevents issues from dropped notifications or connection problems.
+    ///
+    /// Set to `0` to disable periodic fallback syncs entirely. Disabling the fallback interval
+    /// removes protection against missed notifications and is generally not recommended
+    /// in production environments.
     pub fallback_interval_milliseconds: u64,
 }
 
