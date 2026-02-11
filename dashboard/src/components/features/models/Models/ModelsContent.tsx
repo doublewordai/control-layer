@@ -19,6 +19,7 @@ import {
 } from "lucide-react";
 import {
   useModels,
+  useModelsMetrics,
   type Model,
   type ModelsInclude,
   useProbes,
@@ -47,6 +48,7 @@ import {
   formatLatency,
   formatRelativeTime,
 } from "../../../../utils/formatters";
+import { Skeleton } from "../../../ui/skeleton";
 import { StatusRow } from "./StatusRow";
 import { Markdown } from "../../../ui/markdown";
 
@@ -97,15 +99,14 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
     const parts: string[] = ["status", "components"];
     if (canViewEndpoints) parts.push("endpoints");
     if (canManageGroups) parts.push("groups");
-    if (canViewAnalytics) parts.push("metrics");
+    // metrics loaded separately via useModelsMetrics for lazy background loading
     if (showPricing) parts.push("pricing");
     return parts.join(",");
-  }, [canViewEndpoints, canManageGroups, canViewAnalytics, showPricing]);
+  }, [canViewEndpoints, canManageGroups, showPricing]);
 
   // Convert filterModelType to is_composite API parameter
-  const isCompositeFilter = filterModelType === "all"
-    ? undefined
-    : filterModelType === "virtual";
+  const isCompositeFilter =
+    filterModelType === "all" ? undefined : filterModelType === "virtual";
 
   const {
     data: rawModelsData,
@@ -122,9 +123,29 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
     is_composite: isCompositeFilter,
   });
 
+  // Load metrics lazily in the background so model cards render immediately
+  const { metricsMap, isLoading: metricsLoading } = useModelsMetrics({
+    skip: pagination.queryParams.skip,
+    limit: pagination.queryParams.limit,
+    accessible: isStatusMode ? true : !canManageGroups || showAccessibleOnly,
+    search: searchQuery || undefined,
+    endpoint: endpointId,
+    group: groupId,
+    is_composite: isCompositeFilter,
+    enabled: canViewAnalytics,
+  });
+
   const { data: probesData } = useProbes();
 
-  const models = rawModelsData?.data || [];
+  // Merge lazily-loaded metrics into models
+  const models = useMemo(() => {
+    const raw = rawModelsData?.data || [];
+    if (!canViewAnalytics || metricsMap.size === 0) return raw;
+    return raw.map((model) => {
+      const metrics = metricsMap.get(model.id);
+      return metrics ? { ...model, metrics } : model;
+    });
+  }, [rawModelsData?.data, metricsMap, canViewAnalytics]);
 
   const loading = modelsLoading;
   const error = modelsError ? (modelsError as Error).message : null;
@@ -566,22 +587,32 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                           {showPricing && (
                             <>
                               {(() => {
-                                const batchTariffs = model.tariffs?.filter(
-                                  (t) => t.api_key_purpose === "batch",
-                                ) || [];
+                                const batchTariffs =
+                                  model.tariffs?.filter(
+                                    (t) => t.api_key_purpose === "batch",
+                                  ) || [];
 
                                 return (
                                   <>
                                     {batchTariffs.map((batchTariff, index) => (
                                       <React.Fragment key={batchTariff.id}>
-                                        {index > 0 && <span className="mx-1">•</span>}
-                                        <HoverCard openDelay={200} closeDelay={100}>
+                                        {index > 0 && (
+                                          <span className="mx-1">•</span>
+                                        )}
+                                        <HoverCard
+                                          openDelay={200}
+                                          closeDelay={100}
+                                        >
                                           <HoverCardTrigger asChild>
                                             <button
                                               className="flex items-center gap-0.5 shrink-0 hover:opacity-70 transition-opacity"
-                                              onClick={(e) => e.stopPropagation()}
+                                              onClick={(e) =>
+                                                e.stopPropagation()
+                                              }
                                             >
-                                              {batchTariff.completion_window || "Batch"}:
+                                              {batchTariff.completion_window ||
+                                                "Batch"}
+                                              :
                                               {!batchTariff.input_price_per_token &&
                                               !batchTariff.output_price_per_token ? (
                                                 <span className="flex items-center gap-0.5 text-green-700">
@@ -632,7 +663,8 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                                                 </span>
                                               )}
                                               <span className="sr-only">
-                                                View {batchTariff.name} pricing details
+                                                View {batchTariff.name} pricing
+                                                details
                                               </span>
                                             </button>
                                           </HoverCardTrigger>
@@ -643,58 +675,59 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                                             <p className="font-medium text-sm mb-1">
                                               {batchTariff.name}
                                             </p>
-                                                {!batchTariff.input_price_per_token &&
-                                                !batchTariff.output_price_per_token ? (
-                                                  <div className="text-sm">
-                                                    <p className="font-medium text-green-700">
-                                                      Free
-                                                    </p>
-                                                    <p className="text-xs text-muted-foreground mt-1">
-                                                      No charge for calls to this
-                                                      model
-                                                    </p>
-                                                  </div>
-                                                ) : (
-                                                  <div className="space-y-1 text-xs">
-                                                    <p className="text-muted-foreground">
-                                                      Pricing per million tokens:
-                                                    </p>
-                                                    <p>
-                                                      <span className="font-medium">
-                                                        Input:
-                                                      </span>{" "}
-                                                      {batchTariff.input_price_per_token
-                                                        ? (() => {
-                                                            const price =
-                                                              Number(
-                                                                batchTariff.input_price_per_token,
-                                                              ) * 1000000;
-                                                            return `$${price % 1 === 0 ? price.toFixed(0) : price.toFixed(2)}`;
-                                                          })()
-                                                        : "$0"}
-                                                    </p>
-                                                    <p>
-                                                      <span className="font-medium">
-                                                        Output:
-                                                      </span>{" "}
-                                                      {batchTariff.output_price_per_token
-                                                        ? (() => {
-                                                            const price =
-                                                              Number(
-                                                                batchTariff.output_price_per_token,
-                                                              ) * 1000000;
-                                                            return `$${price % 1 === 0 ? price.toFixed(0) : price.toFixed(2)}`;
-                                                          })()
-                                                        : "$0"}
-                                                    </p>
-                                                  </div>
-                                                )}
+                                            {!batchTariff.input_price_per_token &&
+                                            !batchTariff.output_price_per_token ? (
+                                              <div className="text-sm">
+                                                <p className="font-medium text-green-700">
+                                                  Free
+                                                </p>
+                                                <p className="text-xs text-muted-foreground mt-1">
+                                                  No charge for calls to this
+                                                  model
+                                                </p>
+                                              </div>
+                                            ) : (
+                                              <div className="space-y-1 text-xs">
+                                                <p className="text-muted-foreground">
+                                                  Pricing per million tokens:
+                                                </p>
+                                                <p>
+                                                  <span className="font-medium">
+                                                    Input:
+                                                  </span>{" "}
+                                                  {batchTariff.input_price_per_token
+                                                    ? (() => {
+                                                        const price =
+                                                          Number(
+                                                            batchTariff.input_price_per_token,
+                                                          ) * 1000000;
+                                                        return `$${price % 1 === 0 ? price.toFixed(0) : price.toFixed(2)}`;
+                                                      })()
+                                                    : "$0"}
+                                                </p>
+                                                <p>
+                                                  <span className="font-medium">
+                                                    Output:
+                                                  </span>{" "}
+                                                  {batchTariff.output_price_per_token
+                                                    ? (() => {
+                                                        const price =
+                                                          Number(
+                                                            batchTariff.output_price_per_token,
+                                                          ) * 1000000;
+                                                        return `$${price % 1 === 0 ? price.toFixed(0) : price.toFixed(2)}`;
+                                                      })()
+                                                    : "$0"}
+                                                </p>
+                                              </div>
+                                            )}
                                           </HoverCardContent>
                                         </HoverCard>
                                       </React.Fragment>
                                     ))}
 
-                                    {batchTariffs.length === 0 && canManageModels && (
+                                    {batchTariffs.length === 0 &&
+                                      canManageModels && (
                                         <button
                                           className="flex items-center gap-1 text-xs text-gray-600 hover:text-gray-900 transition-colors"
                                           onClick={(e) => {
@@ -834,6 +867,23 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                                 className="w-full h-auto"
                               />
                             </div>
+                          </div>
+                        </div>
+                      ) : canViewAnalytics && metricsLoading ? (
+                        <div
+                          className="flex gap-6 items-center px-6 pb-4"
+                          style={{ minHeight: "90px" }}
+                        >
+                          <div className="flex-1">
+                            <div className="grid grid-cols-2 gap-3">
+                              <Skeleton className="h-4 w-24" />
+                              <Skeleton className="h-4 w-20" />
+                              <Skeleton className="h-4 w-28" />
+                              <Skeleton className="h-4 w-16" />
+                            </div>
+                          </div>
+                          <div className="flex-1 flex items-center justify-center px-2">
+                            <Skeleton className="h-[35px] w-[180px]" />
                           </div>
                         </div>
                       ) : (

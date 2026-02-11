@@ -1827,6 +1827,7 @@ mod tests {
         let config = crate::config::Config {
             host: "localhost".to_string(),
             port: 3001,
+            dashboard_url: "http://localhost:3001".to_string(),
             database_url: None,
             database_replica_url: None,
             database: crate::config::DatabaseConfig::External {

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT\n                u.id,\n                u.username,\n                u.email,\n                u.display_name,\n                u.avatar_url,\n                u.auth_source,\n                u.created_at,\n                u.updated_at,\n                u.last_login,\n                u.is_admin,\n                u.password_hash,\n                u.external_user_id,\n                u.payment_provider_id,\n                u.is_deleted,\n                u.is_internal,\n                ARRAY_AGG(ur.role) FILTER (WHERE ur.role IS NOT NULL) as \"roles: Vec<Role>\"\n            FROM users u\n            LEFT JOIN user_roles ur ON ur.user_id = u.id\n            WHERE u.id = ANY($1) AND u.id != '00000000-0000-0000-0000-000000000000' AND u.is_deleted = false\n            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id, u.is_deleted, u.is_internal\n            ",
+  "query": "\n            UPDATE users SET\n                display_name = COALESCE($2, display_name),\n                avatar_url = COALESCE($3, avatar_url),\n                password_hash = COALESCE($4, password_hash),\n                batch_notifications_enabled = COALESCE($5, batch_notifications_enabled),\n                updated_at = NOW()\n            WHERE id = $1\n            RETURNING *\n            ",
   "describe": {
     "columns": [
       {
@@ -80,33 +80,22 @@
       },
       {
         "ordinal": 15,
-        "name": "roles: Vec<Role>",
-        "type_info": {
-          "Custom": {
-            "name": "user_role[]",
-            "kind": {
-              "Array": {
-                "Custom": {
-                  "name": "user_role",
-                  "kind": {
-                    "Enum": [
-                      "PLATFORMMANAGER",
-                      "REQUESTVIEWER",
-                      "STANDARDUSER",
-                      "BILLINGMANAGER",
-                      "BATCHAPIUSER"
-                    ]
-                  }
-                }
-              }
-            }
-          }
-        }
+        "name": "batch_notifications_enabled",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 16,
+        "name": "first_batch_email_sent",
+        "type_info": "Bool"
       }
     ],
     "parameters": {
       "Left": [
-        "UuidArray"
+        "Uuid",
+        "Varchar",
+        "Varchar",
+        "Text",
+        "Bool"
       ]
     },
     "nullable": [
@@ -125,8 +114,9 @@
       true,
       false,
       false,
-      null
+      false,
+      false
     ]
   },
-  "hash": "7069eb0d07fa065340005000e8bebf8141a1ae405f56392340781ffecad2a903"
+  "hash": "1c23ef983dc9efce0721dc39c6dcc0aa931e860e294bce36a63f8a9e2e1cfe5b"
 }

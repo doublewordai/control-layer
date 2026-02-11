@@ -107,6 +107,9 @@ pub struct Config {
     pub host: String,
     /// HTTP server port to bind to
     pub port: u16,
+    /// Base URL where the dashboard is accessible (e.g., "https://app.example.com")
+    /// Used for password reset links, payment redirect URLs, and batch notification emails.
+    pub dashboard_url: String,
     /// Deprecated: Use `database` field instead. Kept for backward compatibility.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub database_url: Option<String>,
@@ -450,23 +453,11 @@ pub enum PaymentConfig {
     /// - `DWCTL_PAYMENT__STRIPE__API_KEY` - Stripe secret API key
     /// - `DWCTL_PAYMENT__STRIPE__WEBHOOK_SECRET` - Webhook signing secret
     /// - `DWCTL_PAYMENT__STRIPE__PRICE_ID` - Price ID for the payment product
-    /// - `DWCTL_PAYMENT__STRIPE__HOST_URL` - Base URL for redirect URLs (e.g., "https://app.example.com")
     Stripe(StripeConfig),
     /// Dummy payment provider for testing
     /// Set configuration via:
     /// - `DWCTL_PAYMENT__DUMMY__AMOUNT` - Amount to add (defaults to $50)
-    /// - `DWCTL_PAYMENT__DUMMY__HOST_URL` - Base URL for redirect URLs (e.g., "https://app.example.com")
     Dummy(DummyConfig),
-}
-
-impl PaymentConfig {
-    /// Get the host URL configured for this payment provider
-    pub fn host_url(&self) -> Option<&str> {
-        match self {
-            PaymentConfig::Stripe(config) => config.host_url.as_deref(),
-            PaymentConfig::Dummy(config) => config.host_url.as_deref(),
-        }
-    }
 }
 
 /// Stripe payment configuration.
@@ -478,9 +469,6 @@ pub struct StripeConfig {
     pub webhook_secret: String,
     /// Stripe price ID for the payment (starts with price_)
     pub price_id: String,
-    /// Base URL for redirect URLs (e.g., "https://app.example.com")
-    /// This is used to construct success/cancel URLs for checkout sessions
-    pub host_url: Option<String>,
     /// Whether to enable invoice creation for checkout sessions (default: false)
     #[serde(default)]
     pub enable_invoice_creation: bool,
@@ -491,10 +479,6 @@ pub struct StripeConfig {
 pub struct DummyConfig {
     /// Amount to add in dollars (required)
     pub amount: rust_decimal::Decimal,
-    /// Base URL for redirect URLs (e.g., "https://app.example.com")
-    /// This is used to construct success/cancel URLs for checkout sessions
-    #[serde(default)]
-    pub host_url: Option<String>,
 }
 
 /// Frontend metadata displayed in the UI.
@@ -720,6 +704,8 @@ pub struct EmailConfig {
     pub from_name: String,
     /// Password reset email configuration
     pub password_reset: PasswordResetEmailConfig,
+    /// Who to set the reply to field from
+    pub reply_to: Option<String>,
 }
 
 /// Email transport configuration - either SMTP or file-based for testing.
@@ -753,8 +739,6 @@ pub struct PasswordResetEmailConfig {
     /// How long reset tokens are valid
     #[serde(with = "humantime_serde")]
     pub token_expiry: Duration,
-    /// Base URL for reset links (e.g., <https://app.example.com>)
-    pub base_url: String,
 }
 
 /// File upload/download configuration for batch processing.
@@ -797,6 +781,29 @@ impl Default for FilesConfig {
 pub struct LimitsConfig {
     /// File limits (size, request count, and upload concurrency)
     pub files: FileLimitsConfig,
+    /// Request limits (per-request body size within batch files)
+    pub requests: RequestLimitsConfig,
+}
+
+/// Request limits configuration.
+///
+/// Controls per-request body size limits within batch JSONL files
+/// to prevent individual requests from overwhelming inference providers.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RequestLimitsConfig {
+    /// Maximum body size in bytes for individual requests within batch JSONL files.
+    /// Set to 0 for unlimited (not recommended for production).
+    /// Default: 10MB
+    pub max_body_size: u64,
+}
+
+impl Default for RequestLimitsConfig {
+    fn default() -> Self {
+        Self {
+            max_body_size: 10 * 1024 * 1024, // 10MB
+        }
+    }
 }
 
 /// File limits configuration.
@@ -1070,6 +1077,30 @@ impl Default for LeaderElectionConfig {
     }
 }
 
+/// Batch completion notification configuration.
+///
+/// When enabled, polls for completed/failed/cancelled batches and sends email notifications
+/// to batch creators. Safe to run on all replicas — uses atomic `notification_sent_at` claim
+/// to prevent duplicate emails.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NotificationsConfig {
+    /// Enable batch completion notifications (default: true)
+    pub enabled: bool,
+    /// How often to poll for completed batches (default: 30s)
+    #[serde(with = "humantime_serde")]
+    pub poll_interval: Duration,
+}
+
+impl Default for NotificationsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            poll_interval: Duration::from_secs(30),
+        }
+    }
+}
+
 /// Background services configuration.
 ///
 /// Controls which background services are enabled on this instance.
@@ -1086,6 +1117,8 @@ pub struct BackgroundServicesConfig {
     pub leader_election: LeaderElectionConfig,
     /// Configuration for database pool metrics sampling
     pub pool_metrics: PoolMetricsSamplerConfig,
+    /// Configuration for batch completion email notifications
+    pub notifications: NotificationsConfig,
 }
 
 /// Database pool metrics sampling configuration.
@@ -1257,6 +1290,7 @@ impl Default for Config {
         Self {
             host: "0.0.0.0".to_string(),
             port: 3001,
+            dashboard_url: "http://localhost:5173".to_string(),
             database_url: None, // Deprecated field
             database_replica_url: None,
             database: DatabaseConfig::default(),
@@ -1374,6 +1408,7 @@ impl Default for EmailConfig {
             from_email: "noreply@example.com".to_string(),
             from_name: "Control Layer".to_string(),
             password_reset: PasswordResetEmailConfig::default(),
+            reply_to: None,
         }
     }
 }
@@ -1389,8 +1424,7 @@ impl Default for EmailTransportConfig {
 impl Default for PasswordResetEmailConfig {
     fn default() -> Self {
         Self {
-            token_expiry: Duration::from_secs(30 * 60),    // 30 minutes
-            base_url: "http://localhost:3001".to_string(), // Frontend URL
+            token_expiry: Duration::from_secs(30 * 60), // 30 minutes
         }
     }
 }

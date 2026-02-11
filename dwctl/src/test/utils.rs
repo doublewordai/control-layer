@@ -109,6 +109,7 @@ pub fn create_test_config() -> crate::config::Config {
         slow_statement_threshold_ms: 1000,
         host: "127.0.0.1".to_string(),
         port: 0,
+        dashboard_url: "http://localhost:3001".to_string(),
         admin_email: "admin@test.com".to_string(),
         admin_password: None,
         secret_key: Some("test-secret-key-for-testing-only".to_string()),
@@ -177,6 +178,7 @@ pub fn create_test_config() -> crate::config::Config {
                 max_file_size: 1000 * 1024 * 1024, // 1GB
                 ..Default::default()
             },
+            ..Default::default()
         },
     }
 }
@@ -318,6 +320,7 @@ pub async fn get_system_user(pool: &mut PgConnection) -> UserResponse {
         groups: None, // Groups not included in test users by default
         credit_balance: None,
         has_payment_provider_id: false,
+        batch_notifications_enabled: false,
     }
 }
 

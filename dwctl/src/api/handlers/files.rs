@@ -205,6 +205,8 @@ struct FileStreamConfig {
     max_file_size: u64,
     /// Maximum number of requests per file (0 = unlimited)
     max_requests_per_file: usize,
+    /// Maximum body size in bytes for individual requests (0 = unlimited)
+    max_request_body_size: u64,
     /// Channel buffer size for streaming
     buffer_size: usize,
 }
@@ -539,6 +541,20 @@ fn create_file_stream(
                                             // Transform to internal format (includes model access validation)
                                             match openai_req.to_internal(&endpoint, &api_key, &accessible_models) {
                                                 Ok(template) => {
+                                                    // Check per-request body size limit (0 = unlimited)
+                                                    if config.max_request_body_size > 0
+                                                        && template.body.len() as u64 > config.max_request_body_size
+                                                    {
+                                                        abort!(FileUploadError::ValidationError {
+                                                            line: line_count + 1,
+                                                            message: format!(
+                                                                "Request body is {} bytes, which exceeds the maximum allowed size of {} bytes",
+                                                                template.body.len(),
+                                                                config.max_request_body_size
+                                                            ),
+                                                        });
+                                                    }
+
                                                     line_count += 1;
                                                     incomplete_line.clear();
                                                     if tx.send(fusillade::FileStreamItem::Template(template)).await.is_err() {
@@ -608,6 +624,18 @@ fn create_file_stream(
                             match serde_json::from_str::<OpenAIBatchRequest>(trimmed) {
                                 Ok(openai_req) => match openai_req.to_internal(&endpoint, &api_key, &accessible_models) {
                                     Ok(template) => {
+                                        // Check per-request body size limit (0 = unlimited)
+                                        if config.max_request_body_size > 0 && template.body.len() as u64 > config.max_request_body_size {
+                                            abort!(FileUploadError::ValidationError {
+                                                line: line_count + 1,
+                                                message: format!(
+                                                    "Request body is {} bytes, which exceeds the maximum allowed size of {} bytes",
+                                                    template.body.len(),
+                                                    config.max_request_body_size
+                                                ),
+                                            });
+                                        }
+
                                         line_count += 1;
                                         if tx.send(fusillade::FileStreamItem::Template(template)).await.is_err() {
                                             return;
@@ -733,6 +761,7 @@ pub async fn upload_file<P: PoolProvider>(
     let stream_config = FileStreamConfig {
         max_file_size: state.config.limits.files.max_file_size,
         max_requests_per_file: state.config.limits.files.max_requests_per_file,
+        max_request_body_size: state.config.limits.requests.max_body_size,
         buffer_size: state.config.batches.files.upload_buffer_size,
     };
     let uploaded_by = Some(current_user.id.to_string());
@@ -2899,5 +2928,83 @@ mod tests {
         // Verify it implements Error (required for downcast_ref)
         fn assert_error<T: std::error::Error + 'static>() {}
         assert_error::<LengthLimitError>();
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_upload_rejects_request_exceeding_max_body_size(pool: PgPool) {
+        // Create app with a small per-request body size limit
+        let mut config = create_test_config();
+        config.limits.requests.max_body_size = 100; // 100 bytes
+
+        let (app, _bg_services) = create_test_app_with_config(pool.clone(), config, false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        // Create a request with a body that exceeds 100 bytes when serialized
+        let large_content = "x".repeat(200);
+        let jsonl_content = format!(
+            r#"{{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{{"model":"gpt-4","messages":[{{"role":"user","content":"{}"}}]}}}}"#,
+            large_content
+        );
+
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.into_bytes()).file_name("test.jsonl");
+
+        let upload_response = app
+            .post("/ai/v1/files")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .multipart(
+                axum_test::multipart::MultipartForm::new()
+                    .add_text("purpose", "batch")
+                    .add_part("file", file_part),
+            )
+            .await;
+
+        upload_response.assert_status(axum::http::StatusCode::BAD_REQUEST);
+        let body = upload_response.text();
+        assert!(
+            body.contains("exceeds the maximum allowed size"),
+            "Expected error about request body size, got: {}",
+            body
+        );
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_upload_allows_request_within_max_body_size(pool: PgPool) {
+        // Create app with a generous per-request body size limit
+        let mut config = create_test_config();
+        config.limits.requests.max_body_size = 10 * 1024; // 10KB
+
+        let (app, _bg_services) = create_test_app_with_config(pool.clone(), config, false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        // Create a small request well within the limit
+        let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}"#;
+
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test.jsonl");
+
+        let upload_response = app
+            .post("/ai/v1/files")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .multipart(
+                axum_test::multipart::MultipartForm::new()
+                    .add_text("purpose", "batch")
+                    .add_part("file", file_part),
+            )
+            .await;
+
+        upload_response.assert_status(axum::http::StatusCode::CREATED);
     }
 }
