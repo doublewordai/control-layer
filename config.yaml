@@ -278,6 +278,11 @@ batches:
 #     # Maximum seconds to wait for an upload slot before returning HTTP 429
 #     # Set to 0 to reject immediately when no slot is available
 #     max_upload_wait_secs: 60
+#   requests:
+#     # Maximum body size per individual request in batch JSONL files (bytes)
+#     # Set to 0 for unlimited (not recommended for production)
+#     # Default: 10MB (10485760)
+#     max_body_size: 10485760
 
 # Background services configuration
 # Controls which background services run on this instance

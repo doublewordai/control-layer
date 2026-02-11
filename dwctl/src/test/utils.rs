@@ -175,6 +175,7 @@ pub fn create_test_config() -> crate::config::Config {
                 max_file_size: 1000 * 1024 * 1024, // 1GB
                 ..Default::default()
             },
+            ..Default::default()
         },
     }
 }
