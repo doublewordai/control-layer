@@ -781,6 +781,29 @@ impl Default for FilesConfig {
 pub struct LimitsConfig {
     /// File limits (size, request count, and upload concurrency)
     pub files: FileLimitsConfig,
+    /// Request limits (per-request body size within batch files)
+    pub requests: RequestLimitsConfig,
+}
+
+/// Request limits configuration.
+///
+/// Controls per-request body size limits within batch JSONL files
+/// to prevent individual requests from overwhelming inference providers.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RequestLimitsConfig {
+    /// Maximum body size in bytes for individual requests within batch JSONL files.
+    /// Set to 0 for unlimited (not recommended for production).
+    /// Default: 10MB
+    pub max_body_size: u64,
+}
+
+impl Default for RequestLimitsConfig {
+    fn default() -> Self {
+        Self {
+            max_body_size: 10 * 1024 * 1024, // 10MB
+        }
+    }
 }
 
 /// File limits configuration.
