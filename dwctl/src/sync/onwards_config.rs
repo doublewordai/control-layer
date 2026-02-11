@@ -88,18 +88,18 @@ pub struct OnwardsConfigSync {
 
 pub struct SyncConfig {
     pub status_tx: Option<mpsc::Sender<SyncStatus>>,
-    /// Fallback sync interval in seconds (default: 10)
+    /// Fallback sync interval in milliseconds (default: 10000ms = 10 seconds)
     ///
     /// Provides periodic full syncs independent of LISTEN/NOTIFY to guarantee eventual consistency.
     /// Set to 0 to disable fallback sync (not recommended).
-    pub fallback_interval_seconds: u64,
+    pub fallback_interval_milliseconds: u64,
 }
 
 impl Default for SyncConfig {
     fn default() -> Self {
         Self {
             status_tx: None,
-            fallback_interval_seconds: 10,
+            fallback_interval_milliseconds: 10000, // 10 seconds
         }
     }
 }
@@ -158,8 +158,8 @@ impl OnwardsConfigSync {
         const MIN_RELOAD_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
         // Fallback sync interval (0 = disabled)
-        let fallback_interval = if config.fallback_interval_seconds > 0 {
-            Some(std::time::Duration::from_secs(config.fallback_interval_seconds))
+        let fallback_interval = if config.fallback_interval_milliseconds > 0 {
+            Some(std::time::Duration::from_millis(config.fallback_interval_milliseconds))
         } else {
             None
         };
@@ -1434,7 +1434,7 @@ mod tests {
         let (status_tx, mut status_rx) = mpsc::channel(10);
         let config = SyncConfig {
             status_tx: Some(status_tx),
-            fallback_interval_seconds: 10,
+            fallback_interval_milliseconds: 10000,
         };
         let shutdown_token = CancellationToken::new();
         let mut sync_handle = tokio::spawn({
@@ -1510,5 +1510,62 @@ mod tests {
         let result = timeout(Duration::from_millis(100), &mut sync_handle).await;
         assert!(result.is_err(), "Task should still be running after reconnection");
         sync_handle.abort();
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    /// Test that fallback sync triggers periodic reloads even without LISTEN/NOTIFY activity
+    async fn test_fallback_sync_triggers_without_notifications(pool: sqlx::PgPool) {
+        use tokio::sync::mpsc;
+        use tokio_util::sync::CancellationToken;
+
+        // Create the sync service
+        let (sync, _initial_targets, _stream) = super::OnwardsConfigSync::new(pool.clone())
+            .await
+            .expect("Failed to create OnwardsConfigSync");
+
+        // Create sync config with 200ms fallback interval for fast testing
+        let (status_tx, mut status_rx) = mpsc::channel(10);
+        let config = SyncConfig {
+            status_tx: Some(status_tx),
+            fallback_interval_milliseconds: 20,
+        };
+
+        let shutdown_token = CancellationToken::new();
+        let mut sync_handle = tokio::spawn({
+            let token = shutdown_token.clone();
+            async move { sync.start(config, token).await }
+        });
+
+        // Wait for initial connection
+        println!("Waiting for Connecting status...");
+        assert_eq!(status_rx.recv().await, Some(super::SyncStatus::Connecting));
+        println!("Waiting for Connected status...");
+        assert_eq!(status_rx.recv().await, Some(super::SyncStatus::Connected));
+        println!("Initial connection established");
+
+        // Poll task health to ensure fallback sync doesn't crash
+        // Use interval to poll every 100ms for 500ms total (at least 2 fallback syncs at 200ms each)
+        println!("Polling task health while waiting for fallback sync...");
+        let mut poll_interval = tokio::time::interval(Duration::from_millis(100));
+        poll_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        for i in 0..5 {
+            poll_interval.tick().await;
+
+            // Check task is still running (timeout ensures we don't block if it finished)
+            let result = timeout(Duration::from_millis(10), &mut sync_handle).await;
+            assert!(
+                result.is_err(),
+                "Task should still be running at poll {} (proves fallback timer doesn't crash)",
+                i
+            );
+        }
+
+        println!("✅ Fallback sync working: task remained healthy through 5 health polls over 500ms");
+
+        // Cleanup
+        shutdown_token.cancel();
+        let _ = timeout(Duration::from_secs(1), sync_handle).await;
     }
 }

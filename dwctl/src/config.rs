@@ -1117,18 +1117,18 @@ impl Default for PoolMetricsSamplerConfig {
 pub struct OnwardsSyncConfig {
     /// Enable onwards config sync service (default: true)
     pub enabled: bool,
-    /// Fallback sync interval in seconds (default: 10)
+    /// Fallback sync interval in milliseconds (default: 10000ms = 10 seconds)
     ///
     /// Even when LISTEN/NOTIFY is working, this provides periodic full syncs to guarantee
     /// eventual consistency. Prevents issues from dropped notifications or connection problems.
-    pub fallback_interval_seconds: u64,
+    pub fallback_interval_milliseconds: u64,
 }
 
 impl Default for OnwardsSyncConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            fallback_interval_seconds: 10,
+            fallback_interval_milliseconds: 10000, // 10 seconds
         }
     }
 }
@@ -1226,15 +1226,15 @@ pub struct AnalyticsConfig {
     /// Actual delay is: base_delay * 2^attempt (e.g., 100ms, 200ms, 400ms for base=100).
     /// Default: 100
     pub retry_base_delay_ms: u64,
-    /// Minimum interval in seconds between balance depletion notifications globally.
+    /// Minimum interval in milliseconds between balance depletion notifications globally.
     ///
     /// When any user's balance goes negative, we send a pg_notify to invalidate their API keys.
     /// This rate limit prevents notification storms when users continue making requests
     /// with negative balances. At most one notification is sent per interval, even if
     /// multiple users become depleted during that time.
     ///
-    /// Default: 5 seconds
-    pub balance_notification_interval_seconds: u64,
+    /// Default: 5000ms (5 seconds)
+    pub balance_notification_interval_milliseconds: u64,
 }
 
 impl Default for AnalyticsConfig {
@@ -1243,7 +1243,7 @@ impl Default for AnalyticsConfig {
             batch_size: 100,
             max_retries: 3,
             retry_base_delay_ms: 100,
-            balance_notification_interval_seconds: 5,
+            balance_notification_interval_milliseconds: 5000,
         }
     }
 }

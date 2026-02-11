@@ -156,7 +156,7 @@ where
         let batch_size = config.analytics.batch_size;
         let max_retries = config.analytics.max_retries;
         let retry_base_delay = std::time::Duration::from_millis(config.analytics.retry_base_delay_ms);
-        let onwards_sync_notification_interval = Duration::from_secs(config.analytics.balance_notification_interval_seconds);
+        let onwards_sync_notification_interval = Duration::from_millis(config.analytics.balance_notification_interval_milliseconds);
 
         let batcher = Self {
             pool,
@@ -1838,8 +1838,9 @@ mod integration_tests {
         listener.listen("auth_config_changed").await.expect("Failed to listen");
 
         // Drain any notifications from setup (user went from 0 to positive during setup)
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        while timeout(Duration::from_millis(10), listener.try_recv()).await.is_ok() {}
+        while timeout(Duration::from_millis(10), listener.try_recv()).await.is_ok() {
+            // Keep draining while notifications available
+        }
 
         // Create record that will deplete balance: cost = (1000 * 0.00001) + (500 * 0.00003) = $0.025
         let record = create_raw_record("gpt-4-depletion-test", Some(api_key), 1000, 500);
@@ -1872,5 +1873,87 @@ mod integration_tests {
             "Balance should be negative after depletion, got: {}",
             final_balance
         );
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_batcher_rate_limits_balance_notifications(pool: PgPool) {
+        use sqlx::postgres::PgListener;
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        // Setup: Create model with tariff
+        let model_id = create_test_model(&pool, "gpt-4-rate-limit-test").await;
+        let input_price = Decimal::from_str("0.00001").unwrap();
+        let output_price = Decimal::from_str("0.00003").unwrap();
+        setup_tariff(&pool, model_id, input_price, output_price, ApiKeyPurpose::Realtime).await;
+
+        // Setup: Create 3 users with small balances that will all be depleted
+        let initial_balance = Decimal::from_str("0.01").unwrap();
+        let user1_id = setup_user_with_balance(&pool, initial_balance).await;
+        let user2_id = setup_user_with_balance(&pool, initial_balance).await;
+        let user3_id = setup_user_with_balance(&pool, initial_balance).await;
+
+        let api_key1 = create_api_key_for_user(&pool, user1_id, ApiKeyPurpose::Realtime).await;
+        let api_key2 = create_api_key_for_user(&pool, user2_id, ApiKeyPurpose::Realtime).await;
+        let api_key3 = create_api_key_for_user(&pool, user3_id, ApiKeyPurpose::Realtime).await;
+
+        // Set up listener BEFORE running batcher
+        let mut listener = PgListener::connect_with(&pool).await.expect("Failed to create listener");
+        listener.listen("auth_config_changed").await.expect("Failed to listen");
+
+        // Drain any notifications from setup (poll with timeout, no sleep needed)
+        while timeout(Duration::from_millis(10), listener.try_recv()).await.is_ok() {
+            // Keep draining while notifications available
+        }
+
+        // Create 3 records that will all deplete balances (cost = $0.025 each)
+        let record1 = create_raw_record("gpt-4-rate-limit-test", Some(api_key1), 1000, 500);
+        let record2 = create_raw_record("gpt-4-rate-limit-test", Some(api_key2), 1000, 500);
+        let record3 = create_raw_record("gpt-4-rate-limit-test", Some(api_key3), 1000, 500);
+
+        // Create custom config with 100ms rate limiting interval for fast testing
+        let mut config = crate::test::utils::create_test_config();
+        config.analytics.balance_notification_interval_milliseconds = 100;
+
+        // Run batcher with all 3 records - should trigger 3 depletions but only 1 notification
+        // due to rate limiting (interval is 100ms)
+        let (batcher, sender) = AnalyticsBatcher::<crate::metrics::GenAiMetrics>::new(pool.clone(), config, None);
+        for record in [record1, record2, record3] {
+            sender.send(record).await.unwrap();
+        }
+        drop(sender);
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        batcher.run(shutdown).await;
+
+        // Should receive ONLY ONE notification despite 3 balance depletions
+        let first_notification = timeout(Duration::from_secs(2), listener.recv())
+            .await
+            .expect("Timeout waiting for first balance depletion notification")
+            .expect("Failed to receive notification");
+
+        assert_eq!(first_notification.channel(), "auth_config_changed");
+        println!("Received first notification: {}", first_notification.payload());
+
+        // Try to receive a second notification - should timeout because of rate limiting
+        let second_notification = timeout(Duration::from_millis(50), listener.recv()).await;
+        assert!(
+            second_notification.is_err(),
+            "Should NOT receive second notification due to rate limiting (interval is 100ms, we only waited 50ms)"
+        );
+
+        // Verify all 3 users have negative balances
+        let mut conn = pool.acquire().await.unwrap();
+        let mut credits = Credits::new(&mut conn);
+
+        let balance1 = credits.get_user_balance(user1_id).await.unwrap();
+        let balance2 = credits.get_user_balance(user2_id).await.unwrap();
+        let balance3 = credits.get_user_balance(user3_id).await.unwrap();
+
+        assert!(balance1 < Decimal::ZERO, "User 1 balance should be negative, got: {}", balance1);
+        assert!(balance2 < Decimal::ZERO, "User 2 balance should be negative, got: {}", balance2);
+        assert!(balance3 < Decimal::ZERO, "User 3 balance should be negative, got: {}", balance3);
+
+        println!("✅ Rate limiting working: 3 depletions → 1 notification");
     }
 }

@@ -48,12 +48,12 @@ Controls how frequently the batcher can trigger onwards sync for balance depleti
 
 ```yaml
 analytics:
-  balance_notification_interval_seconds: 5
+  balance_notification_interval_milliseconds: 5000
 ```
 
-Environment variable: `DWCTL_ANALYTICS__BALANCE_NOTIFICATION_INTERVAL_SECONDS=5`
+Environment variable: `DWCTL_ANALYTICS__BALANCE_NOTIFICATION_INTERVAL_MILLISECONDS=5000`
 
-**How it works**: When processing a batch of credit transactions, if any users have balance ≤ 0, the batcher checks if we've notified in the last N seconds. If not, it sends ONE notification that triggers a full cache reload.
+**How it works**: When processing a batch of credit transactions, if any users have balance ≤ 0, the batcher checks if we've notified in the last N milliseconds. If not, it sends ONE notification that triggers a full cache reload.
 
 ### Fallback Interval
 
@@ -63,16 +63,16 @@ Controls how often the fallback timer syncs:
 background_services:
   onwards_sync:
     enabled: true
-    fallback_interval_seconds: 10
+    fallback_interval_milliseconds: 10000
 ```
 
-Environment variable: `DWCTL_BACKGROUND_SERVICES__ONWARDS_SYNC__FALLBACK_INTERVAL_SECONDS=10`
+Environment variable: `DWCTL_BACKGROUND_SERVICES__ONWARDS_SYNC__FALLBACK_INTERVAL_MILLISECONDS=10000`
 
 ## Multi-Instance Behavior
 
 In multi-instance deployments:
 
-- **Rate limiting**: Each instance rate-limits independently. If 3 instances each send a notification at the rate limit (5s), the global rate is ~1.67s. This is acceptable since the cache reload is idempotent.
+- **Rate limiting**: Each instance rate-limits independently. If 3 instances each send a notification at the rate limit (5000ms), the global rate is ~1.67s. This is acceptable since the cache reload is idempotent.
 - **Fallback timer**: Each instance syncs independently every 10s. No leader election needed.
 
 ## Monitoring
@@ -164,16 +164,16 @@ docker logs dwctl | grep "fallback sync"
 
 If `dwctl_cache_sync_total` is very high:
 
-1. Check notification rate limit: `analytics.balance_notification_interval_seconds`
-2. Check fallback interval: `background_services.onwards_sync.fallback_interval_seconds`
+1. Check notification rate limit: `analytics.balance_notification_interval_milliseconds`
+2. Check fallback interval: `background_services.onwards_sync.fallback_interval_milliseconds`
 3. Check if many users have balance ≤ 0 (notifications will trigger frequently but be rate-limited)
 
 ### Users with depleted balance can still make requests
 
-This is expected for up to N seconds (rate limit + fallback interval). The sync happens eventually:
+This is expected for up to N milliseconds (rate limit + fallback interval). The sync happens eventually:
 
-- Batcher triggers notification (rate-limited to 5s)
-- Fallback syncs every 10s regardless
+- Batcher triggers notification (rate-limited to 5000ms = 5s)
+- Fallback syncs every 10000ms = 10s regardless
 - Worst case: user makes requests for ~10s before cache updates
 
 ## Design Rationale
