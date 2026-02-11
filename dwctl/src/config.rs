@@ -1082,6 +1082,11 @@ pub struct NotificationsConfig {
     /// How often to poll for completed batches (default: 30s)
     #[serde(with = "humantime_serde")]
     pub poll_interval: Duration,
+    /// Base URL for dashboard links in notification emails
+    pub dashboard_url: String,
+    /// Webhook delivery configuration for Standard Webhooks-compliant
+    /// notifications for batch terminal state events (completed, failed, cancelled).
+    pub webhooks: WebhookConfig,
 }
 
 impl Default for NotificationsConfig {
@@ -1089,6 +1094,8 @@ impl Default for NotificationsConfig {
         Self {
             enabled: true,
             poll_interval: Duration::from_secs(30),
+            dashboard_url: "http://localhost:3001".to_string(),
+            webhooks: WebhookConfig::default(),
         }
     }
 }
@@ -1109,7 +1116,7 @@ pub struct BackgroundServicesConfig {
     pub leader_election: LeaderElectionConfig,
     /// Configuration for database pool metrics sampling
     pub pool_metrics: PoolMetricsSamplerConfig,
-    /// Configuration for batch completion email notifications
+    /// Configuration for batch completion notifications (email + webhooks)
     pub notifications: NotificationsConfig,
 }
 
@@ -1176,6 +1183,34 @@ pub struct ProbeSchedulerConfig {
 impl Default for ProbeSchedulerConfig {
     fn default() -> Self {
         Self { enabled: true }
+    }
+}
+
+/// Webhook delivery service configuration.
+///
+/// The webhook service delivers Standard Webhooks-compliant notifications
+/// for batch terminal state events (completed, failed, cancelled).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WebhookConfig {
+    /// Enable webhook delivery service (default: true)
+    pub enabled: bool,
+    /// HTTP timeout for webhook deliveries in seconds (default: 30)
+    pub timeout_secs: u64,
+    /// Maximum retry attempts before marking delivery as exhausted (default: 7)
+    pub max_retries: i32,
+    /// Number of consecutive failures before disabling a webhook (default: 10)
+    pub circuit_breaker_threshold: i32,
+}
+
+impl Default for WebhookConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            timeout_secs: 30,
+            max_retries: 7,
+            circuit_breaker_threshold: 10,
+        }
     }
 }
 

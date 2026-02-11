@@ -154,6 +154,7 @@ mod static_assets;
 mod sync;
 pub mod telemetry;
 mod types;
+pub mod webhooks;
 
 // Test modules
 #[cfg(test)]
@@ -985,6 +986,26 @@ pub async fn build_router(
         .route(
             "/users/{user_id}/api-keys/{id}",
             delete(api::handlers::api_keys::delete_user_api_key),
+        )
+        // Webhooks as user sub-resources
+        .route("/users/{user_id}/webhooks", get(api::handlers::webhooks::list_webhooks))
+        .route("/users/{user_id}/webhooks", post(api::handlers::webhooks::create_webhook))
+        .route("/users/{user_id}/webhooks/{webhook_id}", get(api::handlers::webhooks::get_webhook))
+        .route(
+            "/users/{user_id}/webhooks/{webhook_id}",
+            patch(api::handlers::webhooks::update_webhook),
+        )
+        .route(
+            "/users/{user_id}/webhooks/{webhook_id}",
+            delete(api::handlers::webhooks::delete_webhook),
+        )
+        .route(
+            "/users/{user_id}/webhooks/{webhook_id}/rotate-secret",
+            post(api::handlers::webhooks::rotate_secret),
+        )
+        .route(
+            "/users/{user_id}/webhooks/{webhook_id}/test",
+            post(api::handlers::webhooks::test_webhook),
         )
         // User-group relationships
         .route("/users/{user_id}/groups", get(api::handlers::groups::get_user_groups))

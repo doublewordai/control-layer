@@ -1,13 +1,7 @@
 //! Email service for sending password reset emails and notifications
 
+use crate::notifications::{BatchNotificationInfo, BatchOutcome};
 use crate::{config::Config, errors::Error};
-/// Outcome of a completed batch for notification purposes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BatchOutcome {
-    Completed,
-    PartiallyCompleted,
-    Failed,
-}
 use lettre::{
     AsyncFileTransport, AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor,
     message::{Mailbox, header::ContentType},
@@ -15,21 +9,6 @@ use lettre::{
 };
 use minijinja::{Environment, context};
 use std::path::Path;
-
-pub struct BatchCompletionInfo {
-    pub batch_id: String,
-    pub endpoint: String,
-    pub model: String,
-    pub outcome: BatchOutcome,
-    pub created_at: chrono::DateTime<chrono::Utc>,
-    pub finished_at: Option<chrono::DateTime<chrono::Utc>>,
-    pub total_requests: i64,
-    pub completed_requests: i64,
-    pub failed_requests: i64,
-    pub completion_window: String,
-    pub filename: Option<String>,
-    pub description: Option<String>,
-}
 
 pub struct EmailService {
     transport: EmailTransport,
@@ -162,7 +141,7 @@ impl EmailService {
         &self,
         to_email: &str,
         to_name: Option<&str>,
-        info: &BatchCompletionInfo,
+        info: &BatchNotificationInfo,
         first_batch: bool,
     ) -> Result<(), Error> {
         let status_text = match info.outcome {
@@ -187,7 +166,7 @@ impl EmailService {
     pub fn render_batch_completion_body(
         &self,
         to_name: String,
-        info: &BatchCompletionInfo,
+        info: &BatchNotificationInfo,
         first_batch: bool,
     ) -> Result<String, minijinja::Error> {
         let mut env = Environment::new();
@@ -268,6 +247,35 @@ mod tests {
     use super::*;
     use crate::test::utils::create_test_config;
 
+    fn test_info(
+        outcome: BatchOutcome,
+        total: i64,
+        completed: i64,
+        failed: i64,
+        filename: Option<&str>,
+        description: Option<&str>,
+    ) -> BatchNotificationInfo {
+        BatchNotificationInfo {
+            batch_id: "abcd1234-5678-90ab-cdef-1234567890ab".to_string(),
+            batch_uuid: uuid::Uuid::nil(),
+            user_id: uuid::Uuid::nil(),
+            endpoint: "/v1/chat/completions".to_string(),
+            model: "gpt-4o".to_string(),
+            outcome,
+            created_at: chrono::Utc::now(),
+            finished_at: Some(chrono::Utc::now()),
+            total_requests: total,
+            completed_requests: completed,
+            failed_requests: failed,
+            cancelled_requests: 0,
+            completion_window: "24h".to_string(),
+            filename: filename.map(String::from),
+            description: description.map(String::from),
+            output_file_id: None,
+            error_file_id: None,
+        }
+    }
+
     #[tokio::test]
     async fn test_email_service_creation() {
         let config = create_test_config();
@@ -307,21 +315,7 @@ mod tests {
         let config = create_test_config();
         let email_service = EmailService::new(&config).unwrap();
 
-        let info = BatchCompletionInfo {
-            batch_id: "abcd1234-5678-90ab-cdef-1234567890ab".to_string(),
-            endpoint: "/v1/chat/completions".to_string(),
-            model: "gpt-4o".to_string(),
-            outcome: BatchOutcome::Completed,
-            created_at: chrono::Utc::now(),
-            finished_at: Some(chrono::Utc::now()),
-            total_requests: 50,
-            completed_requests: 50,
-            failed_requests: 0,
-
-            completion_window: "24h".to_string(),
-            filename: Some("first-run.jsonl".to_string()),
-            description: None,
-        };
+        let info = test_info(BatchOutcome::Completed, 50, 50, 0, Some("first-run.jsonl"), None);
 
         let body = email_service.render_batch_completion_body("Bob".into(), &info, true).unwrap();
 
@@ -338,21 +332,14 @@ mod tests {
         let config = create_test_config();
         let email_service = EmailService::new(&config).unwrap();
 
-        let info = BatchCompletionInfo {
-            batch_id: "abcd1234-5678-90ab-cdef-1234567890ab".to_string(),
-            endpoint: "/v1/chat/completions".to_string(),
-            model: "gpt-4o".to_string(),
-            outcome: BatchOutcome::Completed,
-            created_at: chrono::Utc::now(),
-            finished_at: Some(chrono::Utc::now()),
-            total_requests: 100,
-            completed_requests: 100,
-            failed_requests: 0,
-
-            completion_window: "24h".to_string(),
-            filename: Some("input.jsonl".to_string()),
-            description: Some("Weekly report generation".to_string()),
-        };
+        let info = test_info(
+            BatchOutcome::Completed,
+            100,
+            100,
+            0,
+            Some("input.jsonl"),
+            Some("Weekly report generation"),
+        );
 
         let body = email_service.render_batch_completion_body("Alice".into(), &info, false).unwrap();
 
@@ -374,21 +361,7 @@ mod tests {
         let config = create_test_config();
         let email_service = EmailService::new(&config).unwrap();
 
-        let info = BatchCompletionInfo {
-            batch_id: "abcd1234-5678-90ab-cdef-1234567890ab".to_string(),
-            endpoint: "/v1/chat/completions".to_string(),
-            model: "gpt-4o".to_string(),
-            outcome: BatchOutcome::PartiallyCompleted,
-            created_at: chrono::Utc::now(),
-            finished_at: Some(chrono::Utc::now()),
-            total_requests: 100,
-            completed_requests: 98,
-            failed_requests: 2,
-
-            completion_window: "24h".to_string(),
-            filename: Some("input.jsonl".to_string()),
-            description: None,
-        };
+        let info = test_info(BatchOutcome::PartiallyCompleted, 100, 98, 2, Some("input.jsonl"), None);
 
         let body = email_service.render_batch_completion_body("Alice".into(), &info, false).unwrap();
 
@@ -440,21 +413,7 @@ mod tests {
         let config = create_test_config();
         let email_service = EmailService::new(&config).unwrap();
 
-        let info = BatchCompletionInfo {
-            batch_id: "abcd1234-5678-90ab-cdef-1234567890ab".to_string(),
-            endpoint: "/v1/chat/completions".to_string(),
-            model: "gpt-4o".to_string(),
-            outcome: BatchOutcome::Failed,
-            created_at: chrono::Utc::now(),
-            finished_at: Some(chrono::Utc::now()),
-            total_requests: 100,
-            completed_requests: 0,
-            failed_requests: 100,
-
-            completion_window: "24h".to_string(),
-            filename: None,
-            description: None,
-        };
+        let info = test_info(BatchOutcome::Failed, 100, 0, 100, None, None);
 
         let body = email_service.render_batch_completion_body("Alice".into(), &info, false).unwrap();
 
