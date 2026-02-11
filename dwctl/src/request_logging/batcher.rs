@@ -934,7 +934,8 @@ where
 
         let payload = format!("credits_transactions:{}", epoch_micros);
 
-        sqlx::query(&format!("SELECT pg_notify('{}', $1)", ONWARDS_CONFIG_CHANGED_CHANNEL))
+        sqlx::query("SELECT pg_notify($1, $2)")
+            .bind(ONWARDS_CONFIG_CHANGED_CHANNEL)
             .bind(&payload)
             .execute(conn)
             .await?;
