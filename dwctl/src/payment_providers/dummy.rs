@@ -205,7 +205,6 @@ mod tests {
     fn test_dummy_provider_from_config() {
         let config = crate::config::DummyConfig {
             amount: Decimal::new(100, 0),
-            host_url: None,
         };
         let provider = DummyProvider::from(config);
         assert_eq!(provider.config.amount, Decimal::new(100, 0));
@@ -215,7 +214,6 @@ mod tests {
     async fn test_dummy_full_payment_flow(pool: PgPool) {
         let config = crate::config::DummyConfig {
             amount: Decimal::new(5000, 2), // $50.00
-            host_url: None,
         };
         let provider = DummyProvider::from(config);
         let user = create_test_user(&pool).await;
@@ -278,7 +276,6 @@ mod tests {
     async fn test_dummy_idempotency(pool: PgPool) {
         let config = crate::config::DummyConfig {
             amount: Decimal::new(100, 0),
-            host_url: None,
         };
         let provider = DummyProvider::from(config);
         let user = create_test_user(&pool).await;
@@ -326,7 +323,6 @@ mod tests {
     fn test_dummy_webhook_not_supported() {
         let config = crate::config::DummyConfig {
             amount: Decimal::new(100, 0),
-            host_url: None,
         };
         let provider = DummyProvider::from(config);
 

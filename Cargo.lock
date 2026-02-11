@@ -1446,7 +1446,7 @@ checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
 name = "dwctl"
-version = "5.0.3"
+version = "6.1.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -1481,6 +1481,7 @@ dependencies = [
  "metrics-exporter-prometheus",
  "mime_guess",
  "moka",
+ "multer",
  "once_cell",
  "onwards",
  "opentelemetry",
@@ -1810,9 +1811,9 @@ checksum = "e6d5a32815ae3f33302d95fdcb2ce17862f8c65363dcfd29360480ba1001fc9c"
 
 [[package]]
 name = "fusillade"
-version = "4.1.0"
+version = "5.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9e111279dcd7eda206cb463b984cc7e8f0993de9dfd101af7127fb27809b482a"
+checksum = "026da357a01dc648e87cf13284950d70f7bfd424fb2e3da6a9da61f6460fbcdc"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3279,7 +3280,6 @@ dependencies = [
  "prost",
  "reqwest 0.12.28",
  "thiserror 2.0.18",
- "tracing",
 ]
 
 [[package]]
@@ -3314,9 +3314,9 @@ dependencies = [
 
 [[package]]
 name = "outlet"
-version = "0.5.1"
+version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "95108e61364885ef15285280920cb7d15651597d3b824b726c43c8aef7133172"
+checksum = "5d484da44ecf98edcf2664301db1a2109baf78f108727997f590b5485bad22d7"
 dependencies = [
  "anyhow",
  "axum",
@@ -4108,7 +4108,6 @@ dependencies = [
  "base64",
  "bytes",
  "encoding_rs",
- "futures-channel",
  "futures-core",
  "futures-util",
  "h2",

@@ -117,6 +117,7 @@ struct DeployedModel {
     pub burst_size: Option<i32>,
     pub capacity: Option<i32>,
     pub batch_capacity: Option<i32>,
+    pub throughput: Option<f32>,
     // Provider pricing (flexible)
     pub downstream_pricing_mode: Option<String>,
     pub downstream_input_price_per_token: Option<Decimal>,
@@ -171,6 +172,7 @@ impl From<(Option<ModelType>, DeployedModel)> for DeploymentDBResponse {
             burst_size: m.burst_size,
             capacity: m.capacity,
             batch_capacity: m.batch_capacity,
+            throughput: m.throughput,
             provider_pricing,
             // Composite model fields
             is_composite: m.is_composite,
@@ -222,13 +224,13 @@ impl<'c> Repository for Deployments<'c> {
             r#"
             INSERT INTO deployed_models (
                 model_name, alias, description, type, capabilities, created_by, hosted_on, created_at, updated_at,
-                requests_per_second, burst_size, capacity, batch_capacity,
+                requests_per_second, burst_size, capacity, batch_capacity, throughput,
                 downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token,
                 downstream_hourly_rate, downstream_input_token_cost_ratio,
                 is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status,
                 sanitize_responses
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)
             RETURNING *
             "#,
             request.model_name.trim(),
@@ -244,6 +246,7 @@ impl<'c> Repository for Deployments<'c> {
             request.burst_size,
             request.capacity,
             request.batch_capacity,
+            request.throughput,
             pricing_fields.mode,
             pricing_fields.input_price_per_token,
             pricing_fields.output_price_per_token,
@@ -273,7 +276,7 @@ impl<'c> Repository for Deployments<'c> {
     async fn get_by_id(&mut self, id: Self::Id) -> Result<Option<Self::Response>> {
         let model = sqlx::query_as!(
             DeployedModel,
-            "SELECT id, model_name, alias, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, sanitize_responses FROM deployed_models WHERE id = $1",
+            "SELECT id, model_name, alias, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, sanitize_responses FROM deployed_models WHERE id = $1",
             id
         )
             .fetch_optional(&mut *self.db)
@@ -298,7 +301,7 @@ impl<'c> Repository for Deployments<'c> {
 
         let deployments = sqlx::query_as!(
             DeployedModel,
-            "SELECT id, model_name, alias, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, sanitize_responses FROM deployed_models WHERE id = ANY($1)",
+            "SELECT id, model_name, alias, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, sanitize_responses FROM deployed_models WHERE id = ANY($1)",
             ids.as_slice()
         )
             .fetch_all(&mut *self.db)
@@ -419,6 +422,12 @@ impl<'c> Repository for Deployments<'c> {
                 ELSE batch_capacity
             END,
 
+            -- Three-state update for throughput
+            throughput = CASE
+                WHEN $37 THEN $38
+                ELSE throughput
+            END,
+
             -- Individual field updates for provider/downstream pricing
             downstream_pricing_mode = CASE
                 WHEN $22 THEN $23
@@ -491,11 +500,13 @@ impl<'c> Repository for Deployments<'c> {
             pricing_params.should_update_ratio,  // $30
             pricing_params.ratio,                // $31
             // For composite model fields
-            lb_strategy_str,                                           // $32
-            request.fallback_enabled,                                  // $33
-            request.fallback_on_rate_limit,                            // $34
-            request.fallback_on_status.as_ref().map(|s| s.as_slice()), // $35
-            request.sanitize_responses                                 // $36
+            lb_strategy_str,                                              // $32
+            request.fallback_enabled,                                     // $33
+            request.fallback_on_rate_limit,                               // $34
+            request.fallback_on_status.as_ref().map(|s| s.as_slice()),    // $35
+            request.sanitize_responses,                                   // $36
+            request.throughput.is_some() as bool,                         // $37
+            request.throughput.as_ref().and_then(|inner| inner.as_ref()), // $38
         )
         .fetch_one(&mut *self.db)
         .await?;
@@ -1000,6 +1011,30 @@ impl<'c> Deployments<'c> {
             endpoint_id: r.endpoint_id,
             endpoint_name: r.endpoint_name,
         }))
+    }
+
+    /// Get throughput values for the given model aliases
+    /// Returns a map of alias -> throughput for models that have throughput configured
+    #[instrument(skip(self, aliases), fields(count = aliases.len()), err)]
+    pub async fn get_throughputs_by_aliases(&mut self, aliases: &[String]) -> Result<std::collections::HashMap<String, f32>> {
+        if aliases.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+
+        let rows = sqlx::query!(
+            r#"
+            SELECT alias, throughput
+            FROM deployed_models
+            WHERE alias = ANY($1)
+              AND deleted = false
+              AND throughput IS NOT NULL
+            "#,
+            aliases
+        )
+        .fetch_all(&mut *self.db)
+        .await?;
+
+        Ok(rows.into_iter().filter_map(|r| r.throughput.map(|t| (r.alias, t))).collect())
     }
 }
 

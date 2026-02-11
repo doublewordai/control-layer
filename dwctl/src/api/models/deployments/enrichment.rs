@@ -429,6 +429,7 @@ mod tests {
             burst_size: Some(200),
             capacity: None,
             batch_capacity: None,
+            throughput: None,
             groups: None,
             metrics: None,
             status: None,
