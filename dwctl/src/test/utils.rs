@@ -125,12 +125,6 @@ pub fn create_test_config() -> crate::config::Config {
         auth: crate::config::AuthConfig {
             native: NativeAuthConfig {
                 enabled: false,
-                email: crate::config::EmailConfig {
-                    transport: crate::config::EmailTransportConfig::File {
-                        path: temp_dir.to_string_lossy().to_string(),
-                    },
-                    ..Default::default()
-                },
                 password: PasswordConfig {
                     min_length: 8,
                     max_length: 64,
@@ -170,6 +164,12 @@ pub fn create_test_config() -> crate::config::Config {
                 ..Default::default()
             },
             leader_election: LeaderElectionConfig { enabled: false },
+            ..Default::default()
+        },
+        email: crate::config::EmailConfig {
+            transport: crate::config::EmailTransportConfig::File {
+                path: temp_dir.to_string_lossy().to_string(),
+            },
             ..Default::default()
         },
         sample_files: crate::sample_files::SampleFilesConfig::default(),

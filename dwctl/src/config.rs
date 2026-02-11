@@ -166,6 +166,8 @@ pub struct Config {
     pub sample_files: SampleFilesConfig,
     /// Resource limits for protecting system capacity
     pub limits: LimitsConfig,
+    /// Email configuration for password resets and notifications
+    pub email: EmailConfig,
 }
 
 /// Individual pool configuration with all SQLx parameters.
@@ -582,8 +584,9 @@ pub struct NativeAuthConfig {
     pub password: PasswordConfig,
     /// Session cookie configuration
     pub session: SessionConfig,
-    /// Email configuration for password resets
-    pub email: EmailConfig,
+    /// How long password reset tokens are valid
+    #[serde(with = "humantime_serde")]
+    pub password_reset_token_duration: Duration,
 }
 
 /// Proxy header-based authentication configuration.
@@ -702,8 +705,6 @@ pub struct EmailConfig {
     pub from_email: String,
     /// Sender display name
     pub from_name: String,
-    /// Password reset email configuration
-    pub password_reset: PasswordResetEmailConfig,
     /// Who to set the reply to field from
     pub reply_to: Option<String>,
 }
@@ -730,15 +731,6 @@ pub enum EmailTransportConfig {
         /// Directory path where email files will be written
         path: String,
     },
-}
-
-/// Password reset email configuration.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct PasswordResetEmailConfig {
-    /// How long reset tokens are valid
-    #[serde(with = "humantime_serde")]
-    pub token_expiry: Duration,
 }
 
 /// File upload/download configuration for batch processing.
@@ -1312,6 +1304,7 @@ impl Default for Config {
             credits: CreditsConfig::default(),
             sample_files: SampleFilesConfig::default(),
             limits: LimitsConfig::default(),
+            email: EmailConfig::default(),
         }
     }
 }
@@ -1335,7 +1328,7 @@ impl Default for NativeAuthConfig {
             allow_registration: false,
             password: PasswordConfig::default(),
             session: SessionConfig::default(),
-            email: EmailConfig::default(),
+            password_reset_token_duration: Duration::from_secs(30 * 60), // 30 minutes
         }
     }
 }
@@ -1407,7 +1400,6 @@ impl Default for EmailConfig {
             transport: EmailTransportConfig::default(),
             from_email: "noreply@example.com".to_string(),
             from_name: "Control Layer".to_string(),
-            password_reset: PasswordResetEmailConfig::default(),
             reply_to: None,
         }
     }
@@ -1417,14 +1409,6 @@ impl Default for EmailTransportConfig {
     fn default() -> Self {
         Self::File {
             path: "./emails".to_string(),
-        }
-    }
-}
-
-impl Default for PasswordResetEmailConfig {
-    fn default() -> Self {
-        Self {
-            token_expiry: Duration::from_secs(30 * 60), // 30 minutes
         }
     }
 }

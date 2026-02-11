@@ -149,22 +149,7 @@ auth:
       cookie_name: "dwctl_session"
       cookie_secure: true
       cookie_same_site: "strict"
-    # Email configuration for password resets and notifications
-    email:
-      # Email transport - either 'file' (for development) or 'smtp' (for production)
-      type: file
-      path: "./emails" # Directory for file-based email (when type=file)
-      # For SMTP (production), use:
-      # type: smtp
-      # host: "smtp.example.com"
-      # port: 587
-      # username: "noreply@example.com"
-      # password: "your-smtp-password"
-      # use_tls: true
-      from_email: "noreply@example.com"
-      from_name: "Control Layer"
-      password_reset:
-        token_expiry: "30m" # How long reset tokens are valid
+    password_reset_token_duration: "30m"
 
   # Proxy header authentication
   # Accepts user identity from HTTP headers set by an upstream authentication proxy
@@ -214,6 +199,18 @@ auth:
       max_age: 3600 # Cache preflight requests for 1 hour
       # exposed_headers: []  # Optional: Custom headers to expose to browser (e.g., ["X-Incomplete", "X-Last-Line"])
 
+# Email configuration for password resets and notifications
+email:
+  # Email transport - either 'file' (for development) or 'smtp' (for production)
+  type: file
+  path: "./emails" # Directory for file-based email (when type=file)
+  # For SMTP (production), use:
+  # type: smtp
+  # host: "smtp.example.com"
+  # port: 587
+  # username: "noreply@example.com"
+  # password: "your-smtp-password"
+  # use_tls: true
 # Credits configuration
 credits:
   # Initial credits given to standard users when they are created
