@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT\n                u.id,\n                u.username,\n                u.email,\n                u.display_name,\n                u.avatar_url,\n                u.auth_source,\n                u.created_at,\n                u.updated_at,\n                u.last_login,\n                u.is_admin,\n                u.password_hash,\n                u.external_user_id,\n                u.payment_provider_id,\n                u.is_deleted,\n                u.is_internal,\n                ARRAY_AGG(ur.role) FILTER (WHERE ur.role IS NOT NULL) as \"roles: Vec<Role>\"\n            FROM users u\n            LEFT JOIN user_roles ur ON ur.user_id = u.id\n            WHERE u.id = $1 AND u.id != '00000000-0000-0000-0000-000000000000' AND u.is_deleted = false\n            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id, u.is_deleted, u.is_internal\n            ",
+  "query": "\n            SELECT\n                u.id,\n                u.username,\n                u.email,\n                u.display_name,\n                u.avatar_url,\n                u.auth_source,\n                u.created_at,\n                u.updated_at,\n                u.last_login,\n                u.is_admin,\n                u.password_hash,\n                u.external_user_id,\n                u.payment_provider_id,\n                u.is_deleted,\n                u.is_internal,\n                u.batch_notifications_enabled,\n                u.first_batch_email_sent,\n                ARRAY_AGG(ur.role) FILTER (WHERE ur.role IS NOT NULL) as \"roles: Vec<Role>\"\n            FROM users u\n            LEFT JOIN user_roles ur ON ur.user_id = u.id\n            WHERE u.id = ANY($1) AND u.id != '00000000-0000-0000-0000-000000000000' AND u.is_deleted = false\n            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id, u.is_deleted, u.is_internal, u.batch_notifications_enabled, u.first_batch_email_sent\n            ",
   "describe": {
     "columns": [
       {
@@ -80,6 +80,16 @@
       },
       {
         "ordinal": 15,
+        "name": "batch_notifications_enabled",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 16,
+        "name": "first_batch_email_sent",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 17,
         "name": "roles: Vec<Role>",
         "type_info": {
           "Custom": {
@@ -106,7 +116,7 @@
     ],
     "parameters": {
       "Left": [
-        "Uuid"
+        "UuidArray"
       ]
     },
     "nullable": [
@@ -125,8 +135,10 @@
       true,
       false,
       false,
+      false,
+      false,
       null
     ]
   },
-  "hash": "8957c6a40ee6899cdb23ecb36a8f1a8d66eb4097c0fe326b9ae8b192342e0dd2"
+  "hash": "e9d8fd7daf365550cb6005af4ff2f7a60dc3df543a2cfcf4865a62fbe1a5fa39"
 }

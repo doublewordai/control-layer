@@ -144,6 +144,7 @@ pub mod errors;
 mod leader_election;
 pub mod limits;
 mod metrics;
+mod notifications;
 mod openapi;
 mod payment_providers;
 mod probes;
@@ -1550,6 +1551,25 @@ async fn setup_background_services(
                 info!("Skipping leader election - running as leader with probe scheduler (fusillade daemon disabled)");
             }
         }
+
+        // Start batch notification poller if enabled
+        if config.background_services.notifications.enabled {
+            let daemon_config = config.clone();
+            let daemon_request_manager = request_manager.clone();
+            let daemon_pool = pool.clone();
+            let daemon_shutdown = shutdown_token.clone();
+            background_tasks.spawn("batch-notifications", async move {
+                notifications::run_notification_poller(
+                    daemon_config.background_services.notifications.clone(),
+                    daemon_config,
+                    daemon_request_manager,
+                    daemon_pool,
+                    daemon_shutdown,
+                )
+                .await;
+                Ok(())
+            });
+        }
     } else {
         // Normal leader election
         is_leader = false;
@@ -1610,7 +1630,7 @@ async fn setup_background_services(
                 leader_election_flag,
                 LEADER_LOCK_ID,
                 leader_election_shutdown,
-                move |_pool, config| {
+                move |pool, config| {
                     // This closure is run when a replica becomes the leader
                     let scheduler = leader_election_scheduler_gain.clone();
                     let request_manager = leader_election_request_manager_gain.clone();
@@ -1642,6 +1662,8 @@ async fn setup_background_services(
                             tracing::info!("Probe scheduler disabled by configuration");
                         }
 
+                        let notification_request_manager = request_manager.clone();
+
                         // Start the fusillade batch processing daemon based on config
                         use crate::config::DaemonEnabled;
                         use fusillade::DaemonExecutor;
@@ -1662,6 +1684,23 @@ async fn setup_background_services(
                             DaemonEnabled::Never => {
                                 tracing::info!("Fusillade batch daemon disabled by configuration");
                             }
+                        }
+
+                        // Start batch notification poller if enabled
+                        if config.background_services.notifications.enabled {
+                            let daemon_config = config.clone();
+                            let daemon_session_token = session_token.clone();
+                            tokio::spawn(async move {
+                                notifications::run_notification_poller(
+                                    daemon_config.background_services.notifications.clone(),
+                                    daemon_config,
+                                    notification_request_manager,
+                                    pool,
+                                    daemon_session_token,
+                                )
+                                .await;
+                            });
+                            tracing::info!("Batch notification poller started on elected leader");
                         }
 
                         Ok(())
@@ -1805,6 +1844,8 @@ impl Application {
         tracer_provider: Option<telemetry::SdkTracerProvider>,
     ) -> anyhow::Result<Self> {
         debug!("Starting control layer with configuration: {:#?}", config);
+
+        crypto::ensure_crypto_provider();
 
         // Setup database connections, run migrations, and initialize data
         let (_embedded_db, db_pools, fusillade_pools, outlet_pools) = setup_database(&config, pool).await?;

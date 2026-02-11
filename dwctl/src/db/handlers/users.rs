@@ -55,6 +55,8 @@ struct User {
     pub payment_provider_id: Option<String>,
     pub is_deleted: bool,
     pub is_internal: bool,
+    pub batch_notifications_enabled: bool,
+    pub first_batch_email_sent: bool,
 }
 
 pub struct Users<'c> {
@@ -77,6 +79,8 @@ impl From<(Vec<Role>, User)> for UserDBResponse {
             password_hash: user.password_hash,
             external_user_id: user.external_user_id,
             payment_provider_id: user.payment_provider_id,
+            batch_notifications_enabled: user.batch_notifications_enabled,
+            first_batch_email_sent: user.first_batch_email_sent,
         }
     }
 }
@@ -161,11 +165,13 @@ impl<'c> Repository for Users<'c> {
                 u.payment_provider_id,
                 u.is_deleted,
                 u.is_internal,
+                u.batch_notifications_enabled,
+                u.first_batch_email_sent,
                 ARRAY_AGG(ur.role) FILTER (WHERE ur.role IS NOT NULL) as "roles: Vec<Role>"
             FROM users u
             LEFT JOIN user_roles ur ON ur.user_id = u.id
             WHERE u.id = $1 AND u.id != '00000000-0000-0000-0000-000000000000' AND u.is_deleted = false
-            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id, u.is_deleted, u.is_internal
+            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id, u.is_deleted, u.is_internal, u.batch_notifications_enabled, u.first_batch_email_sent
             "#,
             id
         )
@@ -189,6 +195,8 @@ impl<'c> Repository for Users<'c> {
                 payment_provider_id: row.payment_provider_id,
                 is_deleted: row.is_deleted,
                 is_internal: row.is_internal,
+                batch_notifications_enabled: row.batch_notifications_enabled,
+                first_batch_email_sent: row.first_batch_email_sent,
             };
 
             let roles = row.roles.unwrap_or_default();
@@ -224,11 +232,13 @@ impl<'c> Repository for Users<'c> {
                 u.payment_provider_id,
                 u.is_deleted,
                 u.is_internal,
+                u.batch_notifications_enabled,
+                u.first_batch_email_sent,
                 ARRAY_AGG(ur.role) FILTER (WHERE ur.role IS NOT NULL) as "roles: Vec<Role>"
             FROM users u
             LEFT JOIN user_roles ur ON ur.user_id = u.id
             WHERE u.id = ANY($1) AND u.id != '00000000-0000-0000-0000-000000000000' AND u.is_deleted = false
-            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id, u.is_deleted, u.is_internal
+            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id, u.is_deleted, u.is_internal, u.batch_notifications_enabled, u.first_batch_email_sent
             "#,
             ids.as_slice()
         )
@@ -254,6 +264,8 @@ impl<'c> Repository for Users<'c> {
                 payment_provider_id: row.payment_provider_id,
                 is_deleted: row.is_deleted,
                 is_internal: row.is_internal,
+                batch_notifications_enabled: row.batch_notifications_enabled,
+                first_batch_email_sent: row.first_batch_email_sent,
             };
 
             let roles = row.roles.unwrap_or_default();
@@ -353,6 +365,7 @@ impl<'c> Repository for Users<'c> {
                 display_name = COALESCE($2, display_name),
                 avatar_url = COALESCE($3, avatar_url),
                 password_hash = COALESCE($4, password_hash),
+                batch_notifications_enabled = COALESCE($5, batch_notifications_enabled),
                 updated_at = NOW()
             WHERE id = $1
             RETURNING *
@@ -361,6 +374,7 @@ impl<'c> Repository for Users<'c> {
                 request.display_name,
                 request.avatar_url,
                 request.password_hash,
+                request.batch_notifications_enabled,
             )
             .fetch_optional(&mut *tx)
             .await?
@@ -628,6 +642,15 @@ impl<'c> Users<'c> {
         Ok((user, was_created))
     }
 
+    /// Mark that the first-batch welcome email has been sent for a user.
+    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
+    pub async fn mark_first_batch_email_sent(&mut self, user_id: UserId) -> Result<()> {
+        sqlx::query!("UPDATE users SET first_batch_email_sent = true WHERE id = $1", user_id)
+            .execute(&mut *self.db)
+            .await?;
+        Ok(())
+    }
+
     /// Set the payment provider ID for a user if it's not already set
     /// Returns true if the ID was updated, false if the user already had one or user not found
     #[instrument(skip(self), err)]
@@ -738,6 +761,7 @@ mod tests {
             avatar_url: None,
             roles: Some(vec![Role::RequestViewer]), // Intentionally omitting StandardUser
             password_hash: None,
+            batch_notifications_enabled: None,
         };
 
         let updated_user = repo.update(created_user.id, &update_request).await.unwrap();
@@ -754,6 +778,7 @@ mod tests {
             avatar_url: None,
             roles: Some(vec![]), // Empty roles
             password_hash: None,
+            batch_notifications_enabled: None,
         };
 
         let updated_user = repo.update(created_user.id, &update_request).await.unwrap();
