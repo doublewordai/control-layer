@@ -391,6 +391,7 @@ export const handlers = [
       auth_source: "vouch",
       external_user_id: crypto.randomUUID(),
       has_payment_provider_id: false,
+      batch_notifications_enabled: false,
     };
     return HttpResponse.json(newUser, { status: 201 });
   }),

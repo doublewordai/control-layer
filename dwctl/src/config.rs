@@ -704,6 +704,8 @@ pub struct EmailConfig {
     pub from_name: String,
     /// Password reset email configuration
     pub password_reset: PasswordResetEmailConfig,
+    /// Who to set the reply to field from
+    pub reply_to: Option<String>,
 }
 
 /// Email transport configuration - either SMTP or file-based for testing.
@@ -1075,6 +1077,30 @@ impl Default for LeaderElectionConfig {
     }
 }
 
+/// Batch completion notification configuration.
+///
+/// When enabled, polls for completed/failed/cancelled batches and sends email notifications
+/// to batch creators. Safe to run on all replicas — uses atomic `notification_sent_at` claim
+/// to prevent duplicate emails.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NotificationsConfig {
+    /// Enable batch completion notifications (default: true)
+    pub enabled: bool,
+    /// How often to poll for completed batches (default: 30s)
+    #[serde(with = "humantime_serde")]
+    pub poll_interval: Duration,
+}
+
+impl Default for NotificationsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            poll_interval: Duration::from_secs(30),
+        }
+    }
+}
+
 /// Background services configuration.
 ///
 /// Controls which background services are enabled on this instance.
@@ -1091,6 +1117,8 @@ pub struct BackgroundServicesConfig {
     pub leader_election: LeaderElectionConfig,
     /// Configuration for database pool metrics sampling
     pub pool_metrics: PoolMetricsSamplerConfig,
+    /// Configuration for batch completion email notifications
+    pub notifications: NotificationsConfig,
 }
 
 /// Database pool metrics sampling configuration.
@@ -1358,6 +1386,7 @@ impl Default for EmailConfig {
             from_email: "noreply@example.com".to_string(),
             from_name: "Control Layer".to_string(),
             password_reset: PasswordResetEmailConfig::default(),
+            reply_to: None,
         }
     }
 }
