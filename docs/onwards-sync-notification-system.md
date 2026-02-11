@@ -79,12 +79,13 @@ In multi-instance deployments:
 
 Key metrics:
 
-- `dwctl_onwards_sync_notifications_total{action="sent"}`: Notifications sent by batcher
+- `dwctl_onwards_sync_notifications_total{action="allowed"}`: Notifications allowed by rate limiter
+- `dwctl_onwards_sync_notifications_total{action="sent"}`: Notifications successfully sent via pg_notify
 - `dwctl_onwards_sync_notifications_total{action="rate_limited"}`: Notifications skipped due to rate limit
 - `dwctl_cache_sync_total{source="listen_notify"}`: Syncs triggered by LISTEN/NOTIFY
 - `dwctl_cache_sync_total{source="fallback"}`: Syncs triggered by fallback timer
 
-If `rate_limited` is high relative to `sent`, users with depleted balances are making frequent requests but the cache only syncs once per interval (working as intended).
+If `rate_limited` is high relative to `allowed`, users with depleted balances are making frequent requests but the cache only syncs once per interval (working as intended). If `sent` is lower than `allowed`, some pg_notify calls are failing.
 
 ## Implementation Details
 

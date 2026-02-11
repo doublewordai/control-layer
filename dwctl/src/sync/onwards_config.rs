@@ -86,7 +86,6 @@ pub struct OnwardsConfigSync {
     escalation_models: Vec<String>,
 }
 
-#[derive(Default)]
 pub struct SyncConfig {
     pub status_tx: Option<mpsc::Sender<SyncStatus>>,
     /// Fallback sync interval in seconds (default: 10)
@@ -94,6 +93,15 @@ pub struct SyncConfig {
     /// Provides periodic full syncs independent of LISTEN/NOTIFY to guarantee eventual consistency.
     /// Set to 0 to disable fallback sync (not recommended).
     pub fallback_interval_seconds: u64,
+}
+
+impl Default for SyncConfig {
+    fn default() -> Self {
+        Self {
+            status_tx: None,
+            fallback_interval_seconds: 10,
+        }
+    }
 }
 
 impl OnwardsConfigSync {
@@ -170,7 +178,12 @@ impl OnwardsConfigSync {
             info!("Started onwards configuration listener");
 
             // Create fallback sync timer (if enabled)
-            let mut fallback_timer = fallback_interval.map(tokio::time::interval);
+            let mut fallback_timer = fallback_interval.map(|interval| {
+                let mut timer = tokio::time::interval(interval);
+                // Use Delay to avoid burst of syncs after runtime hiccups
+                timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                timer
+            });
 
             // Listen for notifications with graceful shutdown
             loop {
@@ -235,6 +248,9 @@ impl OnwardsConfigSync {
                                             // If all receivers are dropped, we can exit
                                             break;
                                         }
+
+                                        // Record metric for LISTEN/NOTIFY sync
+                                        metrics::counter!("dwctl_cache_sync_total", "source" => "listen_notify").increment(1);
 
                                         // Record cache sync lag metric (time from DB change to cache update)
                                         if let Some((table_name, lag)) = notify_info {

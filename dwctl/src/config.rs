@@ -1226,11 +1226,12 @@ pub struct AnalyticsConfig {
     /// Actual delay is: base_delay * 2^attempt (e.g., 100ms, 200ms, 400ms for base=100).
     /// Default: 100
     pub retry_base_delay_ms: u64,
-    /// Minimum interval in seconds between balance depletion notifications per user.
+    /// Minimum interval in seconds between balance depletion notifications globally.
     ///
-    /// When a user's balance goes negative, we send a pg_notify to invalidate their API keys.
+    /// When any user's balance goes negative, we send a pg_notify to invalidate their API keys.
     /// This rate limit prevents notification storms when users continue making requests
-    /// with negative balances. Each user can trigger at most one notification per interval.
+    /// with negative balances. At most one notification is sent per interval, even if
+    /// multiple users become depleted during that time.
     ///
     /// Default: 5 seconds
     pub balance_notification_interval_seconds: u64,

@@ -33,7 +33,7 @@
 //! - **Batch enrichment**: User and pricing lookups are batched using `IN` clauses,
 //!   reducing from O(N) queries to O(1) per batch.
 
-use crate::config::Config;
+use crate::config::{Config, ONWARDS_CONFIG_CHANGED_CHANNEL};
 use crate::db::handlers::Credits;
 use crate::db::models::api_keys::ApiKeyPurpose;
 use crate::metrics::MetricsRecorder;
@@ -165,7 +165,11 @@ where
             batch_size,
             max_retries,
             retry_base_delay,
-            last_onwards_sync_notification: Arc::new(RwLock::new(Instant::now() - onwards_sync_notification_interval)),
+            last_onwards_sync_notification: Arc::new(RwLock::new(
+                Instant::now()
+                    .checked_sub(onwards_sync_notification_interval)
+                    .unwrap_or_else(Instant::now),
+            )),
             onwards_sync_notification_interval,
         };
 
@@ -906,7 +910,7 @@ where
 
         if now.duration_since(*last_notification) >= self.onwards_sync_notification_interval {
             *last_notification = now;
-            counter!("dwctl_onwards_sync_notifications_total", "action" => "sent").increment(1);
+            counter!("dwctl_onwards_sync_notifications_total", "action" => "allowed").increment(1);
             true
         } else {
             trace!("Rate limiting onwards sync notification");
@@ -930,10 +934,12 @@ where
 
         let payload = format!("credits_transactions:{}", epoch_micros);
 
-        sqlx::query("SELECT pg_notify('auth_config_changed', $1)")
+        sqlx::query(&format!("SELECT pg_notify('{}', $1)", ONWARDS_CONFIG_CHANGED_CHANNEL))
             .bind(&payload)
             .execute(conn)
             .await?;
+
+        counter!("dwctl_onwards_sync_notifications_total", "action" => "sent").increment(1);
 
         Ok(())
     }
