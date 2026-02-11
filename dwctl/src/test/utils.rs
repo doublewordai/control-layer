@@ -159,7 +159,10 @@ pub fn create_test_config() -> crate::config::Config {
             ..Default::default()
         },
         background_services: crate::config::BackgroundServicesConfig {
-            onwards_sync: OnwardsSyncConfig { enabled: false },
+            onwards_sync: OnwardsSyncConfig {
+                enabled: false,
+                fallback_interval_seconds: 10,
+            },
             probe_scheduler: ProbeSchedulerConfig { enabled: false },
             batch_daemon: DaemonConfig {
                 enabled: DaemonEnabled::Never,
