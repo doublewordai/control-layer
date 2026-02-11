@@ -1503,7 +1503,7 @@ mod tests {
         config.auth.native.enabled = true;
 
         // Save the email path before moving config
-        let email_path = if let crate::config::EmailTransportConfig::File { path } = &config.auth.native.email.transport {
+        let email_path = if let crate::config::EmailTransportConfig::File { path } = &config.email.transport {
             path.clone()
         } else {
             panic!("Expected File transport in test config");
