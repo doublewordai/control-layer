@@ -16,7 +16,7 @@ Database Changes → LISTEN/NOTIFY → Onwards Cache Reload
                      (primary)
 
 Timer Tick ──────→ Periodic Sync → Onwards Cache Reload
-              (fallback, every 10s)
+              (fallback, every N seconds)
 ```
 
 ### Event-Driven Sync (LISTEN/NOTIFY)
