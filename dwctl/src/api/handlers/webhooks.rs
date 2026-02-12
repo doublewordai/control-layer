@@ -19,7 +19,7 @@ use crate::{
     db::models::webhooks::{WebhookCreateDBRequest, WebhookUpdateDBRequest},
     errors::{Error, Result},
     notifications::BatchNotificationInfo,
-    types::{Operation, Permission, Resource, UserId},
+    types::{Operation, Permission, Resource, UserId, UserIdOrCurrent},
     webhooks::{WebhookEvent, WebhookEventType, signing},
 };
 
@@ -51,7 +51,10 @@ pub async fn list_webhooks<P: PoolProvider>(
     Path(params): Path<UserWebhookPathParams>,
     current_user: crate::api::models::users::CurrentUser,
 ) -> Result<Json<Vec<WebhookResponse>>> {
-    let target_user_id: UserId = params.user_id;
+    let target_user_id: UserId = match params.user_id {
+        UserIdOrCurrent::Current(_) => current_user.id,
+        UserIdOrCurrent::Id(id) => id,
+    };
 
     // Check permissions: can read all webhooks OR read own webhooks
     let can_read_all = permissions::has_permission(&current_user, Resource::Webhooks, Operation::ReadAll);
@@ -109,7 +112,10 @@ pub async fn create_webhook<P: PoolProvider>(
     current_user: crate::api::models::users::CurrentUser,
     Json(request): Json<WebhookCreate>,
 ) -> Result<(StatusCode, Json<WebhookWithSecretResponse>)> {
-    let target_user_id: UserId = params.user_id;
+    let target_user_id: UserId = match params.user_id {
+        UserIdOrCurrent::Current(_) => current_user.id,
+        UserIdOrCurrent::Id(id) => id,
+    };
 
     // Check permissions: can create all webhooks OR create own webhooks
     let can_create_all = permissions::has_permission(&current_user, Resource::Webhooks, Operation::CreateAll);
@@ -198,7 +204,10 @@ pub async fn get_webhook<P: PoolProvider>(
     Path(params): Path<WebhookPathParams>,
     current_user: crate::api::models::users::CurrentUser,
 ) -> Result<Json<WebhookResponse>> {
-    let target_user_id: UserId = params.user_id;
+    let target_user_id: UserId = match params.user_id {
+        UserIdOrCurrent::Current(_) => current_user.id,
+        UserIdOrCurrent::Id(id) => id,
+    };
 
     // Check permissions
     let can_read_all = permissions::has_permission(&current_user, Resource::Webhooks, Operation::ReadAll);
@@ -268,7 +277,10 @@ pub async fn update_webhook<P: PoolProvider>(
     current_user: crate::api::models::users::CurrentUser,
     Json(request): Json<WebhookUpdate>,
 ) -> Result<Json<WebhookResponse>> {
-    let target_user_id: UserId = params.user_id;
+    let target_user_id: UserId = match params.user_id {
+        UserIdOrCurrent::Current(_) => current_user.id,
+        UserIdOrCurrent::Id(id) => id,
+    };
 
     // Check permissions
     let can_update_all = permissions::has_permission(&current_user, Resource::Webhooks, Operation::UpdateAll);
@@ -372,7 +384,10 @@ pub async fn delete_webhook<P: PoolProvider>(
     Path(params): Path<WebhookPathParams>,
     current_user: crate::api::models::users::CurrentUser,
 ) -> Result<StatusCode> {
-    let target_user_id: UserId = params.user_id;
+    let target_user_id: UserId = match params.user_id {
+        UserIdOrCurrent::Current(_) => current_user.id,
+        UserIdOrCurrent::Id(id) => id,
+    };
 
     // Check permissions
     let can_delete_all = permissions::has_permission(&current_user, Resource::Webhooks, Operation::DeleteAll);
@@ -449,7 +464,10 @@ pub async fn rotate_secret<P: PoolProvider>(
     Path(params): Path<WebhookPathParams>,
     current_user: crate::api::models::users::CurrentUser,
 ) -> Result<Json<WebhookWithSecretResponse>> {
-    let target_user_id: UserId = params.user_id;
+    let target_user_id: UserId = match params.user_id {
+        UserIdOrCurrent::Current(_) => current_user.id,
+        UserIdOrCurrent::Id(id) => id,
+    };
 
     // Check permissions (use UpdateOwn/UpdateAll for secret rotation)
     let can_update_all = permissions::has_permission(&current_user, Resource::Webhooks, Operation::UpdateAll);
@@ -527,7 +545,10 @@ pub async fn test_webhook<P: PoolProvider>(
     Path(params): Path<WebhookPathParams>,
     current_user: crate::api::models::users::CurrentUser,
 ) -> Result<Json<WebhookTestResponse>> {
-    let target_user_id: UserId = params.user_id;
+    let target_user_id: UserId = match params.user_id {
+        UserIdOrCurrent::Current(_) => current_user.id,
+        UserIdOrCurrent::Id(id) => id,
+    };
 
     // Check permissions (use ReadOwn/ReadAll for testing)
     let can_read_all = permissions::has_permission(&current_user, Resource::Webhooks, Operation::ReadAll);

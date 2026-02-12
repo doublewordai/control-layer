@@ -34,6 +34,8 @@ import type {
   UpdateComponentRequest,
   ModelMetrics,
   ModelsInclude,
+  WebhookCreateRequest,
+  WebhookUpdateRequest,
 } from "./types";
 
 // Config hooks
@@ -1266,5 +1268,96 @@ export function useDaemons(options?: DaemonsQuery) {
     queryKey: ["daemons", "list", options],
     queryFn: () => dwctlApi.daemons.list(options),
     refetchInterval: 5000, // Refetch every 5 seconds to show live daemon status
+  });
+}
+
+// ===== WEBHOOK HOOKS =====
+
+export function useWebhooks(userId: string = "current") {
+  return useQuery({
+    queryKey: queryKeys.webhooks.byUser(userId),
+    queryFn: () => dwctlApi.users.webhooks.list(userId),
+  });
+}
+
+export function useCreateWebhook() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationKey: ["webhooks", "create"],
+    mutationFn: ({
+      data,
+      userId = "current",
+    }: {
+      data: WebhookCreateRequest;
+      userId?: string;
+    }) => dwctlApi.users.webhooks.create(data, userId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.webhooks.all });
+    },
+  });
+}
+
+export function useUpdateWebhook() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationKey: ["webhooks", "update"],
+    mutationFn: ({
+      webhookId,
+      data,
+      userId = "current",
+    }: {
+      webhookId: string;
+      data: WebhookUpdateRequest;
+      userId?: string;
+    }) => dwctlApi.users.webhooks.update(webhookId, data, userId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.webhooks.all });
+    },
+  });
+}
+
+export function useDeleteWebhook() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationKey: ["webhooks", "delete"],
+    mutationFn: ({
+      webhookId,
+      userId = "current",
+    }: {
+      webhookId: string;
+      userId?: string;
+    }) => dwctlApi.users.webhooks.delete(webhookId, userId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.webhooks.all });
+    },
+  });
+}
+
+export function useRotateWebhookSecret() {
+  return useMutation({
+    mutationKey: ["webhooks", "rotateSecret"],
+    mutationFn: ({
+      webhookId,
+      userId = "current",
+    }: {
+      webhookId: string;
+      userId?: string;
+    }) => dwctlApi.users.webhooks.rotateSecret(webhookId, userId),
+  });
+}
+
+export function useTestWebhook() {
+  return useMutation({
+    mutationKey: ["webhooks", "test"],
+    mutationFn: ({
+      webhookId,
+      userId = "current",
+    }: {
+      webhookId: string;
+      userId?: string;
+    }) => dwctlApi.users.webhooks.test(webhookId, userId),
   });
 }

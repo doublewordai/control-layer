@@ -6,7 +6,7 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::db::models::webhooks::{Webhook, WebhookId};
-use crate::types::UserId;
+use crate::types::{UserId, UserIdOrCurrent};
 
 /// Request to create a new webhook.
 #[derive(Debug, Clone, Deserialize, ToSchema)]
@@ -132,12 +132,12 @@ pub struct WebhookTestResponse {
 /// Path parameters for webhook endpoints.
 #[derive(Debug, Clone, Deserialize)]
 pub struct WebhookPathParams {
-    pub user_id: Uuid,
+    pub user_id: UserIdOrCurrent,
     pub webhook_id: Uuid,
 }
 
 /// Path parameters for user-only webhook endpoints.
 #[derive(Debug, Clone, Deserialize)]
 pub struct UserWebhookPathParams {
-    pub user_id: Uuid,
+    pub user_id: UserIdOrCurrent,
 }

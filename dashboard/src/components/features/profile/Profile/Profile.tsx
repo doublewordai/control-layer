@@ -9,8 +9,27 @@ import {
   Eye,
   EyeOff,
   Lock,
+  Plus,
+  Pencil,
+  Trash2,
+  RotateCw,
+  TestTube,
+  AlertTriangle,
+  Copy,
+  Check,
+  Globe,
+  Mail,
 } from "lucide-react";
-import { useUser, useUpdateUser } from "../../../../api/control-layer/hooks";
+import {
+  useUser,
+  useUpdateUser,
+  useWebhooks,
+  useCreateWebhook,
+  useUpdateWebhook,
+  useDeleteWebhook,
+  useRotateWebhookSecret,
+  useTestWebhook,
+} from "../../../../api/control-layer/hooks";
 import {
   UserAvatar,
   Tooltip,
@@ -24,10 +43,51 @@ import { Input } from "../../../ui/input";
 import { Button } from "../../../ui/button";
 import { Switch } from "../../../ui/switch";
 import { Label } from "../../../ui/label";
+import { Badge } from "../../../ui/badge";
+import { Checkbox } from "../../../ui/checkbox";
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogDescription,
+  DialogFooter,
+} from "../../../ui/dialog";
 import { AVAILABLE_ROLES, getRoleDisplayName } from "../../../../utils/roles";
-import type { Role } from "../../../../api/control-layer/types";
+import type {
+  Role,
+  Webhook,
+  WebhookTestResponse,
+} from "../../../../api/control-layer/types";
 import { dwctlApi } from "../../../../api/control-layer/client";
 import { ApiError } from "../../../../api/control-layer/errors";
+
+const EVENT_TYPE_OPTIONS = [
+  {
+    value: "batch.completed",
+    label: "Batch completed",
+    example: `{
+  "type": "batch.completed",
+  "batch_id": "batch_abc123",
+  "status": "completed",
+  "total_requests": 150,
+  "completed": 150,
+  "failed": 0
+}`,
+  },
+  {
+    value: "batch.failed",
+    label: "Batch failed",
+    example: `{
+  "type": "batch.failed",
+  "batch_id": "batch_abc123",
+  "status": "failed",
+  "total_requests": 150,
+  "completed": 80,
+  "failed": 70
+}`,
+  },
+];
 
 export const Profile: React.FC = () => {
   const {
@@ -46,10 +106,32 @@ export const Profile: React.FC = () => {
   const [showCurrentPassword, setShowCurrentPassword] = useState(false);
   const [showNewPassword, setShowNewPassword] = useState(false);
   const [showConfirmPassword, setShowConfirmPassword] = useState(false);
-  const [batchNotificationsEnabled, setBatchNotificationsEnabled] =
-    useState(false);
   const [error, setError] = useState("");
   const [success, setSuccess] = useState("");
+
+  // Webhook state
+  const { data: webhooks } = useWebhooks();
+  const createWebhookMutation = useCreateWebhook();
+  const updateWebhookMutation = useUpdateWebhook();
+  const deleteWebhookMutation = useDeleteWebhook();
+  const rotateSecretMutation = useRotateWebhookSecret();
+  const testWebhookMutation = useTestWebhook();
+
+  const [webhookDialogOpen, setWebhookDialogOpen] = useState(false);
+  const [editingWebhook, setEditingWebhook] = useState<Webhook | null>(null);
+  const [webhookUrl, setWebhookUrl] = useState("");
+  const [webhookDescription, setWebhookDescription] = useState("");
+  const [webhookEventTypes, setWebhookEventTypes] = useState<string[]>([]);
+  const [webhookSecret, setWebhookSecret] = useState<string | null>(null);
+  const [webhookError, setWebhookError] = useState("");
+  const [deletingWebhookId, setDeletingWebhookId] = useState<string | null>(
+    null,
+  );
+  const [testResults, setTestResults] = useState<
+    Record<string, WebhookTestResponse>
+  >({});
+  const [copiedSecret, setCopiedSecret] = useState(false);
+  const [emailNotifSaved, setEmailNotifSaved] = useState(false);
 
   const handleRoleChange = (role: Role) => {
     setRoles((prev) =>
@@ -78,9 +160,6 @@ export const Profile: React.FC = () => {
       setDisplayName(currentUser.display_name || "");
       setAvatarUrl(currentUser.avatar_url || "");
       setRoles(currentUser.roles || []);
-      setBatchNotificationsEnabled(
-        currentUser.batch_notifications_enabled ?? false,
-      );
     }
     if (userError) {
       setError("Failed to load profile information");
@@ -131,7 +210,6 @@ export const Profile: React.FC = () => {
         roles: currentUser.is_admin
           ? ([...new Set([...roles, "StandardUser"])] as Role[])
           : undefined,
-        batch_notifications_enabled: batchNotificationsEnabled,
       };
 
       await updateUserMutation.mutateAsync({
@@ -176,6 +254,173 @@ export const Profile: React.FC = () => {
       setError("Failed to update profile. Please try again.");
       console.error("Failed to update profile:", err);
     }
+  };
+
+  const handleEmailNotificationsToggle = async (enabled: boolean) => {
+    if (!currentUser) return;
+    try {
+      await updateUserMutation.mutateAsync({
+        id: currentUser.id,
+        data: { batch_notifications_enabled: enabled },
+      });
+      await refetchUser();
+      setEmailNotifSaved(true);
+      setTimeout(() => setEmailNotifSaved(false), 2000);
+    } catch {
+      // Revert will happen via refetchUser
+    }
+  };
+
+  // Webhook handlers
+  const openCreateWebhookDialog = () => {
+    setEditingWebhook(null);
+    setWebhookUrl("");
+    setWebhookDescription("");
+    setWebhookEventTypes(EVENT_TYPE_OPTIONS.map((o) => o.value));
+    setWebhookSecret(null);
+    setWebhookError("");
+    setWebhookDialogOpen(true);
+  };
+
+  const openEditWebhookDialog = (webhook: Webhook) => {
+    setEditingWebhook(webhook);
+    setWebhookUrl(webhook.url);
+    setWebhookDescription(webhook.description || "");
+    setWebhookEventTypes(
+      webhook.event_types && webhook.event_types.length > 0
+        ? webhook.event_types
+        : EVENT_TYPE_OPTIONS.map((o) => o.value),
+    );
+    setWebhookSecret(null);
+    setWebhookError("");
+    setWebhookDialogOpen(true);
+  };
+
+  const handleWebhookEventTypeToggle = (eventType: string) => {
+    setWebhookEventTypes((prev) =>
+      prev.includes(eventType)
+        ? prev.filter((t) => t !== eventType)
+        : [...prev, eventType],
+    );
+  };
+
+  const handleWebhookSave = async () => {
+    setWebhookError("");
+
+    if (!webhookUrl.trim()) {
+      setWebhookError("URL is required");
+      return;
+    }
+
+    try {
+      new URL(webhookUrl);
+    } catch {
+      setWebhookError("Please enter a valid URL");
+      return;
+    }
+
+    if (
+      !webhookUrl.startsWith("https://") &&
+      !webhookUrl.startsWith("http://localhost")
+    ) {
+      setWebhookError("URL must use HTTPS (except for localhost)");
+      return;
+    }
+
+    try {
+      if (editingWebhook) {
+        await updateWebhookMutation.mutateAsync({
+          webhookId: editingWebhook.id,
+          data: {
+            url: webhookUrl,
+            description: webhookDescription.trim() || null,
+            event_types: webhookEventTypes,
+          },
+        });
+        setWebhookDialogOpen(false);
+      } else {
+        const result = await createWebhookMutation.mutateAsync({
+          data: {
+            url: webhookUrl,
+            description: webhookDescription.trim() || undefined,
+            event_types: webhookEventTypes,
+          },
+        });
+        setWebhookSecret(result.secret);
+      }
+    } catch {
+      setWebhookError(
+        editingWebhook
+          ? "Failed to update webhook"
+          : "Failed to create webhook",
+      );
+    }
+  };
+
+  const handleWebhookDelete = async (webhookId: string) => {
+    try {
+      await deleteWebhookMutation.mutateAsync({ webhookId });
+      setDeletingWebhookId(null);
+    } catch {
+      // Error handled by mutation
+    }
+  };
+
+  const handleWebhookToggle = async (webhook: Webhook) => {
+    try {
+      await updateWebhookMutation.mutateAsync({
+        webhookId: webhook.id,
+        data: { enabled: !webhook.enabled },
+      });
+    } catch {
+      // Error handled by mutation
+    }
+  };
+
+  const handleRotateSecret = async (webhookId: string) => {
+    try {
+      const result = await rotateSecretMutation.mutateAsync({ webhookId });
+      setWebhookSecret(result.secret);
+    } catch {
+      // Error handled by mutation
+    }
+  };
+
+  const handleTestWebhook = async (webhookId: string) => {
+    try {
+      const result = await testWebhookMutation.mutateAsync({ webhookId });
+      setTestResults((prev) => ({ ...prev, [webhookId]: result }));
+      // Clear test result after 5 seconds
+      setTimeout(() => {
+        setTestResults((prev) => {
+          const next = { ...prev };
+          delete next[webhookId];
+          return next;
+        });
+      }, 5000);
+    } catch {
+      setTestResults((prev) => ({
+        ...prev,
+        [webhookId]: {
+          success: false,
+          error: "Failed to send test",
+          duration_ms: 0,
+        },
+      }));
+      setTimeout(() => {
+        setTestResults((prev) => {
+          const next = { ...prev };
+          delete next[webhookId];
+          return next;
+        });
+      }, 5000);
+    }
+  };
+
+  const handleCopySecret = async (secret: string) => {
+    await navigator.clipboard.writeText(secret);
+    setCopiedSecret(true);
+    setTimeout(() => setCopiedSecret(false), 2000);
   };
 
   const formatDate = (dateString: string) => {
@@ -243,15 +488,29 @@ export const Profile: React.FC = () => {
                     className="w-24 h-24 mx-auto mb-4"
                   />
                 )}
-                <h3 className="text-lg font-medium text-gray-900 truncate px-2">
-                  {displayName ||
-                    currentUser?.display_name ||
-                    currentUser?.username ||
-                    "Unknown User"}
-                </h3>
-                <p className="text-sm text-gray-500 truncate px-2">
-                  {currentUser?.email}
-                </p>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <h3 className="text-lg font-medium text-gray-900 truncate px-2 cursor-default">
+                      {displayName ||
+                        currentUser?.display_name ||
+                        currentUser?.username ||
+                        "Unknown User"}
+                    </h3>
+                  </TooltipTrigger>
+                  <TooltipContent>
+                    <p>Display name: {currentUser?.display_name || "Not set"}</p>
+                  </TooltipContent>
+                </Tooltip>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <p className="text-sm text-gray-500 truncate px-2 cursor-default">
+                      {currentUser?.username}
+                    </p>
+                  </TooltipTrigger>
+                  <TooltipContent>
+                    <p>Username: {currentUser?.username}</p>
+                  </TooltipContent>
+                </Tooltip>
               </div>
             </div>
 
@@ -316,6 +575,20 @@ export const Profile: React.FC = () => {
                 </div>
               </div>
             </div>
+
+            {/* Save Button */}
+            <Button
+              onClick={handleSave}
+              disabled={updateUserMutation.isPending}
+              className="w-full mt-6"
+            >
+              {updateUserMutation.isPending ? (
+                <Loader2 className="w-4 h-4 animate-spin" />
+              ) : (
+                <Save className="w-4 h-4" />
+              )}
+              Save Changes
+            </Button>
           </div>
 
           {/* Editable Profile Information */}
@@ -364,28 +637,6 @@ export const Profile: React.FC = () => {
                     <p className="text-xs text-gray-500 mt-1">
                       Enter a URL to your profile picture
                     </p>
-                  </div>
-                </div>
-
-                {/* Batch Notifications Toggle */}
-                <div className="pt-3 border-t border-gray-200">
-                  <div className="flex items-center justify-between">
-                    <div>
-                      <Label
-                        htmlFor="batchNotifications"
-                        className="text-sm font-medium text-gray-700"
-                      >
-                        Batch Notifications
-                      </Label>
-                      <p className="text-xs text-gray-500 mt-0.5">
-                        Email me when a batch is complete
-                      </p>
-                    </div>
-                    <Switch
-                      id="batchNotifications"
-                      checked={batchNotificationsEnabled}
-                      onCheckedChange={setBatchNotificationsEnabled}
-                    />
                   </div>
                 </div>
 
@@ -615,24 +866,464 @@ export const Profile: React.FC = () => {
                   </div>
                 )}
 
-                <div className="flex justify-end items-center">
-                  <Button
-                    onClick={handleSave}
+              </div>
+            </div>
+
+            {/* Notifications */}
+            <div className="bg-white rounded-lg shadow-sm border border-gray-200 p-6 mt-6">
+              <h4 className="text-lg font-medium text-gray-900 mb-4">
+                Notifications
+              </h4>
+
+              {/* Email Notifications Toggle */}
+              <div className="flex items-center justify-between pb-4 border-b border-gray-200">
+                <div className="flex items-center gap-3">
+                  <div className="p-2 bg-gray-100 rounded-lg">
+                    <Mail className="w-4 h-4 text-gray-600" />
+                  </div>
+                  <div>
+                    <Label
+                      htmlFor="emailNotifications"
+                      className="text-sm font-medium text-gray-900"
+                    >
+                      Email Notifications
+                    </Label>
+                    <p className="text-xs text-gray-500 mt-0.5">
+                      Receive email when a batch completes or fails
+                    </p>
+                  </div>
+                </div>
+                <div className="flex items-center gap-2 shrink-0">
+                  {emailNotifSaved && (
+                    <span className="text-xs text-green-600 flex items-center gap-1">
+                      <Check className="w-3 h-3" />
+                      Saved
+                    </span>
+                  )}
+                  <Switch
+                    id="emailNotifications"
+                    checked={currentUser?.batch_notifications_enabled ?? false}
+                    onCheckedChange={handleEmailNotificationsToggle}
                     disabled={updateUserMutation.isPending}
+                    aria-label="Email notifications"
+                  />
+                </div>
+              </div>
+
+              {/* Webhooks Section */}
+              <div className="pt-4">
+                <div className="flex items-center justify-between mb-3">
+                  <div className="flex items-center gap-3">
+                    <div className="p-2 bg-gray-100 rounded-lg">
+                      <Globe className="w-4 h-4 text-gray-600" />
+                    </div>
+                    <div>
+                      <h5 className="text-sm font-medium text-gray-900">
+                        Webhooks
+                      </h5>
+                      <p className="text-xs text-gray-500 mt-0.5">
+                        Receive HTTP callbacks when events occur
+                      </p>
+                    </div>
+                  </div>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={openCreateWebhookDialog}
+                    aria-label="Add webhook"
                   >
-                    {updateUserMutation.isPending ? (
-                      <Loader2 className="w-4 h-4 animate-spin" />
-                    ) : (
-                      <Save className="w-4 h-4" />
-                    )}
-                    Save Changes
+                    <Plus className="w-3.5 h-3.5" />
+                    Add Webhook
                   </Button>
                 </div>
+
+                {/* Webhook List */}
+                {webhooks && webhooks.length > 0 ? (
+                  <div className="space-y-2">
+                    {webhooks.map((webhook) => (
+                      <div
+                        key={webhook.id}
+                        className="border border-gray-200 rounded-lg p-3"
+                      >
+                        <div className="flex items-start justify-between gap-3">
+                          <div className="min-w-0 flex-1">
+                            <div className="flex items-center gap-2">
+                              <code className="text-sm text-gray-900 truncate block">
+                                {webhook.url}
+                              </code>
+                              {!webhook.enabled && (
+                                <Badge variant="secondary">Disabled</Badge>
+                              )}
+                              {webhook.consecutive_failures > 0 && (
+                                <Tooltip>
+                                  <TooltipTrigger asChild>
+                                    <span className="inline-flex items-center gap-1">
+                                      <AlertTriangle className="w-3.5 h-3.5 text-amber-500" />
+                                      <span className="text-xs text-amber-600">
+                                        {webhook.consecutive_failures} failure
+                                        {webhook.consecutive_failures !== 1
+                                          ? "s"
+                                          : ""}
+                                      </span>
+                                    </span>
+                                  </TooltipTrigger>
+                                  <TooltipContent>
+                                    <p>
+                                      {webhook.consecutive_failures} consecutive
+                                      delivery failure
+                                      {webhook.consecutive_failures !== 1
+                                        ? "s"
+                                        : ""}
+                                      {webhook.disabled_at &&
+                                        ". Auto-disabled due to failures."}
+                                    </p>
+                                  </TooltipContent>
+                                </Tooltip>
+                              )}
+                            </div>
+                            {webhook.description && (
+                              <p className="text-xs text-gray-500 mt-0.5">
+                                {webhook.description}
+                              </p>
+                            )}
+                            <div className="flex items-center gap-1.5 mt-1.5">
+                              {webhook.event_types &&
+                              webhook.event_types.length > 0 ? (
+                                webhook.event_types.map((type) => (
+                                  <Badge
+                                    key={type}
+                                    variant="outline"
+                                    className="text-[10px] px-1.5 py-0"
+                                  >
+                                    {type}
+                                  </Badge>
+                                ))
+                              ) : (
+                                <span className="text-[10px] text-gray-400">
+                                  All events
+                                </span>
+                              )}
+                            </div>
+                            {/* Test result inline */}
+                            {testResults[webhook.id] && (
+                              <div
+                                className={`text-xs mt-1.5 ${testResults[webhook.id].success ? "text-green-600" : "text-red-600"}`}
+                              >
+                                {testResults[webhook.id].success
+                                  ? `Test succeeded (${testResults[webhook.id].status_code}, ${testResults[webhook.id].duration_ms}ms)`
+                                  : `Test failed: ${testResults[webhook.id].error || "Unknown error"}`}
+                              </div>
+                            )}
+                          </div>
+                          <div className="flex items-center gap-1 shrink-0">
+                            <Switch
+                              checked={webhook.enabled}
+                              onCheckedChange={() =>
+                                handleWebhookToggle(webhook)
+                              }
+                              aria-label={`Toggle webhook ${webhook.url}`}
+                            />
+                            <Tooltip>
+                              <TooltipTrigger asChild>
+                                <Button
+                                  variant="ghost"
+                                  size="icon"
+                                  className="h-7 w-7"
+                                  onClick={() => handleTestWebhook(webhook.id)}
+                                  disabled={
+                                    testWebhookMutation.isPending &&
+                                    testWebhookMutation.variables
+                                      ?.webhookId === webhook.id
+                                  }
+                                  aria-label={`Test webhook ${webhook.url}`}
+                                >
+                                  {testWebhookMutation.isPending &&
+                                  testWebhookMutation.variables?.webhookId ===
+                                    webhook.id ? (
+                                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                                  ) : (
+                                    <TestTube className="w-3.5 h-3.5" />
+                                  )}
+                                </Button>
+                              </TooltipTrigger>
+                              <TooltipContent>Test webhook</TooltipContent>
+                            </Tooltip>
+                            <Tooltip>
+                              <TooltipTrigger asChild>
+                                <Button
+                                  variant="ghost"
+                                  size="icon"
+                                  className="h-7 w-7"
+                                  onClick={() =>
+                                    openEditWebhookDialog(webhook)
+                                  }
+                                  aria-label={`Edit webhook ${webhook.url}`}
+                                >
+                                  <Pencil className="w-3.5 h-3.5" />
+                                </Button>
+                              </TooltipTrigger>
+                              <TooltipContent>Edit webhook</TooltipContent>
+                            </Tooltip>
+                            <Tooltip>
+                              <TooltipTrigger asChild>
+                                <Button
+                                  variant="ghost"
+                                  size="icon"
+                                  className="h-7 w-7 text-red-500 hover:text-red-700 hover:bg-red-50"
+                                  onClick={() =>
+                                    setDeletingWebhookId(webhook.id)
+                                  }
+                                  aria-label={`Delete webhook ${webhook.url}`}
+                                >
+                                  <Trash2 className="w-3.5 h-3.5" />
+                                </Button>
+                              </TooltipTrigger>
+                              <TooltipContent>Delete webhook</TooltipContent>
+                            </Tooltip>
+                          </div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="text-sm text-gray-500 py-4 text-center border border-dashed border-gray-200 rounded-lg">
+                    No webhooks configured. Add one to receive HTTP
+                    notifications.
+                  </div>
+                )}
               </div>
             </div>
           </div>
         </div>
       </div>
+
+      {/* Webhook Create/Edit Dialog */}
+      <Dialog
+        open={webhookDialogOpen}
+        onOpenChange={(open) => {
+          if (!open) {
+            setWebhookDialogOpen(false);
+            setWebhookSecret(null);
+          }
+        }}
+      >
+        <DialogContent>
+          {webhookSecret ? (
+            <>
+              <DialogHeader>
+                <DialogTitle>
+                  {editingWebhook ? "Secret Rotated" : "Webhook Created"}
+                </DialogTitle>
+                <DialogDescription>
+                  Copy this secret now. It will not be shown again.
+                </DialogDescription>
+              </DialogHeader>
+              <div className="space-y-3">
+                <div className="flex items-center gap-2 p-3 bg-gray-50 rounded-lg border border-gray-200">
+                  <code className="text-sm flex-1 break-all font-mono">
+                    {webhookSecret}
+                  </code>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="shrink-0 h-8 w-8"
+                    onClick={() => handleCopySecret(webhookSecret)}
+                    aria-label="Copy secret"
+                  >
+                    {copiedSecret ? (
+                      <Check className="w-4 h-4 text-green-600" />
+                    ) : (
+                      <Copy className="w-4 h-4" />
+                    )}
+                  </Button>
+                </div>
+                <p className="text-xs text-amber-600 flex items-center gap-1">
+                  <AlertTriangle className="w-3 h-3 shrink-0" />
+                  Use this secret to verify webhook signatures. Store it
+                  securely.
+                </p>
+              </div>
+              <DialogFooter>
+                <Button onClick={() => setWebhookDialogOpen(false)}>
+                  Done
+                </Button>
+              </DialogFooter>
+            </>
+          ) : (
+            <>
+              <DialogHeader>
+                <DialogTitle>
+                  {editingWebhook ? "Edit Webhook" : "Add Webhook"}
+                </DialogTitle>
+                <DialogDescription>
+                  {editingWebhook
+                    ? "Update your webhook configuration."
+                    : "Configure a URL to receive HTTP POST notifications."}
+                </DialogDescription>
+              </DialogHeader>
+              <div className="space-y-4">
+                {webhookError && (
+                  <div className="text-sm text-red-600 bg-red-50 border border-red-200 p-2 rounded">
+                    {webhookError}
+                  </div>
+                )}
+                <div>
+                  <Label htmlFor="webhookUrl" className="text-sm font-medium">
+                    Endpoint URL
+                  </Label>
+                  <p className="text-xs text-gray-500 mt-0.5 mb-1">
+                    We'll send a POST request with a JSON body to this URL when
+                    events occur.
+                  </p>
+                  <Input
+                    id="webhookUrl"
+                    type="url"
+                    value={webhookUrl}
+                    onChange={(e) => setWebhookUrl(e.target.value)}
+                    placeholder="https://example.com/webhooks/doubleword"
+                  />
+                </div>
+                <div>
+                  <Label
+                    htmlFor="webhookDescription"
+                    className="text-sm font-medium"
+                  >
+                    Description (optional)
+                  </Label>
+                  <Input
+                    id="webhookDescription"
+                    type="text"
+                    value={webhookDescription}
+                    onChange={(e) => setWebhookDescription(e.target.value)}
+                    placeholder="My notification webhook"
+                    className="mt-1"
+                  />
+                </div>
+                <div>
+                  <Label className="text-sm font-medium">
+                    Event Types
+                  </Label>
+                  <p className="text-xs text-gray-500 mt-0.5 mb-2">
+                    Select at least one event to listen for.
+                  </p>
+                  <div className="space-y-2">
+                    {EVENT_TYPE_OPTIONS.map((option) => (
+                      <label
+                        key={option.value}
+                        className="flex items-center gap-2 cursor-pointer"
+                      >
+                        <Checkbox
+                          checked={webhookEventTypes.includes(option.value)}
+                          onCheckedChange={() =>
+                            handleWebhookEventTypeToggle(option.value)
+                          }
+                        />
+                        <span className="text-sm text-gray-700">
+                          {option.label}
+                        </span>
+                        <HoverCard openDelay={200} closeDelay={100}>
+                          <HoverCardTrigger asChild>
+                            <code className="text-xs text-gray-400 ml-auto cursor-help border-b border-dashed border-gray-300">
+                              {option.value}
+                            </code>
+                          </HoverCardTrigger>
+                          <HoverCardContent side="left" align="start" className="w-72">
+                            <p className="text-xs font-medium text-gray-700 mb-1">
+                              Example payload
+                            </p>
+                            <pre className="text-[11px] text-gray-500 bg-gray-50 rounded p-2 overflow-x-auto whitespace-pre">
+                              {option.example}
+                            </pre>
+                          </HoverCardContent>
+                        </HoverCard>
+                      </label>
+                    ))}
+                  </div>
+                </div>
+                {editingWebhook && (
+                  <div className="pt-2 border-t border-gray-200">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => handleRotateSecret(editingWebhook.id)}
+                      disabled={rotateSecretMutation.isPending}
+                    >
+                      {rotateSecretMutation.isPending ? (
+                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      ) : (
+                        <RotateCw className="w-3.5 h-3.5" />
+                      )}
+                      Rotate Secret
+                    </Button>
+                    <p className="text-xs text-gray-500 mt-1">
+                      Generate a new signing secret. The old secret will stop
+                      working immediately.
+                    </p>
+                  </div>
+                )}
+              </div>
+              <DialogFooter>
+                <Button
+                  variant="outline"
+                  onClick={() => setWebhookDialogOpen(false)}
+                >
+                  Cancel
+                </Button>
+                <Button
+                  onClick={handleWebhookSave}
+                  disabled={
+                    createWebhookMutation.isPending ||
+                    updateWebhookMutation.isPending ||
+                    webhookEventTypes.length === 0
+                  }
+                >
+                  {createWebhookMutation.isPending ||
+                  updateWebhookMutation.isPending ? (
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                  ) : null}
+                  {editingWebhook ? "Save Changes" : "Create Webhook"}
+                </Button>
+              </DialogFooter>
+            </>
+          )}
+        </DialogContent>
+      </Dialog>
+
+      {/* Delete Confirmation Dialog */}
+      <Dialog
+        open={!!deletingWebhookId}
+        onOpenChange={(open) => !open && setDeletingWebhookId(null)}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Delete Webhook</DialogTitle>
+            <DialogDescription>
+              Are you sure you want to delete this webhook? This action cannot be
+              undone.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => setDeletingWebhookId(null)}
+            >
+              Cancel
+            </Button>
+            <Button
+              variant="destructive"
+              onClick={() =>
+                deletingWebhookId && handleWebhookDelete(deletingWebhookId)
+              }
+              disabled={deleteWebhookMutation.isPending}
+            >
+              {deleteWebhookMutation.isPending ? (
+                <Loader2 className="w-4 h-4 animate-spin" />
+              ) : null}
+              Delete
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 };

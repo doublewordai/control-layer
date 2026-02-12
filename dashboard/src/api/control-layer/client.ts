@@ -62,6 +62,11 @@ import type {
   ModelComponent,
   AddComponentRequest,
   UpdateComponentRequest,
+  Webhook,
+  WebhookWithSecret,
+  WebhookCreateRequest,
+  WebhookUpdateRequest,
+  WebhookTestResponse,
 } from "./types";
 import { ApiError } from "./errors";
 
@@ -236,6 +241,103 @@ const userApi = {
       if (!response.ok) {
         throw new Error(`Failed to delete API key: ${response.status}`);
       }
+    },
+  },
+
+  // Nested webhooks under users
+  webhooks: {
+    async list(userId: string = "current"): Promise<Webhook[]> {
+      const response = await fetch(
+        `/admin/api/v1/users/${userId}/webhooks`,
+      );
+      if (!response.ok) {
+        throw new Error(`Failed to fetch webhooks: ${response.status}`);
+      }
+      return response.json();
+    },
+
+    async create(
+      data: WebhookCreateRequest,
+      userId: string = "current",
+    ): Promise<WebhookWithSecret> {
+      const response = await fetch(
+        `/admin/api/v1/users/${userId}/webhooks`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(data),
+        },
+      );
+      if (!response.ok) {
+        throw new Error(`Failed to create webhook: ${response.status}`);
+      }
+      return response.json();
+    },
+
+    async update(
+      webhookId: string,
+      data: WebhookUpdateRequest,
+      userId: string = "current",
+    ): Promise<Webhook> {
+      const response = await fetch(
+        `/admin/api/v1/users/${userId}/webhooks/${webhookId}`,
+        {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(data),
+        },
+      );
+      if (!response.ok) {
+        throw new Error(`Failed to update webhook: ${response.status}`);
+      }
+      return response.json();
+    },
+
+    async delete(
+      webhookId: string,
+      userId: string = "current",
+    ): Promise<void> {
+      const response = await fetch(
+        `/admin/api/v1/users/${userId}/webhooks/${webhookId}`,
+        {
+          method: "DELETE",
+        },
+      );
+      if (!response.ok) {
+        throw new Error(`Failed to delete webhook: ${response.status}`);
+      }
+    },
+
+    async rotateSecret(
+      webhookId: string,
+      userId: string = "current",
+    ): Promise<WebhookWithSecret> {
+      const response = await fetch(
+        `/admin/api/v1/users/${userId}/webhooks/${webhookId}/rotate-secret`,
+        {
+          method: "POST",
+        },
+      );
+      if (!response.ok) {
+        throw new Error(`Failed to rotate webhook secret: ${response.status}`);
+      }
+      return response.json();
+    },
+
+    async test(
+      webhookId: string,
+      userId: string = "current",
+    ): Promise<WebhookTestResponse> {
+      const response = await fetch(
+        `/admin/api/v1/users/${userId}/webhooks/${webhookId}/test`,
+        {
+          method: "POST",
+        },
+      );
+      if (!response.ok) {
+        throw new Error(`Failed to test webhook: ${response.status}`);
+      }
+      return response.json();
     },
   },
 };
