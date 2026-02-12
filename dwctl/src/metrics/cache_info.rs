@@ -5,11 +5,20 @@
 //! fallback). Uses the `metrics` crate facade — gauges appear at
 //! `/internal/metrics` automatically when a recorder is installed.
 
+use std::collections::HashSet;
+use std::sync::Mutex;
+
 use metrics::gauge;
 use onwards::target::Targets;
 use serde::Deserialize;
 use sqlx::PgPool;
 use tracing::warn;
+
+/// Previous cycle's (model, group_id) pairs — zeroed when they disappear.
+static PREV_GROUPS: Mutex<Option<HashSet<(String, String)>>> = Mutex::new(None);
+
+/// Previous cycle's (composite, component) pairs — zeroed when they disappear.
+static PREV_COMPONENTS: Mutex<Option<HashSet<(String, String)>>> = Mutex::new(None);
 
 #[derive(Deserialize)]
 struct GroupInfo {
@@ -29,9 +38,10 @@ struct ComponentInfo {
 /// Update Prometheus gauges reflecting the current cache state.
 ///
 /// Queries PostgreSQL for model metadata (groups, components, tariffs) and
-/// iterates the Targets DashMap for API key counts. All gauges are set
-/// unconditionally — stale series from deleted models persist in the exporter
-/// but produce no PromQL joins since operational metrics also stop.
+/// iterates the Targets DashMap for API key counts. Multi-label info gauges
+/// (`dwctl_model_group_info`, `dwctl_model_component_weight`) are zeroed when
+/// their label combination disappears between cycles, so PromQL `group_left`
+/// joins stay time-accurate after group reassignments or component removals.
 pub async fn update_cache_info_metrics(pool: &PgPool, targets: &Targets) -> Result<(), anyhow::Error> {
     // Single query: all model metadata with groups and components as JSON arrays
     let rows = sqlx::query!(
@@ -81,6 +91,9 @@ pub async fn update_cache_info_metrics(pool: &PgPool, targets: &Targets) -> Resu
     )
     .fetch_all(pool)
     .await?;
+
+    let mut current_groups: HashSet<(String, String)> = HashSet::new();
+    let mut current_components: HashSet<(String, String)> = HashSet::new();
 
     for row in &rows {
         let alias = &row.alias;
@@ -141,6 +154,7 @@ pub async fn update_cache_info_metrics(pool: &PgPool, targets: &Targets) -> Resu
             match serde_json::from_str::<Vec<GroupInfo>>(json) {
                 Ok(groups) => {
                     for g in &groups {
+                        current_groups.insert((alias.clone(), g.group_id.clone()));
                         gauge!(
                             "dwctl_model_group_info",
                             "model" => alias.clone(),
@@ -159,6 +173,7 @@ pub async fn update_cache_info_metrics(pool: &PgPool, targets: &Targets) -> Resu
             match serde_json::from_str::<Vec<ComponentInfo>>(json) {
                 Ok(components) => {
                     for c in &components {
+                        current_components.insert((alias.clone(), c.component.clone()));
                         gauge!(
                             "dwctl_model_component_weight",
                             "composite" => alias.clone(),
@@ -173,6 +188,24 @@ pub async fn update_cache_info_metrics(pool: &PgPool, targets: &Targets) -> Resu
                 Err(e) => warn!("Failed to parse components JSON for model '{}': {}", alias, e),
             }
         }
+    }
+
+    // Zero gauges for group/component pairs that disappeared since last cycle
+    if let Ok(mut prev) = PREV_GROUPS.lock() {
+        if let Some(prev_set) = prev.as_ref() {
+            for (model, group_id) in prev_set.difference(&current_groups) {
+                gauge!("dwctl_model_group_info", "model" => model.clone(), "group_id" => group_id.clone(), "group_name" => "").set(0.0);
+            }
+        }
+        *prev = Some(current_groups);
+    }
+    if let Ok(mut prev) = PREV_COMPONENTS.lock() {
+        if let Some(prev_set) = prev.as_ref() {
+            for (composite, component) in prev_set.difference(&current_components) {
+                gauge!("dwctl_model_component_weight", "composite" => composite.clone(), "component" => component.clone(), "component_endpoint" => "", "sort_order" => "", "enabled" => "").set(0.0);
+            }
+        }
+        *prev = Some(current_components);
     }
 
     // API key counts — from the Targets DashMap (no SQL needed)
