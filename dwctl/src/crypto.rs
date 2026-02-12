@@ -1,20 +1,7 @@
-//! Cryptographic utilities for API key generation and TLS provider setup.
-
-use std::sync::Once;
+//! Cryptographic utilities for API key generation.
 
 use base64::{Engine as _, engine::general_purpose};
 use rand::{Rng, thread_rng};
-
-static INIT_CRYPTO: Once = Once::new();
-
-/// Ensures the rustls crypto provider is installed.
-/// Required for rustls 0.23+ (used by reqwest, async-stripe, etc.).
-/// Safe to call multiple times — only initializes once.
-pub(crate) fn ensure_crypto_provider() {
-    INIT_CRYPTO.call_once(|| {
-        rustls::crypto::aws_lc_rs::default_provider().install_default().ok();
-    });
-}
 
 /// Generates a cryptographically secure API key with 256 bits of entropy.
 ///
