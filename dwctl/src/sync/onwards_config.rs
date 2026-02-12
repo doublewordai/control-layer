@@ -131,6 +131,11 @@ impl OnwardsConfigSync {
             update_daemon_capacity_limits(&db, limits).await?;
         }
 
+        // Populate cache info metrics on startup
+        if let Err(e) = crate::metrics::update_cache_info_metrics(&db, &initial_targets).await {
+            error!("Failed to update cache info metrics: {}", e);
+        }
+
         // Create watch channel with initial state
         let (sender, receiver) = watch::channel(initial_targets.clone());
 
@@ -242,6 +247,11 @@ impl OnwardsConfigSync {
                                                 error!("Failed to update daemon capacity limits: {}", e);
                                             }
 
+                                        // Update cache info metrics
+                                        if let Err(e) = crate::metrics::update_cache_info_metrics(&self.db, &new_targets).await {
+                                            error!("Failed to update cache info metrics: {}", e);
+                                        }
+
                                         // Send update through watch channel
                                         if let Err(e) = self.sender.send(new_targets) {
                                             error!("Failed to send targets update: {}", e);
@@ -319,6 +329,11 @@ impl OnwardsConfigSync {
                                     && let Err(e) = update_daemon_capacity_limits(&self.db, limits).await {
                                         error!("Failed to update daemon capacity limits: {}", e);
                                     }
+
+                                // Update cache info metrics
+                                if let Err(e) = crate::metrics::update_cache_info_metrics(&self.db, &new_targets).await {
+                                    error!("Failed to update cache info metrics: {}", e);
+                                }
 
                                 // Send update through watch channel
                                 if let Err(e) = self.sender.send(new_targets) {
