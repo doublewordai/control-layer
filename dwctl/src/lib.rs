@@ -133,6 +133,13 @@
 // TODO: This file has gotten way too big. We need to refactor it into smaller modules.
 // The constructors in test_utils should be unified with the actual constructors: right now they're
 // actually the best lib way to construct things, which is bad.
+/// Install the rustls crypto provider at process startup, before main() or any test runs.
+/// This ensures every TLS client (reqwest, async-stripe, etc.) has a provider available.
+#[ctor::ctor]
+fn install_crypto_provider() {
+    rustls::crypto::aws_lc_rs::default_provider().install_default().ok();
+}
+
 pub mod api;
 pub mod auth;
 pub mod config;
@@ -1496,10 +1503,18 @@ async fn setup_background_services(
 
         // Start the onwards configuration listener
         let onwards_shutdown = shutdown_token.clone();
+        let fallback_interval = config.background_services.onwards_sync.fallback_interval_milliseconds;
         background_tasks.spawn("onwards-config-sync", async move {
-            info!("Starting onwards configuration listener");
+            info!(
+                "Starting onwards configuration listener (fallback sync every {}ms)",
+                fallback_interval
+            );
+            let sync_config = sync::onwards_config::SyncConfig {
+                status_tx: None,
+                fallback_interval_milliseconds: fallback_interval,
+            };
             onwards_config_sync
-                .start(Default::default(), onwards_shutdown)
+                .start(sync_config, onwards_shutdown)
                 .await
                 .context("Onwards configuration listener failed")
         });
@@ -1884,8 +1899,6 @@ impl Application {
         tracer_provider: Option<telemetry::SdkTracerProvider>,
     ) -> anyhow::Result<Self> {
         debug!("Starting control layer with configuration: {:#?}", config);
-
-        crypto::ensure_crypto_provider();
 
         // Setup database connections, run migrations, and initialize data
         let (_embedded_db, db_pools, fusillade_pools, outlet_pools) = setup_database(&config, pool).await?;

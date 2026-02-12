@@ -125,12 +125,6 @@ pub fn create_test_config() -> crate::config::Config {
         auth: crate::config::AuthConfig {
             native: NativeAuthConfig {
                 enabled: false,
-                email: crate::config::EmailConfig {
-                    transport: crate::config::EmailTransportConfig::File {
-                        path: temp_dir.to_string_lossy().to_string(),
-                    },
-                    ..Default::default()
-                },
                 password: PasswordConfig {
                     min_length: 8,
                     max_length: 64,
@@ -160,13 +154,22 @@ pub fn create_test_config() -> crate::config::Config {
             ..Default::default()
         },
         background_services: crate::config::BackgroundServicesConfig {
-            onwards_sync: OnwardsSyncConfig { enabled: false },
+            onwards_sync: OnwardsSyncConfig {
+                enabled: false,
+                fallback_interval_milliseconds: 10000,
+            },
             probe_scheduler: ProbeSchedulerConfig { enabled: false },
             batch_daemon: DaemonConfig {
                 enabled: DaemonEnabled::Never,
                 ..Default::default()
             },
             leader_election: LeaderElectionConfig { enabled: false },
+            ..Default::default()
+        },
+        email: crate::config::EmailConfig {
+            transport: crate::config::EmailTransportConfig::File {
+                path: temp_dir.to_string_lossy().to_string(),
+            },
             ..Default::default()
         },
         sample_files: crate::sample_files::SampleFilesConfig::default(),

@@ -46,7 +46,7 @@ enum EmailTransport {
 
 impl EmailService {
     pub fn new(config: &Config) -> Result<Self, Error> {
-        let email_config = &config.auth.native.email;
+        let email_config = &config.email;
 
         let transport = match &email_config.transport {
             crate::config::EmailTransportConfig::Smtp {

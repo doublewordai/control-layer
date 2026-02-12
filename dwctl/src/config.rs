@@ -166,6 +166,8 @@ pub struct Config {
     pub sample_files: SampleFilesConfig,
     /// Resource limits for protecting system capacity
     pub limits: LimitsConfig,
+    /// Email configuration for password resets and notifications
+    pub email: EmailConfig,
 }
 
 /// Individual pool configuration with all SQLx parameters.
@@ -582,8 +584,9 @@ pub struct NativeAuthConfig {
     pub password: PasswordConfig,
     /// Session cookie configuration
     pub session: SessionConfig,
-    /// Email configuration for password resets
-    pub email: EmailConfig,
+    /// How long password reset tokens are valid
+    #[serde(with = "humantime_serde")]
+    pub password_reset_token_duration: Duration,
 }
 
 /// Proxy header-based authentication configuration.
@@ -702,8 +705,6 @@ pub struct EmailConfig {
     pub from_email: String,
     /// Sender display name
     pub from_name: String,
-    /// Password reset email configuration
-    pub password_reset: PasswordResetEmailConfig,
     /// Who to set the reply to field from
     pub reply_to: Option<String>,
 }
@@ -730,15 +731,6 @@ pub enum EmailTransportConfig {
         /// Directory path where email files will be written
         path: String,
     },
-}
-
-/// Password reset email configuration.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct PasswordResetEmailConfig {
-    /// How long reset tokens are valid
-    #[serde(with = "humantime_serde")]
-    pub token_expiry: Duration,
 }
 
 /// File upload/download configuration for batch processing.
@@ -1172,11 +1164,23 @@ impl Default for PoolMetricsSamplerConfig {
 pub struct OnwardsSyncConfig {
     /// Enable onwards config sync service (default: true)
     pub enabled: bool,
+    /// Fallback sync interval in milliseconds (default: 10000ms = 10 seconds)
+    ///
+    /// Even when LISTEN/NOTIFY is working, this provides periodic full syncs to guarantee
+    /// eventual consistency. Prevents issues from dropped notifications or connection problems.
+    ///
+    /// Set to `0` to disable periodic fallback syncs entirely. Disabling the fallback interval
+    /// removes protection against missed notifications and is generally not recommended
+    /// in production environments.
+    pub fallback_interval_milliseconds: u64,
 }
 
 impl Default for OnwardsSyncConfig {
     fn default() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            fallback_interval_milliseconds: 10000, // 10 seconds
+        }
     }
 }
 
@@ -1273,6 +1277,15 @@ pub struct AnalyticsConfig {
     /// Actual delay is: base_delay * 2^attempt (e.g., 100ms, 200ms, 400ms for base=100).
     /// Default: 100
     pub retry_base_delay_ms: u64,
+    /// Minimum interval in milliseconds between balance depletion notifications globally.
+    ///
+    /// When any user's balance goes negative, we send a pg_notify to invalidate their API keys.
+    /// This rate limit prevents notification storms when users continue making requests
+    /// with negative balances. At most one notification is sent per interval, even if
+    /// multiple users become depleted during that time.
+    ///
+    /// Default: 5000ms (5 seconds)
+    pub balance_notification_interval_milliseconds: u64,
 }
 
 impl Default for AnalyticsConfig {
@@ -1281,6 +1294,7 @@ impl Default for AnalyticsConfig {
             batch_size: 100,
             max_retries: 3,
             retry_base_delay_ms: 100,
+            balance_notification_interval_milliseconds: 5000,
         }
     }
 }
@@ -1312,6 +1326,7 @@ impl Default for Config {
             credits: CreditsConfig::default(),
             sample_files: SampleFilesConfig::default(),
             limits: LimitsConfig::default(),
+            email: EmailConfig::default(),
         }
     }
 }
@@ -1335,7 +1350,7 @@ impl Default for NativeAuthConfig {
             allow_registration: false,
             password: PasswordConfig::default(),
             session: SessionConfig::default(),
-            email: EmailConfig::default(),
+            password_reset_token_duration: Duration::from_secs(30 * 60), // 30 minutes
         }
     }
 }
@@ -1407,7 +1422,6 @@ impl Default for EmailConfig {
             transport: EmailTransportConfig::default(),
             from_email: "noreply@example.com".to_string(),
             from_name: "Control Layer".to_string(),
-            password_reset: PasswordResetEmailConfig::default(),
             reply_to: None,
         }
     }
@@ -1417,14 +1431,6 @@ impl Default for EmailTransportConfig {
     fn default() -> Self {
         Self::File {
             path: "./emails".to_string(),
-        }
-    }
-}
-
-impl Default for PasswordResetEmailConfig {
-    fn default() -> Self {
-        Self {
-            token_expiry: Duration::from_secs(30 * 60), // 30 minutes
         }
     }
 }

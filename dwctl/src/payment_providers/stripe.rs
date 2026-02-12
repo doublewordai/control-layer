@@ -40,7 +40,6 @@ pub struct StripeProvider {
 
 impl From<crate::config::StripeConfig> for StripeProvider {
     fn from(config: crate::config::StripeConfig) -> Self {
-        crate::crypto::ensure_crypto_provider();
         let client = Client::new(&config.api_key);
         Self { config, client }
     }
