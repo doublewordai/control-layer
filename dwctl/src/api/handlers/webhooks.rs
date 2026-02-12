@@ -625,6 +625,7 @@ pub async fn test_webhook<P: PoolProvider>(
         .header("webhook-id", &msg_id)
         .header("webhook-timestamp", timestamp.to_string())
         .header("webhook-signature", &signature)
+        .header("webhook-version", "1")
         .body(payload)
         .timeout(std::time::Duration::from_secs(30))
         .send()

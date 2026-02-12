@@ -92,6 +92,7 @@ impl WebhookService {
                     .header("webhook-id", &msg_id)
                     .header("webhook-timestamp", timestamp.to_string())
                     .header("webhook-signature", &signature)
+                    .header("webhook-version", "1")
                     .body(payload_str.clone())
                     .send()
                     .await;
