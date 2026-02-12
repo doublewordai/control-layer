@@ -133,6 +133,13 @@
 // TODO: This file has gotten way too big. We need to refactor it into smaller modules.
 // The constructors in test_utils should be unified with the actual constructors: right now they're
 // actually the best lib way to construct things, which is bad.
+/// Install the rustls crypto provider at process startup, before main() or any test runs.
+/// This ensures every TLS client (reqwest, async-stripe, etc.) has a provider available.
+#[ctor::ctor]
+fn install_crypto_provider() {
+    rustls::crypto::aws_lc_rs::default_provider().install_default().ok();
+}
+
 pub mod api;
 pub mod auth;
 pub mod config;
@@ -1892,8 +1899,6 @@ impl Application {
         tracer_provider: Option<telemetry::SdkTracerProvider>,
     ) -> anyhow::Result<Self> {
         debug!("Starting control layer with configuration: {:#?}", config);
-
-        crypto::ensure_crypto_provider();
 
         // Setup database connections, run migrations, and initialize data
         let (_embedded_db, db_pools, fusillade_pools, outlet_pools) = setup_database(&config, pool).await?;
