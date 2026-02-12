@@ -129,25 +129,17 @@ pub async fn update_cache_info_metrics(pool: &PgPool, targets: &Targets) -> Resu
         )
         .set(1.0);
 
-        // Rate limit gauge
-        if let Some(rps) = row.requests_per_second {
-            gauge!("dwctl_model_rate_limit_rps", "model" => alias.clone()).set(rps as f64);
-        }
+        // Rate limit gauge — zero when unset so removal is reflected
+        gauge!("dwctl_model_rate_limit_rps", "model" => alias.clone()).set(row.requests_per_second.unwrap_or(0.0) as f64);
 
         // Concurrency limit gauge
-        if let Some(capacity) = row.capacity {
-            gauge!("dwctl_model_concurrency_limit", "model" => alias.clone()).set(capacity as f64);
-        }
+        gauge!("dwctl_model_concurrency_limit", "model" => alias.clone()).set(row.capacity.unwrap_or(0) as f64);
 
         // Batch capacity gauge
-        if let Some(batch_capacity) = row.batch_capacity {
-            gauge!("dwctl_model_batch_capacity", "model" => alias.clone()).set(batch_capacity as f64);
-        }
+        gauge!("dwctl_model_batch_capacity", "model" => alias.clone()).set(row.batch_capacity.unwrap_or(0) as f64);
 
         // Throughput gauge
-        if let Some(throughput) = row.throughput {
-            gauge!("dwctl_model_throughput_rps", "model" => alias.clone()).set(throughput as f64);
-        }
+        gauge!("dwctl_model_throughput_rps", "model" => alias.clone()).set(row.throughput.unwrap_or(0.0) as f64);
 
         // Group info metrics — one gauge per (model, group) pair
         if let Some(ref json) = row.groups_json {
@@ -538,8 +530,11 @@ mod tests {
             "Bare model should appear in dwctl_model_info"
         );
 
-        // No metering without tariff
-        assert!(output.contains(r#"model="cache-info-bare""#), "Model should appear");
+        // Without a tariff, is_metered should be false
+        assert!(
+            output.contains(r#"is_metered="false""#),
+            "Models without tariffs should be marked is_metered=\"false\""
+        );
 
         // API key count gauge should exist (even if 0)
         // The DashMap has the model since load_targets_from_db creates targets
