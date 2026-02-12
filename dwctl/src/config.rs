@@ -982,6 +982,22 @@ pub struct DaemonConfig {
     ///   - x-fusillade-batch-endpoint
     #[serde(default = "default_batch_metadata_fields_dwctl")]
     pub batch_metadata_fields: Vec<String>,
+
+    /// Interval for running the orphaned row purge task (milliseconds).
+    /// Deletes orphaned request_templates and requests whose parent file/batch
+    /// has been soft-deleted, for right-to-erasure compliance.
+    /// Set to 0 to disable purging. Default: 600000 (10 minutes).
+    pub purge_interval_ms: u64,
+
+    /// Maximum number of orphaned rows to delete per purge iteration.
+    /// Each iteration deletes up to this many requests and this many request_templates.
+    /// Default: 1000.
+    pub purge_batch_size: i64,
+
+    /// Throttle delay between consecutive purge batches within a single drain
+    /// cycle (milliseconds). Prevents sustained high DB load when many orphans
+    /// exist. Default: 100.
+    pub purge_throttle_ms: u64,
 }
 
 fn default_batch_metadata_fields_dwctl() -> Vec<String> {
@@ -1012,6 +1028,9 @@ impl Default for DaemonConfig {
             processing_timeout_ms: 600000,
             batch_metadata_fields: default_batch_metadata_fields_dwctl(),
             model_escalations: HashMap::new(),
+            purge_interval_ms: 600_000,
+            purge_batch_size: 1000,
+            purge_throttle_ms: 100,
         }
     }
 }
@@ -1042,6 +1061,9 @@ impl DaemonConfig {
             claim_timeout_ms: self.claim_timeout_ms,
             processing_timeout_ms: self.processing_timeout_ms,
             batch_metadata_fields: self.batch_metadata_fields.clone(),
+            purge_interval_ms: self.purge_interval_ms,
+            purge_batch_size: self.purge_batch_size,
+            purge_throttle_ms: self.purge_throttle_ms,
             ..Default::default()
         }
     }
