@@ -1,5 +1,12 @@
 # Changelog
 
+## [7.0.1](https://github.com/doublewordai/control-layer/compare/v7.0.0...v7.0.1) (2026-02-12)
+
+
+### Bug Fixes
+
+* instantiate tls client as the very first thing ([#687](https://github.com/doublewordai/control-layer/issues/687)) ([895cfab](https://github.com/doublewordai/control-layer/commit/895cfab5fd939467597225336292b3b5662c2b29))
+
 ## [7.0.0](https://github.com/doublewordai/control-layer/compare/v6.1.0...v7.0.0) (2026-02-11)
 
 
