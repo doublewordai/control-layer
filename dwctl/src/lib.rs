@@ -2023,11 +2023,18 @@ impl Application {
         info!("Closing database connections...");
         self.db_pools.close().await;
 
-        // Shutdown telemetry to flush pending spans
-        if let Some(provider) = self._tracer_provider.take() {
-            info!("Shutting down telemetry...");
-            if let Err(e) = provider.shutdown() {
-                tracing::error!("Failed to shutdown tracer provider: {}", e);
+        // Flush pending spans without shutting down the processor.
+        // We intentionally use force_flush() instead of shutdown() because the
+        // tracing_opentelemetry layer (global subscriber) still holds a Tracer
+        // referencing the same inner provider. Calling shutdown() marks the
+        // BatchSpanProcessor as dead, but any tracing event emitted afterward
+        // (during remaining cleanup, tokio runtime drop, etc.) still hits the
+        // processor and generates an "AfterShutdown" warning per span. By only
+        // flushing, the processor stays alive and silently accepts late spans.
+        if let Some(ref provider) = self._tracer_provider {
+            info!("Flushing telemetry...");
+            if let Err(e) = provider.force_flush() {
+                tracing::error!("Failed to flush tracer provider: {}", e);
             }
         }
 
