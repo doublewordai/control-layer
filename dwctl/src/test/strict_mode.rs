@@ -293,8 +293,7 @@ async fn test_strict_mode_allows_chat_completions(pool: PgPool) {
     );
 
     // Verify response structure
-    let body: serde_json::Value =
-        serde_json::from_str(&body_text).expect("Response body should be valid JSON");
+    let body: serde_json::Value = serde_json::from_str(&body_text).expect("Response body should be valid JSON");
     assert_eq!(body["id"].as_str(), Some("chatcmpl-strict-test"));
     assert_eq!(body["object"].as_str(), Some("chat.completion"));
     assert_eq!(body["model"].as_str(), Some("gpt-4"));
