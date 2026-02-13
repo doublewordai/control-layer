@@ -914,7 +914,6 @@ impl Default for BatchConfig {
             allowed_completion_windows: vec!["24h".to_string()],
             allowed_url_paths: vec![
                 "/v1/chat/completions".to_string(),
-                "/v1/completions".to_string(),
                 "/v1/embeddings".to_string(),
                 "/v1/responses".to_string(),
             ],
