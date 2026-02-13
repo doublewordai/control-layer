@@ -27,7 +27,7 @@ use crate::types::Resource;
 use axum::{
     Json,
     body::Body,
-    extract::{Multipart, Path, Query, State},
+    extract::{FromRequest, Multipart, Path, Query, State},
     http::StatusCode,
 };
 use bytes::Bytes;
