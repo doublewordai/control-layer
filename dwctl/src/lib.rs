@@ -1939,9 +1939,35 @@ impl Application {
         )
         .await?;
 
-        // Build onwards router from targets with response sanitization enabled
-        let onwards_app_state =
-            onwards::AppState::new(bg_services.onwards_targets.clone()).with_response_transform(onwards::create_openai_sanitizer());
+        // Enforce `stream_options.include_usage` for streaming chat completions (COR-13).
+        //
+        // For streaming requests, upstream providers only report token usage in the final
+        // SSE chunk when `stream_options: { include_usage: true }` is set. Without it,
+        // the response contains no usage data and the request logs record 0 tokens — meaning
+        // the request can't be billed. The dashboard sets this automatically, but direct API
+        // callers may not.
+        //
+        // This only applies to /chat/completions. The Responses API (/responses) always
+        // includes usage in its response object regardless of streaming, so no transform
+        // is needed there. Embeddings don't support streaming.
+        let body_transform: onwards::BodyTransformFn = Arc::new(|path, _headers, body_bytes| {
+            if path.contains("/chat/completions")
+                && let Ok(mut json_body) = serde_json::from_slice::<serde_json::Value>(body_bytes)
+                && let Some(obj) = json_body.as_object_mut()
+                && obj.get("stream").and_then(|v| v.as_bool()) == Some(true)
+            {
+                obj.entry("stream_options")
+                    .or_insert_with(|| serde_json::json!({}))
+                    .as_object_mut()?["include_usage"] = serde_json::json!(true);
+
+                if let Ok(bytes) = serde_json::to_vec(&json_body) {
+                    return Some(axum::body::Bytes::from(bytes));
+                }
+            }
+            None
+        });
+        let onwards_app_state = onwards::AppState::with_transform(bg_services.onwards_targets.clone(), body_transform)
+            .with_response_transform(onwards::create_openai_sanitizer());
         let onwards_router = onwards::build_router(onwards_app_state);
 
         // Build resource limiters
