@@ -1,5 +1,17 @@
 # Changelog
 
+## [7.3.0](https://github.com/doublewordai/control-layer/compare/v7.2.0...v7.3.0) (2026-02-13)
+
+
+### Features
+
+* New bootstrap content ([#696](https://github.com/doublewordai/control-layer/issues/696)) ([fea21b0](https://github.com/doublewordai/control-layer/commit/fea21b00a20106d4b9573c53ab6ad48c774e399d))
+
+
+### Bug Fixes
+
+* filter stale daemons from running count in model info ([#697](https://github.com/doublewordai/control-layer/issues/697)) ([6adde1c](https://github.com/doublewordai/control-layer/commit/6adde1cb578665955ca88b6ac3c421ff44e64410))
+
 ## [7.2.0](https://github.com/doublewordai/control-layer/compare/v7.1.0...v7.2.0) (2026-02-13)
 
 
