@@ -484,7 +484,6 @@ export const handlers = [
         description: body.description || null,
         created_at: now,
         updated_at: now,
-        consecutive_failures: 0,
         disabled_at: null,
         secret: `whsec_${Math.random().toString(36).substring(2, 34)}`,
       },
@@ -505,7 +504,6 @@ export const handlers = [
         description: body.description !== undefined ? body.description : null,
         created_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
-        consecutive_failures: 0,
         disabled_at: null,
       });
     },
@@ -530,7 +528,6 @@ export const handlers = [
         description: null,
         created_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
-        consecutive_failures: 0,
         disabled_at: null,
         secret: `whsec_${Math.random().toString(36).substring(2, 34)}`,
       });

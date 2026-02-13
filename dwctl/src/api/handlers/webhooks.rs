@@ -144,10 +144,7 @@ pub async fn create_webhook<P: PoolProvider>(
         for event_type in event_types {
             if event_type.parse::<WebhookEventType>().is_err() {
                 return Err(Error::BadRequest {
-                    message: format!(
-                        "Invalid event type: {}. Valid types are: batch.completed, batch.failed, batch.cancelled",
-                        event_type
-                    ),
+                    message: format!("Invalid event type: {}. Valid types are: batch.completed, batch.failed", event_type),
                 });
             }
         }
@@ -297,13 +294,14 @@ pub async fn update_webhook<P: PoolProvider>(
         });
     }
 
-    // Validate URL if provided
-    if let Some(ref url) = request.url
-        && !url.starts_with("https://")
-    {
-        return Err(Error::BadRequest {
-            message: "Webhook URL must use HTTPS".to_string(),
-        });
+    // Validate URL if provided (same localhost exception as create)
+    if let Some(ref url) = request.url {
+        let is_local = url.starts_with("http://localhost") || url.starts_with("http://127.0.0.1");
+        if !url.starts_with("https://") && !is_local {
+            return Err(Error::BadRequest {
+                message: "Webhook URL must use HTTPS (HTTP allowed for localhost only)".to_string(),
+            });
+        }
     }
 
     // Validate event types if provided
@@ -311,10 +309,7 @@ pub async fn update_webhook<P: PoolProvider>(
         for event_type in event_types {
             if event_type.parse::<WebhookEventType>().is_err() {
                 return Err(Error::BadRequest {
-                    message: format!(
-                        "Invalid event type: {}. Valid types are: batch.completed, batch.failed, batch.cancelled",
-                        event_type
-                    ),
+                    message: format!("Invalid event type: {}. Valid types are: batch.completed, batch.failed", event_type),
                 });
             }
         }

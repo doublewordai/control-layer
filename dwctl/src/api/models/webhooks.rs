@@ -53,7 +53,6 @@ pub struct WebhookResponse {
     pub description: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
-    pub consecutive_failures: i32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disabled_at: Option<DateTime<Utc>>,
 }
@@ -71,7 +70,6 @@ impl From<Webhook> for WebhookResponse {
             description: webhook.description,
             created_at: webhook.created_at,
             updated_at: webhook.updated_at,
-            consecutive_failures: webhook.consecutive_failures,
             disabled_at: webhook.disabled_at,
         }
     }

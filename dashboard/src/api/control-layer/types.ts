@@ -1201,7 +1201,6 @@ export interface Webhook {
   description?: string | null;
   created_at: string;
   updated_at: string;
-  consecutive_failures: number;
   disabled_at?: string | null;
 }
 

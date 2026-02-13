@@ -1104,10 +1104,8 @@ pub struct NotificationsConfig {
     /// How often to poll for completed batches (default: 30s)
     #[serde(with = "humantime_serde")]
     pub poll_interval: Duration,
-    /// Base URL for dashboard links in notification emails
-    pub dashboard_url: String,
     /// Webhook delivery configuration for Standard Webhooks-compliant
-    /// notifications for batch terminal state events (completed, failed, cancelled).
+    /// notifications for batch terminal state events (completed, failed).
     pub webhooks: WebhookConfig,
 }
 
@@ -1116,7 +1114,6 @@ impl Default for NotificationsConfig {
         Self {
             enabled: true,
             poll_interval: Duration::from_secs(30),
-            dashboard_url: "http://localhost:3001".to_string(),
             webhooks: WebhookConfig::default(),
         }
     }
@@ -1186,7 +1183,7 @@ impl Default for OnwardsSyncConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            fallback_interval_milliseconds: 1000000, // 10 seconds
+            fallback_interval_milliseconds: 10_000, // 10 seconds
         }
     }
 }

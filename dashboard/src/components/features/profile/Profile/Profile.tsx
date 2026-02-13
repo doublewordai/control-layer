@@ -65,11 +65,20 @@ const EVENT_TYPE_OPTIONS = [
     label: "Batch completed",
     example: `{
   "type": "batch.completed",
-  "batch_id": "batch_abc123",
-  "status": "completed",
-  "total_requests": 150,
-  "completed": 150,
-  "failed": 0
+  "timestamp": "2025-01-15T10:30:00Z",
+  "data": {
+    "batch_id": "batch_abc123",
+    "status": "completed",
+    "request_counts": {
+      "total": 150,
+      "completed": 150,
+      "failed": 0,
+      "cancelled": 0
+    },
+    "output_file_id": "file_def456",
+    "created_at": "2025-01-15T09:00:00Z",
+    "finished_at": "2025-01-15T10:30:00Z"
+  }
 }`,
   },
   {
@@ -77,11 +86,20 @@ const EVENT_TYPE_OPTIONS = [
     label: "Batch failed",
     example: `{
   "type": "batch.failed",
-  "batch_id": "batch_abc123",
-  "status": "failed",
-  "total_requests": 150,
-  "completed": 80,
-  "failed": 70
+  "timestamp": "2025-01-15T10:30:00Z",
+  "data": {
+    "batch_id": "batch_abc123",
+    "status": "failed",
+    "request_counts": {
+      "total": 150,
+      "completed": 80,
+      "failed": 70,
+      "cancelled": 0
+    },
+    "error_file_id": "file_ghi789",
+    "created_at": "2025-01-15T09:00:00Z",
+    "finished_at": "2025-01-15T10:30:00Z"
+  }
 }`,
   },
 ];
@@ -312,11 +330,8 @@ export const Profile: React.FC = () => {
       return;
     }
 
-    if (
-      !webhookUrl.startsWith("https://") &&
-      !webhookUrl.startsWith("http://localhost")
-    ) {
-      setWebhookError("URL must use HTTPS (except for localhost)");
+    if (!webhookUrl.startsWith("https://")) {
+      setWebhookError("URL must use HTTPS");
       return;
     }
 
@@ -916,28 +931,17 @@ export const Profile: React.FC = () => {
                               {!webhook.enabled && (
                                 <Badge variant="secondary">Disabled</Badge>
                               )}
-                              {webhook.consecutive_failures > 0 && (
+                              {webhook.disabled_at && (
                                 <Tooltip>
                                   <TooltipTrigger asChild>
                                     <span className="inline-flex items-center gap-1">
                                       <AlertTriangle className="w-3.5 h-3.5 text-amber-500" />
-                                      <span className="text-xs text-amber-600">
-                                        {webhook.consecutive_failures} failure
-                                        {webhook.consecutive_failures !== 1
-                                          ? "s"
-                                          : ""}
-                                      </span>
                                     </span>
                                   </TooltipTrigger>
                                   <TooltipContent>
                                     <p>
-                                      {webhook.consecutive_failures} consecutive
-                                      delivery failure
-                                      {webhook.consecutive_failures !== 1
-                                        ? "s"
-                                        : ""}
-                                      {webhook.disabled_at &&
-                                        ". Auto-disabled due to failures."}
+                                      Auto-disabled due to repeated delivery
+                                      failures.
                                     </p>
                                   </TooltipContent>
                                 </Tooltip>

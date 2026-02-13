@@ -42,7 +42,6 @@ function makeWebhook(overrides: Partial<Webhook> = {}): Webhook {
     description: "My test webhook",
     created_at: "2025-01-01T00:00:00Z",
     updated_at: "2025-01-01T00:00:00Z",
-    consecutive_failures: 0,
     disabled_at: null,
     ...overrides,
   };
@@ -319,11 +318,11 @@ describe("Webhooks", () => {
     });
   });
 
-  it("shows failure count for webhooks with consecutive failures", async () => {
+  it("shows warning icon for auto-disabled webhooks", async () => {
     server.use(
       http.get("/admin/api/v1/users/:userId/webhooks", () => {
         return HttpResponse.json([
-          makeWebhook({ consecutive_failures: 3 }),
+          makeWebhook({ disabled_at: "2025-06-01T00:00:00Z", enabled: false }),
         ]);
       }),
     );
@@ -332,7 +331,9 @@ describe("Webhooks", () => {
 
     await waitFor(() => {
       expect(
-        within(container).getByText("3 failures"),
+        within(container).getByText(
+          "Auto-disabled due to repeated delivery failures.",
+        ),
       ).toBeInTheDocument();
     });
   });
@@ -377,13 +378,13 @@ describe("Webhooks", () => {
       ).toBeInTheDocument();
     });
 
-    // Try with an http:// (non-localhost) URL
+    // Try with an http:// URL
     await user.clear(urlInput);
     await user.type(urlInput, "http://example.com/hook");
     await user.click(within(dialog).getByRole("button", { name: "Create Webhook" }));
     await waitFor(() => {
       expect(
-        within(dialog).getByText("URL must use HTTPS (except for localhost)"),
+        within(dialog).getByText("URL must use HTTPS"),
       ).toBeInTheDocument();
     });
   });

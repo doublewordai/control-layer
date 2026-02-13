@@ -18,9 +18,6 @@ pub enum WebhookEventType {
     /// Batch failed entirely
     #[serde(rename = "batch.failed")]
     BatchFailed,
-    /// Batch was cancelled
-    #[serde(rename = "batch.cancelled")]
-    BatchCancelled,
 }
 
 impl std::fmt::Display for WebhookEventType {
@@ -28,7 +25,6 @@ impl std::fmt::Display for WebhookEventType {
         match self {
             Self::BatchCompleted => write!(f, "batch.completed"),
             Self::BatchFailed => write!(f, "batch.failed"),
-            Self::BatchCancelled => write!(f, "batch.cancelled"),
         }
     }
 }
@@ -40,7 +36,6 @@ impl std::str::FromStr for WebhookEventType {
         match s {
             "batch.completed" => Ok(Self::BatchCompleted),
             "batch.failed" => Ok(Self::BatchFailed),
-            "batch.cancelled" => Ok(Self::BatchCancelled),
             _ => Err(format!("Unknown event type: {}", s)),
         }
     }
@@ -87,7 +82,6 @@ impl WebhookEvent {
         let status = match event_type {
             WebhookEventType::BatchCompleted => "completed",
             WebhookEventType::BatchFailed => "failed",
-            WebhookEventType::BatchCancelled => "cancelled",
         };
 
         let finished_at = info.finished_at.unwrap_or_else(Utc::now);

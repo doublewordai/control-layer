@@ -173,7 +173,9 @@ impl WebhookDispatcher {
             let payload_str = match serde_json::to_string(&delivery.payload) {
                 Ok(s) => s,
                 Err(e) => {
-                    tracing::warn!(error = %e, delivery_id = %delivery.id, "Failed to serialize delivery payload");
+                    tracing::warn!(error = %e, delivery_id = %delivery.id, "Failed to serialize delivery payload, marking exhausted");
+                    let mut repo = Webhooks::new(&mut conn);
+                    let _ = repo.mark_exhausted(delivery.id).await;
                     continue;
                 }
             };
