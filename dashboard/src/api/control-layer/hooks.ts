@@ -1263,11 +1263,15 @@ export function useCreateBillingPortalSession() {
 
 // ===== DAEMONS HOOKS =====
 
-export function useDaemons(options?: DaemonsQuery) {
+export function useDaemons(
+  options?: DaemonsQuery,
+  queryOptions?: { enabled?: boolean },
+) {
   return useQuery({
     queryKey: ["daemons", "list", options],
     queryFn: () => dwctlApi.daemons.list(options),
     refetchInterval: 5000, // Refetch every 5 seconds to show live daemon status
+    enabled: queryOptions?.enabled ?? true,
   });
 }
 

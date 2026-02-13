@@ -1390,6 +1390,11 @@ impl BackgroundServices {
         }
     }
 
+    /// Get a clone of the shutdown token for coordinating early cancellation
+    pub fn shutdown_token(&self) -> tokio_util::sync::CancellationToken {
+        self.shutdown_token.clone()
+    }
+
     /// Gracefully shutdown all background tasks
     pub async fn shutdown(mut self) {
         // Signal all background tasks to shutdown
@@ -2017,6 +2022,16 @@ impl Application {
         // Apply middleware before path matching
         let middleware = middleware::from_fn_with_state(self.app_state, admin_ai_proxy_middleware);
         let service = middleware.layer(self.router);
+
+        // Cancel shutdown token when SIGTERM arrives, BEFORE axum starts waiting
+        // for in-flight connections to close. This lets background services (e.g.,
+        // fusillade daemon) abort in-flight HTTP tasks immediately, allowing
+        // proxy connections to close and axum's graceful shutdown to complete.
+        let shutdown_token = self.bg_services.shutdown_token();
+        let shutdown = async move {
+            shutdown.await;
+            shutdown_token.cancel();
+        };
 
         // Race the server against background task failures (fail-fast)
         let server_error: Option<anyhow::Error> = tokio::select! {
