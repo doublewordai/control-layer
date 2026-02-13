@@ -1939,7 +1939,7 @@ impl Application {
         )
         .await?;
 
-        // Enforce `stream_options.include_usage` for streaming chat completions (COR-13).
+        // Enforce `stream_options.include_usage` for streaming chat completions.
         //
         // For streaming requests, upstream providers only report token usage in the final
         // SSE chunk when `stream_options: { include_usage: true }` is set. Without it,
@@ -1947,11 +1947,12 @@ impl Application {
         // the request can't be billed. The dashboard sets this automatically, but direct API
         // callers may not.
         //
-        // This only applies to /chat/completions. The Responses API (/responses) always
-        // includes usage in its response object regardless of streaming, so no transform
-        // is needed there. Embeddings don't support streaming.
+        // This applies to /chat/completions and the legacy /completions endpoint (both
+        // support `stream_options`). The Responses API (/responses) always includes usage
+        // in its response object regardless of streaming, so no transform is needed there.
+        // Embeddings don't support streaming.
         let body_transform: onwards::BodyTransformFn = Arc::new(|path, _headers, body_bytes| {
-            if path.contains("/chat/completions")
+            if path.ends_with("/completions")
                 && let Ok(mut json_body) = serde_json::from_slice::<serde_json::Value>(body_bytes)
                 && let Some(obj) = json_body.as_object_mut()
                 && obj.get("stream").and_then(|v| v.as_bool()) == Some(true)
