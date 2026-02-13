@@ -281,10 +281,16 @@ async fn try_api_key_auth(parts: &axum::http::request::Parts, db: &PgPool) -> Op
     };
 
     // Check purpose matches the endpoint path
-    let path = parts.uri.path();
+    // Use OriginalUri to get the full path before axum nest() stripping
+    let path = parts
+        .extensions
+        .get::<axum::extract::OriginalUri>()
+        .map(|uri| uri.path().to_owned());
+    let path = path.as_deref().unwrap_or_else(|| parts.uri.path());
     let purpose_str = &api_key_data.purpose;
 
     // Validate purpose for the endpoint
+    debug!(path, purpose = purpose_str.as_str(), "API key purpose check");
     let is_valid = if path.starts_with("/admin/api/") {
         // Platform endpoints require platform keys
         purpose_str == "platform"
@@ -1054,6 +1060,7 @@ mod tests {
             avatar_url: None,
             roles: Some(vec![Role::StandardUser, Role::PlatformManager]),
             password_hash: None,
+            batch_notifications_enabled: None,
         };
         users_repo.update(user.id, &update).await.unwrap();
 

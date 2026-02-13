@@ -322,4 +322,4 @@ credits:
    `openssl rand -base64 32` to generate a secure random key.
 3. Make sure user registration is enabled or disabled, as per your requirements.
 4. Make sure the CORS settings are correct for your frontend.
-5. If using native auth, configure SMTP email transport for password resets (the default `file` transport is only suitable for development/testing). Update `auth.native.email.type` to `smtp` and provide your SMTP credentials.
+5. If using native auth, configure SMTP email transport for password resets (the default `file` transport is only suitable for development/testing). Update `email.type` to `smtp` and provide your SMTP credentials.

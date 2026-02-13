@@ -1,5 +1,52 @@
 # Changelog
 
+## [7.0.1](https://github.com/doublewordai/control-layer/compare/v7.0.0...v7.0.1) (2026-02-12)
+
+
+### Bug Fixes
+
+* instantiate tls client as the very first thing ([#687](https://github.com/doublewordai/control-layer/issues/687)) ([895cfab](https://github.com/doublewordai/control-layer/commit/895cfab5fd939467597225336292b3b5662c2b29))
+
+## [7.0.0](https://github.com/doublewordai/control-layer/compare/v6.1.0...v7.0.0) (2026-02-11)
+
+
+### ⚠ BREAKING CHANGES
+
+* email is now its own config, rather than a property of native_auth ([#685](https://github.com/doublewordai/control-layer/issues/685))
+* consolidate dashboard URL into single top-level config field ([#677](https://github.com/doublewordai/control-layer/issues/677))
+
+### Features
+
+* add per-request body size limit for batch file uploads ([#674](https://github.com/doublewordai/control-layer/issues/674)) ([6b91ee1](https://github.com/doublewordai/control-layer/commit/6b91ee1aeb76561c92ff0bf0fc4a66a34cc73e70))
+* add rate limiting and fallback sync for onwards notifications ([#676](https://github.com/doublewordai/control-layer/issues/676)) ([9f7431d](https://github.com/doublewordai/control-layer/commit/9f7431dd772b1fab682cbf9ba0fbc5af392beb47))
+* Consent banner ([#654](https://github.com/doublewordai/control-layer/issues/654)) ([7663d8f](https://github.com/doublewordai/control-layer/commit/7663d8f1ee123306d65eb701a5da1d68c8397ed3))
+* consolidate dashboard URL into single top-level config field ([#677](https://github.com/doublewordai/control-layer/issues/677)) ([9480826](https://github.com/doublewordai/control-layer/commit/9480826ee20d819589676b6c3d6f8101d163fe72))
+* email is now its own config, rather than a property of native_auth ([#685](https://github.com/doublewordai/control-layer/issues/685)) ([2569bd6](https://github.com/doublewordai/control-layer/commit/2569bd669e7d2bb600f9b075e4e5b3d7ad4495e0))
+* lazy-load model analytics on Models page ([#675](https://github.com/doublewordai/control-layer/issues/675)) ([728fb76](https://github.com/doublewordai/control-layer/commit/728fb769bb5a26294df734af0d62eaaec1bf1686))
+* Send email notifications to users on batch completions, optionally. Poll batches for completion rather than just calculate on query. ([#659](https://github.com/doublewordai/control-layer/issues/659)) ([00ae12b](https://github.com/doublewordai/control-layer/commit/00ae12bf9f5d6b3fa9da21d052870f1124ba979b))
+
+
+### Bug Fixes
+
+* align TraceLayer with OpenTelemetry HTTP semantic conventions ([#682](https://github.com/doublewordai/control-layer/issues/682)) ([94e61d2](https://github.com/doublewordai/control-layer/commit/94e61d25c073594bba75fd0caa0278d9b0a19917))
+* bump fusillade ([#683](https://github.com/doublewordai/control-layer/issues/683)) ([d7721fb](https://github.com/doublewordai/control-layer/commit/d7721fb16b35ee2de0b53584b9757eece1f284d7))
+* path extraction for endpoint access checks must use unstripped paths ([#660](https://github.com/doublewordai/control-layer/issues/660)) ([b796bc2](https://github.com/doublewordai/control-layer/commit/b796bc2f89274e39128afa52ee89fcaef99a8c3f))
+* Repair tracing by fixing otel package incompatability; add trace ids back to spans. ([#663](https://github.com/doublewordai/control-layer/issues/663)) ([3a45940](https://github.com/doublewordai/control-layer/commit/3a45940724a7514cf87c7f72692a036dbde2a325))
+
+## [6.1.0](https://github.com/doublewordai/control-layer/compare/v6.0.0...v6.1.0) (2026-02-09)
+
+
+### Features
+
+* batch acceptance criteria (part 1) ([#658](https://github.com/doublewordai/control-layer/issues/658)) ([61a3f93](https://github.com/doublewordai/control-layer/commit/61a3f93bf156eb34d4efd29b34b779a9efa53a39))
+
+
+### Bug Fixes
+
+* better handling of large file errors ([#669](https://github.com/doublewordai/control-layer/issues/669)) ([fe44b81](https://github.com/doublewordai/control-layer/commit/fe44b81f09c047e4ad35c2839e06b8ff62ecf905))
+* bump fusillade to 5.1.0 ([#672](https://github.com/doublewordai/control-layer/issues/672)) ([c6cda1e](https://github.com/doublewordai/control-layer/commit/c6cda1ee72e406879dfda2128c64e283a6148b42))
+* default throughput ([#665](https://github.com/doublewordai/control-layer/issues/665)) ([606a114](https://github.com/doublewordai/control-layer/commit/606a1142fec0ae17adad796fc8237fa1e6d8ca38))
+
 ## [6.0.0](https://github.com/doublewordai/control-layer/compare/v5.0.3...v6.0.0) (2026-02-04)
 
 

@@ -216,7 +216,7 @@ dwctl_session: {{user2_jwt}}
 [MultipartFormData]
 purpose: batch
 file: file,restricted.jsonl;
-HTTP 400
+HTTP 403
 [Asserts]
 body contains "Model"
 body contains "has not been configured or is not available to user"
@@ -228,7 +228,7 @@ dwctl_session: {{admin_jwt}}
 [MultipartFormData]
 purpose: batch
 file: file,gpt4.jsonl;
-HTTP 400
+HTTP 403
 [Asserts]
 body contains "Model"
 body contains "has not been configured or is not available to user"

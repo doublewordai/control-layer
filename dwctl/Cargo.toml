@@ -1,6 +1,6 @@
 [package]
 name = "dwctl"
-version = "6.0.0"
+version = "7.0.1"
 edition = "2024"
 description = "The Doubleword Control Layer - A self-hostable observability and analytics platform for LLM applications"
 license = "MIT OR Apache-2.0"
@@ -19,7 +19,7 @@ embedded-db = ["dep:postgresql_embedded"]
 
 [dependencies]
 axum = { version = "0.8", features = ["multipart"] }
-fusillade = { version="5.0.0" }
+fusillade = { version="5.3.0" }
 tokio = { version = "1.0", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = "0.7"
@@ -42,7 +42,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # OpenTelemetry
 opentelemetry = "0.31.0"
 opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.31", features = [
+opentelemetry-otlp = { version = "0.31", default-features = false, features = [
   "http-proto",
   "reqwest-client",
 ] }
@@ -126,6 +126,9 @@ async-stripe-billing = { version = "1.0.0-rc.0", features = [
   "billing_portal_session",
 ] }
 sqlx-pool-router = "0.2.0"
+minijinja = "2.15.1"
+multer = "3.1.0"
+ctor = "0.4"
 
 [dev-dependencies]
 axum-test = { version = "18.4.1" }

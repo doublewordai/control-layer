@@ -1,19 +1,42 @@
-//! Email service for sending password reset emails and notifications.
+//! Email service for sending password reset emails and notifications
 
+use crate::{config::Config, errors::Error};
+/// Outcome of a completed batch for notification purposes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchOutcome {
+    Completed,
+    PartiallyCompleted,
+    Failed,
+}
 use lettre::{
     AsyncFileTransport, AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor,
     message::{Mailbox, header::ContentType},
     transport::smtp::authentication::Credentials,
 };
+use minijinja::{Environment, context};
 use std::path::Path;
 
-use crate::{config::Config, errors::Error};
+pub struct BatchCompletionInfo {
+    pub batch_id: String,
+    pub endpoint: String,
+    pub model: String,
+    pub outcome: BatchOutcome,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub finished_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub total_requests: i64,
+    pub completed_requests: i64,
+    pub failed_requests: i64,
+    pub completion_window: String,
+    pub filename: Option<String>,
+    pub description: Option<String>,
+}
 
 pub struct EmailService {
     transport: EmailTransport,
     from_email: String,
     from_name: String,
     base_url: String,
+    reply_to: Option<String>,
 }
 
 enum EmailTransport {
@@ -23,7 +46,7 @@ enum EmailTransport {
 
 impl EmailService {
     pub fn new(config: &Config) -> Result<Self, Error> {
-        let email_config = &config.auth.native.email;
+        let email_config = &config.email;
 
         let transport = match &email_config.transport {
             crate::config::EmailTransportConfig::Smtp {
@@ -68,7 +91,8 @@ impl EmailService {
             transport,
             from_email: email_config.from_email.clone(),
             from_name: email_config.from_name.clone(),
-            base_url: email_config.password_reset.base_url.clone(),
+            base_url: config.dashboard_url.clone(),
+            reply_to: email_config.reply_to.clone(),
         })
     }
 
@@ -82,40 +106,40 @@ impl EmailService {
         let reset_link = format!("{}/reset-password?id={}&token={}", self.base_url, token_id, token);
 
         let subject = "Password Reset Request";
-        let body = self.create_password_reset_body(to_name, &reset_link);
+        let name = to_name.unwrap_or("User");
+        let body = self.render_password_reset_body(name, &reset_link).map_err(|e| Error::Internal {
+            operation: format!("render email template: {e}"),
+        })?;
 
         self.send_email(to_email, to_name, subject, &body).await
     }
 
     async fn send_email(&self, to_email: &str, to_name: Option<&str>, subject: &str, body: &str) -> Result<(), Error> {
         // Create from mailbox
-        let from = format!("{} <{}>", self.from_name, self.from_email)
-            .parse::<Mailbox>()
-            .map_err(|e| Error::Internal {
-                operation: format!("parse from email: {e}"),
-            })?;
+        let from_address = self.from_email.parse().map_err(|e| Error::Internal {
+            operation: format!("Failed to parse from email: {e}"),
+        })?;
+        let from = Mailbox::new(Some(self.from_name.clone()), from_address);
 
         // Create to mailbox
-        let to = if let Some(name) = to_name {
-            format!("{name} <{to_email}>")
-        } else {
-            to_email.to_string()
-        }
-        .parse::<Mailbox>()
-        .map_err(|e| Error::Internal {
-            operation: format!("parse to email: {e}"),
+        let to_address = to_email.parse().map_err(|e| Error::Internal {
+            operation: format!("Failed to parse to email: {e}"),
         })?;
+        let to = Mailbox::new(to_name.map(|n| n.to_string()), to_address);
 
-        // Build message
-        let message = Message::builder()
-            .from(from)
-            .to(to)
-            .subject(subject)
-            .header(ContentType::TEXT_HTML)
-            .body(body.to_string())
-            .map_err(|e| Error::Internal {
-                operation: format!("build email message: {e}"),
+        let mut builder = Message::builder().from(from).to(to).subject(subject).header(ContentType::TEXT_HTML);
+
+        if let Some(ref reply_to_email) = self.reply_to {
+            let reply_to_address = reply_to_email.parse().map_err(|e| Error::Internal {
+                operation: format!("Failed to parse reply-to email: {e}"),
             })?;
+            let reply_to = Mailbox::new(Some(self.from_name.clone()), reply_to_address);
+            builder = builder.reply_to(reply_to);
+        }
+
+        let message = builder.body(body.to_string()).map_err(|e| Error::Internal {
+            operation: format!("build email message: {e}"),
+        })?;
 
         // Send based on transport type
         match &self.transport {
@@ -134,50 +158,108 @@ impl EmailService {
         Ok(())
     }
 
-    fn create_password_reset_body(&self, to_name: Option<&str>, reset_link: &str) -> String {
-        let greeting = if let Some(name) = to_name {
-            format!("Hello {name},")
+    pub async fn send_batch_completion_email(
+        &self,
+        to_email: &str,
+        to_name: Option<&str>,
+        info: &BatchCompletionInfo,
+        first_batch: bool,
+    ) -> Result<(), Error> {
+        let status_text = match info.outcome {
+            BatchOutcome::Completed => "completed",
+            BatchOutcome::PartiallyCompleted => "completed with errors",
+            BatchOutcome::Failed => "failed",
+        };
+        let subject = if first_batch {
+            format!("Your first Doubleword batch has {status_text}")
         } else {
-            "Hello,".to_string()
+            format!("Batch {} — {}", &info.batch_id[..8.min(info.batch_id.len())], status_text)
+        };
+        let name = to_name.unwrap_or("User");
+        let body = self
+            .render_batch_completion_body(name.to_string(), info, first_batch)
+            .map_err(|e| Error::Internal {
+                operation: format!("render email template: {e}"),
+            })?;
+        self.send_email(to_email, to_name, &subject, &body).await
+    }
+
+    pub fn render_batch_completion_body(
+        &self,
+        to_name: String,
+        info: &BatchCompletionInfo,
+        first_batch: bool,
+    ) -> Result<String, minijinja::Error> {
+        let mut env = Environment::new();
+        if first_batch {
+            env.add_template("email", include_str!("../../email_templates/first_batch.html"))?;
+        } else {
+            env.add_template("email", include_str!("../../email_templates/batch_complete.html"))?;
+        }
+
+        let (outcome_label, outcome_icon, header_color, outcome_message) = match info.outcome {
+            BatchOutcome::Completed => ("Completed", "✓", "#16a34a", "Your batch has finished processing successfully."),
+            BatchOutcome::PartiallyCompleted => (
+                "Completed with some failures",
+                "⚠",
+                "#d97706",
+                "Your batch has finished processing, but some requests failed.",
+            ),
+            BatchOutcome::Failed => ("Failed", "✗", "#dc2626", "There was a problem processing your batch."),
         };
 
-        format!(
-            r#"<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="utf-8">
-    <title>Password Reset Request</title>
-    <style>
-        body {{ font-family: Arial, sans-serif; line-height: 1.6; color: #333; }}
-        .container {{ max-width: 600px; margin: 0 auto; padding: 20px; }}
-        .footer {{ margin-top: 30px; font-size: 12px; color: #666; }}
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h2>Password Reset Request</h2>
+        let duration = info
+            .finished_at
+            .map(|finished| {
+                let dur = finished - info.created_at;
+                let total_secs = dur.num_seconds();
+                if total_secs < 60 {
+                    format!("{total_secs}s")
+                } else if total_secs < 3600 {
+                    format!("{}m {}s", total_secs / 60, total_secs % 60)
+                } else {
+                    format!("{}h {}m", total_secs / 3600, (total_secs % 3600) / 60)
+                }
+            })
+            .unwrap_or_default();
 
-        <p>{greeting}</p>
+        let base = self.base_url.trim_end_matches('/');
+        let dashboard_link = format!("{base}/batches/{}", info.batch_id);
+        let profile_link = format!("{base}/profile");
 
-        <p>We received a request to reset your password. If you didn't make this request, you can safely ignore this email.</p>
+        env.get_template("email")?.render(context! {
+            to_name,
+            batch_id => &info.batch_id,
+            model => &info.model,
+            endpoint => &info.endpoint,
+            outcome_label,
+            outcome_icon,
+            outcome_message,
+            header_color,
+            created_at => info.created_at.format("%b %d, %Y %H:%M UTC").to_string(),
+            finished_at => info.finished_at.map(|t| t.format("%b %d, %Y %H:%M UTC").to_string()).unwrap_or_default(),
+            duration,
+            completed_requests => info.completed_requests,
+            failed_requests => info.failed_requests,
+            total_requests => info.total_requests,
+            dashboard_link,
+            profile_link,
+            completion_window => &info.completion_window,
+            filename => info.filename.as_deref().unwrap_or(""),
+            description => info.description.as_deref().unwrap_or(""),
+            from_name => &self.from_name,
+            reply_to => self.reply_to.as_deref().unwrap_or(&self.from_email),
+        })
+    }
 
-        <p>To reset your password, click the link below:</p>
+    fn render_password_reset_body(&self, to_name: &str, reset_link: &str) -> Result<String, minijinja::Error> {
+        let mut env = Environment::new();
+        env.add_template("email", include_str!("../../email_templates/password_reset.html"))?;
 
-        <p><a href="{reset_link}">Reset your password</a></p>
-
-        <p>Or copy and paste this link into your browser:</p>
-        <p>{reset_link}</p>
-
-        <p>This link will expire in 30 minutes for security reasons.</p>
-
-        <div class="footer">
-            <p>If you're having trouble with the button above, copy and paste the URL into your web browser.</p>
-            <p>This is an automated message, please do not reply to this email.</p>
-        </div>
-    </div>
-</body>
-</html>"#
-        )
+        env.get_template("email")?.render(context! {
+            to_name,
+            reset_link,
+        })
     }
 }
 
@@ -198,7 +280,9 @@ mod tests {
         let config = create_test_config();
         let email_service = EmailService::new(&config).unwrap();
 
-        let body = email_service.create_password_reset_body(Some("John Doe"), "https://example.com/reset?token=abc123");
+        let body = email_service
+            .render_password_reset_body("John Doe", "https://example.com/reset?token=abc123")
+            .unwrap();
 
         assert!(body.contains("Hello John Doe,"));
         assert!(body.contains("https://example.com/reset?token=abc123"));
@@ -210,9 +294,172 @@ mod tests {
         let config = create_test_config();
         let email_service = EmailService::new(&config).unwrap();
 
-        let body = email_service.create_password_reset_body(None, "https://example.com/reset?token=abc123");
+        let body = email_service
+            .render_password_reset_body("User", "https://example.com/reset?token=abc123")
+            .unwrap();
 
-        assert!(body.contains("Hello,"));
+        assert!(body.contains("Hello User,"));
         assert!(body.contains("https://example.com/reset?token=abc123"));
+    }
+
+    #[tokio::test]
+    async fn test_first_batch_email_body_completed() {
+        let config = create_test_config();
+        let email_service = EmailService::new(&config).unwrap();
+
+        let info = BatchCompletionInfo {
+            batch_id: "abcd1234-5678-90ab-cdef-1234567890ab".to_string(),
+            endpoint: "/v1/chat/completions".to_string(),
+            model: "gpt-4o".to_string(),
+            outcome: BatchOutcome::Completed,
+            created_at: chrono::Utc::now(),
+            finished_at: Some(chrono::Utc::now()),
+            total_requests: 50,
+            completed_requests: 50,
+            failed_requests: 0,
+
+            completion_window: "24h".to_string(),
+            filename: Some("first-run.jsonl".to_string()),
+            description: None,
+        };
+
+        let body = email_service.render_batch_completion_body("Bob".into(), &info, true).unwrap();
+
+        assert!(body.contains("Hi Bob,"));
+        assert!(body.contains("Your results are ready!"));
+        assert!(body.contains("http://localhost:3001/batches/abcd1234-5678-90ab-cdef-1234567890ab"));
+        assert!(body.contains("Batch Complete"));
+        assert!(body.contains("Run another batch"));
+        assert!(body.contains("Autobatcher"));
+    }
+
+    #[tokio::test]
+    async fn test_batch_completion_email_body_completed() {
+        let config = create_test_config();
+        let email_service = EmailService::new(&config).unwrap();
+
+        let info = BatchCompletionInfo {
+            batch_id: "abcd1234-5678-90ab-cdef-1234567890ab".to_string(),
+            endpoint: "/v1/chat/completions".to_string(),
+            model: "gpt-4o".to_string(),
+            outcome: BatchOutcome::Completed,
+            created_at: chrono::Utc::now(),
+            finished_at: Some(chrono::Utc::now()),
+            total_requests: 100,
+            completed_requests: 100,
+            failed_requests: 0,
+
+            completion_window: "24h".to_string(),
+            filename: Some("input.jsonl".to_string()),
+            description: Some("Weekly report generation".to_string()),
+        };
+
+        let body = email_service.render_batch_completion_body("Alice".into(), &info, false).unwrap();
+
+        assert!(body.contains("Hi Alice,"));
+        assert!(body.contains("Completed"));
+        assert!(body.contains("finished processing successfully"));
+        assert!(body.contains("/v1/chat/completions"));
+        assert!(body.contains("gpt-4o"));
+        assert!(body.contains("100"));
+        assert!(body.contains("http://localhost:3001/batches/abcd1234-5678-90ab-cdef-1234567890ab"));
+        assert!(body.contains("http://localhost:3001/profile"));
+        assert!(body.contains("24h"));
+        assert!(body.contains("input.jsonl"));
+        assert!(body.contains("Weekly report generation"));
+    }
+
+    #[tokio::test]
+    async fn test_batch_completion_email_body_partially_completed() {
+        let config = create_test_config();
+        let email_service = EmailService::new(&config).unwrap();
+
+        let info = BatchCompletionInfo {
+            batch_id: "abcd1234-5678-90ab-cdef-1234567890ab".to_string(),
+            endpoint: "/v1/chat/completions".to_string(),
+            model: "gpt-4o".to_string(),
+            outcome: BatchOutcome::PartiallyCompleted,
+            created_at: chrono::Utc::now(),
+            finished_at: Some(chrono::Utc::now()),
+            total_requests: 100,
+            completed_requests: 98,
+            failed_requests: 2,
+
+            completion_window: "24h".to_string(),
+            filename: Some("input.jsonl".to_string()),
+            description: None,
+        };
+
+        let body = email_service.render_batch_completion_body("Alice".into(), &info, false).unwrap();
+
+        assert!(body.contains("Completed with some failures"));
+        assert!(body.contains("some requests failed"));
+        assert!(body.contains(">2<"));
+    }
+
+    /// Exercises the full send_email path (mailbox construction + message build + file transport)
+    /// with various name/email combinations that could trip up RFC 5322 parsing.
+    #[tokio::test]
+    async fn test_send_email_with_various_recipient_names() {
+        let config = create_test_config();
+        let email_service = EmailService::new(&config).unwrap();
+
+        let cases: Vec<(Option<&str>, &str)> = vec![
+            // Normal name
+            (Some("Alice Smith"), "alice@example.com"),
+            // No display name
+            (None, "alice@example.com"),
+            // Email address as display name (the bug that hit production)
+            (Some("josh.cowan@doubleword.ai"), "josh.cowan@doubleword.ai"),
+            // Name with special RFC 5322 characters
+            (Some("O'Brien, James"), "james@example.com"),
+            // Name with parentheses
+            (Some("Alice (Engineering)"), "alice@example.com"),
+            // Name with quotes
+            (Some("Alice \"The Boss\" Smith"), "alice@example.com"),
+            // Unicode name
+            (Some("Müller, François"), "francois@example.com"),
+            // Single word
+            (Some("admin"), "admin@example.com"),
+            // Empty string display name
+            (Some(""), "alice@example.com"),
+        ];
+
+        for (name, email) in cases {
+            let result = email_service.send_email(email, name, "Test Subject", "<p>Hello</p>").await;
+            assert!(
+                result.is_ok(),
+                "send_email failed for name={name:?}, email={email:?}: {:?}",
+                result.unwrap_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_batch_completion_email_body_failed() {
+        let config = create_test_config();
+        let email_service = EmailService::new(&config).unwrap();
+
+        let info = BatchCompletionInfo {
+            batch_id: "abcd1234-5678-90ab-cdef-1234567890ab".to_string(),
+            endpoint: "/v1/chat/completions".to_string(),
+            model: "gpt-4o".to_string(),
+            outcome: BatchOutcome::Failed,
+            created_at: chrono::Utc::now(),
+            finished_at: Some(chrono::Utc::now()),
+            total_requests: 100,
+            completed_requests: 0,
+            failed_requests: 100,
+
+            completion_window: "24h".to_string(),
+            filename: None,
+            description: None,
+        };
+
+        let body = email_service.render_batch_completion_body("Alice".into(), &info, false).unwrap();
+
+        assert!(body.contains("Failed"));
+        assert!(body.contains("problem processing your batch"));
+        assert!(body.contains(">100<"));
     }
 }

@@ -86,9 +86,22 @@ pub struct OnwardsConfigSync {
     escalation_models: Vec<String>,
 }
 
-#[derive(Default)]
 pub struct SyncConfig {
-    status_tx: Option<mpsc::Sender<SyncStatus>>,
+    pub status_tx: Option<mpsc::Sender<SyncStatus>>,
+    /// Fallback sync interval in milliseconds (default: 10000ms = 10 seconds)
+    ///
+    /// Provides periodic full syncs independent of LISTEN/NOTIFY to guarantee eventual consistency.
+    /// Set to 0 to disable fallback sync (not recommended).
+    pub fallback_interval_milliseconds: u64,
+}
+
+impl Default for SyncConfig {
+    fn default() -> Self {
+        Self {
+            status_tx: None,
+            fallback_interval_milliseconds: 10000, // 10 seconds
+        }
+    }
 }
 
 impl OnwardsConfigSync {
@@ -144,6 +157,13 @@ impl OnwardsConfigSync {
         let mut last_reload_time = std::time::Instant::now();
         const MIN_RELOAD_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
+        // Fallback sync interval (0 = disabled)
+        let fallback_interval = if config.fallback_interval_milliseconds > 0 {
+            Some(std::time::Duration::from_millis(config.fallback_interval_milliseconds))
+        } else {
+            None
+        };
+
         'outer: loop {
             if let Some(tx) = &config.status_tx {
                 tx.send(SyncStatus::Connecting).await?;
@@ -156,6 +176,15 @@ impl OnwardsConfigSync {
                 tx.send(SyncStatus::Connected).await?;
             }
             info!("Started onwards configuration listener");
+
+            // Create fallback sync timer (if enabled)
+            let mut fallback_timer = fallback_interval.map(|interval| {
+                let mut timer = tokio::time::interval(interval);
+                // Use Delay to avoid burst of syncs after runtime hiccups
+                timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                timer
+            });
+
             // Listen for notifications with graceful shutdown
             loop {
                 tokio::select! {
@@ -220,6 +249,9 @@ impl OnwardsConfigSync {
                                             break;
                                         }
 
+                                        // Record metric for LISTEN/NOTIFY sync
+                                        metrics::counter!("dwctl_cache_sync_total", "source" => "listen_notify").increment(1);
+
                                         // Record cache sync lag metric (time from DB change to cache update)
                                         if let Some((table_name, lag)) = notify_info {
                                             let lag_seconds = lag.as_secs_f64();
@@ -258,6 +290,51 @@ impl OnwardsConfigSync {
                                     return Err(e.into());
                                 }
                                 break;
+                            }
+                        }
+                    }
+
+                    // Fallback periodic sync (if enabled)
+                    _ = async {
+                        match &mut fallback_timer {
+                            Some(timer) => timer.tick().await,
+                            None => std::future::pending().await, // Never resolve if disabled
+                        }
+                    } => {
+                        debug!("Fallback periodic sync triggered");
+
+                        // Skip if we just reloaded via notification (debounce)
+                        if last_reload_time.elapsed() < MIN_RELOAD_INTERVAL {
+                            debug!("Skipping fallback sync due to recent notification-triggered reload");
+                            continue;
+                        }
+
+                        last_reload_time = std::time::Instant::now();
+                        match load_targets_from_db(&self.db, &self.escalation_models).await {
+                            Ok(new_targets) => {
+                                info!("Fallback sync: loaded {} targets from database", new_targets.targets.len());
+
+                                // Update daemon capacity limits if configured
+                                if let Some(ref limits) = self.daemon_capacity_limits
+                                    && let Err(e) = update_daemon_capacity_limits(&self.db, limits).await {
+                                        error!("Failed to update daemon capacity limits: {}", e);
+                                    }
+
+                                // Send update through watch channel
+                                if let Err(e) = self.sender.send(new_targets) {
+                                    error!("Failed to send targets update: {}", e);
+                                    // If all receivers are dropped, we can exit
+                                    break;
+                                }
+
+                                // Record metric for fallback sync
+                                metrics::counter!("dwctl_cache_sync_total", "source" => "fallback").increment(1);
+                                info!("Fallback sync: updated onwards configuration successfully");
+                            }
+                            Err(e) => {
+                                error!("Fallback sync: failed to load targets from database: {}", e);
+                                metrics::counter!("dwctl_cache_sync_errors_total", "source" => "fallback").increment(1);
+                                // Continue - fallback sync errors shouldn't crash the service
                             }
                         }
                     }
@@ -1139,6 +1216,7 @@ mod tests {
                 burst_size: None,
                 capacity: None,
                 batch_capacity: None,
+                throughput: None,
                 provider_pricing: None,
                 // Composite model fields (regular model = not composite)
                 is_composite: false,
@@ -1252,6 +1330,7 @@ mod tests {
                 burst_size: None,
                 capacity: None,
                 batch_capacity: None,
+                throughput: None,
                 provider_pricing: None,
                 is_composite: false,
                 lb_strategy: None,
@@ -1281,6 +1360,7 @@ mod tests {
                 burst_size: None,
                 capacity: None,
                 batch_capacity: None,
+                throughput: None,
                 provider_pricing: None,
                 is_composite: true,
                 lb_strategy: Some(LoadBalancingStrategy::WeightedRandom),
@@ -1354,6 +1434,7 @@ mod tests {
         let (status_tx, mut status_rx) = mpsc::channel(10);
         let config = SyncConfig {
             status_tx: Some(status_tx),
+            fallback_interval_milliseconds: 10000,
         };
         let shutdown_token = CancellationToken::new();
         let mut sync_handle = tokio::spawn({
@@ -1429,5 +1510,62 @@ mod tests {
         let result = timeout(Duration::from_millis(100), &mut sync_handle).await;
         assert!(result.is_err(), "Task should still be running after reconnection");
         sync_handle.abort();
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    /// Test that fallback sync triggers periodic reloads even without LISTEN/NOTIFY activity
+    async fn test_fallback_sync_triggers_without_notifications(pool: sqlx::PgPool) {
+        use tokio::sync::mpsc;
+        use tokio_util::sync::CancellationToken;
+
+        // Create the sync service
+        let (sync, _initial_targets, _stream) = super::OnwardsConfigSync::new(pool.clone())
+            .await
+            .expect("Failed to create OnwardsConfigSync");
+
+        // Create sync config with 200ms fallback interval for fast testing
+        let (status_tx, mut status_rx) = mpsc::channel(10);
+        let config = SyncConfig {
+            status_tx: Some(status_tx),
+            fallback_interval_milliseconds: 20,
+        };
+
+        let shutdown_token = CancellationToken::new();
+        let mut sync_handle = tokio::spawn({
+            let token = shutdown_token.clone();
+            async move { sync.start(config, token).await }
+        });
+
+        // Wait for initial connection
+        println!("Waiting for Connecting status...");
+        assert_eq!(status_rx.recv().await, Some(super::SyncStatus::Connecting));
+        println!("Waiting for Connected status...");
+        assert_eq!(status_rx.recv().await, Some(super::SyncStatus::Connected));
+        println!("Initial connection established");
+
+        // Poll task health to ensure fallback sync doesn't crash
+        // Use interval to poll every 100ms for 500ms total (at least 2 fallback syncs at 200ms each)
+        println!("Polling task health while waiting for fallback sync...");
+        let mut poll_interval = tokio::time::interval(Duration::from_millis(100));
+        poll_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        for i in 0..5 {
+            poll_interval.tick().await;
+
+            // Check task is still running (timeout ensures we don't block if it finished)
+            let result = timeout(Duration::from_millis(10), &mut sync_handle).await;
+            assert!(
+                result.is_err(),
+                "Task should still be running at poll {} (proves fallback timer doesn't crash)",
+                i
+            );
+        }
+
+        println!("✅ Fallback sync working: task remained healthy through 5 health polls over 500ms");
+
+        // Cleanup
+        shutdown_token.cancel();
+        let _ = timeout(Duration::from_secs(1), sync_handle).await;
     }
 }

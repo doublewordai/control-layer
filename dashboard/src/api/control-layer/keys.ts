@@ -25,6 +25,16 @@ export const queryKeys = {
     // Composite model components
     components: (modelId: string) =>
       ["models", "byId", modelId, "components"] as const,
+    // Separate metrics query for lazy loading
+    metrics: (options?: {
+      skip?: number;
+      limit?: number;
+      endpoint?: string;
+      accessible?: boolean;
+      search?: string;
+      is_composite?: boolean;
+      group?: string;
+    }) => ["models", "metrics", options] as const,
   },
 
   // Groups

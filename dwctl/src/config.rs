@@ -107,6 +107,9 @@ pub struct Config {
     pub host: String,
     /// HTTP server port to bind to
     pub port: u16,
+    /// Base URL where the dashboard is accessible (e.g., "https://app.example.com")
+    /// Used for password reset links, payment redirect URLs, and batch notification emails.
+    pub dashboard_url: String,
     /// Deprecated: Use `database` field instead. Kept for backward compatibility.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub database_url: Option<String>,
@@ -163,6 +166,8 @@ pub struct Config {
     pub sample_files: SampleFilesConfig,
     /// Resource limits for protecting system capacity
     pub limits: LimitsConfig,
+    /// Email configuration for password resets and notifications
+    pub email: EmailConfig,
 }
 
 /// Individual pool configuration with all SQLx parameters.
@@ -450,23 +455,11 @@ pub enum PaymentConfig {
     /// - `DWCTL_PAYMENT__STRIPE__API_KEY` - Stripe secret API key
     /// - `DWCTL_PAYMENT__STRIPE__WEBHOOK_SECRET` - Webhook signing secret
     /// - `DWCTL_PAYMENT__STRIPE__PRICE_ID` - Price ID for the payment product
-    /// - `DWCTL_PAYMENT__STRIPE__HOST_URL` - Base URL for redirect URLs (e.g., "https://app.example.com")
     Stripe(StripeConfig),
     /// Dummy payment provider for testing
     /// Set configuration via:
     /// - `DWCTL_PAYMENT__DUMMY__AMOUNT` - Amount to add (defaults to $50)
-    /// - `DWCTL_PAYMENT__DUMMY__HOST_URL` - Base URL for redirect URLs (e.g., "https://app.example.com")
     Dummy(DummyConfig),
-}
-
-impl PaymentConfig {
-    /// Get the host URL configured for this payment provider
-    pub fn host_url(&self) -> Option<&str> {
-        match self {
-            PaymentConfig::Stripe(config) => config.host_url.as_deref(),
-            PaymentConfig::Dummy(config) => config.host_url.as_deref(),
-        }
-    }
 }
 
 /// Stripe payment configuration.
@@ -478,9 +471,6 @@ pub struct StripeConfig {
     pub webhook_secret: String,
     /// Stripe price ID for the payment (starts with price_)
     pub price_id: String,
-    /// Base URL for redirect URLs (e.g., "https://app.example.com")
-    /// This is used to construct success/cancel URLs for checkout sessions
-    pub host_url: Option<String>,
     /// Whether to enable invoice creation for checkout sessions (default: false)
     #[serde(default)]
     pub enable_invoice_creation: bool,
@@ -491,10 +481,6 @@ pub struct StripeConfig {
 pub struct DummyConfig {
     /// Amount to add in dollars (required)
     pub amount: rust_decimal::Decimal,
-    /// Base URL for redirect URLs (e.g., "https://app.example.com")
-    /// This is used to construct success/cancel URLs for checkout sessions
-    #[serde(default)]
-    pub host_url: Option<String>,
 }
 
 /// Frontend metadata displayed in the UI.
@@ -598,8 +584,9 @@ pub struct NativeAuthConfig {
     pub password: PasswordConfig,
     /// Session cookie configuration
     pub session: SessionConfig,
-    /// Email configuration for password resets
-    pub email: EmailConfig,
+    /// How long password reset tokens are valid
+    #[serde(with = "humantime_serde")]
+    pub password_reset_token_duration: Duration,
 }
 
 /// Proxy header-based authentication configuration.
@@ -718,8 +705,8 @@ pub struct EmailConfig {
     pub from_email: String,
     /// Sender display name
     pub from_name: String,
-    /// Password reset email configuration
-    pub password_reset: PasswordResetEmailConfig,
+    /// Who to set the reply to field from
+    pub reply_to: Option<String>,
 }
 
 /// Email transport configuration - either SMTP or file-based for testing.
@@ -744,17 +731,6 @@ pub enum EmailTransportConfig {
         /// Directory path where email files will be written
         path: String,
     },
-}
-
-/// Password reset email configuration.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct PasswordResetEmailConfig {
-    /// How long reset tokens are valid
-    #[serde(with = "humantime_serde")]
-    pub token_expiry: Duration,
-    /// Base URL for reset links (e.g., <https://app.example.com>)
-    pub base_url: String,
 }
 
 /// File upload/download configuration for batch processing.
@@ -797,6 +773,29 @@ impl Default for FilesConfig {
 pub struct LimitsConfig {
     /// File limits (size, request count, and upload concurrency)
     pub files: FileLimitsConfig,
+    /// Request limits (per-request body size within batch files)
+    pub requests: RequestLimitsConfig,
+}
+
+/// Request limits configuration.
+///
+/// Controls per-request body size limits within batch JSONL files
+/// to prevent individual requests from overwhelming inference providers.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RequestLimitsConfig {
+    /// Maximum body size in bytes for individual requests within batch JSONL files.
+    /// Set to 0 for unlimited (not recommended for production).
+    /// Default: 10MB
+    pub max_body_size: u64,
+}
+
+impl Default for RequestLimitsConfig {
+    fn default() -> Self {
+        Self {
+            max_body_size: 10 * 1024 * 1024, // 10MB
+        }
+    }
 }
 
 /// File limits configuration.
@@ -858,6 +857,36 @@ pub struct BatchConfig {
     pub allowed_completion_windows: Vec<String>,
     /// Files configuration for batch file uploads/downloads
     pub files: FilesConfig,
+    /// Default throughput (requests/second) for models without explicit throughput configured.
+    /// Used for SLA capacity calculations when accepting new batches.
+    /// If not specified or null, defaults to 100.0 req/s. This is quite high, in favour of over-acceptance.
+    /// Must be positive (> 0) when specified.
+    #[serde(default = "default_batch_throughput", deserialize_with = "deserialize_positive_throughput")]
+    pub default_throughput: f32,
+}
+
+fn default_batch_throughput() -> f32 {
+    100.0
+}
+
+/// Custom deserializer that validates throughput is positive, with null/missing defaulting to 100.0
+fn deserialize_positive_throughput<'de, D>(deserializer: D) -> Result<f32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+
+    // First, try to deserialize as Option<f32> to handle null
+    let opt: Option<f32> = Option::deserialize(deserializer)?;
+
+    match opt {
+        None => Ok(default_batch_throughput()), // null or missing -> use default
+        Some(value) if value <= 0.0 => Err(D::Error::custom(format!(
+            "default_throughput must be positive (> 0), got {}",
+            value
+        ))),
+        Some(value) => Ok(value),
+    }
 }
 
 impl Default for BatchConfig {
@@ -866,6 +895,7 @@ impl Default for BatchConfig {
             enabled: true,
             allowed_completion_windows: vec!["24h".to_string()],
             files: FilesConfig::default(),
+            default_throughput: default_batch_throughput(),
         }
     }
 }
@@ -944,6 +974,22 @@ pub struct DaemonConfig {
     ///   - x-fusillade-batch-endpoint
     #[serde(default = "default_batch_metadata_fields_dwctl")]
     pub batch_metadata_fields: Vec<String>,
+
+    /// Interval for running the orphaned row purge task (milliseconds).
+    /// Deletes orphaned request_templates and requests whose parent file/batch
+    /// has been soft-deleted, for right-to-erasure compliance.
+    /// Set to 0 to disable purging. Default: 600000 (10 minutes).
+    pub purge_interval_ms: u64,
+
+    /// Maximum number of orphaned rows to delete per purge iteration.
+    /// Each iteration deletes up to this many requests and this many request_templates.
+    /// Default: 1000.
+    pub purge_batch_size: i64,
+
+    /// Throttle delay between consecutive purge batches within a single drain
+    /// cycle (milliseconds). Prevents sustained high DB load when many orphans
+    /// exist. Default: 100.
+    pub purge_throttle_ms: u64,
 }
 
 fn default_batch_metadata_fields_dwctl() -> Vec<String> {
@@ -974,6 +1020,9 @@ impl Default for DaemonConfig {
             processing_timeout_ms: 600000,
             batch_metadata_fields: default_batch_metadata_fields_dwctl(),
             model_escalations: HashMap::new(),
+            purge_interval_ms: 600_000,
+            purge_batch_size: 1000,
+            purge_throttle_ms: 100,
         }
     }
 }
@@ -1004,6 +1053,9 @@ impl DaemonConfig {
             claim_timeout_ms: self.claim_timeout_ms,
             processing_timeout_ms: self.processing_timeout_ms,
             batch_metadata_fields: self.batch_metadata_fields.clone(),
+            purge_interval_ms: self.purge_interval_ms,
+            purge_batch_size: self.purge_batch_size,
+            purge_throttle_ms: self.purge_throttle_ms,
             ..Default::default()
         }
     }
@@ -1039,6 +1091,30 @@ impl Default for LeaderElectionConfig {
     }
 }
 
+/// Batch completion notification configuration.
+///
+/// When enabled, polls for completed/failed/cancelled batches and sends email notifications
+/// to batch creators. Safe to run on all replicas — uses atomic `notification_sent_at` claim
+/// to prevent duplicate emails.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NotificationsConfig {
+    /// Enable batch completion notifications (default: true)
+    pub enabled: bool,
+    /// How often to poll for completed batches (default: 30s)
+    #[serde(with = "humantime_serde")]
+    pub poll_interval: Duration,
+}
+
+impl Default for NotificationsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            poll_interval: Duration::from_secs(30),
+        }
+    }
+}
+
 /// Background services configuration.
 ///
 /// Controls which background services are enabled on this instance.
@@ -1055,6 +1131,8 @@ pub struct BackgroundServicesConfig {
     pub leader_election: LeaderElectionConfig,
     /// Configuration for database pool metrics sampling
     pub pool_metrics: PoolMetricsSamplerConfig,
+    /// Configuration for batch completion email notifications
+    pub notifications: NotificationsConfig,
 }
 
 /// Database pool metrics sampling configuration.
@@ -1086,11 +1164,23 @@ impl Default for PoolMetricsSamplerConfig {
 pub struct OnwardsSyncConfig {
     /// Enable onwards config sync service (default: true)
     pub enabled: bool,
+    /// Fallback sync interval in milliseconds (default: 10000ms = 10 seconds)
+    ///
+    /// Even when LISTEN/NOTIFY is working, this provides periodic full syncs to guarantee
+    /// eventual consistency. Prevents issues from dropped notifications or connection problems.
+    ///
+    /// Set to `0` to disable periodic fallback syncs entirely. Disabling the fallback interval
+    /// removes protection against missed notifications and is generally not recommended
+    /// in production environments.
+    pub fallback_interval_milliseconds: u64,
 }
 
 impl Default for OnwardsSyncConfig {
     fn default() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            fallback_interval_milliseconds: 10000, // 10 seconds
+        }
     }
 }
 
@@ -1187,6 +1277,15 @@ pub struct AnalyticsConfig {
     /// Actual delay is: base_delay * 2^attempt (e.g., 100ms, 200ms, 400ms for base=100).
     /// Default: 100
     pub retry_base_delay_ms: u64,
+    /// Minimum interval in milliseconds between balance depletion notifications globally.
+    ///
+    /// When any user's balance goes negative, we send a pg_notify to invalidate their API keys.
+    /// This rate limit prevents notification storms when users continue making requests
+    /// with negative balances. At most one notification is sent per interval, even if
+    /// multiple users become depleted during that time.
+    ///
+    /// Default: 5000ms (5 seconds)
+    pub balance_notification_interval_milliseconds: u64,
 }
 
 impl Default for AnalyticsConfig {
@@ -1195,6 +1294,7 @@ impl Default for AnalyticsConfig {
             batch_size: 100,
             max_retries: 3,
             retry_base_delay_ms: 100,
+            balance_notification_interval_milliseconds: 5000,
         }
     }
 }
@@ -1204,6 +1304,7 @@ impl Default for Config {
         Self {
             host: "0.0.0.0".to_string(),
             port: 3001,
+            dashboard_url: "http://localhost:5173".to_string(),
             database_url: None, // Deprecated field
             database_replica_url: None,
             database: DatabaseConfig::default(),
@@ -1225,6 +1326,7 @@ impl Default for Config {
             credits: CreditsConfig::default(),
             sample_files: SampleFilesConfig::default(),
             limits: LimitsConfig::default(),
+            email: EmailConfig::default(),
         }
     }
 }
@@ -1248,7 +1350,7 @@ impl Default for NativeAuthConfig {
             allow_registration: false,
             password: PasswordConfig::default(),
             session: SessionConfig::default(),
-            email: EmailConfig::default(),
+            password_reset_token_duration: Duration::from_secs(30 * 60), // 30 minutes
         }
     }
 }
@@ -1320,7 +1422,7 @@ impl Default for EmailConfig {
             transport: EmailTransportConfig::default(),
             from_email: "noreply@example.com".to_string(),
             from_name: "Control Layer".to_string(),
-            password_reset: PasswordResetEmailConfig::default(),
+            reply_to: None,
         }
     }
 }
@@ -1329,15 +1431,6 @@ impl Default for EmailTransportConfig {
     fn default() -> Self {
         Self::File {
             path: "./emails".to_string(),
-        }
-    }
-}
-
-impl Default for PasswordResetEmailConfig {
-    fn default() -> Self {
-        Self {
-            token_expiry: Duration::from_secs(30 * 60),    // 30 minutes
-            base_url: "http://localhost:3001".to_string(), // Frontend URL
         }
     }
 }
@@ -1979,5 +2072,159 @@ secret_key: "test-secret-key"
         let result = config.validate();
         assert!(result.is_err()); // Should fail because batches API needs valid download_buffer_size
         assert!(result.unwrap_err().to_string().contains("download_buffer_size cannot be 0"));
+    }
+
+    #[test]
+    fn test_default_throughput_default_value() {
+        let config = Config::default();
+        assert_eq!(config.batches.default_throughput, 100.0);
+    }
+
+    #[test]
+    fn test_default_throughput_yaml_override() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+batches:
+  default_throughput: 100.0
+"#,
+            )?;
+
+            let args = Args {
+                config: "test.yaml".to_string(),
+                validate: false,
+            };
+
+            let config = Config::load(&args)?;
+            assert_eq!(config.batches.default_throughput, 100.0);
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_default_throughput_null_uses_default() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+batches:
+  default_throughput: null
+"#,
+            )?;
+
+            let args = Args {
+                config: "test.yaml".to_string(),
+                validate: false,
+            };
+
+            let config = Config::load(&args)?;
+            assert_eq!(config.batches.default_throughput, 100.0); // Should use default
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_default_throughput_missing_uses_default() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+batches:
+  enabled: true
+"#,
+            )?;
+
+            let args = Args {
+                config: "test.yaml".to_string(),
+                validate: false,
+            };
+
+            let config = Config::load(&args)?;
+            assert_eq!(config.batches.default_throughput, 100.0); // Should use default
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_default_throughput_zero_rejected() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+batches:
+  default_throughput: 0
+"#,
+            )?;
+
+            let args = Args {
+                config: "test.yaml".to_string(),
+                validate: false,
+            };
+
+            let result = Config::load(&args);
+            assert!(result.is_err());
+            let err = result.unwrap_err().to_string();
+            assert!(err.contains("default_throughput must be positive"));
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_default_throughput_negative_rejected() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+batches:
+  default_throughput: -10.0
+"#,
+            )?;
+
+            let args = Args {
+                config: "test.yaml".to_string(),
+                validate: false,
+            };
+
+            let result = Config::load(&args);
+            assert!(result.is_err());
+            let err = result.unwrap_err().to_string();
+            assert!(err.contains("default_throughput must be positive"));
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_default_throughput_env_override() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+"#,
+            )?;
+
+            jail.set_env("DWCTL_BATCHES__DEFAULT_THROUGHPUT", "75.5");
+
+            let args = Args {
+                config: "test.yaml".to_string(),
+                validate: false,
+            };
+
+            let config = Config::load(&args)?;
+            assert_eq!(config.batches.default_throughput, 75.5);
+
+            Ok(())
+        });
     }
 }

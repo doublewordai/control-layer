@@ -738,6 +738,7 @@ mod tests {
                 burst_size: None,
                 capacity: None,
                 batch_capacity: None,
+                throughput: None,
                 provider_pricing: None,
                 // Composite model fields (regular model = not composite)
                 is_composite: false,
