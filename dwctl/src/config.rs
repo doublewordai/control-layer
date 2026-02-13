@@ -168,6 +168,8 @@ pub struct Config {
     pub limits: LimitsConfig,
     /// Email configuration for password resets and notifications
     pub email: EmailConfig,
+    /// Onwards proxy configuration
+    pub onwards: OnwardsConfig,
 }
 
 /// Individual pool configuration with all SQLx parameters.
@@ -798,6 +800,19 @@ impl Default for RequestLimitsConfig {
     }
 }
 
+/// Onwards AI proxy configuration.
+///
+/// Controls behavior of the onwards routing layer used for AI proxy requests.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+#[derive(Default)]
+pub struct OnwardsConfig {
+    /// Enable strict mode with schema validation and typed handlers.
+    /// When false (default), all requests are passed through transparently.
+    /// When true, only known OpenAI API paths are accepted and validated.
+    pub strict_mode: bool,
+}
+
 /// File limits configuration.
 ///
 /// Controls file size limits, request count limits, and upload concurrency
@@ -1336,6 +1351,7 @@ impl Default for Config {
             sample_files: SampleFilesConfig::default(),
             limits: LimitsConfig::default(),
             email: EmailConfig::default(),
+            onwards: OnwardsConfig::default(),
         }
     }
 }
