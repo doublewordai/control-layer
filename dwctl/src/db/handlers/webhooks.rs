@@ -188,8 +188,11 @@ impl<'c> Webhooks<'c> {
     }
 
     /// Increment consecutive failures and potentially trip circuit breaker.
+    ///
+    /// Returns `None` if the webhook was deleted (e.g. CASCADE from user or
+    /// direct delete while deliveries were in-flight).
     #[instrument(skip(self), fields(webhook_id = %abbrev_uuid(&id)), err)]
-    pub async fn increment_failures(&mut self, id: WebhookId) -> Result<Webhook> {
+    pub async fn increment_failures(&mut self, id: WebhookId) -> Result<Option<Webhook>> {
         let webhook = sqlx::query_as!(
             Webhook,
             r#"
@@ -210,7 +213,7 @@ impl<'c> Webhooks<'c> {
             id,
             CIRCUIT_BREAKER_THRESHOLD,
         )
-        .fetch_one(&mut *self.db)
+        .fetch_optional(&mut *self.db)
         .await?;
 
         Ok(webhook)
@@ -656,7 +659,7 @@ mod tests {
 
         // Fail once to increment failures
         repo.mark_failed(delivery.id, Some(500), "HTTP 500", 0, SCHEDULE_7).await.unwrap();
-        let w = repo.increment_failures(webhook.id).await.unwrap();
+        let w = repo.increment_failures(webhook.id).await.unwrap().unwrap();
         assert_eq!(w.consecutive_failures, 1);
 
         // Succeed on retry

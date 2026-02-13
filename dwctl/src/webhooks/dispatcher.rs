@@ -33,6 +33,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
+use metrics::counter;
 use sqlx::PgPool;
 use tokio::sync::{Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
@@ -42,14 +43,6 @@ use crate::config::WebhookConfig;
 use crate::db::handlers::Webhooks;
 use crate::webhooks::signing;
 
-/// Maximum deliveries to claim per tick.
-const CLAIM_BATCH_SIZE: i64 = 50;
-
-/// Channel capacity for send requests and results.
-const CHANNEL_CAPACITY: usize = 200;
-
-/// Maximum concurrent HTTP sends in the sender task.
-const MAX_CONCURRENT_SENDS: usize = 20;
 
 // --- Channel types ---
 
@@ -87,26 +80,34 @@ pub struct WebhookDispatcher {
     send_tx: mpsc::Sender<WebhookSendRequest>,
     result_rx: mpsc::Receiver<WebhookSendResult>,
     retry_schedule: Vec<i64>,
+    claim_batch_size: i64,
 }
 
 impl WebhookDispatcher {
     /// Create a new dispatcher and spawn the background sender task.
     pub fn spawn(pool: PgPool, config: &WebhookConfig, shutdown: CancellationToken) -> Self {
-        let (send_tx, send_rx) = mpsc::channel::<WebhookSendRequest>(CHANNEL_CAPACITY);
-        let (result_tx, result_rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let (send_tx, send_rx) = mpsc::channel::<WebhookSendRequest>(config.channel_capacity);
+        let (result_tx, result_rx) = mpsc::channel(config.channel_capacity);
 
         let http_client = reqwest::Client::builder()
             .timeout(Duration::from_secs(config.timeout_secs))
             .build()
             .expect("Failed to create webhook HTTP client");
 
-        tokio::spawn(run_sender(send_rx, result_tx, http_client, shutdown));
+        tokio::spawn(run_sender(
+            send_rx,
+            result_tx,
+            http_client,
+            config.max_concurrent_sends,
+            shutdown,
+        ));
 
         Self {
             pool,
             send_tx,
             result_rx,
             retry_schedule: config.retry_schedule_secs.clone(),
+            claim_batch_size: config.claim_batch_size,
         }
     }
 
@@ -129,7 +130,7 @@ impl WebhookDispatcher {
 
         let deliveries = {
             let mut repo = Webhooks::new(&mut conn);
-            match repo.claim_retriable_deliveries(CLAIM_BATCH_SIZE).await {
+            match repo.claim_retriable_deliveries(self.claim_batch_size).await {
                 Ok(d) => d,
                 Err(e) => {
                     tracing::warn!(error = %e, "Failed to claim retriable deliveries");
@@ -143,10 +144,12 @@ impl WebhookDispatcher {
             return;
         }
 
+        counter!("dwctl_webhook_deliveries_claimed_total").increment(deliveries.len() as u64);
         tracing::info!(count = deliveries.len(), "Claimed deliveries for sending");
 
         for delivery in deliveries {
-            // Webhook deleted since delivery was created
+            // Webhook missing from LEFT JOIN. With CASCADE delete this is
+            // unlikely (the delivery row would be gone too), but guard anyway.
             let (Some(url), Some(secret), Some(enabled)) = (&delivery.webhook_url, &delivery.webhook_secret, delivery.webhook_enabled)
             else {
                 tracing::warn!(
@@ -232,8 +235,12 @@ impl WebhookDispatcher {
             drained += 1;
             let mut repo = Webhooks::new(&mut conn);
 
+            // The delivery or webhook may have been CASCADE-deleted while this
+            // send was in-flight. The UPDATE calls below silently affect 0 rows
+            // in that case, which is fine — there's nothing left to update.
             match result.outcome {
                 SendOutcome::Success { status_code } => {
+                    counter!("dwctl_webhook_deliveries_total", "outcome" => "success").increment(1);
                     if let Err(e) = repo.mark_delivered(result.delivery_id, status_code as i32).await {
                         tracing::warn!(error = %e, delivery_id = %result.delivery_id, "Failed to mark delivery as delivered");
                     }
@@ -248,6 +255,7 @@ impl WebhookDispatcher {
                     );
                 }
                 SendOutcome::Failure { status_code, ref error } => {
+                    counter!("dwctl_webhook_deliveries_total", "outcome" => "failure").increment(1);
                     if let Err(e) = repo
                         .mark_failed(
                             result.delivery_id,
@@ -260,8 +268,20 @@ impl WebhookDispatcher {
                     {
                         tracing::warn!(error = %e, delivery_id = %result.delivery_id, "Failed to mark delivery as failed");
                     }
-                    if let Err(e) = repo.increment_failures(result.webhook_id).await {
-                        tracing::warn!(error = %e, webhook_id = %result.webhook_id, "Failed to increment webhook failures");
+                    // increment_failures returns None if the webhook was deleted
+                    // while this delivery was in-flight — not an error.
+                    match repo.increment_failures(result.webhook_id).await {
+                        Ok(None) => {
+                            tracing::debug!(
+                                webhook_id = %result.webhook_id,
+                                delivery_id = %result.delivery_id,
+                                "Webhook deleted while delivery was in-flight, skipping failure tracking"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, webhook_id = %result.webhook_id, "Failed to increment webhook failures");
+                        }
+                        Ok(Some(_)) => {}
                     }
                     tracing::warn!(
                         webhook_id = %result.webhook_id,
@@ -290,9 +310,10 @@ async fn run_sender(
     mut rx: mpsc::Receiver<WebhookSendRequest>,
     result_tx: mpsc::Sender<WebhookSendResult>,
     http_client: reqwest::Client,
+    max_concurrent_sends: usize,
     shutdown: CancellationToken,
 ) {
-    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_SENDS));
+    let semaphore = Arc::new(Semaphore::new(max_concurrent_sends));
 
     loop {
         let request = tokio::select! {
@@ -391,7 +412,7 @@ mod tests {
 
         let sender_shutdown = shutdown.clone();
         tokio::spawn(async move {
-            run_sender(send_rx, result_tx, http_client, sender_shutdown).await;
+            run_sender(send_rx, result_tx, http_client, 20, sender_shutdown).await;
         });
 
         (send_tx, result_rx, shutdown)
@@ -517,7 +538,7 @@ mod tests {
         let shutdown = CancellationToken::new();
 
         let handle = tokio::spawn(async move {
-            run_sender(send_rx, result_tx, http_client, shutdown).await;
+            run_sender(send_rx, result_tx, http_client, 20, shutdown).await;
         });
 
         // Drop the sender — channel closes

@@ -1228,6 +1228,12 @@ pub struct WebhookConfig {
     pub retry_schedule_secs: Vec<i64>,
     /// Number of consecutive failures before disabling a webhook (default: 10)
     pub circuit_breaker_threshold: i32,
+    /// Maximum deliveries to claim from the database per tick (default: 50)
+    pub claim_batch_size: i64,
+    /// Maximum concurrent outbound HTTP requests (default: 20)
+    pub max_concurrent_sends: usize,
+    /// Internal channel buffer capacity for send requests and results (default: 200)
+    pub channel_capacity: usize,
 }
 
 impl Default for WebhookConfig {
@@ -1237,6 +1243,9 @@ impl Default for WebhookConfig {
             timeout_secs: 30,
             retry_schedule_secs: vec![0, 5, 300, 1800, 7200, 28800, 86400],
             circuit_breaker_threshold: 10,
+            claim_batch_size: 50,
+            max_concurrent_sends: 20,
+            channel_capacity: 200,
         }
     }
 }

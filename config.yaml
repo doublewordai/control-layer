@@ -345,6 +345,9 @@ background_services:
   #     # Retry backoff schedule in seconds. Length = max attempts before exhaustion.
   #     # Default: immediate, 5s, 5m, 30m, 2h, 8h, 24h
   #     retry_schedule_secs: [0, 5, 300, 1800, 7200, 28800, 86400]
+  #     claim_batch_size: 50            # Max deliveries claimed from DB per tick
+  #     max_concurrent_sends: 20        # Max parallel outbound HTTP requests
+  #     channel_capacity: 200           # Internal send/result channel buffer size
 
   # Leader election - coordinates which instance runs leader-only services
   # When disabled, all instances run as leader (useful for single-instance deployments)
