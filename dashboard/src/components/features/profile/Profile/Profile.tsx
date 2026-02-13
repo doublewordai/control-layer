@@ -934,7 +934,10 @@ export const Profile: React.FC = () => {
                               {webhook.disabled_at && (
                                 <Tooltip>
                                   <TooltipTrigger asChild>
-                                    <span className="inline-flex items-center gap-1">
+                                    <span
+                                      className="inline-flex items-center gap-1"
+                                      aria-label="Auto-disabled due to repeated delivery failures"
+                                    >
                                       <AlertTriangle className="w-3.5 h-3.5 text-amber-500" />
                                     </span>
                                   </TooltipTrigger>

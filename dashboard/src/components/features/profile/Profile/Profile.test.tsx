@@ -331,8 +331,8 @@ describe("Webhooks", () => {
 
     await waitFor(() => {
       expect(
-        within(container).getByText(
-          "Auto-disabled due to repeated delivery failures.",
+        within(container).getByLabelText(
+          "Auto-disabled due to repeated delivery failures",
         ),
       ).toBeInTheDocument();
     });
