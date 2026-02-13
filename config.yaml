@@ -335,6 +335,17 @@ background_services:
     #     escalation_model: o1-preview  # Route to this model when near expiry
     #     escalation_threshold_seconds: 900  # Default: 900 (15 minutes before expiry)
 
+  # Batch completion notifications (emails + webhooks)
+  # notifications:
+  #   poll_interval: 30s                # How often to poll for completed batches
+  #   webhooks:
+  #     enabled: true
+  #     timeout_secs: 30                # HTTP timeout per delivery attempt
+  #     circuit_breaker_threshold: 10   # Consecutive failures before auto-disabling
+  #     # Retry backoff schedule in seconds. Length = max attempts before exhaustion.
+  #     # Default: immediate, 5s, 5m, 30m, 2h, 8h, 24h
+  #     retry_schedule_secs: [0, 5, 300, 1800, 7200, 28800, 86400]
+
   # Leader election - coordinates which instance runs leader-only services
   # When disabled, all instances run as leader (useful for single-instance deployments)
   leader_election:

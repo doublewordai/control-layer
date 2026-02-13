@@ -11,17 +11,6 @@ use crate::db::models::webhooks::{
 };
 use crate::types::{UserId, abbrev_uuid};
 
-/// Retry schedule in seconds: 0s → 5s → 5m → 30m → 2h → 8h → 24h
-const RETRY_DELAYS_SECS: &[i64] = &[
-    0,     // Attempt 1: immediate
-    5,     // Attempt 2: 5 seconds
-    300,   // Attempt 3: 5 minutes
-    1800,  // Attempt 4: 30 minutes
-    7200,  // Attempt 5: 2 hours
-    28800, // Attempt 6: 8 hours
-    86400, // Attempt 7: 24 hours
-];
-
 /// Circuit breaker threshold for consecutive failures.
 pub const CIRCUIT_BREAKER_THRESHOLD: i32 = 10;
 
@@ -350,15 +339,16 @@ impl<'c> Webhooks<'c> {
         status_code: Option<i32>,
         error: &str,
         current_attempt: i32,
-        max_retries: i32,
+        retry_schedule: &[i64],
     ) -> Result<()> {
         let new_attempt = current_attempt + 1;
+        let max_attempts = retry_schedule.len() as i32;
 
         // Determine next status and retry time
-        let (new_status, next_attempt_at) = if new_attempt >= max_retries {
+        let (new_status, next_attempt_at) = if new_attempt >= max_attempts {
             (DeliveryStatus::Exhausted.as_str(), Utc::now())
         } else {
-            let delay_secs = RETRY_DELAYS_SECS.get(new_attempt as usize).copied().unwrap_or(86400);
+            let delay_secs = retry_schedule.get(new_attempt as usize).copied().unwrap_or(86400);
             let next = Utc::now() + Duration::seconds(delay_secs);
             (DeliveryStatus::Failed.as_str(), next)
         };
@@ -415,6 +405,11 @@ mod tests {
     use crate::webhooks::signing::generate_secret;
     use chrono::DateTime;
     use sqlx::PgPool;
+
+    /// Default retry schedule matching production config default.
+    const SCHEDULE_7: &[i64] = &[0, 5, 300, 1800, 7200, 28800, 86400];
+    /// Short 3-attempt schedule for lifecycle tests.
+    const SCHEDULE_3: &[i64] = &[0, 5, 300];
 
     /// Create a webhook for testing delivery operations.
     async fn create_test_webhook(pool: &PgPool) -> (Webhook, uuid::Uuid) {
@@ -558,7 +553,7 @@ mod tests {
         let mut repo = Webhooks::new(&mut conn);
 
         // Attempt 0 → 1: next retry in ~5 seconds
-        repo.mark_failed(delivery.id, Some(500), "HTTP 500", 0, 7).await.unwrap();
+        repo.mark_failed(delivery.id, Some(500), "HTTP 500", 0, SCHEDULE_7).await.unwrap();
         let d = get_delivery(&pool, delivery.id).await;
         assert_eq!(d.status, "failed");
         assert_eq!(d.attempt_count, 1);
@@ -567,7 +562,7 @@ mod tests {
 
         // Time travel and fail again: attempt 1 → 2: next retry in ~5 minutes
         time_travel_delivery(&pool, delivery.id).await;
-        repo.mark_failed(delivery.id, Some(502), "HTTP 502", 1, 7).await.unwrap();
+        repo.mark_failed(delivery.id, Some(502), "HTTP 502", 1, SCHEDULE_7).await.unwrap();
         let d = get_delivery(&pool, delivery.id).await;
         assert_eq!(d.attempt_count, 2);
         let delay = (d.next_attempt_at - Utc::now()).num_seconds();
@@ -582,8 +577,8 @@ mod tests {
         let mut conn = pool.acquire().await.unwrap();
         let mut repo = Webhooks::new(&mut conn);
 
-        // Attempt 6 → 7 with max_retries=7: should exhaust
-        repo.mark_failed(delivery.id, Some(500), "HTTP 500", 6, 7).await.unwrap();
+        // Attempt 6 → 7 with 7-entry schedule: should exhaust
+        repo.mark_failed(delivery.id, Some(500), "HTTP 500", 6, SCHEDULE_7).await.unwrap();
         let d = get_delivery(&pool, delivery.id).await;
         assert_eq!(d.status, "exhausted");
         assert_eq!(d.attempt_count, 7);
@@ -597,8 +592,8 @@ mod tests {
         let mut conn = pool.acquire().await.unwrap();
         let mut repo = Webhooks::new(&mut conn);
 
-        // With max_retries=3, attempt 2 → 3 should exhaust
-        repo.mark_failed(delivery.id, Some(500), "HTTP 500", 2, 3).await.unwrap();
+        // With 3-entry schedule, attempt 2 → 3 should exhaust
+        repo.mark_failed(delivery.id, Some(500), "HTTP 500", 2, SCHEDULE_3).await.unwrap();
         let d = get_delivery(&pool, delivery.id).await;
         assert_eq!(d.status, "exhausted");
         assert_eq!(d.attempt_count, 3);
@@ -614,13 +609,11 @@ mod tests {
         let mut conn = pool.acquire().await.unwrap();
         let mut repo = Webhooks::new(&mut conn);
 
-        let max_retries = 3;
-
         // Attempt 1: claim, fail, check state
         let claimed = repo.claim_retriable_deliveries(10).await.unwrap();
         assert_eq!(claimed.len(), 1);
 
-        repo.mark_failed(delivery.id, Some(500), "HTTP 500", 0, max_retries).await.unwrap();
+        repo.mark_failed(delivery.id, Some(500), "HTTP 500", 0, SCHEDULE_3).await.unwrap();
         let d = get_delivery(&pool, delivery.id).await;
         assert_eq!(d.status, "failed");
         assert_eq!(d.attempt_count, 1);
@@ -631,7 +624,7 @@ mod tests {
         let claimed = repo.claim_retriable_deliveries(10).await.unwrap();
         assert_eq!(claimed.len(), 1);
 
-        repo.mark_failed(delivery.id, Some(503), "HTTP 503", 1, max_retries).await.unwrap();
+        repo.mark_failed(delivery.id, Some(503), "HTTP 503", 1, SCHEDULE_3).await.unwrap();
         let d = get_delivery(&pool, delivery.id).await;
         assert_eq!(d.status, "failed");
         assert_eq!(d.attempt_count, 2);
@@ -642,7 +635,7 @@ mod tests {
         let claimed = repo.claim_retriable_deliveries(10).await.unwrap();
         assert_eq!(claimed.len(), 1);
 
-        repo.mark_failed(delivery.id, Some(500), "HTTP 500", 2, max_retries).await.unwrap();
+        repo.mark_failed(delivery.id, Some(500), "HTTP 500", 2, SCHEDULE_3).await.unwrap();
         let d = get_delivery(&pool, delivery.id).await;
         assert_eq!(d.status, "exhausted");
         assert_eq!(d.attempt_count, 3);
@@ -662,7 +655,7 @@ mod tests {
         let mut repo = Webhooks::new(&mut conn);
 
         // Fail once to increment failures
-        repo.mark_failed(delivery.id, Some(500), "HTTP 500", 0, 7).await.unwrap();
+        repo.mark_failed(delivery.id, Some(500), "HTTP 500", 0, SCHEDULE_7).await.unwrap();
         let w = repo.increment_failures(webhook.id).await.unwrap();
         assert_eq!(w.consecutive_failures, 1);
 

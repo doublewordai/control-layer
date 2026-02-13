@@ -86,7 +86,7 @@ pub struct WebhookDispatcher {
     pool: PgPool,
     send_tx: mpsc::Sender<WebhookSendRequest>,
     result_rx: mpsc::Receiver<WebhookSendResult>,
-    max_retries: i32,
+    retry_schedule: Vec<i64>,
 }
 
 impl WebhookDispatcher {
@@ -106,7 +106,7 @@ impl WebhookDispatcher {
             pool,
             send_tx,
             result_rx,
-            max_retries: config.max_retries,
+            retry_schedule: config.retry_schedule_secs.clone(),
         }
     }
 
@@ -254,7 +254,7 @@ impl WebhookDispatcher {
                             status_code.map(|c| c as i32),
                             error,
                             result.attempt_count,
-                            self.max_retries,
+                            &self.retry_schedule,
                         )
                         .await
                     {

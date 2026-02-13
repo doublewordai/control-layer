@@ -616,7 +616,10 @@ pub async fn test_webhook<P: PoolProvider>(
     })?;
 
     // Send the request
-    let client = reqwest::Client::new();
+    let timeout = std::time::Duration::from_secs(state.config.background_services.notifications.webhooks.timeout_secs);
+    let client = reqwest::Client::builder().timeout(timeout).build().map_err(|e| Error::Internal {
+        operation: format!("Failed to create HTTP client: {}", e),
+    })?;
     let start = std::time::Instant::now();
 
     let result = client
@@ -627,7 +630,6 @@ pub async fn test_webhook<P: PoolProvider>(
         .header("webhook-signature", &signature)
         .header("webhook-version", "1")
         .body(payload)
-        .timeout(std::time::Duration::from_secs(30))
         .send()
         .await;
 
