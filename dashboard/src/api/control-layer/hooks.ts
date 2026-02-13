@@ -1349,15 +1349,3 @@ export function useRotateWebhookSecret() {
   });
 }
 
-export function useTestWebhook() {
-  return useMutation({
-    mutationKey: ["webhooks", "test"],
-    mutationFn: ({
-      webhookId,
-      userId = "current",
-    }: {
-      webhookId: string;
-      userId?: string;
-    }) => dwctlApi.users.webhooks.test(webhookId, userId),
-  });
-}

@@ -1,7 +1,6 @@
 //! Database models for webhook configuration and delivery tracking.
 
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use uuid::Uuid;
 
@@ -52,13 +51,8 @@ impl Webhook {
 }
 
 /// Delivery status for webhook deliveries.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeliveryStatus {
-    /// Pending first delivery attempt
-    Pending,
-    /// Successfully delivered
-    Delivered,
     /// Failed but will retry
     Failed,
     /// All retries exhausted
@@ -68,24 +62,8 @@ pub enum DeliveryStatus {
 impl DeliveryStatus {
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::Pending => "pending",
-            Self::Delivered => "delivered",
             Self::Failed => "failed",
             Self::Exhausted => "exhausted",
-        }
-    }
-}
-
-impl std::str::FromStr for DeliveryStatus {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "pending" => Ok(Self::Pending),
-            "delivered" => Ok(Self::Delivered),
-            "failed" => Ok(Self::Failed),
-            "exhausted" => Ok(Self::Exhausted),
-            _ => Err(format!("Unknown delivery status: {}", s)),
         }
     }
 }
@@ -108,11 +86,27 @@ pub struct WebhookDelivery {
     pub updated_at: DateTime<Utc>,
 }
 
-impl WebhookDelivery {
-    /// Get the parsed delivery status.
-    pub fn delivery_status(&self) -> DeliveryStatus {
-        self.status.parse().unwrap_or(DeliveryStatus::Pending)
-    }
+/// A delivery claimed for sending, joined with its webhook config.
+#[derive(Debug, Clone, FromRow)]
+pub struct ClaimedDelivery {
+    // delivery fields
+    pub id: DeliveryId,
+    pub webhook_id: WebhookId,
+    pub event_id: Uuid,
+    pub event_type: String,
+    pub payload: serde_json::Value,
+    pub status: String,
+    pub attempt_count: i32,
+    pub next_attempt_at: DateTime<Utc>,
+    pub batch_id: Uuid,
+    pub last_status_code: Option<i32>,
+    pub last_error: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    // webhook fields
+    pub webhook_url: Option<String>,
+    pub webhook_secret: Option<String>,
+    pub webhook_enabled: Option<bool>,
 }
 
 /// Request to create a new webhook.
@@ -142,4 +136,6 @@ pub struct WebhookDeliveryCreateDBRequest {
     pub event_type: String,
     pub payload: serde_json::Value,
     pub batch_id: Uuid,
+    /// When to attempt delivery. `None` defaults to `now()` in the DB.
+    pub next_attempt_at: Option<DateTime<Utc>>,
 }

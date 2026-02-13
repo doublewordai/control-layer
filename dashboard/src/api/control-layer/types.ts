@@ -1222,9 +1222,3 @@ export interface WebhookUpdateRequest {
   description?: string | null;
 }
 
-export interface WebhookTestResponse {
-  success: boolean;
-  status_code?: number;
-  error?: string;
-  duration_ms: number;
-}

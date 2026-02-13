@@ -13,7 +13,6 @@ import {
   Pencil,
   Trash2,
   RotateCw,
-  TestTube,
   AlertTriangle,
   Copy,
   Check,
@@ -28,7 +27,6 @@ import {
   useUpdateWebhook,
   useDeleteWebhook,
   useRotateWebhookSecret,
-  useTestWebhook,
 } from "../../../../api/control-layer/hooks";
 import {
   UserAvatar,
@@ -57,7 +55,6 @@ import { AVAILABLE_ROLES, getRoleDisplayName } from "../../../../utils/roles";
 import type {
   Role,
   Webhook,
-  WebhookTestResponse,
 } from "../../../../api/control-layer/types";
 import { dwctlApi } from "../../../../api/control-layer/client";
 import { ApiError } from "../../../../api/control-layer/errors";
@@ -115,7 +112,6 @@ export const Profile: React.FC = () => {
   const updateWebhookMutation = useUpdateWebhook();
   const deleteWebhookMutation = useDeleteWebhook();
   const rotateSecretMutation = useRotateWebhookSecret();
-  const testWebhookMutation = useTestWebhook();
 
   const [webhookDialogOpen, setWebhookDialogOpen] = useState(false);
   const [editingWebhook, setEditingWebhook] = useState<Webhook | null>(null);
@@ -127,9 +123,6 @@ export const Profile: React.FC = () => {
   const [deletingWebhookId, setDeletingWebhookId] = useState<string | null>(
     null,
   );
-  const [testResults, setTestResults] = useState<
-    Record<string, WebhookTestResponse>
-  >({});
   const [copiedSecret, setCopiedSecret] = useState(false);
   const [emailNotifSaved, setEmailNotifSaved] = useState(false);
 
@@ -383,37 +376,6 @@ export const Profile: React.FC = () => {
       setWebhookSecret(result.secret);
     } catch {
       // Error handled by mutation
-    }
-  };
-
-  const handleTestWebhook = async (webhookId: string) => {
-    try {
-      const result = await testWebhookMutation.mutateAsync({ webhookId });
-      setTestResults((prev) => ({ ...prev, [webhookId]: result }));
-      // Clear test result after 5 seconds
-      setTimeout(() => {
-        setTestResults((prev) => {
-          const next = { ...prev };
-          delete next[webhookId];
-          return next;
-        });
-      }, 5000);
-    } catch {
-      setTestResults((prev) => ({
-        ...prev,
-        [webhookId]: {
-          success: false,
-          error: "Failed to send test",
-          duration_ms: 0,
-        },
-      }));
-      setTimeout(() => {
-        setTestResults((prev) => {
-          const next = { ...prev };
-          delete next[webhookId];
-          return next;
-        });
-      }, 5000);
     }
   };
 
@@ -1004,16 +966,6 @@ export const Profile: React.FC = () => {
                                 </span>
                               )}
                             </div>
-                            {/* Test result inline */}
-                            {testResults[webhook.id] && (
-                              <div
-                                className={`text-xs mt-1.5 ${testResults[webhook.id].success ? "text-green-600" : "text-red-600"}`}
-                              >
-                                {testResults[webhook.id].success
-                                  ? `Test succeeded (${testResults[webhook.id].status_code}, ${testResults[webhook.id].duration_ms}ms)`
-                                  : `Test failed: ${testResults[webhook.id].error || "Unknown error"}`}
-                              </div>
-                            )}
                           </div>
                           <div className="flex items-center gap-1 shrink-0">
                             <Switch
@@ -1023,31 +975,6 @@ export const Profile: React.FC = () => {
                               }
                               aria-label={`Toggle webhook ${webhook.url}`}
                             />
-                            <Tooltip>
-                              <TooltipTrigger asChild>
-                                <Button
-                                  variant="ghost"
-                                  size="icon"
-                                  className="h-7 w-7"
-                                  onClick={() => handleTestWebhook(webhook.id)}
-                                  disabled={
-                                    testWebhookMutation.isPending &&
-                                    testWebhookMutation.variables
-                                      ?.webhookId === webhook.id
-                                  }
-                                  aria-label={`Test webhook ${webhook.url}`}
-                                >
-                                  {testWebhookMutation.isPending &&
-                                  testWebhookMutation.variables?.webhookId ===
-                                    webhook.id ? (
-                                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                                  ) : (
-                                    <TestTube className="w-3.5 h-3.5" />
-                                  )}
-                                </Button>
-                              </TooltipTrigger>
-                              <TooltipContent>Test webhook</TooltipContent>
-                            </Tooltip>
                             <Tooltip>
                               <TooltipTrigger asChild>
                                 <Button

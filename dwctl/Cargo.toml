@@ -128,9 +128,9 @@ async-stripe-billing = { version = "1.0.0-rc.0", features = [
 sqlx-pool-router = "0.2.0"
 minijinja = "2.15.1"
 multer = "3.1.0"
+ctor = "0.4"
 hmac = "0.12.1"
 sha2 = "0.10.9"
-ctor = "0.4"
 
 [dev-dependencies]
 axum-test = { version = "18.4.1" }

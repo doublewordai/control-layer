@@ -1186,7 +1186,7 @@ impl Default for OnwardsSyncConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            fallback_interval_milliseconds: 10000, // 10 seconds
+            fallback_interval_milliseconds: 1000000, // 10 seconds
         }
     }
 }
@@ -1219,8 +1219,13 @@ pub struct WebhookConfig {
     pub enabled: bool,
     /// HTTP timeout for webhook deliveries in seconds (default: 30)
     pub timeout_secs: u64,
-    /// Maximum retry attempts before marking delivery as exhausted (default: 7)
-    pub max_retries: i32,
+    /// Retry backoff schedule in seconds. Each entry is the delay before the
+    /// corresponding attempt. The length of this list is the maximum number of
+    /// attempts — once exhausted, the delivery is marked as exhausted.
+    ///
+    /// Default: [0, 5, 300, 1800, 7200, 28800, 86400]
+    ///          (immediate, 5s, 5m, 30m, 2h, 8h, 24h)
+    pub retry_schedule_secs: Vec<i64>,
     /// Number of consecutive failures before disabling a webhook (default: 10)
     pub circuit_breaker_threshold: i32,
 }
@@ -1230,7 +1235,7 @@ impl Default for WebhookConfig {
         Self {
             enabled: true,
             timeout_secs: 30,
-            max_retries: 7,
+            retry_schedule_secs: vec![0, 5, 300, 1800, 7200, 28800, 86400],
             circuit_breaker_threshold: 10,
         }
     }

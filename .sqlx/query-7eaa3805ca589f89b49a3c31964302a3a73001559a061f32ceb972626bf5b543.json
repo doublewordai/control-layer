@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT * FROM webhook_deliveries\n            WHERE status IN ('pending', 'failed')\n              AND next_attempt_at <= now()\n            ORDER BY next_attempt_at ASC\n            LIMIT $1\n            ",
+  "query": "\n            INSERT INTO webhook_deliveries (webhook_id, event_id, event_type, payload, batch_id, next_attempt_at)\n            VALUES ($1, $2, $3, $4, $5, COALESCE($6, now()))\n            RETURNING *\n            ",
   "describe": {
     "columns": [
       {
@@ -71,7 +71,12 @@
     ],
     "parameters": {
       "Left": [
-        "Int8"
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Jsonb",
+        "Uuid",
+        "Timestamptz"
       ]
     },
     "nullable": [
@@ -90,5 +95,5 @@
       false
     ]
   },
-  "hash": "361342941d6f21c4a2bc6f398a574025faa2c37d4e45ec92d0e7d332a569ebd5"
+  "hash": "7eaa3805ca589f89b49a3c31964302a3a73001559a061f32ceb972626bf5b543"
 }
