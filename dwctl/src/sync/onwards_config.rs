@@ -84,6 +84,8 @@ pub struct OnwardsConfigSync {
     daemon_capacity_limits: Option<Arc<dashmap::DashMap<String, usize>>>,
     /// Model aliases that batch API keys should have automatic access to (escalation targets)
     escalation_models: Vec<String>,
+    /// Tracks previous-cycle gauge label sets for zeroing stale metrics
+    cache_info_state: crate::metrics::CacheInfoState,
 }
 
 pub struct SyncConfig {
@@ -132,7 +134,8 @@ impl OnwardsConfigSync {
         }
 
         // Populate cache info metrics on startup
-        if let Err(e) = crate::metrics::update_cache_info_metrics(&db, &initial_targets).await {
+        let mut cache_info_state = crate::metrics::CacheInfoState::new();
+        if let Err(e) = crate::metrics::update_cache_info_metrics(&db, &initial_targets, &mut cache_info_state).await {
             error!("Failed to update cache info metrics: {}", e);
         }
 
@@ -144,6 +147,7 @@ impl OnwardsConfigSync {
             sender,
             daemon_capacity_limits,
             escalation_models,
+            cache_info_state,
         };
         let stream = WatchTargetsStream::new(receiver);
 
@@ -157,7 +161,7 @@ impl OnwardsConfigSync {
 
     /// Starts the background task that listens for database changes and updates the configuration
     #[instrument(skip(self, config, shutdown_token), err)]
-    pub async fn start(self, config: SyncConfig, shutdown_token: CancellationToken) -> Result<(), anyhow::Error> {
+    pub async fn start(mut self, config: SyncConfig, shutdown_token: CancellationToken) -> Result<(), anyhow::Error> {
         // Debouncing: prevent rapid-fire reloads
         let mut last_reload_time = std::time::Instant::now();
         const MIN_RELOAD_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
@@ -248,7 +252,7 @@ impl OnwardsConfigSync {
                                             }
 
                                         // Update cache info metrics
-                                        if let Err(e) = crate::metrics::update_cache_info_metrics(&self.db, &new_targets).await {
+                                        if let Err(e) = crate::metrics::update_cache_info_metrics(&self.db, &new_targets, &mut self.cache_info_state).await {
                                             error!("Failed to update cache info metrics: {}", e);
                                         }
 
@@ -331,7 +335,7 @@ impl OnwardsConfigSync {
                                     }
 
                                 // Update cache info metrics
-                                if let Err(e) = crate::metrics::update_cache_info_metrics(&self.db, &new_targets).await {
+                                if let Err(e) = crate::metrics::update_cache_info_metrics(&self.db, &new_targets, &mut self.cache_info_state).await {
                                     error!("Failed to update cache info metrics: {}", e);
                                 }
 

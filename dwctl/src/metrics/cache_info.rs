@@ -6,17 +6,12 @@
 //! `/internal/metrics` automatically when a recorder is installed.
 
 use std::collections::HashSet;
-use std::sync::Mutex;
 
 use metrics::gauge;
 use onwards::target::Targets;
 use serde::Deserialize;
 use sqlx::PgPool;
 use tracing::warn;
-
-/// Previous cycle's model info label sets — zeroed when the model disappears.
-/// Fields: (alias, model_name, model_type, endpoint_name, endpoint_host, is_composite, lb_strategy, sanitize_responses, is_metered)
-static PREV_MODELS: Mutex<Option<HashSet<ModelLabels>>> = Mutex::new(None);
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct ModelLabels {
@@ -31,11 +26,29 @@ struct ModelLabels {
     is_metered: String,
 }
 
-/// Previous cycle's (model, group_id, group_name) tuples — zeroed when they disappear.
-static PREV_GROUPS: Mutex<Option<HashSet<(String, String, String)>>> = Mutex::new(None);
+/// Tracks previous-cycle label sets so stale gauge series can be zeroed.
+///
+/// Must be owned by the caller and passed into [`update_cache_info_metrics`] on
+/// each sync cycle. The first call (when the sets are empty) skips zeroing;
+/// subsequent calls diff against the previous state.
+pub struct CacheInfoState {
+    prev_models: HashSet<ModelLabels>,
+    prev_groups: HashSet<(String, String, String)>,
+    prev_components: HashSet<(String, String, String, String, String)>,
+    /// Whether at least one cycle has run (skip zeroing on the first call).
+    initialized: bool,
+}
 
-/// Previous cycle's (composite, component, component_endpoint, sort_order, enabled) tuples.
-static PREV_COMPONENTS: Mutex<Option<HashSet<(String, String, String, String, String)>>> = Mutex::new(None);
+impl CacheInfoState {
+    pub fn new() -> Self {
+        Self {
+            prev_models: HashSet::new(),
+            prev_groups: HashSet::new(),
+            prev_components: HashSet::new(),
+            initialized: false,
+        }
+    }
+}
 
 #[derive(Deserialize)]
 struct GroupInfo {
@@ -59,7 +72,7 @@ struct ComponentInfo {
 /// (`dwctl_model_group_info`, `dwctl_model_component_weight`) are zeroed when
 /// their label combination disappears between cycles, so PromQL `group_left`
 /// joins stay time-accurate after group reassignments or component removals.
-pub async fn update_cache_info_metrics(pool: &PgPool, targets: &Targets) -> Result<(), anyhow::Error> {
+pub async fn update_cache_info_metrics(pool: &PgPool, targets: &Targets, state: &mut CacheInfoState) -> Result<(), anyhow::Error> {
     // Single query: all model metadata with groups and components as JSON arrays
     let rows = sqlx::query!(
         r#"
@@ -219,60 +232,53 @@ pub async fn update_cache_info_metrics(pool: &PgPool, targets: &Targets) -> Resu
         }
     }
 
-    // Zero gauges for models that disappeared since last cycle.
-    // Info gauge uses full label set (so metadata changes zero the old series).
-    // Single-label gauges only zero when the alias itself disappears.
-    if let Ok(mut prev) = PREV_MODELS.lock() {
-        if let Some(prev_set) = prev.as_ref() {
-            let current_aliases: HashSet<&str> = current_models.iter().map(|m| m.alias.as_str()).collect();
+    // Zero stale gauges by diffing against previous cycle's state.
+    // Skip on the first call — there's nothing to zero yet.
+    if state.initialized {
+        // Info gauge uses full label set (so metadata changes zero the old series).
+        // Single-label gauges only zero when the alias itself disappears.
+        let current_aliases: HashSet<&str> = current_models.iter().map(|m| m.alias.as_str()).collect();
 
-            for m in prev_set.difference(&current_models) {
-                // Zero the old info gauge series (label set changed or model deleted)
-                gauge!(
-                    "dwctl_model_info",
-                    "model" => m.alias.clone(),
-                    "model_name" => m.model_name.clone(),
-                    "model_type" => m.model_type.clone(),
-                    "endpoint_name" => m.endpoint_name.clone(),
-                    "endpoint_host" => m.endpoint_host.clone(),
-                    "is_composite" => m.is_composite.clone(),
-                    "lb_strategy" => m.lb_strategy.clone(),
-                    "sanitize_responses" => m.sanitize_responses.clone(),
-                    "is_metered" => m.is_metered.clone(),
-                )
+        for m in state.prev_models.difference(&current_models) {
+            gauge!(
+                "dwctl_model_info",
+                "model" => m.alias.clone(),
+                "model_name" => m.model_name.clone(),
+                "model_type" => m.model_type.clone(),
+                "endpoint_name" => m.endpoint_name.clone(),
+                "endpoint_host" => m.endpoint_host.clone(),
+                "is_composite" => m.is_composite.clone(),
+                "lb_strategy" => m.lb_strategy.clone(),
+                "sanitize_responses" => m.sanitize_responses.clone(),
+                "is_metered" => m.is_metered.clone(),
+            )
+            .set(0.0);
+
+            // Only zero single-label gauges if the alias is truly gone
+            // (not just a metadata change like is_metered flipping)
+            if !current_aliases.contains(m.alias.as_str()) {
+                gauge!("dwctl_model_rate_limit_rps", "model" => m.alias.clone()).set(0.0);
+                gauge!("dwctl_model_concurrency_limit", "model" => m.alias.clone()).set(0.0);
+                gauge!("dwctl_model_batch_capacity", "model" => m.alias.clone()).set(0.0);
+                gauge!("dwctl_model_throughput_rps", "model" => m.alias.clone()).set(0.0);
+                gauge!("dwctl_model_api_key_count", "model" => m.alias.clone()).set(0.0);
+            }
+        }
+
+        for (model, group_id, group_name) in state.prev_groups.difference(&current_groups) {
+            gauge!("dwctl_model_group_info", "model" => model.clone(), "group_id" => group_id.clone(), "group_name" => group_name.clone())
                 .set(0.0);
-
-                // Only zero single-label gauges if the alias is truly gone
-                // (not just a metadata change like is_metered flipping)
-                if !current_aliases.contains(m.alias.as_str()) {
-                    gauge!("dwctl_model_rate_limit_rps", "model" => m.alias.clone()).set(0.0);
-                    gauge!("dwctl_model_concurrency_limit", "model" => m.alias.clone()).set(0.0);
-                    gauge!("dwctl_model_batch_capacity", "model" => m.alias.clone()).set(0.0);
-                    gauge!("dwctl_model_throughput_rps", "model" => m.alias.clone()).set(0.0);
-                    gauge!("dwctl_model_api_key_count", "model" => m.alias.clone()).set(0.0);
-                }
-            }
         }
-        *prev = Some(current_models);
+
+        for (composite, component, component_endpoint, sort_order, enabled) in state.prev_components.difference(&current_components) {
+            gauge!("dwctl_model_component_weight", "composite" => composite.clone(), "component" => component.clone(), "component_endpoint" => component_endpoint.clone(), "sort_order" => sort_order.clone(), "enabled" => enabled.clone()).set(0.0);
+        }
     }
 
-    // Zero gauges for group/component pairs that disappeared since last cycle
-    if let Ok(mut prev) = PREV_GROUPS.lock() {
-        if let Some(prev_set) = prev.as_ref() {
-            for (model, group_id, group_name) in prev_set.difference(&current_groups) {
-                gauge!("dwctl_model_group_info", "model" => model.clone(), "group_id" => group_id.clone(), "group_name" => group_name.clone()).set(0.0);
-            }
-        }
-        *prev = Some(current_groups);
-    }
-    if let Ok(mut prev) = PREV_COMPONENTS.lock() {
-        if let Some(prev_set) = prev.as_ref() {
-            for (composite, component, component_endpoint, sort_order, enabled) in prev_set.difference(&current_components) {
-                gauge!("dwctl_model_component_weight", "composite" => composite.clone(), "component" => component.clone(), "component_endpoint" => component_endpoint.clone(), "sort_order" => sort_order.clone(), "enabled" => enabled.clone()).set(0.0);
-            }
-        }
-        *prev = Some(current_components);
-    }
+    state.prev_models = current_models;
+    state.prev_groups = current_groups;
+    state.prev_components = current_components;
+    state.initialized = true;
 
     // API key counts — from the Targets DashMap (no SQL needed)
     for entry in targets.targets.iter() {
@@ -308,6 +314,7 @@ mod tests {
     #[sqlx::test]
     async fn test_model_info_and_group_metrics(pool: sqlx::PgPool) {
         let handle = ensure_recorder();
+        let mut state = super::CacheInfoState::new();
         let test_user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
 
         // Create endpoint
@@ -397,7 +404,7 @@ mod tests {
 
         // Load targets and update metrics
         let targets = load_targets_from_db(&pool, &[]).await.unwrap();
-        super::update_cache_info_metrics(&pool, &targets).await.unwrap();
+        super::update_cache_info_metrics(&pool, &targets, &mut state).await.unwrap();
 
         let output = handle.render();
 
@@ -427,6 +434,7 @@ mod tests {
     #[sqlx::test]
     async fn test_composite_model_component_metrics(pool: sqlx::PgPool) {
         let handle = ensure_recorder();
+        let mut state = super::CacheInfoState::new();
         let test_user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
 
         // Create endpoint
@@ -517,7 +525,7 @@ mod tests {
         .unwrap();
 
         let targets = load_targets_from_db(&pool, &[]).await.unwrap();
-        super::update_cache_info_metrics(&pool, &targets).await.unwrap();
+        super::update_cache_info_metrics(&pool, &targets, &mut state).await.unwrap();
 
         let output = handle.render();
 
@@ -545,6 +553,7 @@ mod tests {
     #[sqlx::test]
     async fn test_no_gauges_for_missing_optional_fields(pool: sqlx::PgPool) {
         let handle = ensure_recorder();
+        let mut state = super::CacheInfoState::new();
         let test_user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
 
         // Create endpoint
@@ -594,7 +603,7 @@ mod tests {
         tx.commit().await.unwrap();
 
         let targets = load_targets_from_db(&pool, &[]).await.unwrap();
-        super::update_cache_info_metrics(&pool, &targets).await.unwrap();
+        super::update_cache_info_metrics(&pool, &targets, &mut state).await.unwrap();
 
         let output = handle.render();
 
@@ -628,10 +637,8 @@ mod tests {
         // real group_name) should be zeroed. No phantom series with empty labels
         // should be created.
         let handle = ensure_recorder();
+        let mut state = super::CacheInfoState::new();
         let test_user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
-
-        // Reset global state so this test has a clean starting point
-        *super::PREV_GROUPS.lock().unwrap() = None;
 
         // Create endpoint
         let mut tx = pool.begin().await.unwrap();
@@ -704,7 +711,7 @@ mod tests {
 
         // Cycle 1: group is present — populates PREV_GROUPS
         let targets = load_targets_from_db(&pool, &[]).await.unwrap();
-        super::update_cache_info_metrics(&pool, &targets).await.unwrap();
+        super::update_cache_info_metrics(&pool, &targets, &mut state).await.unwrap();
 
         let output = handle.render();
         let group_id_str = group.id.to_string();
@@ -731,7 +738,7 @@ mod tests {
 
         // Cycle 2: group is gone — zeroing should zero the ORIGINAL series
         let targets = load_targets_from_db(&pool, &[]).await.unwrap();
-        super::update_cache_info_metrics(&pool, &targets).await.unwrap();
+        super::update_cache_info_metrics(&pool, &targets, &mut state).await.unwrap();
 
         let output = handle.render();
         let lines = find_metric_lines(&output, "dwctl_model_group_info", &group_id_str);
@@ -761,10 +768,8 @@ mod tests {
         // series (with real sort_order/enabled labels) should be zeroed.
         // No phantom series with empty labels should be created.
         let handle = ensure_recorder();
+        let mut state = super::CacheInfoState::new();
         let test_user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
-
-        // Reset global state
-        *super::PREV_COMPONENTS.lock().unwrap() = None;
 
         // Create endpoint
         let mut tx = pool.begin().await.unwrap();
@@ -855,7 +860,7 @@ mod tests {
 
         // Cycle 1: component is present
         let targets = load_targets_from_db(&pool, &[]).await.unwrap();
-        super::update_cache_info_metrics(&pool, &targets).await.unwrap();
+        super::update_cache_info_metrics(&pool, &targets, &mut state).await.unwrap();
 
         let output = handle.render();
         let lines = find_metric_lines(&output, "dwctl_model_component_weight", r#"composite="phantom-composite""#);
@@ -880,7 +885,7 @@ mod tests {
 
         // Cycle 2: component is gone — should zero the original series
         let targets = load_targets_from_db(&pool, &[]).await.unwrap();
-        super::update_cache_info_metrics(&pool, &targets).await.unwrap();
+        super::update_cache_info_metrics(&pool, &targets, &mut state).await.unwrap();
 
         let output = handle.render();
         let lines = find_metric_lines(&output, "dwctl_model_component_weight", r#"composite="phantom-composite""#);
@@ -912,6 +917,7 @@ mod tests {
         // When a model is soft-deleted, all its gauges (info, rate limit,
         // concurrency, etc.) should be zeroed so dashboards reflect reality.
         let handle = ensure_recorder();
+        let mut state = super::CacheInfoState::new();
         let test_user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
 
         // Create endpoint
@@ -963,7 +969,7 @@ mod tests {
 
         // Cycle 1: model is active
         let targets = load_targets_from_db(&pool, &[]).await.unwrap();
-        super::update_cache_info_metrics(&pool, &targets).await.unwrap();
+        super::update_cache_info_metrics(&pool, &targets, &mut state).await.unwrap();
 
         let output = handle.render();
 
@@ -988,7 +994,7 @@ mod tests {
 
         // Cycle 2: model is deleted — gauges should be zeroed
         let targets = load_targets_from_db(&pool, &[]).await.unwrap();
-        super::update_cache_info_metrics(&pool, &targets).await.unwrap();
+        super::update_cache_info_metrics(&pool, &targets, &mut state).await.unwrap();
 
         let output = handle.render();
 
@@ -1024,10 +1030,8 @@ mod tests {
         // gauges (rate_limit, concurrency, etc.) must NOT be zeroed because
         // the model still exists.
         let handle = ensure_recorder();
+        let mut state = super::CacheInfoState::new();
         let test_user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
-
-        // Reset global state
-        *super::PREV_MODELS.lock().unwrap() = None;
 
         // Create endpoint
         let mut tx = pool.begin().await.unwrap();
@@ -1078,7 +1082,7 @@ mod tests {
 
         // Cycle 1: model exists, is_metered=false (no tariff)
         let targets = load_targets_from_db(&pool, &[]).await.unwrap();
-        super::update_cache_info_metrics(&pool, &targets).await.unwrap();
+        super::update_cache_info_metrics(&pool, &targets, &mut state).await.unwrap();
 
         let output = handle.render();
         let info_lines = find_metric_lines(&output, "dwctl_model_info", r#"model="meta-change-model""#);
@@ -1106,7 +1110,7 @@ mod tests {
 
         // Cycle 2: same model, but is_metered changed
         let targets = load_targets_from_db(&pool, &[]).await.unwrap();
-        super::update_cache_info_metrics(&pool, &targets).await.unwrap();
+        super::update_cache_info_metrics(&pool, &targets, &mut state).await.unwrap();
 
         let output = handle.render();
 
