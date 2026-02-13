@@ -11,8 +11,7 @@ use tracing::instrument;
 use crate::{
     AppState,
     api::models::webhooks::{
-        UserWebhookPathParams, WebhookCreate, WebhookPathParams, WebhookResponse, WebhookUpdate,
-        WebhookWithSecretResponse,
+        UserWebhookPathParams, WebhookCreate, WebhookPathParams, WebhookResponse, WebhookUpdate, WebhookWithSecretResponse,
     },
     auth::permissions,
     db::handlers::Webhooks,
@@ -514,7 +513,6 @@ pub async fn rotate_secret<P: PoolProvider>(
 
     Ok(Json(webhook.into()))
 }
-
 
 #[cfg(test)]
 mod tests {
