@@ -1,5 +1,18 @@
 # Changelog
 
+## [7.1.0](https://github.com/doublewordai/control-layer/compare/v7.0.1...v7.1.0) (2026-02-13)
+
+
+### Features
+
+* add Prometheus info/gauge metrics for onwards cache state ([#686](https://github.com/doublewordai/control-layer/issues/686)) ([cf9e5ea](https://github.com/doublewordai/control-layer/commit/cf9e5eac2de82f3a498b688f685e641de65afff6))
+
+
+### Bug Fixes
+
+* add purge config to daemon config structs ([#690](https://github.com/doublewordai/control-layer/issues/690)) ([4ec8c38](https://github.com/doublewordai/control-layer/commit/4ec8c380351bdc8d573e7cad81d5576bc8bfab87))
+* stream batch results and file content to prevent OOM ([#662](https://github.com/doublewordai/control-layer/issues/662)) ([765f951](https://github.com/doublewordai/control-layer/commit/765f9511444961357e942427d2a98b3b74caaac5))
+
 ## [7.0.1](https://github.com/doublewordai/control-layer/compare/v7.0.0...v7.0.1) (2026-02-12)
 
 
