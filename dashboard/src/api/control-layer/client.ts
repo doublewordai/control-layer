@@ -66,7 +66,6 @@ import type {
   WebhookWithSecret,
   WebhookCreateRequest,
   WebhookUpdateRequest,
-  WebhookTestResponse,
 } from "./types";
 import { ApiError } from "./errors";
 
@@ -324,21 +323,6 @@ const userApi = {
       return response.json();
     },
 
-    async test(
-      webhookId: string,
-      userId: string = "current",
-    ): Promise<WebhookTestResponse> {
-      const response = await fetch(
-        `/admin/api/v1/users/${userId}/webhooks/${webhookId}/test`,
-        {
-          method: "POST",
-        },
-      );
-      if (!response.ok) {
-        throw new Error(`Failed to test webhook: ${response.status}`);
-      }
-      return response.json();
-    },
   },
 };
 

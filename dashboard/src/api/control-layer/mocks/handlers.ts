@@ -537,17 +537,6 @@ export const handlers = [
     },
   ),
 
-  http.post(
-    "/admin/api/v1/users/:userId/webhooks/:webhookId/test",
-    () => {
-      return HttpResponse.json({
-        success: true,
-        status_code: 200,
-        duration_ms: 150,
-      });
-    },
-  ),
-
   // Models API
   http.get("/admin/api/v1/models", ({ request }) => {
     const url = new URL(request.url);

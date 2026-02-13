@@ -114,21 +114,6 @@ impl From<Webhook> for WebhookWithSecretResponse {
     }
 }
 
-/// Response for a test webhook delivery.
-#[derive(Debug, Clone, Serialize, ToSchema)]
-pub struct WebhookTestResponse {
-    /// Whether the test delivery was successful
-    pub success: bool,
-    /// HTTP status code received (if any)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub status_code: Option<u16>,
-    /// Error message (if any)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-    /// Time taken for the request in milliseconds
-    pub duration_ms: u64,
-}
-
 /// Path parameters for webhook endpoints.
 #[derive(Debug, Clone, Deserialize)]
 pub struct WebhookPathParams {

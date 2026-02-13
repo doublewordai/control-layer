@@ -1010,10 +1010,6 @@ pub async fn build_router(
             "/users/{user_id}/webhooks/{webhook_id}/rotate-secret",
             post(api::handlers::webhooks::rotate_secret),
         )
-        .route(
-            "/users/{user_id}/webhooks/{webhook_id}/test",
-            post(api::handlers::webhooks::test_webhook),
-        )
         // User-group relationships
         .route("/users/{user_id}/groups", get(api::handlers::groups::get_user_groups))
         .route("/users/{user_id}/groups/{group_id}", post(api::handlers::groups::add_group_to_user))

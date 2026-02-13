@@ -295,11 +295,6 @@ describe("Webhooks", () => {
     // Action buttons
     expect(
       within(container).getByRole("button", {
-        name: `Test webhook ${webhook.url}`,
-      }),
-    ).toBeInTheDocument();
-    expect(
-      within(container).getByRole("button", {
         name: `Edit webhook ${webhook.url}`,
       }),
     ).toBeInTheDocument();
@@ -531,73 +526,4 @@ describe("Webhooks", () => {
     });
   });
 
-  it("sends a test and shows the result", async () => {
-    const webhook = makeWebhook();
-    server.use(
-      http.get("/admin/api/v1/users/:userId/webhooks", () => {
-        return HttpResponse.json([webhook]);
-      }),
-    );
-
-    const { container, user } = await renderAndWaitForProfile();
-
-    await waitFor(() => {
-      expect(
-        within(container).getByText(webhook.url),
-      ).toBeInTheDocument();
-    });
-
-    // Click test button
-    await user.click(
-      within(container).getByRole("button", {
-        name: `Test webhook ${webhook.url}`,
-      }),
-    );
-
-    // Test result is displayed inline (mock returns success: true, 200, 150ms)
-    await waitFor(() => {
-      expect(
-        within(container).getByText(/Test succeeded \(200, 150ms\)/),
-      ).toBeInTheDocument();
-    });
-  });
-
-  it("shows test failure result", async () => {
-    const webhook = makeWebhook();
-    server.use(
-      http.get("/admin/api/v1/users/:userId/webhooks", () => {
-        return HttpResponse.json([webhook]);
-      }),
-      http.post(
-        "/admin/api/v1/users/:userId/webhooks/:webhookId/test",
-        () => {
-          return HttpResponse.json({
-            success: false,
-            error: "Connection refused",
-            duration_ms: 50,
-          });
-        },
-      ),
-    );
-
-    const { container, user } = await renderAndWaitForProfile();
-
-    await waitFor(() => {
-      expect(
-        within(container).getByText(webhook.url),
-      ).toBeInTheDocument();
-    });
-
-    await user.click(
-      within(container).getByRole("button", {
-        name: `Test webhook ${webhook.url}`,
-      }),
-    );
-
-    await waitFor(() => {
-      expect(
-        within(container).getByText(/Test failed: Connection refused/),
-      ).toBeInTheDocument();
-    });
-  });
 });

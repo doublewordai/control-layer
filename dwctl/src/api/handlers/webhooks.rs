@@ -11,16 +11,15 @@ use tracing::instrument;
 use crate::{
     AppState,
     api::models::webhooks::{
-        UserWebhookPathParams, WebhookCreate, WebhookPathParams, WebhookResponse, WebhookTestResponse, WebhookUpdate,
+        UserWebhookPathParams, WebhookCreate, WebhookPathParams, WebhookResponse, WebhookUpdate,
         WebhookWithSecretResponse,
     },
     auth::permissions,
     db::handlers::Webhooks,
     db::models::webhooks::{WebhookCreateDBRequest, WebhookUpdateDBRequest},
     errors::{Error, Result},
-    notifications::BatchNotificationInfo,
     types::{Operation, Permission, Resource, UserId, UserIdOrCurrent},
-    webhooks::{WebhookEvent, WebhookEventType, signing},
+    webhooks::{WebhookEventType, signing},
 };
 
 /// List all webhooks for a user.
@@ -133,10 +132,11 @@ pub async fn create_webhook<P: PoolProvider>(
         });
     }
 
-    // Validate URL is HTTPS
-    if !request.url.starts_with("https://") {
+    // Validate URL is HTTPS (allow HTTP for localhost/127.0.0.1 in development)
+    let is_local = request.url.starts_with("http://localhost") || request.url.starts_with("http://127.0.0.1");
+    if !request.url.starts_with("https://") && !is_local {
         return Err(Error::BadRequest {
-            message: "Webhook URL must use HTTPS".to_string(),
+            message: "Webhook URL must use HTTPS (HTTP allowed for localhost only)".to_string(),
         });
     }
 
@@ -515,145 +515,6 @@ pub async fn rotate_secret<P: PoolProvider>(
     Ok(Json(webhook.into()))
 }
 
-/// Send a test event to a webhook.
-#[utoipa::path(
-    post,
-    path = "/users/{user_id}/webhooks/{webhook_id}/test",
-    tag = "webhooks",
-    summary = "Test webhook",
-    description = "Send a test event to verify webhook connectivity.",
-    params(
-        ("user_id" = uuid::Uuid, Path, description = "User ID"),
-        ("webhook_id" = uuid::Uuid, Path, description = "Webhook ID"),
-    ),
-    responses(
-        (status = 200, description = "Test result", body = WebhookTestResponse),
-        (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Forbidden"),
-        (status = 404, description = "Webhook not found"),
-        (status = 500, description = "Internal server error"),
-    ),
-    security(
-        ("BearerAuth" = []),
-        ("CookieAuth" = []),
-        ("X-Doubleword-User" = [])
-    )
-)]
-#[instrument(skip_all)]
-pub async fn test_webhook<P: PoolProvider>(
-    State(state): State<AppState<P>>,
-    Path(params): Path<WebhookPathParams>,
-    current_user: crate::api::models::users::CurrentUser,
-) -> Result<Json<WebhookTestResponse>> {
-    let target_user_id: UserId = match params.user_id {
-        UserIdOrCurrent::Current(_) => current_user.id,
-        UserIdOrCurrent::Id(id) => id,
-    };
-
-    // Check permissions (use ReadOwn/ReadAll for testing)
-    let can_read_all = permissions::has_permission(&current_user, Resource::Webhooks, Operation::ReadAll);
-    let can_read_own =
-        target_user_id == current_user.id && permissions::has_permission(&current_user, Resource::Webhooks, Operation::ReadOwn);
-
-    if !can_read_all && !can_read_own {
-        return Err(Error::InsufficientPermissions {
-            required: Permission::Any(vec![
-                Permission::Allow(Resource::Webhooks, Operation::ReadAll),
-                Permission::Allow(Resource::Webhooks, Operation::ReadOwn),
-            ]),
-            action: Operation::ReadAll,
-            resource: format!("webhook {}", params.webhook_id),
-        });
-    }
-
-    let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
-    let mut repo = Webhooks::new(&mut conn);
-
-    let webhook = repo.get_by_id(params.webhook_id).await?.ok_or_else(|| Error::NotFound {
-        resource: "Webhook".to_string(),
-        id: params.webhook_id.to_string(),
-    })?;
-
-    if webhook.user_id != target_user_id {
-        return Err(Error::NotFound {
-            resource: "Webhook".to_string(),
-            id: params.webhook_id.to_string(),
-        });
-    }
-
-    // Create a synthetic test payload
-    let test_info = BatchNotificationInfo {
-        batch_id: "batch_00000000-0000-0000-0000-000000000000".to_string(),
-        batch_uuid: uuid::Uuid::nil(),
-        user_id: target_user_id,
-        endpoint: "test".to_string(),
-        model: "test".to_string(),
-        outcome: crate::notifications::BatchOutcome::Completed,
-        created_at: chrono::Utc::now(),
-        finished_at: Some(chrono::Utc::now()),
-        total_requests: 10,
-        completed_requests: 10,
-        failed_requests: 0,
-        cancelled_requests: 0,
-        completion_window: "24h".to_string(),
-        filename: None,
-        description: None,
-        output_file_id: None,
-        error_file_id: None,
-    };
-
-    let test_event = WebhookEvent::batch_terminal(WebhookEventType::BatchCompleted, &test_info);
-
-    let payload = serde_json::to_string(&test_event).map_err(|e| Error::Internal {
-        operation: format!("Failed to serialize test event: {}", e),
-    })?;
-
-    // Generate signature
-    let msg_id = uuid::Uuid::new_v4().to_string();
-    let timestamp = chrono::Utc::now().timestamp();
-    let signature = signing::sign_payload(&msg_id, timestamp, &payload, &webhook.secret).ok_or_else(|| Error::Internal {
-        operation: "Failed to sign webhook payload".to_string(),
-    })?;
-
-    // Send the request
-    let timeout = std::time::Duration::from_secs(state.config.background_services.notifications.webhooks.timeout_secs);
-    let client = reqwest::Client::builder().timeout(timeout).build().map_err(|e| Error::Internal {
-        operation: format!("Failed to create HTTP client: {}", e),
-    })?;
-    let start = std::time::Instant::now();
-
-    let result = client
-        .post(&webhook.url)
-        .header("Content-Type", "application/json")
-        .header("webhook-id", &msg_id)
-        .header("webhook-timestamp", timestamp.to_string())
-        .header("webhook-signature", &signature)
-        .header("webhook-version", "1")
-        .body(payload)
-        .send()
-        .await;
-
-    let duration_ms = start.elapsed().as_millis() as u64;
-
-    match result {
-        Ok(response) => {
-            let status = response.status();
-            let success = status.is_success();
-            Ok(Json(WebhookTestResponse {
-                success,
-                status_code: Some(status.as_u16()),
-                error: if success { None } else { Some(format!("HTTP {}", status)) },
-                duration_ms,
-            }))
-        }
-        Err(e) => Ok(Json(WebhookTestResponse {
-            success: false,
-            status_code: None,
-            error: Some(e.to_string()),
-            duration_ms,
-        })),
-    }
-}
 
 #[cfg(test)]
 mod tests {
