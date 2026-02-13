@@ -176,7 +176,12 @@ const ModelInfo: React.FC = () => {
     { status: "running" },
     { enabled: canManageGroups },
   );
-  const runningDaemonCount = daemonsData?.daemons.length ?? 0;
+  const runningDaemonCount =
+    daemonsData?.daemons.filter((d) => {
+      if (d.status !== "running" || !d.last_heartbeat) return false;
+      const timeSinceHeartbeat = Date.now() - d.last_heartbeat * 1000;
+      return timeSinceHeartbeat <= d.config.heartbeat_interval_ms * 2;
+    }).length ?? 0;
 
   const loading = modelLoading || endpointLoading;
   const error = modelError
