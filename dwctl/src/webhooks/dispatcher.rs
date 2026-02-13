@@ -43,7 +43,6 @@ use crate::config::WebhookConfig;
 use crate::db::handlers::Webhooks;
 use crate::webhooks::signing;
 
-
 // --- Channel types ---
 
 /// A pre-built webhook HTTP request ready to send.
@@ -81,6 +80,7 @@ pub struct WebhookDispatcher {
     result_rx: mpsc::Receiver<WebhookSendResult>,
     retry_schedule: Vec<i64>,
     claim_batch_size: i64,
+    circuit_breaker_threshold: i32,
 }
 
 impl WebhookDispatcher {
@@ -94,13 +94,7 @@ impl WebhookDispatcher {
             .build()
             .expect("Failed to create webhook HTTP client");
 
-        tokio::spawn(run_sender(
-            send_rx,
-            result_tx,
-            http_client,
-            config.max_concurrent_sends,
-            shutdown,
-        ));
+        tokio::spawn(run_sender(send_rx, result_tx, http_client, config.max_concurrent_sends, shutdown));
 
         Self {
             pool,
@@ -108,6 +102,7 @@ impl WebhookDispatcher {
             result_rx,
             retry_schedule: config.retry_schedule_secs.clone(),
             claim_batch_size: config.claim_batch_size,
+            circuit_breaker_threshold: config.circuit_breaker_threshold,
         }
     }
 
@@ -270,7 +265,7 @@ impl WebhookDispatcher {
                     }
                     // increment_failures returns None if the webhook was deleted
                     // while this delivery was in-flight — not an error.
-                    match repo.increment_failures(result.webhook_id).await {
+                    match repo.increment_failures(result.webhook_id, self.circuit_breaker_threshold).await {
                         Ok(None) => {
                             tracing::debug!(
                                 webhook_id = %result.webhook_id,

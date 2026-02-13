@@ -11,9 +11,6 @@ use crate::db::models::webhooks::{
 };
 use crate::types::{UserId, abbrev_uuid};
 
-/// Circuit breaker threshold for consecutive failures.
-pub const CIRCUIT_BREAKER_THRESHOLD: i32 = 10;
-
 /// Repository for webhook operations.
 pub struct Webhooks<'c> {
     db: &'c mut PgConnection,
@@ -192,7 +189,7 @@ impl<'c> Webhooks<'c> {
     /// Returns `None` if the webhook was deleted (e.g. CASCADE from user or
     /// direct delete while deliveries were in-flight).
     #[instrument(skip(self), fields(webhook_id = %abbrev_uuid(&id)), err)]
-    pub async fn increment_failures(&mut self, id: WebhookId) -> Result<Option<Webhook>> {
+    pub async fn increment_failures(&mut self, id: WebhookId, circuit_breaker_threshold: i32) -> Result<Option<Webhook>> {
         let webhook = sqlx::query_as!(
             Webhook,
             r#"
@@ -211,7 +208,7 @@ impl<'c> Webhooks<'c> {
             RETURNING *
             "#,
             id,
-            CIRCUIT_BREAKER_THRESHOLD,
+            circuit_breaker_threshold,
         )
         .fetch_optional(&mut *self.db)
         .await?;
@@ -620,7 +617,7 @@ mod tests {
         let d = get_delivery(&pool, delivery.id).await;
         assert_eq!(d.status, "failed");
         assert_eq!(d.attempt_count, 1);
-        repo.increment_failures(webhook.id).await.unwrap();
+        repo.increment_failures(webhook.id, 10).await.unwrap();
 
         // Attempt 2: time travel, claim, fail
         time_travel_delivery(&pool, delivery.id).await;
@@ -631,7 +628,7 @@ mod tests {
         let d = get_delivery(&pool, delivery.id).await;
         assert_eq!(d.status, "failed");
         assert_eq!(d.attempt_count, 2);
-        repo.increment_failures(webhook.id).await.unwrap();
+        repo.increment_failures(webhook.id, 10).await.unwrap();
 
         // Attempt 3: time travel, claim, fail → exhausted
         time_travel_delivery(&pool, delivery.id).await;
@@ -659,7 +656,7 @@ mod tests {
 
         // Fail once to increment failures
         repo.mark_failed(delivery.id, Some(500), "HTTP 500", 0, SCHEDULE_7).await.unwrap();
-        let w = repo.increment_failures(webhook.id).await.unwrap().unwrap();
+        let w = repo.increment_failures(webhook.id, 10).await.unwrap().unwrap();
         assert_eq!(w.consecutive_failures, 1);
 
         // Succeed on retry
