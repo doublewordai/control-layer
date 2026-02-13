@@ -26,9 +26,11 @@ use crate::errors::{Error, Result};
 use crate::types::Resource;
 use axum::{
     Json,
+    body::Body,
     extract::{FromRequest, Multipart, Path, Query, State},
     http::StatusCode,
 };
+use bytes::Bytes;
 use chrono::Utc;
 use fusillade::Storage;
 use futures::StreamExt;
@@ -1085,39 +1087,11 @@ pub async fn get_file_content<P: PoolProvider>(
     // For non-error files (input, output): show all content (false)
     let hide_retriable_before_sla = matches!(file.purpose, Some(fusillade::batch::Purpose::BatchError));
 
-    // Stream the file content as JSONL, starting from offset
-    let offset = query.pagination.skip.unwrap_or(0) as usize;
-    let search = query.search.clone();
-    let content_stream =
-        state
-            .request_manager
-            .get_file_content_stream(fusillade::FileId(file_id), offset, search, hide_retriable_before_sla);
-
-    // Apply limit if specified, fetching one extra to detect if there are more results
-    let requested_limit = query.pagination.limit.map(|l| l as usize);
-    let fetch_limit = requested_limit.map(|l| l + 1); // Fetch one extra to check for more results
-
-    let content_stream: Pin<Box<dyn Stream<Item = fusillade::Result<fusillade::FileContentItem>> + Send>> = if let Some(limit) = fetch_limit
-    {
-        Box::pin(content_stream.take(limit))
-    } else {
-        Box::pin(content_stream)
-    };
-
-    // Collect items to determine if we need to truncate and set headers
-    let items: Vec<_> = content_stream.collect().await;
-
-    // Check if there's more paginated data currently available
-    let has_more_paginated = if let Some(req_limit) = requested_limit {
-        items.len() > req_limit
-    } else {
-        false // No limit means we fetched everything currently available
-    };
-
     // For BatchOutput and BatchError files, check if the batch is still running
-    // (which means more data may be written to this file in the future)
-    let file_may_receive_more_data = match file.purpose {
-        Some(fusillade::batch::Purpose::Batch) => false, // Input files are static
+    // (which means more data may be written to this file in the future).
+    // Also capture the expected content count for streaming X-Last-Line.
+    let (file_may_receive_more_data, file_content_count) = match file.purpose {
+        Some(fusillade::batch::Purpose::Batch) => (false, None), // Input files: count unknown without query
         Some(fusillade::batch::Purpose::BatchOutput) => {
             let batch = state
                 .request_manager
@@ -1134,9 +1108,10 @@ pub async fn get_file_content<P: PoolProvider>(
                     .map_err(|e| Error::Internal {
                         operation: format!("get batch status: {}", e),
                     })?;
-                status.pending_requests > 0 || status.in_progress_requests > 0
+                let still_processing = status.pending_requests > 0 || status.in_progress_requests > 0;
+                (still_processing, Some(status.completed_requests as usize))
             } else {
-                false
+                (false, None)
             }
         }
         Some(fusillade::batch::Purpose::BatchError) => {
@@ -1155,74 +1130,124 @@ pub async fn get_file_content<P: PoolProvider>(
                     .map_err(|e| Error::Internal {
                         operation: format!("get batch status: {}", e),
                     })?;
-                status.pending_requests > 0 || status.in_progress_requests > 0
+                let still_processing = status.pending_requests > 0 || status.in_progress_requests > 0;
+                (still_processing, Some(status.failed_requests as usize))
             } else {
-                false
+                (false, None)
             }
         }
-        None => false, // Shouldn't happen, but assume complete
+        None => (false, None), // Shouldn't happen, but assume complete
     };
 
-    let has_more = has_more_paginated || file_may_receive_more_data;
+    // Stream the file content as JSONL, starting from offset
+    let offset = query.pagination.skip() as usize;
+    let search = query.search.clone();
+    let requested_limit = query.pagination.limit.map(|_| query.pagination.limit() as usize);
 
-    // Truncate to requested limit if we fetched extra
-    let items_to_return = if let Some(req_limit) = requested_limit {
-        items.into_iter().take(req_limit).collect::<Vec<_>>()
-    } else {
-        items
-    };
-
-    let line_count = items_to_return.len();
-    let last_line = offset + line_count;
-
-    // Convert FileContentItem to JSONL (one per line)
-    let mut jsonl_lines = Vec::new();
-    for content_result in items_to_return {
-        let json_line = content_result
-            .and_then(|content_item| {
-                // Handle different content types
-                match content_item {
-                    fusillade::FileContentItem::Template(template) => {
-                        // Transform to OpenAI format (drops api_key, endpoint)
-                        OpenAIBatchRequest::from_internal(&template)
-                            .map_err(|e| fusillade::FusilladeError::Other(anyhow::anyhow!("Failed to transform to OpenAI format: {:?}", e)))
-                            .and_then(|openai_req| {
-                                serde_json::to_string(&openai_req)
-                                    .map(|json| format!("{}\n", json))
-                                    .map_err(|e| fusillade::FusilladeError::Other(anyhow::anyhow!("JSON serialization failed: {}", e)))
-                            })
-                    }
-                    fusillade::FileContentItem::Output(output) => {
-                        // Already in OpenAI format, just serialize
-                        serde_json::to_string(&output)
+    // Helper to serialize FileContentItem to JSON line
+    fn serialize_content_item(content_item: fusillade::FileContentItem) -> fusillade::Result<String> {
+        match content_item {
+            fusillade::FileContentItem::Template(template) => {
+                // Transform to OpenAI format (drops api_key, endpoint)
+                OpenAIBatchRequest::from_internal(&template)
+                    .map_err(|e| fusillade::FusilladeError::Other(anyhow::anyhow!("Failed to transform to OpenAI format: {:?}", e)))
+                    .and_then(|openai_req| {
+                        serde_json::to_string(&openai_req)
                             .map(|json| format!("{}\n", json))
                             .map_err(|e| fusillade::FusilladeError::Other(anyhow::anyhow!("JSON serialization failed: {}", e)))
-                    }
-                    fusillade::FileContentItem::Error(error) => {
-                        // Already in OpenAI format, just serialize
-                        serde_json::to_string(&error)
-                            .map(|json| format!("{}\n", json))
-                            .map_err(|e| fusillade::FusilladeError::Other(anyhow::anyhow!("JSON serialization failed: {}", e)))
-                    }
-                }
-            })
-            .map_err(|e| Error::Internal {
-                operation: format!("serialize content: {}", e),
-            })?;
-        jsonl_lines.push(json_line);
+                    })
+            }
+            fusillade::FileContentItem::Output(output) => serde_json::to_string(&output)
+                .map(|json| format!("{}\n", json))
+                .map_err(|e| fusillade::FusilladeError::Other(anyhow::anyhow!("JSON serialization failed: {}", e))),
+            fusillade::FileContentItem::Error(error) => serde_json::to_string(&error)
+                .map(|json| format!("{}\n", json))
+                .map_err(|e| fusillade::FusilladeError::Other(anyhow::anyhow!("JSON serialization failed: {}", e))),
+        }
     }
 
-    let jsonl_content = jsonl_lines.join("");
+    if let Some(limit) = requested_limit {
+        // Pagination case: buffer only N+1 items to check for more pages
+        let content_stream =
+            state
+                .request_manager
+                .get_file_content_stream(fusillade::FileId(file_id), offset, search, hide_retriable_before_sla);
 
-    let mut response = axum::response::Response::new(axum::body::Body::from(jsonl_content));
-    response
-        .headers_mut()
-        .insert("content-type", "application/x-ndjson".parse().unwrap());
-    response.headers_mut().insert("X-Incomplete", has_more.to_string().parse().unwrap());
-    response.headers_mut().insert("X-Last-Line", last_line.to_string().parse().unwrap());
-    *response.status_mut() = StatusCode::OK;
+        let mut buffer: Vec<_> = content_stream.take(limit + 1).collect().await;
+        let has_more_pages = buffer.len() > limit;
+        buffer.truncate(limit);
 
-    Ok(response)
+        let line_count = buffer.len();
+        let last_line = offset + line_count;
+        let has_more = has_more_pages || file_may_receive_more_data;
+
+        // Serialize buffered items
+        let mut jsonl_lines = Vec::new();
+        for content_result in buffer {
+            let json_line = content_result.and_then(serialize_content_item).map_err(|e| Error::Internal {
+                operation: format!("serialize content: {}", e),
+            })?;
+            jsonl_lines.push(json_line);
+        }
+
+        let jsonl_content = jsonl_lines.join("");
+
+        let mut response = axum::response::Response::new(Body::from(jsonl_content));
+        response
+            .headers_mut()
+            .insert("content-type", "application/x-ndjson".parse().unwrap());
+        response.headers_mut().insert("X-Incomplete", has_more.to_string().parse().unwrap());
+        response.headers_mut().insert("X-Last-Line", last_line.to_string().parse().unwrap());
+        *response.status_mut() = StatusCode::OK;
+
+        Ok(response)
+    } else {
+        // Unlimited case: true streaming to avoid OOM on large result sets
+        //
+        // Derive expected count from batch status when available, so we can
+        // set X-Last-Line before streaming. Search filters make the count
+        // unknown, so we skip X-Last-Line in that case.
+        let expected_count = if search.is_none() {
+            file_content_count.map(|c| c.saturating_sub(offset))
+        } else {
+            None
+        };
+
+        let content_stream =
+            state
+                .request_manager
+                .get_file_content_stream(fusillade::FileId(file_id), offset, search, hide_retriable_before_sla);
+
+        // Limit stream to expected count so X-Last-Line is accurate
+        let content_stream: Pin<Box<dyn Stream<Item = fusillade::Result<fusillade::FileContentItem>> + Send>> =
+            if let Some(count) = expected_count {
+                Box::pin(content_stream.take(count))
+            } else {
+                Box::pin(content_stream)
+            };
+
+        let body_stream = content_stream.map(|result| {
+            result
+                .and_then(|item| serialize_content_item(item).map(Bytes::from))
+                .map_err(|e| std::io::Error::other(e.to_string()))
+        });
+
+        let body = Body::from_stream(body_stream);
+        let mut response = axum::response::Response::new(body);
+        response
+            .headers_mut()
+            .insert("content-type", "application/x-ndjson".parse().unwrap());
+        response
+            .headers_mut()
+            .insert("X-Incomplete", file_may_receive_more_data.to_string().parse().unwrap());
+        if let Some(count) = expected_count {
+            let last_line = offset + count;
+            response.headers_mut().insert("X-Last-Line", last_line.to_string().parse().unwrap());
+        }
+        *response.status_mut() = StatusCode::OK;
+
+        Ok(response)
+    }
 }
 
 #[utoipa::path(
@@ -2663,6 +2688,149 @@ mod tests {
             .await;
 
         upload_response.assert_status(axum::http::StatusCode::CREATED);
+    }
+
+    /// Regression test for streaming file content (output files).
+    ///
+    /// Previously, get_file_content collected ALL items into memory before
+    /// sending the response. This test verifies that:
+    /// 1. Unlimited downloads (no limit param) return all results correctly
+    /// 2. Unlimited responses use streaming (no content-length header)
+    /// 3. Paginated downloads return correct subset and headers
+    /// 4. Each line is valid JSON
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_file_content_streaming(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        // Build a file with many requests
+        let num_requests = 30;
+        let jsonl_lines: Vec<String> = (0..num_requests)
+            .map(|i| {
+                format!(
+                    r#"{{"custom_id":"req-{}","method":"POST","url":"/v1/chat/completions","body":{{"model":"gpt-4","messages":[{{"role":"user","content":"Test {}"}}]}}}}"#,
+                    i, i
+                )
+            })
+            .collect();
+        let jsonl_content = jsonl_lines.join("\n") + "\n";
+
+        // Upload
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes().to_vec()).file_name("test.jsonl");
+        let upload_response = app
+            .post("/ai/v1/files")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .multipart(
+                axum_test::multipart::MultipartForm::new()
+                    .add_text("purpose", "batch")
+                    .add_part("file", file_part),
+            )
+            .await;
+
+        upload_response.assert_status(axum::http::StatusCode::CREATED);
+        let file: FileResponse = upload_response.json();
+
+        // Create batch to get an output file
+        let batch_response = app
+            .post("/ai/v1/batches")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .json(&serde_json::json!({
+                "input_file_id": file.id,
+                "endpoint": "/v1/chat/completions",
+                "completion_window": "24h"
+            }))
+            .await;
+
+        batch_response.assert_status(axum::http::StatusCode::CREATED);
+        let batch: serde_json::Value = batch_response.json();
+        let batch_id_str = batch["id"].as_str().expect("Should have id");
+        let output_file_id = batch["output_file_id"].as_str().expect("Should have output_file_id");
+
+        // Complete all requests so the output file has content
+        let batch_uuid_str = batch_id_str.strip_prefix("batch_").unwrap_or(batch_id_str);
+        let batch_uuid = Uuid::parse_str(batch_uuid_str).expect("Valid batch UUID");
+
+        sqlx::query(
+            r#"
+            UPDATE fusillade.requests
+            SET state = 'completed', response_status = 200,
+                response_body = '{"choices":[{"message":{"content":"ok"}}]}',
+                completed_at = NOW()
+            WHERE batch_id = $1
+            "#,
+        )
+        .bind(batch_uuid)
+        .execute(&pool)
+        .await
+        .expect("Failed to complete requests");
+
+        let auth = add_auth_headers(&user);
+
+        // Test 1: Unlimited download (streaming path)
+        let response = app
+            .get(&format!("/ai/v1/files/{}/content", output_file_id))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+
+        response.assert_status(axum::http::StatusCode::OK);
+        response.assert_header("content-type", "application/x-ndjson");
+        response.assert_header("X-Incomplete", "false");
+        // Streaming responses must not have content-length (regression guard)
+        assert!(
+            response.headers().get("content-length").is_none(),
+            "Unlimited download should be streamed without content-length"
+        );
+
+        let body = response.text();
+        let lines: Vec<&str> = body.trim().lines().collect();
+        assert_eq!(lines.len(), num_requests, "Should return all {} results", num_requests);
+
+        // Verify each line is valid JSON
+        for line in &lines {
+            let item: serde_json::Value = serde_json::from_str(line).expect("Each line should be valid JSON");
+            assert!(item.get("custom_id").is_some(), "Each result should have custom_id");
+        }
+
+        // Test 2: Paginated download (buffered path)
+        let page_size = 10;
+        let response = app
+            .get(&format!("/ai/v1/files/{}/content?limit={}", output_file_id, page_size))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+
+        response.assert_status(axum::http::StatusCode::OK);
+        response.assert_header("X-Incomplete", "true"); // more pages exist
+        response.assert_header("X-Last-Line", &page_size.to_string());
+
+        let body = response.text();
+        let lines: Vec<&str> = body.trim().lines().collect();
+        assert_eq!(lines.len(), page_size, "Should return exactly {} results", page_size);
+
+        // Test 3: Last page should have X-Incomplete=false
+        let response = app
+            .get(&format!(
+                "/ai/v1/files/{}/content?limit={}&skip={}",
+                output_file_id,
+                page_size,
+                num_requests - page_size
+            ))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+
+        response.assert_status(axum::http::StatusCode::OK);
+        response.assert_header("X-Incomplete", "false"); // no more pages, batch complete
+        response.assert_header("X-Last-Line", &num_requests.to_string());
     }
 
     #[test]
