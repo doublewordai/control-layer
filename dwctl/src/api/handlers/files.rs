@@ -26,9 +26,11 @@ use crate::errors::{Error, Result};
 use crate::types::Resource;
 use axum::{
     Json,
-    extract::{Multipart, Path, Query, State},
+    body::Body,
+    extract::{FromRequest, Multipart, Path, Query, State},
     http::StatusCode,
 };
+use bytes::Bytes;
 use chrono::Utc;
 use fusillade::Storage;
 use futures::StreamExt;
@@ -36,10 +38,14 @@ use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
-
+// Note: We import multer directly to get typed error matching for body limit errors.
+// axum's multipart wraps multer, and checking error variants is more robust than string matching.
+use crate::limits::MULTIPART_OVERHEAD;
+use axum::extract::rejection::LengthLimitError;
 /// OpenAI Batch API request format
 /// See: https://platform.openai.com/docs/api-reference/batch
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -143,7 +149,8 @@ impl OpenAIBatchRequest {
 
         // Validate model access
         if !accessible_models.contains(&model) {
-            return Err(Error::BadRequest {
+            return Err(Error::ModelAccessDenied {
+                model_name: model.clone(),
                 message: format!("Model '{}' has not been configured or is not available to user.", model),
             });
         }
@@ -172,7 +179,7 @@ impl OpenAIBatchRequest {
             path: self.url.clone(),
             body,
             model,
-            api_key,
+            api_key: api_key.to_string(),
         })
     }
 
@@ -203,9 +210,140 @@ struct FileStreamConfig {
     max_file_size: u64,
     /// Maximum number of requests per file (0 = unlimited)
     max_requests_per_file: usize,
+    /// Maximum body size in bytes for individual requests (0 = unlimited)
+    max_request_body_size: u64,
     /// Channel buffer size for streaming
     buffer_size: usize,
 }
+
+/// Errors that can occur during file upload processing.
+/// These are handled in control-layer, not round-tripped through fusillade.
+#[derive(Debug, Clone)]
+enum FileUploadError {
+    /// HTTP stream was interrupted (connection dropped, body limit exceeded, etc.)
+    StreamInterrupted { message: String },
+    /// File exceeds the configured maximum size
+    FileTooLarge { max: u64 },
+    /// File contains too many requests
+    TooManyRequests { count: usize, max: usize },
+    /// Invalid JSON on a specific line
+    InvalidJson { line: u64, error: String },
+    /// Invalid UTF-8 encoding in the file
+    InvalidUtf8 { line: u64, byte_offset: i64, error: String },
+    /// No file field in multipart upload
+    NoFile,
+    /// File contains no valid request templates
+    EmptyFile,
+    /// User doesn't have access to a model referenced in the file
+    ModelAccessDenied { model: String, line: u64 },
+    /// Per-line validation error (custom_id, method, url, etc.)
+    ValidationError { line: u64, message: String },
+}
+
+impl FileUploadError {
+    /// Convert to the appropriate HTTP error type
+    fn into_http_error(self) -> Error {
+        match self {
+            FileUploadError::StreamInterrupted { message } => {
+                // Stream errors are server-side issues we can't determine the cause of
+                Error::Internal {
+                    operation: format!("upload file: {}", message),
+                }
+            }
+            FileUploadError::FileTooLarge { max } => {
+                if max == 0 {
+                    // max_file_size=0 means unlimited, so this error shouldn't occur
+                    // in normal operation. Treat as internal error.
+                    Error::Internal {
+                        operation: "upload file: unexpected size limit error with unlimited file size configured".to_string(),
+                    }
+                } else {
+                    Error::PayloadTooLarge {
+                        message: format!("File exceeds the maximum allowed size of {} bytes", max),
+                    }
+                }
+            }
+            FileUploadError::TooManyRequests { count, max } => Error::BadRequest {
+                message: format!("File contains {} requests, which exceeds the maximum of {}", count, max),
+            },
+            FileUploadError::InvalidJson { line, error } => Error::BadRequest {
+                message: format!("Invalid JSON on line {}: {}", line, error),
+            },
+            FileUploadError::InvalidUtf8 { line, byte_offset, error } => Error::BadRequest {
+                message: format!(
+                    "File contains invalid UTF-8 on/near line {} at byte offset {}: {}",
+                    line, byte_offset, error
+                ),
+            },
+            FileUploadError::NoFile => Error::BadRequest {
+                message: "No file field found in multipart upload".to_string(),
+            },
+            FileUploadError::EmptyFile => Error::BadRequest {
+                message: "File contains no valid request templates".to_string(),
+            },
+            FileUploadError::ModelAccessDenied { model, line } => Error::ModelAccessDenied {
+                model_name: model.clone(),
+                message: format!(
+                    "Line {}: Model '{}' has not been configured or is not available to user",
+                    line, model
+                ),
+            },
+            FileUploadError::ValidationError { line, message } => Error::BadRequest {
+                message: format!("Line {}: {}", line, message),
+            },
+        }
+    }
+}
+
+/// Check if an error (or any error in its source chain) is a body/stream length limit error.
+/// Uses typed error matching via downcasting, with string-based fallback for wrapped errors.
+fn is_length_limit_error(err: &(dyn std::error::Error + 'static)) -> bool {
+    // Check for axum's LengthLimitError directly
+    if err.downcast_ref::<LengthLimitError>().is_some() {
+        return true;
+    }
+
+    // Check for multer stream/field size exceeded
+    if let Some(multer_err) = err.downcast_ref::<multer::Error>()
+        && is_multer_length_limit(multer_err)
+    {
+        return true;
+    }
+
+    // String-based fallback: check error message for length limit indicators.
+    // This catches cases where the error is wrapped in a way that prevents downcasting
+    // (e.g., http_body_util::LengthLimitError wrapped in Box<dyn Error>).
+    let err_string = err.to_string().to_lowercase();
+    if err_string.contains("length limit exceeded") {
+        return true;
+    }
+
+    // Recursively check the source chain
+    if let Some(source) = std::error::Error::source(err) {
+        return is_length_limit_error(source);
+    }
+
+    false
+}
+
+/// Check if a multer error indicates a length/size limit was exceeded.
+fn is_multer_length_limit(err: &multer::Error) -> bool {
+    match err {
+        multer::Error::StreamSizeExceeded { .. } | multer::Error::FieldSizeExceeded { .. } => true,
+        multer::Error::StreamReadFailed(boxed) => {
+            // Recursively check the boxed error using the main function
+            is_length_limit_error(boxed.as_ref())
+        }
+        _ => false,
+    }
+}
+
+/// Result from create_file_stream: the stream and an error slot.
+/// If the stream aborts, check the error slot for the typed error.
+type FileStreamResult = (
+    Pin<Box<dyn Stream<Item = fusillade::FileStreamItem> + Send>>,
+    Arc<Mutex<Option<FileUploadError>>>,
+);
 
 /// Helper function to create a stream of FileStreamItem from multipart upload
 /// This handles the entire multipart parsing inside the stream
@@ -222,25 +360,58 @@ fn create_file_stream(
     api_key: String,
     accessible_models: HashSet<String>,
     allowed_url_paths: Vec<String>,
-) -> Pin<Box<dyn Stream<Item = fusillade::FileStreamItem> + Send>> {
+) -> FileStreamResult {
     let (tx, rx) = mpsc::channel(config.buffer_size);
+    // std::sync::Mutex is appropriate here because:
+    // 1. Lock is held only briefly (no await points while locked)
+    // 2. No contention (only writer is spawned task, only reader is error handler)
+    let error_slot: Arc<Mutex<Option<FileUploadError>>> = Arc::new(Mutex::new(None));
+    let error_slot_clone = Arc::clone(&error_slot);
 
     tokio::spawn(async move {
-        let mut total_size = 0i64;
+        let mut total_size = 0u64;
         let mut line_count = 0u64;
-        let mut incomplete_line = String::new();
-        let mut incomplete_utf8_bytes = Vec::new(); // Buffer for incomplete UTF-8 sequences at chunk boundaries
+        let mut incomplete_line = String::with_capacity(1024);
+        let mut incomplete_utf8_bytes = Vec::with_capacity(4);
         let mut metadata = fusillade::FileMetadata {
             uploaded_by,
             ..Default::default()
         };
         let mut file_processed = false;
 
-        // Parse multipart fields
-        while let Ok(Some(field)) = multipart.next_field().await {
-            let field_name = field.name().unwrap_or("").to_string();
+        /// Store error and signal abort to fusillade
+        macro_rules! abort {
+            ($error:expr) => {{
+                // Use into_inner() on poisoned mutex - the data is still valid
+                match error_slot_clone.lock() {
+                    Ok(mut guard) => *guard = Some($error),
+                    Err(poisoned) => *poisoned.into_inner() = Some($error),
+                }
+                let _ = tx.send(fusillade::FileStreamItem::Error("aborted".to_string())).await;
+                return;
+            }};
+        }
 
-            match field_name.as_str() {
+        // Parse multipart fields
+        loop {
+            let field = match multipart.next_field().await {
+                Ok(Some(field)) => field,
+                Ok(None) => break, // No more fields
+                Err(e) => {
+                    // Check if this is a body limit error using typed matching
+                    if is_length_limit_error(&e) {
+                        abort!(FileUploadError::FileTooLarge { max: config.max_file_size });
+                    } else {
+                        abort!(FileUploadError::StreamInterrupted {
+                            message: format!("Multipart parsing failed: {}", e),
+                        });
+                    }
+                }
+            };
+
+            let field_name = field.name().unwrap_or("");
+
+            match field_name {
                 "purpose" => {
                     if let Ok(value) = field.text().await {
                         metadata.purpose = Some(value);
@@ -270,179 +441,175 @@ fn create_file_stream(
                     // Now stream and parse the file content
                     let mut field = field;
 
-                    while let Ok(Some(chunk)) = field.chunk().await {
-                        let chunk_size = chunk.len() as i64;
-                        total_size += chunk_size;
-
-                        tracing::debug!(
-                            "Processing chunk: {} bytes, total: {} bytes, lines so far: {}",
-                            chunk_size,
-                            total_size,
-                            line_count
-                        );
-
-                        // Check size limit (0 = unlimited)
-                        if config.max_file_size > 0 && total_size > config.max_file_size as i64 {
-                            let _ = tx
-                                .send(fusillade::FileStreamItem::Error(format!(
-                                    "File size exceeds maximum: {} > {}",
-                                    total_size, config.max_file_size
-                                )))
-                                .await;
-                            return;
-                        }
-
-                        // Combine incomplete UTF-8 bytes from previous chunk with current chunk
-                        let combined_bytes = if incomplete_utf8_bytes.is_empty() {
-                            chunk.to_vec()
-                        } else {
-                            let mut combined = incomplete_utf8_bytes.clone();
-                            combined.extend_from_slice(&chunk);
-                            combined
-                        };
-
-                        // Try to convert to UTF-8, handling incomplete sequences at the end
-                        let (chunk_str, remaining_bytes) = match std::str::from_utf8(&combined_bytes) {
-                            Ok(s) => {
-                                // All bytes are valid UTF-8
-                                incomplete_utf8_bytes.clear();
-                                (s.to_string(), Vec::new())
-                            }
-                            Err(e) => {
-                                // Check if the error is due to an incomplete sequence at the end
-                                let valid_up_to = e.valid_up_to();
-
-                                // If there's an error length, it means we have invalid UTF-8, not just incomplete
-                                if let Some(error_len) = e.error_len() {
-                                    // This is actual invalid UTF-8, not just an incomplete sequence
-                                    tracing::error!(
-                                        "UTF-8 parsing error on/near line {}, byte offset {} in combined buffer, total file offset ~{}, combined buffer size: {} bytes, error: {:?}",
-                                        line_count + 1,
-                                        valid_up_to,
-                                        total_size - chunk_size + valid_up_to as i64,
-                                        combined_bytes.len(),
-                                        e
-                                    );
-
-                                    // Show a hex dump of the problematic area
-                                    let error_start = valid_up_to.saturating_sub(20);
-                                    let error_end = (valid_up_to + error_len + 20).min(combined_bytes.len());
-                                    let problem_bytes = &combined_bytes[error_start..error_end];
-                                    tracing::error!("Bytes around error (offset {}-{}): {:02x?}", error_start, error_end, problem_bytes);
-
-                                    // Try to show ASCII representation
-                                    let ascii_repr: String = problem_bytes
-                                        .iter()
-                                        .map(|&b| if b.is_ascii_graphic() || b == b' ' { b as char } else { '.' })
-                                        .collect();
-                                    tracing::error!("ASCII representation: '{}'", ascii_repr);
-
-                                    // Also show the incomplete_line if any
-                                    if !incomplete_line.is_empty() {
-                                        tracing::error!(
-                                            "Incomplete line from previous chunk (may be part of the problem): '{}'",
-                                            incomplete_line.chars().take(200).collect::<String>()
-                                        );
-                                    }
-
-                                    let error_msg = format!(
-                                        "File contains invalid UTF-8 on/near line {} at byte offset {}. Error: {}",
-                                        line_count + 1,
-                                        total_size - chunk_size + valid_up_to as i64,
-                                        e
-                                    );
-                                    let _ = tx.send(fusillade::FileStreamItem::Error(error_msg)).await;
-                                    return;
-                                }
-
-                                // Otherwise, this is an incomplete UTF-8 sequence at the end of the chunk
-                                // Save the incomplete bytes for the next chunk
-                                let valid_str =
-                                    std::str::from_utf8(&combined_bytes[..valid_up_to]).expect("valid_up_to should point to valid UTF-8");
-                                let remaining = combined_bytes[valid_up_to..].to_vec();
+                    loop {
+                        match field.chunk().await {
+                            Ok(Some(chunk)) => {
+                                let chunk_size = chunk.len() as u64;
+                                total_size += chunk_size;
 
                                 tracing::debug!(
-                                    "Incomplete UTF-8 sequence at chunk boundary, buffering {} bytes for next chunk",
-                                    remaining.len()
+                                    "Processing chunk: {} bytes, total: {} bytes, lines so far: {}",
+                                    chunk_size,
+                                    total_size,
+                                    line_count
                                 );
 
-                                (valid_str.to_string(), remaining)
-                            }
-                        };
+                                // Check size limit (0 = unlimited)
+                                if config.max_file_size > 0 && total_size > config.max_file_size {
+                                    abort!(FileUploadError::FileTooLarge { max: config.max_file_size });
+                                }
 
-                        // Update the incomplete UTF-8 buffer for next iteration
-                        incomplete_utf8_bytes = remaining_bytes;
+                                // Combine incomplete UTF-8 bytes from previous chunk with current chunk
+                                let combined_bytes = if incomplete_utf8_bytes.is_empty() {
+                                    chunk.to_vec()
+                                } else {
+                                    let mut combined = incomplete_utf8_bytes.clone();
+                                    combined.extend_from_slice(&chunk);
+                                    combined
+                                };
 
-                        // Combine with incomplete line from previous chunk
-                        let text_to_process = if incomplete_line.is_empty() {
-                            chunk_str.to_string()
-                        } else {
-                            format!("{}{}", incomplete_line, chunk_str)
-                        };
+                                // Try to convert to UTF-8, handling incomplete sequences at the end
+                                let (chunk_str, remaining_bytes) = match std::str::from_utf8(&combined_bytes) {
+                                    Ok(s) => {
+                                        incomplete_utf8_bytes.clear();
+                                        (s.to_string(), Vec::new())
+                                    }
+                                    Err(e) => {
+                                        let valid_up_to = e.valid_up_to();
 
-                        let mut lines = text_to_process.lines().peekable();
-                        let ends_with_newline = chunk_str.ends_with('\n');
+                                        if e.error_len().is_some() {
+                                            // Actual invalid UTF-8, not incomplete sequence
+                                            let byte_offset = (total_size - chunk_size) as i64 + valid_up_to as i64;
+                                            tracing::error!(
+                                                "UTF-8 parsing error on/near line {}, byte offset {}",
+                                                line_count + 1,
+                                                byte_offset
+                                            );
 
-                        // Process complete lines
-                        while let Some(line) = lines.next() {
-                            let is_last_line = lines.peek().is_none();
+                                            abort!(FileUploadError::InvalidUtf8 {
+                                                line: line_count + 1,
+                                                byte_offset,
+                                                error: e.to_string(),
+                                            });
+                                        }
 
-                            // If this is the last line and chunk doesn't end with newline,
-                            // it might be incomplete - save it for next chunk
-                            if is_last_line && !ends_with_newline {
-                                incomplete_line = line.to_string();
-                                break;
-                            }
+                                        // Incomplete UTF-8 sequence at end - buffer for next chunk
+                                        let valid_str = std::str::from_utf8(&combined_bytes[..valid_up_to])
+                                            .expect("valid_up_to should point to valid UTF-8");
+                                        let remaining = combined_bytes[valid_up_to..].to_vec();
 
-                            let trimmed = line.trim();
-                            if trimmed.is_empty() {
-                                continue;
-                            }
+                                        tracing::debug!("Incomplete UTF-8 sequence at chunk boundary, buffering {} bytes", remaining.len());
 
-                            // Parse JSON line as OpenAI Batch format, then transform to internal
-                            match serde_json::from_str::<OpenAIBatchRequest>(trimmed) {
-                                Ok(openai_req) => {
-                                    // Transform to internal format (includes model access validation)
-                                    match openai_req.to_internal(&endpoint, api_key.clone(), &accessible_models, &allowed_url_paths) {
-                                        Ok(template) => {
-                                            // Check request count limit (0 = unlimited)
-                                            if config.max_requests_per_file > 0 && line_count >= config.max_requests_per_file as u64 {
-                                                let _ = tx
-                                                    .send(fusillade::FileStreamItem::Error(format!(
-                                                        "File exceeds maximum request limit of {}",
-                                                        config.max_requests_per_file
-                                                    )))
-                                                    .await;
-                                                return;
-                                            }
-                                            line_count += 1;
+                                        (valid_str.to_string(), remaining)
+                                    }
+                                };
 
-                                            incomplete_line.clear();
-                                            if tx.send(fusillade::FileStreamItem::Template(template)).await.is_err() {
-                                                return;
+                                // Update the incomplete UTF-8 buffer for next iteration
+                                incomplete_utf8_bytes = remaining_bytes;
+
+                                // Combine with incomplete line from previous chunk
+                                let text_to_process = if incomplete_line.is_empty() {
+                                    chunk_str.to_string()
+                                } else {
+                                    format!("{}{}", incomplete_line, chunk_str)
+                                };
+
+                                let mut lines = text_to_process.lines().peekable();
+                                let ends_with_newline = chunk_str.ends_with('\n');
+
+                                // Process complete lines
+                                while let Some(line) = lines.next() {
+                                    let is_last_line = lines.peek().is_none();
+
+                                    // If this is the last line and chunk doesn't end with newline,
+                                    // it might be incomplete - save it for next chunk
+                                    if is_last_line && !ends_with_newline {
+                                        incomplete_line = line.to_string();
+                                        break;
+                                    }
+
+                                    let trimmed = line.trim();
+                                    if trimmed.is_empty() {
+                                        continue;
+                                    }
+
+                                    // Check request count limit before parsing (0 = unlimited)
+                                    if config.max_requests_per_file > 0 && line_count >= config.max_requests_per_file as u64 {
+                                        abort!(FileUploadError::TooManyRequests {
+                                            count: (line_count + 1).try_into().unwrap_or(usize::MAX),
+                                            max: config.max_requests_per_file,
+                                        });
+                                    }
+
+                                    // Parse JSON line as OpenAI Batch format, then transform to internal
+                                    match serde_json::from_str::<OpenAIBatchRequest>(trimmed) {
+                                        Ok(openai_req) => {
+                                            // Transform to internal format (includes model access validation)
+                                            match openai_req.to_internal(&endpoint, &api_key, &accessible_models, &allowed_url_paths) {
+                                                Ok(template) => {
+                                                    // Check per-request body size limit (0 = unlimited)
+                                                    if config.max_request_body_size > 0
+                                                        && template.body.len() as u64 > config.max_request_body_size
+                                                    {
+                                                        abort!(FileUploadError::ValidationError {
+                                                            line: line_count + 1,
+                                                            message: format!(
+                                                                "Request body is {} bytes, which exceeds the maximum allowed size of {} bytes",
+                                                                template.body.len(),
+                                                                config.max_request_body_size
+                                                            ),
+                                                        });
+                                                    }
+
+                                                    line_count += 1;
+                                                    incomplete_line.clear();
+                                                    if tx.send(fusillade::FileStreamItem::Template(template)).await.is_err() {
+                                                        return;
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    // Map the Error back to FileUploadError
+                                                    let upload_err = match &e {
+                                                        Error::ModelAccessDenied { model_name, .. } => FileUploadError::ModelAccessDenied {
+                                                            model: model_name.clone(),
+                                                            line: line_count + 1,
+                                                        },
+                                                        _ => FileUploadError::ValidationError {
+                                                            line: line_count + 1,
+                                                            message: e.to_string(),
+                                                        },
+                                                    };
+                                                    abort!(upload_err);
+                                                }
                                             }
                                         }
                                         Err(e) => {
-                                            let _ = tx
-                                                .send(fusillade::FileStreamItem::Error(format!(
-                                                    "Failed to transform request on line {}: {}",
-                                                    line_count + 1,
-                                                    e
-                                                )))
-                                                .await;
-                                            return;
+                                            abort!(FileUploadError::InvalidJson {
+                                                line: line_count + 1,
+                                                error: e.to_string(),
+                                            });
                                         }
                                     }
                                 }
-                                Err(e) => {
-                                    let _ = tx
-                                        .send(fusillade::FileStreamItem::Error(format!(
-                                            "Invalid JSON on line {}: {}",
-                                            line_count + 1,
-                                            e
-                                        )))
-                                        .await;
-                                    return;
+                            }
+                            Ok(None) => {
+                                // Normal end of stream
+                                break;
+                            }
+                            Err(e) => {
+                                // Log Display and Debug representations
+                                tracing::warn!(
+                                    error_display = %e,
+                                    error_debug = ?e,
+                                    "File upload stream error"
+                                );
+
+                                // Check if this is a body limit error using typed matching
+                                if is_length_limit_error(&e) {
+                                    abort!(FileUploadError::FileTooLarge { max: config.max_file_size });
+                                } else {
+                                    // Genuine stream error
+                                    abort!(FileUploadError::StreamInterrupted { message: e.to_string() });
                                 }
                             }
                         }
@@ -452,39 +619,53 @@ fn create_file_stream(
                     if !incomplete_line.is_empty() {
                         let trimmed = incomplete_line.trim();
                         if !trimmed.is_empty() {
-                            match serde_json::from_str::<OpenAIBatchRequest>(trimmed) {
-                                Ok(openai_req) => {
-                                    match openai_req.to_internal(&endpoint, api_key.clone(), &accessible_models, &allowed_url_paths) {
-                                        Ok(template) => {
-                                            // Check request count limit (0 = unlimited)
-                                            if config.max_requests_per_file > 0 && line_count >= config.max_requests_per_file as u64 {
-                                                let _ = tx
-                                                    .send(fusillade::FileStreamItem::Error(format!(
-                                                        "File exceeds maximum request limit of {}",
-                                                        config.max_requests_per_file
-                                                    )))
-                                                    .await;
-                                                return;
-                                            }
-                                            line_count += 1;
+                            // Check request count limit
+                            if config.max_requests_per_file > 0 && line_count >= config.max_requests_per_file as u64 {
+                                abort!(FileUploadError::TooManyRequests {
+                                    count: (line_count + 1).try_into().unwrap_or(usize::MAX),
+                                    max: config.max_requests_per_file,
+                                });
+                            }
 
-                                            if tx.send(fusillade::FileStreamItem::Template(template)).await.is_err() {
-                                                return;
-                                            }
+                            match serde_json::from_str::<OpenAIBatchRequest>(trimmed) {
+                                Ok(openai_req) => match openai_req.to_internal(&endpoint, &api_key, &accessible_models, &allowed_url_paths) {
+                                    Ok(template) => {
+                                        // Check per-request body size limit (0 = unlimited)
+                                        if config.max_request_body_size > 0 && template.body.len() as u64 > config.max_request_body_size {
+                                            abort!(FileUploadError::ValidationError {
+                                                line: line_count + 1,
+                                                message: format!(
+                                                    "Request body is {} bytes, which exceeds the maximum allowed size of {} bytes",
+                                                    template.body.len(),
+                                                    config.max_request_body_size
+                                                ),
+                                            });
                                         }
-                                        Err(e) => {
-                                            let _ = tx
-                                                .send(fusillade::FileStreamItem::Error(format!("Failed to transform final line: {:?}", e)))
-                                                .await;
+
+                                        line_count += 1;
+                                        if tx.send(fusillade::FileStreamItem::Template(template)).await.is_err() {
                                             return;
                                         }
                                     }
-                                }
+                                    Err(e) => {
+                                        let upload_err = match &e {
+                                            Error::ModelAccessDenied { model_name, .. } => FileUploadError::ModelAccessDenied {
+                                                model: model_name.clone(),
+                                                line: line_count + 1,
+                                            },
+                                            _ => FileUploadError::ValidationError {
+                                                line: line_count + 1,
+                                                message: e.to_string(),
+                                            },
+                                        };
+                                        abort!(upload_err);
+                                    }
+                                },
                                 Err(e) => {
-                                    let _ = tx
-                                        .send(fusillade::FileStreamItem::Error(format!("Invalid JSON on final line: {}", e)))
-                                        .await;
-                                    return;
+                                    abort!(FileUploadError::InvalidJson {
+                                        line: line_count + 1,
+                                        error: e.to_string(),
+                                    });
                                 }
                             }
                         }
@@ -492,16 +673,16 @@ fn create_file_stream(
 
                     // Check if file is empty (no templates parsed)
                     if line_count == 0 {
-                        let _ = tx
-                            .send(fusillade::FileStreamItem::Error(
-                                "File contains no valid request templates".to_string(),
-                            ))
-                            .await;
-                        return;
+                        abort!(FileUploadError::EmptyFile);
                     }
 
-                    // Set the size and mark file as processed
-                    metadata.size_bytes = Some(total_size);
+                    metadata.size_bytes = match i64::try_from(total_size) {
+                        Ok(size) => Some(size),
+                        Err(_) => {
+                            // File size exceeds i64::MAX (~9.2 exabytes) - treat as too large
+                            abort!(FileUploadError::FileTooLarge { max: config.max_file_size });
+                        }
+                    };
                     file_processed = true;
 
                     // Continue processing remaining fields (metadata after file)
@@ -514,19 +695,14 @@ fn create_file_stream(
 
         // After all fields are processed, check if we got a file
         if !file_processed {
-            let _ = tx
-                .send(fusillade::FileStreamItem::Error(
-                    "No file field found in multipart upload".to_string(),
-                ))
-                .await;
-            return;
+            abort!(FileUploadError::NoFile);
         }
 
         // Send final metadata with all fields (including any that came after the file)
         let _ = tx.send(fusillade::FileStreamItem::Metadata(metadata.clone())).await;
     });
 
-    Box::pin(ReceiverStream::new(rx))
+    (Box::pin(ReceiverStream::new(rx)), error_slot)
 }
 
 #[utoipa::path(
@@ -543,7 +719,8 @@ Each line must be a valid JSON object containing `custom_id`, `method`, `url`, a
     ),
     responses(
         (status = 201, description = "File uploaded and validated successfully.", body = FileResponse),
-        (status = 400, description = "Invalid file format, malformed JSON, missing required fields, or referencing an inaccessible model."),
+        (status = 400, description = "Invalid file format, malformed JSON, missing required fields, etc."),
+        (status = 403, description = "Model referenced in the file is not configured or not accessible to your account."),
         (status = 413, description = "File exceeds the maximum allowed size."),
         (status = 429, description = "Too many concurrent uploads. Retry after a short delay."),
         (status = 500, description = "An unexpected error occurred. Retry the request or contact support if the issue persists.")
@@ -553,7 +730,7 @@ Each line must be a valid JSON object containing `custom_id`, `method`, `url`, a
 pub async fn upload_file<P: PoolProvider>(
     State(state): State<AppState<P>>,
     current_user: RequiresPermission<resource::Files, operation::CreateOwn>,
-    multipart: Multipart,
+    request: axum::http::Request<axum::body::Body>,
 ) -> Result<(StatusCode, Json<FileResponse>)> {
     // Acquire upload permit (if limiter is configured)
     // The permit is held for the duration of the upload to limit concurrency
@@ -563,9 +740,34 @@ pub async fn upload_file<P: PoolProvider>(
         None
     };
 
+    let max_file_size = state.config.limits.files.max_file_size;
+
+    // Early rejection based on Content-Length header (if present)
+    // This avoids streaming a large file only to reject it later.
+    // Note: Content-Length may be absent (chunked encoding) or spoofed,
+    // so we still verify during streaming.
+    // We add 10KB overhead for multipart encoding (boundaries, headers) to match
+    // the DefaultBodyLimit layer configuration in lib.rs.
+    if max_file_size > 0
+        && let Some(content_length) = request.headers().get(axum::http::header::CONTENT_LENGTH)
+        && let Ok(length_str) = content_length.to_str()
+        && let Ok(length) = length_str.parse::<u64>()
+        && length > max_file_size.saturating_add(MULTIPART_OVERHEAD)
+    {
+        return Err(Error::PayloadTooLarge {
+            message: format!("File exceeds the maximum allowed size of {} bytes", max_file_size),
+        });
+    }
+
+    // Extract multipart from request body
+    let multipart = Multipart::from_request(request, &state).await.map_err(|e| Error::BadRequest {
+        message: format!("Invalid multipart request: {}", e),
+    })?;
+
     let stream_config = FileStreamConfig {
         max_file_size: state.config.limits.files.max_file_size,
         max_requests_per_file: state.config.limits.files.max_requests_per_file,
+        max_request_body_size: state.config.limits.requests.max_body_size,
         buffer_size: state.config.batches.files.upload_buffer_size,
     };
     let uploaded_by = Some(current_user.id.to_string());
@@ -605,11 +807,26 @@ pub async fn upload_file<P: PoolProvider>(
     );
 
     // Create file via request manager with streaming
-    let created_file_id = state.request_manager.create_file_stream(file_stream).await.map_err(|e| match e {
-        fusillade::FusilladeError::ValidationError(msg) => Error::BadRequest { message: msg },
-        _ => Error::Internal {
-            operation: format!("create file: {}", e),
-        },
+    let created_file_id = state.request_manager.create_file_stream(file_stream).await.map_err(|e| {
+        // Check if WE aborted (control-layer error in slot)
+        // Handle poisoned mutex gracefully - the data is still valid
+        let upload_err = match error_slot.lock() {
+            Ok(mut guard) => guard.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        };
+        if let Some(upload_err) = upload_err {
+            tracing::warn!("File upload aborted with error: {:?}", upload_err);
+            return upload_err.into_http_error();
+        }
+
+        // Otherwise it's a fusillade error
+        tracing::warn!("Fusillade error during file upload: {:?}", e);
+        match e {
+            fusillade::FusilladeError::ValidationError(msg) => Error::BadRequest { message: msg },
+            _ => Error::Internal {
+                operation: format!("create file: {}", e),
+            },
+        }
     })?;
 
     tracing::info!("File {} uploaded successfully", created_file_id);
@@ -882,39 +1099,11 @@ pub async fn get_file_content<P: PoolProvider>(
     // For non-error files (input, output): show all content (false)
     let hide_retriable_before_sla = matches!(file.purpose, Some(fusillade::batch::Purpose::BatchError));
 
-    // Stream the file content as JSONL, starting from offset
-    let offset = query.pagination.skip.unwrap_or(0) as usize;
-    let search = query.search.clone();
-    let content_stream =
-        state
-            .request_manager
-            .get_file_content_stream(fusillade::FileId(file_id), offset, search, hide_retriable_before_sla);
-
-    // Apply limit if specified, fetching one extra to detect if there are more results
-    let requested_limit = query.pagination.limit.map(|l| l as usize);
-    let fetch_limit = requested_limit.map(|l| l + 1); // Fetch one extra to check for more results
-
-    let content_stream: Pin<Box<dyn Stream<Item = fusillade::Result<fusillade::FileContentItem>> + Send>> = if let Some(limit) = fetch_limit
-    {
-        Box::pin(content_stream.take(limit))
-    } else {
-        Box::pin(content_stream)
-    };
-
-    // Collect items to determine if we need to truncate and set headers
-    let items: Vec<_> = content_stream.collect().await;
-
-    // Check if there's more paginated data currently available
-    let has_more_paginated = if let Some(req_limit) = requested_limit {
-        items.len() > req_limit
-    } else {
-        false // No limit means we fetched everything currently available
-    };
-
     // For BatchOutput and BatchError files, check if the batch is still running
-    // (which means more data may be written to this file in the future)
-    let file_may_receive_more_data = match file.purpose {
-        Some(fusillade::batch::Purpose::Batch) => false, // Input files are static
+    // (which means more data may be written to this file in the future).
+    // Also capture the expected content count for streaming X-Last-Line.
+    let (file_may_receive_more_data, file_content_count) = match file.purpose {
+        Some(fusillade::batch::Purpose::Batch) => (false, None), // Input files: count unknown without query
         Some(fusillade::batch::Purpose::BatchOutput) => {
             let batch = state
                 .request_manager
@@ -931,9 +1120,10 @@ pub async fn get_file_content<P: PoolProvider>(
                     .map_err(|e| Error::Internal {
                         operation: format!("get batch status: {}", e),
                     })?;
-                status.pending_requests > 0 || status.in_progress_requests > 0
+                let still_processing = status.pending_requests > 0 || status.in_progress_requests > 0;
+                (still_processing, Some(status.completed_requests as usize))
             } else {
-                false
+                (false, None)
             }
         }
         Some(fusillade::batch::Purpose::BatchError) => {
@@ -952,74 +1142,124 @@ pub async fn get_file_content<P: PoolProvider>(
                     .map_err(|e| Error::Internal {
                         operation: format!("get batch status: {}", e),
                     })?;
-                status.pending_requests > 0 || status.in_progress_requests > 0
+                let still_processing = status.pending_requests > 0 || status.in_progress_requests > 0;
+                (still_processing, Some(status.failed_requests as usize))
             } else {
-                false
+                (false, None)
             }
         }
-        None => false, // Shouldn't happen, but assume complete
+        None => (false, None), // Shouldn't happen, but assume complete
     };
 
-    let has_more = has_more_paginated || file_may_receive_more_data;
+    // Stream the file content as JSONL, starting from offset
+    let offset = query.pagination.skip() as usize;
+    let search = query.search.clone();
+    let requested_limit = query.pagination.limit.map(|_| query.pagination.limit() as usize);
 
-    // Truncate to requested limit if we fetched extra
-    let items_to_return = if let Some(req_limit) = requested_limit {
-        items.into_iter().take(req_limit).collect::<Vec<_>>()
-    } else {
-        items
-    };
-
-    let line_count = items_to_return.len();
-    let last_line = offset + line_count;
-
-    // Convert FileContentItem to JSONL (one per line)
-    let mut jsonl_lines = Vec::new();
-    for content_result in items_to_return {
-        let json_line = content_result
-            .and_then(|content_item| {
-                // Handle different content types
-                match content_item {
-                    fusillade::FileContentItem::Template(template) => {
-                        // Transform to OpenAI format (drops api_key, endpoint)
-                        OpenAIBatchRequest::from_internal(&template)
-                            .map_err(|e| fusillade::FusilladeError::Other(anyhow::anyhow!("Failed to transform to OpenAI format: {:?}", e)))
-                            .and_then(|openai_req| {
-                                serde_json::to_string(&openai_req)
-                                    .map(|json| format!("{}\n", json))
-                                    .map_err(|e| fusillade::FusilladeError::Other(anyhow::anyhow!("JSON serialization failed: {}", e)))
-                            })
-                    }
-                    fusillade::FileContentItem::Output(output) => {
-                        // Already in OpenAI format, just serialize
-                        serde_json::to_string(&output)
+    // Helper to serialize FileContentItem to JSON line
+    fn serialize_content_item(content_item: fusillade::FileContentItem) -> fusillade::Result<String> {
+        match content_item {
+            fusillade::FileContentItem::Template(template) => {
+                // Transform to OpenAI format (drops api_key, endpoint)
+                OpenAIBatchRequest::from_internal(&template)
+                    .map_err(|e| fusillade::FusilladeError::Other(anyhow::anyhow!("Failed to transform to OpenAI format: {:?}", e)))
+                    .and_then(|openai_req| {
+                        serde_json::to_string(&openai_req)
                             .map(|json| format!("{}\n", json))
                             .map_err(|e| fusillade::FusilladeError::Other(anyhow::anyhow!("JSON serialization failed: {}", e)))
-                    }
-                    fusillade::FileContentItem::Error(error) => {
-                        // Already in OpenAI format, just serialize
-                        serde_json::to_string(&error)
-                            .map(|json| format!("{}\n", json))
-                            .map_err(|e| fusillade::FusilladeError::Other(anyhow::anyhow!("JSON serialization failed: {}", e)))
-                    }
-                }
-            })
-            .map_err(|e| Error::Internal {
-                operation: format!("serialize content: {}", e),
-            })?;
-        jsonl_lines.push(json_line);
+                    })
+            }
+            fusillade::FileContentItem::Output(output) => serde_json::to_string(&output)
+                .map(|json| format!("{}\n", json))
+                .map_err(|e| fusillade::FusilladeError::Other(anyhow::anyhow!("JSON serialization failed: {}", e))),
+            fusillade::FileContentItem::Error(error) => serde_json::to_string(&error)
+                .map(|json| format!("{}\n", json))
+                .map_err(|e| fusillade::FusilladeError::Other(anyhow::anyhow!("JSON serialization failed: {}", e))),
+        }
     }
 
-    let jsonl_content = jsonl_lines.join("");
+    if let Some(limit) = requested_limit {
+        // Pagination case: buffer only N+1 items to check for more pages
+        let content_stream =
+            state
+                .request_manager
+                .get_file_content_stream(fusillade::FileId(file_id), offset, search, hide_retriable_before_sla);
 
-    let mut response = axum::response::Response::new(axum::body::Body::from(jsonl_content));
-    response
-        .headers_mut()
-        .insert("content-type", "application/x-ndjson".parse().unwrap());
-    response.headers_mut().insert("X-Incomplete", has_more.to_string().parse().unwrap());
-    response.headers_mut().insert("X-Last-Line", last_line.to_string().parse().unwrap());
-    *response.status_mut() = StatusCode::OK;
+        let mut buffer: Vec<_> = content_stream.take(limit + 1).collect().await;
+        let has_more_pages = buffer.len() > limit;
+        buffer.truncate(limit);
 
-    Ok(response)
+        let line_count = buffer.len();
+        let last_line = offset + line_count;
+        let has_more = has_more_pages || file_may_receive_more_data;
+
+        // Serialize buffered items
+        let mut jsonl_lines = Vec::new();
+        for content_result in buffer {
+            let json_line = content_result.and_then(serialize_content_item).map_err(|e| Error::Internal {
+                operation: format!("serialize content: {}", e),
+            })?;
+            jsonl_lines.push(json_line);
+        }
+
+        let jsonl_content = jsonl_lines.join("");
+
+        let mut response = axum::response::Response::new(Body::from(jsonl_content));
+        response
+            .headers_mut()
+            .insert("content-type", "application/x-ndjson".parse().unwrap());
+        response.headers_mut().insert("X-Incomplete", has_more.to_string().parse().unwrap());
+        response.headers_mut().insert("X-Last-Line", last_line.to_string().parse().unwrap());
+        *response.status_mut() = StatusCode::OK;
+
+        Ok(response)
+    } else {
+        // Unlimited case: true streaming to avoid OOM on large result sets
+        //
+        // Derive expected count from batch status when available, so we can
+        // set X-Last-Line before streaming. Search filters make the count
+        // unknown, so we skip X-Last-Line in that case.
+        let expected_count = if search.is_none() {
+            file_content_count.map(|c| c.saturating_sub(offset))
+        } else {
+            None
+        };
+
+        let content_stream =
+            state
+                .request_manager
+                .get_file_content_stream(fusillade::FileId(file_id), offset, search, hide_retriable_before_sla);
+
+        // Limit stream to expected count so X-Last-Line is accurate
+        let content_stream: Pin<Box<dyn Stream<Item = fusillade::Result<fusillade::FileContentItem>> + Send>> =
+            if let Some(count) = expected_count {
+                Box::pin(content_stream.take(count))
+            } else {
+                Box::pin(content_stream)
+            };
+
+        let body_stream = content_stream.map(|result| {
+            result
+                .and_then(|item| serialize_content_item(item).map(Bytes::from))
+                .map_err(|e| std::io::Error::other(e.to_string()))
+        });
+
+        let body = Body::from_stream(body_stream);
+        let mut response = axum::response::Response::new(body);
+        response
+            .headers_mut()
+            .insert("content-type", "application/x-ndjson".parse().unwrap());
+        response
+            .headers_mut()
+            .insert("X-Incomplete", file_may_receive_more_data.to_string().parse().unwrap());
+        if let Some(count) = expected_count {
+            let last_line = offset + count;
+            response.headers_mut().insert("X-Last-Line", last_line.to_string().parse().unwrap());
+        }
+        *response.status_mut() = StatusCode::OK;
+
+        Ok(response)
+    }
 }
 
 #[utoipa::path(
@@ -1427,11 +1667,11 @@ mod tests {
             )
             .await;
 
-        // Should reject with 400 Bad Request due to model access denied
-        upload_response.assert_status(axum::http::StatusCode::BAD_REQUEST);
+        // Should reject with 403 Forbidden due to model access denied
+        upload_response.assert_status(axum::http::StatusCode::FORBIDDEN);
         let error_body = upload_response.text();
         assert!(error_body.contains("Model"));
-        assert!(error_body.contains("has not been configured or is not available to user."));
+        assert!(error_body.contains("has not been configured or is not available to user"));
     }
 
     #[sqlx::test]
@@ -2449,7 +2689,7 @@ mod tests {
         upload_response.assert_status(axum::http::StatusCode::BAD_REQUEST);
         let body = upload_response.text();
         assert!(
-            body.contains("maximum request limit"),
+            body.contains("exceeds the maximum of"),
             "Expected error about request limit, got: {}",
             body
         );
@@ -2478,6 +2718,492 @@ mod tests {
         let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test.jsonl");
 
         // Upload should succeed because file has exactly 2 requests (at the limit)
+        let upload_response = app
+            .post("/ai/v1/files")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .multipart(
+                axum_test::multipart::MultipartForm::new()
+                    .add_text("purpose", "batch")
+                    .add_part("file", file_part),
+            )
+            .await;
+
+        upload_response.assert_status(axum::http::StatusCode::CREATED);
+    }
+
+    /// Regression test for streaming file content (output files).
+    ///
+    /// Previously, get_file_content collected ALL items into memory before
+    /// sending the response. This test verifies that:
+    /// 1. Unlimited downloads (no limit param) return all results correctly
+    /// 2. Unlimited responses use streaming (no content-length header)
+    /// 3. Paginated downloads return correct subset and headers
+    /// 4. Each line is valid JSON
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_file_content_streaming(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        // Build a file with many requests
+        let num_requests = 30;
+        let jsonl_lines: Vec<String> = (0..num_requests)
+            .map(|i| {
+                format!(
+                    r#"{{"custom_id":"req-{}","method":"POST","url":"/v1/chat/completions","body":{{"model":"gpt-4","messages":[{{"role":"user","content":"Test {}"}}]}}}}"#,
+                    i, i
+                )
+            })
+            .collect();
+        let jsonl_content = jsonl_lines.join("\n") + "\n";
+
+        // Upload
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes().to_vec()).file_name("test.jsonl");
+        let upload_response = app
+            .post("/ai/v1/files")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .multipart(
+                axum_test::multipart::MultipartForm::new()
+                    .add_text("purpose", "batch")
+                    .add_part("file", file_part),
+            )
+            .await;
+
+        upload_response.assert_status(axum::http::StatusCode::CREATED);
+        let file: FileResponse = upload_response.json();
+
+        // Create batch to get an output file
+        let batch_response = app
+            .post("/ai/v1/batches")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .json(&serde_json::json!({
+                "input_file_id": file.id,
+                "endpoint": "/v1/chat/completions",
+                "completion_window": "24h"
+            }))
+            .await;
+
+        batch_response.assert_status(axum::http::StatusCode::CREATED);
+        let batch: serde_json::Value = batch_response.json();
+        let batch_id_str = batch["id"].as_str().expect("Should have id");
+        let output_file_id = batch["output_file_id"].as_str().expect("Should have output_file_id");
+
+        // Complete all requests so the output file has content
+        let batch_uuid_str = batch_id_str.strip_prefix("batch_").unwrap_or(batch_id_str);
+        let batch_uuid = Uuid::parse_str(batch_uuid_str).expect("Valid batch UUID");
+
+        sqlx::query(
+            r#"
+            UPDATE fusillade.requests
+            SET state = 'completed', response_status = 200,
+                response_body = '{"choices":[{"message":{"content":"ok"}}]}',
+                completed_at = NOW()
+            WHERE batch_id = $1
+            "#,
+        )
+        .bind(batch_uuid)
+        .execute(&pool)
+        .await
+        .expect("Failed to complete requests");
+
+        let auth = add_auth_headers(&user);
+
+        // Test 1: Unlimited download (streaming path)
+        let response = app
+            .get(&format!("/ai/v1/files/{}/content", output_file_id))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+
+        response.assert_status(axum::http::StatusCode::OK);
+        response.assert_header("content-type", "application/x-ndjson");
+        response.assert_header("X-Incomplete", "false");
+        // Streaming responses must not have content-length (regression guard)
+        assert!(
+            response.headers().get("content-length").is_none(),
+            "Unlimited download should be streamed without content-length"
+        );
+
+        let body = response.text();
+        let lines: Vec<&str> = body.trim().lines().collect();
+        assert_eq!(lines.len(), num_requests, "Should return all {} results", num_requests);
+
+        // Verify each line is valid JSON
+        for line in &lines {
+            let item: serde_json::Value = serde_json::from_str(line).expect("Each line should be valid JSON");
+            assert!(item.get("custom_id").is_some(), "Each result should have custom_id");
+        }
+
+        // Test 2: Paginated download (buffered path)
+        let page_size = 10;
+        let response = app
+            .get(&format!("/ai/v1/files/{}/content?limit={}", output_file_id, page_size))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+
+        response.assert_status(axum::http::StatusCode::OK);
+        response.assert_header("X-Incomplete", "true"); // more pages exist
+        response.assert_header("X-Last-Line", &page_size.to_string());
+
+        let body = response.text();
+        let lines: Vec<&str> = body.trim().lines().collect();
+        assert_eq!(lines.len(), page_size, "Should return exactly {} results", page_size);
+
+        // Test 3: Last page should have X-Incomplete=false
+        let response = app
+            .get(&format!(
+                "/ai/v1/files/{}/content?limit={}&skip={}",
+                output_file_id,
+                page_size,
+                num_requests - page_size
+            ))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+
+        response.assert_status(axum::http::StatusCode::OK);
+        response.assert_header("X-Incomplete", "false"); // no more pages, batch complete
+        response.assert_header("X-Last-Line", &num_requests.to_string());
+    }
+
+    #[test]
+    fn test_file_upload_error_into_http_error_stream_interrupted() {
+        let err = super::FileUploadError::StreamInterrupted {
+            message: "connection reset".to_string(),
+        };
+        let http_err = err.into_http_error();
+        match http_err {
+            crate::errors::Error::Internal { operation } => {
+                assert!(operation.contains("connection reset"));
+            }
+            _ => panic!("Expected Internal error"),
+        }
+    }
+
+    #[test]
+    fn test_file_upload_error_into_http_error_file_too_large() {
+        let err = super::FileUploadError::FileTooLarge { max: 100_000_000 };
+        let http_err = err.into_http_error();
+        match http_err {
+            crate::errors::Error::PayloadTooLarge { message } => {
+                assert!(message.contains("100000000"));
+                // Should NOT contain the partial size
+                assert!(!message.contains("200000000"));
+            }
+            _ => panic!("Expected PayloadTooLarge error"),
+        }
+    }
+
+    #[test]
+    fn test_file_upload_error_into_http_error_too_many_requests() {
+        let err = super::FileUploadError::TooManyRequests { count: 1001, max: 1000 };
+        let http_err = err.into_http_error();
+        match http_err {
+            crate::errors::Error::BadRequest { message } => {
+                assert!(message.contains("1001"));
+                assert!(message.contains("1000"));
+            }
+            _ => panic!("Expected BadRequest error"),
+        }
+    }
+
+    #[test]
+    fn test_file_upload_error_into_http_error_invalid_json() {
+        let err = super::FileUploadError::InvalidJson {
+            line: 42,
+            error: "expected comma".to_string(),
+        };
+        let http_err = err.into_http_error();
+        match http_err {
+            crate::errors::Error::BadRequest { message } => {
+                assert!(message.contains("line 42"));
+                assert!(message.contains("expected comma"));
+            }
+            _ => panic!("Expected BadRequest error"),
+        }
+    }
+
+    #[test]
+    fn test_file_upload_error_into_http_error_invalid_utf8() {
+        let err = super::FileUploadError::InvalidUtf8 {
+            line: 5,
+            byte_offset: 128,
+            error: "invalid byte sequence".to_string(),
+        };
+        let http_err = err.into_http_error();
+        match http_err {
+            crate::errors::Error::BadRequest { message } => {
+                assert!(message.contains("line 5"));
+                assert!(message.contains("byte offset 128"));
+            }
+            _ => panic!("Expected BadRequest error"),
+        }
+    }
+
+    #[test]
+    fn test_file_upload_error_into_http_error_no_file() {
+        let err = super::FileUploadError::NoFile;
+        let http_err = err.into_http_error();
+        match http_err {
+            crate::errors::Error::BadRequest { message } => {
+                assert!(message.contains("No file field"));
+            }
+            _ => panic!("Expected BadRequest error"),
+        }
+    }
+
+    #[test]
+    fn test_file_upload_error_into_http_error_empty_file() {
+        let err = super::FileUploadError::EmptyFile;
+        let http_err = err.into_http_error();
+        match http_err {
+            crate::errors::Error::BadRequest { message } => {
+                assert!(message.contains("no valid request templates"));
+            }
+            _ => panic!("Expected BadRequest error"),
+        }
+    }
+
+    #[test]
+    fn test_file_upload_error_into_http_error_model_access_denied() {
+        let error = super::FileUploadError::ModelAccessDenied {
+            model: "gpt-5".to_string(),
+            line: 42,
+        };
+        let http_error = error.into_http_error();
+        match http_error {
+            crate::errors::Error::ModelAccessDenied { model_name, message } => {
+                assert_eq!(model_name, "gpt-5");
+                assert!(message.contains("42"));
+                assert!(message.contains("gpt-5"));
+            }
+            _ => panic!("Expected ModelAccessDenied error, got {:?}", http_error),
+        }
+    }
+
+    #[test]
+    fn test_file_upload_error_into_http_error_validation_error() {
+        let err = super::FileUploadError::ValidationError {
+            line: 3,
+            message: "custom_id too long".to_string(),
+        };
+        let http_err = err.into_http_error();
+        match http_err {
+            crate::errors::Error::BadRequest { message } => {
+                assert!(message.contains("Line 3"));
+                assert!(message.contains("custom_id too long"));
+            }
+            _ => panic!("Expected BadRequest error"),
+        }
+    }
+
+    /// Test that Content-Length header triggers early rejection for oversized files
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_upload_content_length_early_rejection(pool: PgPool) {
+        // Create app with a small file size limit
+        let mut config = create_test_config();
+        config.limits.files.max_file_size = 1000; // 1KB limit
+
+        let (app, _bg_services) = create_test_app_with_config(pool.clone(), config, false).await;
+
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+
+        // The early rejection check allows max_file_size + 10KB overhead for multipart encoding.
+        // With a 1KB limit, we need Content-Length > 1000 + 10240 = 11240 bytes.
+        // Use 15KB of content to guarantee rejection via the early Content-Length check.
+        let large_content = "x".repeat(15 * 1024);
+        let file_part = axum_test::multipart::Part::bytes(large_content.into_bytes()).file_name("test.jsonl");
+
+        let upload_response = app
+            .post("/ai/v1/files")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .multipart(
+                axum_test::multipart::MultipartForm::new()
+                    .add_part("file", file_part)
+                    .add_text("purpose", "batch"),
+            )
+            .await;
+
+        // Should get 413 Payload Too Large
+        upload_response.assert_status(axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+        let body = upload_response.text();
+        assert!(body.contains("exceeds the maximum allowed size"));
+    }
+
+    /// Test that files exceeding size limit during streaming return 413
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_upload_streaming_size_limit_returns_413(pool: PgPool) {
+        // Use a limit large enough for multipart overhead but small enough
+        // that our test content will exceed it during streaming
+        let mut config = create_test_config();
+        config.limits.files.max_file_size = 5000; // 5KB file limit
+
+        let (app, _bg_services) = create_test_app_with_config(pool.clone(), config, false).await;
+
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        // Create content that will exceed 5KB limit during streaming
+        // Each line is ~150 bytes, so 50 lines is ~7.5KB which exceeds 5KB limit
+        let mut lines = Vec::new();
+        for i in 0..50 {
+            lines.push(format!(
+                r#"{{"custom_id":"req-{}","method":"POST","url":"/v1/chat/completions","body":{{"model":"gpt-4","messages":[{{"role":"user","content":"Hello world number {}"}}]}}}}"#,
+                i, i
+            ));
+        }
+        let large_content = lines.join("\n");
+        let file_part = axum_test::multipart::Part::bytes(large_content.into_bytes()).file_name("test.jsonl");
+
+        let upload_response = app
+            .post("/ai/v1/files")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .multipart(
+                axum_test::multipart::MultipartForm::new()
+                    .add_part("file", file_part)
+                    .add_text("purpose", "batch"),
+            )
+            .await;
+
+        // Should get 413 Payload Too Large (not 500 or confusing error)
+        upload_response.assert_status(axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_upload_invalid_utf8(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+
+        // Create content with invalid UTF-8 bytes
+        // 0xFF 0xFE is not valid UTF-8
+        let mut content = b"{\"custom_id\":\"req-1\",\"method\":\"POST\",\"url\":\"/v1/chat/completions\",\"body\":{\"model\":\"gpt-4\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello ".to_vec();
+        content.extend_from_slice(&[0xFF, 0xFE]); // Invalid UTF-8
+        content.extend_from_slice(b"\"}]}}");
+
+        let file_part = axum_test::multipart::Part::bytes(content).file_name("test.jsonl");
+
+        let upload_response = app
+            .post("/ai/v1/files")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .multipart(
+                axum_test::multipart::MultipartForm::new()
+                    .add_text("purpose", "batch")
+                    .add_part("file", file_part),
+            )
+            .await;
+
+        // Should reject with 400 Bad Request for invalid UTF-8
+        upload_response.assert_status(axum::http::StatusCode::BAD_REQUEST);
+        let body = upload_response.text();
+        assert!(
+            body.contains("UTF-8") || body.contains("utf-8") || body.contains("encoding"),
+            "Expected error about UTF-8, got: {}",
+            body
+        );
+    }
+
+    #[test]
+    fn test_multer_error_variants_exist() {
+        // If multer removes/renames these, this won't compile
+        let _stream_size = multer::Error::StreamSizeExceeded { limit: 0 };
+        let _field_size = multer::Error::FieldSizeExceeded {
+            limit: 0,
+            field_name: None,
+        };
+        let _stream_read = multer::Error::StreamReadFailed(Box::new(std::io::Error::new(std::io::ErrorKind::Other, "test")));
+    }
+
+    /// Compile-time test: Ensure axum's LengthLimitError exists.
+    #[test]
+    fn test_axum_length_limit_error_exists() {
+        use super::LengthLimitError;
+        // Verify it implements Error (required for downcast_ref)
+        fn assert_error<T: std::error::Error + 'static>() {}
+        assert_error::<LengthLimitError>();
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_upload_rejects_request_exceeding_max_body_size(pool: PgPool) {
+        // Create app with a small per-request body size limit
+        let mut config = create_test_config();
+        config.limits.requests.max_body_size = 100; // 100 bytes
+
+        let (app, _bg_services) = create_test_app_with_config(pool.clone(), config, false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        // Create a request with a body that exceeds 100 bytes when serialized
+        let large_content = "x".repeat(200);
+        let jsonl_content = format!(
+            r#"{{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{{"model":"gpt-4","messages":[{{"role":"user","content":"{}"}}]}}}}"#,
+            large_content
+        );
+
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.into_bytes()).file_name("test.jsonl");
+
+        let upload_response = app
+            .post("/ai/v1/files")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .multipart(
+                axum_test::multipart::MultipartForm::new()
+                    .add_text("purpose", "batch")
+                    .add_part("file", file_part),
+            )
+            .await;
+
+        upload_response.assert_status(axum::http::StatusCode::BAD_REQUEST);
+        let body = upload_response.text();
+        assert!(
+            body.contains("exceeds the maximum allowed size"),
+            "Expected error about request body size, got: {}",
+            body
+        );
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_upload_allows_request_within_max_body_size(pool: PgPool) {
+        // Create app with a generous per-request body size limit
+        let mut config = create_test_config();
+        config.limits.requests.max_body_size = 10 * 1024; // 10KB
+
+        let (app, _bg_services) = create_test_app_with_config(pool.clone(), config, false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        // Create a small request well within the limit
+        let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}"#;
+
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test.jsonl");
+
         let upload_response = app
             .post("/ai/v1/files")
             .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)

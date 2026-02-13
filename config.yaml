@@ -7,6 +7,10 @@
 host: "0.0.0.0"
 port: 3001
 
+# Base URL where the dashboard is accessible
+# Used for password reset links, payment redirect URLs, and batch notification emails
+dashboard_url: "http://localhost:5173"
+
 # Database configuration
 database:
   # Configure connectivity to an external postgres database here
@@ -106,7 +110,6 @@ secret_key: insecure-change-in-production
 # For production, configure Stripe or another provider
 payment:
   dummy:
-    host_url: "http://localhost:5173"
     amount: 100.00
 
 # Model sources - inference endpoints to connect to
@@ -146,23 +149,7 @@ auth:
       cookie_name: "dwctl_session"
       cookie_secure: true
       cookie_same_site: "strict"
-    # Email configuration for password resets and notifications
-    email:
-      # Email transport - either 'file' (for development) or 'smtp' (for production)
-      type: file
-      path: "./emails" # Directory for file-based email (when type=file)
-      # For SMTP (production), use:
-      # type: smtp
-      # host: "smtp.example.com"
-      # port: 587
-      # username: "noreply@example.com"
-      # password: "your-smtp-password"
-      # use_tls: true
-      from_email: "noreply@example.com"
-      from_name: "Control Layer"
-      password_reset:
-        token_expiry: "30m" # How long reset tokens are valid
-        base_url: "http://localhost:3001" # Frontend URL for reset links
+    password_reset_token_duration: "30m"
 
   # Proxy header authentication
   # Accepts user identity from HTTP headers set by an upstream authentication proxy
@@ -212,6 +199,18 @@ auth:
       max_age: 3600 # Cache preflight requests for 1 hour
       # exposed_headers: []  # Optional: Custom headers to expose to browser (e.g., ["X-Incomplete", "X-Last-Line"])
 
+# Email configuration for password resets and notifications
+email:
+  # Email transport - either 'file' (for development) or 'smtp' (for production)
+  type: file
+  path: "./emails" # Directory for file-based email (when type=file)
+  # For SMTP (production), use:
+  # type: smtp
+  # host: "smtp.example.com"
+  # port: 587
+  # username: "noreply@example.com"
+  # password: "your-smtp-password"
+  # use_tls: true
 # Credits configuration
 credits:
   # Initial credits given to standard users when they are created
@@ -284,6 +283,11 @@ batches:
 #     # Maximum seconds to wait for an upload slot before returning HTTP 429
 #     # Set to 0 to reject immediately when no slot is available
 #     max_upload_wait_secs: 60
+#   requests:
+#     # Maximum body size per individual request in batch JSONL files (bytes)
+#     # Set to 0 for unlimited (not recommended for production)
+#     # Default: 10MB (10485760)
+#     max_body_size: 10485760
 
 # Background services configuration
 # Controls which background services run on this instance

@@ -133,6 +133,13 @@
 // TODO: This file has gotten way too big. We need to refactor it into smaller modules.
 // The constructors in test_utils should be unified with the actual constructors: right now they're
 // actually the best lib way to construct things, which is bad.
+/// Install the rustls crypto provider at process startup, before main() or any test runs.
+/// This ensures every TLS client (reqwest, async-stripe, etc.) has a provider available.
+#[ctor::ctor]
+fn install_crypto_provider() {
+    rustls::crypto::aws_lc_rs::default_provider().install_default().ok();
+}
+
 pub mod api;
 pub mod auth;
 pub mod config;
@@ -144,6 +151,7 @@ pub mod errors;
 mod leader_election;
 pub mod limits;
 mod metrics;
+mod notifications;
 mod openapi;
 mod payment_providers;
 mod probes;
@@ -185,6 +193,7 @@ use axum_prometheus::PrometheusMetricLayerBuilder;
 use bon::Builder;
 pub use config::Config;
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
+use opentelemetry::trace::TraceContextExt;
 use outlet::{MultiHandler, RequestLoggerConfig, RequestLoggerLayer};
 use outlet_postgres::PostgresHandler;
 use request_logging::{AiResponse, ParsedAIRequest};
@@ -195,6 +204,7 @@ use tokio::net::TcpListener;
 use tower::Layer;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing::{debug, info, instrument};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 use utoipa::OpenApi;
 use utoipa_scalar::{Scalar, Servable};
 use uuid::Uuid;
@@ -1093,7 +1103,11 @@ pub async fn build_router(
         let body_limit_layer = if file_upload_limit == 0 {
             DefaultBodyLimit::disable()
         } else {
-            DefaultBodyLimit::max(file_upload_limit as usize)
+            // Add overhead for multipart encoding (headers, boundaries, etc.)
+            let body_limit_u64 = file_upload_limit.saturating_add(limits::MULTIPART_OVERHEAD);
+            // Clamp to usize::MAX to avoid truncation when converting to usize
+            let body_limit = usize::try_from(body_limit_u64).unwrap_or(usize::MAX);
+            DefaultBodyLimit::max(body_limit)
         };
         let file_router = Router::new().route("/files", post(api::handlers::files::upload_file).layer(body_limit_layer));
 
@@ -1220,28 +1234,82 @@ pub async fn build_router(
     }
 
     // Add tracing layer with OTel-compatible span names and HTTP semantic conventions
-    let router = router.layer(TraceLayer::new_for_http().make_span_with(|request: &http::Request<_>| {
-        let path = request.uri().path();
-        let span_name = format!("{} {}", request.method(), path);
-        let api_type = if path.starts_with("/ai/") {
-            "ai_proxy"
-        } else if path.starts_with("/admin/") {
-            "admin"
-        } else {
-            "other"
-        };
-        tracing::info_span!(
-            "request",
-            otel.name = %span_name,
-            otel.kind = "Server",
-            api.type = api_type,
-            http.request.method = %request.method(),
-            url.path = path,
-            url.query = request.uri().query().unwrap_or(""),
-        )
-    }));
+    // Reference: https://opentelemetry.io/docs/specs/semconv/http/http-spans/
+    let router = router.layer(middleware::from_fn(inject_trace_id)).layer(
+        TraceLayer::new_for_http()
+            .make_span_with(|request: &http::Request<_>| {
+                let path = request.uri().path();
+                let route = request
+                    .extensions()
+                    .get::<axum::extract::MatchedPath>()
+                    .map(|mp| mp.as_str().to_owned());
+                let span_name = if let Some(ref route) = route {
+                    format!("{} {}", request.method(), route)
+                } else {
+                    format!("{} {}", request.method(), path)
+                };
+                let api_type = if path.starts_with("/ai/") {
+                    "ai_proxy"
+                } else if path.starts_with("/admin/") {
+                    "admin"
+                } else {
+                    "other"
+                };
+                tracing::info_span!(
+                    "request",
+                    trace_id = tracing::field::Empty,
+                    otel.name = %span_name,
+                    otel.kind = "Server",
+                    otel.status_code = tracing::field::Empty,
+                    api.type = api_type,
+                    http.request.method = %request.method(),
+                    http.route = route.as_deref().unwrap_or(""),
+                    http.response.status_code = tracing::field::Empty,
+                    url.path = path,
+                    url.query = request.uri().query().unwrap_or(""),
+                    error.type = tracing::field::Empty,
+                )
+            })
+            .on_response(|response: &http::Response<_>, latency: std::time::Duration, span: &tracing::Span| {
+                let status = response.status().as_u16();
+                span.record("http.response.status_code", status);
+                if status >= 500 {
+                    span.record("otel.status_code", "ERROR");
+                    span.record("error.type", status.to_string().as_str());
+                } else if status >= 400 {
+                    span.record("error.type", status.to_string().as_str());
+                }
+                tracing::info!(
+                    http.response.status_code = status,
+                    latency_ms = latency.as_millis() as u64,
+                    "finished processing request"
+                );
+            })
+            .on_failure(
+                |error: tower_http::classify::ServerErrorsFailureClass, latency: std::time::Duration, span: &tracing::Span| {
+                    span.record("otel.status_code", "ERROR");
+                    span.record("error.type", tracing::field::display(&error));
+                    tracing::error!(
+                        error = %error,
+                        latency_ms = latency.as_millis() as u64,
+                        "request failed"
+                    );
+                },
+            ),
+    );
 
     Ok(router)
+}
+
+/// Middleware that records the OpenTelemetry trace ID on the current span,
+/// making it visible in fmt log output for Loki → Tempo correlation.
+async fn inject_trace_id(request: axum::extract::Request, next: middleware::Next) -> axum::response::Response {
+    let span = tracing::Span::current();
+    let sc = span.context().span().span_context().clone();
+    if sc.is_valid() {
+        span.record("trace_id", tracing::field::display(sc.trace_id()));
+    }
+    next.run(request).await
 }
 
 /// Container for background services and their lifecycle management.
@@ -1435,10 +1503,18 @@ async fn setup_background_services(
 
         // Start the onwards configuration listener
         let onwards_shutdown = shutdown_token.clone();
+        let fallback_interval = config.background_services.onwards_sync.fallback_interval_milliseconds;
         background_tasks.spawn("onwards-config-sync", async move {
-            info!("Starting onwards configuration listener");
+            info!(
+                "Starting onwards configuration listener (fallback sync every {}ms)",
+                fallback_interval
+            );
+            let sync_config = sync::onwards_config::SyncConfig {
+                status_tx: None,
+                fallback_interval_milliseconds: fallback_interval,
+            };
             onwards_config_sync
-                .start(Default::default(), onwards_shutdown)
+                .start(sync_config, onwards_shutdown)
                 .await
                 .context("Onwards configuration listener failed")
         });
@@ -1530,6 +1606,25 @@ async fn setup_background_services(
                 info!("Skipping leader election - running as leader with probe scheduler (fusillade daemon disabled)");
             }
         }
+
+        // Start batch notification poller if enabled
+        if config.background_services.notifications.enabled {
+            let daemon_config = config.clone();
+            let daemon_request_manager = request_manager.clone();
+            let daemon_pool = pool.clone();
+            let daemon_shutdown = shutdown_token.clone();
+            background_tasks.spawn("batch-notifications", async move {
+                notifications::run_notification_poller(
+                    daemon_config.background_services.notifications.clone(),
+                    daemon_config,
+                    daemon_request_manager,
+                    daemon_pool,
+                    daemon_shutdown,
+                )
+                .await;
+                Ok(())
+            });
+        }
     } else {
         // Normal leader election
         is_leader = false;
@@ -1590,7 +1685,7 @@ async fn setup_background_services(
                 leader_election_flag,
                 LEADER_LOCK_ID,
                 leader_election_shutdown,
-                move |_pool, config| {
+                move |pool, config| {
                     // This closure is run when a replica becomes the leader
                     let scheduler = leader_election_scheduler_gain.clone();
                     let request_manager = leader_election_request_manager_gain.clone();
@@ -1622,6 +1717,8 @@ async fn setup_background_services(
                             tracing::info!("Probe scheduler disabled by configuration");
                         }
 
+                        let notification_request_manager = request_manager.clone();
+
                         // Start the fusillade batch processing daemon based on config
                         use crate::config::DaemonEnabled;
                         use fusillade::DaemonExecutor;
@@ -1642,6 +1739,23 @@ async fn setup_background_services(
                             DaemonEnabled::Never => {
                                 tracing::info!("Fusillade batch daemon disabled by configuration");
                             }
+                        }
+
+                        // Start batch notification poller if enabled
+                        if config.background_services.notifications.enabled {
+                            let daemon_config = config.clone();
+                            let daemon_session_token = session_token.clone();
+                            tokio::spawn(async move {
+                                notifications::run_notification_poller(
+                                    daemon_config.background_services.notifications.clone(),
+                                    daemon_config,
+                                    notification_request_manager,
+                                    pool,
+                                    daemon_session_token,
+                                )
+                                .await;
+                            });
+                            tracing::info!("Batch notification poller started on elected leader");
                         }
 
                         Ok(())

@@ -22,6 +22,8 @@ import {
 } from "../../../ui";
 import { Input } from "../../../ui/input";
 import { Button } from "../../../ui/button";
+import { Switch } from "../../../ui/switch";
+import { Label } from "../../../ui/label";
 import { AVAILABLE_ROLES, getRoleDisplayName } from "../../../../utils/roles";
 import type { Role } from "../../../../api/control-layer/types";
 import { dwctlApi } from "../../../../api/control-layer/client";
@@ -44,6 +46,8 @@ export const Profile: React.FC = () => {
   const [showCurrentPassword, setShowCurrentPassword] = useState(false);
   const [showNewPassword, setShowNewPassword] = useState(false);
   const [showConfirmPassword, setShowConfirmPassword] = useState(false);
+  const [batchNotificationsEnabled, setBatchNotificationsEnabled] =
+    useState(false);
   const [error, setError] = useState("");
   const [success, setSuccess] = useState("");
 
@@ -74,6 +78,9 @@ export const Profile: React.FC = () => {
       setDisplayName(currentUser.display_name || "");
       setAvatarUrl(currentUser.avatar_url || "");
       setRoles(currentUser.roles || []);
+      setBatchNotificationsEnabled(
+        currentUser.batch_notifications_enabled ?? false,
+      );
     }
     if (userError) {
       setError("Failed to load profile information");
@@ -124,6 +131,7 @@ export const Profile: React.FC = () => {
         roles: currentUser.is_admin
           ? ([...new Set([...roles, "StandardUser"])] as Role[])
           : undefined,
+        batch_notifications_enabled: batchNotificationsEnabled,
       };
 
       await updateUserMutation.mutateAsync({
@@ -356,6 +364,28 @@ export const Profile: React.FC = () => {
                     <p className="text-xs text-gray-500 mt-1">
                       Enter a URL to your profile picture
                     </p>
+                  </div>
+                </div>
+
+                {/* Batch Notifications Toggle */}
+                <div className="pt-3 border-t border-gray-200">
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <Label
+                        htmlFor="batchNotifications"
+                        className="text-sm font-medium text-gray-700"
+                      >
+                        Batch Notifications
+                      </Label>
+                      <p className="text-xs text-gray-500 mt-0.5">
+                        Email me when a batch is complete
+                      </p>
+                    </div>
+                    <Switch
+                      id="batchNotifications"
+                      checked={batchNotificationsEnabled}
+                      onCheckedChange={setBatchNotificationsEnabled}
+                    />
                   </div>
                 </div>
 

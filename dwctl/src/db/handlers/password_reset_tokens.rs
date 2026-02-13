@@ -148,7 +148,7 @@ impl<'c> PasswordResetTokens<'c> {
     pub async fn create_for_user(&mut self, user_id: UserId, config: &Config) -> Result<(String, PasswordResetToken)> {
         let raw_token = password::generate_reset_token();
         let expires_at = Utc::now()
-            + chrono::Duration::from_std(config.auth.native.email.password_reset.token_expiry).unwrap_or(chrono::Duration::minutes(30));
+            + chrono::Duration::from_std(config.auth.native.password_reset_token_duration).unwrap_or(chrono::Duration::minutes(30));
 
         let request = PasswordResetTokenCreateRequest {
             user_id,

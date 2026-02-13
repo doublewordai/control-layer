@@ -11,10 +11,13 @@
             fetchpriority="high"
         />
         <title>Doubleword Control Layer</title>
-        <script src="/bootstrap.js"></script>
     </head>
     <body>
         <div id="root"></div>
         <script type="module" src="/src/main.tsx"></script>
+
+        <!-- Bootstrap is used for custom JS configured via deployment env -->
+        <!-- Look at control-layer/dwctl/src/api/handlers/static_assets.rs -->
+        <script src="/bootstrap.js"></script>
     </body>
 </html>
