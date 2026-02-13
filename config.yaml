@@ -289,6 +289,15 @@ batches:
 #     # Default: 10MB (10485760)
 #     max_body_size: 10485760
 
+# Onwards AI proxy configuration
+# Controls behavior of the onwards routing layer for AI proxy requests
+onwards:
+  # Enable strict mode with schema validation and typed handlers.
+  # When false (default), all requests are passed through transparently.
+  # When true, only known OpenAI API paths are accepted and validated.
+  # Set via environment: DWCTL_ONWARDS__STRICT_MODE=true
+  strict_mode: false
+
 # Background services configuration
 # Controls which background services run on this instance
 background_services:

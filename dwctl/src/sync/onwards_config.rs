@@ -86,6 +86,8 @@ pub struct OnwardsConfigSync {
     escalation_models: Vec<String>,
     /// Tracks previous-cycle gauge label sets for zeroing stale metrics
     cache_info_state: crate::metrics::CacheInfoState,
+    /// Enable strict mode with schema validation
+    strict_mode: bool,
 }
 
 pub struct SyncConfig {
@@ -111,7 +113,7 @@ impl OnwardsConfigSync {
     #[cfg(test)]
     #[instrument(skip(db))]
     pub async fn new(db: PgPool) -> Result<(Self, Targets, WatchTargetsStream), anyhow::Error> {
-        Self::new_with_daemon_limits(db, None, Vec::new()).await
+        Self::new_with_daemon_limits(db, None, Vec::new(), false).await
     }
 
     /// Creates a new OnwardsConfigSync with optional daemon capacity limits map and escalation models
@@ -119,14 +121,16 @@ impl OnwardsConfigSync {
     /// `escalation_models` - Model aliases that batch API keys should have automatic access to.
     /// This enables batch processing to route requests to escalation models without needing
     /// separate API key configuration.
+    /// `strict_mode` - Enable strict mode with schema validation (only known OpenAI API paths accepted)
     #[instrument(skip(db, daemon_capacity_limits, escalation_models))]
     pub async fn new_with_daemon_limits(
         db: PgPool,
         daemon_capacity_limits: Option<Arc<dashmap::DashMap<String, usize>>>,
         escalation_models: Vec<String>,
+        strict_mode: bool,
     ) -> Result<(Self, Targets, WatchTargetsStream), anyhow::Error> {
         // Load initial configuration (including composite models)
-        let initial_targets = load_targets_from_db(&db, &escalation_models).await?;
+        let initial_targets = load_targets_from_db(&db, &escalation_models, strict_mode).await?;
 
         // If daemon limits are provided, populate them
         if let Some(ref limits) = daemon_capacity_limits {
@@ -148,6 +152,7 @@ impl OnwardsConfigSync {
             daemon_capacity_limits,
             escalation_models,
             cache_info_state,
+            strict_mode,
         };
         let stream = WatchTargetsStream::new(receiver);
 
@@ -237,7 +242,7 @@ impl OnwardsConfigSync {
 
                                 // Reload configuration from database (including composite models)
                                 last_reload_time = std::time::Instant::now();
-                                match load_targets_from_db(&self.db, &self.escalation_models).await {
+                                match load_targets_from_db(&self.db, &self.escalation_models, self.strict_mode).await {
                                     Ok(new_targets) => {
                                         info!("Loaded {} targets from database", new_targets.targets.len());
                                         for entry in new_targets.targets.iter() {
@@ -324,7 +329,7 @@ impl OnwardsConfigSync {
                         }
 
                         last_reload_time = std::time::Instant::now();
-                        match load_targets_from_db(&self.db, &self.escalation_models).await {
+                        match load_targets_from_db(&self.db, &self.escalation_models, self.strict_mode).await {
                             Ok(new_targets) => {
                                 info!("Fallback sync: loaded {} targets from database", new_targets.targets.len());
 
@@ -779,7 +784,7 @@ fn convert_composite_to_target_spec(
 
 /// Converts both regular targets and composite models to ConfigFile format
 #[tracing::instrument(skip(targets, composites))]
-fn convert_to_config_file(targets: Vec<OnwardsTarget>, composites: Vec<OnwardsCompositeModel>) -> ConfigFile {
+fn convert_to_config_file(targets: Vec<OnwardsTarget>, composites: Vec<OnwardsCompositeModel>, strict_mode: bool) -> ConfigFile {
     let mut key_definitions = HashMap::new();
 
     // Convert regular deployed models (wrapped in TargetSpecOrList::Single)
@@ -885,6 +890,7 @@ fn convert_to_config_file(targets: Vec<OnwardsTarget>, composites: Vec<OnwardsCo
     ConfigFile {
         targets: target_specs,
         auth,
+        strict_mode,
     }
 }
 
@@ -893,8 +899,9 @@ fn convert_to_config_file(targets: Vec<OnwardsTarget>, composites: Vec<OnwardsCo
 /// `escalation_models` - Model aliases that batch API keys should have automatic access to.
 /// This enables batch processing to route requests to escalation models without needing
 /// separate API key configuration.
+/// `strict_mode` - Enable strict mode with schema validation (only known OpenAI API paths accepted)
 #[tracing::instrument(skip(db, escalation_models))]
-pub async fn load_targets_from_db(db: &PgPool, escalation_models: &[String]) -> Result<Targets, anyhow::Error> {
+pub async fn load_targets_from_db(db: &PgPool, escalation_models: &[String], strict_mode: bool) -> Result<Targets, anyhow::Error> {
     let query_start = std::time::Instant::now();
     debug!("Loading onwards targets from database (with composite models)");
 
@@ -1034,7 +1041,7 @@ pub async fn load_targets_from_db(db: &PgPool, escalation_models: &[String]) -> 
     let composites = load_composite_models_from_db(db, escalation_models).await?;
 
     // Convert to ConfigFile format
-    let config = convert_to_config_file(targets, composites);
+    let config = convert_to_config_file(targets, composites, strict_mode);
 
     // Convert ConfigFile to Targets
     Targets::from_config(config)
@@ -1107,7 +1114,7 @@ mod tests {
         let target2 = create_test_target("claude-3", "claude-alias", "https://api.anthropic.com");
 
         let targets = vec![target1, target2];
-        let config = convert_to_config_file(targets, vec![]);
+        let config = convert_to_config_file(targets, vec![], false);
 
         // Verify the config
         assert_eq!(config.targets.len(), 2);
@@ -1140,7 +1147,7 @@ mod tests {
         let target = create_test_target("valid-model", "valid-alias", "https://api.valid.com");
 
         let targets = vec![target];
-        let config = convert_to_config_file(targets, vec![]);
+        let config = convert_to_config_file(targets, vec![], false);
 
         // Should have exactly one target
         assert_eq!(config.targets.len(), 1);
@@ -1423,7 +1430,7 @@ mod tests {
 
         // Load targets with composite alias in escalation_models
         let escalation_models = vec![composite_alias.clone()];
-        let targets = super::load_targets_from_db(&pool, &escalation_models).await.unwrap();
+        let targets = super::load_targets_from_db(&pool, &escalation_models, false).await.unwrap();
 
         // Find the composite model in targets (DashMap)
         let composite_target = targets.targets.get(&composite_alias).expect("Composite model should be in targets");

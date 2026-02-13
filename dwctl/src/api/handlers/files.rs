@@ -545,7 +545,8 @@ fn create_file_stream(
                                     match serde_json::from_str::<OpenAIBatchRequest>(trimmed) {
                                         Ok(openai_req) => {
                                             // Transform to internal format (includes model access validation)
-                                            match openai_req.to_internal(&endpoint, &api_key, &accessible_models, &allowed_url_paths) {
+                                            match openai_req.to_internal(&endpoint, api_key.clone(), &accessible_models, &allowed_url_paths)
+                                            {
                                                 Ok(template) => {
                                                     // Check per-request body size limit (0 = unlimited)
                                                     if config.max_request_body_size > 0
@@ -628,39 +629,42 @@ fn create_file_stream(
                             }
 
                             match serde_json::from_str::<OpenAIBatchRequest>(trimmed) {
-                                Ok(openai_req) => match openai_req.to_internal(&endpoint, &api_key, &accessible_models, &allowed_url_paths) {
-                                    Ok(template) => {
-                                        // Check per-request body size limit (0 = unlimited)
-                                        if config.max_request_body_size > 0 && template.body.len() as u64 > config.max_request_body_size {
-                                            abort!(FileUploadError::ValidationError {
-                                                line: line_count + 1,
-                                                message: format!(
-                                                    "Request body is {} bytes, which exceeds the maximum allowed size of {} bytes",
-                                                    template.body.len(),
-                                                    config.max_request_body_size
-                                                ),
-                                            });
-                                        }
+                                Ok(openai_req) => {
+                                    match openai_req.to_internal(&endpoint, api_key.clone(), &accessible_models, &allowed_url_paths) {
+                                        Ok(template) => {
+                                            // Check per-request body size limit (0 = unlimited)
+                                            if config.max_request_body_size > 0 && template.body.len() as u64 > config.max_request_body_size
+                                            {
+                                                abort!(FileUploadError::ValidationError {
+                                                    line: line_count + 1,
+                                                    message: format!(
+                                                        "Request body is {} bytes, which exceeds the maximum allowed size of {} bytes",
+                                                        template.body.len(),
+                                                        config.max_request_body_size
+                                                    ),
+                                                });
+                                            }
 
-                                        line_count += 1;
-                                        if tx.send(fusillade::FileStreamItem::Template(template)).await.is_err() {
-                                            return;
+                                            line_count += 1;
+                                            if tx.send(fusillade::FileStreamItem::Template(template)).await.is_err() {
+                                                return;
+                                            }
+                                        }
+                                        Err(e) => {
+                                            let upload_err = match &e {
+                                                Error::ModelAccessDenied { model_name, .. } => FileUploadError::ModelAccessDenied {
+                                                    model: model_name.clone(),
+                                                    line: line_count + 1,
+                                                },
+                                                _ => FileUploadError::ValidationError {
+                                                    line: line_count + 1,
+                                                    message: e.to_string(),
+                                                },
+                                            };
+                                            abort!(upload_err);
                                         }
                                     }
-                                    Err(e) => {
-                                        let upload_err = match &e {
-                                            Error::ModelAccessDenied { model_name, .. } => FileUploadError::ModelAccessDenied {
-                                                model: model_name.clone(),
-                                                line: line_count + 1,
-                                            },
-                                            _ => FileUploadError::ValidationError {
-                                                line: line_count + 1,
-                                                message: e.to_string(),
-                                            },
-                                        };
-                                        abort!(upload_err);
-                                    }
-                                },
+                                }
                                 Err(e) => {
                                     abort!(FileUploadError::InvalidJson {
                                         line: line_count + 1,
@@ -796,7 +800,7 @@ pub async fn upload_file<P: PoolProvider>(
     drop(conn);
 
     // Create a stream that parses the multipart upload and yields FileStreamItems
-    let file_stream = create_file_stream(
+    let (file_stream, error_slot) = create_file_stream(
         multipart,
         stream_config,
         uploaded_by,
