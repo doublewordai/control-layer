@@ -1186,7 +1186,7 @@ impl Default for OnwardsSyncConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            fallback_interval_milliseconds: 10000, // 10 seconds
+            fallback_interval_milliseconds: 1000000, // 10 seconds
         }
     }
 }

@@ -1,9 +1,12 @@
 //! Batch completion notification poller.
 //!
-//! Polls fusillade for completed/failed/cancelled batches and sends notifications
-//! to batch creators. When webhooks are enabled, delivers webhooks; otherwise sends
-//! email notifications. Uses atomic `notification_sent_at` claiming to prevent
-//! duplicate notifications across replicas.
+//! Polls fusillade for completed/failed/cancelled batches and:
+//! 1. Creates webhook delivery records for matching webhooks
+//! 2. Ticks the webhook dispatcher (claim → sign → send → process results)
+//! 3. Sends email notifications
+//!
+//! Uses atomic `notification_sent_at` claiming to prevent duplicate
+//! notifications across replicas.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -16,10 +19,13 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::config::NotificationsConfig;
+use crate::db::handlers::Webhooks;
 use crate::db::handlers::repository::Repository;
 use crate::db::handlers::users::Users;
+use crate::db::models::webhooks::WebhookDeliveryCreateDBRequest;
 use crate::email::EmailService;
-use crate::webhooks::WebhookService;
+use crate::webhooks::WebhookDispatcher;
+use crate::webhooks::events::{WebhookEvent, WebhookEventType};
 
 /// Outcome of a completed batch for notification purposes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,8 +119,8 @@ pub async fn run_notification_poller(
     dwctl_pool: PgPool,
     shutdown: CancellationToken,
 ) {
-    let webhook_service = if config.webhooks.enabled {
-        Some(WebhookService::new(dwctl_pool.clone(), config.webhooks.clone()))
+    let mut dispatcher = if config.webhooks.enabled {
+        Some(WebhookDispatcher::spawn(dwctl_pool.clone(), &config.webhooks, shutdown.clone()))
     } else {
         None
     };
@@ -143,95 +149,165 @@ pub async fn run_notification_poller(
             }
         }
 
+        tracing::debug!("Notification poller tick");
+
+        // === Step 1: Poll fusillade for completed batches ===
         match request_manager.poll_completed_batches().await {
             Ok(batches) => {
-                if batches.is_empty() {
-                    continue;
-                }
-                tracing::info!(count = batches.len(), "Found batches needing notification");
+                if !batches.is_empty() {
+                    tracing::info!(count = batches.len(), "Found batches needing notification");
 
-                let infos: Vec<_> = batches.iter().filter_map(BatchNotificationInfo::try_from_batch).collect();
+                    let infos: Vec<_> = batches.iter().filter_map(BatchNotificationInfo::try_from_batch).collect();
 
-                // Deliver webhooks (service fetches its own webhook configs)
-                if let Some(ref webhook_service) = webhook_service
-                    && let Err(e) = webhook_service.send_batch_webhooks(&infos).await
-                {
-                    tracing::warn!(error = %e, "Failed to deliver batch webhooks");
-                }
-
-                // Send email notifications
-                if let Some(ref email_service) = email_service {
-                    let user_ids: Vec<Uuid> = infos.iter().map(|i| i.user_id).collect::<HashSet<_>>().into_iter().collect();
-
-                    let mut conn = match dwctl_pool.acquire().await {
-                        Ok(c) => c,
-                        Err(e) => {
-                            tracing::warn!(error = %e, "Failed to acquire database connection");
-                            continue;
-                        }
-                    };
-
-                    let users_by_id = {
-                        let mut users = Users::new(&mut conn);
-                        match users.get_bulk(user_ids).await {
-                            Ok(u) => u,
-                            Err(e) => {
-                                tracing::warn!(error = %e, "Failed to fetch users for email notifications");
-                                continue;
-                            }
-                        }
-                    };
-
-                    for info in &infos {
-                        let Some(user) = users_by_id.get(&info.user_id) else {
-                            continue;
-                        };
-
-                        let is_first_batch = !user.first_batch_email_sent && info.outcome == BatchOutcome::Completed;
-
-                        if !is_first_batch && !user.batch_notifications_enabled {
-                            continue;
-                        }
-
-                        let name = user.display_name.as_deref().unwrap_or(&user.username);
-
-                        if let Err(e) = email_service
-                            .send_batch_completion_email(&user.email, Some(name), info, is_first_batch)
+                    // === Step 2: Create webhook delivery records ===
+                    if dispatcher.is_some() {
+                        let _ = create_batch_deliveries(&dwctl_pool, &infos)
                             .await
-                        {
-                            tracing::warn!(
-                                batch_id = %info.batch_id,
-                                email = %user.email,
-                                error = %e,
-                                first_batch = is_first_batch,
-                                "Failed to send batch completion email"
-                            );
-                            continue;
-                        }
+                            .inspect_err(|e| tracing::warn!(error = %e, "Failed to create webhook delivery records"));
+                    }
 
-                        tracing::debug!(
-                            batch_id = %info.batch_id,
-                            email = %user.email,
-                            outcome = ?info.outcome,
-                            first_batch = is_first_batch,
-                            "Sent batch completion notification"
-                        );
-
-                        if is_first_batch {
-                            let mut users = Users::new(&mut conn);
-                            if let Err(e) = users.mark_first_batch_email_sent(info.user_id).await {
-                                tracing::warn!(
-                                    user_id = %info.user_id,
-                                    error = %e,
-                                    "Failed to mark first batch email as sent"
-                                );
-                            }
-                        }
+                    // === Step 3: Send email notifications ===
+                    if let Some(ref email_service) = email_service {
+                        send_email_notifications(email_service, &infos, &dwctl_pool).await;
                     }
                 }
             }
             Err(e) => {
                 tracing::warn!(error = %e, "Failed to poll for completed batches");
+            }
+        }
+
+        // === Step 4: Dispatch webhooks (claim → sign → send → process results) ===
+        if let Some(ref mut dispatcher) = dispatcher {
+            dispatcher.tick().await;
+        }
+    }
+}
+
+/// Create webhook delivery records for a batch of notifications.
+///
+/// Deliveries are created with `next_attempt_at = now()` so the dispatcher's
+/// claim mechanism picks them up immediately.
+async fn create_batch_deliveries(pool: &PgPool, infos: &[BatchNotificationInfo]) -> anyhow::Result<()> {
+    if infos.is_empty() {
+        return Ok(());
+    }
+
+    let mut conn = pool.acquire().await?;
+
+    let user_ids: Vec<Uuid> = infos.iter().map(|i| i.user_id).collect::<HashSet<_>>().into_iter().collect();
+    let webhooks_by_user = {
+        let mut repo = Webhooks::new(&mut conn);
+        repo.get_enabled_webhooks_for_users(user_ids).await?
+    };
+
+    let mut repo = Webhooks::new(&mut conn);
+
+    for info in infos {
+        let Some(webhooks) = webhooks_by_user.get(&info.user_id) else {
+            tracing::debug!(user_id = %info.user_id, "No webhooks configured, skipping");
+            continue;
+        };
+
+        let webhook_status = match info.outcome {
+            BatchOutcome::Completed | BatchOutcome::PartiallyCompleted => WebhookEventType::BatchCompleted,
+            BatchOutcome::Failed => WebhookEventType::BatchFailed,
+        };
+
+        let webhook_event = WebhookEvent::batch_terminal(webhook_status, info);
+        let payload_json = serde_json::to_value(&webhook_event)?;
+
+        for webhook in webhooks.iter().filter(|w| w.accepts_event(webhook_status)) {
+            let event_id = Uuid::new_v4();
+
+            let delivery_request = WebhookDeliveryCreateDBRequest {
+                webhook_id: webhook.id,
+                event_id,
+                event_type: webhook_status.to_string(),
+                payload: payload_json.clone(),
+                batch_id: info.batch_uuid,
+                next_attempt_at: None, // defaults to now() — claimed immediately
+            };
+
+            repo.create_delivery(&delivery_request).await?;
+
+            tracing::debug!(
+                webhook_id = %webhook.id,
+                batch_id = %info.batch_uuid,
+                "Webhook delivery record created"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Send email notifications for completed batches.
+async fn send_email_notifications(email_service: &EmailService, infos: &[BatchNotificationInfo], pool: &PgPool) {
+    let user_ids: Vec<Uuid> = infos.iter().map(|i| i.user_id).collect::<HashSet<_>>().into_iter().collect();
+
+    let mut conn = match pool.acquire().await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to acquire database connection");
+            return;
+        }
+    };
+
+    let users_by_id = {
+        let mut users = Users::new(&mut conn);
+        match users.get_bulk(user_ids).await {
+            Ok(u) => u,
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to fetch users for email notifications");
+                return;
+            }
+        }
+    };
+
+    for info in infos {
+        let Some(user) = users_by_id.get(&info.user_id) else {
+            continue;
+        };
+
+        let is_first_batch = !user.first_batch_email_sent && info.outcome == BatchOutcome::Completed;
+
+        if !is_first_batch && !user.batch_notifications_enabled {
+            continue;
+        }
+
+        let name = user.display_name.as_deref().unwrap_or(&user.username);
+
+        if let Err(e) = email_service
+            .send_batch_completion_email(&user.email, Some(name), info, is_first_batch)
+            .await
+        {
+            tracing::warn!(
+                batch_id = %info.batch_id,
+                email = %user.email,
+                error = %e,
+                first_batch = is_first_batch,
+                "Failed to send batch completion email"
+            );
+            continue;
+        }
+
+        tracing::debug!(
+            batch_id = %info.batch_id,
+            email = %user.email,
+            outcome = ?info.outcome,
+            first_batch = is_first_batch,
+            "Sent batch completion notification"
+        );
+
+        if is_first_batch {
+            let mut users = Users::new(&mut conn);
+            if let Err(e) = users.mark_first_batch_email_sent(info.user_id).await {
+                tracing::warn!(
+                    user_id = %info.user_id,
+                    error = %e,
+                    "Failed to mark first batch email as sent"
+                );
             }
         }
     }
