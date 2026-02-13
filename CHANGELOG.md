@@ -1,5 +1,17 @@
 # Changelog
 
+## [7.2.0](https://github.com/doublewordai/control-layer/compare/v7.1.0...v7.2.0) (2026-02-13)
+
+
+### Features
+
+* **dashboard:** show per-daemon batch concurrency in model info ([#694](https://github.com/doublewordai/control-layer/issues/694)) ([672901e](https://github.com/doublewordai/control-layer/commit/672901e14a0a125eb6e904a35149e27ef078fb75))
+
+
+### Bug Fixes
+
+* bump fusillade to 3.5.1 ([#692](https://github.com/doublewordai/control-layer/issues/692)) ([35ef5f8](https://github.com/doublewordai/control-layer/commit/35ef5f86d11230654961513e0ae494e621c4082b))
+
 ## [7.1.0](https://github.com/doublewordai/control-layer/compare/v7.0.1...v7.1.0) (2026-02-13)
 
 
