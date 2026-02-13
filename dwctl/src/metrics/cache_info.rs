@@ -14,11 +14,28 @@ use serde::Deserialize;
 use sqlx::PgPool;
 use tracing::warn;
 
-/// Previous cycle's (model, group_id) pairs — zeroed when they disappear.
-static PREV_GROUPS: Mutex<Option<HashSet<(String, String)>>> = Mutex::new(None);
+/// Previous cycle's model info label sets — zeroed when the model disappears.
+/// Fields: (alias, model_name, model_type, endpoint_name, endpoint_host, is_composite, lb_strategy, sanitize_responses, is_metered)
+static PREV_MODELS: Mutex<Option<HashSet<ModelLabels>>> = Mutex::new(None);
 
-/// Previous cycle's (composite, component) pairs — zeroed when they disappear.
-static PREV_COMPONENTS: Mutex<Option<HashSet<(String, String)>>> = Mutex::new(None);
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ModelLabels {
+    alias: String,
+    model_name: String,
+    model_type: String,
+    endpoint_name: String,
+    endpoint_host: String,
+    is_composite: String,
+    lb_strategy: String,
+    sanitize_responses: String,
+    is_metered: String,
+}
+
+/// Previous cycle's (model, group_id, group_name) tuples — zeroed when they disappear.
+static PREV_GROUPS: Mutex<Option<HashSet<(String, String, String)>>> = Mutex::new(None);
+
+/// Previous cycle's (composite, component, component_endpoint, sort_order, enabled) tuples.
+static PREV_COMPONENTS: Mutex<Option<HashSet<(String, String, String, String, String)>>> = Mutex::new(None);
 
 #[derive(Deserialize)]
 struct GroupInfo {
@@ -92,8 +109,9 @@ pub async fn update_cache_info_metrics(pool: &PgPool, targets: &Targets) -> Resu
     .fetch_all(pool)
     .await?;
 
-    let mut current_groups: HashSet<(String, String)> = HashSet::new();
-    let mut current_components: HashSet<(String, String)> = HashSet::new();
+    let mut current_models: HashSet<ModelLabels> = HashSet::new();
+    let mut current_groups: HashSet<(String, String, String)> = HashSet::new();
+    let mut current_components: HashSet<(String, String, String, String, String)> = HashSet::new();
 
     for row in &rows {
         let alias = &row.alias;
@@ -114,6 +132,19 @@ pub async fn update_cache_info_metrics(pool: &PgPool, targets: &Targets) -> Resu
         let sanitize = if row.sanitize_responses { "true" } else { "false" };
         let is_metered = if row.is_metered { "true" } else { "false" };
 
+        let labels = ModelLabels {
+            alias: alias.clone(),
+            model_name: model_name.clone(),
+            model_type: model_type.to_string(),
+            endpoint_name: endpoint_name.to_string(),
+            endpoint_host: endpoint_host.clone(),
+            is_composite: is_composite.to_string(),
+            lb_strategy: lb_strategy.to_string(),
+            sanitize_responses: sanitize.to_string(),
+            is_metered: is_metered.to_string(),
+        };
+        current_models.insert(labels);
+
         // Info metric — constant 1.0, labels carry the metadata
         gauge!(
             "dwctl_model_info",
@@ -121,7 +152,7 @@ pub async fn update_cache_info_metrics(pool: &PgPool, targets: &Targets) -> Resu
             "model_name" => model_name.clone(),
             "model_type" => model_type.to_string(),
             "endpoint_name" => endpoint_name.to_string(),
-            "endpoint_host" => endpoint_host,
+            "endpoint_host" => endpoint_host.clone(),
             "is_composite" => is_composite.to_string(),
             "lb_strategy" => lb_strategy.to_string(),
             "sanitize_responses" => sanitize.to_string(),
@@ -146,7 +177,7 @@ pub async fn update_cache_info_metrics(pool: &PgPool, targets: &Targets) -> Resu
             match serde_json::from_str::<Vec<GroupInfo>>(json) {
                 Ok(groups) => {
                     for g in &groups {
-                        current_groups.insert((alias.clone(), g.group_id.clone()));
+                        current_groups.insert((alias.clone(), g.group_id.clone(), g.group_name.clone()));
                         gauge!(
                             "dwctl_model_group_info",
                             "model" => alias.clone(),
@@ -165,7 +196,13 @@ pub async fn update_cache_info_metrics(pool: &PgPool, targets: &Targets) -> Resu
             match serde_json::from_str::<Vec<ComponentInfo>>(json) {
                 Ok(components) => {
                     for c in &components {
-                        current_components.insert((alias.clone(), c.component.clone()));
+                        current_components.insert((
+                            alias.clone(),
+                            c.component.clone(),
+                            c.component_endpoint.clone().unwrap_or_default(),
+                            c.sort_order.to_string(),
+                            c.enabled.to_string(),
+                        ));
                         gauge!(
                             "dwctl_model_component_weight",
                             "composite" => alias.clone(),
@@ -182,19 +219,56 @@ pub async fn update_cache_info_metrics(pool: &PgPool, targets: &Targets) -> Resu
         }
     }
 
+    // Zero gauges for models that disappeared since last cycle.
+    // Info gauge uses full label set (so metadata changes zero the old series).
+    // Single-label gauges only zero when the alias itself disappears.
+    if let Ok(mut prev) = PREV_MODELS.lock() {
+        if let Some(prev_set) = prev.as_ref() {
+            let current_aliases: HashSet<&str> = current_models.iter().map(|m| m.alias.as_str()).collect();
+
+            for m in prev_set.difference(&current_models) {
+                // Zero the old info gauge series (label set changed or model deleted)
+                gauge!(
+                    "dwctl_model_info",
+                    "model" => m.alias.clone(),
+                    "model_name" => m.model_name.clone(),
+                    "model_type" => m.model_type.clone(),
+                    "endpoint_name" => m.endpoint_name.clone(),
+                    "endpoint_host" => m.endpoint_host.clone(),
+                    "is_composite" => m.is_composite.clone(),
+                    "lb_strategy" => m.lb_strategy.clone(),
+                    "sanitize_responses" => m.sanitize_responses.clone(),
+                    "is_metered" => m.is_metered.clone(),
+                )
+                .set(0.0);
+
+                // Only zero single-label gauges if the alias is truly gone
+                // (not just a metadata change like is_metered flipping)
+                if !current_aliases.contains(m.alias.as_str()) {
+                    gauge!("dwctl_model_rate_limit_rps", "model" => m.alias.clone()).set(0.0);
+                    gauge!("dwctl_model_concurrency_limit", "model" => m.alias.clone()).set(0.0);
+                    gauge!("dwctl_model_batch_capacity", "model" => m.alias.clone()).set(0.0);
+                    gauge!("dwctl_model_throughput_rps", "model" => m.alias.clone()).set(0.0);
+                    gauge!("dwctl_model_api_key_count", "model" => m.alias.clone()).set(0.0);
+                }
+            }
+        }
+        *prev = Some(current_models);
+    }
+
     // Zero gauges for group/component pairs that disappeared since last cycle
     if let Ok(mut prev) = PREV_GROUPS.lock() {
         if let Some(prev_set) = prev.as_ref() {
-            for (model, group_id) in prev_set.difference(&current_groups) {
-                gauge!("dwctl_model_group_info", "model" => model.clone(), "group_id" => group_id.clone(), "group_name" => "").set(0.0);
+            for (model, group_id, group_name) in prev_set.difference(&current_groups) {
+                gauge!("dwctl_model_group_info", "model" => model.clone(), "group_id" => group_id.clone(), "group_name" => group_name.clone()).set(0.0);
             }
         }
         *prev = Some(current_groups);
     }
     if let Ok(mut prev) = PREV_COMPONENTS.lock() {
         if let Some(prev_set) = prev.as_ref() {
-            for (composite, component) in prev_set.difference(&current_components) {
-                gauge!("dwctl_model_component_weight", "composite" => composite.clone(), "component" => component.clone(), "component_endpoint" => "", "sort_order" => "", "enabled" => "").set(0.0);
+            for (composite, component, component_endpoint, sort_order, enabled) in prev_set.difference(&current_components) {
+                gauge!("dwctl_model_component_weight", "composite" => composite.clone(), "component" => component.clone(), "component_endpoint" => component_endpoint.clone(), "sort_order" => sort_order.clone(), "enabled" => enabled.clone()).set(0.0);
             }
         }
         *prev = Some(current_components);
@@ -539,5 +613,524 @@ mod tests {
         // API key count gauge should exist (even if 0)
         // The DashMap has the model since load_targets_from_db creates targets
         assert!(output.contains("dwctl_model_api_key_count{"), "Should emit api key count gauge");
+    }
+
+    /// Helper to find all Prometheus lines matching a metric name and a label filter.
+    /// Returns lines from the rendered output that contain both the metric name and
+    /// the filter string (e.g. a specific label value).
+    fn find_metric_lines<'a>(output: &'a str, metric: &str, filter: &str) -> Vec<&'a str> {
+        output.lines().filter(|l| l.starts_with(metric) && l.contains(filter)).collect()
+    }
+
+    #[sqlx::test]
+    async fn test_removed_group_is_zeroed(pool: sqlx::PgPool) {
+        // When a group is removed from a model, the original series (with the
+        // real group_name) should be zeroed. No phantom series with empty labels
+        // should be created.
+        let handle = ensure_recorder();
+        let test_user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+
+        // Reset global state so this test has a clean starting point
+        *super::PREV_GROUPS.lock().unwrap() = None;
+
+        // Create endpoint
+        let mut tx = pool.begin().await.unwrap();
+        let mut repo = InferenceEndpoints::new(&mut tx);
+        let endpoint = repo
+            .create(&InferenceEndpointCreateDBRequest {
+                created_by: test_user.id,
+                name: "phantom-ep".to_string(),
+                description: None,
+                url: url::Url::from_str("https://api.test.com").unwrap(),
+                api_key: None,
+                model_filter: None,
+                auth_header_name: Some("Authorization".to_string()),
+                auth_header_prefix: Some("Bearer ".to_string()),
+            })
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        // Create deployment
+        let mut tx = pool.begin().await.unwrap();
+        let mut repo = Deployments::new(&mut tx);
+        let deployment = repo
+            .create(&DeploymentCreateDBRequest {
+                created_by: test_user.id,
+                model_name: "gpt-4o".to_string(),
+                alias: "phantom-test-model".to_string(),
+                description: None,
+                model_type: None,
+                capabilities: None,
+                hosted_on: Some(endpoint.id),
+                requests_per_second: None,
+                burst_size: None,
+                capacity: None,
+                batch_capacity: None,
+                throughput: None,
+                provider_pricing: None,
+                is_composite: false,
+                lb_strategy: None,
+                fallback_enabled: None,
+                fallback_on_rate_limit: None,
+                fallback_on_status: None,
+                sanitize_responses: false,
+            })
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        // Create group and assign to deployment
+        let mut tx = pool.begin().await.unwrap();
+        let mut repo = Groups::new(&mut tx);
+        let group = repo
+            .create(&GroupCreateDBRequest {
+                created_by: test_user.id,
+                name: "PhantomGroup".to_string(),
+                description: None,
+            })
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        sqlx::query!(
+            "INSERT INTO deployment_groups (deployment_id, group_id) VALUES ($1, $2)",
+            deployment.id,
+            group.id
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Cycle 1: group is present — populates PREV_GROUPS
+        let targets = load_targets_from_db(&pool, &[]).await.unwrap();
+        super::update_cache_info_metrics(&pool, &targets).await.unwrap();
+
+        let output = handle.render();
+        let group_id_str = group.id.to_string();
+
+        // Verify the original series exists with the real group name at 1.0
+        let lines = find_metric_lines(&output, "dwctl_model_group_info", &group_id_str);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains(r#"group_name="PhantomGroup""#) && l.ends_with(" 1")),
+            "Original series should have group_name=\"PhantomGroup\" at 1.0, got: {:?}",
+            lines
+        );
+
+        // Remove the group assignment
+        sqlx::query!(
+            "DELETE FROM deployment_groups WHERE deployment_id = $1 AND group_id = $2",
+            deployment.id,
+            group.id
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Cycle 2: group is gone — zeroing should zero the ORIGINAL series
+        let targets = load_targets_from_db(&pool, &[]).await.unwrap();
+        super::update_cache_info_metrics(&pool, &targets).await.unwrap();
+
+        let output = handle.render();
+        let lines = find_metric_lines(&output, "dwctl_model_group_info", &group_id_str);
+
+        // The original series with group_name="PhantomGroup" should be zeroed
+        let original_zeroed = lines
+            .iter()
+            .any(|l| l.contains(r#"group_name="PhantomGroup""#) && l.ends_with(" 0"));
+        assert!(
+            original_zeroed,
+            "Original series {{group_name=\"PhantomGroup\"}} should be zeroed to 0. Lines: {:?}",
+            lines
+        );
+
+        // No phantom series with group_name="" should exist
+        let phantom_exists = lines.iter().any(|l| l.contains(r#"group_name="""#));
+        assert!(
+            !phantom_exists,
+            "No phantom series with group_name=\"\" should be created. Lines: {:?}",
+            lines
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_removed_component_is_zeroed(pool: sqlx::PgPool) {
+        // When a component is removed from a composite model, the original
+        // series (with real sort_order/enabled labels) should be zeroed.
+        // No phantom series with empty labels should be created.
+        let handle = ensure_recorder();
+        let test_user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+
+        // Reset global state
+        *super::PREV_COMPONENTS.lock().unwrap() = None;
+
+        // Create endpoint
+        let mut tx = pool.begin().await.unwrap();
+        let mut repo = InferenceEndpoints::new(&mut tx);
+        let endpoint = repo
+            .create(&InferenceEndpointCreateDBRequest {
+                created_by: test_user.id,
+                name: "phantom-comp-ep".to_string(),
+                description: None,
+                url: url::Url::from_str("https://api.test.com").unwrap(),
+                api_key: None,
+                model_filter: None,
+                auth_header_name: Some("Authorization".to_string()),
+                auth_header_prefix: Some("Bearer ".to_string()),
+            })
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        // Create component model
+        let mut tx = pool.begin().await.unwrap();
+        let mut repo = Deployments::new(&mut tx);
+        let component = repo
+            .create(&DeploymentCreateDBRequest {
+                created_by: test_user.id,
+                model_name: "gpt-4o".to_string(),
+                alias: "phantom-comp-child".to_string(),
+                description: None,
+                model_type: None,
+                capabilities: None,
+                hosted_on: Some(endpoint.id),
+                requests_per_second: None,
+                burst_size: None,
+                capacity: None,
+                batch_capacity: None,
+                throughput: None,
+                provider_pricing: None,
+                is_composite: false,
+                lb_strategy: None,
+                fallback_enabled: None,
+                fallback_on_rate_limit: None,
+                fallback_on_status: None,
+                sanitize_responses: false,
+            })
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        // Create composite model
+        let mut tx = pool.begin().await.unwrap();
+        let mut repo = Deployments::new(&mut tx);
+        let composite = repo
+            .create(&DeploymentCreateDBRequest {
+                created_by: test_user.id,
+                model_name: "composite".to_string(),
+                alias: "phantom-composite".to_string(),
+                description: None,
+                model_type: None,
+                capabilities: None,
+                hosted_on: None,
+                requests_per_second: None,
+                burst_size: None,
+                capacity: None,
+                batch_capacity: None,
+                throughput: None,
+                provider_pricing: None,
+                is_composite: true,
+                lb_strategy: Some(LoadBalancingStrategy::WeightedRandom),
+                fallback_enabled: None,
+                fallback_on_rate_limit: None,
+                fallback_on_status: None,
+                sanitize_responses: false,
+            })
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        // Link component with weight=70, sort_order=0, enabled=true
+        sqlx::query!(
+            "INSERT INTO deployed_model_components (composite_model_id, deployed_model_id, weight, sort_order, enabled)
+             VALUES ($1, $2, 70, 0, TRUE)",
+            composite.id,
+            component.id,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Cycle 1: component is present
+        let targets = load_targets_from_db(&pool, &[]).await.unwrap();
+        super::update_cache_info_metrics(&pool, &targets).await.unwrap();
+
+        let output = handle.render();
+        let lines = find_metric_lines(&output, "dwctl_model_component_weight", r#"composite="phantom-composite""#);
+        assert!(
+            lines.iter().any(|l| l.contains(r#"component="phantom-comp-child""#)
+                && l.contains(r#"sort_order="0""#)
+                && l.contains(r#"enabled="true""#)
+                && l.ends_with(" 70")),
+            "Original component series should have real labels at weight 70. Lines: {:?}",
+            lines
+        );
+
+        // Remove the component link
+        sqlx::query!(
+            "DELETE FROM deployed_model_components WHERE composite_model_id = $1 AND deployed_model_id = $2",
+            composite.id,
+            component.id,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Cycle 2: component is gone — should zero the original series
+        let targets = load_targets_from_db(&pool, &[]).await.unwrap();
+        super::update_cache_info_metrics(&pool, &targets).await.unwrap();
+
+        let output = handle.render();
+        let lines = find_metric_lines(&output, "dwctl_model_component_weight", r#"composite="phantom-composite""#);
+
+        // The original series with real labels should be zeroed
+        let original_zeroed = lines.iter().any(|l| {
+            l.contains(r#"component="phantom-comp-child""#)
+                && l.contains(r#"sort_order="0""#)
+                && l.contains(r#"enabled="true""#)
+                && l.ends_with(" 0")
+        });
+        assert!(
+            original_zeroed,
+            "Original component series should be zeroed to 0. Lines: {:?}",
+            lines
+        );
+
+        // No phantom series with empty sort_order/enabled labels should exist
+        let phantom_exists = lines.iter().any(|l| l.contains(r#"sort_order="""#) && l.contains(r#"enabled="""#));
+        assert!(
+            !phantom_exists,
+            "No phantom series with empty sort_order/enabled labels should be created. Lines: {:?}",
+            lines
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_deleted_model_gauges_are_zeroed(pool: sqlx::PgPool) {
+        // When a model is soft-deleted, all its gauges (info, rate limit,
+        // concurrency, etc.) should be zeroed so dashboards reflect reality.
+        let handle = ensure_recorder();
+        let test_user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+
+        // Create endpoint
+        let mut tx = pool.begin().await.unwrap();
+        let mut repo = InferenceEndpoints::new(&mut tx);
+        let endpoint = repo
+            .create(&InferenceEndpointCreateDBRequest {
+                created_by: test_user.id,
+                name: "ghost-ep".to_string(),
+                description: None,
+                url: url::Url::from_str("https://api.test.com").unwrap(),
+                api_key: None,
+                model_filter: None,
+                auth_header_name: Some("Authorization".to_string()),
+                auth_header_prefix: Some("Bearer ".to_string()),
+            })
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        // Create deployment with distinctive values
+        let mut tx = pool.begin().await.unwrap();
+        let mut repo = Deployments::new(&mut tx);
+        let deployment = repo
+            .create(&DeploymentCreateDBRequest {
+                created_by: test_user.id,
+                model_name: "gpt-4o".to_string(),
+                alias: "ghost-model".to_string(),
+                description: None,
+                model_type: None,
+                capabilities: None,
+                hosted_on: Some(endpoint.id),
+                requests_per_second: Some(42.0),
+                burst_size: None,
+                capacity: Some(99),
+                batch_capacity: None,
+                throughput: None,
+                provider_pricing: None,
+                is_composite: false,
+                lb_strategy: None,
+                fallback_enabled: None,
+                fallback_on_rate_limit: None,
+                fallback_on_status: None,
+                sanitize_responses: false,
+            })
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        // Cycle 1: model is active
+        let targets = load_targets_from_db(&pool, &[]).await.unwrap();
+        super::update_cache_info_metrics(&pool, &targets).await.unwrap();
+
+        let output = handle.render();
+
+        // Verify the model is emitting metrics
+        let info_lines = find_metric_lines(&output, "dwctl_model_info", r#"model="ghost-model""#);
+        assert!(
+            info_lines.iter().any(|l| l.ends_with(" 1")),
+            "dwctl_model_info should be 1.0 for active model"
+        );
+
+        let rps_lines = find_metric_lines(&output, "dwctl_model_rate_limit_rps", r#"model="ghost-model""#);
+        assert!(
+            rps_lines.iter().any(|l| l.ends_with(" 42")),
+            "Rate limit should be 42 for active model"
+        );
+
+        // Soft-delete the model
+        sqlx::query!("UPDATE deployed_models SET deleted = TRUE WHERE id = $1", deployment.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // Cycle 2: model is deleted — gauges should be zeroed
+        let targets = load_targets_from_db(&pool, &[]).await.unwrap();
+        super::update_cache_info_metrics(&pool, &targets).await.unwrap();
+
+        let output = handle.render();
+
+        // dwctl_model_info should be zeroed to 0
+        let info_lines = find_metric_lines(&output, "dwctl_model_info", r#"model="ghost-model""#);
+        assert!(
+            info_lines.iter().any(|l| l.ends_with(" 0")),
+            "dwctl_model_info should be 0 after model deletion. Lines: {:?}",
+            info_lines
+        );
+
+        // Rate limit gauge should be zeroed
+        let rps_lines = find_metric_lines(&output, "dwctl_model_rate_limit_rps", r#"model="ghost-model""#);
+        assert!(
+            rps_lines.iter().any(|l| l.ends_with(" 0")),
+            "Rate limit should be 0 after model deletion. Lines: {:?}",
+            rps_lines
+        );
+
+        // Concurrency limit gauge should be zeroed
+        let cap_lines = find_metric_lines(&output, "dwctl_model_concurrency_limit", r#"model="ghost-model""#);
+        assert!(
+            cap_lines.iter().any(|l| l.ends_with(" 0")),
+            "Concurrency limit should be 0 after model deletion. Lines: {:?}",
+            cap_lines
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_metadata_change_preserves_single_label_gauges(pool: sqlx::PgPool) {
+        // When a model's metadata changes (e.g., tariff added so is_metered
+        // flips), the old info gauge series should be zeroed but single-label
+        // gauges (rate_limit, concurrency, etc.) must NOT be zeroed because
+        // the model still exists.
+        let handle = ensure_recorder();
+        let test_user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+
+        // Reset global state
+        *super::PREV_MODELS.lock().unwrap() = None;
+
+        // Create endpoint
+        let mut tx = pool.begin().await.unwrap();
+        let mut repo = InferenceEndpoints::new(&mut tx);
+        let endpoint = repo
+            .create(&InferenceEndpointCreateDBRequest {
+                created_by: test_user.id,
+                name: "meta-ep".to_string(),
+                description: None,
+                url: url::Url::from_str("https://api.test.com").unwrap(),
+                api_key: None,
+                model_filter: None,
+                auth_header_name: Some("Authorization".to_string()),
+                auth_header_prefix: Some("Bearer ".to_string()),
+            })
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        // Create deployment with rate limit
+        let mut tx = pool.begin().await.unwrap();
+        let mut repo = Deployments::new(&mut tx);
+        let deployment = repo
+            .create(&DeploymentCreateDBRequest {
+                created_by: test_user.id,
+                model_name: "gpt-4o".to_string(),
+                alias: "meta-change-model".to_string(),
+                description: None,
+                model_type: None,
+                capabilities: None,
+                hosted_on: Some(endpoint.id),
+                requests_per_second: Some(77.0),
+                burst_size: None,
+                capacity: None,
+                batch_capacity: None,
+                throughput: None,
+                provider_pricing: None,
+                is_composite: false,
+                lb_strategy: None,
+                fallback_enabled: None,
+                fallback_on_rate_limit: None,
+                fallback_on_status: None,
+                sanitize_responses: false,
+            })
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        // Cycle 1: model exists, is_metered=false (no tariff)
+        let targets = load_targets_from_db(&pool, &[]).await.unwrap();
+        super::update_cache_info_metrics(&pool, &targets).await.unwrap();
+
+        let output = handle.render();
+        let info_lines = find_metric_lines(&output, "dwctl_model_info", r#"model="meta-change-model""#);
+        assert!(
+            info_lines.iter().any(|l| l.contains(r#"is_metered="false""#) && l.ends_with(" 1")),
+            "Info gauge should show is_metered=false before tariff. Lines: {:?}",
+            info_lines
+        );
+
+        // Add a tariff — flips is_metered to true
+        let mut tx = pool.begin().await.unwrap();
+        let mut repo = Tariffs::new(&mut tx);
+        repo.create(&TariffCreateDBRequest {
+            deployed_model_id: deployment.id,
+            name: "default".to_string(),
+            input_price_per_token: Decimal::new(1, 6),
+            output_price_per_token: Decimal::new(2, 6),
+            api_key_purpose: None,
+            completion_window: None,
+            valid_from: None,
+        })
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+
+        // Cycle 2: same model, but is_metered changed
+        let targets = load_targets_from_db(&pool, &[]).await.unwrap();
+        super::update_cache_info_metrics(&pool, &targets).await.unwrap();
+
+        let output = handle.render();
+
+        // New info gauge with is_metered=true should be at 1.0
+        let info_lines = find_metric_lines(&output, "dwctl_model_info", r#"model="meta-change-model""#);
+        assert!(
+            info_lines.iter().any(|l| l.contains(r#"is_metered="true""#) && l.ends_with(" 1")),
+            "New info gauge should show is_metered=true. Lines: {:?}",
+            info_lines
+        );
+
+        // Old info gauge with is_metered=false should be zeroed
+        assert!(
+            info_lines.iter().any(|l| l.contains(r#"is_metered="false""#) && l.ends_with(" 0")),
+            "Old info gauge with is_metered=false should be zeroed. Lines: {:?}",
+            info_lines
+        );
+
+        // Single-label gauges must NOT be zeroed — model still exists
+        let rps_lines = find_metric_lines(&output, "dwctl_model_rate_limit_rps", r#"model="meta-change-model""#);
+        assert!(
+            rps_lines.iter().any(|l| l.ends_with(" 77")),
+            "Rate limit should still be 77 after metadata change (not zeroed). Lines: {:?}",
+            rps_lines
+        );
     }
 }
