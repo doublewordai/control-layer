@@ -90,7 +90,7 @@ var bootstrapContent = `
       margin-top: 0.5rem;
     }
     @media (min-width: 768px) {
-      .dw-cards { grid-template-columns: repeat(3, 1fr); }
+      .dw-cards { grid-template-columns: repeat(4, 1fr); }
     }
     .dw-card {
       display: flex;
@@ -158,35 +158,7 @@ var bootstrapContent = `
       color: ${colors.muted};
       margin-top: 0.125rem;
     }
-    .dw-card--cta {
-      background: ${colors.primary};
-      border-color: ${colors.primary};
-      color: #ffffff;
-    }
-    .dw-card--cta:hover {
-      border-color: ${colors.primary};
-    }
-    .dw-card--cta .dw-card-icon {
-      background: rgba(255,255,255,0.2);
-    }
-    .dw-card--cta .dw-card-icon svg {
-      color: #ffffff;
-    }
-    .dw-card--cta .dw-card-t {
-      color: #ffffff;
-    }
-    .dw-card--cta:hover .dw-card-t {
-      color: #ffffff;
-    }
-    .dw-card--cta .dw-card-d {
-      color: rgba(255,255,255,0.8);
-    }
-    .dw-card--cta .dw-card-arrow {
-      font-size: 0.875rem;
-      font-weight: 500;
-      color: #ffffff;
-      opacity: 1;
-    }
+
   </style>
   <div class="dw-bb">
     <div class="dw-glow dw-glow--top"></div>
@@ -231,27 +203,27 @@ var bootstrapContent = `
           </div>
           <span class="dw-card-arrow">&rarr;</span>
         </a>
-        <a href="https://docs.doubleword.ai/batches/image-summarization" target="_blank" rel="noopener noreferrer" class="dw-card">
+        <a href="https://docs.doubleword.ai/batches/cli-examples" target="_blank" rel="noopener noreferrer" class="dw-card">
           <div class="dw-card-icon">
             <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2" ry="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/></svg>
           </div>
           <div>
-            <h3 class="dw-card-t">Large Scale Image Processing</h3>
-            <p class="dw-card-d">See batch inference in action</p>
+            <h3 class="dw-card-t">Looking for inspiration?</h3>
+            <p class="dw-card-d">Check out our use case examples</p>
+          </div>
+          <span class="dw-card-arrow">&rarr;</span>
+        </a>
+        <a href="https://calendly.com/meryem-pikk/30min" target="_blank" rel="noopener noreferrer" class="dw-card">
+          <div class="dw-card-icon">
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>
+          </div>
+          <div>
+            <h3 class="dw-card-t">Book a 15-minute Demo</h3>
+            <p class="dw-card-d">Talk to an engineer</p>
           </div>
           <span class="dw-card-arrow">&rarr;</span>
         </a>
       </div>
-      <a href="https://calendly.com/meryem-pikk/30min" target="_blank" rel="noopener noreferrer" class="dw-card dw-card--cta">
-        <div class="dw-card-icon">
-          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>
-        </div>
-        <div>
-          <h3 class="dw-card-t">Book a 15-minute Demo</h3>
-          <p class="dw-card-d">Get a personalized walkthrough with our solutions engineer</p>
-        </div>
-        <span class="dw-card-arrow">Schedule now &rarr;</span>
-      </a>
     </div>
   </div>
 `;
