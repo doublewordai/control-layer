@@ -19,6 +19,7 @@ import {
   useUpdateModel,
   useProbes,
   useModelComponents,
+  useDaemons,
 } from "../../../../api/control-layer";
 import { useAuthorization } from "../../../../utils";
 import {
@@ -169,6 +170,13 @@ const ModelInfo: React.FC = () => {
   const { data: components } = useModelComponents(modelId!, {
     enabled: !!model?.is_composite,
   });
+
+  // Fetch running daemon count for batch capacity context (requires System::ReadAll)
+  const { data: daemonsData } = useDaemons(
+    { status: "running" },
+    { enabled: canManageGroups },
+  );
+  const runningDaemonCount = daemonsData?.daemons.length ?? 0;
 
   const loading = modelLoading || endpointLoading;
   const error = modelError
@@ -869,7 +877,7 @@ const ModelInfo: React.FC = () => {
                           </div>
                           <div>
                             <label className="text-sm text-gray-600 mb-2 flex items-center gap-1">
-                              Maximum Batch Concurrent Requests
+                              Per-Daemon Batch Concurrency
                               <HoverCard openDelay={100} closeDelay={50}>
                                 <HoverCardTrigger asChild>
                                   <Info className="h-3 w-3 text-gray-400 hover:text-gray-600" />
@@ -879,8 +887,10 @@ const ModelInfo: React.FC = () => {
                                   sideOffset={5}
                                 >
                                   <p className="text-sm text-muted-foreground">
-                                    Maximum number of concurrent requests the
-                                    batching system can send to this model.
+                                    Maximum concurrent batch requests each
+                                    daemon can send to this model. Total
+                                    capacity scales with the number of running
+                                    daemons.
                                   </p>
                                 </HoverCardContent>
                               </HoverCard>
@@ -907,6 +917,12 @@ const ModelInfo: React.FC = () => {
                                   : "None"
                               }
                             />
+                            {runningDaemonCount > 0 && (
+                              <p className="text-xs text-gray-500 mt-1">
+                                {runningDaemonCount} {runningDaemonCount === 1 ? "daemon" : "daemons"} running
+                                {updateData.batch_capacity ? ` · ${(updateData.batch_capacity * runningDaemonCount).toLocaleString()} total capacity` : ""}
+                              </p>
+                            )}
                           </div>
                         </div>
                         {(updateData.requests_per_second ||
@@ -948,12 +964,13 @@ const ModelInfo: React.FC = () => {
                           )}
                         {updateData.batch_capacity &&
                           updateData.capacity &&
-                          updateData.batch_capacity > updateData.capacity && (
+                          runningDaemonCount > 0 &&
+                          updateData.batch_capacity * runningDaemonCount > updateData.capacity && (
                             <div className="mt-2 p-2 bg-yellow-50 border border-yellow-200 rounded-md">
                               <p className="text-xs text-yellow-700">
-                                ⚠️ Maximum Batch Concurrent Requests is higher
-                                than Maximum Concurrent Requests. Batch requests
-                                may be rate limited.
+                                ⚠️ Total batch capacity ({(updateData.batch_capacity * runningDaemonCount).toLocaleString()} = {updateData.batch_capacity.toLocaleString()} × {runningDaemonCount} {runningDaemonCount === 1 ? "daemon" : "daemons"}) exceeds
+                                the maximum concurrent requests limit ({updateData.capacity.toLocaleString()}).
+                                Batch requests may be rate limited.
                               </p>
                             </div>
                           )}
@@ -1352,7 +1369,7 @@ const ModelInfo: React.FC = () => {
                               </div>
                               <div>
                                 <p className="text-xs text-gray-500 mb-1 flex items-center gap-1">
-                                  Maximum Batch Concurrent Requests
+                                  Per-Daemon Batch Concurrency
                                   <HoverCard openDelay={100} closeDelay={50}>
                                     <HoverCardTrigger asChild>
                                       <Info className="h-3 w-3 text-gray-400 hover:text-gray-600" />
@@ -1362,17 +1379,23 @@ const ModelInfo: React.FC = () => {
                                       sideOffset={5}
                                     >
                                       <p className="text-sm text-muted-foreground">
-                                        Maximum number of concurrent requests
-                                        the batching system can send to this
-                                        model.
+                                        Maximum concurrent batch requests each
+                                        daemon can send to this model. Total
+                                        capacity scales with the number of
+                                        running daemons.
                                       </p>
                                     </HoverCardContent>
                                   </HoverCard>
                                 </p>
                                 <p className="font-medium">
                                   {model.batch_capacity
-                                    ? `${model.batch_capacity.toLocaleString()} concurrent`
+                                    ? `${model.batch_capacity.toLocaleString()} per daemon`
                                     : "No limit"}
+                                  {model.batch_capacity && runningDaemonCount > 0 && (
+                                    <span className="text-xs text-gray-500 font-normal ml-1">
+                                      · {runningDaemonCount} {runningDaemonCount === 1 ? "daemon" : "daemons"} running
+                                    </span>
+                                  )}
                                 </p>
                               </div>
                             </div>
@@ -1387,11 +1410,12 @@ const ModelInfo: React.FC = () => {
                             )}
                             {model.batch_capacity &&
                               model.capacity &&
-                              model.batch_capacity > model.capacity && (
+                              runningDaemonCount > 0 &&
+                              model.batch_capacity * runningDaemonCount > model.capacity && (
                                 <div className="mt-4 p-2 bg-yellow-50 border border-yellow-200 rounded-md">
                                   <p className="text-xs text-yellow-700">
-                                    ⚠️ Maximum Batch Concurrent Requests is
-                                    higher than Maximum Concurrent Requests.
+                                    ⚠️ Total batch capacity ({(model.batch_capacity * runningDaemonCount).toLocaleString()} = {model.batch_capacity.toLocaleString()} × {runningDaemonCount} {runningDaemonCount === 1 ? "daemon" : "daemons"}) exceeds
+                                    the maximum concurrent requests limit ({model.capacity.toLocaleString()}).
                                     Batch requests may be rate limited.
                                   </p>
                                 </div>
