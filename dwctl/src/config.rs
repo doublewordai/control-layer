@@ -168,6 +168,8 @@ pub struct Config {
     pub limits: LimitsConfig,
     /// Email configuration for password resets and notifications
     pub email: EmailConfig,
+    /// Onwards proxy configuration
+    pub onwards: OnwardsConfig,
 }
 
 /// Individual pool configuration with all SQLx parameters.
@@ -798,6 +800,19 @@ impl Default for RequestLimitsConfig {
     }
 }
 
+/// Onwards AI proxy configuration.
+///
+/// Controls behavior of the onwards routing layer used for AI proxy requests.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+#[derive(Default)]
+pub struct OnwardsConfig {
+    /// Enable strict mode with schema validation and typed handlers.
+    /// When false (default), all requests are passed through transparently.
+    /// When true, only known OpenAI API paths are accepted and validated.
+    pub strict_mode: bool,
+}
+
 /// File limits configuration.
 ///
 /// Controls file size limits, request count limits, and upload concurrency
@@ -855,6 +870,9 @@ pub struct BatchConfig {
     /// These define the maximum time from batch creation to completion.
     /// Default: vec!["24h".to_string()]
     pub allowed_completion_windows: Vec<String>,
+    /// Allowed OpenAI-compatible URL paths for batch requests.
+    /// These paths are validated during file upload and batch creation.
+    pub allowed_url_paths: Vec<String>,
     /// Files configuration for batch file uploads/downloads
     pub files: FilesConfig,
     /// Default throughput (requests/second) for models without explicit throughput configured.
@@ -894,6 +912,11 @@ impl Default for BatchConfig {
         Self {
             enabled: true,
             allowed_completion_windows: vec!["24h".to_string()],
+            allowed_url_paths: vec![
+                "/v1/chat/completions".to_string(),
+                "/v1/embeddings".to_string(),
+                "/v1/responses".to_string(),
+            ],
             files: FilesConfig::default(),
             default_throughput: default_batch_throughput(),
         }
@@ -1327,6 +1350,7 @@ impl Default for Config {
             sample_files: SampleFilesConfig::default(),
             limits: LimitsConfig::default(),
             email: EmailConfig::default(),
+            onwards: OnwardsConfig::default(),
         }
     }
 }
@@ -1599,6 +1623,13 @@ impl Config {
 
         // Validate batches API-specific configuration (only if batches API is enabled)
         if self.batches.enabled {
+            if self.batches.allowed_url_paths.is_empty() {
+                return Err(Error::Internal {
+                    operation: "Config validation: batches.allowed_url_paths cannot be empty. Add at least one supported URL path."
+                        .to_string(),
+                });
+            }
+
             // upload_buffer_size is only used during file uploads (batches API specific)
             if self.batches.files.upload_buffer_size == 0 {
                 return Err(Error::Internal {

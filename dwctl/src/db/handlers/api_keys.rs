@@ -1867,6 +1867,7 @@ mod tests {
             sample_files: Default::default(),
             limits: Default::default(),
             email: Default::default(),
+            onwards: Default::default(),
         };
         crate::seed_database(&config.model_sources, &pool).await.unwrap();
 
