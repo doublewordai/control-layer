@@ -706,7 +706,9 @@ fn convert_composite_to_target_spec(
             // Convert i32 status codes to u16 for onwards
             on_status: composite.fallback_on_status.iter().map(|&s| s as u16).collect(),
             with_replacement: composite.fallback_with_replacement,
-            max_attempts: composite.fallback_max_attempts.map(|n| n as usize),
+            max_attempts: composite
+                .fallback_max_attempts
+                .and_then(|n| usize::try_from(n).ok().filter(|&v| v >= 1)),
         })
     } else {
         None

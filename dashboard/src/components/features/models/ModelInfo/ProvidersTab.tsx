@@ -823,7 +823,14 @@ const EditRoutingModal: React.FC<{
                         value={maxAttempts ?? ""}
                         onChange={(e) => {
                           const val = e.target.value;
-                          setMaxAttempts(val ? parseInt(val, 10) : null);
+                          if (val === "") {
+                            setMaxAttempts(null);
+                          } else {
+                            const num = Number(val);
+                            if (Number.isFinite(num) && num >= 1) {
+                              setMaxAttempts(Math.floor(num));
+                            }
+                          }
                         }}
                         placeholder="Default"
                         className="w-24"

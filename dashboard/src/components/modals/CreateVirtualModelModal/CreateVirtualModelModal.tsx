@@ -315,7 +315,7 @@ export const CreateVirtualModelModal: React.FC<CreateVirtualModelModalProps> = (
               </p>
             </div>
 
-            {formData.lb_strategy === "weighted_random" && (
+            {formData.lb_strategy === "weighted_random" && formData.fallback_enabled && (
               <>
                 <div className="flex items-center space-x-2">
                   <Checkbox
@@ -346,10 +346,14 @@ export const CreateVirtualModelModal: React.FC<CreateVirtualModelModalProps> = (
                     value={formData.fallback_max_attempts ?? ""}
                     onChange={(e) => {
                       const val = e.target.value;
-                      setFormData({
-                        ...formData,
-                        fallback_max_attempts: val ? parseInt(val, 10) : null,
-                      });
+                      if (val === "") {
+                        setFormData({ ...formData, fallback_max_attempts: null });
+                      } else {
+                        const num = Number(val);
+                        if (Number.isFinite(num) && num >= 1) {
+                          setFormData({ ...formData, fallback_max_attempts: Math.floor(num) });
+                        }
+                      }
                     }}
                     placeholder="Default: number of providers"
                     disabled={
