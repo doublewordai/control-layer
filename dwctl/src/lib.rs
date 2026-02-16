@@ -1993,9 +1993,23 @@ impl Application {
         )
         .await?;
 
-        // Build onwards router from targets with response sanitization enabled
-        let onwards_app_state =
-            onwards::AppState::new(bg_services.onwards_targets.clone()).with_response_transform(onwards::create_openai_sanitizer());
+        // Enforce `stream_options.include_usage` for streaming chat completions.
+        //
+        // For streaming requests, upstream providers only report token usage in the final
+        // SSE chunk when `stream_options: { include_usage: true }` is set. Without it,
+        // the response contains no usage data and the request logs record 0 tokens — meaning
+        // the request can't be billed. The dashboard sets this automatically, but direct API
+        // callers may not.
+        //
+        // This applies to /chat/completions and the legacy /completions endpoint (both
+        // support `stream_options`). The Responses API (/responses) always includes usage
+        // in its response object regardless of streaming, so no transform is needed there.
+        // Embeddings don't support streaming.
+        let body_transform: onwards::BodyTransformFn = Arc::new(request_logging::stream_usage::stream_usage_transform);
+
+        // Build onwards router from targets with body transform and response sanitization
+        let onwards_app_state = onwards::AppState::with_transform(bg_services.onwards_targets.clone(), body_transform)
+            .with_response_transform(onwards::create_openai_sanitizer());
         let onwards_router = if bg_services.onwards_targets.strict_mode {
             tracing::info!("Strict mode enabled - using typed request validation");
             onwards::strict::build_strict_router(onwards_app_state)
