@@ -1335,22 +1335,22 @@ pub async fn build_router(
                     && let Ok(tp) = traceparent.to_str()
                 {
                     let parts: Vec<&str> = tp.split('-').collect();
-                    if parts.len() == 4 {
-                        if let (Ok(trace_id), Ok(span_id)) = (
+                    if parts.len() == 4
+                        && let (Ok(trace_id), Ok(span_id)) = (
                             opentelemetry::trace::TraceId::from_hex(parts[1]),
                             opentelemetry::trace::SpanId::from_hex(parts[2]),
-                        ) {
-                            let flags = u8::from_str_radix(parts[3], 16).unwrap_or(1);
-                            let parent_ctx = opentelemetry::trace::SpanContext::new(
-                                trace_id,
-                                span_id,
-                                opentelemetry::trace::TraceFlags::new(flags),
-                                true, // remote: this span context came from another process
-                                opentelemetry::trace::TraceState::default(),
-                            );
-                            let parent = opentelemetry::Context::new().with_remote_span_context(parent_ctx);
-                            let _ = span.set_parent(parent);
-                        }
+                        )
+                    {
+                        let flags = u8::from_str_radix(parts[3], 16).unwrap_or(1);
+                        let parent_ctx = opentelemetry::trace::SpanContext::new(
+                            trace_id,
+                            span_id,
+                            opentelemetry::trace::TraceFlags::new(flags),
+                            true, // remote: this span context came from another process
+                            opentelemetry::trace::TraceState::default(),
+                        );
+                        let parent = opentelemetry::Context::new().with_remote_span_context(parent_ctx);
+                        let _ = span.set_parent(parent);
                     }
                 }
 
