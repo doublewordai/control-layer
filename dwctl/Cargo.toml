@@ -52,7 +52,7 @@ tower-http = { version = "0.6", features = ["cors", "fs", "trace"] }
 async-trait = "0.1"
 url = { version = "2.4", features = ["serde"] }
 clap = { version = "4.4", features = ["derive", "env"] }
-reqwest = { version = "0.12", default-features = false, features = [
+reqwest = { version = "0.13", default-features = false, features = [
   "json",
   "rustls-tls-webpki-roots-no-provider",
   "http2",
@@ -68,13 +68,13 @@ utoipa = { version = "5.0", features = [
 ] }
 utoipa-scalar = { version = "0.3", features = ["axum"] }
 figment = { version = "0.10", features = ["yaml", "env", "test"] }
-rand = "0.8"
+rand = "0.10"
 # Authentication
 jsonwebtoken = "9.0"
 argon2 = "0.5"
 base64 = "0.22"
 bytes = "1.5"
-onwards = "0.12.0"
+onwards = "0.13.0"
 thiserror = "2.0.14"
 axum-prometheus = "0.10"
 # Metrics facade and exporter (same versions as axum-prometheus uses)
@@ -82,7 +82,7 @@ metrics = "0.24"
 metrics-exporter-prometheus = "0.18"
 outlet = "0.5.2"
 outlet-postgres = "0.4.6"
-async-openai = { version = "0.29.2", default-features = false }
+async-openai = { version = "0.32.0", default-features = false }
 brotli = "8.0"
 lettre = { version = "0.11", features = [
   "smtp-transport",
@@ -128,7 +128,7 @@ async-stripe-billing = { version = "1.0.0-rc.0", features = [
 sqlx-pool-router = "0.2.0"
 minijinja = "2.15.1"
 multer = "3.1.0"
-ctor = "0.4"
+ctor = "0.6"
 hmac = "0.12.1"
 sha2 = "0.10.9"
 
