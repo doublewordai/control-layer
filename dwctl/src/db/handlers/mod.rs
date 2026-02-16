@@ -67,6 +67,7 @@ pub mod password_reset_tokens;
 pub mod repository;
 pub mod tariffs;
 pub mod users;
+pub mod webhooks;
 
 pub use credits::Credits;
 pub use deployments::Deployments;
@@ -76,3 +77,4 @@ pub use password_reset_tokens::PasswordResetTokens;
 pub use repository::Repository;
 pub use tariffs::Tariffs;
 pub use users::Users;
+pub use webhooks::Webhooks;

@@ -462,6 +462,78 @@ export const handlers = [
     return HttpResponse.json(null, { status: 204 });
   }),
 
+  // Webhooks under users
+  http.get("/admin/api/v1/users/:userId/webhooks", () => {
+    return HttpResponse.json([]);
+  }),
+
+  http.post("/admin/api/v1/users/:userId/webhooks", async ({ request }) => {
+    const body = (await request.json()) as {
+      url: string;
+      event_types?: string[];
+      description?: string;
+    };
+    const now = new Date().toISOString();
+    return HttpResponse.json(
+      {
+        id: `wh-${Date.now()}`,
+        user_id: "550e8400-e29b-41d4-a716-446655440000",
+        url: body.url,
+        enabled: true,
+        event_types: body.event_types || null,
+        description: body.description || null,
+        created_at: now,
+        updated_at: now,
+        disabled_at: null,
+        secret: `whsec_${Math.random().toString(36).substring(2, 34)}`,
+      },
+      { status: 201 },
+    );
+  }),
+
+  http.patch(
+    "/admin/api/v1/users/:userId/webhooks/:webhookId",
+    async ({ params, request }) => {
+      const body = (await request.json()) as Record<string, unknown>;
+      return HttpResponse.json({
+        id: params.webhookId,
+        user_id: "550e8400-e29b-41d4-a716-446655440000",
+        url: (body.url as string) || "https://example.com/webhook",
+        enabled: body.enabled !== undefined ? body.enabled : true,
+        event_types: body.event_types !== undefined ? body.event_types : null,
+        description: body.description !== undefined ? body.description : null,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+        disabled_at: null,
+      });
+    },
+  ),
+
+  http.delete(
+    "/admin/api/v1/users/:userId/webhooks/:webhookId",
+    () => {
+      return HttpResponse.json(null, { status: 204 });
+    },
+  ),
+
+  http.post(
+    "/admin/api/v1/users/:userId/webhooks/:webhookId/rotate-secret",
+    () => {
+      return HttpResponse.json({
+        id: "wh-mock",
+        user_id: "550e8400-e29b-41d4-a716-446655440000",
+        url: "https://example.com/webhook",
+        enabled: true,
+        event_types: null,
+        description: null,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+        disabled_at: null,
+        secret: `whsec_${Math.random().toString(36).substring(2, 34)}`,
+      });
+    },
+  ),
+
   // Models API
   http.get("/admin/api/v1/models", ({ request }) => {
     const url = new URL(request.url);

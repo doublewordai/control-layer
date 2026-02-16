@@ -1189,3 +1189,35 @@ export interface DaemonsListResponse {
 export interface DaemonsQuery {
   status?: DaemonStatus;
 }
+
+// ===== WEBHOOK TYPES =====
+
+export interface Webhook {
+  id: string;
+  user_id: string;
+  url: string;
+  enabled: boolean;
+  event_types?: string[] | null;
+  description?: string | null;
+  created_at: string;
+  updated_at: string;
+  disabled_at?: string | null;
+}
+
+export interface WebhookWithSecret extends Webhook {
+  secret: string;
+}
+
+export interface WebhookCreateRequest {
+  url: string;
+  event_types?: string[];
+  description?: string;
+}
+
+export interface WebhookUpdateRequest {
+  url?: string;
+  enabled?: boolean;
+  event_types?: string[] | null;
+  description?: string | null;
+}
+
