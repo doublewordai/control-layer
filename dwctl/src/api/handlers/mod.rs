@@ -48,3 +48,4 @@ pub mod sla_capacity;
 pub mod static_assets;
 pub mod transactions;
 pub mod users;
+pub mod webhooks;

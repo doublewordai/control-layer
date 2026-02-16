@@ -1,5 +1,50 @@
 # Changelog
 
+## [7.3.1](https://github.com/doublewordai/control-layer/compare/v7.3.0...v7.3.1) (2026-02-16)
+
+
+### Bug Fixes
+
+* **batch:** support /v1/responses via configured allowlist ([#667](https://github.com/doublewordai/control-layer/issues/667)) ([233c95d](https://github.com/doublewordai/control-layer/commit/233c95dafa69b147e683f2dbe2d31d1a6bb30d40))
+* cancel shutdown token before axum graceful shutdown ([#699](https://github.com/doublewordai/control-layer/issues/699)) ([d9f56e7](https://github.com/doublewordai/control-layer/commit/d9f56e73e3e731c0598814057ff1cd0f5b4180f2))
+
+## [7.3.0](https://github.com/doublewordai/control-layer/compare/v7.2.0...v7.3.0) (2026-02-13)
+
+
+### Features
+
+* New bootstrap content ([#696](https://github.com/doublewordai/control-layer/issues/696)) ([fea21b0](https://github.com/doublewordai/control-layer/commit/fea21b00a20106d4b9573c53ab6ad48c774e399d))
+
+
+### Bug Fixes
+
+* filter stale daemons from running count in model info ([#697](https://github.com/doublewordai/control-layer/issues/697)) ([6adde1c](https://github.com/doublewordai/control-layer/commit/6adde1cb578665955ca88b6ac3c421ff44e64410))
+
+## [7.2.0](https://github.com/doublewordai/control-layer/compare/v7.1.0...v7.2.0) (2026-02-13)
+
+
+### Features
+
+* **dashboard:** show per-daemon batch concurrency in model info ([#694](https://github.com/doublewordai/control-layer/issues/694)) ([672901e](https://github.com/doublewordai/control-layer/commit/672901e14a0a125eb6e904a35149e27ef078fb75))
+
+
+### Bug Fixes
+
+* bump fusillade to 3.5.1 ([#692](https://github.com/doublewordai/control-layer/issues/692)) ([35ef5f8](https://github.com/doublewordai/control-layer/commit/35ef5f86d11230654961513e0ae494e621c4082b))
+
+## [7.1.0](https://github.com/doublewordai/control-layer/compare/v7.0.1...v7.1.0) (2026-02-13)
+
+
+### Features
+
+* add Prometheus info/gauge metrics for onwards cache state ([#686](https://github.com/doublewordai/control-layer/issues/686)) ([cf9e5ea](https://github.com/doublewordai/control-layer/commit/cf9e5eac2de82f3a498b688f685e641de65afff6))
+
+
+### Bug Fixes
+
+* add purge config to daemon config structs ([#690](https://github.com/doublewordai/control-layer/issues/690)) ([4ec8c38](https://github.com/doublewordai/control-layer/commit/4ec8c380351bdc8d573e7cad81d5576bc8bfab87))
+* stream batch results and file content to prevent OOM ([#662](https://github.com/doublewordai/control-layer/issues/662)) ([765f951](https://github.com/doublewordai/control-layer/commit/765f9511444961357e942427d2a98b3b74caaac5))
+
 ## [7.0.1](https://github.com/doublewordai/control-layer/compare/v7.0.0...v7.0.1) (2026-02-12)
 
 

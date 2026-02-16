@@ -18,9 +18,11 @@ use crate::errors::{Error, Result};
 use crate::types::{Operation, Resource};
 use axum::{
     Json,
+    body::Body,
     extract::{Path, Query, State},
     http::StatusCode,
 };
+use bytes::Bytes;
 use fusillade::Storage;
 use futures::StreamExt;
 use std::collections::HashMap;
@@ -189,8 +191,8 @@ pub async fn create_batch<P: PoolProvider>(
     }
 
     // Validate endpoint
-    let supported_endpoints = ["/v1/chat/completions", "/v1/completions", "/v1/embeddings", "/v1/moderations"];
-    if !supported_endpoints.contains(&req.endpoint.as_str()) {
+    let supported_endpoints = &state.config.batches.allowed_url_paths;
+    if !supported_endpoints.iter().any(|endpoint| endpoint == &req.endpoint) {
         return Err(Error::BadRequest {
             message: format!(
                 "Unsupported endpoint '{}'. Supported: {}",
@@ -519,73 +521,115 @@ pub async fn get_batch_results<P: PoolProvider>(
         }
     }
 
+    // Check if batch is still processing (more results may arrive).
+    // The batch object already contains computed request counts from the LATERAL join,
+    // so no separate get_batch_status call is needed.
+    let still_processing = batch.pending_requests > 0 || batch.in_progress_requests > 0;
+
     // Stream the batch results as JSONL
     // Hide retriable errors before SLA expiry
-    let offset = query.pagination.skip.unwrap_or(0) as usize;
+    let offset = query.pagination.skip() as usize;
     let search = query.search.clone();
     let status = query.status.clone();
-    let results_stream = state
-        .request_manager
-        .get_batch_results_stream(fusillade::BatchId(batch_id), offset, search, status, true);
+    let requested_limit = query.pagination.limit.map(|_| query.pagination.limit() as usize);
 
-    // Apply limit if specified, fetching one extra to detect if there are more results
-    let requested_limit = query.pagination.limit.map(|l| l as usize);
-    let fetch_limit = requested_limit.map(|l| l + 1);
+    if let Some(limit) = requested_limit {
+        // Pagination case: buffer only N+1 items to check for more pages
+        let results_stream = state
+            .request_manager
+            .get_batch_results_stream(fusillade::BatchId(batch_id), offset, search, status, true);
 
-    let results_stream: Pin<Box<dyn futures::Stream<Item = fusillade::Result<fusillade::batch::BatchResultItem>> + Send>> =
-        if let Some(limit) = fetch_limit {
-            Box::pin(results_stream.take(limit))
+        let mut buffer: Vec<_> = results_stream.take(limit + 1).collect().await;
+        let has_more_pages = buffer.len() > limit;
+        buffer.truncate(limit);
+
+        let line_count = buffer.len();
+        let last_line = offset + line_count;
+        let has_more = has_more_pages || still_processing;
+
+        // Serialize buffered items
+        let mut jsonl_lines = Vec::new();
+        for result in buffer {
+            let json_line = result
+                .and_then(|item| {
+                    serde_json::to_string(&item)
+                        .map(|json| format!("{}\n", json))
+                        .map_err(|e| fusillade::FusilladeError::Other(anyhow::anyhow!("JSON serialization failed: {}", e)))
+                })
+                .map_err(|e| Error::Internal {
+                    operation: format!("serialize batch result: {}", e),
+                })?;
+            jsonl_lines.push(json_line);
+        }
+
+        let jsonl_content = jsonl_lines.join("");
+
+        let mut response = axum::response::Response::new(Body::from(jsonl_content));
+        response
+            .headers_mut()
+            .insert("content-type", "application/x-ndjson".parse().unwrap());
+        response.headers_mut().insert("X-Incomplete", has_more.to_string().parse().unwrap());
+        response.headers_mut().insert("X-Last-Line", last_line.to_string().parse().unwrap());
+        *response.status_mut() = StatusCode::OK;
+
+        Ok(response)
+    } else {
+        // Unlimited case: true streaming to avoid OOM on large result sets
+        //
+        // Derive the expected count from batch status so we can set X-Last-Line
+        // before streaming. When a search filter is active the count is unknown
+        // without an extra query, so we skip X-Last-Line in that case.
+        let expected_count = if search.is_none() {
+            let count = match status.as_deref() {
+                Some("completed") => batch.completed_requests,
+                Some("failed") => batch.failed_requests,
+                Some("pending") => batch.pending_requests,
+                Some("in_progress") => batch.in_progress_requests,
+                _ => batch.total_requests,
+            };
+            Some((count as usize).saturating_sub(offset))
         } else {
-            Box::pin(results_stream)
+            None
         };
 
-    // Collect items to determine if we need to truncate and set headers
-    let items: Vec<_> = results_stream.collect().await;
+        let results_stream = state
+            .request_manager
+            .get_batch_results_stream(fusillade::BatchId(batch_id), offset, search, status, true);
 
-    // Check if there's more data available (more pages to paginate through)
-    // The result set is fixed (one entry per input template), we're just waiting for status changes
-    let has_more = if let Some(req_limit) = requested_limit {
-        items.len() > req_limit
-    } else {
-        false
-    };
+        // Limit stream to expected count so X-Last-Line is accurate
+        let results_stream: Pin<Box<dyn futures::Stream<Item = fusillade::Result<fusillade::batch::BatchResultItem>> + Send>> =
+            if let Some(count) = expected_count {
+                Box::pin(results_stream.take(count))
+            } else {
+                Box::pin(results_stream)
+            };
 
-    // Truncate to requested limit if we fetched extra
-    let items_to_return = if let Some(req_limit) = requested_limit {
-        items.into_iter().take(req_limit).collect::<Vec<_>>()
-    } else {
-        items
-    };
+        let body_stream = results_stream.map(|result| {
+            result
+                .and_then(|item| {
+                    serde_json::to_string(&item)
+                        .map(|json| Bytes::from(format!("{}\n", json)))
+                        .map_err(|e| fusillade::FusilladeError::Other(anyhow::anyhow!("JSON serialization failed: {}", e)))
+                })
+                .map_err(|e| std::io::Error::other(e.to_string()))
+        });
 
-    let line_count = items_to_return.len();
-    let last_line = offset + line_count;
+        let body = Body::from_stream(body_stream);
+        let mut response = axum::response::Response::new(body);
+        response
+            .headers_mut()
+            .insert("content-type", "application/x-ndjson".parse().unwrap());
+        response
+            .headers_mut()
+            .insert("X-Incomplete", still_processing.to_string().parse().unwrap());
+        if let Some(count) = expected_count {
+            let last_line = offset + count;
+            response.headers_mut().insert("X-Last-Line", last_line.to_string().parse().unwrap());
+        }
+        *response.status_mut() = StatusCode::OK;
 
-    // Convert items to JSONL
-    let mut jsonl_lines = Vec::new();
-    for result in items_to_return {
-        let json_line = result
-            .and_then(|item| {
-                serde_json::to_string(&item)
-                    .map(|json| format!("{}\n", json))
-                    .map_err(|e| fusillade::FusilladeError::Other(anyhow::anyhow!("JSON serialization failed: {}", e)))
-            })
-            .map_err(|e| Error::Internal {
-                operation: format!("serialize batch result: {}", e),
-            })?;
-        jsonl_lines.push(json_line);
+        Ok(response)
     }
-
-    let jsonl_content = jsonl_lines.join("");
-
-    let mut response = axum::response::Response::new(axum::body::Body::from(jsonl_content));
-    response
-        .headers_mut()
-        .insert("content-type", "application/x-ndjson".parse().unwrap());
-    response.headers_mut().insert("X-Incomplete", has_more.to_string().parse().unwrap());
-    response.headers_mut().insert("X-Last-Line", last_line.to_string().parse().unwrap());
-    *response.status_mut() = StatusCode::OK;
-
-    Ok(response)
 }
 
 #[utoipa::path(
@@ -1243,6 +1287,51 @@ mod tests {
 
     #[sqlx::test]
     #[test_log::test]
+    async fn test_create_batch_with_responses_endpoint(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        // Create a deployment and add to group so user has access to the model
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        // Upload a /v1/responses batch file first
+        let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/v1/responses","body":{"model":"gpt-4","input":"Hello"}}"#;
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test-batch.jsonl");
+        let multipart = axum_test::multipart::MultipartForm::new()
+            .add_part("file", file_part)
+            .add_part("purpose", axum_test::multipart::Part::text("batch"));
+        let upload_resp = app
+            .post("/ai/v1/files")
+            .multipart(multipart)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        upload_resp.assert_status(StatusCode::CREATED);
+        let file: serde_json::Value = upload_resp.json();
+        let file_id = file["id"].as_str().unwrap();
+
+        // Create batch with /v1/responses endpoint
+        let create_req = CreateBatchRequest {
+            input_file_id: file_id.to_string(),
+            endpoint: "/v1/responses".to_string(),
+            completion_window: "24h".to_string(),
+            metadata: None,
+        };
+
+        let resp = app
+            .post("/ai/v1/batches")
+            .json(&create_req)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        resp.assert_status(StatusCode::CREATED);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
     async fn test_sla_to_expiry_timestamp_24h(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
@@ -1624,5 +1713,282 @@ mod tests {
         // Note: We can't easily verify the exact failed count since we didn't actually
         // create failed requests in the DB (just set the errors field). But we verified
         // it was hidden before, so the logic is working.
+    }
+
+    /// Regression test for streaming batch results.
+    ///
+    /// Previously, get_batch_results collected ALL results into memory before
+    /// sending the response, causing OOM kills on large result sets. This test
+    /// verifies that:
+    /// 1. Unlimited downloads (no limit param) return all results correctly
+    /// 2. Paginated downloads (with limit) return correct subset and headers
+    /// 3. X-Incomplete reflects batch processing status
+    /// 4. X-Last-Line is set correctly
+    /// 5. Unlimited responses use streaming (no content-length header)
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_batch_results_streaming(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        let deployment = create_test_deployment(&pool, user.id, "test-model-endpoint", "test-model").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        // Create file, templates, batch, and completed requests directly in the DB
+        let file_id = Uuid::new_v4();
+        let batch_id = Uuid::new_v4();
+        let num_requests = 50;
+
+        sqlx::query(
+            "INSERT INTO fusillade.files (id, name, status, created_at, updated_at) VALUES ($1, 'test.jsonl', 'processed', NOW(), NOW())",
+        )
+        .bind(file_id)
+        .execute(&pool)
+        .await
+        .expect("Failed to create file");
+
+        sqlx::query(
+            "INSERT INTO fusillade.batches (id, created_by, file_id, endpoint, completion_window, expires_at, created_at, total_requests) VALUES ($1, $2, $3, '/v1/chat/completions', '24h', NOW() + interval '24 hours', NOW(), $4)",
+        )
+        .bind(batch_id)
+        .bind(user.id.to_string())
+        .bind(file_id)
+        .bind(num_requests as i32)
+        .execute(&pool)
+        .await
+        .expect("Failed to create batch");
+
+        for i in 0..num_requests {
+            let template_id = Uuid::new_v4();
+            let request_id = Uuid::new_v4();
+            let custom_id = format!("req-{}", i);
+            let body = serde_json::json!({"model": "test-model", "messages": [{"role": "user", "content": format!("Test {}", i)}]});
+            let response_body = serde_json::json!({
+                "id": format!("chatcmpl-{}", i),
+                "choices": [{"message": {"content": format!("Response {}", i)}}]
+            });
+
+            sqlx::query(
+                "INSERT INTO fusillade.request_templates (id, file_id, model, api_key, endpoint, path, body, custom_id, method) VALUES ($1, $2, 'test-model', 'test-key', 'http://test', '/v1/chat/completions', $3, $4, 'POST')",
+            )
+            .bind(template_id)
+            .bind(file_id)
+            .bind(serde_json::to_string(&body).unwrap())
+            .bind(&custom_id)
+            .execute(&pool)
+            .await
+            .expect("Failed to create template");
+
+            sqlx::query(
+                "INSERT INTO fusillade.requests (id, batch_id, template_id, model, state, response_status, response_body, created_at, completed_at) VALUES ($1, $2, $3, 'test-model', 'completed', 200, $4, NOW(), NOW())",
+            )
+            .bind(request_id)
+            .bind(batch_id)
+            .bind(template_id)
+            .bind(serde_json::to_string(&response_body).unwrap())
+            .execute(&pool)
+            .await
+            .expect("Failed to create completed request");
+        }
+
+        let auth = add_auth_headers(&user);
+
+        // Test 1: Unlimited download (streaming path)
+        let response = app
+            .get(&format!("/ai/v1/batches/{}/results", batch_id))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+
+        response.assert_status(StatusCode::OK);
+        response.assert_header("content-type", "application/x-ndjson");
+        response.assert_header("X-Incomplete", "false");
+        response.assert_header("X-Last-Line", &num_requests.to_string());
+        // Streaming responses must not have content-length (regression guard against
+        // collecting the entire result set into memory before sending)
+        assert!(
+            response.headers().get("content-length").is_none(),
+            "Unlimited download should be streamed without content-length"
+        );
+
+        let body = response.text();
+        let lines: Vec<&str> = body.trim().lines().collect();
+        assert_eq!(lines.len(), num_requests, "Should return all {} results", num_requests);
+
+        // Verify each line is valid JSON with expected fields
+        for line in &lines {
+            let item: serde_json::Value = serde_json::from_str(line).expect("Each line should be valid JSON");
+            assert!(item.get("custom_id").is_some(), "Each result should have custom_id");
+            assert!(item.get("status").is_some(), "Each result should have status");
+        }
+
+        // Test 2: Paginated download (buffered path)
+        let page_size = 10;
+        let response = app
+            .get(&format!("/ai/v1/batches/{}/results?limit={}", batch_id, page_size))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+
+        response.assert_status(StatusCode::OK);
+        response.assert_header("X-Incomplete", "true"); // more pages exist
+        response.assert_header("X-Last-Line", &page_size.to_string());
+
+        let body = response.text();
+        let lines: Vec<&str> = body.trim().lines().collect();
+        assert_eq!(lines.len(), page_size, "Should return exactly {} results", page_size);
+
+        // Test 3: Last page should have X-Incomplete=false
+        let response = app
+            .get(&format!(
+                "/ai/v1/batches/{}/results?limit={}&skip={}",
+                batch_id,
+                page_size,
+                num_requests - page_size
+            ))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+
+        response.assert_status(StatusCode::OK);
+        response.assert_header("X-Incomplete", "false"); // no more pages, batch complete
+        response.assert_header("X-Last-Line", &num_requests.to_string());
+    }
+
+    /// Test that X-Incomplete reflects batch processing status, not just pagination.
+    ///
+    /// When a batch still has pending/in-progress requests, X-Incomplete should be
+    /// true even on the last page of currently available results (or unlimited download).
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_batch_results_x_incomplete_while_still_processing(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        let deployment = create_test_deployment(&pool, user.id, "test-model-endpoint", "test-model").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        let file_id = Uuid::new_v4();
+        let batch_id = Uuid::new_v4();
+        let num_completed = 5;
+        let num_pending = 3;
+        let total = num_completed + num_pending;
+
+        sqlx::query(
+            "INSERT INTO fusillade.files (id, name, status, created_at, updated_at) VALUES ($1, 'test.jsonl', 'processed', NOW(), NOW())",
+        )
+        .bind(file_id)
+        .execute(&pool)
+        .await
+        .expect("Failed to create file");
+
+        sqlx::query(
+            "INSERT INTO fusillade.batches (id, created_by, file_id, endpoint, completion_window, expires_at, created_at, total_requests) VALUES ($1, $2, $3, '/v1/chat/completions', '24h', NOW() + interval '24 hours', NOW(), $4)",
+        )
+        .bind(batch_id)
+        .bind(user.id.to_string())
+        .bind(file_id)
+        .bind(total as i32)
+        .execute(&pool)
+        .await
+        .expect("Failed to create batch");
+
+        // Create completed requests
+        for i in 0..num_completed {
+            let template_id = Uuid::new_v4();
+            let request_id = Uuid::new_v4();
+            let custom_id = format!("req-{}", i);
+            let body = serde_json::json!({"model": "test-model", "messages": [{"role": "user", "content": format!("Test {}", i)}]});
+            let response_body = serde_json::json!({
+                "id": format!("chatcmpl-{}", i),
+                "choices": [{"message": {"content": format!("Response {}", i)}}]
+            });
+
+            sqlx::query(
+                "INSERT INTO fusillade.request_templates (id, file_id, model, api_key, endpoint, path, body, custom_id, method) VALUES ($1, $2, 'test-model', 'test-key', 'http://test', '/v1/chat/completions', $3, $4, 'POST')",
+            )
+            .bind(template_id)
+            .bind(file_id)
+            .bind(serde_json::to_string(&body).unwrap())
+            .bind(&custom_id)
+            .execute(&pool)
+            .await
+            .expect("Failed to create template");
+
+            sqlx::query(
+                "INSERT INTO fusillade.requests (id, batch_id, template_id, model, state, response_status, response_body, created_at, completed_at) VALUES ($1, $2, $3, 'test-model', 'completed', 200, $4, NOW(), NOW())",
+            )
+            .bind(request_id)
+            .bind(batch_id)
+            .bind(template_id)
+            .bind(serde_json::to_string(&response_body).unwrap())
+            .execute(&pool)
+            .await
+            .expect("Failed to create completed request");
+        }
+
+        // Create pending requests (no response yet)
+        for i in num_completed..total {
+            let template_id = Uuid::new_v4();
+            let request_id = Uuid::new_v4();
+            let custom_id = format!("req-{}", i);
+            let body = serde_json::json!({"model": "test-model", "messages": [{"role": "user", "content": format!("Test {}", i)}]});
+
+            sqlx::query(
+                "INSERT INTO fusillade.request_templates (id, file_id, model, api_key, endpoint, path, body, custom_id, method) VALUES ($1, $2, 'test-model', 'test-key', 'http://test', '/v1/chat/completions', $3, $4, 'POST')",
+            )
+            .bind(template_id)
+            .bind(file_id)
+            .bind(serde_json::to_string(&body).unwrap())
+            .bind(&custom_id)
+            .execute(&pool)
+            .await
+            .expect("Failed to create template");
+
+            sqlx::query(
+                "INSERT INTO fusillade.requests (id, batch_id, template_id, model, state, created_at) VALUES ($1, $2, $3, 'test-model', 'pending', NOW())",
+            )
+            .bind(request_id)
+            .bind(batch_id)
+            .bind(template_id)
+            .execute(&pool)
+            .await
+            .expect("Failed to create pending request");
+        }
+
+        let auth = add_auth_headers(&user);
+
+        // Unlimited download: X-Incomplete should be true because batch is still processing
+        let response = app
+            .get(&format!("/ai/v1/batches/{}/results", batch_id))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+
+        response.assert_status(StatusCode::OK);
+        response.assert_header("X-Incomplete", "true");
+
+        let body = response.text();
+        let lines: Vec<&str> = body.trim().lines().collect();
+        // Results include all requests (completed + pending)
+        assert_eq!(lines.len(), total, "Should return all request results");
+
+        // Paginated last page: even though no more pages, X-Incomplete should still be true
+        let response = app
+            .get(&format!("/ai/v1/batches/{}/results?limit={}", batch_id, total))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+
+        response.assert_status(StatusCode::OK);
+        response.assert_header("X-Incomplete", "true");
+
+        let body = response.text();
+        let lines: Vec<&str> = body.trim().lines().collect();
+        assert_eq!(lines.len(), total, "Should return all request results");
     }
 }

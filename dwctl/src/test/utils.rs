@@ -180,6 +180,7 @@ pub fn create_test_config() -> crate::config::Config {
             },
             ..Default::default()
         },
+        onwards: crate::config::OnwardsConfig::default(),
     }
 }
 

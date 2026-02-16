@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE webhook_deliveries\n            SET status = 'exhausted',\n                last_error = 'webhook disabled'\n            WHERE id = $1\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "af91c41f19e1d2743f3bbed7f16b206c82affdf16bea68778e2c482264af5c7f"
+}
