@@ -114,8 +114,28 @@ async fn test_strict_mode_allows_models_endpoint(pool: PgPool) {
     // Sync onwards config to ensure API key is available
     bg_services.sync_onwards_config(&pool).await.unwrap();
 
-    // Small delay to allow background task to process the update
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    // Poll until onwards picks up the API key via LISTEN/NOTIFY
+    // First verify initial state (key not yet available)
+    let initial_response = server
+        .get("/ai/models")
+        .add_header("Authorization", &format!("Bearer {}", api_key))
+        .await;
+    let initial_status = initial_response.status_code();
+
+    // Poll until the key is synced (up to 1 second)
+    let start = std::time::Instant::now();
+    let mut synced = initial_status == 200;
+    while !synced && start.elapsed() < std::time::Duration::from_secs(1) {
+        let check_response = server
+            .get("/ai/models")
+            .add_header("Authorization", &format!("Bearer {}", api_key))
+            .await;
+        synced = check_response.status_code() == 200;
+        if !synced {
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        }
+    }
+    assert!(synced, "API key should be synced to onwards within 1 second");
 
     // Test both /models and /v1/models endpoints
     for endpoint in &["/ai/models", "/ai/v1/models"] {
@@ -267,8 +287,28 @@ async fn test_strict_mode_allows_chat_completions(pool: PgPool) {
     // Sync onwards config
     bg_services.sync_onwards_config(&pool).await.unwrap();
 
-    // Small delay to allow background task to process the update
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    // Poll until onwards picks up the API key and model deployment via LISTEN/NOTIFY
+    // Check that the gpt-4 model is available
+    let start = std::time::Instant::now();
+    let mut model_available = false;
+    while !model_available && start.elapsed() < std::time::Duration::from_secs(1) {
+        let check_response = server
+            .get("/ai/models")
+            .add_header("Authorization", &format!("Bearer {}", api_key))
+            .await;
+
+        if check_response.status_code() == 200 {
+            let models: serde_json::Value = check_response.json();
+            if let Some(data) = models["data"].as_array() {
+                model_available = data.iter().any(|m| m["id"].as_str() == Some("gpt-4"));
+            }
+        }
+
+        if !model_available {
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        }
+    }
+    assert!(model_available, "Model gpt-4 should be available in onwards within 1 second");
 
     // Make chat completion request
     let chat_response = server
@@ -414,8 +454,31 @@ async fn test_strict_mode_allows_embeddings(pool: PgPool) {
 
     bg_services.sync_onwards_config(&pool).await.unwrap();
 
-    // Small delay to allow background task to process the update
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    // Poll until onwards picks up the API key and model deployment via LISTEN/NOTIFY
+    // Check that the text-embedding-3-small model is available
+    let start = std::time::Instant::now();
+    let mut model_available = false;
+    while !model_available && start.elapsed() < std::time::Duration::from_secs(1) {
+        let check_response = server
+            .get("/ai/models")
+            .add_header("Authorization", &format!("Bearer {}", api_key))
+            .await;
+
+        if check_response.status_code() == 200 {
+            let models: serde_json::Value = check_response.json();
+            if let Some(data) = models["data"].as_array() {
+                model_available = data.iter().any(|m| m["id"].as_str() == Some("text-embedding-3-small"));
+            }
+        }
+
+        if !model_available {
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        }
+    }
+    assert!(
+        model_available,
+        "Model text-embedding-3-small should be available in onwards within 1 second"
+    );
 
     // Make embeddings request
     let embeddings_response = server
