@@ -1282,7 +1282,10 @@ pub async fn build_router(
             .layer(prometheus_layer);
     }
 
-    // Add tracing layer with OTel-compatible span names and HTTP semantic conventions
+    // Add tracing layer with OTel-compatible span names and HTTP semantic conventions.
+    // Only trace_id and otel.name are tracing span fields (visible in fmt log output).
+    // All other attributes are set via OpenTelemetrySpanExt::set_attribute() so they're
+    // exported to the trace backend but don't clutter log lines.
     // Reference: https://opentelemetry.io/docs/specs/semconv/http/http-spans/
     let router = router.layer(middleware::from_fn(inject_trace_id)).layer(
         TraceLayer::new_for_http()
@@ -1304,29 +1307,69 @@ pub async fn build_router(
                 } else {
                     "other"
                 };
-                tracing::info_span!(
+                let span = tracing::info_span!(
                     "request",
                     trace_id = tracing::field::Empty,
                     otel.name = %span_name,
-                    otel.kind = "Server",
-                    otel.status_code = tracing::field::Empty,
-                    api.type = api_type,
-                    http.request.method = %request.method(),
-                    http.route = route.as_deref().unwrap_or(""),
-                    http.response.status_code = tracing::field::Empty,
-                    url.path = path,
-                    url.query = request.uri().query().unwrap_or(""),
-                    error.type = tracing::field::Empty,
-                )
+                );
+
+                // W3C Trace Context propagation (https://www.w3.org/TR/trace-context/)
+                //
+                // When an upstream caller (e.g. fusillade's batch daemon) sends a
+                // request with a `traceparent` header, we parse it and set this
+                // span's parent to the remote span context. This makes the dwctl
+                // request span appear as a child of the caller's span in the trace
+                // backend, producing one continuous trace across service boundaries.
+                //
+                // Without this, dwctl would start a new trace for every incoming
+                // request, breaking the connection between fusillade's
+                // process_request → execute and the dwctl request it dispatches.
+                //
+                // The traceparent header format is: {version}-{trace_id}-{span_id}-{flags}
+                // e.g. "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+                //
+                // If parsing fails at any point we silently fall through and the
+                // span starts a fresh trace — this is fine for requests that don't
+                // carry trace context (e.g. direct API calls from users).
+                if let Some(traceparent) = request.headers().get("traceparent")
+                    && let Ok(tp) = traceparent.to_str()
+                {
+                    let parts: Vec<&str> = tp.split('-').collect();
+                    if parts.len() == 4
+                        && let (Ok(trace_id), Ok(span_id)) = (
+                            opentelemetry::trace::TraceId::from_hex(parts[1]),
+                            opentelemetry::trace::SpanId::from_hex(parts[2]),
+                        )
+                    {
+                        let flags = u8::from_str_radix(parts[3], 16).unwrap_or(1);
+                        let parent_ctx = opentelemetry::trace::SpanContext::new(
+                            trace_id,
+                            span_id,
+                            opentelemetry::trace::TraceFlags::new(flags),
+                            true, // remote: this span context came from another process
+                            opentelemetry::trace::TraceState::default(),
+                        );
+                        let parent = opentelemetry::Context::new().with_remote_span_context(parent_ctx);
+                        let _ = span.set_parent(parent);
+                    }
+                }
+
+                span.set_attribute("otel.kind", "Server");
+                span.set_attribute("api.type", api_type.to_string());
+                span.set_attribute("http.request.method", request.method().to_string());
+                span.set_attribute("http.route", route.unwrap_or_default());
+                span.set_attribute("url.path", path.to_string());
+                span.set_attribute("url.query", request.uri().query().unwrap_or("").to_string());
+                span
             })
             .on_response(|response: &http::Response<_>, latency: std::time::Duration, span: &tracing::Span| {
                 let status = response.status().as_u16();
-                span.record("http.response.status_code", status);
+                span.set_attribute("http.response.status_code", i64::from(status));
                 if status >= 500 {
-                    span.record("otel.status_code", "ERROR");
-                    span.record("error.type", status.to_string().as_str());
+                    span.set_attribute("otel.status_code", "ERROR");
+                    span.set_attribute("error.type", status.to_string());
                 } else if status >= 400 {
-                    span.record("error.type", status.to_string().as_str());
+                    span.set_attribute("error.type", status.to_string());
                 }
                 tracing::info!(
                     http.response.status_code = status,
@@ -1336,8 +1379,8 @@ pub async fn build_router(
             })
             .on_failure(
                 |error: tower_http::classify::ServerErrorsFailureClass, latency: std::time::Duration, span: &tracing::Span| {
-                    span.record("otel.status_code", "ERROR");
-                    span.record("error.type", tracing::field::display(&error));
+                    span.set_attribute("otel.status_code", "ERROR");
+                    span.set_attribute("error.type", error.to_string());
                     tracing::error!(
                         error = %error,
                         latency_ms = latency.as_millis() as u64,

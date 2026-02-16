@@ -1,5 +1,13 @@
 # Changelog
 
+## [7.4.1](https://github.com/doublewordai/control-layer/compare/v7.4.0...v7.4.1) (2026-02-16)
+
+
+### Bug Fixes
+
+* allow model selection beyond combobox initial list ([#707](https://github.com/doublewordai/control-layer/issues/707)) ([48029ff](https://github.com/doublewordai/control-layer/commit/48029ff38b6f8d80eccb634f12309f3306939a42)), closes [#623](https://github.com/doublewordai/control-layer/issues/623)
+* clean up log lines + inherit trace id from fusillade ([#706](https://github.com/doublewordai/control-layer/issues/706)) ([6ff2949](https://github.com/doublewordai/control-layer/commit/6ff29496f1497aee317b1b05e90e0043515e9167))
+
 ## [7.4.0](https://github.com/doublewordai/control-layer/compare/v7.3.1...v7.4.0) (2026-02-16)
 
 
