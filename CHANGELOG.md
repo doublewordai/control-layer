@@ -1,5 +1,13 @@
 # Changelog
 
+## [7.3.1](https://github.com/doublewordai/control-layer/compare/v7.3.0...v7.3.1) (2026-02-16)
+
+
+### Bug Fixes
+
+* **batch:** support /v1/responses via configured allowlist ([#667](https://github.com/doublewordai/control-layer/issues/667)) ([233c95d](https://github.com/doublewordai/control-layer/commit/233c95dafa69b147e683f2dbe2d31d1a6bb30d40))
+* cancel shutdown token before axum graceful shutdown ([#699](https://github.com/doublewordai/control-layer/issues/699)) ([d9f56e7](https://github.com/doublewordai/control-layer/commit/d9f56e73e3e731c0598814057ff1cd0f5b4180f2))
+
 ## [7.3.0](https://github.com/doublewordai/control-layer/compare/v7.2.0...v7.3.0) (2026-02-13)
 
 
