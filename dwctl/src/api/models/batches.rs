@@ -57,8 +57,8 @@ pub struct CreateBatchRequest {
     #[schema(example = "file-abc123")]
     pub input_file_id: String,
 
-    /// The endpoint to be used for all requests in the batch
-    /// Currently /v1/chat/completions, /v1/embeddings, /v1/completions, and /v1/moderations are supported
+    /// The endpoint to be used for all requests in the batch.
+    /// Supported values are configured via `batches.allowed_url_paths`.
     #[schema(example = "/v1/chat/completions")]
     pub endpoint: String,
 

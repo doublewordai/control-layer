@@ -906,6 +906,7 @@ pub async fn build_router(
     onwards_router: Router,
     analytics_sender: Option<request_logging::batcher::AnalyticsSender>,
     metrics_recorder: Option<GenAiMetrics>,
+    strict_mode: bool,
 ) -> anyhow::Result<Router> {
     // Setup request logging and/or analytics based on config flags
     //
@@ -1161,20 +1162,51 @@ pub async fn build_router(
     };
 
     // Build the app with admin API and onwards proxy nested. serve the (restricted) openai spec.
-    // Batches routes are merged with onwards router under /ai/v1 (batches match first)
-    let ai_router = if let Some(batches) = batches_routes {
-        batches.merge(onwards_router)
-    } else {
-        onwards_router
-    };
-
-    let router = Router::new()
+    // Strict mode requires different nesting:
+    // - Batches routes (no /v1 prefix) need to be at /ai/v1/files, /ai/v1/batches
+    // - Onwards strict routes (with /v1 prefix) need to be at /ai so /ai/v1/chat/completions matches /v1/chat/completions
+    // Non-strict mode:
+    // - Both batches and onwards can be merged and nested at /ai/v1 (catchall handles everything)
+    let mut router = Router::new()
         .route("/healthz", get(|| async { "OK" }))
         // Webhook routes (external services, not part of client API docs)
         .route("/webhooks/payments", post(api::handlers::payments::webhook_handler))
         .with_state(state.clone())
-        .merge(auth_routes)
-        .nest("/ai/v1", ai_router)
+        .merge(auth_routes);
+
+    // Add AI routes with appropriate nesting based on strict mode
+    if strict_mode {
+        // Strict mode: nest onwards at /ai, nest batches at /ai/v1
+        router = router.nest("/ai", onwards_router);
+        if let Some(batches) = batches_routes {
+            // Add fallback to batches router to return 404 for unknown routes
+            // This prevents unknown /ai/v1/* requests from falling through to the
+            // global GET-only fallback which would return 405 for POST requests
+            let batches_with_fallback = batches.fallback(|| async {
+                (
+                    axum::http::StatusCode::NOT_FOUND,
+                    axum::Json(serde_json::json!({
+                        "error": {
+                            "message": "Unknown endpoint",
+                            "type": "invalid_request_error",
+                            "code": "not_found"
+                        }
+                    })),
+                )
+            });
+            router = router.nest("/ai/v1", batches_with_fallback);
+        }
+    } else {
+        // Non-strict mode: merge batches + onwards, nest at /ai/v1
+        let ai_router = if let Some(batches) = batches_routes {
+            batches.merge(onwards_router)
+        } else {
+            onwards_router
+        };
+        router = router.nest("/ai/v1", ai_router);
+    }
+
+    let router = router
         .nest("/admin/api/v1", api_routes_with_state)
         .route("/admin/openapi.json", get(|| async { axum::Json(AdminApiDoc::openapi()) }))
         .route("/ai/openapi.json", get(|| async { axum::Json(AiApiDoc::openapi()) }))
@@ -1332,6 +1364,8 @@ pub struct BackgroundServices {
     onwards_targets: onwards::target::Targets,
     #[cfg_attr(not(test), allow(dead_code))]
     onwards_sender: Option<tokio::sync::watch::Sender<onwards::target::Targets>>,
+    #[allow(dead_code)] // Used in sync_onwards_config method
+    strict_mode: bool,
     /// Sender for analytics records (if analytics is enabled)
     analytics_sender: Option<request_logging::batcher::AnalyticsSender>,
     // JoinSet is cancel-safe - can be polled in select! without losing tasks
@@ -1415,7 +1449,7 @@ impl BackgroundServices {
 
         // Use the same load function as the automatic sync
         // Note: escalation_models is empty for tests - individual tests can set up their own
-        let new_targets = crate::sync::onwards_config::load_targets_from_db(pool, &[]).await?;
+        let new_targets = crate::sync::onwards_config::load_targets_from_db(pool, &[], self.strict_mode).await?;
 
         // Send through the watch channel (same as automatic sync)
         sender
@@ -1493,6 +1527,7 @@ async fn setup_background_services(
             pool.clone(),
             Some(model_capacity_limits.clone()),
             escalation_models,
+            config.onwards.strict_mode,
         )
         .await?;
 
@@ -1531,6 +1566,7 @@ async fn setup_background_services(
         let empty_config = onwards::target::ConfigFile {
             targets: std::collections::HashMap::new(),
             auth: None,
+            strict_mode: false,
         };
         (onwards::target::Targets::from_config(empty_config)?, None)
     };
@@ -1850,6 +1886,7 @@ async fn setup_background_services(
         is_leader,
         onwards_targets: initial_targets,
         onwards_sender,
+        strict_mode: config.onwards.strict_mode,
         analytics_sender,
         background_tasks,
         task_names,
@@ -1942,7 +1979,12 @@ impl Application {
         // Build onwards router from targets with response sanitization enabled
         let onwards_app_state =
             onwards::AppState::new(bg_services.onwards_targets.clone()).with_response_transform(onwards::create_openai_sanitizer());
-        let onwards_router = onwards::build_router(onwards_app_state);
+        let onwards_router = if bg_services.onwards_targets.strict_mode {
+            tracing::info!("Strict mode enabled - using typed request validation");
+            onwards::strict::build_strict_router(onwards_app_state)
+        } else {
+            onwards::build_router(onwards_app_state)
+        };
 
         // Build resource limiters
         let limiters = limits::Limiters::new(&config.limits);
@@ -1962,6 +2004,7 @@ impl Application {
             onwards_router,
             bg_services.analytics_sender.clone(),
             metrics_recorder,
+            bg_services.onwards_targets.strict_mode,
         )
         .await?;
 
