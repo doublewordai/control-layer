@@ -2005,22 +2005,7 @@ impl Application {
         // support `stream_options`). The Responses API (/responses) always includes usage
         // in its response object regardless of streaming, so no transform is needed there.
         // Embeddings don't support streaming.
-        let body_transform: onwards::BodyTransformFn = Arc::new(|path, _headers, body_bytes| {
-            if path.ends_with("/completions")
-                && let Ok(mut json_body) = serde_json::from_slice::<serde_json::Value>(body_bytes)
-                && let Some(obj) = json_body.as_object_mut()
-                && obj.get("stream").and_then(|v| v.as_bool()) == Some(true)
-            {
-                obj.entry("stream_options")
-                    .or_insert_with(|| serde_json::json!({}))
-                    .as_object_mut()?["include_usage"] = serde_json::json!(true);
-
-                if let Ok(bytes) = serde_json::to_vec(&json_body) {
-                    return Some(axum::body::Bytes::from(bytes));
-                }
-            }
-            None
-        });
+        let body_transform: onwards::BodyTransformFn = Arc::new(request_logging::stream_usage::stream_usage_transform);
 
         // Build onwards router from targets with body transform and response sanitization
         let onwards_app_state = onwards::AppState::with_transform(bg_services.onwards_targets.clone(), body_transform)
