@@ -16,5 +16,6 @@ pub mod requests;
 pub mod tariffs;
 pub mod transactions;
 pub mod users;
+pub mod webhooks;
 
 pub use pagination::Pagination;

@@ -1,0 +1,112 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            WITH claimed AS (\n                SELECT id FROM webhook_deliveries\n                WHERE status IN ('pending', 'failed')\n                  AND next_attempt_at <= now()\n                ORDER BY next_attempt_at ASC\n                LIMIT $1\n                FOR UPDATE SKIP LOCKED\n            ),\n            updated AS (\n                UPDATE webhook_deliveries wd\n                SET next_attempt_at = now() + interval '5 minutes'\n                FROM claimed\n                WHERE wd.id = claimed.id\n                RETURNING wd.*\n            )\n            SELECT u.*,\n                   w.url AS webhook_url,\n                   w.secret AS webhook_secret,\n                   w.enabled AS webhook_enabled\n            FROM updated u\n            LEFT JOIN user_webhooks w ON w.id = u.webhook_id\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "webhook_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "event_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "event_type",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "payload",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 5,
+        "name": "status",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "attempt_count",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 7,
+        "name": "next_attempt_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 8,
+        "name": "batch_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 9,
+        "name": "last_status_code",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 10,
+        "name": "last_error",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 11,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 12,
+        "name": "updated_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 13,
+        "name": "webhook_url",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 14,
+        "name": "webhook_secret",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 15,
+        "name": "webhook_enabled",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      false,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "c211d5abaf903b421c375e6a1b6392d5f2d1a6215326a2fdb9353cd338f75ba2"
+}

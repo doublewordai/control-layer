@@ -1127,6 +1127,9 @@ pub struct NotificationsConfig {
     /// How often to poll for completed batches (default: 30s)
     #[serde(with = "humantime_serde")]
     pub poll_interval: Duration,
+    /// Webhook delivery configuration for Standard Webhooks-compliant
+    /// notifications for batch terminal state events (completed, failed).
+    pub webhooks: WebhookConfig,
 }
 
 impl Default for NotificationsConfig {
@@ -1134,6 +1137,7 @@ impl Default for NotificationsConfig {
         Self {
             enabled: true,
             poll_interval: Duration::from_secs(30),
+            webhooks: WebhookConfig::default(),
         }
     }
 }
@@ -1154,7 +1158,7 @@ pub struct BackgroundServicesConfig {
     pub leader_election: LeaderElectionConfig,
     /// Configuration for database pool metrics sampling
     pub pool_metrics: PoolMetricsSamplerConfig,
-    /// Configuration for batch completion email notifications
+    /// Configuration for batch completion notifications (email + webhooks)
     pub notifications: NotificationsConfig,
 }
 
@@ -1202,7 +1206,7 @@ impl Default for OnwardsSyncConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            fallback_interval_milliseconds: 10000, // 10 seconds
+            fallback_interval_milliseconds: 10_000, // 10 seconds
         }
     }
 }
@@ -1221,6 +1225,48 @@ pub struct ProbeSchedulerConfig {
 impl Default for ProbeSchedulerConfig {
     fn default() -> Self {
         Self { enabled: true }
+    }
+}
+
+/// Webhook delivery service configuration.
+///
+/// The webhook service delivers Standard Webhooks-compliant notifications
+/// for batch terminal state events (completed, failed, cancelled).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WebhookConfig {
+    /// Enable webhook delivery service (default: true)
+    pub enabled: bool,
+    /// HTTP timeout for webhook deliveries in seconds (default: 30)
+    pub timeout_secs: u64,
+    /// Retry backoff schedule in seconds. Each entry is the delay before the
+    /// corresponding attempt. The length of this list is the maximum number of
+    /// attempts — once exhausted, the delivery is marked as exhausted.
+    ///
+    /// Default: [0, 5, 300, 1800, 7200, 28800, 86400]
+    ///          (immediate, 5s, 5m, 30m, 2h, 8h, 24h)
+    pub retry_schedule_secs: Vec<i64>,
+    /// Number of consecutive failures before disabling a webhook (default: 10)
+    pub circuit_breaker_threshold: i32,
+    /// Maximum deliveries to claim from the database per tick (default: 50)
+    pub claim_batch_size: i64,
+    /// Maximum concurrent outbound HTTP requests (default: 20)
+    pub max_concurrent_sends: usize,
+    /// Internal channel buffer capacity for send requests and results (default: 200)
+    pub channel_capacity: usize,
+}
+
+impl Default for WebhookConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            timeout_secs: 30,
+            retry_schedule_secs: vec![0, 5, 300, 1800, 7200, 28800, 86400],
+            circuit_breaker_threshold: 10,
+            claim_batch_size: 50,
+            max_concurrent_sends: 20,
+            channel_capacity: 200,
+        }
     }
 }
 

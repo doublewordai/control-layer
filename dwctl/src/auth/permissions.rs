@@ -58,6 +58,9 @@ pub mod resource {
     #[derive(Default)]
     pub struct System;
 
+    #[derive(Default)]
+    pub struct Webhooks;
+
     // Convert type-level markers to enum values using Into
     impl From<Users> for Resource {
         fn from(_: Users) -> Resource {
@@ -132,6 +135,11 @@ pub mod resource {
     impl From<System> for Resource {
         fn from(_: System) -> Resource {
             Resource::System
+        }
+    }
+    impl From<Webhooks> for Resource {
+        fn from(_: Webhooks) -> Resource {
+            Resource::Webhooks
         }
     }
 }
@@ -303,7 +311,11 @@ pub fn role_has_permission(role: &Role, resource: Resource, operation: Operation
                     | (Resource::ApiKeys, Operation::DeleteOwn)   // Can delete own API keys
                     | (Resource::Users, Operation::ReadOwn)       // Can read own user data
                     | (Resource::Users, Operation::UpdateOwn)     // Can update own user data
-                    | (Resource::Credits, Operation::ReadOwn) // Can read own credit balance and transactions
+                    | (Resource::Credits, Operation::ReadOwn)     // Can read own credit balance and transactions
+                    | (Resource::Webhooks, Operation::CreateOwn)  // Can create own webhooks
+                    | (Resource::Webhooks, Operation::ReadOwn)    // Can read own webhooks
+                    | (Resource::Webhooks, Operation::UpdateOwn)  // Can update own webhooks
+                    | (Resource::Webhooks, Operation::DeleteOwn) // Can delete own webhooks
             )
         }
         Role::RequestViewer => {

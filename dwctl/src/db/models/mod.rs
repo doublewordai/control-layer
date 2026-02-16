@@ -69,3 +69,4 @@ pub mod password_reset_tokens;
 pub mod probes;
 pub mod tariffs;
 pub mod users;
+pub mod webhooks;
