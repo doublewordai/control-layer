@@ -1348,8 +1348,7 @@ pub async fn build_router(
                                 true, // remote: this span context came from another process
                                 opentelemetry::trace::TraceState::default(),
                             );
-                            let parent = opentelemetry::Context::new()
-                                .with_remote_span_context(parent_ctx);
+                            let parent = opentelemetry::Context::new().with_remote_span_context(parent_ctx);
                             let _ = span.set_parent(parent);
                         }
                     }
