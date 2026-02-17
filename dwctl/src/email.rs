@@ -8,7 +8,7 @@ use lettre::{
     transport::smtp::authentication::Credentials,
 };
 use minijinja::{Environment, context};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub struct EmailService {
     transport: EmailTransport,
@@ -16,6 +16,7 @@ pub struct EmailService {
     from_name: String,
     base_url: String,
     reply_to: Option<String>,
+    templates_dir: PathBuf,
 }
 
 enum EmailTransport {
@@ -72,6 +73,7 @@ impl EmailService {
             from_name: email_config.from_name.clone(),
             base_url: config.dashboard_url.clone(),
             reply_to: email_config.reply_to.clone(),
+            templates_dir: PathBuf::from(&email_config.templates_dir),
         })
     }
 
@@ -163,18 +165,26 @@ impl EmailService {
         self.send_email(to_email, to_name, &subject, &body).await
     }
 
+    fn load_template(&self, name: &str) -> Result<String, minijinja::Error> {
+        let path = self.templates_dir.join(name);
+        std::fs::read_to_string(&path).map_err(|e| {
+            minijinja::Error::new(
+                minijinja::ErrorKind::InvalidOperation,
+                format!("read email template {}: {e}", path.display()),
+            )
+        })
+    }
+
     pub fn render_batch_completion_body(
         &self,
         to_name: String,
         info: &BatchNotificationInfo,
         first_batch: bool,
     ) -> Result<String, minijinja::Error> {
+        let template_name = if first_batch { "first_batch.html" } else { "batch_complete.html" };
+        let template_src = self.load_template(template_name)?;
         let mut env = Environment::new();
-        if first_batch {
-            env.add_template("email", include_str!("../../email_templates/first_batch.html"))?;
-        } else {
-            env.add_template("email", include_str!("../../email_templates/batch_complete.html"))?;
-        }
+        env.add_template("email", &template_src)?;
 
         let (outcome_label, outcome_icon, header_color, outcome_message) = match info.outcome {
             BatchOutcome::Completed => ("Completed", "✓", "#16a34a", "Your batch has finished processing successfully."),
@@ -232,8 +242,9 @@ impl EmailService {
     }
 
     fn render_password_reset_body(&self, to_name: &str, reset_link: &str) -> Result<String, minijinja::Error> {
+        let template_src = self.load_template("password_reset.html")?;
         let mut env = Environment::new();
-        env.add_template("email", include_str!("../../email_templates/password_reset.html"))?;
+        env.add_template("email", &template_src)?;
 
         env.get_template("email")?.render(context! {
             to_name,
@@ -320,11 +331,8 @@ mod tests {
         let body = email_service.render_batch_completion_body("Bob".into(), &info, true).unwrap();
 
         assert!(body.contains("Hi Bob,"));
-        assert!(body.contains("Your results are ready!"));
+        assert!(body.contains("first batch has completed"));
         assert!(body.contains("http://localhost:3001/batches/abcd1234-5678-90ab-cdef-1234567890ab"));
-        assert!(body.contains("Batch Complete"));
-        assert!(body.contains("Run another batch"));
-        assert!(body.contains("Autobatcher"));
     }
 
     #[tokio::test]

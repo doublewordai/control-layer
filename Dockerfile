@@ -33,7 +33,6 @@ WORKDIR /app
 COPY .sqlx/ .sqlx/
 COPY Cargo.toml Cargo.lock ./
 COPY dwctl/ dwctl/
-COPY email_templates/ email_templates/
 RUN rm -rf dwctl/static && cp -r dashboard/dist dwctl/static
 ENV SQLX_OFFLINE=true
 RUN cargo build --release -p dwctl
