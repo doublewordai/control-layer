@@ -287,6 +287,17 @@ Use embeddings for:
         (name = "models", description = "List and retrieve information about available models.
 
 Use these endpoints to discover which models you have access to and their capabilities."),
+        (name = "responses-api", description = "Create model responses with enhanced capabilities.
+
+The Responses API is OpenAI's unified API that supersedes Chat Completions for advanced use cases:
+
+- **Reasoning models** — Control computational effort with `reasoning_effort` parameter
+- **Multimodal support** — Generate text, audio, or other modalities via `modalities`
+- **Stateful conversations** — Maintain context across turns with `previous_response_id`
+- **Flexible input** — Use simple strings or full message arrays
+- **Structured instructions** — Separate system instructions from user input
+
+[Learn more about the Responses API →](https://platform.openai.com/docs/api-reference/responses)"),
     ),
     info(
         title = "AI API",
