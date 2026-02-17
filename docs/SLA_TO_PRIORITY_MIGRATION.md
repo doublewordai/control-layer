@@ -261,7 +261,31 @@ const getDefaultName = (
 };
 ```
 
-**Example:** Selecting "Standard (24h)" priority auto-populates the tariff name as "Standard (24h)" (not "Batch (Standard (24h))")
+**Example:** Selecting "Standard (24h)" priority auto-populates the tariff name as "Standard (24h)"
+
+### Tariff Display UI
+
+The ModelTariffTable displays batch tariffs with both purpose and priority in the "API Key Purpose" column:
+
+| API Key Purpose | Name | Priority |
+|----------------|------|----------|
+| Batch - Standard (24h) | Standard (24h) | Standard (24h) |
+| Batch - High (1h) | High (1h) | High (1h) |
+| Realtime | Realtime Pricing | N/A |
+
+**Note:** For batch tariffs, the "API Key Purpose" column shows "Batch - {priority}" format (e.g., "Batch - Standard (24h)") to clearly indicate both the purpose and the priority level.
+
+### Transaction Display
+
+Batch transactions in the billing/cost management page display with the format:
+- `API Batch - Standard (24h): 5 requests`
+- `Frontend Batch - High (1h): 12 requests`
+
+This format clearly shows:
+1. Source (API or Frontend)
+2. Transaction type (Batch)
+3. Priority level
+4. Request count
 
 ## Testing
 

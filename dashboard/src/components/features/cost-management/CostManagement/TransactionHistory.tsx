@@ -167,7 +167,7 @@ export function TransactionHistory({
   };
 
   // Format transaction description with category prefix for usage transactions
-  // Format: "Category: model (tokens)" or "Batch (Priority): X requests" for batches
+  // Format: "Category: model (tokens)" or "Source Batch - Priority: X requests" for batches
   const formatDescription = (tx: Transaction): string => {
     const baseDescription = tx.description || "No description";
 
@@ -176,7 +176,7 @@ export function TransactionHistory({
       return baseDescription;
     }
 
-    // For batches, show "Batch (Source - Priority): X requests" format
+    // For batches, show "Source Batch - Priority: X requests" format
     // A transaction is a batch if it has a batch_id
     const isBatch = tx.batch_id;
     if (isBatch) {
@@ -193,7 +193,7 @@ export function TransactionHistory({
         priorityText = ` - ${tx.batch_sla}`;
       }
 
-      return `Batch (${source}${priorityText})${requestsText}`;
+      return `${source} Batch${priorityText}${requestsText}`;
     }
 
     // For non-batch usage, extract model and tokens from description

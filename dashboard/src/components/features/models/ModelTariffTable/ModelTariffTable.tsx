@@ -413,7 +413,7 @@ export const ModelTariffTable: React.FC<ModelTariffTableProps> = ({
         <TableCell>
           {tariff.api_key_purpose
             ? tariff.api_key_purpose === "batch" && tariff.completion_window
-              ? `${API_KEY_PURPOSE_LABELS[tariff.api_key_purpose]} (${tariff.completion_window.charAt(0).toUpperCase() + tariff.completion_window.slice(1)})`
+              ? `Batch - ${tariff.completion_window}`
               : API_KEY_PURPOSE_LABELS[tariff.api_key_purpose]
             : API_KEY_PURPOSE_LABELS.none}
         </TableCell>
@@ -425,7 +425,7 @@ export const ModelTariffTable: React.FC<ModelTariffTableProps> = ({
         <TableCell>
           {tariff.completion_window ? (
             <span className="text-sm text-gray-600">
-              {tariff.completion_window.charAt(0).toUpperCase() + tariff.completion_window.slice(1)}
+              {tariff.completion_window}
             </span>
           ) : (
             <span className="text-sm text-gray-400 italic">N/A</span>
