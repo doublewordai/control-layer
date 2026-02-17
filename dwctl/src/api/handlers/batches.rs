@@ -536,7 +536,6 @@ pub async fn get_batch_results<P: PoolProvider>(
     let still_processing = batch.pending_requests > 0 || batch.in_progress_requests > 0;
 
     // Stream the batch results as JSONL
-    // Hide retriable errors before SLA expiry
     let offset = query.pagination.skip() as usize;
     let search = query.search.clone();
     let status = query.status.clone();
