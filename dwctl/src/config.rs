@@ -881,10 +881,18 @@ pub struct BatchConfig {
     /// Must be positive (> 0) when specified.
     #[serde(default = "default_batch_throughput", deserialize_with = "deserialize_positive_throughput")]
     pub default_throughput: f32,
+    /// TTL for batch capacity reservations (seconds).
+    /// Used to prevent stale reservations from reducing capacity forever.
+    #[serde(default = "default_reservation_ttl_secs")]
+    pub reservation_ttl_secs: i64,
 }
 
 fn default_batch_throughput() -> f32 {
     100.0
+}
+
+fn default_reservation_ttl_secs() -> i64 {
+    10 * 60
 }
 
 /// Custom deserializer that validates throughput is positive, with null/missing defaulting to 100.0
@@ -919,6 +927,7 @@ impl Default for BatchConfig {
             ],
             files: FilesConfig::default(),
             default_throughput: default_batch_throughput(),
+            reservation_ttl_secs: default_reservation_ttl_secs(),
         }
     }
 }

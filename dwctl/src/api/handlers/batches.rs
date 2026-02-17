@@ -23,8 +23,10 @@ use axum::{
     http::StatusCode,
 };
 use bytes::Bytes;
+use chrono::{Duration, Utc};
 use fusillade::Storage;
 use futures::StreamExt;
+use sqlx::Row;
 use std::collections::HashMap;
 use std::pin::Pin;
 use uuid::Uuid;
@@ -257,49 +259,17 @@ pub async fn create_batch<P: PoolProvider>(
     // Get model throughputs from database
     let model_aliases: Vec<String> = file_model_counts.keys().cloned().collect();
     let model_throughputs = get_model_throughputs(&state, &model_aliases).await?;
+    let model_ids_by_alias = get_model_ids_by_aliases(&state, &model_aliases).await?;
 
-    // Perform capacity check
-    //
-    // Note: This capacity check does not use locking, so concurrent batch creations
-    // may both pass the check and then exceed the actual capacity. This is a known
-    // limitation that provides "best effort" protection - it will reject obvious
-    // overflows but may allow slight over-acceptance (~10-20%) during concurrent bursts.
-    // This trade-off is intentional for Phase 1 to avoid complexity; proper
-    // concurrency control (e.g., advisory locks on model aliases) may be added in
-    // future iterations if the over-acceptance becomes problematic.
-    // NOTE: over acceptance is proportional to number of concurrent batches created, not number of requests in the batch
-    // so over-acceptance can be very high for a burst of large files.
-    let capacity_result = check_sla_capacity(
+    let reservation_ids = reserve_capacity_for_batch(
+        &state,
+        &req.completion_window,
         &file_model_counts,
         &pending_counts,
         &model_throughputs,
-        state.config.batches.default_throughput,
-        &req.completion_window,
-    );
-
-    if !capacity_result.has_capacity {
-        let overloaded_details: Vec<String> = capacity_result
-            .overloaded_models
-            .iter()
-            .map(|(model, deficit)| format!("{} (needs {} more capacity)", model, deficit))
-            .collect();
-        tracing::warn!(
-            completion_window = %req.completion_window,
-            overloaded_models = %overloaded_details.join(", "),
-            "Batch rejected due to insufficient SLA capacity"
-        );
-
-        // User-facing message: only list model names, no capacity details
-        let model_names: Vec<&str> = capacity_result.overloaded_models.keys().map(|model| model.as_str()).collect();
-
-        return Err(Error::TooManyRequests {
-            message: format!(
-                "Insufficient capacity for {} SLA window. The following models are currently at capacity: {}. Try again later or use a longer completion window.",
-                req.completion_window,
-                model_names.join(", ")
-            ),
-        });
-    }
+        &model_ids_by_alias,
+    )
+    .await?;
 
     // Determine request_source from authentication method
     // - API key present -> "api"
@@ -323,8 +293,11 @@ pub async fn create_batch<P: PoolProvider>(
         created_by: Some(current_user.id.to_string()),
     };
 
-    // Create the batch
-    let batch = state.request_manager.create_batch(batch_input).await.map_err(|e| Error::Internal {
+    let batch = state.request_manager.create_batch(batch_input).await;
+
+    let _ = release_capacity_reservations(&state, &reservation_ids).await;
+
+    let batch = batch.map_err(|e| Error::Internal {
         operation: format!("create batch: {}", e),
     })?;
 
@@ -335,6 +308,157 @@ pub async fn create_batch<P: PoolProvider>(
         StatusCode::CREATED,
         Json(to_batch_response_with_email(batch, Some(&current_user.email))),
     ))
+}
+
+async fn get_model_ids_by_aliases<P: PoolProvider>(state: &AppState<P>, model_aliases: &[String]) -> Result<HashMap<String, Uuid>> {
+    if model_aliases.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let mut conn = state.db.read().acquire().await.map_err(|e| Error::Internal {
+        operation: format!("get db connection: {}", e),
+    })?;
+
+    let rows = sqlx::query(
+        r#"
+        SELECT id, alias
+        FROM deployed_models
+        WHERE alias = ANY($1)
+          AND deleted = false
+        "#,
+    )
+    .bind(model_aliases)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(|e| Error::Internal {
+        operation: format!("get model ids: {}", e),
+    })?;
+
+    let mut result = HashMap::new();
+    for row in rows {
+        let id: Uuid = row.try_get("id").map_err(|e| Error::Internal {
+            operation: format!("read model id: {}", e),
+        })?;
+        let alias: String = row.try_get("alias").map_err(|e| Error::Internal {
+            operation: format!("read model alias: {}", e),
+        })?;
+        result.insert(alias, id);
+    }
+
+    Ok(result)
+}
+
+async fn reserve_capacity_for_batch<P: PoolProvider>(
+    state: &AppState<P>,
+    completion_window: &str,
+    file_model_counts: &HashMap<String, i64>,
+    pending_counts: &HashMap<String, HashMap<String, i64>>,
+    model_throughputs: &HashMap<String, f32>,
+    model_ids_by_alias: &HashMap<String, Uuid>,
+) -> Result<Vec<Uuid>> {
+    use crate::db::handlers::BatchCapacityReservations;
+
+    let mut tx = state.db.write().begin().await.map_err(|e| Error::Internal {
+        operation: format!("begin reservation transaction: {}", e),
+    })?;
+
+    // Lock per model+window in deterministic order
+    let mut model_pairs: Vec<(String, Uuid)> = model_ids_by_alias.iter().map(|(a, id)| (a.clone(), *id)).collect();
+    model_pairs.sort_by_key(|(_, id)| *id);
+
+    for (alias, model_id) in &model_pairs {
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))")
+            .bind(model_id.to_string())
+            .bind(completion_window)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| Error::Internal {
+                operation: format!("lock reservation for {}: {}", alias, e),
+            })?;
+    }
+
+    // Sum active reservations and add to pending_counts
+    let model_ids: Vec<Uuid> = model_pairs.iter().map(|(_, id)| *id).collect();
+    let id_to_alias: HashMap<Uuid, String> = model_pairs.iter().map(|(a, id)| (*id, a.clone())).collect();
+
+    let mut reservations = BatchCapacityReservations::new(&mut tx);
+    let reserved_rows = reservations
+        .sum_active_by_model_window(&model_ids, completion_window)
+        .await
+        .map_err(|e| Error::Internal {
+            operation: format!("sum active reservations: {}", e),
+        })?;
+
+    let mut pending_with_reservations = pending_counts.clone();
+    for (model_id, reserved) in reserved_rows {
+        if let Some(alias) = id_to_alias.get(&model_id) {
+            let windows = pending_with_reservations.entry(alias.clone()).or_default();
+            let entry = windows.entry(completion_window.to_string()).or_insert(0);
+            *entry += reserved;
+        }
+    }
+
+    let capacity_result = check_sla_capacity(
+        file_model_counts,
+        &pending_with_reservations,
+        model_throughputs,
+        state.config.batches.default_throughput,
+        completion_window,
+    );
+
+    if !capacity_result.has_capacity {
+        tx.rollback().await.ok();
+
+        let model_names: Vec<&str> = capacity_result.overloaded_models.keys().map(|model| model.as_str()).collect();
+        return Err(Error::TooManyRequests {
+            message: format!(
+                "Insufficient capacity for {} SLA window. The following models are currently at capacity: {}. Try again later or use a longer completion window.",
+                completion_window,
+                model_names.join(", ")
+            ),
+        });
+    }
+
+    let expires_at = Utc::now() + Duration::seconds(state.config.batches.reservation_ttl_secs);
+
+    let mut rows = Vec::new();
+    for (alias, model_id) in &model_pairs {
+        if let Some(&count) = file_model_counts.get(alias)
+            && count > 0
+        {
+            rows.push((*model_id, completion_window, count, expires_at));
+        }
+    }
+
+    let reservation_ids = reservations.insert_reservations(&rows).await.map_err(|e| Error::Internal {
+        operation: format!("insert reservations: {}", e),
+    })?;
+
+    tx.commit().await.map_err(|e| Error::Internal {
+        operation: format!("commit reservation transaction: {}", e),
+    })?;
+
+    Ok(reservation_ids)
+}
+
+async fn release_capacity_reservations<P: PoolProvider>(state: &AppState<P>, reservation_ids: &[Uuid]) -> Result<()> {
+    use crate::db::handlers::BatchCapacityReservations;
+
+    if reservation_ids.is_empty() {
+        return Ok(());
+    }
+
+    let mut conn = state.db.write().acquire().await.map_err(|e| Error::Internal {
+        operation: format!("get db connection: {}", e),
+    })?;
+
+    let mut reservations = BatchCapacityReservations::new(&mut conn);
+    reservations
+        .release_reservations(reservation_ids)
+        .await
+        .map_err(|e| Error::Internal {
+            operation: format!("release reservations: {}", e),
+        })
 }
 
 /// Get throughput values for the given model aliases from the database
@@ -1094,9 +1218,11 @@ pub async fn list_batches<P: PoolProvider>(
 mod tests {
     use crate::api::models::batches::CreateBatchRequest;
     use crate::api::models::users::Role;
+    use crate::errors::Error;
     use crate::test::utils::*;
     use axum::http::StatusCode;
     use sqlx::PgPool;
+    use std::collections::HashMap;
     use uuid::Uuid;
 
     #[sqlx::test]
@@ -1978,5 +2104,106 @@ mod tests {
         let body = response.text();
         let lines: Vec<&str> = body.trim().lines().collect();
         assert_eq!(lines.len(), total, "Should return all request results");
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_reserve_capacity_for_batch_inserts_and_releases(pool: PgPool) {
+        let config = create_test_config();
+        let state = create_test_app_state_with_config(pool.clone(), config).await;
+
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let endpoint_id = create_test_endpoint(&pool, &format!("test-{}", Uuid::new_v4()), user.id).await;
+
+        let alias = format!("alias-{}", Uuid::new_v4());
+        let model_id = create_test_model(&pool, "model-a", &alias, endpoint_id, user.id).await;
+
+        let file_model_counts: HashMap<String, i64> = HashMap::from([(alias.clone(), 5_i64)]);
+        let pending_counts: HashMap<String, HashMap<String, i64>> = HashMap::new();
+        let model_throughputs = HashMap::from([(alias.clone(), 1000.0_f32)]);
+        let model_ids_by_alias = HashMap::from([(alias.clone(), model_id)]);
+
+        let reservation_ids = super::reserve_capacity_for_batch(
+            &state,
+            "24h",
+            &file_model_counts,
+            &pending_counts,
+            &model_throughputs,
+            &model_ids_by_alias,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(reservation_ids.len(), 1);
+
+        let row = sqlx::query!(
+            "SELECT reserved_requests, released_at FROM batch_capacity_reservations WHERE id = $1",
+            reservation_ids[0]
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(row.reserved_requests, 5);
+        assert!(row.released_at.is_none());
+
+        super::release_capacity_reservations(&state, &reservation_ids).await.unwrap();
+
+        let row = sqlx::query!(
+            "SELECT released_at FROM batch_capacity_reservations WHERE id = $1",
+            reservation_ids[0]
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert!(row.released_at.is_some());
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_reserve_capacity_for_batch_rejects_over_capacity(pool: PgPool) {
+        let mut config = create_test_config();
+        config.batches.default_throughput = 0.0;
+
+        let state = create_test_app_state_with_config(pool.clone(), config).await;
+
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let endpoint_id = create_test_endpoint(&pool, &format!("test-{}", Uuid::new_v4()), user.id).await;
+
+        let alias = format!("alias-{}", Uuid::new_v4());
+        let model_id = create_test_model(&pool, "model-a", &alias, endpoint_id, user.id).await;
+
+        let file_model_counts: HashMap<String, i64> = HashMap::from([(alias.clone(), 1_i64)]);
+        let pending_counts: HashMap<String, HashMap<String, i64>> = HashMap::new();
+        let model_throughputs = HashMap::from([(alias.clone(), 0.0_f32)]);
+        let model_ids_by_alias = HashMap::from([(alias.clone(), model_id)]);
+
+        let err = super::reserve_capacity_for_batch(
+            &state,
+            "1h",
+            &file_model_counts,
+            &pending_counts,
+            &model_throughputs,
+            &model_ids_by_alias,
+        )
+        .await
+        .unwrap_err();
+
+        match err {
+            Error::TooManyRequests { .. } => {}
+            other => panic!("expected TooManyRequests, got {other:?}"),
+        }
+
+        let count = sqlx::query_scalar!(
+            "SELECT COUNT(*) as count FROM batch_capacity_reservations WHERE model_id = $1 AND completion_window = $2",
+            model_id,
+            "1h"
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(count.unwrap_or(0), 0);
     }
 }
