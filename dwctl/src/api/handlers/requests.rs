@@ -10,12 +10,15 @@ use sqlx_pool_router::PoolProvider;
 
 use crate::{
     AppState,
-    api::models::requests::{
-        AggregateRequestsQuery, HttpAnalyticsFilter, ListAnalyticsResponse, ListRequestsQuery, ModelUserUsageResponse,
-        RequestsAggregateResponse,
+    api::models::{
+        requests::{
+            AggregateRequestsQuery, HttpAnalyticsFilter, ListAnalyticsResponse, ListRequestsQuery, ModelUserUsageResponse,
+            RequestsAggregateResponse, UserBatchUsageResponse,
+        },
+        users::CurrentUser,
     },
     auth::permissions::{RequiresPermission, operation, resource},
-    db::handlers::analytics::{get_model_user_usage, get_requests_aggregate, list_http_analytics},
+    db::handlers::analytics::{get_model_user_usage, get_requests_aggregate, get_user_batch_usage, get_user_model_breakdown, list_http_analytics},
     errors::Error,
 };
 use chrono::{DateTime, Duration, Utc};
@@ -144,6 +147,45 @@ pub async fn aggregate_by_user<P: PoolProvider>(
     let usage_data = get_model_user_usage(state.db.read(), &model_alias, start_date, end_date).await?;
 
     Ok(Json(usage_data))
+}
+
+/// Get the current user's batch usage metrics
+///
+/// Returns all-time batch usage including total tokens, costs, request/batch counts,
+/// and per-model breakdown. Only includes batched requests. Any authenticated user
+/// can access their own usage data.
+#[utoipa::path(
+    get,
+    path = "/admin/api/v1/usage",
+    responses(
+        (status = 200, description = "User batch usage metrics", body = UserBatchUsageResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "usage",
+    security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
+        ("X-Doubleword-User" = [])
+    )
+)]
+#[tracing::instrument(skip_all)]
+pub async fn get_usage<P: PoolProvider>(
+    State(state): State<AppState<P>>,
+    current_user: CurrentUser,
+) -> Result<Json<UserBatchUsageResponse>, Error> {
+    // Read-only: relies on batch_aggregates being kept up-to-date
+    // by other write paths (e.g. list_transactions_with_batches on /cost-management).
+    // Slightly stale data is acceptable for an all-time overview dashboard.
+    let read_pool = state.db.read();
+    let (mut usage, by_model) = tokio::try_join!(
+        get_user_batch_usage(read_pool, current_user.id),
+        get_user_model_breakdown(read_pool, current_user.id),
+    )?;
+
+    usage.by_model = by_model;
+
+    Ok(Json(usage))
 }
 
 #[cfg(test)]

@@ -330,3 +330,26 @@ pub struct RequestsAggregateResponse {
     pub models: Option<Vec<ModelUsage>>,
     pub time_series: Vec<TimeSeriesPoint>,
 }
+
+/// Per-model breakdown entry for user batch usage
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ModelBreakdownEntry {
+    pub model: String,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cost: String,
+    pub request_count: i64,
+    pub batch_count: i64,
+}
+
+/// User batch usage response with overall metrics and per-model breakdown
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct UserBatchUsageResponse {
+    pub total_input_tokens: i64,
+    pub total_output_tokens: i64,
+    pub total_request_count: i64,
+    pub total_batch_count: i64,
+    pub avg_requests_per_batch: f64,
+    pub total_cost: String,
+    pub by_model: Vec<ModelBreakdownEntry>,
+}
