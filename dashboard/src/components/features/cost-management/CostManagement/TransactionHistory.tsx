@@ -167,7 +167,7 @@ export function TransactionHistory({
   };
 
   // Format transaction description with category prefix for usage transactions
-  // Format: "Category: model (tokens)" or "Batch (SLA): X requests" for batches
+  // Format: "Category: model (tokens)" or "Batch (Priority): X requests" for batches
   const formatDescription = (tx: Transaction): string => {
     const baseDescription = tx.description || "No description";
 
@@ -176,7 +176,7 @@ export function TransactionHistory({
       return baseDescription;
     }
 
-    // For batches, show "Batch (Source - SLA): X requests" format
+    // For batches, show "Batch (Source - Priority): X requests" format
     // A transaction is a batch if it has a batch_id
     const isBatch = tx.batch_id;
     if (isBatch) {
@@ -186,13 +186,15 @@ export function TransactionHistory({
       // Determine source label: "Frontend" for frontend origin, "API" for everything else
       const source = tx.request_origin === "frontend" ? "Frontend" : "API";
 
-      // Format SLA - should always be present for batches
-      let slaText = "";
-      if (tx.batch_sla === "24h") slaText = " - 24hr";
-      else if (tx.batch_sla === "1h") slaText = " - 1hr";
-      else if (tx.batch_sla) slaText = ` - ${tx.batch_sla}`;
+      // Format priority - should always be present for batches
+      let priorityText = "";
+      if (tx.batch_sla) {
+        // Capitalize priority name from API (e.g., "high" → "High", "standard" → "Standard")
+        const formatted = tx.batch_sla.charAt(0).toUpperCase() + tx.batch_sla.slice(1);
+        priorityText = ` - ${formatted}`;
+      }
 
-      return `Batch (${source}${slaText})${requestsText}`;
+      return `Batch (${source}${priorityText})${requestsText}`;
     }
 
     // For non-batch usage, extract model and tokens from description

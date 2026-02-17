@@ -63,6 +63,10 @@ export type Role =
 export type ApiKeyPurpose = "platform" | "realtime" | "batch" | "playground";
 export type TariffApiKeyPurpose = "realtime" | "batch" | "playground";
 
+// Batch priority types
+// API always returns priority names: "standard" (24h) or "high" (1h)
+export type BatchPriority = "standard" | "high";
+
 // Config/Metadata types
 export interface ConfigResponse {
   region: string;
@@ -73,7 +77,7 @@ export interface ConfigResponse {
   docs_url: string;
   batches?: {
     enabled: boolean;
-    allowed_completion_windows: string[]; // Available SLAs like ["24h", "1h", "12h"]
+    allowed_completion_windows: string[]; // Available windows like ["24h", "1h"] (mapped to priorities in UI)
   };
   /** Base URL for AI API endpoints (files, batches, daemons). If not set, use relative paths. */
   ai_api_base_url?: string;
@@ -115,7 +119,7 @@ export interface ModelTariff {
   valid_from: string; // ISO 8601 timestamp
   valid_until?: string | null; // ISO 8601 timestamp, null means currently active
   api_key_purpose?: TariffApiKeyPurpose | null;
-  completion_window?: string | null; // SLA like "24h", "1h" - required for batch tariffs
+  completion_window?: string | null; // Priority name: "standard", "high" (API returns priority names)
   is_active: boolean;
 }
 
@@ -125,7 +129,7 @@ export interface TariffDefinition {
   input_price_per_token: string; // Decimal string to preserve precision
   output_price_per_token: string; // Decimal string to preserve precision
   api_key_purpose?: TariffApiKeyPurpose | null;
-  completion_window?: string | null; // SLA like "24h", "1h" - required for batch tariffs
+  completion_window?: string | null; // Completion window like "24h", "1h" (display as priority in UI)
 }
 
 // Base model types
@@ -680,7 +684,7 @@ export interface RequestsAggregateResponse {
   time_series: TimeSeriesPoint[];
 }
 
-// Monitoring: pending request counts grouped by model and completion window (SLA)
+// Monitoring: pending request counts grouped by model and completion window (priority)
 export type PendingRequestCountsByModelAndWindow = Record<
   string,
   Record<string, number>
@@ -779,7 +783,7 @@ export interface Transaction {
   created_at: string; // ISO 8601 timestamp
   /** Request origin: "api" (direct API), "frontend" (playground), or "fusillade" (batch) */
   request_origin?: string;
-  /** Batch SLA completion window: "1h", "24h", or empty string for non-batch */
+  /** Batch priority: "High (1h)", "Standard (24h)", or empty string for non-batch */
   batch_sla?: string;
   /** Number of requests in this batch (only present for batch transactions) */
   batch_request_count?: number;
@@ -988,7 +992,7 @@ export interface Batch {
   endpoint: string;
   errors?: BatchErrors | null;
   input_file_id: string;
-  completion_window: string; // SLA like "24h", "1h", "12h", "48h"
+  completion_window: string; // Priority like "Standard (24h)", "High (1h)"
   status: BatchStatus;
   output_file_id?: string | null;
   error_file_id?: string | null;
@@ -1019,7 +1023,7 @@ export interface BatchListResponse {
 export interface BatchCreateRequest {
   input_file_id: string;
   endpoint: string;
-  completion_window: string; // SLA like "24h", "1h", "12h", "48h"
+  completion_window: string; // Priority like "Standard (24h)", "High (1h)"
   metadata?: Record<string, string>;
   output_expires_after?: {
     anchor: "created_at";

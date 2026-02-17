@@ -109,7 +109,7 @@ export const UpdateModelPricingModal: React.FC<
               onChange={handleTariffsChange}
               isLoading={updateModel.isPending}
               availableSLAs={
-                config?.batches?.allowed_completion_windows || ["24h"]
+                config?.batches?.allowed_completion_windows || ["Standard (24h)"]
               }
             />
           )}

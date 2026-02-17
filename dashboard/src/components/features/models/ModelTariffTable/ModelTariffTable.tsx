@@ -30,7 +30,7 @@ interface TariffFormData {
   input_price_per_million: string;
   output_price_per_million: string;
   api_key_purpose: TariffApiKeyPurpose | "none";
-  completion_window: string; // SLA like "24h", "1h", etc.
+  completion_window: string; // Priority like "Standard (24h)", "High (1h)", etc.
 }
 
 // Internal representation with temporary IDs for editing
@@ -44,7 +44,7 @@ interface ModelTariffTableProps {
   onChange: (tariffs: TariffDefinition[]) => void;
   isLoading?: boolean;
   readOnly?: boolean;
-  availableSLAs?: string[]; // Available completion windows like ["24h", "1h", "12h"]
+  availableSLAs?: string[]; // Available priorities like ["Standard (24h)", "High (1h)"]
 }
 
 const EMPTY_FORM: TariffFormData = {
@@ -67,7 +67,7 @@ export const ModelTariffTable: React.FC<ModelTariffTableProps> = ({
   onChange,
   isLoading = false,
   readOnly = false,
-  availableSLAs = ["24h"], // Default to 24h if not provided
+  availableSLAs = ["Standard (24h)"], // Default to standard priority if not provided
 }) => {
   // Local state: convert ModelTariff[] to TariffEdit[] for editing
   const [localTariffs, setLocalTariffs] = useState<TariffEdit[]>([]);
@@ -101,14 +101,14 @@ export const ModelTariffTable: React.FC<ModelTariffTableProps> = ({
     );
   };
 
-  // Generate default name based on purpose and SLA
+  // Generate default name based on purpose and priority
   const getDefaultName = (
     purpose: TariffApiKeyPurpose | "none",
-    sla?: string,
+    priority?: string,
   ): string => {
     if (purpose === "none") return "";
-    if (purpose === "batch" && sla) {
-      return `Batch (${sla})`;
+    if (purpose === "batch" && priority) {
+      return priority; // Priority already includes display name like "Standard (24h)"
     }
     return API_KEY_PURPOSE_LABELS[purpose];
   };
@@ -138,7 +138,7 @@ export const ModelTariffTable: React.FC<ModelTariffTableProps> = ({
 
     // Batch tariffs must have a completion_window
     if (formData.api_key_purpose === "batch" && !formData.completion_window) {
-      newErrors.completion_window = "SLA is required for batch tariffs";
+      newErrors.completion_window = "Priority is required for batch tariffs";
     }
 
     setErrors(newErrors);
@@ -355,7 +355,7 @@ export const ModelTariffTable: React.FC<ModelTariffTableProps> = ({
                   <SelectTrigger
                     className={`w-full ${errors.completion_window ? "border-red-500" : ""}`}
                   >
-                    <SelectValue placeholder="Select SLA" />
+                    <SelectValue placeholder="Select Priority" />
                   </SelectTrigger>
                   <SelectContent>
                     {availableSLAs.map((sla) => (
@@ -413,7 +413,7 @@ export const ModelTariffTable: React.FC<ModelTariffTableProps> = ({
         <TableCell>
           {tariff.api_key_purpose
             ? tariff.api_key_purpose === "batch" && tariff.completion_window
-              ? `${API_KEY_PURPOSE_LABELS[tariff.api_key_purpose]} (${tariff.completion_window})`
+              ? `${API_KEY_PURPOSE_LABELS[tariff.api_key_purpose]} (${tariff.completion_window.charAt(0).toUpperCase() + tariff.completion_window.slice(1)})`
               : API_KEY_PURPOSE_LABELS[tariff.api_key_purpose]
             : API_KEY_PURPOSE_LABELS.none}
         </TableCell>
@@ -425,7 +425,7 @@ export const ModelTariffTable: React.FC<ModelTariffTableProps> = ({
         <TableCell>
           {tariff.completion_window ? (
             <span className="text-sm text-gray-600">
-              {tariff.completion_window}
+              {tariff.completion_window.charAt(0).toUpperCase() + tariff.completion_window.slice(1)}
             </span>
           ) : (
             <span className="text-sm text-gray-400 italic">N/A</span>
@@ -491,7 +491,7 @@ export const ModelTariffTable: React.FC<ModelTariffTableProps> = ({
               <TableHead className="w-[180px]">Name</TableHead>
               <TableHead className="w-20">Input (per 1M)</TableHead>
               <TableHead className="w-20">Output (per 1M)</TableHead>
-              <TableHead className="w-20">SLA</TableHead>
+              <TableHead className="w-20">Priority</TableHead>
               <TableHead className="w-20">Valid From</TableHead>
               <TableHead className="w-20">Actions</TableHead>
             </TableRow>
@@ -604,7 +604,7 @@ export const ModelTariffTable: React.FC<ModelTariffTableProps> = ({
                         <SelectTrigger
                           className={`w-full ${errors.completion_window ? "border-red-500" : ""}`}
                         >
-                          <SelectValue placeholder="Select SLA" />
+                          <SelectValue placeholder="Select Priority" />
                         </SelectTrigger>
                         <SelectContent>
                           {availableSLAs.map((sla) => (

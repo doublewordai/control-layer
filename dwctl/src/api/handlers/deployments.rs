@@ -355,13 +355,20 @@ pub async fn create_deployed_model<P: PoolProvider>(
     if let Some(tariff_defs) = tariffs {
         let mut tariffs_repo = Tariffs::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
         for tariff_def in tariff_defs {
+            // Normalize completion_window (convert "high"/"standard" to "1h"/"24h")
+            let completion_window = tariff_def.completion_window.map(|w| match w.as_str() {
+                "high" => "1h".to_string(),
+                "standard" => "24h".to_string(),
+                _ => w,
+            });
+
             let tariff_request = TariffCreateDBRequest {
                 deployed_model_id: model.id,
                 name: tariff_def.name,
                 input_price_per_token: tariff_def.input_price_per_token,
                 output_price_per_token: tariff_def.output_price_per_token,
                 api_key_purpose: tariff_def.api_key_purpose,
-                completion_window: tariff_def.completion_window,
+                completion_window,
                 valid_from: None, // Use NOW()
             };
             tariffs_repo.create(&tariff_request).await?;
@@ -450,11 +457,18 @@ pub async fn update_deployed_model<P: PoolProvider>(
         // Helper function to check if a tariff matches the definition
         let tariff_matches = |existing: &crate::db::models::tariffs::ModelTariff,
                               def: &crate::api::models::deployments::TariffDefinition| {
+            // Normalize def's completion_window for comparison (convert "high"/"standard" to "1h"/"24h")
+            let normalized_def_window = def.completion_window.as_ref().map(|w| match w.as_str() {
+                "high" => "1h".to_string(),
+                "standard" => "24h".to_string(),
+                _ => w.clone(),
+            });
+
             existing.name == def.name
                 && existing.input_price_per_token == def.input_price_per_token
                 && existing.output_price_per_token == def.output_price_per_token
                 && existing.api_key_purpose == def.api_key_purpose
-                && existing.completion_window == def.completion_window
+                && existing.completion_window == normalized_def_window
         };
 
         // Collect IDs of tariffs to close (those not in the new set or have changed)
@@ -476,13 +490,20 @@ pub async fn update_deployed_model<P: PoolProvider>(
                 continue;
             }
 
+            // Normalize completion_window (convert "high"/"standard" to "1h"/"24h")
+            let completion_window = tariff_def.completion_window.map(|w| match w.as_str() {
+                "high" => "1h".to_string(),
+                "standard" => "24h".to_string(),
+                _ => w,
+            });
+
             let tariff_request = TariffCreateDBRequest {
                 deployed_model_id: deployment_id,
                 name: tariff_def.name,
                 input_price_per_token: tariff_def.input_price_per_token,
                 output_price_per_token: tariff_def.output_price_per_token,
                 api_key_purpose: tariff_def.api_key_purpose,
-                completion_window: tariff_def.completion_window,
+                completion_window,
                 valid_from: None, // Use NOW()
             };
             tariffs_repo.create(&tariff_request).await?;

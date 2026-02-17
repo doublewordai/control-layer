@@ -518,7 +518,7 @@ pub struct DeploymentDBResponse {
     pub burst_size: Option<i32>,
     pub capacity: Option<i32>,
     pub batch_capacity: Option<i32>,
-    /// Throughput in requests/second for batch SLA capacity calculations
+    /// Throughput in requests/second for batch capacity calculations
     pub throughput: Option<f32>,
     // Provider/downstream pricing
     pub provider_pricing: Option<ProviderPricing>,

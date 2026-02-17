@@ -28,23 +28,7 @@ var bootstrapContent = `
     .dw-bb *, .dw-bb *::before { box-sizing: border-box; }
     .dw-bb p, .dw-bb h2, .dw-bb h3 { margin: 0; }
     .dw-glow {
-      position: absolute;
-      border-radius: 9999px;
-      pointer-events: none;
-    }
-    .dw-glow--top {
-      top: 0; right: 0;
-      width: 16rem; height: 16rem;
-      background: ${colors.primaryLighter};
-      filter: blur(48px);
-      transform: translate(50%, -50%);
-    }
-    .dw-glow--bottom {
-      bottom: 0; left: 0;
-      width: 12rem; height: 12rem;
-      background: ${colors.primaryLight};
-      filter: blur(32px);
-      transform: translate(-25%, 50%);
+      display: none;
     }
     .dw-content {
       position: relative;
@@ -61,13 +45,8 @@ var bootstrapContent = `
       gap: 0.5rem;
     }
     .dw-dot {
-      display: inline-block;
-      width: 0.5rem; height: 0.5rem;
-      border-radius: 9999px;
-      background: ${colors.primary};
-      animation: dwP 2s ease-in-out infinite;
+      display: none;
     }
-    @keyframes dwP { 0%,100%{opacity:1} 50%{opacity:.3} }
     .dw-muted { color: ${colors.muted}; }
     .dw-hl { color: ${colors.primary}; font-weight: 500; }
     .dw-badges { display: flex; flex-wrap: wrap; gap: 0.75rem; }
@@ -171,7 +150,7 @@ var bootstrapContent = `
       <div class="dw-badges">
         <div class="dw-badge">
           <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
-          <span>1h or 24h SLA</span>
+          <span>High or Standard Priority</span>
         </div>
         <div class="dw-badge">
           <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 17 13.5 8.5 8.5 13.5 2 7"/><polyline points="16 17 22 17 22 11"/></svg>
@@ -220,6 +199,16 @@ var bootstrapContent = `
           <div>
             <h3 class="dw-card-t">Book a 15-minute Demo</h3>
             <p class="dw-card-d">Talk to an engineer</p>
+          </div>
+          <span class="dw-card-arrow">&rarr;</span>
+        </a>
+        <a href="https://calendly.com/meryem-pikk/30min" target="_blank" rel="noopener noreferrer" class="dw-card">
+          <div class="dw-card-icon">
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>
+          </div>
+          <div>
+            <h3 class="dw-card-t">Book a 15-minute Demo</h3>
+            <p class="dw-card-d">Get a personalized walkthrough with our solutions engineer</p>
           </div>
           <span class="dw-card-arrow">&rarr;</span>
         </a>

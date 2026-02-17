@@ -610,8 +610,9 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                                                 e.stopPropagation()
                                               }
                                             >
-                                              {batchTariff.completion_window ||
-                                                "Batch"}
+                                              {batchTariff.completion_window
+                                                ? batchTariff.completion_window.charAt(0).toUpperCase() + batchTariff.completion_window.slice(1)
+                                                : "Batch"}
                                               :
                                               {!batchTariff.input_price_per_token &&
                                               !batchTariff.output_price_per_token ? (

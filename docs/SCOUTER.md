@@ -2,7 +2,7 @@
 
 ## Recent Change: Pending Queue Counts by Model + Completion Window
 
-- Added a new storage API to report queued request depth grouped by model and completion window (SLA).
+- Added a new storage API to report queued request depth grouped by model and completion window (priority).
 - API: `Storage::get_pending_request_counts_by_model_and_completion_window() -> Result<HashMap<String, HashMap<String, i64>>>`
   - Outer key: `model`
   - Inner key: `completion_window`

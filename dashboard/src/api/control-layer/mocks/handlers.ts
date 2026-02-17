@@ -1025,6 +1025,10 @@ export const handlers = [
       organization: "ACME Corp",
       payment_enabled: true,
       docs_url: "https://docs.doubleword.ai/control-layer",
+      batches: {
+        enabled: true,
+        allowed_completion_windows: ["Standard (24h)", "High (1h)"],
+      },
     });
   }),
 

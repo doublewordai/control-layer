@@ -1,7 +1,7 @@
-//! SLA capacity checking for batch creation.
+//! Completion window capacity checking for batch creation.
 //!
 //! This module provides functions to check whether a new batch can be accepted
-//! within the requested SLA window based on model throughput and pending work.
+//! within the requested completion window based on model throughput and pending work.
 
 use std::collections::HashMap;
 use tracing::info;
@@ -9,7 +9,7 @@ use tracing::info;
 /// Maximum window size in seconds to prevent overflow (roughly 100 years)
 const MAX_WINDOW_SECONDS: i64 = 3_153_600_000;
 
-/// Result of an SLA capacity check
+/// Result of a completion window capacity check
 #[derive(Debug)]
 pub struct SlaCapacityCheckResult {
     /// Whether there is sufficient capacity for the batch
@@ -18,7 +18,7 @@ pub struct SlaCapacityCheckResult {
     pub overloaded_models: HashMap<String, i64>,
 }
 
-/// Check if a batch can be accepted within the SLA window.
+/// Check if a batch can be accepted within the requested completion window.
 ///
 /// This is a simple check: for each model in the batch, verify that
 /// `(pending_requests + new_requests) <= throughput * window_seconds`
@@ -36,7 +36,7 @@ pub struct SlaCapacityCheckResult {
 /// * `pending_counts` - Map of model alias -> window -> pending request count
 /// * `model_throughputs` - Map of model alias to throughput (req/s)
 /// * `default_throughput` - Default throughput for models not in `model_throughputs`
-/// * `completion_window` - The SLA window (e.g., "24h", "1h")
+/// * `completion_window` - The completion window (e.g., "24h", "1h")
 ///
 /// # Returns
 /// `SlaCapacityCheckResult` indicating whether there's capacity and which models are overloaded
@@ -85,7 +85,7 @@ pub fn check_sla_capacity(
                 throughput = throughput,
                 window = completion_window,
                 deficit = deficit,
-                "Model exceeds SLA capacity"
+                "Model exceeds completion window capacity"
             );
             overloaded_models.insert(model_alias.clone(), deficit);
         }
@@ -406,7 +406,7 @@ mod tests {
         assert_eq!(result.overloaded_models.get("unknown-model"), Some(&6800)); // 50000 - 43200
     }
 
-    // ==================== Different SLA window tests ====================
+    // ==================== Different completion window tests ====================
 
     #[test]
     fn test_capacity_check_1h_window() {

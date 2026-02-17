@@ -12,6 +12,7 @@ use crate::api::models::batches::{
     BatchAnalytics, BatchErrors, BatchListResponse, BatchObjectType, BatchResponse, BatchResultsQuery, CreateBatchRequest,
     ListBatchesQuery, ListObjectType, RequestCounts, RetryRequestsRequest,
 };
+use crate::api::models::completion_window::format_completion_window;
 use crate::auth::permissions::{RequiresPermission, can_read_all_resources, has_permission, operation, resource};
 use crate::db::handlers::{Users, repository::Repository};
 use crate::errors::{Error, Result};
@@ -28,6 +29,22 @@ use futures::StreamExt;
 use std::collections::HashMap;
 use std::pin::Pin;
 use uuid::Uuid;
+
+/// Normalize completion_window from API request to internal storage format.
+///
+/// Accepts both user-friendly priority names and time-based completion window values:
+/// - "high" → "1h" (high priority, fast processing)
+/// - "standard" → "24h" (standard priority)
+/// - Any other value (e.g., "1h", "24h", "48h") → passed through unchanged
+///
+/// This allows custom completion windows while providing user-friendly priority names.
+fn normalize_completion_window(window: &str) -> String {
+    match window {
+        "high" => "1h".to_string(),
+        "standard" => "24h".to_string(),
+        _ => window.to_string(),
+    }
+}
 
 /// Helper function to convert fusillade Batch to OpenAI BatchResponse
 ///
@@ -123,7 +140,7 @@ fn to_batch_response_with_email(batch: fusillade::Batch, creator_email: Option<&
         endpoint: batch.endpoint.clone(),
         errors,
         input_file_id: batch.file_id.map(|id| id.0.to_string()).unwrap_or_default(),
-        completion_window: batch.completion_window.clone(),
+        completion_window: format_completion_window(&batch.completion_window),
         status: openai_status.to_string(),
         output_file_id: batch.output_file_id.map(|id| id.0.to_string()),
         // Always show error_file_id if it exists - the file content itself is filtered by fusillade
@@ -179,11 +196,15 @@ pub async fn create_batch<P: PoolProvider>(
     has_api_key: crate::auth::current_user::HasApiKey,
     Json(req): Json<CreateBatchRequest>,
 ) -> Result<(StatusCode, Json<BatchResponse>)> {
-    // Validate completion_window against configured allowed values
-    if !state.config.batches.allowed_completion_windows.contains(&req.completion_window) {
+    // Normalize completion_window (convert "high"/"standard" to "1h"/"24h", pass through other values)
+    let normalized_window = normalize_completion_window(&req.completion_window);
+
+    // Validate normalized value against configured allowed values
+    if !state.config.batches.allowed_completion_windows.contains(&normalized_window) {
+        // Provide helpful error message mentioning both priority names and configured values
         return Err(Error::BadRequest {
             message: format!(
-                "Unsupported completion_window '{}'. Allowed: {}",
+                "Unsupported completion_window '{}'. Use 'standard' (24h) or 'high' (1h), or one of the configured values: {}",
                 req.completion_window,
                 state.config.batches.allowed_completion_windows.join(", ")
             ),
@@ -274,7 +295,7 @@ pub async fn create_batch<P: PoolProvider>(
         &pending_counts,
         &model_throughputs,
         state.config.batches.default_throughput,
-        &req.completion_window,
+        &normalized_window,
     );
 
     if !capacity_result.has_capacity {
@@ -284,9 +305,9 @@ pub async fn create_batch<P: PoolProvider>(
             .map(|(model, deficit)| format!("{} (needs {} more capacity)", model, deficit))
             .collect();
         tracing::warn!(
-            completion_window = %req.completion_window,
+            completion_window = %normalized_window,
             overloaded_models = %overloaded_details.join(", "),
-            "Batch rejected due to insufficient SLA capacity"
+            "Batch rejected due to insufficient capacity"
         );
 
         // User-facing message: only list model names, no capacity details
@@ -294,8 +315,8 @@ pub async fn create_batch<P: PoolProvider>(
 
         return Err(Error::TooManyRequests {
             message: format!(
-                "Insufficient capacity for {} SLA window. The following models are currently at capacity: {}. Try again later or use a longer completion window.",
-                req.completion_window,
+                "Insufficient capacity for {} priority. The following models are currently at capacity: {}. Try again later or use a longer completion window.",
+                if normalized_window == "1h" { "high" } else { "standard" },
                 model_names.join(", ")
             ),
         });
@@ -318,7 +339,7 @@ pub async fn create_batch<P: PoolProvider>(
     let batch_input = fusillade::BatchInput {
         file_id: fusillade::FileId(file_id),
         endpoint: req.endpoint.clone(),
-        completion_window: req.completion_window.clone(),
+        completion_window: normalized_window,
         metadata,
         created_by: Some(current_user.id.to_string()),
     };
@@ -1990,5 +2011,241 @@ mod tests {
         let body = response.text();
         let lines: Vec<&str> = body.trim().lines().collect();
         assert_eq!(lines.len(), total, "Should return all request results");
+    }
+
+    /// Test that the normalize_completion_window function works correctly
+    #[test]
+    fn test_normalize_completion_window() {
+        // User-friendly priority names are normalized
+        assert_eq!(super::normalize_completion_window("high"), "1h");
+        assert_eq!(super::normalize_completion_window("standard"), "24h");
+
+        // Time-based values pass through unchanged
+        assert_eq!(super::normalize_completion_window("1h"), "1h");
+        assert_eq!(super::normalize_completion_window("24h"), "24h");
+        assert_eq!(super::normalize_completion_window("48h"), "48h");
+
+        // Unknown values also pass through (validation happens in the handler)
+        assert_eq!(super::normalize_completion_window("invalid"), "invalid");
+        assert_eq!(super::normalize_completion_window("12h"), "12h");
+        assert_eq!(super::normalize_completion_window(""), "");
+        assert_eq!(super::normalize_completion_window("HIGH"), "HIGH"); // case-sensitive
+    }
+
+    /// Test that batch responses format completion_window correctly
+    #[test]
+    fn test_batch_response_formats_completion_window() {
+        use crate::api::models::completion_window::format_completion_window;
+
+        // Internal storage values are formatted with priority labels
+        assert_eq!(format_completion_window("1h"), "High (1h)");
+        assert_eq!(format_completion_window("24h"), "Standard (24h)");
+
+        // Unknown values pass through unchanged
+        assert_eq!(format_completion_window("48h"), "48h");
+        assert_eq!(format_completion_window("12h"), "12h");
+    }
+
+    /// Test that create_batch API accepts "high" priority name
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_create_batch_with_high_priority(pool: PgPool) {
+        // Create app with config allowing 1h window
+        let mut config = create_test_config();
+        config.batches.allowed_completion_windows = vec!["1h".to_string(), "24h".to_string()];
+
+        let (app, _bg_services) = create_test_app_with_config(pool.clone(), config, false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        // Upload a batch file
+        let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}"#;
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test-batch.jsonl");
+        let multipart = axum_test::multipart::MultipartForm::new()
+            .add_part("file", file_part)
+            .add_part("purpose", axum_test::multipart::Part::text("batch"));
+        let upload_resp = app
+            .post("/ai/v1/files")
+            .multipart(multipart)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        upload_resp.assert_status(StatusCode::CREATED);
+        let file: serde_json::Value = upload_resp.json();
+        let file_id = file["id"].as_str().unwrap();
+
+        // Create batch with "high" priority (should normalize to "1h")
+        let create_req = CreateBatchRequest {
+            input_file_id: file_id.to_string(),
+            endpoint: "/v1/chat/completions".to_string(),
+            completion_window: "high".to_string(),
+            metadata: None,
+        };
+
+        let resp = app
+            .post("/ai/v1/batches")
+            .json(&create_req)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        resp.assert_status(StatusCode::CREATED);
+        let batch: serde_json::Value = resp.json();
+
+        // Verify the API returns formatted priority label (stored as "1h" internally)
+        assert_eq!(batch["completion_window"].as_str().unwrap(), "High (1h)");
+    }
+
+    /// Test that create_batch API accepts "standard" priority name
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_create_batch_with_standard_priority(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        // Upload a batch file
+        let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}"#;
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test-batch.jsonl");
+        let multipart = axum_test::multipart::MultipartForm::new()
+            .add_part("file", file_part)
+            .add_part("purpose", axum_test::multipart::Part::text("batch"));
+        let upload_resp = app
+            .post("/ai/v1/files")
+            .multipart(multipart)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        upload_resp.assert_status(StatusCode::CREATED);
+        let file: serde_json::Value = upload_resp.json();
+        let file_id = file["id"].as_str().unwrap();
+
+        // Create batch with "standard" priority (should normalize to "24h")
+        let create_req = CreateBatchRequest {
+            input_file_id: file_id.to_string(),
+            endpoint: "/v1/chat/completions".to_string(),
+            completion_window: "standard".to_string(),
+            metadata: None,
+        };
+
+        let resp = app
+            .post("/ai/v1/batches")
+            .json(&create_req)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        resp.assert_status(StatusCode::CREATED);
+        let batch: serde_json::Value = resp.json();
+
+        // Verify the API returns formatted priority label (stored as "24h" internally)
+        assert_eq!(batch["completion_window"].as_str().unwrap(), "Standard (24h)");
+    }
+
+    /// Test that legacy "1h" format still works (backwards compatibility)
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_create_batch_with_legacy_1h_format(pool: PgPool) {
+        // Create app with config allowing 1h window
+        let mut config = create_test_config();
+        config.batches.allowed_completion_windows = vec!["1h".to_string(), "24h".to_string()];
+
+        let (app, _bg_services) = create_test_app_with_config(pool.clone(), config, false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        // Upload a batch file
+        let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}"#;
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test-batch.jsonl");
+        let multipart = axum_test::multipart::MultipartForm::new()
+            .add_part("file", file_part)
+            .add_part("purpose", axum_test::multipart::Part::text("batch"));
+        let upload_resp = app
+            .post("/ai/v1/files")
+            .multipart(multipart)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        upload_resp.assert_status(StatusCode::CREATED);
+        let file: serde_json::Value = upload_resp.json();
+        let file_id = file["id"].as_str().unwrap();
+
+        // Create batch with legacy "1h" format
+        let create_req = CreateBatchRequest {
+            input_file_id: file_id.to_string(),
+            endpoint: "/v1/chat/completions".to_string(),
+            completion_window: "1h".to_string(),
+            metadata: None,
+        };
+
+        let resp = app
+            .post("/ai/v1/batches")
+            .json(&create_req)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        resp.assert_status(StatusCode::CREATED);
+        let batch: serde_json::Value = resp.json();
+
+        // Verify the API returns formatted priority label (legacy "1h" input accepted and formatted)
+        assert_eq!(batch["completion_window"].as_str().unwrap(), "High (1h)");
+    }
+
+    /// Test that invalid completion_window values are rejected
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_create_batch_rejects_invalid_completion_window(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        // Upload a batch file
+        let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}"#;
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test-batch.jsonl");
+        let multipart = axum_test::multipart::MultipartForm::new()
+            .add_part("file", file_part)
+            .add_part("purpose", axum_test::multipart::Part::text("batch"));
+        let upload_resp = app
+            .post("/ai/v1/files")
+            .multipart(multipart)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        upload_resp.assert_status(StatusCode::CREATED);
+        let file: serde_json::Value = upload_resp.json();
+        let file_id = file["id"].as_str().unwrap();
+
+        // Try to create batch with invalid completion_window
+        let create_req = CreateBatchRequest {
+            input_file_id: file_id.to_string(),
+            endpoint: "/v1/chat/completions".to_string(),
+            completion_window: "invalid".to_string(),
+            metadata: None,
+        };
+
+        let resp = app
+            .post("/ai/v1/batches")
+            .json(&create_req)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        resp.assert_status(StatusCode::BAD_REQUEST);
+        let error_text = resp.text();
+        assert!(error_text.contains("Unsupported completion_window"));
+        assert!(error_text.contains("standard") || error_text.contains("high"));
     }
 }
