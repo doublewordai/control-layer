@@ -1,5 +1,12 @@
 # Changelog
 
+## [7.5.0](https://github.com/doublewordai/control-layer/compare/v7.4.1...v7.5.0) (2026-02-17)
+
+
+### Features
+
+* support with-replacement sampling for weighted random failover ([#704](https://github.com/doublewordai/control-layer/issues/704)) ([3c4fb9b](https://github.com/doublewordai/control-layer/commit/3c4fb9b97affac993e24595e337a457fe22449d0))
+
 ## [7.4.1](https://github.com/doublewordai/control-layer/compare/v7.4.0...v7.4.1) (2026-02-16)
 
 
