@@ -980,6 +980,9 @@ const ModelInfo: React.FC = () => {
                                   : "None"
                               }
                             />
+                            <p className="text-xs text-gray-500 mt-1">
+                              Defaults to 100 req/s if not set.
+                            </p>
                           </div>
                         </div>
                         {(updateData.requests_per_second ||
@@ -1009,7 +1012,7 @@ const ModelInfo: React.FC = () => {
                           </div>
                         )}
                         <p className="text-xs text-gray-500 mt-2">
-                          Leave fields blank for no limits.
+                          Leave fields blank for no limits/defaults.
                         </p>
                         {updateData.burst_size &&
                           !updateData.requests_per_second && (
@@ -1509,7 +1512,7 @@ const ModelInfo: React.FC = () => {
                                 <p className="font-medium">
                                   {model.throughput
                                     ? `${model.throughput} req/s`
-                                    : "System default"}
+                                    : "100 req/s (default)"}
                                 </p>
                               </div>
                             </div>
