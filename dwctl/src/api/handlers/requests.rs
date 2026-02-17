@@ -18,7 +18,9 @@ use crate::{
         users::CurrentUser,
     },
     auth::permissions::{RequiresPermission, operation, resource},
-    db::handlers::analytics::{get_model_user_usage, get_requests_aggregate, get_user_batch_usage, get_user_model_breakdown, list_http_analytics},
+    db::handlers::analytics::{
+        get_model_user_usage, get_requests_aggregate, get_user_batch_usage, get_user_model_breakdown, list_http_analytics,
+    },
     errors::Error,
 };
 use chrono::{DateTime, Duration, Utc};
