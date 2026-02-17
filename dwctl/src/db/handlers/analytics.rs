@@ -1042,7 +1042,71 @@ pub async fn get_user_batch_counts(pool: &PgPool, user_id: Uuid) -> Result<(i64,
     ))
 }
 
-/// Get per-model breakdown for a user's batched requests from http_analytics.
+/// Incrementally aggregate new http_analytics rows into the user_model_usage summary table.
+/// Uses a cursor to track the last processed id, so only new rows are scanned.
+#[instrument(skip(pool), err)]
+pub async fn refresh_user_model_usage(pool: &PgPool) -> Result<()> {
+    let mut tx = pool.begin().await?;
+
+    let cursor: i64 = sqlx::query_scalar!(
+        "SELECT last_processed_id FROM user_model_usage_cursor WHERE id = TRUE FOR UPDATE"
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+
+    let new_max: Option<i64> = sqlx::query_scalar!(
+        r#"
+        SELECT MAX(id) FROM http_analytics
+        WHERE id > $1 AND user_id IS NOT NULL AND model IS NOT NULL AND fusillade_batch_id IS NOT NULL
+        "#,
+        cursor
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+
+    let Some(new_max) = new_max else {
+        return Ok(());
+    };
+
+    sqlx::query!(
+        r#"
+        INSERT INTO user_model_usage (user_id, model, input_tokens, output_tokens, cost, request_count)
+        SELECT user_id,
+               model,
+               COALESCE(SUM(prompt_tokens), 0),
+               COALESCE(SUM(completion_tokens), 0),
+               COALESCE(SUM(total_cost), 0),
+               COUNT(*)
+        FROM http_analytics
+        WHERE id > $1 AND id <= $2
+              AND user_id IS NOT NULL AND model IS NOT NULL AND fusillade_batch_id IS NOT NULL
+        GROUP BY user_id, model
+        ON CONFLICT (user_id, model)
+        DO UPDATE SET
+            input_tokens = user_model_usage.input_tokens + EXCLUDED.input_tokens,
+            output_tokens = user_model_usage.output_tokens + EXCLUDED.output_tokens,
+            cost = user_model_usage.cost + EXCLUDED.cost,
+            request_count = user_model_usage.request_count + EXCLUDED.request_count,
+            updated_at = NOW()
+        "#,
+        cursor,
+        new_max
+    )
+    .execute(&mut *tx)
+    .await?;
+
+    sqlx::query!(
+        "UPDATE user_model_usage_cursor SET last_processed_id = $1, updated_at = NOW() WHERE id = TRUE",
+        new_max
+    )
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Get per-model breakdown from the pre-aggregated user_model_usage table.
 /// Totals (tokens, cost, request count) are derived from these results by the handler.
 #[instrument(skip(pool), err)]
 pub async fn get_user_model_breakdown(pool: &PgPool, user_id: Uuid) -> Result<Vec<ModelBreakdownEntry>> {
@@ -1050,14 +1114,13 @@ pub async fn get_user_model_breakdown(pool: &PgPool, user_id: Uuid) -> Result<Ve
         ModelBreakdownRow,
         r#"
         SELECT model,
-               COALESCE(SUM(prompt_tokens), 0)::bigint as input_tokens,
-               COALESCE(SUM(completion_tokens), 0)::bigint as output_tokens,
-               COALESCE(SUM(total_cost), 0) as cost,
-               COUNT(*) as request_count
-        FROM http_analytics
-        WHERE user_id = $1 AND fusillade_batch_id IS NOT NULL AND model IS NOT NULL
-        GROUP BY model
-        ORDER BY COUNT(*) DESC
+               input_tokens,
+               output_tokens,
+               cost,
+               request_count
+        FROM user_model_usage
+        WHERE user_id = $1
+        ORDER BY request_count DESC
         "#,
         user_id
     )
