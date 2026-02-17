@@ -20,6 +20,9 @@ dwctl/static/*
 !dwctl/static/index.html
 target/
 
+# Generated email files (for testing)
+dwctl/emails/
+
 # Coverage reports
 cobertura.xml
 *.lcov
