@@ -378,10 +378,9 @@ pub async fn get_batch<P: PoolProvider>(
         message: "Invalid batch ID format".to_string(),
     })?;
 
-    // Get batch with SLA-appropriate error filtering (hide retriable errors before SLA expiry)
     let batch = state
         .request_manager
-        .get_batch(fusillade::BatchId(batch_id), true)
+        .get_batch(fusillade::BatchId(batch_id))
         .await
         .map_err(|_| Error::NotFound {
             resource: "Batch".to_string(),
@@ -433,10 +432,9 @@ pub async fn get_batch_analytics<P: PoolProvider>(
     })?;
 
     // Get batch first to verify it exists and check permissions
-    // Hide retriable errors before SLA expiry
     let batch = state
         .request_manager
-        .get_batch(fusillade::BatchId(batch_id), true)
+        .get_batch(fusillade::BatchId(batch_id))
         .await
         .map_err(|_| Error::NotFound {
             resource: "Batch".to_string(),
@@ -497,10 +495,9 @@ pub async fn get_batch_results<P: PoolProvider>(
     })?;
 
     // Get batch first to verify it exists and check permissions
-    // Hide retriable errors before SLA expiry
     let batch = state
         .request_manager
-        .get_batch(fusillade::BatchId(batch_id), true)
+        .get_batch(fusillade::BatchId(batch_id))
         .await
         .map_err(|_| Error::NotFound {
             resource: "Batch".to_string(),
@@ -526,7 +523,7 @@ pub async fn get_batch_results<P: PoolProvider>(
     let status = query.status.clone();
     let results_stream = state
         .request_manager
-        .get_batch_results_stream(fusillade::BatchId(batch_id), offset, search, status, true);
+        .get_batch_results_stream(fusillade::BatchId(batch_id), offset, search, status);
 
     // Apply limit if specified, fetching one extra to detect if there are more results
     let requested_limit = query.pagination.limit.map(|l| l as usize);
@@ -616,10 +613,9 @@ pub async fn cancel_batch<P: PoolProvider>(
     })?;
 
     // Get batch first to verify it exists
-    // Hide retriable errors before SLA expiry
     let batch = state
         .request_manager
-        .get_batch(fusillade::BatchId(batch_id), true)
+        .get_batch(fusillade::BatchId(batch_id))
         .await
         .map_err(|_| Error::NotFound {
             resource: "Batch".to_string(),
@@ -648,10 +644,9 @@ pub async fn cancel_batch<P: PoolProvider>(
         })?;
 
     // Fetch updated batch to get latest status
-    // Hide retriable errors before SLA expiry
     let batch = state
         .request_manager
-        .get_batch(fusillade::BatchId(batch_id), true)
+        .get_batch(fusillade::BatchId(batch_id))
         .await
         .map_err(|_| Error::NotFound {
             resource: "Batch".to_string(),
@@ -694,10 +689,9 @@ pub async fn delete_batch<P: PoolProvider>(
     })?;
 
     // Get batch first to verify it exists and check ownership
-    // Hide retriable errors before SLA expiry
     let batch = state
         .request_manager
-        .get_batch(fusillade::BatchId(batch_id), true)
+        .get_batch(fusillade::BatchId(batch_id))
         .await
         .map_err(|_| Error::NotFound {
             resource: "Batch".to_string(),
@@ -759,10 +753,9 @@ pub async fn retry_failed_batch_requests<P: PoolProvider>(
     })?;
 
     // Get batch first to verify it exists
-    // Hide retriable errors before SLA expiry
     let batch = state
         .request_manager
-        .get_batch(fusillade::BatchId(batch_id), true)
+        .get_batch(fusillade::BatchId(batch_id))
         .await
         .map_err(|_| Error::NotFound {
             resource: "Batch".to_string(),
@@ -803,10 +796,9 @@ pub async fn retry_failed_batch_requests<P: PoolProvider>(
     );
 
     // Fetch updated batch to get latest status
-    // Hide retriable errors before SLA expiry
     let batch = state
         .request_manager
-        .get_batch(fusillade::BatchId(batch_id), true)
+        .get_batch(fusillade::BatchId(batch_id))
         .await
         .map_err(|_| Error::NotFound {
             resource: "Batch".to_string(),
@@ -849,10 +841,9 @@ pub async fn retry_specific_requests<P: PoolProvider>(
     })?;
 
     // Get batch first to verify it exists
-    // Hide retriable errors before SLA expiry
     let batch = state
         .request_manager
-        .get_batch(fusillade::BatchId(batch_id), true)
+        .get_batch(fusillade::BatchId(batch_id))
         .await
         .map_err(|_| Error::NotFound {
             resource: "Batch".to_string(),
@@ -922,10 +913,9 @@ pub async fn retry_specific_requests<P: PoolProvider>(
     );
 
     // Fetch updated batch to get latest status
-    // Hide retriable errors before SLA expiry
     let batch = state
         .request_manager
-        .get_batch(fusillade::BatchId(batch_id), true)
+        .get_batch(fusillade::BatchId(batch_id))
         .await
         .map_err(|_| Error::NotFound {
             resource: "Batch".to_string(),
@@ -973,11 +963,9 @@ pub async fn list_batches<P: PoolProvider>(
     let created_by = if can_read_all { None } else { Some(current_user.id.to_string()) };
 
     // Fetch batches with ownership filtering, search, and cursor-based pagination
-    // Per-batch SLA-based error filtering is now handled efficiently in the database layer
-    // using SQL CASE expressions (hide retriable errors before each batch's SLA expiry)
     let batches = state
         .request_manager
-        .list_batches(created_by, query.search.clone(), after, limit + 1, true) // Fetch one extra to determine has_more
+        .list_batches(created_by, query.search.clone(), after, limit + 1) // Fetch one extra to determine has_more
         .await
         .map_err(|e| Error::Internal {
             operation: format!("list batches: {}", e),
