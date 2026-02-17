@@ -221,6 +221,11 @@ fn create_response() {}
             extra_types::ModelObject,
             extra_types::OpenAIErrorResponse,
             extra_types::OpenAIError,
+            // Responses API types
+            extra_types::ResponseRequest,
+            extra_types::ResponseObject,
+            extra_types::ResponseInput,
+            extra_types::ResponseItem,
             // File/Batch types
             api::models::files::ListFilesQuery,
             api::models::files::FileResponse,
