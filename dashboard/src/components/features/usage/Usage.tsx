@@ -1,21 +1,13 @@
-import { useMemo, useState } from "react";
+import { useMemo } from "react";
 import { useUsage } from "@/api/control-layer/hooks";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table";
 import {
   ChartContainer,
   ChartTooltip,
   ChartTooltipContent,
   type ChartConfig,
 } from "@/components/ui/chart";
-import { BarChart, Bar, XAxis, YAxis, CartesianGrid } from "recharts";
+import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Legend } from "recharts";
 import { formatDollars } from "@/utils/money";
 
 function formatNumber(n: number): string {
@@ -102,47 +94,30 @@ function TokenBreakdownCard({
   );
 }
 
-type ChartMetric = "requests" | "tokens" | "cost";
+const tokenChartConfig = {
+  input_tokens: { label: "Input Tokens", color: "#3b82f6" },
+  output_tokens: { label: "Output Tokens", color: "#10b981" },
+} satisfies ChartConfig;
 
-const CHART_METRICS: { value: ChartMetric; label: string }[] = [
-  { value: "requests", label: "Requests" },
-  { value: "tokens", label: "Tokens" },
-  { value: "cost", label: "Cost" },
-];
+const costChartConfig = {
+  cost: { label: "Cost", color: "#8b5cf6" },
+  requests: { label: "Requests", color: "#f59e0b" },
+} satisfies ChartConfig;
 
 export function Usage() {
   const { data: usage, isLoading } = useUsage();
-  const [chartMetric, setChartMetric] = useState<ChartMetric>("requests");
 
-  const { chartData, chartConfig } = useMemo(() => {
-    if (!usage?.by_model.length) return { chartData: [], chartConfig: {} };
+  const chartData = useMemo(() => {
+    if (!usage?.by_model.length) return [];
 
-    const models = usage.by_model.slice(0, 8);
-    const data = models.map((entry, index) => ({
+    return usage.by_model.slice(0, 8).map((entry) => ({
       model: entry.model.split("/").pop() || entry.model,
       requests: entry.request_count,
-      tokens: entry.input_tokens + entry.output_tokens,
+      input_tokens: entry.input_tokens,
+      output_tokens: entry.output_tokens,
       cost: parseFloat(entry.cost),
-      fill: `var(--chart-${(index % 5) + 1})`,
     }));
-
-    const config = Object.fromEntries(
-      models.map((entry, index) => [
-        entry.model.split("/").pop() || entry.model,
-        {
-          label: entry.model.split("/").pop() || entry.model,
-          color: `var(--chart-${(index % 5) + 1})`,
-        },
-      ]),
-    ) satisfies ChartConfig;
-
-    return { chartData: data, chartConfig: config };
   }, [usage?.by_model]);
-
-  const chartFormatter = (value: number) => {
-    if (chartMetric === "cost") return formatDollars(value, 2);
-    return formatNumber(value);
-  };
 
   if (isLoading) {
     return (
@@ -205,29 +180,14 @@ export function Usage() {
       {usage.by_model.length > 0 && (
         <div className="grid gap-4 lg:grid-cols-2">
           <Card>
-            <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
+            <CardHeader className="pb-2">
               <CardTitle className="text-sm font-medium">
-                By Model
+                Tokens by Model
               </CardTitle>
-              <div className="flex gap-1 rounded-lg bg-muted p-0.5">
-                {CHART_METRICS.map((m) => (
-                  <button
-                    key={m.value}
-                    onClick={() => setChartMetric(m.value)}
-                    className={`px-2.5 py-1 text-xs font-medium rounded-md transition-colors ${
-                      chartMetric === m.value
-                        ? "bg-background text-foreground shadow-sm"
-                        : "text-muted-foreground hover:text-foreground"
-                    }`}
-                  >
-                    {m.label}
-                  </button>
-                ))}
-              </div>
             </CardHeader>
             <CardContent>
               <ChartContainer
-                config={chartConfig}
+                config={tokenChartConfig}
                 className="h-[300px] w-full"
               >
                 <BarChart
@@ -238,7 +198,7 @@ export function Usage() {
                   <CartesianGrid horizontal={false} strokeDasharray="3 3" />
                   <XAxis
                     type="number"
-                    tickFormatter={chartMetric === "cost" ? (v: number) => formatDollars(v, 0) : formatCompact}
+                    tickFormatter={formatCompact}
                     fontSize={12}
                   />
                   <YAxis
@@ -252,13 +212,24 @@ export function Usage() {
                   <ChartTooltip
                     content={
                       <ChartTooltipContent
-                        formatter={(value) => chartFormatter(value as number)}
+                        formatter={(value) => formatNumber(value as number)}
                       />
                     }
                   />
+                  <Legend />
                   <Bar
-                    dataKey={chartMetric}
+                    dataKey="input_tokens"
+                    stackId="tokens"
+                    fill="#3b82f6"
+                    radius={[0, 0, 0, 0]}
+                    name="Input Tokens"
+                  />
+                  <Bar
+                    dataKey="output_tokens"
+                    stackId="tokens"
+                    fill="#10b981"
                     radius={[0, 4, 4, 0]}
+                    name="Output Tokens"
                   />
                 </BarChart>
               </ChartContainer>
@@ -266,40 +237,72 @@ export function Usage() {
           </Card>
 
           <Card>
-            <CardHeader>
+            <CardHeader className="pb-2">
               <CardTitle className="text-sm font-medium">
-                Per-Model Breakdown
+                Cost & Requests by Model
               </CardTitle>
             </CardHeader>
             <CardContent>
-              <Table>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead>Model</TableHead>
-                    <TableHead className="text-right">Input</TableHead>
-                    <TableHead className="text-right">Output</TableHead>
-                    <TableHead className="text-right">Cost</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {usage.by_model.map((entry) => (
-                    <TableRow key={entry.model}>
-                      <TableCell className="font-medium">
-                        {entry.model}
-                      </TableCell>
-                      <TableCell className="text-right tabular-nums">
-                        {formatCompact(entry.input_tokens)}
-                      </TableCell>
-                      <TableCell className="text-right tabular-nums">
-                        {formatCompact(entry.output_tokens)}
-                      </TableCell>
-                      <TableCell className="text-right tabular-nums">
-                        {formatDollars(parseFloat(entry.cost), 4)}
-                      </TableCell>
-                    </TableRow>
-                  ))}
-                </TableBody>
-              </Table>
+              <ChartContainer
+                config={costChartConfig}
+                className="h-[300px] w-full"
+              >
+                <BarChart
+                  data={chartData}
+                  layout="vertical"
+                  margin={{ top: 0, right: 16, bottom: 0, left: 0 }}
+                >
+                  <CartesianGrid horizontal={false} strokeDasharray="3 3" />
+                  <XAxis
+                    xAxisId="cost"
+                    type="number"
+                    orientation="bottom"
+                    tickFormatter={(v: number) => formatDollars(v, 2)}
+                    fontSize={12}
+                  />
+                  <XAxis
+                    xAxisId="requests"
+                    type="number"
+                    orientation="top"
+                    tickFormatter={formatCompact}
+                    fontSize={12}
+                  />
+                  <YAxis
+                    dataKey="model"
+                    type="category"
+                    width={140}
+                    fontSize={12}
+                    tickLine={false}
+                    axisLine={false}
+                  />
+                  <ChartTooltip
+                    content={
+                      <ChartTooltipContent
+                        formatter={(value, name) => {
+                          if (name === "cost") return formatDollars(value as number, 4);
+                          return formatNumber(value as number);
+                        }}
+                      />
+                    }
+                  />
+                  <Legend />
+                  <Bar
+                    xAxisId="cost"
+                    dataKey="cost"
+                    fill="#8b5cf6"
+                    radius={[0, 4, 4, 0]}
+                    name="Cost"
+                  />
+                  <Bar
+                    xAxisId="requests"
+                    dataKey="requests"
+                    fill="#f59e0b"
+                    radius={[0, 4, 4, 0]}
+                    opacity={0.6}
+                    name="Requests"
+                  />
+                </BarChart>
+              </ChartContainer>
             </CardContent>
           </Card>
         </div>
