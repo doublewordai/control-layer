@@ -44,7 +44,7 @@ pub struct FileContentQuery {
 /// Query parameters for file cost estimate
 #[derive(Debug, Deserialize, IntoParams, ToSchema)]
 pub struct FileCostEstimateQuery {
-    /// Completion window (SLA) for batch processing (e.g., "24h", "1h", "48h")
+    /// Completion window (priority) for batch processing (e.g., "24h", "1h", "48h")
     /// If not provided, defaults to "24h"
     pub completion_window: Option<String>,
 }

@@ -86,7 +86,7 @@ pub struct RawAnalyticsRecord {
     pub fusillade_batch_id: Option<Uuid>,
     pub fusillade_request_id: Option<Uuid>,
     pub custom_id: Option<String>,
-    /// The completion window SLA (e.g., "24h") - used for batch pricing lookup
+    /// The completion window (e.g., "24h") - used for batch pricing lookup
     pub batch_completion_window: Option<String>,
     /// The batch creation timestamp (from x-fusillade-batch-created-at header)
     /// Used to look up tariff pricing as of batch creation time, not processing time
@@ -559,7 +559,7 @@ where
             .filter(|t| t.effective_from <= timestamp && t.valid_until.is_none_or(|valid_until| valid_until > timestamp))
             .collect();
 
-        // Try exact match with completion_window (for batch tariffs with specific SLA)
+        // Try exact match with completion_window (for batch tariffs with specific priority)
         if let Some(cw) = completion_window
             && let Some(tariff) = valid_tariffs
                 .iter()
@@ -569,7 +569,7 @@ where
         }
 
         // Try generic tariff for this purpose (completion_window = None)
-        // This ensures we don't accidentally match a different SLA tier
+        // This ensures we don't accidentally match a different priority tier
         if let Some(tariff) = valid_tariffs
             .iter()
             .find(|t| &t.purpose == purpose && t.completion_window.is_none())
@@ -1291,23 +1291,23 @@ mod tests {
                 "0.00020",
                 None,
             ),
-            // SLA-specific batch tariff for 24h window
+            // Priority-specific batch tariff for 24h window
             make_tariff(
                 ApiKeyPurpose::Batch,
                 now - chrono::Duration::days(1),
                 None,
-                "0.00005", // Cheaper for 24h SLA
+                "0.00005", // Cheaper for 24h priority
                 "0.00010",
                 Some("24h"),
             ),
         ];
 
-        // Request with 24h completion window should get the SLA-specific pricing
+        // Request with 24h completion window should get the priority-specific pricing
         let (input, output) = find_tariff(&tariffs, Some(&ApiKeyPurpose::Batch), Some("24h"), now);
         assert_eq!(
             input,
             Some(Decimal::from_str("0.00005").unwrap()),
-            "24h SLA should get specific pricing"
+            "24h priority should get specific pricing"
         );
         assert_eq!(output, Some(Decimal::from_str("0.00010").unwrap()));
 
@@ -1316,14 +1316,14 @@ mod tests {
         assert_eq!(
             input,
             Some(Decimal::from_str("0.00010").unwrap()),
-            "No SLA should get generic pricing"
+            "No priority should get generic pricing"
         );
         assert_eq!(output, Some(Decimal::from_str("0.00020").unwrap()));
     }
 
     #[test]
     fn test_find_best_tariff_completion_window_fallback_to_generic() {
-        // Test that unknown completion_window falls back to generic tariff, not another SLA
+        // Test that unknown completion_window falls back to generic tariff, not another priority
         let now = chrono::Utc::now();
         let tariffs = vec![
             // Generic batch tariff
@@ -1335,7 +1335,7 @@ mod tests {
                 "0.00020",
                 None,
             ),
-            // 24h SLA tariff
+            // 24h priority tariff
             make_tariff(
                 ApiKeyPurpose::Batch,
                 now - chrono::Duration::days(1),
@@ -1344,7 +1344,7 @@ mod tests {
                 "0.00010",
                 Some("24h"),
             ),
-            // 7d SLA tariff
+            // 7d priority tariff
             make_tariff(
                 ApiKeyPurpose::Batch,
                 now - chrono::Duration::days(1),
@@ -1355,12 +1355,12 @@ mod tests {
             ),
         ];
 
-        // Request with unknown "1h" SLA should fall back to generic, NOT to 24h or 7d
+        // Request with unknown "1h" priority should fall back to generic, NOT to 24h or 7d
         let (input, output) = find_tariff(&tariffs, Some(&ApiKeyPurpose::Batch), Some("1h"), now);
         assert_eq!(
             input,
             Some(Decimal::from_str("0.00010").unwrap()),
-            "Unknown SLA should fall back to generic, not another SLA"
+            "Unknown priority should fall back to generic, not another priority"
         );
         assert_eq!(output, Some(Decimal::from_str("0.00020").unwrap()));
     }

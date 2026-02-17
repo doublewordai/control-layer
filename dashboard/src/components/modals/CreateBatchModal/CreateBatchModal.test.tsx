@@ -106,7 +106,7 @@ describe("CreateBatchModal", () => {
     vi.mocked(hooks.useConfig).mockReturnValue({
       data: {
         batches: {
-          allowed_completion_windows: ["24h"],
+          allowed_completion_windows: ["Standard (24h)"],
         },
       },
       isLoading: false,
@@ -203,9 +203,8 @@ describe("CreateBatchModal", () => {
       );
 
       // Add a description
-      const descriptionInput = screen.getByPlaceholderText(
-        /Data generation task/i,
-      );
+      const descriptionInput =
+        screen.getByPlaceholderText(/Data generation task/i);
       await user.type(descriptionInput, "Test batch");
 
       // Find and click the Create Batch button
@@ -219,7 +218,7 @@ describe("CreateBatchModal", () => {
         expect(mutateAsync).toHaveBeenCalledWith({
           input_file_id: "file-123",
           endpoint: "/v1/chat/completions",
-          completion_window: "24h",
+          completion_window: "Standard (24h)",
           metadata: {
             batch_description: "Test batch",
           },
@@ -351,9 +350,8 @@ describe("CreateBatchModal", () => {
       );
 
       // Find and focus the description input - use screen since Dialog renders in a portal
-      const descriptionInput = screen.getByPlaceholderText(
-        /Data generation task/i,
-      );
+      const descriptionInput =
+        screen.getByPlaceholderText(/Data generation task/i);
       await user.click(descriptionInput);
       await user.type(descriptionInput, "Test batch description");
 
@@ -365,7 +363,7 @@ describe("CreateBatchModal", () => {
         expect(mutateAsync).toHaveBeenCalledWith({
           input_file_id: "file-123",
           endpoint: "/v1/chat/completions",
-          completion_window: "24h",
+          completion_window: "Standard (24h)",
           metadata: {
             batch_description: "Test batch description",
           },
@@ -413,9 +411,8 @@ describe("CreateBatchModal", () => {
       );
 
       // Find and focus the description input - use screen since Dialog renders in a portal
-      const descriptionInput = screen.getByPlaceholderText(
-        /Data generation task/i,
-      );
+      const descriptionInput =
+        screen.getByPlaceholderText(/Data generation task/i);
       await user.click(descriptionInput);
       await user.type(descriptionInput, "Test description");
 
@@ -460,9 +457,8 @@ describe("CreateBatchModal", () => {
       );
 
       // Find and focus the description input - use screen since Dialog renders in a portal
-      const descriptionInput = screen.getByPlaceholderText(
-        /Data generation task/i,
-      );
+      const descriptionInput =
+        screen.getByPlaceholderText(/Data generation task/i);
       await user.click(descriptionInput);
       await user.type(descriptionInput, "Test description");
 
@@ -509,9 +505,8 @@ describe("CreateBatchModal", () => {
       );
 
       // Find and focus the description input (don't type anything) - use screen since Dialog renders in a portal
-      const descriptionInput = screen.getByPlaceholderText(
-        /Data generation task/i,
-      );
+      const descriptionInput =
+        screen.getByPlaceholderText(/Data generation task/i);
       await user.click(descriptionInput);
 
       // Press Enter without typing
@@ -522,7 +517,7 @@ describe("CreateBatchModal", () => {
         expect(mutateAsync).toHaveBeenCalledWith({
           input_file_id: "file-123",
           endpoint: "/v1/chat/completions",
-          completion_window: "24h",
+          completion_window: "Standard (24h)",
           metadata: undefined,
         });
       });

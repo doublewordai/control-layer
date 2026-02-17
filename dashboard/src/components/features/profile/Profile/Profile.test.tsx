@@ -281,14 +281,10 @@ describe("Webhooks", () => {
     });
 
     // Description is shown
-    expect(
-      within(container).getByText("My test webhook"),
-    ).toBeInTheDocument();
+    expect(within(container).getByText("My test webhook")).toBeInTheDocument();
 
     // Event type badges
-    expect(
-      within(container).getByText("batch.completed"),
-    ).toBeInTheDocument();
+    expect(within(container).getByText("batch.completed")).toBeInTheDocument();
     expect(within(container).getByText("batch.failed")).toBeInTheDocument();
 
     // Action buttons
@@ -363,7 +359,9 @@ describe("Webhooks", () => {
     });
 
     // Try to create with empty URL -> validation error
-    await user.click(within(dialog).getByRole("button", { name: "Create Webhook" }));
+    await user.click(
+      within(dialog).getByRole("button", { name: "Create Webhook" }),
+    );
     await waitFor(() => {
       expect(within(dialog).getByText("URL is required")).toBeInTheDocument();
     });
@@ -371,7 +369,9 @@ describe("Webhooks", () => {
     // Try with an invalid URL
     const urlInput = within(dialog).getByLabelText("Endpoint URL");
     await user.type(urlInput, "not-a-url");
-    await user.click(within(dialog).getByRole("button", { name: "Create Webhook" }));
+    await user.click(
+      within(dialog).getByRole("button", { name: "Create Webhook" }),
+    );
     await waitFor(() => {
       expect(
         within(dialog).getByText("Please enter a valid URL"),
@@ -381,7 +381,9 @@ describe("Webhooks", () => {
     // Try with an http:// URL
     await user.clear(urlInput);
     await user.type(urlInput, "http://example.com/hook");
-    await user.click(within(dialog).getByRole("button", { name: "Create Webhook" }));
+    await user.click(
+      within(dialog).getByRole("button", { name: "Create Webhook" }),
+    );
     await waitFor(() => {
       expect(
         within(dialog).getByText("URL must use HTTPS"),
@@ -413,9 +415,7 @@ describe("Webhooks", () => {
 
     // After creation, the secret is displayed
     await waitFor(() => {
-      expect(
-        within(dialog).getByText("Webhook Created"),
-      ).toBeInTheDocument();
+      expect(within(dialog).getByText("Webhook Created")).toBeInTheDocument();
     });
     expect(
       within(dialog).getByText(/Copy this secret now/),
@@ -462,9 +462,9 @@ describe("Webhooks", () => {
     expect(within(dialog).getByLabelText("Endpoint URL")).toHaveValue(
       "https://hooks.slack.com/abc",
     );
-    expect(
-      within(dialog).getByLabelText("Description (optional)"),
-    ).toHaveValue("Slack notifications");
+    expect(within(dialog).getByLabelText("Description (optional)")).toHaveValue(
+      "Slack notifications",
+    );
 
     // Rotate Secret button is available in edit mode
     expect(
@@ -483,9 +483,7 @@ describe("Webhooks", () => {
     const { container, user } = await renderAndWaitForProfile();
 
     await waitFor(() => {
-      expect(
-        within(container).getByText(webhook.url),
-      ).toBeInTheDocument();
+      expect(within(container).getByText(webhook.url)).toBeInTheDocument();
     });
 
     // Click delete
@@ -517,14 +515,11 @@ describe("Webhooks", () => {
       }),
     );
     const dialog2 = await screen.findByRole("dialog");
-    await user.click(
-      within(dialog2).getByRole("button", { name: "Delete" }),
-    );
+    await user.click(within(dialog2).getByRole("button", { name: "Delete" }));
 
     // Dialog closes after deletion
     await waitFor(() => {
       expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     });
   });
-
 });
