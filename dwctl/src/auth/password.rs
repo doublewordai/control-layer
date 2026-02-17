@@ -2,10 +2,11 @@
 
 use argon2::{
     Algorithm, Argon2, Params, Version,
-    password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
+    password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString, rand_core::OsRng},
 };
 use base64::{Engine as _, engine::general_purpose};
-use rand::{Rng, rngs::OsRng, thread_rng};
+use rand::prelude::RngExt;
+use rand::rng;
 
 use crate::errors::Error;
 
@@ -79,7 +80,7 @@ pub fn verify_string(input: &str, hash: &str) -> Result<bool, Error> {
 pub fn generate_reset_token() -> String {
     // Generate 32 bytes (256 bits) of cryptographically secure random data
     let mut token_bytes = [0u8; 32];
-    thread_rng().fill(&mut token_bytes);
+    rng().fill(&mut token_bytes);
 
     // Encode as base64url without padding
     general_purpose::URL_SAFE_NO_PAD.encode(token_bytes)

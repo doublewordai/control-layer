@@ -1,7 +1,8 @@
 //! Cryptographic utilities for API key generation.
 
 use base64::{Engine as _, engine::general_purpose};
-use rand::{Rng, thread_rng};
+use rand::prelude::RngExt;
+use rand::rng;
 
 /// Generates a cryptographically secure API key with 256 bits of entropy.
 ///
@@ -24,7 +25,7 @@ use rand::{Rng, thread_rng};
 pub fn generate_api_key() -> String {
     // Generate 32 bytes (256 bits) of cryptographically secure random data
     let mut key_bytes = [0u8; 32];
-    thread_rng().fill(&mut key_bytes);
+    rng().fill(&mut key_bytes);
 
     format!("sk-{}", general_purpose::URL_SAFE_NO_PAD.encode(key_bytes))
 }
