@@ -505,3 +505,229 @@ pub struct OpenAIError {
     #[schema(example = "invalid_api_key")]
     pub code: Option<String>,
 }
+
+// ============================================================================
+// Responses API
+// ============================================================================
+
+/// Input for response requests - can be a single string or array of messages.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(untagged)]
+#[schema(example = "What is a doubleword?")]
+pub enum ResponseInput {
+    /// A single string input.
+    Single(String),
+    /// An array of messages (chat-style conversation).
+    Messages(Vec<ChatMessage>),
+}
+
+/// A single item in the response output array.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[schema(example = json!({
+    "type": "message",
+    "role": "assistant",
+    "content": "A doubleword is a data unit that is twice the size of a standard word in computer architecture."
+}))]
+pub struct ResponseItem {
+    /// The type of item (e.g., "message", "function_call").
+    #[serde(rename = "type")]
+    #[schema(example = "message")]
+    pub item_type: String,
+
+    /// The role of the message (for message-type items).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "assistant")]
+    pub role: Option<String>,
+
+    /// The content of the message (for message-type items).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "A doubleword is a data unit that is twice the size of a standard word.")]
+    pub content: Option<String>,
+
+    /// Tool calls made by the model (for message-type items with tool calls).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
+}
+
+/// Request body for creating a response.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[schema(example = json!({
+    "model": "gpt-4o",
+    "input": "What is a doubleword?",
+    "temperature": 0.7,
+    "max_output_tokens": 256
+}))]
+pub struct ResponseRequest {
+    /// ID of the model to use.
+    #[schema(example = "gpt-4o")]
+    pub model: String,
+
+    /// The input to generate a response for. Can be a string or array of messages.
+    pub input: ResponseInput,
+
+    /// System instructions for the model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "You are a helpful assistant.")]
+    pub instructions: Option<String>,
+
+    /// What sampling temperature to use, between 0 and 2.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = 0.7)]
+    pub temperature: Option<f32>,
+
+    /// An alternative to sampling with temperature, called nucleus sampling.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = 1.0)]
+    pub top_p: Option<f32>,
+
+    /// The maximum number of tokens to generate in the response.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = 256)]
+    pub max_output_tokens: Option<i32>,
+
+    /// Output types that you would like the model to generate (e.g., ["text"], ["text", "audio"]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub modalities: Option<Vec<String>>,
+
+    /// Constrains effort on reasoning. Supported values: "none", "minimal", "low", "medium", "high", "xhigh".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "medium")]
+    pub reasoning_effort: Option<String>,
+
+    /// A list of tools the model may call.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<Tool>>,
+
+    /// Controls which (if any) tool is called by the model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<serde_json::Value>,
+
+    /// Whether to enable parallel function calling during tool use.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = true)]
+    pub parallel_tool_calls: Option<bool>,
+
+    /// If set, partial message deltas will be sent as server-sent events.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = false)]
+    pub stream: Option<bool>,
+
+    /// Options for streaming response.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_options: Option<serde_json::Value>,
+
+    /// The ID of a previous response to continue from (for stateful conversations).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_response_id: Option<String>,
+
+    /// Developer-defined tags and values for organizing responses.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
+
+    /// Include encrypted reasoning content for rehydration on subsequent requests.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub include: Option<String>,
+
+    /// Text output configuration.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<serde_json::Value>,
+
+    /// Reasoning configuration for controlling reasoning behavior.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<serde_json::Value>,
+
+    /// How to handle context window overflow ("auto" or "disabled").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub truncation: Option<String>,
+
+    /// Whether to store this response for future reference.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = false)]
+    pub store: Option<bool>,
+
+    /// A unique identifier representing your end-user.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+
+    /// Up to 4 sequences where the API will stop generating further tokens.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop: Option<Vec<String>>,
+
+    /// Number between -2.0 and 2.0. Positive values penalize new tokens based on
+    /// whether they appear in the text so far.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = 0.0)]
+    pub presence_penalty: Option<f32>,
+
+    /// Number between -2.0 and 2.0. Positive values penalize new tokens based on
+    /// their existing frequency in the text so far.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = 0.0)]
+    pub frequency_penalty: Option<f32>,
+}
+
+/// Response from creating a response.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[schema(example = json!({
+    "id": "resp-abc123",
+    "object": "response",
+    "created_at": 1703187200,
+    "completed_at": 1703187205,
+    "model": "gpt-4o",
+    "status": "completed",
+    "output": [{
+        "type": "message",
+        "role": "assistant",
+        "content": "A doubleword is a data unit that is twice the size of a standard word in computer architecture."
+    }],
+    "usage": {
+        "prompt_tokens": 10,
+        "completion_tokens": 25,
+        "total_tokens": 35
+    },
+    "temperature": 0.7,
+    "top_p": 1.0
+}))]
+pub struct ResponseObject {
+    /// A unique identifier for the response.
+    #[schema(example = "resp-abc123")]
+    pub id: String,
+
+    /// The object type, always "response".
+    #[schema(example = "response")]
+    pub object: String,
+
+    /// The Unix timestamp of when the response was created.
+    #[schema(example = 1703187200)]
+    pub created_at: i64,
+
+    /// The Unix timestamp of when the response was completed.
+    #[schema(example = 1703187205)]
+    pub completed_at: i64,
+
+    /// The model used for generating the response.
+    #[schema(example = "gpt-4o")]
+    pub model: String,
+
+    /// The status of the response. Can be "completed", "incomplete", "cancelled", or "failed".
+    #[schema(example = "completed")]
+    pub status: String,
+
+    /// The output items generated by the model.
+    pub output: Vec<ResponseItem>,
+
+    /// Usage statistics for the response request.
+    pub usage: Usage,
+
+    /// The temperature used for sampling (echoed from request).
+    #[schema(example = 0.7)]
+    pub temperature: f32,
+
+    /// The nucleus sampling parameter used (echoed from request).
+    #[schema(example = 1.0)]
+    pub top_p: f32,
+
+    /// Developer-defined tags and values.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
+}
