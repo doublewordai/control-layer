@@ -3,6 +3,8 @@ use crate::errors::{Error, Result};
 /// Normalizes completion window from display format to storage format
 /// - "Standard (24h)" → "24h"
 /// - "High (1h)" → "1h"
+/// - "standard" → "24h" (bare priority name)
+/// - "high" → "1h" (bare priority name)
 /// - "24h" → "24h" (pass through)
 pub fn normalize_completion_window(input: &str) -> Result<String> {
     let trimmed = input.trim();
@@ -13,16 +15,22 @@ pub fn normalize_completion_window(input: &str) -> Result<String> {
         });
     }
 
+    let lower = trimmed.to_lowercase();
+
     // Direct raw format: "24h", "1h", etc.
     if trimmed.ends_with('h') && trimmed.chars().take(trimmed.len() - 1).all(|c| c.is_ascii_digit()) {
         return Ok(trimmed.to_lowercase());
     }
 
-    // Display format: "Standard (24h)", "High (1h)"
-    let lower = trimmed.to_lowercase();
+    // Bare priority names: "standard", "high"
+    match lower.as_str() {
+        "standard" => return Ok("24h".to_string()),
+        "high" => return Ok("1h".to_string()),
+        _ => {}
+    }
 
+    // Display format: "Standard (24h)", "High (1h)"
     if lower.starts_with("standard") {
-        // Extract time from parentheses
         if let Some(time) = extract_time_from_parens(&lower) {
             return Ok(time);
         }
@@ -34,7 +42,7 @@ pub fn normalize_completion_window(input: &str) -> Result<String> {
 
     Err(Error::BadRequest {
         message: format!(
-            "Invalid completion window format: '{}'. Expected '24h', '1h', 'Standard (24h)', or 'High (1h)'",
+            "Invalid completion window format: '{}'. Expected '24h', '1h', 'standard', 'high', 'Standard (24h)', or 'High (1h)'",
             input
         ),
     })
@@ -98,6 +106,20 @@ mod tests {
     fn test_normalize_with_whitespace() {
         assert_eq!(normalize_completion_window(" Standard (24h) ").unwrap(), "24h");
         assert_eq!(normalize_completion_window("Standard ( 24h )").unwrap(), "24h");
+    }
+
+    #[test]
+    fn test_normalize_bare_standard() {
+        assert_eq!(normalize_completion_window("standard").unwrap(), "24h");
+        assert_eq!(normalize_completion_window("Standard").unwrap(), "24h");
+        assert_eq!(normalize_completion_window("STANDARD").unwrap(), "24h");
+    }
+
+    #[test]
+    fn test_normalize_bare_high() {
+        assert_eq!(normalize_completion_window("high").unwrap(), "1h");
+        assert_eq!(normalize_completion_window("High").unwrap(), "1h");
+        assert_eq!(normalize_completion_window("HIGH").unwrap(), "1h");
     }
 
     #[test]

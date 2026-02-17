@@ -63,8 +63,8 @@ pub struct CreateBatchRequest {
     pub endpoint: String,
 
     /// Processing priority for the batch.
-    /// Accepts both display format ("Standard (24h)", "High (1h)") and raw format ("24h", "1h").
-    /// The value is normalized to raw format for storage.
+    /// Accepts display format ("Standard (24h)", "High (1h)"), bare names ("standard", "high"), or raw format ("24h", "1h").
+    /// All formats are normalized to raw format for internal storage.
     #[schema(example = "Standard (24h)")]
     #[serde(deserialize_with = "deserialize_completion_window")]
     pub completion_window: String,

@@ -30,22 +30,6 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use uuid::Uuid;
 
-/// Normalize completion_window from API request to internal storage format.
-///
-/// Accepts both user-friendly priority names and time-based completion window values:
-/// - "high" → "1h" (high priority, fast processing)
-/// - "standard" → "24h" (standard priority)
-/// - Any other value (e.g., "1h", "24h", "48h") → passed through unchanged
-///
-/// This allows custom completion windows while providing user-friendly priority names.
-fn normalize_completion_window(window: &str) -> String {
-    match window {
-        "high" => "1h".to_string(),
-        "standard" => "24h".to_string(),
-        _ => window.to_string(),
-    }
-}
-
 /// Helper function to convert fusillade Batch to OpenAI BatchResponse
 ///
 /// If `creator_email` is provided, it will be injected into the metadata as `created_by_email`.
@@ -196,17 +180,22 @@ pub async fn create_batch<P: PoolProvider>(
     has_api_key: crate::auth::current_user::HasApiKey,
     Json(req): Json<CreateBatchRequest>,
 ) -> Result<(StatusCode, Json<BatchResponse>)> {
-    // Normalize completion_window (convert "high"/"standard" to "1h"/"24h", pass through other values)
-    let normalized_window = normalize_completion_window(&req.completion_window);
+    // Note: completion_window is already normalized by custom deserializer in CreateBatchRequest
 
     // Validate normalized value against configured allowed values
-    if !state.config.batches.allowed_completion_windows.contains(&normalized_window) {
-        // Provide helpful error message mentioning both priority names and configured values
+    if !state.config.batches.allowed_completion_windows.contains(&req.completion_window) {
+        use crate::api::models::completion_window::format_completion_window;
+
+        // Provide helpful error message with formatted priority labels
+        let allowed_formatted: Vec<String> = state.config.batches.allowed_completion_windows
+            .iter()
+            .map(|w| format_completion_window(w))
+            .collect();
+
         return Err(Error::BadRequest {
             message: format!(
-                "Unsupported completion_window '{}'. Use 'standard' (24h) or 'high' (1h), or one of the configured values: {}",
-                req.completion_window,
-                state.config.batches.allowed_completion_windows.join(", ")
+                "Unsupported completion_window. Allowed values: {}",
+                allowed_formatted.join(", ")
             ),
         });
     }
@@ -295,17 +284,19 @@ pub async fn create_batch<P: PoolProvider>(
         &pending_counts,
         &model_throughputs,
         state.config.batches.default_throughput,
-        &normalized_window,
+        &req.completion_window,
     );
 
     if !capacity_result.has_capacity {
+        use crate::api::models::completion_window::format_completion_window;
+
         let overloaded_details: Vec<String> = capacity_result
             .overloaded_models
             .iter()
             .map(|(model, deficit)| format!("{} (needs {} more capacity)", model, deficit))
             .collect();
         tracing::warn!(
-            completion_window = %normalized_window,
+            completion_window = %req.completion_window,
             overloaded_models = %overloaded_details.join(", "),
             "Batch rejected due to insufficient capacity"
         );
@@ -316,7 +307,7 @@ pub async fn create_batch<P: PoolProvider>(
         return Err(Error::TooManyRequests {
             message: format!(
                 "Insufficient capacity for {} priority. The following models are currently at capacity: {}. Try again later or use a longer completion window.",
-                if normalized_window == "1h" { "high" } else { "standard" },
+                format_completion_window(&req.completion_window),
                 model_names.join(", ")
             ),
         });
@@ -339,7 +330,7 @@ pub async fn create_batch<P: PoolProvider>(
     let batch_input = fusillade::BatchInput {
         file_id: fusillade::FileId(file_id),
         endpoint: req.endpoint.clone(),
-        completion_window: normalized_window,
+        completion_window: req.completion_window.clone(),
         metadata,
         created_by: Some(current_user.id.to_string()),
     };
@@ -2011,25 +2002,6 @@ mod tests {
         let body = response.text();
         let lines: Vec<&str> = body.trim().lines().collect();
         assert_eq!(lines.len(), total, "Should return all request results");
-    }
-
-    /// Test that the normalize_completion_window function works correctly
-    #[test]
-    fn test_normalize_completion_window() {
-        // User-friendly priority names are normalized
-        assert_eq!(super::normalize_completion_window("high"), "1h");
-        assert_eq!(super::normalize_completion_window("standard"), "24h");
-
-        // Time-based values pass through unchanged
-        assert_eq!(super::normalize_completion_window("1h"), "1h");
-        assert_eq!(super::normalize_completion_window("24h"), "24h");
-        assert_eq!(super::normalize_completion_window("48h"), "48h");
-
-        // Unknown values also pass through (validation happens in the handler)
-        assert_eq!(super::normalize_completion_window("invalid"), "invalid");
-        assert_eq!(super::normalize_completion_window("12h"), "12h");
-        assert_eq!(super::normalize_completion_window(""), "");
-        assert_eq!(super::normalize_completion_window("HIGH"), "HIGH"); // case-sensitive
     }
 
     /// Test that batch responses format completion_window correctly

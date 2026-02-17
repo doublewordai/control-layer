@@ -353,14 +353,15 @@ pub async fn create_deployed_model<P: PoolProvider>(
 
     // Create tariffs if provided
     if let Some(tariff_defs) = tariffs {
+        use crate::api::models::completion_window::normalize_completion_window;
+
         let mut tariffs_repo = Tariffs::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
         for tariff_def in tariff_defs {
-            // Normalize completion_window (convert "high"/"standard" to "1h"/"24h")
-            let completion_window = tariff_def.completion_window.map(|w| match w.as_str() {
-                "high" => "1h".to_string(),
-                "standard" => "24h".to_string(),
-                _ => w,
-            });
+            // Normalize completion_window using shared utility
+            let completion_window = match tariff_def.completion_window {
+                Some(w) => Some(normalize_completion_window(&w)?),
+                None => None,
+            };
 
             let tariff_request = TariffCreateDBRequest {
                 deployed_model_id: model.id,
@@ -457,12 +458,11 @@ pub async fn update_deployed_model<P: PoolProvider>(
         // Helper function to check if a tariff matches the definition
         let tariff_matches = |existing: &crate::db::models::tariffs::ModelTariff,
                               def: &crate::api::models::deployments::TariffDefinition| {
-            // Normalize def's completion_window for comparison (convert "high"/"standard" to "1h"/"24h")
-            let normalized_def_window = def.completion_window.as_ref().map(|w| match w.as_str() {
-                "high" => "1h".to_string(),
-                "standard" => "24h".to_string(),
-                _ => w.clone(),
-            });
+            use crate::api::models::completion_window::normalize_completion_window;
+
+            // Normalize def's completion_window for comparison
+            let normalized_def_window = def.completion_window.as_ref()
+                .and_then(|w| normalize_completion_window(w).ok());
 
             existing.name == def.name
                 && existing.input_price_per_token == def.input_price_per_token

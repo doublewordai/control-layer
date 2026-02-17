@@ -198,15 +198,13 @@ impl CreditTransactionResponse {
         batch_sla: Option<String>,
         batch_count: i32,
     ) -> Self {
+        use super::completion_window::format_completion_window;
+
         // Only include batch_request_count for actual batches (count > 1)
         let batch_request_count = if batch_count > 1 { Some(batch_count) } else { None };
 
-        // Convert batch_sla from internal format to priority names for API responses
-        let batch_sla = batch_sla.map(|sla| match sla.as_str() {
-            "1h" => "high".to_string(),
-            "24h" => "standard".to_string(),
-            _ => sla,
-        });
+        // Format batch_sla for API responses ("24h" → "Standard (24h)")
+        let batch_sla = batch_sla.map(|sla| format_completion_window(&sla));
 
         Self {
             id: db.id,

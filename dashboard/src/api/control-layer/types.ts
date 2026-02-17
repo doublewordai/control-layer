@@ -64,8 +64,8 @@ export type ApiKeyPurpose = "platform" | "realtime" | "batch" | "playground";
 export type TariffApiKeyPurpose = "realtime" | "batch" | "playground";
 
 // Batch priority types
-// API always returns priority names: "standard" (24h) or "high" (1h)
-export type BatchPriority = "standard" | "high";
+// API returns formatted priority labels: "Standard (24h)" or "High (1h)"
+export type BatchPriority = "Standard (24h)" | "High (1h)";
 
 // Config/Metadata types
 export interface ConfigResponse {
@@ -77,7 +77,7 @@ export interface ConfigResponse {
   docs_url: string;
   batches?: {
     enabled: boolean;
-    allowed_completion_windows: string[]; // Available windows like ["24h", "1h"] (mapped to priorities in UI)
+    allowed_completion_windows: string[]; // Formatted priority labels like ["Standard (24h)", "High (1h)"]
   };
   /** Base URL for AI API endpoints (files, batches, daemons). If not set, use relative paths. */
   ai_api_base_url?: string;
