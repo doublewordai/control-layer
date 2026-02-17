@@ -1,5 +1,14 @@
 # Changelog
 
+## [7.5.1](https://github.com/doublewordai/control-layer/compare/v7.5.0...v7.5.1) (2026-02-17)
+
+
+### Bug Fixes
+
+* bump onwards to 0.14.0 for TCP keepalive ([#720](https://github.com/doublewordai/control-layer/issues/720)) ([54f4d6c](https://github.com/doublewordai/control-layer/commit/54f4d6c35fa853cb0fc86080599fd0d4dbb5b01c))
+* escalation and finalization management ([#715](https://github.com/doublewordai/control-layer/issues/715)) ([337810f](https://github.com/doublewordai/control-layer/commit/337810fd61c6230f9ab2e09a6f1395ef1b325533))
+* reenable tracing by adding tls support for reqwest 12 ([#718](https://github.com/doublewordai/control-layer/issues/718)) ([cade847](https://github.com/doublewordai/control-layer/commit/cade847530033d6b5204708ff8e66b9800e66bea))
+
 ## [7.5.0](https://github.com/doublewordai/control-layer/compare/v7.4.1...v7.5.0) (2026-02-17)
 
 
