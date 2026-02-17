@@ -88,8 +88,14 @@ fn create_otlp_tracer() -> anyhow::Result<(opentelemetry_sdk::trace::Tracer, Sdk
     // Get service name from env or use default
     let service_name = std::env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| "dwctl".to_string());
 
-    // Get endpoint
-    let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").unwrap_or_else(|_| "http://localhost:4318".to_string());
+    // Get endpoint — append /v1/traces since with_endpoint() treats it as a
+    // signal-specific URL (doesn't auto-append like the SDK would for the base env var)
+    let base = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").unwrap_or_else(|_| "http://localhost:4318".to_string());
+    let endpoint = if base.ends_with("/v1/traces") {
+        base
+    } else {
+        format!("{}/v1/traces", base.trim_end_matches('/'))
+    };
 
     eprintln!("[OTLP] Initializing OTLP tracer with the following configuration:");
     eprintln!("[OTLP] Service Name: {}", service_name);

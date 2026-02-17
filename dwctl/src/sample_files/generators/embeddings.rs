@@ -6,8 +6,8 @@
 use super::SampleGenerator;
 use crate::db::models::deployments::ModelType;
 use fusillade::RequestTemplateInput;
-use rand::prelude::SliceRandom;
-use rand::thread_rng;
+use rand::prelude::IndexedRandom;
+use rand::rng;
 
 /// Generator for embeddings samples.
 pub struct EmbeddingsGenerator;
@@ -114,7 +114,7 @@ impl SampleGenerator for EmbeddingsGenerator {
     }
 
     fn generate(&self, model_alias: &str, api_key: &str, endpoint: &str, count: usize) -> Vec<RequestTemplateInput> {
-        let mut rng = thread_rng();
+        let mut rng = rng();
 
         (0..count)
             .map(|i| {

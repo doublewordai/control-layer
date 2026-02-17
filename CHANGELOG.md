@@ -1,5 +1,27 @@
 # Changelog
 
+## [7.4.1](https://github.com/doublewordai/control-layer/compare/v7.4.0...v7.4.1) (2026-02-16)
+
+
+### Bug Fixes
+
+* allow model selection beyond combobox initial list ([#707](https://github.com/doublewordai/control-layer/issues/707)) ([48029ff](https://github.com/doublewordai/control-layer/commit/48029ff38b6f8d80eccb634f12309f3306939a42)), closes [#623](https://github.com/doublewordai/control-layer/issues/623)
+* clean up log lines + inherit trace id from fusillade ([#706](https://github.com/doublewordai/control-layer/issues/706)) ([6ff2949](https://github.com/doublewordai/control-layer/commit/6ff29496f1497aee317b1b05e90e0043515e9167))
+
+## [7.4.0](https://github.com/doublewordai/control-layer/compare/v7.3.1...v7.4.0) (2026-02-16)
+
+
+### Features
+
+* Webhooks ([#684](https://github.com/doublewordai/control-layer/issues/684)) ([60d1b4e](https://github.com/doublewordai/control-layer/commit/60d1b4ec2a5fb32cb72ebd7cc3e800cf36294733))
+
+
+### Bug Fixes
+
+* bump fusillade 5.4.2 ([#705](https://github.com/doublewordai/control-layer/issues/705)) ([f69d132](https://github.com/doublewordai/control-layer/commit/f69d1326742a6f0a31ff77e78c2545414a4e5d4e))
+* more reqwest problems with otel ([#689](https://github.com/doublewordai/control-layer/issues/689)) ([8fc1761](https://github.com/doublewordai/control-layer/commit/8fc1761c9a1edcdf15b7974779a8f91f32a5d883))
+* Stream usage transform ([#701](https://github.com/doublewordai/control-layer/issues/701)) ([770f281](https://github.com/doublewordai/control-layer/commit/770f2817a4aa729dbe836198522809893ba99160))
+
 ## [7.3.1](https://github.com/doublewordai/control-layer/compare/v7.3.0...v7.3.1) (2026-02-16)
 
 

@@ -454,10 +454,9 @@ impl From<&AiResponse> for TokenMetrics {
 mod tests {
     use super::{UsageMetrics, parse_ai_request, parse_ai_response};
     use crate::request_logging::models::{AiRequest, AiResponse};
-    use async_openai::types::{
-        CreateBase64EmbeddingResponse, CreateChatCompletionResponse, CreateChatCompletionStreamResponse, CreateCompletionResponse,
-        CreateEmbeddingResponse, EmbeddingUsage,
-    };
+    use async_openai::types::chat::{CreateChatCompletionResponse, CreateChatCompletionStreamResponse};
+    use async_openai::types::completions::CreateCompletionResponse;
+    use async_openai::types::embeddings::{CreateBase64EmbeddingResponse, CreateEmbeddingResponse, EmbeddingUsage};
     use axum::http::{Method, StatusCode, Uri};
     use bytes::Bytes;
     use outlet::{RequestData, ResponseData};
@@ -872,7 +871,7 @@ mod tests {
             created: 1677652288,
             model: "gpt-5".to_string(),
             choices: vec![],
-            usage: Some(async_openai::types::CompletionUsage {
+            usage: Some(async_openai::types::chat::CompletionUsage {
                 prompt_tokens: 15,
                 completion_tokens: 25,
                 total_tokens: 40,
@@ -937,7 +936,7 @@ mod tests {
             created: 1677652288,
             model: "gpt-4".to_string(),
             choices: vec![],
-            usage: Some(async_openai::types::CompletionUsage {
+            usage: Some(async_openai::types::chat::CompletionUsage {
                 prompt_tokens: 8,
                 completion_tokens: 12,
                 total_tokens: 20,
@@ -1043,7 +1042,7 @@ mod tests {
             created: 1677652288,
             model: "gpt-3.5-turbo-instruct".to_string(),
             choices: vec![],
-            usage: Some(async_openai::types::CompletionUsage {
+            usage: Some(async_openai::types::chat::CompletionUsage {
                 prompt_tokens: 10,
                 completion_tokens: 15,
                 total_tokens: 25,
