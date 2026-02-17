@@ -141,15 +141,17 @@ fn get_model() {}
     summary = "Create response",
     description = "Creates a model response for the given input.
 
-The Responses API is OpenAI's unified API that supersedes Chat Completions for advanced use cases. It provides enhanced capabilities including:
+This endpoint implements the Open Responses compatible API, providing enhanced capabilities including:
 
-- **Reasoning models** with controllable effort levels via `reasoning_effort`
-- **Multimodal support** via `modalities` parameter
+- **Reasoning models** with controllable effort via `reasoning` parameter
 - **Stateful conversations** via `previous_response_id` for maintaining context across turns
 - **Flexible input** - accepts either a string or array of messages
-- **Structured instructions** - separate `instructions` and `input` fields for cleaner semantics
+- **Text output configuration** via `text` parameter for structured outputs
+- **Context window management** via `truncation` parameter
 
-Set `stream: true` to receive partial responses as server-sent events.",
+Set `stream: true` to receive partial responses as server-sent events.
+
+[Open Responses API Reference →](https://www.openresponses.org/reference)",
     request_body = extra_types::ResponseRequest,
     responses(
         (status = 200, description = "Response generated successfully. When streaming, returns a series of SSE events.", body = extra_types::ResponseObject),
@@ -289,15 +291,15 @@ Use embeddings for:
 Use these endpoints to discover which models you have access to and their capabilities."),
         (name = "responses-api", description = "Create model responses with enhanced capabilities.
 
-The Responses API is OpenAI's unified API that supersedes Chat Completions for advanced use cases:
+Open Responses compatible endpoint providing advanced features:
 
-- **Reasoning models** — Control computational effort with `reasoning_effort` parameter
-- **Multimodal support** — Generate text, audio, or other modalities via `modalities`
+- **Reasoning models** — Control computational effort with `reasoning` parameter
 - **Stateful conversations** — Maintain context across turns with `previous_response_id`
 - **Flexible input** — Use simple strings or full message arrays
-- **Structured instructions** — Separate system instructions from user input
+- **Text output configuration** — Structured outputs via `text` parameter
+- **Context management** — Handle overflow with `truncation` parameter
 
-[Learn more about the Responses API →](https://platform.openai.com/docs/api-reference/responses)"),
+[Open Responses API Reference →](https://www.openresponses.org/reference)"),
     ),
     info(
         title = "AI API",

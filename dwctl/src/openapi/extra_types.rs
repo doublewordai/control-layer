@@ -624,6 +624,22 @@ pub struct ResponseRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
 
+    /// Include encrypted reasoning content for rehydration on subsequent requests.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub include: Option<String>,
+
+    /// Text output configuration.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<serde_json::Value>,
+
+    /// Reasoning configuration for controlling reasoning behavior.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<serde_json::Value>,
+
+    /// How to handle context window overflow ("auto" or "disabled").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub truncation: Option<String>,
+
     /// Whether to store this response for future reference.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(example = false)]
@@ -656,6 +672,7 @@ pub struct ResponseRequest {
     "id": "resp-abc123",
     "object": "response",
     "created_at": 1703187200,
+    "completed_at": 1703187205,
     "model": "gpt-4o",
     "status": "completed",
     "output": [{
@@ -667,7 +684,9 @@ pub struct ResponseRequest {
         "prompt_tokens": 10,
         "completion_tokens": 25,
         "total_tokens": 35
-    }
+    },
+    "temperature": 0.7,
+    "top_p": 1.0
 }))]
 pub struct ResponseObject {
     /// A unique identifier for the response.
@@ -682,6 +701,10 @@ pub struct ResponseObject {
     #[schema(example = 1703187200)]
     pub created_at: i64,
 
+    /// The Unix timestamp of when the response was completed.
+    #[schema(example = 1703187205)]
+    pub completed_at: i64,
+
     /// The model used for generating the response.
     #[schema(example = "gpt-4o")]
     pub model: String,
@@ -694,8 +717,15 @@ pub struct ResponseObject {
     pub output: Vec<ResponseItem>,
 
     /// Usage statistics for the response request.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub usage: Option<Usage>,
+    pub usage: Usage,
+
+    /// The temperature used for sampling (echoed from request).
+    #[schema(example = 0.7)]
+    pub temperature: f32,
+
+    /// The nucleus sampling parameter used (echoed from request).
+    #[schema(example = 1.0)]
+    pub top_p: f32,
 
     /// Developer-defined tags and values.
     #[serde(skip_serializing_if = "Option::is_none")]
