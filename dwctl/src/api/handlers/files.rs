@@ -1098,11 +1098,6 @@ pub async fn get_file_content<P: PoolProvider>(
         }
     }
 
-    // Determine whether to hide retriable errors based on file purpose
-    // For error files: hide retriable errors before SLA expiry (per-batch logic in database)
-    // For non-error files (input, output): show all content (false)
-    let hide_retriable_before_sla = matches!(file.purpose, Some(fusillade::batch::Purpose::BatchError));
-
     // For BatchOutput and BatchError files, check if the batch is still running
     // (which means more data may be written to this file in the future).
     // Also capture the expected content count for streaming X-Last-Line.
@@ -1119,7 +1114,7 @@ pub async fn get_file_content<P: PoolProvider>(
             if let Some(batch) = batch {
                 let status = state
                     .request_manager
-                    .get_batch_status(batch.id, false)
+                    .get_batch_status(batch.id)
                     .await
                     .map_err(|e| Error::Internal {
                         operation: format!("get batch status: {}", e),
@@ -1141,7 +1136,7 @@ pub async fn get_file_content<P: PoolProvider>(
             if let Some(batch) = batch {
                 let status = state
                     .request_manager
-                    .get_batch_status(batch.id, false)
+                    .get_batch_status(batch.id)
                     .await
                     .map_err(|e| Error::Internal {
                         operation: format!("get batch status: {}", e),
@@ -1184,10 +1179,9 @@ pub async fn get_file_content<P: PoolProvider>(
 
     if let Some(limit) = requested_limit {
         // Pagination case: buffer only N+1 items to check for more pages
-        let content_stream =
-            state
-                .request_manager
-                .get_file_content_stream(fusillade::FileId(file_id), offset, search, hide_retriable_before_sla);
+        let content_stream = state
+            .request_manager
+            .get_file_content_stream(fusillade::FileId(file_id), offset, search);
 
         let mut buffer: Vec<_> = content_stream.take(limit + 1).collect().await;
         let has_more_pages = buffer.len() > limit;
@@ -1229,10 +1223,9 @@ pub async fn get_file_content<P: PoolProvider>(
             None
         };
 
-        let content_stream =
-            state
-                .request_manager
-                .get_file_content_stream(fusillade::FileId(file_id), offset, search, hide_retriable_before_sla);
+        let content_stream = state
+            .request_manager
+            .get_file_content_stream(fusillade::FileId(file_id), offset, search);
 
         // Limit stream to expected count so X-Last-Line is accurate
         let content_stream: Pin<Box<dyn Stream<Item = fusillade::Result<fusillade::FileContentItem>> + Send>> =

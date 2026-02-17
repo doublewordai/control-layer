@@ -391,11 +391,10 @@ pub async fn delete_user<P: PoolProvider>(
     }
 
     // Cancel all active batches for this user before deletion
-    // Use false for hide_retriable_before_sla since this is an admin operation, not user-facing
     let user_id_str = user_id.to_string();
     let batches = state
         .request_manager
-        .list_batches(Some(user_id_str.clone()), None, None, i64::MAX, false)
+        .list_batches(Some(user_id_str.clone()), None, None, i64::MAX)
         .await
         .map_err(|_| Error::NotFound {
             resource: "Batch".to_string(),
