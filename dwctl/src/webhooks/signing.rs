@@ -20,10 +20,10 @@ pub const SECRET_PREFIX: &str = "whsec_";
 ///
 /// Returns a `whsec_` prefixed base64-encoded 32-byte random secret.
 pub fn generate_secret() -> String {
-    use rand::RngCore;
+    use rand::Rng;
 
     let mut secret_bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut secret_bytes);
+    rand::rng().fill_bytes(&mut secret_bytes);
 
     format!("{}{}", SECRET_PREFIX, BASE64_STANDARD.encode(secret_bytes))
 }

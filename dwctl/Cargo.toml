@@ -54,7 +54,7 @@ url = { version = "2.4", features = ["serde"] }
 clap = { version = "4.4", features = ["derive", "env"] }
 reqwest = { version = "0.13", default-features = false, features = [
   "json",
-  "rustls-tls-webpki-roots-no-provider",
+  "rustls-no-provider",
   "http2",
   "charset",
 ] }
@@ -74,7 +74,7 @@ jsonwebtoken = "9.0"
 argon2 = "0.5"
 base64 = "0.22"
 bytes = "1.5"
-onwards = "0.13.0"
+onwards = "0.12.0"
 thiserror = "2.0.14"
 axum-prometheus = "0.10"
 # Metrics facade and exporter (same versions as axum-prometheus uses)
@@ -82,7 +82,11 @@ metrics = "0.24"
 metrics-exporter-prometheus = "0.18"
 outlet = "0.5.2"
 outlet-postgres = "0.4.6"
-async-openai = { version = "0.32.0", default-features = false }
+async-openai = { version = "0.32.0", default-features = false, features = [
+  "chat-completion-types",
+  "completion-types",
+  "embedding-types",
+] }
 brotli = "8.0"
 lettre = { version = "0.11", features = [
   "smtp-transport",

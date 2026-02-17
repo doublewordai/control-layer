@@ -2,9 +2,12 @@
 
 use std::collections::HashMap;
 
-use async_openai::types::{
-    CreateBase64EmbeddingResponse, CreateChatCompletionRequest, CreateChatCompletionResponse, CreateChatCompletionStreamResponse,
-    CreateCompletionRequest, CreateCompletionResponse, CreateEmbeddingRequest, CreateEmbeddingResponse,
+use async_openai::types::chat::{
+    CreateChatCompletionRequest, CreateChatCompletionResponse, CreateChatCompletionStreamResponse,
+};
+use async_openai::types::completions::{CreateCompletionRequest, CreateCompletionResponse};
+use async_openai::types::embeddings::{
+    CreateBase64EmbeddingResponse, CreateEmbeddingRequest, CreateEmbeddingResponse,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
