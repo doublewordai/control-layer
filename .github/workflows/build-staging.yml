@@ -1,0 +1,120 @@
+name: Build Staging
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  packages: write
+  pull-requests: write
+  id-token: write
+
+concurrency:
+  group: build-staging-${{ github.event.issue.number }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-dispatch:
+    if: >-
+      github.event.issue.pull_request &&
+      contains(github.event.comment.body, '/build-staging')
+    runs-on: depot-ubuntu-24.04
+
+    steps:
+      - name: React to comment
+        uses: actions/github-script@v8
+        with:
+          script: |
+            await github.rest.reactions.createForIssueComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: context.payload.comment.id,
+              content: 'rocket'
+            });
+
+      - name: Get PR details
+        id: pr
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const pr = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number
+            });
+            core.setOutput('ref', pr.data.head.ref);
+            core.setOutput('sha', pr.data.head.sha);
+
+      - name: Compute image tag
+        id: tag
+        run: |
+          REF="${{ steps.pr.outputs.ref }}"
+          # Sanitize branch name: replace / with -, append -rc
+          TAG=$(echo "$REF" | sed 's|/|-|g')-rc
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "Image tag: $TAG"
+
+      - name: Checkout PR branch
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ steps.pr.outputs.sha }}
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push with Depot
+        uses: depot/build-push-action@v1
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ghcr.io/doublewordai/control-layer:${{ steps.tag.outputs.tag }}
+          sbom: true
+
+      - name: Dispatch to internal
+        uses: actions/github-script@v8
+        with:
+          github-token: ${{ secrets.DEPLOY_PAT }}
+          script: |
+            await github.rest.repos.createDispatchEvent({
+              owner: '${{ secrets.DEPLOY_TARGET_OWNER }}',
+              repo: '${{ secrets.DEPLOY_TARGET_REPO }}',
+              event_type: 'control-layer-staging-override',
+              client_payload: {
+                tag: '${{ steps.tag.outputs.tag }}',
+                source_repo: '${{ github.repository }}',
+                source_pr: '${{ github.event.issue.number }}',
+                source_ref: '${{ steps.pr.outputs.ref }}'
+              }
+            });
+
+      - name: Comment with status
+        if: success()
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const tag = '${{ steps.tag.outputs.tag }}';
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `Staging image \`${tag}\` built and pushed. A staging PR has been created in the internal repo — comment \`/deploy-staging\` there to deploy.`
+            });
+
+      - name: Comment on failure
+        if: failure()
+        uses: actions/github-script@v8
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `Staging build failed. [See logs](${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID})`
+            });
