@@ -658,6 +658,14 @@ export function usePendingRequestCounts(options?: { enabled?: boolean }) {
   });
 }
 
+// Usage hooks
+export function useUsage() {
+  return useQuery({
+    queryKey: queryKeys.usage.all,
+    queryFn: () => dwctlApi.usage.get(),
+  });
+}
+
 // Authentication hooks
 export function useRegistrationInfo() {
   return useQuery({

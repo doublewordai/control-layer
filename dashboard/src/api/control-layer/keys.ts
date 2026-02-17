@@ -131,6 +131,11 @@ export const queryKeys = {
       [...queryKeys.payments.all, "process", sessionId] as const,
   },
 
+  // Usage
+  usage: {
+    all: ["usage"] as const,
+  },
+
   // Webhooks
   webhooks: {
     all: ["webhooks"] as const,

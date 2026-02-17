@@ -15,6 +15,7 @@ import {
   DollarSign,
   BarChart3,
   LifeBuoy,
+  Activity,
 } from "lucide-react";
 import {
   useUser,
@@ -76,6 +77,7 @@ export function AppSidebar() {
     { path: "/analytics", icon: BarChart3, label: "Analytics" },
     { path: "/users-groups", icon: Users, label: "Users & Groups" },
     { path: "/api-keys", icon: Key, label: "API Keys" },
+    { path: "/usage", icon: Activity, label: "Usage" },
     { path: "/system", icon: Settings, label: "System" },
   ];
 
