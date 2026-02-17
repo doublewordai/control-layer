@@ -17,6 +17,8 @@ export interface FallbackConfig {
   enabled: boolean;
   on_rate_limit: boolean;
   on_status: number[];
+  with_replacement: boolean;
+  max_attempts: number | null;
 }
 
 export interface ComponentEndpointSummary {
@@ -190,6 +192,8 @@ export interface VirtualModelCreate {
   fallback_enabled?: boolean;
   fallback_on_rate_limit?: boolean;
   fallback_on_status?: number[];
+  fallback_with_replacement?: boolean;
+  fallback_max_attempts?: number | null;
   sanitize_responses?: boolean;
 }
 
@@ -369,6 +373,8 @@ export interface ModelUpdateRequest {
   fallback_enabled?: boolean | null;
   fallback_on_rate_limit?: boolean | null;
   fallback_on_status?: number[] | null;
+  fallback_with_replacement?: boolean | null;
+  fallback_max_attempts?: number | null;
   sanitize_responses?: boolean | null;
 }
 

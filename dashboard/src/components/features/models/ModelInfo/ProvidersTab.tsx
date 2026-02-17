@@ -649,6 +649,12 @@ const EditRoutingModal: React.FC<{
   const [fallbackOn5xx, setFallbackOn5xx] = useState(
     model.fallback?.on_status?.some((s) => s >= 500 && s < 600) ?? false,
   );
+  const [withReplacement, setWithReplacement] = useState(
+    model.fallback?.with_replacement ?? false
+  );
+  const [maxAttempts, setMaxAttempts] = useState<number | null>(
+    model.fallback?.max_attempts ?? null
+  );
 
   const updateMutation = useUpdateModel();
 
@@ -661,6 +667,8 @@ const EditRoutingModal: React.FC<{
     setFallbackOn5xx(
       model.fallback?.on_status?.some((s) => s >= 500 && s < 600) ?? false,
     );
+    setWithReplacement(model.fallback?.with_replacement ?? false);
+    setMaxAttempts(model.fallback?.max_attempts ?? null);
   }, [model]);
 
   const handleSubmit = async () => {
@@ -681,6 +689,8 @@ const EditRoutingModal: React.FC<{
           fallback_enabled: fallbackEnabled,
           fallback_on_rate_limit: fallbackEnabled ? fallbackOnRateLimit : false,
           fallback_on_status: fallbackEnabled ? onStatus : [],
+          fallback_with_replacement: fallbackEnabled ? withReplacement : false,
+          fallback_max_attempts: fallbackEnabled ? maxAttempts : null,
         },
       });
       onClose();
@@ -799,6 +809,50 @@ const EditRoutingModal: React.FC<{
                     onCheckedChange={setFallbackOn5xx}
                   />
                 </div>
+
+                {strategy === "weighted_random" && (
+                  <>
+                    <div className="border-t pt-3 mt-1" />
+
+                    <div className="flex items-center justify-between">
+                      <div>
+                        <Label className="text-sm">Sample with replacement</Label>
+                        <p className="text-xs text-gray-500">
+                          Allow retrying the same provider, weighted by probability
+                        </p>
+                      </div>
+                      <Switch
+                        checked={withReplacement}
+                        onCheckedChange={setWithReplacement}
+                      />
+                    </div>
+
+                    <div>
+                      <Label className="text-sm">Max failover attempts</Label>
+                      <p className="text-xs text-gray-500 mb-1">
+                        Defaults to the number of hosted models
+                      </p>
+                      <Input
+                        type="number"
+                        min={1}
+                        value={maxAttempts ?? ""}
+                        onChange={(e) => {
+                          const val = e.target.value;
+                          if (val === "") {
+                            setMaxAttempts(null);
+                          } else {
+                            const num = Number(val);
+                            if (Number.isFinite(num) && num >= 1) {
+                              setMaxAttempts(Math.floor(num));
+                            }
+                          }
+                        }}
+                        placeholder="Default"
+                        className="w-24"
+                      />
+                    </div>
+                  </>
+                )}
               </div>
             )}
           </div>

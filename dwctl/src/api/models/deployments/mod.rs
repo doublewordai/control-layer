@@ -174,6 +174,12 @@ pub struct CompositeModelCreate {
     /// HTTP status codes that trigger fallback (defaults to [500, 502, 503, 504])
     #[serde(default = "default_fallback_statuses")]
     pub fallback_on_status: Vec<i32>,
+    /// Sample with replacement during weighted random failover (defaults to false)
+    #[serde(default)]
+    pub fallback_with_replacement: bool,
+    /// Maximum number of failover attempts (defaults to provider count)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_max_attempts: Option<i32>,
     /// Whether to sanitize/filter sensitive data from model responses (defaults to false)
     #[serde(default)]
     pub sanitize_responses: bool,
@@ -228,6 +234,12 @@ pub struct DeployedModelUpdate {
     /// HTTP status codes that trigger fallback (null = no change)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback_on_status: Option<Vec<i32>>,
+    /// Sample with replacement during weighted random failover (null = no change)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_with_replacement: Option<bool>,
+    /// Maximum number of failover attempts (null = no change, Some(None) = reset to default)
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
+    pub fallback_max_attempts: Option<Option<i32>>,
     /// Whether to sanitize/filter sensitive data from model responses (null = no change)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sanitize_responses: Option<bool>,
@@ -335,6 +347,8 @@ impl From<DeploymentDBResponse> for DeployedModelResponse {
                 enabled: db.fallback_enabled,
                 on_rate_limit: db.fallback_on_rate_limit,
                 on_status: db.fallback_on_status,
+                with_replacement: db.fallback_with_replacement,
+                max_attempts: db.fallback_max_attempts,
             })
         } else {
             None
