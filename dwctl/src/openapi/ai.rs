@@ -182,6 +182,7 @@ fn create_response() {}
         embeddings,
         list_models,
         get_model,
+        create_response,
         // Batch API endpoints (actual handlers)
         api::handlers::files::upload_file,
         api::handlers::files::list_files,
