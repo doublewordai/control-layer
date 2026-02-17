@@ -478,6 +478,7 @@ pub async fn confirm_password_reset<P: PoolProvider>(
         avatar_url: None,
         roles: None,
         password_hash: Some(new_password_hash),
+        batch_notifications_enabled: None,
     };
 
     let mut tx = state.db.write().begin().await.unwrap();
@@ -608,6 +609,7 @@ pub async fn change_password<P: PoolProvider>(
         avatar_url: None,
         roles: None,
         password_hash: Some(new_password_hash),
+        batch_notifications_enabled: None,
     };
 
     user_repo.update(current_user.id, &update_request).await?;
@@ -1501,7 +1503,7 @@ mod tests {
         config.auth.native.enabled = true;
 
         // Save the email path before moving config
-        let email_path = if let crate::config::EmailTransportConfig::File { path } = &config.auth.native.email.transport {
+        let email_path = if let crate::config::EmailTransportConfig::File { path } = &config.email.transport {
             path.clone()
         } else {
             panic!("Expected File transport in test config");

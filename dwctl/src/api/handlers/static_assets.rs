@@ -6,8 +6,7 @@ use axum::{
     http::{Response, StatusCode, Uri},
     response::{Html, IntoResponse},
 };
-use base64::Engine;
-use tracing::{debug, error, instrument};
+use tracing::{debug, instrument};
 
 use crate::{AppState, static_assets};
 use sqlx_pool_router::PoolProvider;
@@ -31,25 +30,18 @@ pub async fn serve_embedded_asset<P: PoolProvider + Clone>(State(state): State<A
         path = "index.html";
     }
 
-    // Check for bootstrap.js override via environment variable (base64 encoded)
-    // This allows injecting custom bootstrap code without volume mounts
+    // Check for bootstrap.js override via environment variable
+    // This allows injecting custom bootstrap code via Helm/ConfigMap
+    // Falls through to the embedded dashboard bootstrap.js if not set
     if path == "bootstrap.js"
-        && let Ok(encoded) = std::env::var("DASHBOARD_BOOTSTRAP_JS")
+        && let Ok(content) = std::env::var("DASHBOARD_BOOTSTRAP_JS")
     {
-        match base64::prelude::BASE64_STANDARD.decode(encoded.trim()) {
-            Ok(content) => {
-                debug!("Serving bootstrap.js from DASHBOARD_BOOTSTRAP_JS environment variable");
-                return Response::builder()
-                    .header(axum::http::header::CONTENT_TYPE, "text/javascript")
-                    .header(axum::http::header::CACHE_CONTROL, "no-cache")
-                    .body(Body::from(content))
-                    .unwrap();
-            }
-            Err(e) => {
-                error!("Failed to decode DASHBOARD_BOOTSTRAP_JS (expected base64): {}", e);
-                // Fall through to embedded assets
-            }
-        }
+        debug!("Serving bootstrap.js from DASHBOARD_BOOTSTRAP_JS environment variable");
+        return Response::builder()
+            .header(axum::http::header::CONTENT_TYPE, "text/javascript")
+            .header(axum::http::header::CACHE_CONTROL, "no-cache")
+            .body(Body::from(content))
+            .unwrap();
     }
 
     // Fall back to embedded static assets

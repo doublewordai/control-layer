@@ -17,6 +17,8 @@ export interface FallbackConfig {
   enabled: boolean;
   on_rate_limit: boolean;
   on_status: number[];
+  with_replacement: boolean;
+  max_attempts: number | null;
 }
 
 export interface ComponentEndpointSummary {
@@ -186,6 +188,8 @@ export interface VirtualModelCreate {
   fallback_enabled?: boolean;
   fallback_on_rate_limit?: boolean;
   fallback_on_status?: number[];
+  fallback_with_replacement?: boolean;
+  fallback_max_attempts?: number | null;
   sanitize_responses?: boolean;
 }
 
@@ -247,6 +251,7 @@ export interface User {
   auth_source: AuthSource;
   credit_balance?: number; // User's balance in dollars (backend field name is credit_balance)
   has_payment_provider_id: boolean; // Whether the user has a payment provider customer ID set
+  batch_notifications_enabled: boolean; // Whether the user receives batch completion emails
 }
 
 export interface ApiKey {
@@ -341,6 +346,7 @@ export interface UserUpdateRequest {
   display_name?: string;
   avatar_url?: string;
   roles?: Role[];
+  batch_notifications_enabled?: boolean;
 }
 
 export interface GroupUpdateRequest {
@@ -363,6 +369,8 @@ export interface ModelUpdateRequest {
   fallback_enabled?: boolean | null;
   fallback_on_rate_limit?: boolean | null;
   fallback_on_status?: number[] | null;
+  fallback_with_replacement?: boolean | null;
+  fallback_max_attempts?: number | null;
   sanitize_responses?: boolean | null;
 }
 
@@ -1187,3 +1195,35 @@ export interface DaemonsListResponse {
 export interface DaemonsQuery {
   status?: DaemonStatus;
 }
+
+// ===== WEBHOOK TYPES =====
+
+export interface Webhook {
+  id: string;
+  user_id: string;
+  url: string;
+  enabled: boolean;
+  event_types?: string[] | null;
+  description?: string | null;
+  created_at: string;
+  updated_at: string;
+  disabled_at?: string | null;
+}
+
+export interface WebhookWithSecret extends Webhook {
+  secret: string;
+}
+
+export interface WebhookCreateRequest {
+  url: string;
+  event_types?: string[];
+  description?: string;
+}
+
+export interface WebhookUpdateRequest {
+  url?: string;
+  enabled?: boolean;
+  event_types?: string[] | null;
+  description?: string | null;
+}
+

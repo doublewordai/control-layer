@@ -109,6 +109,7 @@ pub fn create_test_config() -> crate::config::Config {
         slow_statement_threshold_ms: 1000,
         host: "127.0.0.1".to_string(),
         port: 0,
+        dashboard_url: "http://localhost:3001".to_string(),
         admin_email: "admin@test.com".to_string(),
         admin_password: None,
         secret_key: Some("test-secret-key-for-testing-only".to_string()),
@@ -124,12 +125,6 @@ pub fn create_test_config() -> crate::config::Config {
         auth: crate::config::AuthConfig {
             native: NativeAuthConfig {
                 enabled: false,
-                email: crate::config::EmailConfig {
-                    transport: crate::config::EmailTransportConfig::File {
-                        path: temp_dir.to_string_lossy().to_string(),
-                    },
-                    ..Default::default()
-                },
                 password: PasswordConfig {
                     min_length: 8,
                     max_length: 64,
@@ -159,7 +154,10 @@ pub fn create_test_config() -> crate::config::Config {
             ..Default::default()
         },
         background_services: crate::config::BackgroundServicesConfig {
-            onwards_sync: OnwardsSyncConfig { enabled: false },
+            onwards_sync: OnwardsSyncConfig {
+                enabled: false,
+                fallback_interval_milliseconds: 10000,
+            },
             probe_scheduler: ProbeSchedulerConfig { enabled: false },
             batch_daemon: DaemonConfig {
                 enabled: DaemonEnabled::Never,
@@ -168,13 +166,21 @@ pub fn create_test_config() -> crate::config::Config {
             leader_election: LeaderElectionConfig { enabled: false },
             ..Default::default()
         },
+        email: crate::config::EmailConfig {
+            transport: crate::config::EmailTransportConfig::File {
+                path: temp_dir.to_string_lossy().to_string(),
+            },
+            ..Default::default()
+        },
         sample_files: crate::sample_files::SampleFilesConfig::default(),
         limits: LimitsConfig {
             files: FileLimitsConfig {
                 max_file_size: 1000 * 1024 * 1024, // 1GB
                 ..Default::default()
             },
+            ..Default::default()
         },
+        onwards: crate::config::OnwardsConfig::default(),
     }
 }
 
@@ -315,6 +321,7 @@ pub async fn get_system_user(pool: &mut PgConnection) -> UserResponse {
         groups: None, // Groups not included in test users by default
         credit_balance: None,
         has_payment_provider_id: false,
+        batch_notifications_enabled: false,
     }
 }
 

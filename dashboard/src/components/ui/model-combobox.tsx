@@ -51,7 +51,7 @@ export function ModelCombobox({
     return filterFn ? allModels.filter(filterFn) : allModels;
   }, [modelsData, filterFn]);
 
-  const selectedModel = models.find((model) => model.id === value?.id);
+  const selectedModel = models.find((model) => model.id === value?.id) ?? value;
 
   return (
     <Popover open={open} onOpenChange={setOpen}>

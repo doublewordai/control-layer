@@ -7,6 +7,10 @@
 host: "0.0.0.0"
 port: 3001
 
+# Base URL where the dashboard is accessible
+# Used for password reset links, payment redirect URLs, and batch notification emails
+dashboard_url: "http://localhost:5173"
+
 # Database configuration
 database:
   # Configure connectivity to an external postgres database here
@@ -106,7 +110,6 @@ secret_key: insecure-change-in-production
 # For production, configure Stripe or another provider
 payment:
   dummy:
-    host_url: "http://localhost:5173"
     amount: 100.00
 
 # Model sources - inference endpoints to connect to
@@ -146,23 +149,7 @@ auth:
       cookie_name: "dwctl_session"
       cookie_secure: true
       cookie_same_site: "strict"
-    # Email configuration for password resets and notifications
-    email:
-      # Email transport - either 'file' (for development) or 'smtp' (for production)
-      type: file
-      path: "./emails" # Directory for file-based email (when type=file)
-      # For SMTP (production), use:
-      # type: smtp
-      # host: "smtp.example.com"
-      # port: 587
-      # username: "noreply@example.com"
-      # password: "your-smtp-password"
-      # use_tls: true
-      from_email: "noreply@example.com"
-      from_name: "Control Layer"
-      password_reset:
-        token_expiry: "30m" # How long reset tokens are valid
-        base_url: "http://localhost:3001" # Frontend URL for reset links
+    password_reset_token_duration: "30m"
 
   # Proxy header authentication
   # Accepts user identity from HTTP headers set by an upstream authentication proxy
@@ -212,6 +199,18 @@ auth:
       max_age: 3600 # Cache preflight requests for 1 hour
       # exposed_headers: []  # Optional: Custom headers to expose to browser (e.g., ["X-Incomplete", "X-Last-Line"])
 
+# Email configuration for password resets and notifications
+email:
+  # Email transport - either 'file' (for development) or 'smtp' (for production)
+  type: file
+  path: "./emails" # Directory for file-based email (when type=file)
+  # For SMTP (production), use:
+  # type: smtp
+  # host: "smtp.example.com"
+  # port: 587
+  # username: "noreply@example.com"
+  # password: "your-smtp-password"
+  # use_tls: true
 # Credits configuration
 credits:
   # Initial credits given to standard users when they are created
@@ -246,6 +245,13 @@ batches:
     # - "12h"  # Uncomment to allow 12 hour SLA
     # - "48h"  # Uncomment to allow 48 hour SLA
 
+  # Allowed OpenAI-compatible URL paths for batch requests.
+  # This is used by both /files upload validation and /batches endpoint validation.
+  allowed_url_paths:
+    - "/v1/chat/completions"
+    - "/v1/embeddings"
+    - "/v1/responses"
+
   # Files configuration for batch file uploads/downloads
   # NOTE: max_file_size has moved to limits.files.max_file_size
   files:
@@ -276,6 +282,20 @@ batches:
 #     # Maximum seconds to wait for an upload slot before returning HTTP 429
 #     # Set to 0 to reject immediately when no slot is available
 #     max_upload_wait_secs: 60
+#   requests:
+#     # Maximum body size per individual request in batch JSONL files (bytes)
+#     # Set to 0 for unlimited (not recommended for production)
+#     # Default: 10MB (10485760)
+#     max_body_size: 10485760
+
+# Onwards AI proxy configuration
+# Controls behavior of the onwards routing layer for AI proxy requests
+onwards:
+  # Enable strict mode with schema validation and typed handlers.
+  # When false (default), all requests are passed through transparently.
+  # When true, only known OpenAI API paths are accepted and validated.
+  # Set via environment: DWCTL_ONWARDS__STRICT_MODE=true
+  strict_mode: false
 
 # Background services configuration
 # Controls which background services run on this instance
@@ -330,6 +350,20 @@ background_services:
     #   gpt-4:  # Original model
     #     escalation_model: o1-preview  # Route to this model when near expiry
     #     escalation_threshold_seconds: 900  # Default: 900 (15 minutes before expiry)
+
+  # Batch completion notifications (emails + webhooks)
+  # notifications:
+  #   poll_interval: 30s                # How often to poll for completed batches
+  #   webhooks:
+  #     enabled: true
+  #     timeout_secs: 30                # HTTP timeout per delivery attempt
+  #     circuit_breaker_threshold: 10   # Consecutive failures before auto-disabling
+  #     # Retry backoff schedule in seconds. Length = max attempts before exhaustion.
+  #     # Default: immediate, 5s, 5m, 30m, 2h, 8h, 24h
+  #     retry_schedule_secs: [0, 5, 300, 1800, 7200, 28800, 86400]
+  #     claim_batch_size: 50            # Max deliveries claimed from DB per tick
+  #     max_concurrent_sends: 20        # Max parallel outbound HTTP requests
+  #     channel_capacity: 200           # Internal send/result channel buffer size
 
   # Leader election - coordinates which instance runs leader-only services
   # When disabled, all instances run as leader (useful for single-instance deployments)

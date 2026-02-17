@@ -1,6 +1,7 @@
 //! Authentication utility functions.
 
-use rand::Rng;
+use rand::prelude::RngExt;
+use rand::rng;
 
 /// Generate a random inference-themed display name
 /// Format: "{adjective} {noun} {4-digit number}"
@@ -42,10 +43,10 @@ pub fn generate_random_display_name() -> String {
         "Reasoning",
     ];
 
-    let mut rng = rand::thread_rng();
-    let adjective = ADJECTIVES[rng.gen_range(0..ADJECTIVES.len())];
-    let noun = NOUNS[rng.gen_range(0..NOUNS.len())];
-    let number = rng.gen_range(1000..10000);
+    let mut rng = rng();
+    let adjective = ADJECTIVES[rng.random_range(0..ADJECTIVES.len())];
+    let noun = NOUNS[rng.random_range(0..NOUNS.len())];
+    let number = rng.random_range(1000..10000);
 
     format!("{} {} {}", adjective, noun, number)
 }

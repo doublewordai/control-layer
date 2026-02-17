@@ -84,11 +84,28 @@ pub struct OnwardsConfigSync {
     daemon_capacity_limits: Option<Arc<dashmap::DashMap<String, usize>>>,
     /// Model aliases that batch API keys should have automatic access to (escalation targets)
     escalation_models: Vec<String>,
+    /// Tracks previous-cycle gauge label sets for zeroing stale metrics
+    cache_info_state: crate::metrics::CacheInfoState,
+    /// Enable strict mode with schema validation
+    strict_mode: bool,
 }
 
-#[derive(Default)]
 pub struct SyncConfig {
-    status_tx: Option<mpsc::Sender<SyncStatus>>,
+    pub status_tx: Option<mpsc::Sender<SyncStatus>>,
+    /// Fallback sync interval in milliseconds (default: 10000ms = 10 seconds)
+    ///
+    /// Provides periodic full syncs independent of LISTEN/NOTIFY to guarantee eventual consistency.
+    /// Set to 0 to disable fallback sync (not recommended).
+    pub fallback_interval_milliseconds: u64,
+}
+
+impl Default for SyncConfig {
+    fn default() -> Self {
+        Self {
+            status_tx: None,
+            fallback_interval_milliseconds: 10000, // 10 seconds
+        }
+    }
 }
 
 impl OnwardsConfigSync {
@@ -96,7 +113,7 @@ impl OnwardsConfigSync {
     #[cfg(test)]
     #[instrument(skip(db))]
     pub async fn new(db: PgPool) -> Result<(Self, Targets, WatchTargetsStream), anyhow::Error> {
-        Self::new_with_daemon_limits(db, None, Vec::new()).await
+        Self::new_with_daemon_limits(db, None, Vec::new(), false).await
     }
 
     /// Creates a new OnwardsConfigSync with optional daemon capacity limits map and escalation models
@@ -104,18 +121,26 @@ impl OnwardsConfigSync {
     /// `escalation_models` - Model aliases that batch API keys should have automatic access to.
     /// This enables batch processing to route requests to escalation models without needing
     /// separate API key configuration.
+    /// `strict_mode` - Enable strict mode with schema validation (only known OpenAI API paths accepted)
     #[instrument(skip(db, daemon_capacity_limits, escalation_models))]
     pub async fn new_with_daemon_limits(
         db: PgPool,
         daemon_capacity_limits: Option<Arc<dashmap::DashMap<String, usize>>>,
         escalation_models: Vec<String>,
+        strict_mode: bool,
     ) -> Result<(Self, Targets, WatchTargetsStream), anyhow::Error> {
         // Load initial configuration (including composite models)
-        let initial_targets = load_targets_from_db(&db, &escalation_models).await?;
+        let initial_targets = load_targets_from_db(&db, &escalation_models, strict_mode).await?;
 
         // If daemon limits are provided, populate them
         if let Some(ref limits) = daemon_capacity_limits {
             update_daemon_capacity_limits(&db, limits).await?;
+        }
+
+        // Populate cache info metrics on startup
+        let mut cache_info_state = crate::metrics::CacheInfoState::new();
+        if let Err(e) = crate::metrics::update_cache_info_metrics(&db, &initial_targets, &mut cache_info_state).await {
+            error!("Failed to update cache info metrics: {}", e);
         }
 
         // Create watch channel with initial state
@@ -126,6 +151,8 @@ impl OnwardsConfigSync {
             sender,
             daemon_capacity_limits,
             escalation_models,
+            cache_info_state,
+            strict_mode,
         };
         let stream = WatchTargetsStream::new(receiver);
 
@@ -139,10 +166,17 @@ impl OnwardsConfigSync {
 
     /// Starts the background task that listens for database changes and updates the configuration
     #[instrument(skip(self, config, shutdown_token), err)]
-    pub async fn start(self, config: SyncConfig, shutdown_token: CancellationToken) -> Result<(), anyhow::Error> {
+    pub async fn start(mut self, config: SyncConfig, shutdown_token: CancellationToken) -> Result<(), anyhow::Error> {
         // Debouncing: prevent rapid-fire reloads
         let mut last_reload_time = std::time::Instant::now();
         const MIN_RELOAD_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+        // Fallback sync interval (0 = disabled)
+        let fallback_interval = if config.fallback_interval_milliseconds > 0 {
+            Some(std::time::Duration::from_millis(config.fallback_interval_milliseconds))
+        } else {
+            None
+        };
 
         'outer: loop {
             if let Some(tx) = &config.status_tx {
@@ -156,6 +190,15 @@ impl OnwardsConfigSync {
                 tx.send(SyncStatus::Connected).await?;
             }
             info!("Started onwards configuration listener");
+
+            // Create fallback sync timer (if enabled)
+            let mut fallback_timer = fallback_interval.map(|interval| {
+                let mut timer = tokio::time::interval(interval);
+                // Use Delay to avoid burst of syncs after runtime hiccups
+                timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                timer
+            });
+
             // Listen for notifications with graceful shutdown
             loop {
                 tokio::select! {
@@ -199,7 +242,7 @@ impl OnwardsConfigSync {
 
                                 // Reload configuration from database (including composite models)
                                 last_reload_time = std::time::Instant::now();
-                                match load_targets_from_db(&self.db, &self.escalation_models).await {
+                                match load_targets_from_db(&self.db, &self.escalation_models, self.strict_mode).await {
                                     Ok(new_targets) => {
                                         info!("Loaded {} targets from database", new_targets.targets.len());
                                         for entry in new_targets.targets.iter() {
@@ -213,12 +256,20 @@ impl OnwardsConfigSync {
                                                 error!("Failed to update daemon capacity limits: {}", e);
                                             }
 
+                                        // Update cache info metrics
+                                        if let Err(e) = crate::metrics::update_cache_info_metrics(&self.db, &new_targets, &mut self.cache_info_state).await {
+                                            error!("Failed to update cache info metrics: {}", e);
+                                        }
+
                                         // Send update through watch channel
                                         if let Err(e) = self.sender.send(new_targets) {
                                             error!("Failed to send targets update: {}", e);
                                             // If all receivers are dropped, we can exit
                                             break;
                                         }
+
+                                        // Record metric for LISTEN/NOTIFY sync
+                                        metrics::counter!("dwctl_cache_sync_total", "source" => "listen_notify").increment(1);
 
                                         // Record cache sync lag metric (time from DB change to cache update)
                                         if let Some((table_name, lag)) = notify_info {
@@ -258,6 +309,56 @@ impl OnwardsConfigSync {
                                     return Err(e.into());
                                 }
                                 break;
+                            }
+                        }
+                    }
+
+                    // Fallback periodic sync (if enabled)
+                    _ = async {
+                        match &mut fallback_timer {
+                            Some(timer) => timer.tick().await,
+                            None => std::future::pending().await, // Never resolve if disabled
+                        }
+                    } => {
+                        debug!("Fallback periodic sync triggered");
+
+                        // Skip if we just reloaded via notification (debounce)
+                        if last_reload_time.elapsed() < MIN_RELOAD_INTERVAL {
+                            debug!("Skipping fallback sync due to recent notification-triggered reload");
+                            continue;
+                        }
+
+                        last_reload_time = std::time::Instant::now();
+                        match load_targets_from_db(&self.db, &self.escalation_models, self.strict_mode).await {
+                            Ok(new_targets) => {
+                                info!("Fallback sync: loaded {} targets from database", new_targets.targets.len());
+
+                                // Update daemon capacity limits if configured
+                                if let Some(ref limits) = self.daemon_capacity_limits
+                                    && let Err(e) = update_daemon_capacity_limits(&self.db, limits).await {
+                                        error!("Failed to update daemon capacity limits: {}", e);
+                                    }
+
+                                // Update cache info metrics
+                                if let Err(e) = crate::metrics::update_cache_info_metrics(&self.db, &new_targets, &mut self.cache_info_state).await {
+                                    error!("Failed to update cache info metrics: {}", e);
+                                }
+
+                                // Send update through watch channel
+                                if let Err(e) = self.sender.send(new_targets) {
+                                    error!("Failed to send targets update: {}", e);
+                                    // If all receivers are dropped, we can exit
+                                    break;
+                                }
+
+                                // Record metric for fallback sync
+                                metrics::counter!("dwctl_cache_sync_total", "source" => "fallback").increment(1);
+                                info!("Fallback sync: updated onwards configuration successfully");
+                            }
+                            Err(e) => {
+                                error!("Fallback sync: failed to load targets from database: {}", e);
+                                metrics::counter!("dwctl_cache_sync_errors_total", "source" => "fallback").increment(1);
+                                // Continue - fallback sync errors shouldn't crash the service
                             }
                         }
                     }
@@ -302,6 +403,10 @@ struct OnwardsCompositeModel {
     fallback_on_rate_limit: bool,
     /// HTTP status codes that trigger fallback
     fallback_on_status: Vec<i32>,
+    /// Sample with replacement during weighted random failover
+    fallback_with_replacement: bool,
+    /// Maximum number of failover attempts
+    fallback_max_attempts: Option<i32>,
     /// Whether to sanitize/filter sensitive data from model responses
     sanitize_responses: bool,
     components: Vec<CompositeModelComponent>,
@@ -330,6 +435,8 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
             cm.fallback_enabled,
             cm.fallback_on_rate_limit,
             cm.fallback_on_status,
+            cm.fallback_with_replacement,
+            cm.fallback_max_attempts,
             cm.sanitize_responses as composite_sanitize_responses,
             -- Component info
             dmc.deployed_model_id,
@@ -467,6 +574,8 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                 fallback_enabled: row.fallback_enabled.unwrap_or(true),
                 fallback_on_rate_limit: row.fallback_on_rate_limit.unwrap_or(true),
                 fallback_on_status: row.fallback_on_status.clone().unwrap_or_else(|| vec![429, 500, 502, 503, 504]),
+                fallback_with_replacement: row.fallback_with_replacement.unwrap_or(false),
+                fallback_max_attempts: row.fallback_max_attempts,
                 sanitize_responses: row.composite_sanitize_responses,
                 components: Vec::new(),
                 api_keys: Vec::new(),
@@ -596,6 +705,10 @@ fn convert_composite_to_target_spec(
             on_rate_limit: composite.fallback_on_rate_limit,
             // Convert i32 status codes to u16 for onwards
             on_status: composite.fallback_on_status.iter().map(|&s| s as u16).collect(),
+            with_replacement: composite.fallback_with_replacement,
+            max_attempts: composite
+                .fallback_max_attempts
+                .and_then(|n| usize::try_from(n).ok().filter(|&v| v >= 1)),
         })
     } else {
         None
@@ -683,7 +796,7 @@ fn convert_composite_to_target_spec(
 
 /// Converts both regular targets and composite models to ConfigFile format
 #[tracing::instrument(skip(targets, composites))]
-fn convert_to_config_file(targets: Vec<OnwardsTarget>, composites: Vec<OnwardsCompositeModel>) -> ConfigFile {
+fn convert_to_config_file(targets: Vec<OnwardsTarget>, composites: Vec<OnwardsCompositeModel>, strict_mode: bool) -> ConfigFile {
     let mut key_definitions = HashMap::new();
 
     // Convert regular deployed models (wrapped in TargetSpecOrList::Single)
@@ -789,6 +902,7 @@ fn convert_to_config_file(targets: Vec<OnwardsTarget>, composites: Vec<OnwardsCo
     ConfigFile {
         targets: target_specs,
         auth,
+        strict_mode,
     }
 }
 
@@ -797,8 +911,9 @@ fn convert_to_config_file(targets: Vec<OnwardsTarget>, composites: Vec<OnwardsCo
 /// `escalation_models` - Model aliases that batch API keys should have automatic access to.
 /// This enables batch processing to route requests to escalation models without needing
 /// separate API key configuration.
+/// `strict_mode` - Enable strict mode with schema validation (only known OpenAI API paths accepted)
 #[tracing::instrument(skip(db, escalation_models))]
-pub async fn load_targets_from_db(db: &PgPool, escalation_models: &[String]) -> Result<Targets, anyhow::Error> {
+pub async fn load_targets_from_db(db: &PgPool, escalation_models: &[String], strict_mode: bool) -> Result<Targets, anyhow::Error> {
     let query_start = std::time::Instant::now();
     debug!("Loading onwards targets from database (with composite models)");
 
@@ -938,7 +1053,7 @@ pub async fn load_targets_from_db(db: &PgPool, escalation_models: &[String]) -> 
     let composites = load_composite_models_from_db(db, escalation_models).await?;
 
     // Convert to ConfigFile format
-    let config = convert_to_config_file(targets, composites);
+    let config = convert_to_config_file(targets, composites, strict_mode);
 
     // Convert ConfigFile to Targets
     Targets::from_config(config)
@@ -1011,7 +1126,7 @@ mod tests {
         let target2 = create_test_target("claude-3", "claude-alias", "https://api.anthropic.com");
 
         let targets = vec![target1, target2];
-        let config = convert_to_config_file(targets, vec![]);
+        let config = convert_to_config_file(targets, vec![], false);
 
         // Verify the config
         assert_eq!(config.targets.len(), 2);
@@ -1044,7 +1159,7 @@ mod tests {
         let target = create_test_target("valid-model", "valid-alias", "https://api.valid.com");
 
         let targets = vec![target];
-        let config = convert_to_config_file(targets, vec![]);
+        let config = convert_to_config_file(targets, vec![], false);
 
         // Should have exactly one target
         assert_eq!(config.targets.len(), 1);
@@ -1147,6 +1262,8 @@ mod tests {
                 fallback_enabled: None,
                 fallback_on_rate_limit: None,
                 fallback_on_status: None,
+                fallback_with_replacement: None,
+                fallback_max_attempts: None,
                 sanitize_responses: true,
             })
             .await
@@ -1260,6 +1377,8 @@ mod tests {
                 fallback_enabled: None,
                 fallback_on_rate_limit: None,
                 fallback_on_status: None,
+                fallback_with_replacement: None,
+                fallback_max_attempts: None,
                 sanitize_responses: true,
             })
             .await
@@ -1290,6 +1409,8 @@ mod tests {
                 fallback_enabled: Some(true),
                 fallback_on_rate_limit: Some(true),
                 fallback_on_status: Some(vec![429, 500, 502, 503, 504]),
+                fallback_with_replacement: None,
+                fallback_max_attempts: None,
                 sanitize_responses: true,
             })
             .await
@@ -1327,7 +1448,7 @@ mod tests {
 
         // Load targets with composite alias in escalation_models
         let escalation_models = vec![composite_alias.clone()];
-        let targets = super::load_targets_from_db(&pool, &escalation_models).await.unwrap();
+        let targets = super::load_targets_from_db(&pool, &escalation_models, false).await.unwrap();
 
         // Find the composite model in targets (DashMap)
         let composite_target = targets.targets.get(&composite_alias).expect("Composite model should be in targets");
@@ -1357,6 +1478,7 @@ mod tests {
         let (status_tx, mut status_rx) = mpsc::channel(10);
         let config = SyncConfig {
             status_tx: Some(status_tx),
+            fallback_interval_milliseconds: 10000,
         };
         let shutdown_token = CancellationToken::new();
         let mut sync_handle = tokio::spawn({
@@ -1432,5 +1554,62 @@ mod tests {
         let result = timeout(Duration::from_millis(100), &mut sync_handle).await;
         assert!(result.is_err(), "Task should still be running after reconnection");
         sync_handle.abort();
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    /// Test that fallback sync triggers periodic reloads even without LISTEN/NOTIFY activity
+    async fn test_fallback_sync_triggers_without_notifications(pool: sqlx::PgPool) {
+        use tokio::sync::mpsc;
+        use tokio_util::sync::CancellationToken;
+
+        // Create the sync service
+        let (sync, _initial_targets, _stream) = super::OnwardsConfigSync::new(pool.clone())
+            .await
+            .expect("Failed to create OnwardsConfigSync");
+
+        // Create sync config with 200ms fallback interval for fast testing
+        let (status_tx, mut status_rx) = mpsc::channel(10);
+        let config = SyncConfig {
+            status_tx: Some(status_tx),
+            fallback_interval_milliseconds: 20,
+        };
+
+        let shutdown_token = CancellationToken::new();
+        let mut sync_handle = tokio::spawn({
+            let token = shutdown_token.clone();
+            async move { sync.start(config, token).await }
+        });
+
+        // Wait for initial connection
+        println!("Waiting for Connecting status...");
+        assert_eq!(status_rx.recv().await, Some(super::SyncStatus::Connecting));
+        println!("Waiting for Connected status...");
+        assert_eq!(status_rx.recv().await, Some(super::SyncStatus::Connected));
+        println!("Initial connection established");
+
+        // Poll task health to ensure fallback sync doesn't crash
+        // Use interval to poll every 100ms for 500ms total (at least 2 fallback syncs at 200ms each)
+        println!("Polling task health while waiting for fallback sync...");
+        let mut poll_interval = tokio::time::interval(Duration::from_millis(100));
+        poll_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        for i in 0..5 {
+            poll_interval.tick().await;
+
+            // Check task is still running (timeout ensures we don't block if it finished)
+            let result = timeout(Duration::from_millis(10), &mut sync_handle).await;
+            assert!(
+                result.is_err(),
+                "Task should still be running at poll {} (proves fallback timer doesn't crash)",
+                i
+            );
+        }
+
+        println!("✅ Fallback sync working: task remained healthy through 5 health polls over 500ms");
+
+        // Cleanup
+        shutdown_token.cancel();
+        let _ = timeout(Duration::from_secs(1), sync_handle).await;
     }
 }

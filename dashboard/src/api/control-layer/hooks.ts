@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useMemo } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { dwctlApi, setAiApiBaseUrl } from "./client";
 import { queryKeys } from "./keys";
@@ -32,6 +32,10 @@ import type {
   Endpoint,
   AddComponentRequest,
   UpdateComponentRequest,
+  ModelMetrics,
+  ModelsInclude,
+  WebhookCreateRequest,
+  WebhookUpdateRequest,
 } from "./types";
 
 // Config hooks
@@ -146,6 +150,47 @@ export function useModels(options?: ModelsQuery) {
   });
 }
 
+/**
+ * Fetches model metrics separately from the main models query.
+ * Returns a Map<modelId, ModelMetrics> for efficient lookup.
+ *
+ * Does NOT seed individual model caches, since its response only contains
+ * metrics and would overwrite richer cached data from the main query.
+ */
+export function useModelsMetrics(
+  options?: Omit<ModelsQuery, "include"> & { enabled?: boolean },
+) {
+  const { enabled = true, ...queryOptions } = options || {};
+
+  const query = useQuery({
+    queryKey: queryKeys.models.metrics(queryOptions),
+    queryFn: () =>
+      dwctlApi.models.list({
+        ...queryOptions,
+        include: "metrics" as ModelsInclude,
+      }),
+    enabled,
+    staleTime: 30 * 1000,
+  });
+
+  const metricsMap = useMemo(() => {
+    const map = new Map<string, ModelMetrics>();
+    if (query.data?.data) {
+      for (const model of query.data.data) {
+        if (model.metrics) {
+          map.set(model.id, model.metrics);
+        }
+      }
+    }
+    return map;
+  }, [query.data]);
+
+  return {
+    ...query,
+    metricsMap,
+  };
+}
+
 export function useModel(id: string, options?: { include?: string }) {
   const queryClient = useQueryClient();
 
@@ -195,7 +240,10 @@ export function useCreateModel() {
 }
 
 // Composite model component hooks
-export function useModelComponents(modelId: string, options?: { enabled?: boolean }) {
+export function useModelComponents(
+  modelId: string,
+  options?: { enabled?: boolean },
+) {
   return useQuery({
     queryKey: queryKeys.models.components(modelId),
     queryFn: () => dwctlApi.models.components.list(modelId),
@@ -1215,10 +1263,93 @@ export function useCreateBillingPortalSession() {
 
 // ===== DAEMONS HOOKS =====
 
-export function useDaemons(options?: DaemonsQuery) {
+export function useDaemons(
+  options?: DaemonsQuery,
+  queryOptions?: { enabled?: boolean },
+) {
   return useQuery({
     queryKey: ["daemons", "list", options],
     queryFn: () => dwctlApi.daemons.list(options),
     refetchInterval: 5000, // Refetch every 5 seconds to show live daemon status
+    enabled: queryOptions?.enabled ?? true,
   });
 }
+
+// ===== WEBHOOK HOOKS =====
+
+export function useWebhooks(userId: string = "current") {
+  return useQuery({
+    queryKey: queryKeys.webhooks.byUser(userId),
+    queryFn: () => dwctlApi.users.webhooks.list(userId),
+  });
+}
+
+export function useCreateWebhook() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationKey: ["webhooks", "create"],
+    mutationFn: ({
+      data,
+      userId = "current",
+    }: {
+      data: WebhookCreateRequest;
+      userId?: string;
+    }) => dwctlApi.users.webhooks.create(data, userId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.webhooks.all });
+    },
+  });
+}
+
+export function useUpdateWebhook() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationKey: ["webhooks", "update"],
+    mutationFn: ({
+      webhookId,
+      data,
+      userId = "current",
+    }: {
+      webhookId: string;
+      data: WebhookUpdateRequest;
+      userId?: string;
+    }) => dwctlApi.users.webhooks.update(webhookId, data, userId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.webhooks.all });
+    },
+  });
+}
+
+export function useDeleteWebhook() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationKey: ["webhooks", "delete"],
+    mutationFn: ({
+      webhookId,
+      userId = "current",
+    }: {
+      webhookId: string;
+      userId?: string;
+    }) => dwctlApi.users.webhooks.delete(webhookId, userId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.webhooks.all });
+    },
+  });
+}
+
+export function useRotateWebhookSecret() {
+  return useMutation({
+    mutationKey: ["webhooks", "rotateSecret"],
+    mutationFn: ({
+      webhookId,
+      userId = "current",
+    }: {
+      webhookId: string;
+      userId?: string;
+    }) => dwctlApi.users.webhooks.rotateSecret(webhookId, userId),
+  });
+}
+

@@ -107,6 +107,9 @@ pub struct Config {
     pub host: String,
     /// HTTP server port to bind to
     pub port: u16,
+    /// Base URL where the dashboard is accessible (e.g., "https://app.example.com")
+    /// Used for password reset links, payment redirect URLs, and batch notification emails.
+    pub dashboard_url: String,
     /// Deprecated: Use `database` field instead. Kept for backward compatibility.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub database_url: Option<String>,
@@ -163,6 +166,10 @@ pub struct Config {
     pub sample_files: SampleFilesConfig,
     /// Resource limits for protecting system capacity
     pub limits: LimitsConfig,
+    /// Email configuration for password resets and notifications
+    pub email: EmailConfig,
+    /// Onwards proxy configuration
+    pub onwards: OnwardsConfig,
 }
 
 /// Individual pool configuration with all SQLx parameters.
@@ -450,23 +457,11 @@ pub enum PaymentConfig {
     /// - `DWCTL_PAYMENT__STRIPE__API_KEY` - Stripe secret API key
     /// - `DWCTL_PAYMENT__STRIPE__WEBHOOK_SECRET` - Webhook signing secret
     /// - `DWCTL_PAYMENT__STRIPE__PRICE_ID` - Price ID for the payment product
-    /// - `DWCTL_PAYMENT__STRIPE__HOST_URL` - Base URL for redirect URLs (e.g., "https://app.example.com")
     Stripe(StripeConfig),
     /// Dummy payment provider for testing
     /// Set configuration via:
     /// - `DWCTL_PAYMENT__DUMMY__AMOUNT` - Amount to add (defaults to $50)
-    /// - `DWCTL_PAYMENT__DUMMY__HOST_URL` - Base URL for redirect URLs (e.g., "https://app.example.com")
     Dummy(DummyConfig),
-}
-
-impl PaymentConfig {
-    /// Get the host URL configured for this payment provider
-    pub fn host_url(&self) -> Option<&str> {
-        match self {
-            PaymentConfig::Stripe(config) => config.host_url.as_deref(),
-            PaymentConfig::Dummy(config) => config.host_url.as_deref(),
-        }
-    }
 }
 
 /// Stripe payment configuration.
@@ -478,9 +473,6 @@ pub struct StripeConfig {
     pub webhook_secret: String,
     /// Stripe price ID for the payment (starts with price_)
     pub price_id: String,
-    /// Base URL for redirect URLs (e.g., "https://app.example.com")
-    /// This is used to construct success/cancel URLs for checkout sessions
-    pub host_url: Option<String>,
     /// Whether to enable invoice creation for checkout sessions (default: false)
     #[serde(default)]
     pub enable_invoice_creation: bool,
@@ -491,10 +483,6 @@ pub struct StripeConfig {
 pub struct DummyConfig {
     /// Amount to add in dollars (required)
     pub amount: rust_decimal::Decimal,
-    /// Base URL for redirect URLs (e.g., "https://app.example.com")
-    /// This is used to construct success/cancel URLs for checkout sessions
-    #[serde(default)]
-    pub host_url: Option<String>,
 }
 
 /// Frontend metadata displayed in the UI.
@@ -598,8 +586,9 @@ pub struct NativeAuthConfig {
     pub password: PasswordConfig,
     /// Session cookie configuration
     pub session: SessionConfig,
-    /// Email configuration for password resets
-    pub email: EmailConfig,
+    /// How long password reset tokens are valid
+    #[serde(with = "humantime_serde")]
+    pub password_reset_token_duration: Duration,
 }
 
 /// Proxy header-based authentication configuration.
@@ -718,8 +707,8 @@ pub struct EmailConfig {
     pub from_email: String,
     /// Sender display name
     pub from_name: String,
-    /// Password reset email configuration
-    pub password_reset: PasswordResetEmailConfig,
+    /// Who to set the reply to field from
+    pub reply_to: Option<String>,
 }
 
 /// Email transport configuration - either SMTP or file-based for testing.
@@ -744,17 +733,6 @@ pub enum EmailTransportConfig {
         /// Directory path where email files will be written
         path: String,
     },
-}
-
-/// Password reset email configuration.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct PasswordResetEmailConfig {
-    /// How long reset tokens are valid
-    #[serde(with = "humantime_serde")]
-    pub token_expiry: Duration,
-    /// Base URL for reset links (e.g., <https://app.example.com>)
-    pub base_url: String,
 }
 
 /// File upload/download configuration for batch processing.
@@ -797,6 +775,42 @@ impl Default for FilesConfig {
 pub struct LimitsConfig {
     /// File limits (size, request count, and upload concurrency)
     pub files: FileLimitsConfig,
+    /// Request limits (per-request body size within batch files)
+    pub requests: RequestLimitsConfig,
+}
+
+/// Request limits configuration.
+///
+/// Controls per-request body size limits within batch JSONL files
+/// to prevent individual requests from overwhelming inference providers.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RequestLimitsConfig {
+    /// Maximum body size in bytes for individual requests within batch JSONL files.
+    /// Set to 0 for unlimited (not recommended for production).
+    /// Default: 10MB
+    pub max_body_size: u64,
+}
+
+impl Default for RequestLimitsConfig {
+    fn default() -> Self {
+        Self {
+            max_body_size: 10 * 1024 * 1024, // 10MB
+        }
+    }
+}
+
+/// Onwards AI proxy configuration.
+///
+/// Controls behavior of the onwards routing layer used for AI proxy requests.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+#[derive(Default)]
+pub struct OnwardsConfig {
+    /// Enable strict mode with schema validation and typed handlers.
+    /// When false (default), all requests are passed through transparently.
+    /// When true, only known OpenAI API paths are accepted and validated.
+    pub strict_mode: bool,
 }
 
 /// File limits configuration.
@@ -856,6 +870,9 @@ pub struct BatchConfig {
     /// These define the maximum time from batch creation to completion.
     /// Default: vec!["24h".to_string()]
     pub allowed_completion_windows: Vec<String>,
+    /// Allowed OpenAI-compatible URL paths for batch requests.
+    /// These paths are validated during file upload and batch creation.
+    pub allowed_url_paths: Vec<String>,
     /// Files configuration for batch file uploads/downloads
     pub files: FilesConfig,
     /// Default throughput (requests/second) for models without explicit throughput configured.
@@ -895,6 +912,11 @@ impl Default for BatchConfig {
         Self {
             enabled: true,
             allowed_completion_windows: vec!["24h".to_string()],
+            allowed_url_paths: vec![
+                "/v1/chat/completions".to_string(),
+                "/v1/embeddings".to_string(),
+                "/v1/responses".to_string(),
+            ],
             files: FilesConfig::default(),
             default_throughput: default_batch_throughput(),
         }
@@ -975,6 +997,22 @@ pub struct DaemonConfig {
     ///   - x-fusillade-batch-endpoint
     #[serde(default = "default_batch_metadata_fields_dwctl")]
     pub batch_metadata_fields: Vec<String>,
+
+    /// Interval for running the orphaned row purge task (milliseconds).
+    /// Deletes orphaned request_templates and requests whose parent file/batch
+    /// has been soft-deleted, for right-to-erasure compliance.
+    /// Set to 0 to disable purging. Default: 600000 (10 minutes).
+    pub purge_interval_ms: u64,
+
+    /// Maximum number of orphaned rows to delete per purge iteration.
+    /// Each iteration deletes up to this many requests and this many request_templates.
+    /// Default: 1000.
+    pub purge_batch_size: i64,
+
+    /// Throttle delay between consecutive purge batches within a single drain
+    /// cycle (milliseconds). Prevents sustained high DB load when many orphans
+    /// exist. Default: 100.
+    pub purge_throttle_ms: u64,
 }
 
 fn default_batch_metadata_fields_dwctl() -> Vec<String> {
@@ -1005,6 +1043,9 @@ impl Default for DaemonConfig {
             processing_timeout_ms: 600000,
             batch_metadata_fields: default_batch_metadata_fields_dwctl(),
             model_escalations: HashMap::new(),
+            purge_interval_ms: 600_000,
+            purge_batch_size: 1000,
+            purge_throttle_ms: 100,
         }
     }
 }
@@ -1035,6 +1076,9 @@ impl DaemonConfig {
             claim_timeout_ms: self.claim_timeout_ms,
             processing_timeout_ms: self.processing_timeout_ms,
             batch_metadata_fields: self.batch_metadata_fields.clone(),
+            purge_interval_ms: self.purge_interval_ms,
+            purge_batch_size: self.purge_batch_size,
+            purge_throttle_ms: self.purge_throttle_ms,
             ..Default::default()
         }
     }
@@ -1070,6 +1114,34 @@ impl Default for LeaderElectionConfig {
     }
 }
 
+/// Batch completion notification configuration.
+///
+/// When enabled, polls for completed/failed/cancelled batches and sends email notifications
+/// to batch creators. Safe to run on all replicas — uses atomic `notification_sent_at` claim
+/// to prevent duplicate emails.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NotificationsConfig {
+    /// Enable batch completion notifications (default: true)
+    pub enabled: bool,
+    /// How often to poll for completed batches (default: 30s)
+    #[serde(with = "humantime_serde")]
+    pub poll_interval: Duration,
+    /// Webhook delivery configuration for Standard Webhooks-compliant
+    /// notifications for batch terminal state events (completed, failed).
+    pub webhooks: WebhookConfig,
+}
+
+impl Default for NotificationsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            poll_interval: Duration::from_secs(30),
+            webhooks: WebhookConfig::default(),
+        }
+    }
+}
+
 /// Background services configuration.
 ///
 /// Controls which background services are enabled on this instance.
@@ -1086,6 +1158,8 @@ pub struct BackgroundServicesConfig {
     pub leader_election: LeaderElectionConfig,
     /// Configuration for database pool metrics sampling
     pub pool_metrics: PoolMetricsSamplerConfig,
+    /// Configuration for batch completion notifications (email + webhooks)
+    pub notifications: NotificationsConfig,
 }
 
 /// Database pool metrics sampling configuration.
@@ -1117,11 +1191,23 @@ impl Default for PoolMetricsSamplerConfig {
 pub struct OnwardsSyncConfig {
     /// Enable onwards config sync service (default: true)
     pub enabled: bool,
+    /// Fallback sync interval in milliseconds (default: 10000ms = 10 seconds)
+    ///
+    /// Even when LISTEN/NOTIFY is working, this provides periodic full syncs to guarantee
+    /// eventual consistency. Prevents issues from dropped notifications or connection problems.
+    ///
+    /// Set to `0` to disable periodic fallback syncs entirely. Disabling the fallback interval
+    /// removes protection against missed notifications and is generally not recommended
+    /// in production environments.
+    pub fallback_interval_milliseconds: u64,
 }
 
 impl Default for OnwardsSyncConfig {
     fn default() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            fallback_interval_milliseconds: 10_000, // 10 seconds
+        }
     }
 }
 
@@ -1139,6 +1225,48 @@ pub struct ProbeSchedulerConfig {
 impl Default for ProbeSchedulerConfig {
     fn default() -> Self {
         Self { enabled: true }
+    }
+}
+
+/// Webhook delivery service configuration.
+///
+/// The webhook service delivers Standard Webhooks-compliant notifications
+/// for batch terminal state events (completed, failed, cancelled).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WebhookConfig {
+    /// Enable webhook delivery service (default: true)
+    pub enabled: bool,
+    /// HTTP timeout for webhook deliveries in seconds (default: 30)
+    pub timeout_secs: u64,
+    /// Retry backoff schedule in seconds. Each entry is the delay before the
+    /// corresponding attempt. The length of this list is the maximum number of
+    /// attempts — once exhausted, the delivery is marked as exhausted.
+    ///
+    /// Default: [0, 5, 300, 1800, 7200, 28800, 86400]
+    ///          (immediate, 5s, 5m, 30m, 2h, 8h, 24h)
+    pub retry_schedule_secs: Vec<i64>,
+    /// Number of consecutive failures before disabling a webhook (default: 10)
+    pub circuit_breaker_threshold: i32,
+    /// Maximum deliveries to claim from the database per tick (default: 50)
+    pub claim_batch_size: i64,
+    /// Maximum concurrent outbound HTTP requests (default: 20)
+    pub max_concurrent_sends: usize,
+    /// Internal channel buffer capacity for send requests and results (default: 200)
+    pub channel_capacity: usize,
+}
+
+impl Default for WebhookConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            timeout_secs: 30,
+            retry_schedule_secs: vec![0, 5, 300, 1800, 7200, 28800, 86400],
+            circuit_breaker_threshold: 10,
+            claim_batch_size: 50,
+            max_concurrent_sends: 20,
+            channel_capacity: 200,
+        }
     }
 }
 
@@ -1218,6 +1346,15 @@ pub struct AnalyticsConfig {
     /// Actual delay is: base_delay * 2^attempt (e.g., 100ms, 200ms, 400ms for base=100).
     /// Default: 100
     pub retry_base_delay_ms: u64,
+    /// Minimum interval in milliseconds between balance depletion notifications globally.
+    ///
+    /// When any user's balance goes negative, we send a pg_notify to invalidate their API keys.
+    /// This rate limit prevents notification storms when users continue making requests
+    /// with negative balances. At most one notification is sent per interval, even if
+    /// multiple users become depleted during that time.
+    ///
+    /// Default: 5000ms (5 seconds)
+    pub balance_notification_interval_milliseconds: u64,
 }
 
 impl Default for AnalyticsConfig {
@@ -1226,6 +1363,7 @@ impl Default for AnalyticsConfig {
             batch_size: 100,
             max_retries: 3,
             retry_base_delay_ms: 100,
+            balance_notification_interval_milliseconds: 5000,
         }
     }
 }
@@ -1235,6 +1373,7 @@ impl Default for Config {
         Self {
             host: "0.0.0.0".to_string(),
             port: 3001,
+            dashboard_url: "http://localhost:5173".to_string(),
             database_url: None, // Deprecated field
             database_replica_url: None,
             database: DatabaseConfig::default(),
@@ -1256,6 +1395,8 @@ impl Default for Config {
             credits: CreditsConfig::default(),
             sample_files: SampleFilesConfig::default(),
             limits: LimitsConfig::default(),
+            email: EmailConfig::default(),
+            onwards: OnwardsConfig::default(),
         }
     }
 }
@@ -1279,7 +1420,7 @@ impl Default for NativeAuthConfig {
             allow_registration: false,
             password: PasswordConfig::default(),
             session: SessionConfig::default(),
-            email: EmailConfig::default(),
+            password_reset_token_duration: Duration::from_secs(30 * 60), // 30 minutes
         }
     }
 }
@@ -1351,7 +1492,7 @@ impl Default for EmailConfig {
             transport: EmailTransportConfig::default(),
             from_email: "noreply@example.com".to_string(),
             from_name: "Control Layer".to_string(),
-            password_reset: PasswordResetEmailConfig::default(),
+            reply_to: None,
         }
     }
 }
@@ -1360,15 +1501,6 @@ impl Default for EmailTransportConfig {
     fn default() -> Self {
         Self::File {
             path: "./emails".to_string(),
-        }
-    }
-}
-
-impl Default for PasswordResetEmailConfig {
-    fn default() -> Self {
-        Self {
-            token_expiry: Duration::from_secs(30 * 60),    // 30 minutes
-            base_url: "http://localhost:3001".to_string(), // Frontend URL
         }
     }
 }
@@ -1537,6 +1669,13 @@ impl Config {
 
         // Validate batches API-specific configuration (only if batches API is enabled)
         if self.batches.enabled {
+            if self.batches.allowed_url_paths.is_empty() {
+                return Err(Error::Internal {
+                    operation: "Config validation: batches.allowed_url_paths cannot be empty. Add at least one supported URL path."
+                        .to_string(),
+                });
+            }
+
             // upload_buffer_size is only used during file uploads (batches API specific)
             if self.batches.files.upload_buffer_size == 0 {
                 return Err(Error::Internal {

@@ -133,6 +133,13 @@
 // TODO: This file has gotten way too big. We need to refactor it into smaller modules.
 // The constructors in test_utils should be unified with the actual constructors: right now they're
 // actually the best lib way to construct things, which is bad.
+/// Install the rustls crypto provider at process startup, before main() or any test runs.
+/// This ensures every TLS client (reqwest, async-stripe, etc.) has a provider available.
+#[ctor::ctor]
+fn install_crypto_provider() {
+    rustls::crypto::aws_lc_rs::default_provider().install_default().ok();
+}
+
 pub mod api;
 pub mod auth;
 pub mod config;
@@ -144,6 +151,7 @@ pub mod errors;
 mod leader_election;
 pub mod limits;
 mod metrics;
+mod notifications;
 mod openapi;
 mod payment_providers;
 mod probes;
@@ -153,6 +161,7 @@ mod static_assets;
 mod sync;
 pub mod telemetry;
 mod types;
+pub mod webhooks;
 
 // Test modules
 #[cfg(test)]
@@ -185,6 +194,7 @@ use axum_prometheus::PrometheusMetricLayerBuilder;
 use bon::Builder;
 pub use config::Config;
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
+use opentelemetry::trace::TraceContextExt;
 use outlet::{MultiHandler, RequestLoggerConfig, RequestLoggerLayer};
 use outlet_postgres::PostgresHandler;
 use request_logging::{AiResponse, ParsedAIRequest};
@@ -195,6 +205,7 @@ use tokio::net::TcpListener;
 use tower::Layer;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing::{debug, info, instrument};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 use utoipa::OpenApi;
 use utoipa_scalar::{Scalar, Servable};
 use uuid::Uuid;
@@ -896,6 +907,7 @@ pub async fn build_router(
     onwards_router: Router,
     analytics_sender: Option<request_logging::batcher::AnalyticsSender>,
     metrics_recorder: Option<GenAiMetrics>,
+    strict_mode: bool,
 ) -> anyhow::Result<Router> {
     // Setup request logging and/or analytics based on config flags
     //
@@ -982,6 +994,22 @@ pub async fn build_router(
         .route(
             "/users/{user_id}/api-keys/{id}",
             delete(api::handlers::api_keys::delete_user_api_key),
+        )
+        // Webhooks as user sub-resources
+        .route("/users/{user_id}/webhooks", get(api::handlers::webhooks::list_webhooks))
+        .route("/users/{user_id}/webhooks", post(api::handlers::webhooks::create_webhook))
+        .route("/users/{user_id}/webhooks/{webhook_id}", get(api::handlers::webhooks::get_webhook))
+        .route(
+            "/users/{user_id}/webhooks/{webhook_id}",
+            patch(api::handlers::webhooks::update_webhook),
+        )
+        .route(
+            "/users/{user_id}/webhooks/{webhook_id}",
+            delete(api::handlers::webhooks::delete_webhook),
+        )
+        .route(
+            "/users/{user_id}/webhooks/{webhook_id}/rotate-secret",
+            post(api::handlers::webhooks::rotate_secret),
         )
         // User-group relationships
         .route("/users/{user_id}/groups", get(api::handlers::groups::get_user_groups))
@@ -1151,20 +1179,51 @@ pub async fn build_router(
     };
 
     // Build the app with admin API and onwards proxy nested. serve the (restricted) openai spec.
-    // Batches routes are merged with onwards router under /ai/v1 (batches match first)
-    let ai_router = if let Some(batches) = batches_routes {
-        batches.merge(onwards_router)
-    } else {
-        onwards_router
-    };
-
-    let router = Router::new()
+    // Strict mode requires different nesting:
+    // - Batches routes (no /v1 prefix) need to be at /ai/v1/files, /ai/v1/batches
+    // - Onwards strict routes (with /v1 prefix) need to be at /ai so /ai/v1/chat/completions matches /v1/chat/completions
+    // Non-strict mode:
+    // - Both batches and onwards can be merged and nested at /ai/v1 (catchall handles everything)
+    let mut router = Router::new()
         .route("/healthz", get(|| async { "OK" }))
         // Webhook routes (external services, not part of client API docs)
         .route("/webhooks/payments", post(api::handlers::payments::webhook_handler))
         .with_state(state.clone())
-        .merge(auth_routes)
-        .nest("/ai/v1", ai_router)
+        .merge(auth_routes);
+
+    // Add AI routes with appropriate nesting based on strict mode
+    if strict_mode {
+        // Strict mode: nest onwards at /ai, nest batches at /ai/v1
+        router = router.nest("/ai", onwards_router);
+        if let Some(batches) = batches_routes {
+            // Add fallback to batches router to return 404 for unknown routes
+            // This prevents unknown /ai/v1/* requests from falling through to the
+            // global GET-only fallback which would return 405 for POST requests
+            let batches_with_fallback = batches.fallback(|| async {
+                (
+                    axum::http::StatusCode::NOT_FOUND,
+                    axum::Json(serde_json::json!({
+                        "error": {
+                            "message": "Unknown endpoint",
+                            "type": "invalid_request_error",
+                            "code": "not_found"
+                        }
+                    })),
+                )
+            });
+            router = router.nest("/ai/v1", batches_with_fallback);
+        }
+    } else {
+        // Non-strict mode: merge batches + onwards, nest at /ai/v1
+        let ai_router = if let Some(batches) = batches_routes {
+            batches.merge(onwards_router)
+        } else {
+            onwards_router
+        };
+        router = router.nest("/ai/v1", ai_router);
+    }
+
+    let router = router
         .nest("/admin/api/v1", api_routes_with_state)
         .route("/admin/openapi.json", get(|| async { axum::Json(AdminApiDoc::openapi()) }))
         .route("/ai/openapi.json", get(|| async { axum::Json(AiApiDoc::openapi()) }))
@@ -1223,29 +1282,126 @@ pub async fn build_router(
             .layer(prometheus_layer);
     }
 
-    // Add tracing layer with OTel-compatible span names and HTTP semantic conventions
-    let router = router.layer(TraceLayer::new_for_http().make_span_with(|request: &http::Request<_>| {
-        let path = request.uri().path();
-        let span_name = format!("{} {}", request.method(), path);
-        let api_type = if path.starts_with("/ai/") {
-            "ai_proxy"
-        } else if path.starts_with("/admin/") {
-            "admin"
-        } else {
-            "other"
-        };
-        tracing::info_span!(
-            "request",
-            otel.name = %span_name,
-            otel.kind = "Server",
-            api.type = api_type,
-            http.request.method = %request.method(),
-            url.path = path,
-            url.query = request.uri().query().unwrap_or(""),
-        )
-    }));
+    // Add tracing layer with OTel-compatible span names and HTTP semantic conventions.
+    // Only trace_id and otel.name are tracing span fields (visible in fmt log output).
+    // All other attributes are set via OpenTelemetrySpanExt::set_attribute() so they're
+    // exported to the trace backend but don't clutter log lines.
+    // Reference: https://opentelemetry.io/docs/specs/semconv/http/http-spans/
+    let router = router.layer(middleware::from_fn(inject_trace_id)).layer(
+        TraceLayer::new_for_http()
+            .make_span_with(|request: &http::Request<_>| {
+                let path = request.uri().path();
+                let route = request
+                    .extensions()
+                    .get::<axum::extract::MatchedPath>()
+                    .map(|mp| mp.as_str().to_owned());
+                let span_name = if let Some(ref route) = route {
+                    format!("{} {}", request.method(), route)
+                } else {
+                    format!("{} {}", request.method(), path)
+                };
+                let api_type = if path.starts_with("/ai/") {
+                    "ai_proxy"
+                } else if path.starts_with("/admin/") {
+                    "admin"
+                } else {
+                    "other"
+                };
+                let span = tracing::info_span!(
+                    "request",
+                    trace_id = tracing::field::Empty,
+                    otel.name = %span_name,
+                );
+
+                // W3C Trace Context propagation (https://www.w3.org/TR/trace-context/)
+                //
+                // When an upstream caller (e.g. fusillade's batch daemon) sends a
+                // request with a `traceparent` header, we parse it and set this
+                // span's parent to the remote span context. This makes the dwctl
+                // request span appear as a child of the caller's span in the trace
+                // backend, producing one continuous trace across service boundaries.
+                //
+                // Without this, dwctl would start a new trace for every incoming
+                // request, breaking the connection between fusillade's
+                // process_request → execute and the dwctl request it dispatches.
+                //
+                // The traceparent header format is: {version}-{trace_id}-{span_id}-{flags}
+                // e.g. "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+                //
+                // If parsing fails at any point we silently fall through and the
+                // span starts a fresh trace — this is fine for requests that don't
+                // carry trace context (e.g. direct API calls from users).
+                if let Some(traceparent) = request.headers().get("traceparent")
+                    && let Ok(tp) = traceparent.to_str()
+                {
+                    let parts: Vec<&str> = tp.split('-').collect();
+                    if parts.len() == 4
+                        && let (Ok(trace_id), Ok(span_id)) = (
+                            opentelemetry::trace::TraceId::from_hex(parts[1]),
+                            opentelemetry::trace::SpanId::from_hex(parts[2]),
+                        )
+                    {
+                        let flags = u8::from_str_radix(parts[3], 16).unwrap_or(1);
+                        let parent_ctx = opentelemetry::trace::SpanContext::new(
+                            trace_id,
+                            span_id,
+                            opentelemetry::trace::TraceFlags::new(flags),
+                            true, // remote: this span context came from another process
+                            opentelemetry::trace::TraceState::default(),
+                        );
+                        let parent = opentelemetry::Context::new().with_remote_span_context(parent_ctx);
+                        let _ = span.set_parent(parent);
+                    }
+                }
+
+                span.set_attribute("otel.kind", "Server");
+                span.set_attribute("api.type", api_type.to_string());
+                span.set_attribute("http.request.method", request.method().to_string());
+                span.set_attribute("http.route", route.unwrap_or_default());
+                span.set_attribute("url.path", path.to_string());
+                span.set_attribute("url.query", request.uri().query().unwrap_or("").to_string());
+                span
+            })
+            .on_response(|response: &http::Response<_>, latency: std::time::Duration, span: &tracing::Span| {
+                let status = response.status().as_u16();
+                span.set_attribute("http.response.status_code", i64::from(status));
+                if status >= 500 {
+                    span.set_attribute("otel.status_code", "ERROR");
+                    span.set_attribute("error.type", status.to_string());
+                } else if status >= 400 {
+                    span.set_attribute("error.type", status.to_string());
+                }
+                tracing::info!(
+                    http.response.status_code = status,
+                    latency_ms = latency.as_millis() as u64,
+                    "finished processing request"
+                );
+            })
+            .on_failure(
+                |error: tower_http::classify::ServerErrorsFailureClass, latency: std::time::Duration, span: &tracing::Span| {
+                    span.set_attribute("otel.status_code", "ERROR");
+                    span.set_attribute("error.type", error.to_string());
+                    tracing::error!(
+                        error = %error,
+                        latency_ms = latency.as_millis() as u64,
+                        "request failed"
+                    );
+                },
+            ),
+    );
 
     Ok(router)
+}
+
+/// Middleware that records the OpenTelemetry trace ID on the current span,
+/// making it visible in fmt log output for Loki → Tempo correlation.
+async fn inject_trace_id(request: axum::extract::Request, next: middleware::Next) -> axum::response::Response {
+    let span = tracing::Span::current();
+    let sc = span.context().span().span_context().clone();
+    if sc.is_valid() {
+        span.record("trace_id", tracing::field::display(sc.trace_id()));
+    }
+    next.run(request).await
 }
 
 /// Container for background services and their lifecycle management.
@@ -1268,6 +1424,8 @@ pub struct BackgroundServices {
     onwards_targets: onwards::target::Targets,
     #[cfg_attr(not(test), allow(dead_code))]
     onwards_sender: Option<tokio::sync::watch::Sender<onwards::target::Targets>>,
+    #[allow(dead_code)] // Used in sync_onwards_config method
+    strict_mode: bool,
     /// Sender for analytics records (if analytics is enabled)
     analytics_sender: Option<request_logging::batcher::AnalyticsSender>,
     // JoinSet is cancel-safe - can be polled in select! without losing tasks
@@ -1309,6 +1467,11 @@ impl BackgroundServices {
         }
     }
 
+    /// Get a clone of the shutdown token for coordinating early cancellation
+    pub fn shutdown_token(&self) -> tokio_util::sync::CancellationToken {
+        self.shutdown_token.clone()
+    }
+
     /// Gracefully shutdown all background tasks
     pub async fn shutdown(mut self) {
         // Signal all background tasks to shutdown
@@ -1346,7 +1509,7 @@ impl BackgroundServices {
 
         // Use the same load function as the automatic sync
         // Note: escalation_models is empty for tests - individual tests can set up their own
-        let new_targets = crate::sync::onwards_config::load_targets_from_db(pool, &[]).await?;
+        let new_targets = crate::sync::onwards_config::load_targets_from_db(pool, &[], self.strict_mode).await?;
 
         // Send through the watch channel (same as automatic sync)
         sender
@@ -1424,6 +1587,7 @@ async fn setup_background_services(
             pool.clone(),
             Some(model_capacity_limits.clone()),
             escalation_models,
+            config.onwards.strict_mode,
         )
         .await?;
 
@@ -1439,10 +1603,18 @@ async fn setup_background_services(
 
         // Start the onwards configuration listener
         let onwards_shutdown = shutdown_token.clone();
+        let fallback_interval = config.background_services.onwards_sync.fallback_interval_milliseconds;
         background_tasks.spawn("onwards-config-sync", async move {
-            info!("Starting onwards configuration listener");
+            info!(
+                "Starting onwards configuration listener (fallback sync every {}ms)",
+                fallback_interval
+            );
+            let sync_config = sync::onwards_config::SyncConfig {
+                status_tx: None,
+                fallback_interval_milliseconds: fallback_interval,
+            };
             onwards_config_sync
-                .start(Default::default(), onwards_shutdown)
+                .start(sync_config, onwards_shutdown)
                 .await
                 .context("Onwards configuration listener failed")
         });
@@ -1454,6 +1626,7 @@ async fn setup_background_services(
         let empty_config = onwards::target::ConfigFile {
             targets: std::collections::HashMap::new(),
             auth: None,
+            strict_mode: false,
         };
         (onwards::target::Targets::from_config(empty_config)?, None)
     };
@@ -1534,6 +1707,25 @@ async fn setup_background_services(
                 info!("Skipping leader election - running as leader with probe scheduler (fusillade daemon disabled)");
             }
         }
+
+        // Start batch notification poller if enabled
+        if config.background_services.notifications.enabled {
+            let daemon_config = config.clone();
+            let daemon_request_manager = request_manager.clone();
+            let daemon_pool = pool.clone();
+            let daemon_shutdown = shutdown_token.clone();
+            background_tasks.spawn("batch-notifications", async move {
+                notifications::run_notification_poller(
+                    daemon_config.background_services.notifications.clone(),
+                    daemon_config,
+                    daemon_request_manager,
+                    daemon_pool,
+                    daemon_shutdown,
+                )
+                .await;
+                Ok(())
+            });
+        }
     } else {
         // Normal leader election
         is_leader = false;
@@ -1594,7 +1786,7 @@ async fn setup_background_services(
                 leader_election_flag,
                 LEADER_LOCK_ID,
                 leader_election_shutdown,
-                move |_pool, config| {
+                move |pool, config| {
                     // This closure is run when a replica becomes the leader
                     let scheduler = leader_election_scheduler_gain.clone();
                     let request_manager = leader_election_request_manager_gain.clone();
@@ -1626,6 +1818,8 @@ async fn setup_background_services(
                             tracing::info!("Probe scheduler disabled by configuration");
                         }
 
+                        let notification_request_manager = request_manager.clone();
+
                         // Start the fusillade batch processing daemon based on config
                         use crate::config::DaemonEnabled;
                         use fusillade::DaemonExecutor;
@@ -1646,6 +1840,23 @@ async fn setup_background_services(
                             DaemonEnabled::Never => {
                                 tracing::info!("Fusillade batch daemon disabled by configuration");
                             }
+                        }
+
+                        // Start batch notification poller if enabled
+                        if config.background_services.notifications.enabled {
+                            let daemon_config = config.clone();
+                            let daemon_session_token = session_token.clone();
+                            tokio::spawn(async move {
+                                notifications::run_notification_poller(
+                                    daemon_config.background_services.notifications.clone(),
+                                    daemon_config,
+                                    notification_request_manager,
+                                    pool,
+                                    daemon_session_token,
+                                )
+                                .await;
+                            });
+                            tracing::info!("Batch notification poller started on elected leader");
                         }
 
                         Ok(())
@@ -1735,6 +1946,7 @@ async fn setup_background_services(
         is_leader,
         onwards_targets: initial_targets,
         onwards_sender,
+        strict_mode: config.onwards.strict_mode,
         analytics_sender,
         background_tasks,
         task_names,
@@ -1824,10 +2036,29 @@ impl Application {
         )
         .await?;
 
-        // Build onwards router from targets with response sanitization enabled
-        let onwards_app_state =
-            onwards::AppState::new(bg_services.onwards_targets.clone()).with_response_transform(onwards::create_openai_sanitizer());
-        let onwards_router = onwards::build_router(onwards_app_state);
+        // Enforce `stream_options.include_usage` for streaming chat completions.
+        //
+        // For streaming requests, upstream providers only report token usage in the final
+        // SSE chunk when `stream_options: { include_usage: true }` is set. Without it,
+        // the response contains no usage data and the request logs record 0 tokens — meaning
+        // the request can't be billed. The dashboard sets this automatically, but direct API
+        // callers may not.
+        //
+        // This applies to /chat/completions and the legacy /completions endpoint (both
+        // support `stream_options`). The Responses API (/responses) always includes usage
+        // in its response object regardless of streaming, so no transform is needed there.
+        // Embeddings don't support streaming.
+        let body_transform: onwards::BodyTransformFn = Arc::new(request_logging::stream_usage::stream_usage_transform);
+
+        // Build onwards router from targets with body transform and response sanitization
+        let onwards_app_state = onwards::AppState::with_transform(bg_services.onwards_targets.clone(), body_transform)
+            .with_response_transform(onwards::create_openai_sanitizer());
+        let onwards_router = if bg_services.onwards_targets.strict_mode {
+            tracing::info!("Strict mode enabled - using typed request validation");
+            onwards::strict::build_strict_router(onwards_app_state)
+        } else {
+            onwards::build_router(onwards_app_state)
+        };
 
         // Build resource limiters
         let limiters = limits::Limiters::new(&config.limits);
@@ -1847,6 +2078,7 @@ impl Application {
             onwards_router,
             bg_services.analytics_sender.clone(),
             metrics_recorder,
+            bg_services.onwards_targets.strict_mode,
         )
         .await?;
 
@@ -1891,6 +2123,16 @@ impl Application {
         let middleware = middleware::from_fn_with_state(self.app_state, admin_ai_proxy_middleware);
         let service = middleware.layer(self.router);
 
+        // Cancel shutdown token when SIGTERM arrives, BEFORE axum starts waiting
+        // for in-flight connections to close. This lets background services (e.g.,
+        // fusillade daemon) abort in-flight HTTP tasks immediately, allowing
+        // proxy connections to close and axum's graceful shutdown to complete.
+        let shutdown_token = self.bg_services.shutdown_token();
+        let shutdown = async move {
+            shutdown.await;
+            shutdown_token.cancel();
+        };
+
         // Race the server against background task failures (fail-fast)
         let server_error: Option<anyhow::Error> = tokio::select! {
             result = axum::serve(listener, service.into_make_service()).with_graceful_shutdown(shutdown) => {
@@ -1913,11 +2155,18 @@ impl Application {
         info!("Closing database connections...");
         self.db_pools.close().await;
 
-        // Shutdown telemetry to flush pending spans
-        if let Some(provider) = self._tracer_provider.take() {
-            info!("Shutting down telemetry...");
-            if let Err(e) = provider.shutdown() {
-                tracing::error!("Failed to shutdown tracer provider: {}", e);
+        // Flush pending spans without shutting down the processor.
+        // We intentionally use force_flush() instead of shutdown() because the
+        // tracing_opentelemetry layer (global subscriber) still holds a Tracer
+        // referencing the same inner provider. Calling shutdown() marks the
+        // BatchSpanProcessor as dead, but any tracing event emitted afterward
+        // (during remaining cleanup, tokio runtime drop, etc.) still hits the
+        // processor and generates an "AfterShutdown" warning per span. By only
+        // flushing, the processor stays alive and silently accepts late spans.
+        if let Some(ref provider) = self._tracer_provider {
+            info!("Flushing telemetry...");
+            if let Err(e) = provider.force_flush() {
+                tracing::error!("Failed to flush tracer provider: {}", e);
             }
         }
 
