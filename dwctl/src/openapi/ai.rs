@@ -133,6 +133,39 @@ fn list_models() {}
 #[allow(unused)]
 fn get_model() {}
 
+/// Create a response.
+#[utoipa::path(
+    post,
+    path = "/responses",
+    tag = "responses-api",
+    summary = "Create response",
+    description = "Creates a model response for the given input.
+
+The Responses API is OpenAI's unified API that supersedes Chat Completions for advanced use cases. It provides enhanced capabilities including:
+
+- **Reasoning models** with controllable effort levels via `reasoning_effort`
+- **Multimodal support** via `modalities` parameter
+- **Stateful conversations** via `previous_response_id` for maintaining context across turns
+- **Flexible input** - accepts either a string or array of messages
+- **Structured instructions** - separate `instructions` and `input` fields for cleaner semantics
+
+Set `stream: true` to receive partial responses as server-sent events.",
+    request_body = extra_types::ResponseRequest,
+    responses(
+        (status = 200, description = "Response generated successfully. When streaming, returns a series of SSE events.", body = extra_types::ResponseObject),
+        (status = 400, description = "Invalid request — check that your input is properly formatted and all required fields are present.", body = extra_types::OpenAIErrorResponse),
+        (status = 401, description = "Invalid or missing API key. Ensure your `Authorization` header is set to `Bearer YOUR_API_KEY`.", body = extra_types::OpenAIErrorResponse),
+        (status = 402, description = "Insufficient credits. Top up your account to continue making requests.", body = extra_types::OpenAIErrorResponse),
+        (status = 403, description = "Your API key does not have access to the requested model.", body = extra_types::OpenAIErrorResponse),
+        (status = 404, description = "The specified model does not exist. Use `GET /models` to list available models.", body = extra_types::OpenAIErrorResponse),
+        (status = 429, description = "Rate limit exceeded. Back off and retry after a short delay.", body = extra_types::OpenAIErrorResponse),
+        (status = 500, description = "An unexpected error occurred. Retry the request or contact support if the issue persists.", body = extra_types::OpenAIErrorResponse),
+    ),
+    security(("BearerAuth" = []))
+)]
+#[allow(unused)]
+fn create_response() {}
+
 // ============================================================================
 // OpenAPI Document
 // ============================================================================
