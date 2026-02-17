@@ -28,14 +28,10 @@ pub fn normalize_completion_window(input: &str) -> Result<String> {
     }
 
     // Display format: "Standard (24h)", "High (1h)"
-    if lower.starts_with("standard") {
-        if let Some(time) = extract_time_from_parens(&lower) {
-            return Ok(time);
-        }
-    } else if lower.starts_with("high") {
-        if let Some(time) = extract_time_from_parens(&lower) {
-            return Ok(time);
-        }
+    if (lower.starts_with("standard") || lower.starts_with("high"))
+        && let Some(time) = extract_time_from_parens(&lower)
+    {
+        return Ok(time);
     }
 
     Err(Error::BadRequest {

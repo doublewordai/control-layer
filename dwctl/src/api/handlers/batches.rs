@@ -2202,9 +2202,9 @@ mod tests {
             .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
             .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .await;
-        resp.assert_status(StatusCode::BAD_REQUEST);
+        resp.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
         let error_text = resp.text();
-        assert!(error_text.contains("Unsupported completion_window"));
-        assert!(error_text.contains("standard") || error_text.contains("high"));
+        assert!(error_text.contains("Invalid completion window format"));
+        assert!(error_text.contains("Standard (24h)") || error_text.contains("High (1h)"));
     }
 }
