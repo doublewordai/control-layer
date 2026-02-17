@@ -27,9 +27,10 @@ pub struct TariffResponse {
     /// Optional API key purpose this tariff applies to (realtime, batch, playground)
     /// If null, tariff is not automatically applied
     pub api_key_purpose: Option<ApiKeyPurpose>,
-    /// Optional completion window (priority) for batch tariffs (e.g., "24h", "1h")
+    /// Optional completion window (priority) for batch tariffs (e.g., "Standard (24h)", "High (1h)")
     /// Only applicable when api_key_purpose is Batch
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "Standard (24h)")]
     pub completion_window: Option<String>,
     pub valid_from: DateTime<Utc>,
     pub valid_until: Option<DateTime<Utc>>,

@@ -110,10 +110,17 @@ export function CreateBatchModal({
     }
   }, [availableFiles.length, hasLoadedFiles]);
 
+  // Extract raw completion window value for cost estimate API
+  // "Standard (24h)" -> "24h", "High (1h)" -> "1h"
+  const rawCompletionWindow = useMemo(() => {
+    const match = completionWindow.match(/\(([^)]+)\)/);
+    return match ? match[1] : completionWindow;
+  }, [completionWindow]);
+
   // Fetch cost estimate for selected file with current completion window
   const { data: costEstimate, isLoading: isLoadingCost } = useFileCostEstimate(
     selectedFileId || undefined,
-    completionWindow,
+    rawCompletionWindow,
   );
 
   // Update default when available windows change
@@ -291,7 +298,7 @@ export function CreateBatchModal({
     setSelectedFileId(preselectedFile?.id || null);
     setFileToUpload(null);
     setEndpoint("/v1/chat/completions");
-    setCompletionWindow(availableWindows[0] || "24h");
+    setCompletionWindow(availableWindows[0] || "Standard (24h)");
     setDescription("");
     setExpirationSeconds(2592000);
     setFilename("");
