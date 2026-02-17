@@ -1179,10 +1179,9 @@ pub async fn get_file_content<P: PoolProvider>(
 
     if let Some(limit) = requested_limit {
         // Pagination case: buffer only N+1 items to check for more pages
-        let content_stream =
-            state
-                .request_manager
-                .get_file_content_stream(fusillade::FileId(file_id), offset, search);
+        let content_stream = state
+            .request_manager
+            .get_file_content_stream(fusillade::FileId(file_id), offset, search);
 
         let mut buffer: Vec<_> = content_stream.take(limit + 1).collect().await;
         let has_more_pages = buffer.len() > limit;
@@ -1224,10 +1223,9 @@ pub async fn get_file_content<P: PoolProvider>(
             None
         };
 
-        let content_stream =
-            state
-                .request_manager
-                .get_file_content_stream(fusillade::FileId(file_id), offset, search);
+        let content_stream = state
+            .request_manager
+            .get_file_content_stream(fusillade::FileId(file_id), offset, search);
 
         // Limit stream to expected count so X-Last-Line is accurate
         let content_stream: Pin<Box<dyn Stream<Item = fusillade::Result<fusillade::FileContentItem>> + Send>> =

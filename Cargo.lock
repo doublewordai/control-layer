@@ -1459,7 +1459,7 @@ checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
 name = "dwctl"
-version = "7.4.1"
+version = "7.5.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -1817,9 +1817,9 @@ checksum = "e6d5a32815ae3f33302d95fdcb2ce17862f8c65363dcfd29360480ba1001fc9c"
 
 [[package]]
 name = "fusillade"
-version = "5.5.0"
+version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d8a5de4869dbe1f0faa5dfe3acbdcc18115ca893c7c72c88032b61f7ca9fab32"
+checksum = "6d5d98e06222453cbbc3ee34e9d81fa8cce5236d409b4c7b0f04f731bb680677"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6026,18 +6026,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "wasmparser"
-version = "0.244.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "47b807c72e1bac69382b3a6fb3dbe8ea4c0ed87ff5629b8685ae6b9a611028fe"
-dependencies = [
- "bitflags 2.10.0",
- "hashbrown 0.15.5",
- "indexmap 2.13.0",
- "semver",
-]
-
-[[package]]
 name = "web-sys"
 version = "0.3.85"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6570,11 +6558,7 @@ dependencies = [
  "prettyplease",
  "proc-macro2",
  "quote",
-<<<<<<< HEAD
- "syn 2.0.114",
-=======
  "syn 2.0.116",
->>>>>>> main
  "wit-bindgen-core",
  "wit-bindgen-rust",
 ]

@@ -591,7 +591,7 @@ pub async fn get_batch_results<P: PoolProvider>(
 
         let results_stream = state
             .request_manager
-            .get_batch_results_stream(fusillade::BatchId(batch_id), offset, search, status, true);
+            .get_batch_results_stream(fusillade::BatchId(batch_id), offset, search, status);
 
         // Limit stream to expected count so X-Last-Line is accurate
         let results_stream: Pin<Box<dyn futures::Stream<Item = fusillade::Result<fusillade::batch::BatchResultItem>> + Send>> =
