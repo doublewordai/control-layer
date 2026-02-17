@@ -1,5 +1,17 @@
 # Changelog
 
+## [8.0.0](https://github.com/doublewordai/control-layer/compare/v7.5.1...v8.0.0) (2026-02-17)
+
+
+### ⚠ BREAKING CHANGES
+
+* move from SLA to Priority ([#711](https://github.com/doublewordai/control-layer/issues/711))
+
+### Features
+
+* add OpenAPI docs for Responses API ([#713](https://github.com/doublewordai/control-layer/issues/713)) ([ec3a49b](https://github.com/doublewordai/control-layer/commit/ec3a49ba2509bf2aa9802916563e09693f70d8df))
+* move from SLA to Priority ([#711](https://github.com/doublewordai/control-layer/issues/711)) ([1ee7f63](https://github.com/doublewordai/control-layer/commit/1ee7f63bfdcc88111b3c7f80919eb72bf3e4fe6d))
+
 ## [7.5.1](https://github.com/doublewordai/control-layer/compare/v7.5.0...v7.5.1) (2026-02-17)
 
 
