@@ -79,6 +79,11 @@ export interface ConfigResponse {
   };
   /** Base URL for AI API endpoints (files, batches, daemons). If not set, use relative paths. */
   ai_api_base_url?: string;
+  /** Onwards AI proxy configuration */
+  onwards: {
+    /** Whether strict mode is enabled (uses trusted flag for providers) */
+    strict_mode: boolean;
+  };
 }
 
 // Model metrics time series point
@@ -154,6 +159,7 @@ export interface Model {
   fallback?: FallbackConfig | null;
   components?: ModelComponent[]; // only present when include=components
   sanitize_responses?: boolean | null; // only present for virtual models
+  trusted?: boolean; // Mark provider as trusted in strict mode (bypasses error sanitization)
 }
 
 // Model creation types - discriminated union with "type" field
@@ -169,6 +175,7 @@ export interface StandardModelCreate {
   burst_size?: number;
   capacity?: number;
   batch_capacity?: number;
+  trusted?: boolean;
 }
 
 // Virtual model creation - routes requests across multiple hosted models
@@ -372,6 +379,7 @@ export interface ModelUpdateRequest {
   fallback_with_replacement?: boolean | null;
   fallback_max_attempts?: number | null;
   sanitize_responses?: boolean | null;
+  trusted?: boolean | null;
 }
 
 // Endpoint-specific types
