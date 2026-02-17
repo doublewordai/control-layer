@@ -133,6 +133,41 @@ fn list_models() {}
 #[allow(unused)]
 fn get_model() {}
 
+/// Create a response.
+#[utoipa::path(
+    post,
+    path = "/responses",
+    tag = "responses-api",
+    summary = "Create response",
+    description = "Creates a model response for the given input.
+
+This endpoint implements the Open Responses compatible API, providing enhanced capabilities including:
+
+- **Reasoning models** with controllable effort via `reasoning` parameter
+- **Stateful conversations** via `previous_response_id` for maintaining context across turns
+- **Flexible input** - accepts either a string or array of messages
+- **Text output configuration** via `text` parameter for structured outputs
+- **Context window management** via `truncation` parameter
+
+Set `stream: true` to receive partial responses as server-sent events.
+
+[Open Responses API Reference →](https://www.openresponses.org/reference)",
+    request_body = extra_types::ResponseRequest,
+    responses(
+        (status = 200, description = "Response generated successfully. When streaming, returns a series of SSE events.", body = extra_types::ResponseObject),
+        (status = 400, description = "Invalid request — check that your input is properly formatted and all required fields are present.", body = extra_types::OpenAIErrorResponse),
+        (status = 401, description = "Invalid or missing API key. Ensure your `Authorization` header is set to `Bearer YOUR_API_KEY`.", body = extra_types::OpenAIErrorResponse),
+        (status = 402, description = "Insufficient credits. Top up your account to continue making requests.", body = extra_types::OpenAIErrorResponse),
+        (status = 403, description = "Your API key does not have access to the requested model.", body = extra_types::OpenAIErrorResponse),
+        (status = 404, description = "The specified model does not exist. Use `GET /models` to list available models.", body = extra_types::OpenAIErrorResponse),
+        (status = 429, description = "Rate limit exceeded. Back off and retry after a short delay.", body = extra_types::OpenAIErrorResponse),
+        (status = 500, description = "An unexpected error occurred. Retry the request or contact support if the issue persists.", body = extra_types::OpenAIErrorResponse),
+    ),
+    security(("BearerAuth" = []))
+)]
+#[allow(unused)]
+fn create_response() {}
+
 // ============================================================================
 // OpenAPI Document
 // ============================================================================
@@ -149,6 +184,7 @@ fn get_model() {}
         embeddings,
         list_models,
         get_model,
+        create_response,
         // Batch API endpoints (actual handlers)
         api::handlers::files::upload_file,
         api::handlers::files::list_files,
@@ -187,6 +223,11 @@ fn get_model() {}
             extra_types::ModelObject,
             extra_types::OpenAIErrorResponse,
             extra_types::OpenAIError,
+            // Responses API types
+            extra_types::ResponseRequest,
+            extra_types::ResponseObject,
+            extra_types::ResponseInput,
+            extra_types::ResponseItem,
             // File/Batch types
             api::models::files::ListFilesQuery,
             api::models::files::FileResponse,
@@ -248,6 +289,17 @@ Use embeddings for:
         (name = "models", description = "List and retrieve information about available models.
 
 Use these endpoints to discover which models you have access to and their capabilities."),
+        (name = "responses-api", description = "Create model responses with enhanced capabilities.
+
+Open Responses compatible endpoint providing advanced features:
+
+- **Reasoning models** — Control computational effort with `reasoning` parameter
+- **Stateful conversations** — Maintain context across turns with `previous_response_id`
+- **Flexible input** — Use simple strings or full message arrays
+- **Text output configuration** — Structured outputs via `text` parameter
+- **Context management** — Handle overflow with `truncation` parameter
+
+[Open Responses API Reference →](https://www.openresponses.org/reference)"),
     ),
     info(
         title = "AI API",
