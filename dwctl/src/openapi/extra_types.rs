@@ -548,3 +548,104 @@ pub struct ResponseItem {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
 }
+
+/// Request body for creating a response.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[schema(example = json!({
+    "model": "gpt-4o",
+    "input": "What is a doubleword?",
+    "temperature": 0.7,
+    "max_output_tokens": 256
+}))]
+pub struct ResponseRequest {
+    /// ID of the model to use.
+    #[schema(example = "gpt-4o")]
+    pub model: String,
+
+    /// The input to generate a response for. Can be a string or array of messages.
+    pub input: ResponseInput,
+
+    /// System instructions for the model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "You are a helpful assistant.")]
+    pub instructions: Option<String>,
+
+    /// What sampling temperature to use, between 0 and 2.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = 0.7)]
+    pub temperature: Option<f32>,
+
+    /// An alternative to sampling with temperature, called nucleus sampling.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = 1.0)]
+    pub top_p: Option<f32>,
+
+    /// The maximum number of tokens to generate in the response.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = 256)]
+    pub max_output_tokens: Option<i32>,
+
+    /// Output types that you would like the model to generate (e.g., ["text"], ["text", "audio"]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub modalities: Option<Vec<String>>,
+
+    /// Constrains effort on reasoning. Supported values: "none", "minimal", "low", "medium", "high", "xhigh".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "medium")]
+    pub reasoning_effort: Option<String>,
+
+    /// A list of tools the model may call.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<Tool>>,
+
+    /// Controls which (if any) tool is called by the model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<serde_json::Value>,
+
+    /// Whether to enable parallel function calling during tool use.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = true)]
+    pub parallel_tool_calls: Option<bool>,
+
+    /// If set, partial message deltas will be sent as server-sent events.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = false)]
+    pub stream: Option<bool>,
+
+    /// Options for streaming response.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_options: Option<serde_json::Value>,
+
+    /// The ID of a previous response to continue from (for stateful conversations).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_response_id: Option<String>,
+
+    /// Developer-defined tags and values for organizing responses.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
+
+    /// Whether to store this response for future reference.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = false)]
+    pub store: Option<bool>,
+
+    /// A unique identifier representing your end-user.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+
+    /// Up to 4 sequences where the API will stop generating further tokens.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop: Option<Vec<String>>,
+
+    /// Number between -2.0 and 2.0. Positive values penalize new tokens based on
+    /// whether they appear in the text so far.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = 0.0)]
+    pub presence_penalty: Option<f32>,
+
+    /// Number between -2.0 and 2.0. Positive values penalize new tokens based on
+    /// their existing frequency in the text so far.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = 0.0)]
+    pub frequency_penalty: Option<f32>,
+}
