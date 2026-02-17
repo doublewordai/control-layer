@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO user_model_usage (user_id, model, input_tokens, output_tokens, cost, request_count)\n        SELECT user_id,\n               model,\n               COALESCE(SUM(prompt_tokens), 0),\n               COALESCE(SUM(completion_tokens), 0),\n               COALESCE(SUM(total_cost), 0),\n               COUNT(*)\n        FROM http_analytics\n        WHERE id > $1 AND id <= $2\n              AND user_id IS NOT NULL AND model IS NOT NULL AND fusillade_batch_id IS NOT NULL\n        GROUP BY user_id, model\n        ON CONFLICT (user_id, model)\n        DO UPDATE SET\n            input_tokens = user_model_usage.input_tokens + EXCLUDED.input_tokens,\n            output_tokens = user_model_usage.output_tokens + EXCLUDED.output_tokens,\n            cost = user_model_usage.cost + EXCLUDED.cost,\n            request_count = user_model_usage.request_count + EXCLUDED.request_count,\n            updated_at = NOW()\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "defd1edae9db821d2f8ccc18259c1cd67a86d02fd92910358125a3aaefc14b5b"
+}
