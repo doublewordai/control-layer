@@ -1627,6 +1627,7 @@ async fn setup_background_services(
             targets: std::collections::HashMap::new(),
             auth: None,
             strict_mode: false,
+            http_pool: None,
         };
         (onwards::target::Targets::from_config(empty_config)?, None)
     };

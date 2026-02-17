@@ -3159,9 +3159,9 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "onwards"
-version = "0.13.0"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c7f0ee159a3951509052a471d4213bea1f2f4155a5bb3f24a937b61b3bcd2cf4"
+checksum = "7336a32312878ad332bcef96d0c4bd2eb13c16452604b083008da15034b09185"
 dependencies = [
  "anyhow",
  "async-trait",
