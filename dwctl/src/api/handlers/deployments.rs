@@ -485,17 +485,18 @@ pub async fn update_deployed_model<P: PoolProvider>(
 
         // Create new or changed tariffs (skip those that already exist unchanged)
         for tariff_def in tariff_defs {
+            use crate::api::models::completion_window::normalize_completion_window;
+
             // Skip if this tariff already exists with the same values
             if current_tariffs.iter().any(|existing| tariff_matches(existing, &tariff_def)) {
                 continue;
             }
 
-            // Normalize completion_window (convert "high"/"standard" to "1h"/"24h")
-            let completion_window = tariff_def.completion_window.map(|w| match w.as_str() {
-                "high" => "1h".to_string(),
-                "standard" => "24h".to_string(),
-                _ => w,
-            });
+            // Normalize completion_window using shared utility
+            let completion_window = match tariff_def.completion_window {
+                Some(w) => Some(normalize_completion_window(&w)?),
+                None => None,
+            };
 
             let tariff_request = TariffCreateDBRequest {
                 deployed_model_id: deployment_id,

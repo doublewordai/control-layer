@@ -119,7 +119,7 @@ export interface ModelTariff {
   valid_from: string; // ISO 8601 timestamp
   valid_until?: string | null; // ISO 8601 timestamp, null means currently active
   api_key_purpose?: TariffApiKeyPurpose | null;
-  completion_window?: string | null; // Priority name: "standard", "high" (API returns priority names)
+  completion_window?: string | null; // Priority name: "Standard (24h)", "High (1h)" (API returns priority names)
   is_active: boolean;
 }
 
