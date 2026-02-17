@@ -520,3 +520,31 @@ pub enum ResponseInput {
     /// An array of messages (chat-style conversation).
     Messages(Vec<ChatMessage>),
 }
+
+/// A single item in the response output array.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[schema(example = json!({
+    "type": "message",
+    "role": "assistant",
+    "content": "A doubleword is a data unit that is twice the size of a standard word in computer architecture."
+}))]
+pub struct ResponseItem {
+    /// The type of item (e.g., "message", "function_call").
+    #[serde(rename = "type")]
+    #[schema(example = "message")]
+    pub item_type: String,
+
+    /// The role of the message (for message-type items).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "assistant")]
+    pub role: Option<String>,
+
+    /// The content of the message (for message-type items).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "A doubleword is a data unit that is twice the size of a standard word.")]
+    pub content: Option<String>,
+
+    /// Tool calls made by the model (for message-type items with tool calls).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
+}
