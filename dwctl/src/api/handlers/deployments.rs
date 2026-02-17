@@ -461,8 +461,7 @@ pub async fn update_deployed_model<P: PoolProvider>(
             use crate::api::models::completion_window::normalize_completion_window;
 
             // Normalize def's completion_window for comparison
-            let normalized_def_window = def.completion_window.as_ref()
-                .and_then(|w| normalize_completion_window(w).ok());
+            let normalized_def_window = def.completion_window.as_ref().and_then(|w| normalize_completion_window(w).ok());
 
             existing.name == def.name
                 && existing.input_price_per_token == def.input_price_per_token

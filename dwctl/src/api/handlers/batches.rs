@@ -187,16 +187,16 @@ pub async fn create_batch<P: PoolProvider>(
         use crate::api::models::completion_window::format_completion_window;
 
         // Provide helpful error message with formatted priority labels
-        let allowed_formatted: Vec<String> = state.config.batches.allowed_completion_windows
+        let allowed_formatted: Vec<String> = state
+            .config
+            .batches
+            .allowed_completion_windows
             .iter()
             .map(|w| format_completion_window(w))
             .collect();
 
         return Err(Error::BadRequest {
-            message: format!(
-                "Unsupported completion_window. Allowed values: {}",
-                allowed_formatted.join(", ")
-            ),
+            message: format!("Unsupported completion_window. Allowed values: {}", allowed_formatted.join(", ")),
         });
     }
 

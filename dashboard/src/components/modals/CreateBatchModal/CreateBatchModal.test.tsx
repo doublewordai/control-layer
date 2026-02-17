@@ -203,9 +203,8 @@ describe("CreateBatchModal", () => {
       );
 
       // Add a description
-      const descriptionInput = screen.getByPlaceholderText(
-        /Data generation task/i,
-      );
+      const descriptionInput =
+        screen.getByPlaceholderText(/Data generation task/i);
       await user.type(descriptionInput, "Test batch");
 
       // Find and click the Create Batch button
@@ -351,9 +350,8 @@ describe("CreateBatchModal", () => {
       );
 
       // Find and focus the description input - use screen since Dialog renders in a portal
-      const descriptionInput = screen.getByPlaceholderText(
-        /Data generation task/i,
-      );
+      const descriptionInput =
+        screen.getByPlaceholderText(/Data generation task/i);
       await user.click(descriptionInput);
       await user.type(descriptionInput, "Test batch description");
 
@@ -413,9 +411,8 @@ describe("CreateBatchModal", () => {
       );
 
       // Find and focus the description input - use screen since Dialog renders in a portal
-      const descriptionInput = screen.getByPlaceholderText(
-        /Data generation task/i,
-      );
+      const descriptionInput =
+        screen.getByPlaceholderText(/Data generation task/i);
       await user.click(descriptionInput);
       await user.type(descriptionInput, "Test description");
 
@@ -460,9 +457,8 @@ describe("CreateBatchModal", () => {
       );
 
       // Find and focus the description input - use screen since Dialog renders in a portal
-      const descriptionInput = screen.getByPlaceholderText(
-        /Data generation task/i,
-      );
+      const descriptionInput =
+        screen.getByPlaceholderText(/Data generation task/i);
       await user.click(descriptionInput);
       await user.type(descriptionInput, "Test description");
 
@@ -509,9 +505,8 @@ describe("CreateBatchModal", () => {
       );
 
       // Find and focus the description input (don't type anything) - use screen since Dialog renders in a portal
-      const descriptionInput = screen.getByPlaceholderText(
-        /Data generation task/i,
-      );
+      const descriptionInput =
+        screen.getByPlaceholderText(/Data generation task/i);
       await user.click(descriptionInput);
 
       // Press Enter without typing

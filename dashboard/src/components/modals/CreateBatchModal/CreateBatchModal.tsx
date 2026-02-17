@@ -70,7 +70,8 @@ export function CreateBatchModal({
   );
   const [expirationSeconds, setExpirationSeconds] = useState<number>(2592000); // 30 days default
   const [endpoint, setEndpoint] = useState<string>("/v1/chat/completions");
-  const [completionWindow, setCompletionWindow] = useState<string>("Standard (24h)"); // Default: standard priority
+  const [completionWindow, setCompletionWindow] =
+    useState<string>("Standard (24h)"); // Default: standard priority
   const [description, setDescription] = useState<string>("");
   const [error, setError] = useState<string | null>(null);
   const [dragActive, setDragActive] = useState(false);
@@ -125,7 +126,10 @@ export function CreateBatchModal({
 
   // Update default when available windows change
   useEffect(() => {
-    if (availableWindows.length > 0 && !availableWindows.includes(completionWindow)) {
+    if (
+      availableWindows.length > 0 &&
+      !availableWindows.includes(completionWindow)
+    ) {
       setCompletionWindow(availableWindows[0]);
     }
   }, [availableWindows, completionWindow]);

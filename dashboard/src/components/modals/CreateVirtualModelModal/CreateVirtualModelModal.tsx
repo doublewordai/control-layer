@@ -35,11 +35,9 @@ interface CreateVirtualModelModalProps {
 
 const DEFAULT_FALLBACK_STATUS_CODES = [429, 500, 502, 503, 504];
 
-export const CreateVirtualModelModal: React.FC<CreateVirtualModelModalProps> = ({
-  isOpen,
-  onClose,
-  onSuccess,
-}) => {
+export const CreateVirtualModelModal: React.FC<
+  CreateVirtualModelModalProps
+> = ({ isOpen, onClose, onSuccess }) => {
   const navigate = useNavigate();
   const [formData, setFormData] = useState({
     model_name: "",
@@ -246,7 +244,8 @@ export const CreateVirtualModelModal: React.FC<CreateVirtualModelModalProps> = (
               disabled={createModelMutation.isPending}
             />
             <Label htmlFor="sanitize_responses" className="font-normal">
-              Sanitize responses (filter out third party fields from OpenAI compatible responses)
+              Sanitize responses (filter out third party fields from OpenAI
+              compatible responses)
             </Label>
           </div>
 
@@ -273,7 +272,10 @@ export const CreateVirtualModelModal: React.FC<CreateVirtualModelModalProps> = (
                 id="fallback_on_rate_limit"
                 checked={formData.fallback_on_rate_limit}
                 onCheckedChange={(checked) =>
-                  setFormData({ ...formData, fallback_on_rate_limit: !!checked })
+                  setFormData({
+                    ...formData,
+                    fallback_on_rate_limit: !!checked,
+                  })
                 }
                 disabled={
                   createModelMutation.isPending || !formData.fallback_enabled

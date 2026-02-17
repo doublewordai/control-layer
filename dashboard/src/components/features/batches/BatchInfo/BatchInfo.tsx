@@ -697,11 +697,10 @@ const BatchInfo: React.FC = () => {
                         </p>
                       </div>
                       <div>
-                        <p className="text-sm text-gray-600 mb-1">
-                          Priority
-                        </p>
+                        <p className="text-sm text-gray-600 mb-1">Priority</p>
                         <p className="font-medium">
-                          {batch.completion_window.charAt(0).toUpperCase() + batch.completion_window.slice(1)}
+                          {batch.completion_window.charAt(0).toUpperCase() +
+                            batch.completion_window.slice(1)}
                         </p>
                       </div>
                     </div>

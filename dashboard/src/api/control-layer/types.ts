@@ -1224,4 +1224,3 @@ export interface WebhookUpdateRequest {
   event_types?: string[] | null;
   description?: string | null;
 }
-

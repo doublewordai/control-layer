@@ -90,6 +90,7 @@ db-setup:
     DB_PASS="${DB_PASS:-password}"
 
     # Check if postgres is running
+    
     if ! pg_isready -h "$DB_HOST" -p "$DB_PORT" >/dev/null 2>&1; then
         echo "❌ PostgreSQL is not running on $DB_HOST:$DB_PORT"
         echo "Run 'just db-start' to start Docker postgres"
@@ -100,9 +101,9 @@ db-setup:
 
     # Create databases
     echo "Creating databases..."
+    createuser -s postgres 2>/dev/null || echo "  - postgres user already exists"
     PGPASSWORD="$DB_PASS" psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d postgres -c "CREATE DATABASE dwctl;" 2>/dev/null || echo "  - dwctl database already exists"
     PGPASSWORD="$DB_PASS" psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d postgres -c "CREATE DATABASE fusillade;" 2>/dev/null || echo "  - fusillade database already exists"
-    createuser -s postgres 2>/dev/null || echo "  - postgres user already exists"
 
     # Write .env files for sqlx compile-time verification
     echo "Writing .env files..."
