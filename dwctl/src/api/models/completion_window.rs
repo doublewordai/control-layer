@@ -3,8 +3,6 @@ use crate::errors::{Error, Result};
 /// Normalizes completion window from display format to storage format
 /// - "Standard (24h)" → "24h"
 /// - "High (1h)" → "1h"
-/// - "standard" → "24h" (bare priority name)
-/// - "high" → "1h" (bare priority name)
 /// - "24h" → "24h" (pass through)
 pub fn normalize_completion_window(input: &str) -> Result<String> {
     let trimmed = input.trim();
@@ -22,7 +20,7 @@ pub fn normalize_completion_window(input: &str) -> Result<String> {
         return Ok(trimmed.to_lowercase());
     }
 
-    // Bare priority names: "standard", "high"
+    // Support legacy bare priority names (not documented)
     match lower.as_str() {
         "standard" => return Ok("24h".to_string()),
         "high" => return Ok("1h".to_string()),
@@ -42,7 +40,7 @@ pub fn normalize_completion_window(input: &str) -> Result<String> {
 
     Err(Error::BadRequest {
         message: format!(
-            "Invalid completion window format: '{}'. Expected '24h', '1h', 'standard', 'high', 'Standard (24h)', or 'High (1h)'",
+            "Invalid completion window format: '{}'. Expected formats: 'Standard (24h)', 'High (1h)', '24h', or '1h'",
             input
         ),
     })

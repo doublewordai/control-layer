@@ -63,8 +63,8 @@ pub struct CreateBatchRequest {
     pub endpoint: String,
 
     /// Processing priority for the batch.
-    /// Accepts display format ("Standard (24h)", "High (1h)"), bare names ("standard", "high"), or raw format ("24h", "1h").
-    /// All formats are normalized to raw format for internal storage.
+    /// Accepts formatted labels ("Standard (24h)", "High (1h)") or raw time values ("24h", "1h").
+    /// Values are normalized to raw format for internal storage.
     #[schema(example = "Standard (24h)")]
     #[serde(deserialize_with = "deserialize_completion_window")]
     pub completion_window: String,
@@ -129,7 +129,7 @@ pub struct BatchResponse {
 
     /// Processing priority for the batch.
     /// API responses always return formatted priority labels: "Standard (24h)" or "High (1h)".
-    /// For backwards compatibility, the API accepts both priority names and legacy time-based values.
+    /// Requests can use either formatted labels or raw time values ("24h", "1h").
     #[schema(example = "Standard (24h)")]
     pub completion_window: String,
 

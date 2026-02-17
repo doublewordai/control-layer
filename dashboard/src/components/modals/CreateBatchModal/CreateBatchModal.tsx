@@ -85,7 +85,7 @@ export function CreateBatchModal({
   const createBatchMutation = useCreateBatch();
   const uploadMutation = useUploadFileWithProgress();
 
-  // Fetch config to get available completion windows (API returns priority names)
+  // Fetch config to get available priority options (formatted labels like "Standard (24h)")
   const { data: config } = useConfig();
   const availableWindows = useMemo(
     () => config?.batches?.allowed_completion_windows || ["Standard (24h)"],

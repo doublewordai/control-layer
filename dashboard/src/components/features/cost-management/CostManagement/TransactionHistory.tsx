@@ -189,9 +189,8 @@ export function TransactionHistory({
       // Format priority - should always be present for batches
       let priorityText = "";
       if (tx.batch_sla) {
-        // Capitalize priority name from API (e.g., "high" → "High", "standard" → "Standard")
-        const formatted = tx.batch_sla.charAt(0).toUpperCase() + tx.batch_sla.slice(1);
-        priorityText = ` - ${formatted}`;
+        // API returns formatted priority labels like "Standard (24h)" or "High (1h)"
+        priorityText = ` - ${tx.batch_sla}`;
       }
 
       return `Batch (${source}${priorityText})${requestsText}`;

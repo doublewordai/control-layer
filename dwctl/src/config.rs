@@ -869,7 +869,7 @@ pub struct BatchConfig {
     /// Allowed completion windows for batch processing.
     /// These define the maximum time from batch creation to completion.
     /// Values are stored as time-based strings ("1h", "24h") for OpenAI API compatibility,
-    /// but users can also specify priority names ("high"="1h", "standard"="24h").
+    /// Accepts formatted labels ("Standard (24h)", "High (1h)") or raw time values ("24h", "1h").
     /// Default: vec!["24h".to_string()]
     pub allowed_completion_windows: Vec<String>,
     /// Allowed OpenAI-compatible URL paths for batch requests.

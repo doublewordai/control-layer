@@ -72,7 +72,7 @@ pub struct CreditTransactionResponse {
     /// Only present for usage transactions
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_origin: Option<String>,
-    /// Batch priority: "high", "standard", or empty string for non-batch
+    /// Batch priority: "Standard (24h)", "High (1h)", or empty string for non-batch
     /// API responses return priority names (converted from internal "1h"/"24h" storage)
     /// Only present for usage transactions
     #[serde(skip_serializing_if = "Option::is_none")]

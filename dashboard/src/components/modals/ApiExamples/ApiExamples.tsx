@@ -151,7 +151,7 @@ print(f"File ID: {batch_file.id}")
 batch = client.batches.create(
     input_file_id=batch_file.id,
     endpoint="/v1/chat/completions",
-    completion_window="24h"
+    completion_window="Standard (24h)"
 )
 
 print(f"Batch ID: {batch.id}")
@@ -182,7 +182,7 @@ async function runBatch() {
     const batch = await client.batches.create({
         input_file_id: batchFile.id,
         endpoint: '/v1/chat/completions',
-        completion_window: '24h'
+        completion_window: 'Standard (24h)'
     });
 
     console.log(\`Batch ID: \${batch.id}\`);
@@ -209,7 +209,7 @@ BATCH_ID=$(curl -s -X POST "${getBaseUrl()}/batches" \\
   -d '{
     "input_file_id": "'"$FILE_ID"'",
     "endpoint": "/v1/chat/completions",
-    "completion_window": "24h"
+    "completion_window": "Standard (24h)"
   }' | jq -r '.id')
 
 echo "Batch ID: $BATCH_ID"
