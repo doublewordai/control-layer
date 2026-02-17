@@ -505,3 +505,18 @@ pub struct OpenAIError {
     #[schema(example = "invalid_api_key")]
     pub code: Option<String>,
 }
+
+// ============================================================================
+// Responses API
+// ============================================================================
+
+/// Input for response requests - can be a single string or array of messages.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(untagged)]
+#[schema(example = "What is a doubleword?")]
+pub enum ResponseInput {
+    /// A single string input.
+    Single(String),
+    /// An array of messages (chat-style conversation).
+    Messages(Vec<ChatMessage>),
+}
