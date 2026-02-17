@@ -395,6 +395,9 @@ pub struct DeploymentCreateDBRequest {
     /// Whether to sanitize/filter sensitive data from model responses (defaults to true)
     #[builder(default = true)]
     pub sanitize_responses: bool,
+    /// Whether to mark provider as trusted in strict mode (bypasses sanitization)
+    #[builder(default = false)]
+    pub trusted: bool,
 }
 
 impl DeploymentCreateDBRequest {
@@ -416,6 +419,8 @@ impl DeploymentCreateDBRequest {
                 .maybe_throughput(standard.throughput)
                 .maybe_provider_pricing(standard.provider_pricing)
                 .is_composite(false)
+                .sanitize_responses(standard.sanitize_responses.unwrap_or(false))
+                .trusted(standard.trusted.unwrap_or(false))
                 .build(),
             DeployedModelCreate::Composite(composite) => Self::builder()
                 .created_by(created_by)
@@ -437,6 +442,7 @@ impl DeploymentCreateDBRequest {
                 .fallback_with_replacement(composite.fallback_with_replacement)
                 .maybe_fallback_max_attempts(composite.fallback_max_attempts)
                 .sanitize_responses(composite.sanitize_responses)
+                .trusted(composite.trusted.unwrap_or(false))
                 .build(),
         }
     }
@@ -469,6 +475,8 @@ pub struct DeploymentUpdateDBRequest {
     pub fallback_max_attempts: Option<Option<i32>>,
     /// Whether to sanitize/filter sensitive data from model responses
     pub sanitize_responses: Option<bool>,
+    /// Whether to mark provider as trusted in strict mode (bypasses sanitization)
+    pub trusted: Option<bool>,
 }
 
 impl From<DeployedModelUpdate> for DeploymentUpdateDBRequest {
@@ -491,6 +499,7 @@ impl From<DeployedModelUpdate> for DeploymentUpdateDBRequest {
             .maybe_fallback_with_replacement(update.fallback_with_replacement)
             .maybe_fallback_max_attempts(update.fallback_max_attempts)
             .maybe_sanitize_responses(update.sanitize_responses)
+            .maybe_trusted(update.trusted)
             .build()
     }
 }
@@ -551,4 +560,6 @@ pub struct DeploymentDBResponse {
     pub fallback_max_attempts: Option<i32>,
     /// Whether to sanitize/filter sensitive data from model responses
     pub sanitize_responses: bool,
+    /// Whether to mark provider as trusted in strict mode (bypasses sanitization)
+    pub trusted: bool,
 }

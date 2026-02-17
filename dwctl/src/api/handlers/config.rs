@@ -15,6 +15,13 @@ pub struct BatchConfigResponse {
     pub allowed_completion_windows: Vec<String>,
 }
 
+/// Onwards AI proxy configuration
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct OnwardsConfigResponse {
+    /// Whether strict mode is enabled (uses trusted flag, otherwise uses sanitize_responses)
+    pub strict_mode: bool,
+}
+
 /// Instance configuration and capabilities
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ConfigResponse {
@@ -35,6 +42,8 @@ pub struct ConfigResponse {
     /// If not set, the frontend should use relative paths (same-origin requests)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ai_api_base_url: Option<String>,
+    /// Onwards AI proxy configuration
+    pub onwards: OnwardsConfigResponse,
 }
 
 #[utoipa::path(
@@ -77,6 +86,9 @@ pub async fn get_config(State(state): State<AppState>, _user: CurrentUser) -> im
         docs_jsonl_url: metadata.docs_jsonl_url.clone(),
         batches: batches_config,
         ai_api_base_url: metadata.ai_api_base_url.clone(),
+        onwards: OnwardsConfigResponse {
+            strict_mode: state.config.onwards.strict_mode,
+        },
     };
 
     Json(response)

@@ -361,6 +361,7 @@ mod tests {
                 fallback_with_replacement: None,
                 fallback_max_attempts: None,
                 sanitize_responses: true,
+                trusted: false,
             })
             .await
             .unwrap();
@@ -483,6 +484,7 @@ mod tests {
                 fallback_with_replacement: None,
                 fallback_max_attempts: None,
                 sanitize_responses: true,
+                trusted: false,
             })
             .await
             .unwrap();
@@ -514,6 +516,7 @@ mod tests {
                 fallback_with_replacement: None,
                 fallback_max_attempts: None,
                 sanitize_responses: true,
+                trusted: false,
             })
             .await
             .unwrap();
@@ -605,6 +608,7 @@ mod tests {
             fallback_with_replacement: None,
             fallback_max_attempts: None,
             sanitize_responses: false,
+            trusted: false,
         })
         .await
         .unwrap();
@@ -692,6 +696,7 @@ mod tests {
                 fallback_with_replacement: None,
                 fallback_max_attempts: None,
                 sanitize_responses: false,
+                trusted: false,
             })
             .await
             .unwrap();
@@ -825,6 +830,7 @@ mod tests {
                 fallback_with_replacement: None,
                 fallback_max_attempts: None,
                 sanitize_responses: false,
+                trusted: false,
             })
             .await
             .unwrap();
@@ -856,6 +862,7 @@ mod tests {
                 fallback_with_replacement: None,
                 fallback_max_attempts: None,
                 sanitize_responses: false,
+                trusted: false,
             })
             .await
             .unwrap();
@@ -978,6 +985,7 @@ mod tests {
                 fallback_with_replacement: None,
                 fallback_max_attempts: None,
                 sanitize_responses: false,
+                trusted: false,
             })
             .await
             .unwrap();
@@ -1093,6 +1101,7 @@ mod tests {
                 fallback_with_replacement: None,
                 fallback_max_attempts: None,
                 sanitize_responses: false,
+                trusted: false,
             })
             .await
             .unwrap();

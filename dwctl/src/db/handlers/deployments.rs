@@ -133,6 +133,7 @@ struct DeployedModel {
     pub fallback_with_replacement: Option<bool>,
     pub fallback_max_attempts: Option<i32>,
     pub sanitize_responses: bool,
+    pub trusted: bool,
 }
 
 pub struct Deployments<'c> {
@@ -185,6 +186,7 @@ impl From<(Option<ModelType>, DeployedModel)> for DeploymentDBResponse {
             fallback_with_replacement: m.fallback_with_replacement.unwrap_or(false),
             fallback_max_attempts: m.fallback_max_attempts,
             sanitize_responses: m.sanitize_responses,
+            trusted: m.trusted,
         }
     }
 }
@@ -233,9 +235,9 @@ impl<'c> Repository for Deployments<'c> {
                 downstream_hourly_rate, downstream_input_token_cost_ratio,
                 is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status,
                 fallback_with_replacement, fallback_max_attempts,
-                sanitize_responses
+                sanitize_responses, trusted
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28)
             RETURNING *
             "#,
             request.model_name.trim(),
@@ -264,7 +266,8 @@ impl<'c> Repository for Deployments<'c> {
             request.fallback_on_status.as_ref().map(|s| s.as_slice()),
             request.fallback_with_replacement,
             request.fallback_max_attempts,
-            request.sanitize_responses
+            request.sanitize_responses,
+            request.trusted
         )
         .fetch_one(&mut *self.db)
         .await?;
@@ -283,7 +286,7 @@ impl<'c> Repository for Deployments<'c> {
     async fn get_by_id(&mut self, id: Self::Id) -> Result<Option<Self::Response>> {
         let model = sqlx::query_as!(
             DeployedModel,
-            "SELECT id, model_name, alias, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_with_replacement, fallback_max_attempts, sanitize_responses FROM deployed_models WHERE id = $1",
+            "SELECT id, model_name, alias, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_with_replacement, fallback_max_attempts, sanitize_responses, trusted FROM deployed_models WHERE id = $1",
             id
         )
             .fetch_optional(&mut *self.db)
@@ -308,7 +311,7 @@ impl<'c> Repository for Deployments<'c> {
 
         let deployments = sqlx::query_as!(
             DeployedModel,
-            "SELECT id, model_name, alias, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_with_replacement, fallback_max_attempts, sanitize_responses FROM deployed_models WHERE id = ANY($1)",
+            "SELECT id, model_name, alias, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_with_replacement, fallback_max_attempts, sanitize_responses, trusted FROM deployed_models WHERE id = ANY($1)",
             ids.as_slice()
         )
             .fetch_all(&mut *self.db)
@@ -468,6 +471,7 @@ impl<'c> Repository for Deployments<'c> {
                 WHEN $40 THEN $41
                 ELSE fallback_max_attempts
             END,
+            trusted = COALESCE($42, trusted),
 
             updated_at = NOW()
         WHERE id = $1
@@ -522,6 +526,7 @@ impl<'c> Repository for Deployments<'c> {
             request.fallback_with_replacement,                                       // $39
             request.fallback_max_attempts.is_some() as bool,                         // $40
             request.fallback_max_attempts.as_ref().and_then(|inner| inner.as_ref()), // $41
+            request.trusted,                                                         // $42
         )
         .fetch_one(&mut *self.db)
         .await?;

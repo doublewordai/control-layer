@@ -442,6 +442,7 @@ mod tests {
             fallback: None,
             components: None,
             sanitize_responses: None,
+            trusted: None,
         }
     }
 

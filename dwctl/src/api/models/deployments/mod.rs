@@ -135,6 +135,12 @@ pub struct StandardModelCreate {
     pub provider_pricing: Option<ProviderPricing>,
     /// Tariffs for this model - if provided, these will be created as active tariffs
     pub tariffs: Option<Vec<TariffDefinition>>,
+    /// Whether to sanitize/filter sensitive data from model responses (defaults to false, used when strict_mode=false)
+    #[serde(default)]
+    pub sanitize_responses: Option<bool>,
+    /// Whether to mark provider as trusted in strict mode (defaults to false, used when strict_mode=true)
+    #[serde(default)]
+    pub trusted: Option<bool>,
 }
 
 /// Data for creating a composite model (routes across multiple providers)
@@ -180,9 +186,12 @@ pub struct CompositeModelCreate {
     /// Maximum number of failover attempts (defaults to provider count)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback_max_attempts: Option<i32>,
-    /// Whether to sanitize/filter sensitive data from model responses (defaults to false)
+    /// Whether to sanitize/filter sensitive data from model responses (defaults to false, used when strict_mode=false)
     #[serde(default)]
     pub sanitize_responses: bool,
+    /// Whether to mark provider as trusted in strict mode (defaults to false, used when strict_mode=true)
+    #[serde(default)]
+    pub trusted: Option<bool>,
 }
 
 fn default_true() -> bool {
@@ -240,9 +249,12 @@ pub struct DeployedModelUpdate {
     /// Maximum number of failover attempts (null = no change, Some(None) = reset to default)
     #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
     pub fallback_max_attempts: Option<Option<i32>>,
-    /// Whether to sanitize/filter sensitive data from model responses (null = no change)
+    /// Whether to sanitize/filter sensitive data from model responses (null = no change, used when strict_mode=false)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sanitize_responses: Option<bool>,
+    /// Whether to mark provider as trusted in strict mode (null = no change, used when strict_mode=true)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trusted: Option<bool>,
 }
 
 /// A request to update a specific model (i.e. bundle a `DeployedModelUpdate` with a model id).
@@ -334,9 +346,12 @@ pub struct DeployedModelResponse {
     /// Components of this composite model (only included if requested for composite models)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub components: Option<Vec<ModelComponentResponse>>,
-    /// Whether to sanitize/filter sensitive data from model responses (only included for composite models)
+    /// Whether to sanitize/filter sensitive data from model responses (used when strict_mode=false)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sanitize_responses: Option<bool>,
+    /// Whether to mark provider as trusted in strict mode (used when strict_mode=true)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trusted: Option<bool>,
 }
 
 impl From<DeploymentDBResponse> for DeployedModelResponse {
@@ -382,6 +397,7 @@ impl From<DeploymentDBResponse> for DeployedModelResponse {
             fallback,
             components: None, // By default, components are not included
             sanitize_responses: Some(db.sanitize_responses),
+            trusted: Some(db.trusted),
         }
     }
 }

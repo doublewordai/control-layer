@@ -184,6 +184,7 @@ mod tests {
             fallback_with_replacement: false,
             fallback_max_attempts: None,
             sanitize_responses: true,
+            trusted: false,
         }
     }
 

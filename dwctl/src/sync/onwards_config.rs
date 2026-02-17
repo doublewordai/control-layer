@@ -56,6 +56,7 @@ struct OnwardsTarget {
     burst_size: Option<i32>,
     capacity: Option<i32>,
     sanitize_responses: bool,
+    trusted: bool,
 
     // Endpoint info
     endpoint_url: url::Url,
@@ -409,6 +410,8 @@ struct OnwardsCompositeModel {
     fallback_max_attempts: Option<i32>,
     /// Whether to sanitize/filter sensitive data from model responses
     sanitize_responses: bool,
+    /// Whether to mark provider as trusted in strict mode
+    trusted: bool,
     components: Vec<CompositeModelComponent>,
     // API keys that have access to this composite model
     api_keys: Vec<OnwardsApiKey>,
@@ -438,6 +441,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
             cm.fallback_with_replacement,
             cm.fallback_max_attempts,
             cm.sanitize_responses as composite_sanitize_responses,
+            cm.trusted as composite_trusted,
             -- Component info
             dmc.deployed_model_id,
             dmc.weight,
@@ -448,6 +452,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
             dm.burst_size as deployment_burst_size,
             dm.capacity as deployment_capacity,
             dm.sanitize_responses as deployment_sanitize_responses,
+            dm.trusted as deployment_trusted,
             -- Endpoint info
             ie.url as "endpoint_url!",
             ie.api_key as endpoint_api_key,
@@ -577,6 +582,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                 fallback_with_replacement: row.fallback_with_replacement.unwrap_or(false),
                 fallback_max_attempts: row.fallback_max_attempts,
                 sanitize_responses: row.composite_sanitize_responses,
+                trusted: row.composite_trusted,
                 components: Vec::new(),
                 api_keys: Vec::new(),
             }
@@ -591,6 +597,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                 burst_size: row.deployment_burst_size,
                 capacity: row.deployment_capacity,
                 sanitize_responses: row.deployment_sanitize_responses,
+                trusted: row.deployment_trusted,
                 endpoint_url,
                 endpoint_api_key: row.endpoint_api_key.clone(),
                 auth_header_name: row.auth_header_name.clone(),
@@ -705,7 +712,7 @@ fn convert_composite_to_target_spec(
             on_rate_limit: composite.fallback_on_rate_limit,
             // Convert i32 status codes to u16 for onwards
             on_status: composite.fallback_on_status.iter().map(|&s| s as u16).collect(),
-            with_replacement: composite.fallback_with_replacement,
+with_replacement: composite.fallback_with_replacement,
             max_attempts: composite
                 .fallback_max_attempts
                 .and_then(|n| usize::try_from(n).ok().filter(|&v| v >= 1)),
@@ -790,6 +797,7 @@ fn convert_composite_to_target_spec(
         providers,
         response_headers: None,
         sanitize_response: composite.sanitize_responses,
+        trusted: composite.trusted,
     };
 
     (composite.alias.clone(), TargetSpecOrList::Pool(pool_spec))
@@ -873,6 +881,7 @@ fn convert_to_config_file(targets: Vec<OnwardsTarget>, composites: Vec<OnwardsCo
                 response_headers: None,
                 weight: 1, // Default weight for single-provider targets
                 sanitize_response: target.sanitize_responses,
+                trusted: target.trusted,
                 request_timeout_secs: None,
             };
 
@@ -949,6 +958,7 @@ pub async fn load_targets_from_db(db: &PgPool, escalation_models: &[String], str
             dm.burst_size as deployment_burst_size,
             dm.capacity,
             dm.sanitize_responses,
+            dm.trusted,
             ie.id as endpoint_id,
             ie.url as "endpoint_url!",
             ie.api_key as endpoint_api_key,
@@ -1032,6 +1042,7 @@ pub async fn load_targets_from_db(db: &PgPool, escalation_models: &[String], str
             burst_size: row.deployment_burst_size,
             capacity: row.capacity,
             sanitize_responses: row.sanitize_responses,
+            trusted: row.trusted,
             endpoint_url: url::Url::parse(&row.endpoint_url).expect("Invalid URL in database"),
             endpoint_api_key: row.endpoint_api_key.clone(),
             auth_header_name: row.auth_header_name.clone(),
@@ -1114,6 +1125,7 @@ mod tests {
             burst_size: None,
             capacity: None,
             sanitize_responses: true,
+            trusted: false,
             endpoint_url: url::Url::parse(endpoint_url).unwrap(),
             endpoint_api_key: None,
             auth_header_name: "Authorization".to_string(),
@@ -1268,6 +1280,7 @@ mod tests {
                 fallback_with_replacement: None,
                 fallback_max_attempts: None,
                 sanitize_responses: true,
+                trusted: false,
             })
             .await
             .unwrap();
@@ -1383,6 +1396,7 @@ mod tests {
                 fallback_with_replacement: None,
                 fallback_max_attempts: None,
                 sanitize_responses: true,
+                trusted: false,
             })
             .await
             .unwrap();
@@ -1415,6 +1429,7 @@ mod tests {
                 fallback_with_replacement: None,
                 fallback_max_attempts: None,
                 sanitize_responses: true,
+                trusted: false,
             })
             .await
             .unwrap();
