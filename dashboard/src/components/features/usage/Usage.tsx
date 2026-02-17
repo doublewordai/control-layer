@@ -102,11 +102,10 @@ function TokenBreakdownCard({
   );
 }
 
-type ChartMetric = "requests" | "batches" | "tokens" | "cost";
+type ChartMetric = "requests" | "tokens" | "cost";
 
 const CHART_METRICS: { value: ChartMetric; label: string }[] = [
   { value: "requests", label: "Requests" },
-  { value: "batches", label: "Batches" },
   { value: "tokens", label: "Tokens" },
   { value: "cost", label: "Cost" },
 ];
@@ -122,7 +121,6 @@ export function Usage() {
     const data = models.map((entry, index) => ({
       model: entry.model.split("/").pop() || entry.model,
       requests: entry.request_count,
-      batches: entry.batch_count,
       tokens: entry.input_tokens + entry.output_tokens,
       cost: parseFloat(entry.cost),
       fill: `var(--chart-${(index % 5) + 1})`,

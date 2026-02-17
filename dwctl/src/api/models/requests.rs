@@ -339,7 +339,6 @@ pub struct ModelBreakdownEntry {
     pub output_tokens: i64,
     pub cost: String,
     pub request_count: i64,
-    pub batch_count: i64,
 }
 
 /// User batch usage response with overall metrics and per-model breakdown

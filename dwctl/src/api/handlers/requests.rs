@@ -6,7 +6,10 @@ use axum::{
     extract::{Query, State},
     response::Json,
 };
+use moka::future::Cache;
+use once_cell::sync::Lazy;
 use sqlx_pool_router::PoolProvider;
+use uuid::Uuid;
 
 use crate::{
     AppState,
@@ -19,13 +22,21 @@ use crate::{
     },
     auth::permissions::{RequiresPermission, operation, resource},
     db::handlers::analytics::{
-        get_model_user_usage, get_requests_aggregate, get_user_batch_usage, get_user_model_breakdown, list_http_analytics,
+        get_model_user_usage, get_requests_aggregate, get_user_batch_counts, get_user_model_breakdown, list_http_analytics,
     },
     errors::Error,
 };
 use chrono::{DateTime, Duration, Utc};
 use serde::Deserialize;
 use utoipa::IntoParams;
+
+/// Cache for user usage data (60 second TTL, keyed by user ID)
+static USAGE_CACHE: Lazy<Cache<Uuid, UserBatchUsageResponse>> = Lazy::new(|| {
+    Cache::builder()
+        .max_capacity(1_000)
+        .time_to_live(std::time::Duration::from_secs(60))
+        .build()
+});
 
 /// List HTTP analytics entries with filtering and pagination
 ///
@@ -176,16 +187,37 @@ pub async fn get_usage<P: PoolProvider>(
     State(state): State<AppState<P>>,
     current_user: CurrentUser,
 ) -> Result<Json<UserBatchUsageResponse>, Error> {
-    // Read-only: relies on batch_aggregates being kept up-to-date
-    // by other write paths (e.g. list_transactions_with_batches on /cost-management).
-    // Slightly stale data is acceptable for an all-time overview dashboard.
+    if let Some(cached) = USAGE_CACHE.get(&current_user.id).await {
+        return Ok(Json(cached));
+    }
+
     let read_pool = state.db.read();
-    let (mut usage, by_model) = tokio::try_join!(
-        get_user_batch_usage(read_pool, current_user.id),
+    let ((total_batch_count, avg_requests_per_batch, total_cost), by_model) = tokio::try_join!(
+        get_user_batch_counts(read_pool, current_user.id),
         get_user_model_breakdown(read_pool, current_user.id),
     )?;
 
-    usage.by_model = by_model;
+    // Derive token/request totals from per-model breakdown
+    let mut total_input_tokens: i64 = 0;
+    let mut total_output_tokens: i64 = 0;
+    let mut total_request_count: i64 = 0;
+    for entry in &by_model {
+        total_input_tokens += entry.input_tokens;
+        total_output_tokens += entry.output_tokens;
+        total_request_count += entry.request_count;
+    }
+
+    let usage = UserBatchUsageResponse {
+        total_input_tokens,
+        total_output_tokens,
+        total_request_count,
+        total_batch_count,
+        avg_requests_per_batch,
+        total_cost,
+        by_model,
+    };
+
+    USAGE_CACHE.insert(current_user.id, usage.clone()).await;
 
     Ok(Json(usage))
 }

@@ -12,8 +12,8 @@ use crate::{
         batches::BatchAnalytics,
         deployments::{ModelMetrics, ModelTimeSeriesPoint},
         requests::{
-            AnalyticsEntry, HttpAnalyticsFilter, ModelUsage, ModelUserUsageResponse, RequestsAggregateResponse, StatusCodeBreakdown,
-            TimeSeriesPoint, UserUsage,
+            AnalyticsEntry, HttpAnalyticsFilter, ModelBreakdownEntry, ModelUsage, ModelUserUsageResponse, RequestsAggregateResponse,
+            StatusCodeBreakdown, TimeSeriesPoint, UserUsage,
         },
     },
     db::errors::Result,
@@ -994,6 +994,88 @@ pub async fn list_http_analytics(
     }
 
     Ok(entries)
+}
+
+/// Row type for batch aggregate stats from pre-aggregated table
+#[derive(FromRow)]
+struct BatchCountRow {
+    pub total_batch_count: Option<i64>,
+    pub avg_requests_per_batch: Option<Decimal>,
+    pub total_cost: Option<Decimal>,
+}
+
+/// Row type for per-model breakdown query
+#[derive(FromRow)]
+struct ModelBreakdownRow {
+    pub model: Option<String>,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub cost: Option<Decimal>,
+    pub request_count: Option<i64>,
+}
+
+/// Get batch-level metrics from pre-aggregated batch_aggregates table.
+/// Returns (batch_count, avg_requests_per_batch, total_cost).
+/// Batch count and avg can't be derived from per-model breakdown
+/// (batches may span multiple models). Cost is already aggregated here.
+#[instrument(skip(pool), err)]
+pub async fn get_user_batch_counts(pool: &PgPool, user_id: Uuid) -> Result<(i64, f64, String)> {
+    let row = sqlx::query_as!(
+        BatchCountRow,
+        r#"
+        SELECT
+            COUNT(*) as total_batch_count,
+            COALESCE(AVG(transaction_count), 0) as avg_requests_per_batch,
+            COALESCE(SUM(total_amount), 0) as total_cost
+        FROM batch_aggregates
+        WHERE user_id = $1
+        "#,
+        user_id
+    )
+    .fetch_one(pool)
+    .await?;
+
+    Ok((
+        row.total_batch_count.unwrap_or(0),
+        row.avg_requests_per_batch.and_then(|d| d.to_f64()).unwrap_or(0.0),
+        row.total_cost.map(|d| d.to_string()).unwrap_or_else(|| "0".to_string()),
+    ))
+}
+
+/// Get per-model breakdown for a user's batched requests from http_analytics.
+/// Totals (tokens, cost, request count) are derived from these results by the handler.
+#[instrument(skip(pool), err)]
+pub async fn get_user_model_breakdown(pool: &PgPool, user_id: Uuid) -> Result<Vec<ModelBreakdownEntry>> {
+    let rows = sqlx::query_as!(
+        ModelBreakdownRow,
+        r#"
+        SELECT model,
+               COALESCE(SUM(prompt_tokens), 0)::bigint as input_tokens,
+               COALESCE(SUM(completion_tokens), 0)::bigint as output_tokens,
+               COALESCE(SUM(total_cost), 0) as cost,
+               COUNT(*) as request_count
+        FROM http_analytics
+        WHERE user_id = $1 AND fusillade_batch_id IS NOT NULL AND model IS NOT NULL
+        GROUP BY model
+        ORDER BY COUNT(*) DESC
+        "#,
+        user_id
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            row.model.map(|model| ModelBreakdownEntry {
+                model,
+                input_tokens: row.input_tokens.unwrap_or(0),
+                output_tokens: row.output_tokens.unwrap_or(0),
+                cost: row.cost.map(|d| d.to_string()).unwrap_or_else(|| "0".to_string()),
+                request_count: row.request_count.unwrap_or(0),
+            })
+        })
+        .collect())
 }
 
 #[cfg(test)]

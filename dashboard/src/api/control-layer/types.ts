@@ -722,7 +722,6 @@ export interface ModelBreakdownEntry {
   output_tokens: number;
   cost: string;
   request_count: number;
-  batch_count: number;
 }
 
 export interface UserBatchUsageResponse {
