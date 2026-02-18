@@ -172,10 +172,11 @@ mod tests {
     #[tokio::test]
     async fn otlp_reqwest_supports_https() {
         let client = reqwest::Client::new();
-        let result = client
-            .get("https://example.com")
-            .send()
-            .await;
-        assert!(result.is_ok(), "reqwest cannot make HTTPS requests — TLS not configured: {}", result.unwrap_err());
+        let result = client.get("https://example.com").send().await;
+        assert!(
+            result.is_ok(),
+            "reqwest cannot make HTTPS requests — TLS not configured: {}",
+            result.unwrap_err()
+        );
     }
 }

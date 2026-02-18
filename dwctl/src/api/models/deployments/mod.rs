@@ -89,8 +89,8 @@ pub struct TariffDefinition {
     pub output_price_per_token: rust_decimal::Decimal,
     /// Optional API key purpose this tariff applies to (realtime, batch, playground)
     pub api_key_purpose: Option<crate::db::models::api_keys::ApiKeyPurpose>,
-    /// Optional completion window (SLA) for batch tariffs (e.g., "24h", "1h")
-    /// Required when api_key_purpose is Batch to support multiple pricing tiers per SLA
+    /// Optional completion window (priority) for batch tariffs (e.g., "24h", "1h")
+    /// Required when api_key_purpose is Batch to support multiple pricing tiers per priority
     #[serde(skip_serializing_if = "Option::is_none")]
     pub completion_window: Option<String>,
 }
@@ -129,7 +129,7 @@ pub struct StandardModelCreate {
     pub capacity: Option<i32>,
     /// Maximum number of concurrent batch requests allowed for this model (null = defaults to capacity or no limit)
     pub batch_capacity: Option<i32>,
-    /// Throughput in requests/second for batch SLA capacity calculations (null = use config default)
+    /// Throughput in requests/second for batch capacity calculations (null = use config default)
     pub throughput: Option<f32>,
     /// Provider/downstream pricing details (admin only)
     pub provider_pricing: Option<ProviderPricing>,
@@ -158,7 +158,7 @@ pub struct CompositeModelCreate {
     pub capacity: Option<i32>,
     /// Maximum number of concurrent batch requests allowed for this model (null = defaults to capacity or no limit)
     pub batch_capacity: Option<i32>,
-    /// Throughput in requests/second for batch SLA capacity calculations (null = use config default)
+    /// Throughput in requests/second for batch capacity calculations (null = use config default)
     pub throughput: Option<f32>,
     /// Tariffs for this model - if provided, these will be created as active tariffs
     pub tariffs: Option<Vec<TariffDefinition>>,
@@ -174,6 +174,12 @@ pub struct CompositeModelCreate {
     /// HTTP status codes that trigger fallback (defaults to [500, 502, 503, 504])
     #[serde(default = "default_fallback_statuses")]
     pub fallback_on_status: Vec<i32>,
+    /// Sample with replacement during weighted random failover (defaults to false)
+    #[serde(default)]
+    pub fallback_with_replacement: bool,
+    /// Maximum number of failover attempts (defaults to provider count)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_max_attempts: Option<i32>,
     /// Whether to sanitize/filter sensitive data from model responses (defaults to false)
     #[serde(default)]
     pub sanitize_responses: bool,
@@ -228,6 +234,12 @@ pub struct DeployedModelUpdate {
     /// HTTP status codes that trigger fallback (null = no change)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback_on_status: Option<Vec<i32>>,
+    /// Sample with replacement during weighted random failover (null = no change)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_with_replacement: Option<bool>,
+    /// Maximum number of failover attempts (null = no change, Some(None) = reset to default)
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
+    pub fallback_max_attempts: Option<Option<i32>>,
     /// Whether to sanitize/filter sensitive data from model responses (null = no change)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sanitize_responses: Option<bool>,
@@ -284,7 +296,7 @@ pub struct DeployedModelResponse {
     /// Maximum number of concurrent batch requests allowed for this model (null = defaults to capacity or no limit)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub batch_capacity: Option<i32>,
-    /// Throughput in requests/second for batch SLA capacity calculations (null = use config default)
+    /// Throughput in requests/second for batch capacity calculations (null = use config default)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub throughput: Option<f32>,
     /// Groups that have access to this model (only included if requested)
@@ -335,6 +347,8 @@ impl From<DeploymentDBResponse> for DeployedModelResponse {
                 enabled: db.fallback_enabled,
                 on_rate_limit: db.fallback_on_rate_limit,
                 on_status: db.fallback_on_status,
+                with_replacement: db.fallback_with_replacement,
+                max_attempts: db.fallback_max_attempts,
             })
         } else {
             None

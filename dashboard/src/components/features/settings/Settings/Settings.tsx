@@ -148,7 +148,6 @@ export function Settings() {
                 )}
               </div>
             </div>
-
           </div>
         ) : (
           <div className="bg-gray-50 border border-gray-200 rounded-lg p-6">

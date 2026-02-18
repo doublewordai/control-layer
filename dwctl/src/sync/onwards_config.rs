@@ -403,6 +403,10 @@ struct OnwardsCompositeModel {
     fallback_on_rate_limit: bool,
     /// HTTP status codes that trigger fallback
     fallback_on_status: Vec<i32>,
+    /// Sample with replacement during weighted random failover
+    fallback_with_replacement: bool,
+    /// Maximum number of failover attempts
+    fallback_max_attempts: Option<i32>,
     /// Whether to sanitize/filter sensitive data from model responses
     sanitize_responses: bool,
     components: Vec<CompositeModelComponent>,
@@ -431,6 +435,8 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
             cm.fallback_enabled,
             cm.fallback_on_rate_limit,
             cm.fallback_on_status,
+            cm.fallback_with_replacement,
+            cm.fallback_max_attempts,
             cm.sanitize_responses as composite_sanitize_responses,
             -- Component info
             dmc.deployed_model_id,
@@ -568,6 +574,8 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                 fallback_enabled: row.fallback_enabled.unwrap_or(true),
                 fallback_on_rate_limit: row.fallback_on_rate_limit.unwrap_or(true),
                 fallback_on_status: row.fallback_on_status.clone().unwrap_or_else(|| vec![429, 500, 502, 503, 504]),
+                fallback_with_replacement: row.fallback_with_replacement.unwrap_or(false),
+                fallback_max_attempts: row.fallback_max_attempts,
                 sanitize_responses: row.composite_sanitize_responses,
                 components: Vec::new(),
                 api_keys: Vec::new(),
@@ -697,6 +705,10 @@ fn convert_composite_to_target_spec(
             on_rate_limit: composite.fallback_on_rate_limit,
             // Convert i32 status codes to u16 for onwards
             on_status: composite.fallback_on_status.iter().map(|&s| s as u16).collect(),
+            with_replacement: composite.fallback_with_replacement,
+            max_attempts: composite
+                .fallback_max_attempts
+                .and_then(|n| usize::try_from(n).ok().filter(|&v| v >= 1)),
         })
     } else {
         None
@@ -753,6 +765,7 @@ fn convert_composite_to_target_spec(
                     // For composite models, use the composite model's sanitize_responses setting
                     // This ensures the virtual model's toggle controls all providers
                     sanitize_response: composite.sanitize_responses,
+                    request_timeout_secs: None,
                 }
             }
         })
@@ -777,6 +790,7 @@ fn convert_composite_to_target_spec(
         providers,
         response_headers: None,
         sanitize_response: composite.sanitize_responses,
+        trusted: false,
     };
 
     (composite.alias.clone(), TargetSpecOrList::Pool(pool_spec))
@@ -860,6 +874,8 @@ fn convert_to_config_file(targets: Vec<OnwardsTarget>, composites: Vec<OnwardsCo
                 response_headers: None,
                 weight: 1, // Default weight for single-provider targets
                 sanitize_response: target.sanitize_responses,
+                request_timeout_secs: None,
+                trusted: false,
             };
 
             (target.alias, TargetSpecOrList::Single(target_spec))
@@ -891,6 +907,7 @@ fn convert_to_config_file(targets: Vec<OnwardsTarget>, composites: Vec<OnwardsCo
         targets: target_specs,
         auth,
         strict_mode,
+        http_pool: None,
     }
 }
 
@@ -1250,6 +1267,8 @@ mod tests {
                 fallback_enabled: None,
                 fallback_on_rate_limit: None,
                 fallback_on_status: None,
+                fallback_with_replacement: None,
+                fallback_max_attempts: None,
                 sanitize_responses: true,
             })
             .await
@@ -1363,6 +1382,8 @@ mod tests {
                 fallback_enabled: None,
                 fallback_on_rate_limit: None,
                 fallback_on_status: None,
+                fallback_with_replacement: None,
+                fallback_max_attempts: None,
                 sanitize_responses: true,
             })
             .await
@@ -1393,6 +1414,8 @@ mod tests {
                 fallback_enabled: Some(true),
                 fallback_on_rate_limit: Some(true),
                 fallback_on_status: Some(vec![429, 500, 502, 503, 504]),
+                fallback_with_replacement: None,
+                fallback_max_attempts: None,
                 sanitize_responses: true,
             })
             .await

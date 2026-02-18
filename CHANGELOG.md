@@ -1,5 +1,40 @@
 # Changelog
 
+## [8.0.1](https://github.com/doublewordai/control-layer/compare/v8.0.0...v8.0.1) (2026-02-18)
+
+
+### Bug Fixes
+
+* bump onwards to 0.15.1 ([#726](https://github.com/doublewordai/control-layer/issues/726)) ([b567f15](https://github.com/doublewordai/control-layer/commit/b567f1512ebc9ecdfcb719f7f4ff80ca4c0829bc))
+
+## [8.0.0](https://github.com/doublewordai/control-layer/compare/v7.5.1...v8.0.0) (2026-02-17)
+
+
+### ⚠ BREAKING CHANGES
+
+* move from SLA to Priority ([#711](https://github.com/doublewordai/control-layer/issues/711))
+
+### Features
+
+* add OpenAPI docs for Responses API ([#713](https://github.com/doublewordai/control-layer/issues/713)) ([ec3a49b](https://github.com/doublewordai/control-layer/commit/ec3a49ba2509bf2aa9802916563e09693f70d8df))
+* move from SLA to Priority ([#711](https://github.com/doublewordai/control-layer/issues/711)) ([1ee7f63](https://github.com/doublewordai/control-layer/commit/1ee7f63bfdcc88111b3c7f80919eb72bf3e4fe6d))
+
+## [7.5.1](https://github.com/doublewordai/control-layer/compare/v7.5.0...v7.5.1) (2026-02-17)
+
+
+### Bug Fixes
+
+* bump onwards to 0.14.0 for TCP keepalive ([#720](https://github.com/doublewordai/control-layer/issues/720)) ([54f4d6c](https://github.com/doublewordai/control-layer/commit/54f4d6c35fa853cb0fc86080599fd0d4dbb5b01c))
+* escalation and finalization management ([#715](https://github.com/doublewordai/control-layer/issues/715)) ([337810f](https://github.com/doublewordai/control-layer/commit/337810fd61c6230f9ab2e09a6f1395ef1b325533))
+* reenable tracing by adding tls support for reqwest 12 ([#718](https://github.com/doublewordai/control-layer/issues/718)) ([cade847](https://github.com/doublewordai/control-layer/commit/cade847530033d6b5204708ff8e66b9800e66bea))
+
+## [7.5.0](https://github.com/doublewordai/control-layer/compare/v7.4.1...v7.5.0) (2026-02-17)
+
+
+### Features
+
+* support with-replacement sampling for weighted random failover ([#704](https://github.com/doublewordai/control-layer/issues/704)) ([3c4fb9b](https://github.com/doublewordai/control-layer/commit/3c4fb9b97affac993e24595e337a457fe22449d0))
+
 ## [7.4.1](https://github.com/doublewordai/control-layer/compare/v7.4.0...v7.4.1) (2026-02-16)
 
 

@@ -358,6 +358,8 @@ mod tests {
                 fallback_enabled: None,
                 fallback_on_rate_limit: None,
                 fallback_on_status: None,
+                fallback_with_replacement: None,
+                fallback_max_attempts: None,
                 sanitize_responses: true,
             })
             .await
@@ -478,6 +480,8 @@ mod tests {
                 fallback_enabled: None,
                 fallback_on_rate_limit: None,
                 fallback_on_status: None,
+                fallback_with_replacement: None,
+                fallback_max_attempts: None,
                 sanitize_responses: true,
             })
             .await
@@ -507,6 +511,8 @@ mod tests {
                 fallback_enabled: Some(true),
                 fallback_on_rate_limit: Some(true),
                 fallback_on_status: Some(vec![429, 500]),
+                fallback_with_replacement: None,
+                fallback_max_attempts: None,
                 sanitize_responses: true,
             })
             .await
@@ -596,6 +602,8 @@ mod tests {
             fallback_enabled: None,
             fallback_on_rate_limit: None,
             fallback_on_status: None,
+            fallback_with_replacement: None,
+            fallback_max_attempts: None,
             sanitize_responses: false,
         })
         .await
@@ -681,6 +689,8 @@ mod tests {
                 fallback_enabled: None,
                 fallback_on_rate_limit: None,
                 fallback_on_status: None,
+                fallback_with_replacement: None,
+                fallback_max_attempts: None,
                 sanitize_responses: false,
             })
             .await
@@ -812,6 +822,8 @@ mod tests {
                 fallback_enabled: None,
                 fallback_on_rate_limit: None,
                 fallback_on_status: None,
+                fallback_with_replacement: None,
+                fallback_max_attempts: None,
                 sanitize_responses: false,
             })
             .await
@@ -841,6 +853,8 @@ mod tests {
                 fallback_enabled: None,
                 fallback_on_rate_limit: None,
                 fallback_on_status: None,
+                fallback_with_replacement: None,
+                fallback_max_attempts: None,
                 sanitize_responses: false,
             })
             .await
@@ -961,6 +975,8 @@ mod tests {
                 fallback_enabled: None,
                 fallback_on_rate_limit: None,
                 fallback_on_status: None,
+                fallback_with_replacement: None,
+                fallback_max_attempts: None,
                 sanitize_responses: false,
             })
             .await
@@ -1074,6 +1090,8 @@ mod tests {
                 fallback_enabled: None,
                 fallback_on_rate_limit: None,
                 fallback_on_status: None,
+                fallback_with_replacement: None,
+                fallback_max_attempts: None,
                 sanitize_responses: false,
             })
             .await

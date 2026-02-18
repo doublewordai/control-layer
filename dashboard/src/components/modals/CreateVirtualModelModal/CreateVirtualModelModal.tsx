@@ -35,11 +35,9 @@ interface CreateVirtualModelModalProps {
 
 const DEFAULT_FALLBACK_STATUS_CODES = [429, 500, 502, 503, 504];
 
-export const CreateVirtualModelModal: React.FC<CreateVirtualModelModalProps> = ({
-  isOpen,
-  onClose,
-  onSuccess,
-}) => {
+export const CreateVirtualModelModal: React.FC<
+  CreateVirtualModelModalProps
+> = ({ isOpen, onClose, onSuccess }) => {
   const navigate = useNavigate();
   const [formData, setFormData] = useState({
     model_name: "",
@@ -50,6 +48,8 @@ export const CreateVirtualModelModal: React.FC<CreateVirtualModelModalProps> = (
     fallback_enabled: true,
     fallback_on_rate_limit: true,
     fallback_on_status: DEFAULT_FALLBACK_STATUS_CODES,
+    fallback_with_replacement: false,
+    fallback_max_attempts: null as number | null,
     sanitize_responses: false,
   });
   const [error, setError] = useState<string | null>(null);
@@ -68,6 +68,8 @@ export const CreateVirtualModelModal: React.FC<CreateVirtualModelModalProps> = (
         fallback_enabled: true,
         fallback_on_rate_limit: true,
         fallback_on_status: DEFAULT_FALLBACK_STATUS_CODES,
+        fallback_with_replacement: false,
+        fallback_max_attempts: null,
         sanitize_responses: false,
       });
       setError(null);
@@ -93,6 +95,8 @@ export const CreateVirtualModelModal: React.FC<CreateVirtualModelModalProps> = (
       fallback_enabled: formData.fallback_enabled,
       fallback_on_rate_limit: formData.fallback_on_rate_limit,
       fallback_on_status: formData.fallback_on_status,
+      fallback_with_replacement: formData.fallback_with_replacement,
+      fallback_max_attempts: formData.fallback_max_attempts,
       sanitize_responses: formData.sanitize_responses,
     };
 
@@ -246,7 +250,8 @@ export const CreateVirtualModelModal: React.FC<CreateVirtualModelModalProps> = (
               disabled={createModelMutation.isPending}
             />
             <Label htmlFor="sanitize_responses" className="font-normal">
-              Sanitize responses (filter out third party fields from OpenAI compatible responses)
+              Sanitize responses (filter out third party fields from OpenAI
+              compatible responses)
             </Label>
           </div>
 
@@ -273,7 +278,10 @@ export const CreateVirtualModelModal: React.FC<CreateVirtualModelModalProps> = (
                 id="fallback_on_rate_limit"
                 checked={formData.fallback_on_rate_limit}
                 onCheckedChange={(checked) =>
-                  setFormData({ ...formData, fallback_on_rate_limit: !!checked })
+                  setFormData({
+                    ...formData,
+                    fallback_on_rate_limit: !!checked,
+                  })
                 }
                 disabled={
                   createModelMutation.isPending || !formData.fallback_enabled
@@ -308,6 +316,59 @@ export const CreateVirtualModelModal: React.FC<CreateVirtualModelModalProps> = (
                 Comma-separated HTTP status codes that trigger fallback
               </p>
             </div>
+
+            {formData.lb_strategy === "weighted_random" && formData.fallback_enabled && (
+              <>
+                <div className="flex items-center space-x-2">
+                  <Checkbox
+                    id="fallback_with_replacement"
+                    checked={formData.fallback_with_replacement}
+                    onCheckedChange={(checked) =>
+                      setFormData({ ...formData, fallback_with_replacement: !!checked })
+                    }
+                    disabled={
+                      createModelMutation.isPending || !formData.fallback_enabled
+                    }
+                  />
+                  <Label htmlFor="fallback_with_replacement" className="font-normal">
+                    Sample with replacement
+                  </Label>
+                </div>
+                <p className="text-xs text-muted-foreground -mt-2 ml-6">
+                  Allow retrying the same provider during failover, weighted by probability
+                </p>
+
+                <div>
+                  <Label className="font-normal text-sm">
+                    Max failover attempts
+                  </Label>
+                  <Input
+                    type="number"
+                    min={1}
+                    value={formData.fallback_max_attempts ?? ""}
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      if (val === "") {
+                        setFormData({ ...formData, fallback_max_attempts: null });
+                      } else {
+                        const num = Number(val);
+                        if (Number.isFinite(num) && num >= 1) {
+                          setFormData({ ...formData, fallback_max_attempts: Math.floor(num) });
+                        }
+                      }
+                    }}
+                    placeholder="Default: number of providers"
+                    disabled={
+                      createModelMutation.isPending || !formData.fallback_enabled
+                    }
+                    className="mt-1"
+                  />
+                  <p className="text-xs text-muted-foreground mt-1">
+                    Maximum retry attempts. Defaults to the number of hosted models.
+                  </p>
+                </div>
+              </>
+            )}
           </div>
         </form>
 

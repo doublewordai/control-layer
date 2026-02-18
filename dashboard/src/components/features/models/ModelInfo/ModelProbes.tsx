@@ -55,7 +55,10 @@ interface ModelProbesProps {
   canManageProbes?: boolean;
 }
 
-const ModelProbes: React.FC<ModelProbesProps> = ({ model, canManageProbes = false }) => {
+const ModelProbes: React.FC<ModelProbesProps> = ({
+  model,
+  canManageProbes = false,
+}) => {
   const [showCreateForm, setShowCreateForm] = useState(false);
   const [intervalSeconds, setIntervalSeconds] = useState(60);
   const [pingType, setPingType] = useState<"default" | "custom">("default");
@@ -352,76 +355,78 @@ const ModelProbes: React.FC<ModelProbesProps> = ({ model, canManageProbes = fals
                       <PopoverTrigger asChild>
                         <Edit2 className="h-3.5 w-3.5 opacity-0 group-hover/edit-cell:opacity-100 transition-opacity cursor-pointer text-gray-600 hover:text-gray-900" />
                       </PopoverTrigger>
-                    <PopoverContent className="w-80" align="start">
-                      <div className="space-y-2">
-                        <h4 className="font-medium text-sm">Edit Interval</h4>
-                        <div className="flex gap-2">
-                          <div className="flex items-center gap-2 flex-1">
-                            <Input
-                              type="number"
-                              min="10"
-                              value={newInterval}
-                              onChange={(e) =>
-                                setNewInterval(parseInt(e.target.value))
-                              }
-                              placeholder="Seconds"
-                              autoFocus
-                              onKeyDown={(e) => {
-                                if (e.key === "Enter") {
-                                  updateProbeMutation
-                                    .mutateAsync({
-                                      id: modelProbe.id,
-                                      data: { interval_seconds: newInterval },
-                                    })
-                                    .then(() => {
-                                      setEditingInterval(false);
-                                      toast.success("Interval updated");
-                                    })
-                                    .catch(() => {
-                                      toast.error("Failed to update interval");
-                                    });
-                                } else if (e.key === "Escape") {
+                      <PopoverContent className="w-80" align="start">
+                        <div className="space-y-2">
+                          <h4 className="font-medium text-sm">Edit Interval</h4>
+                          <div className="flex gap-2">
+                            <div className="flex items-center gap-2 flex-1">
+                              <Input
+                                type="number"
+                                min="10"
+                                value={newInterval}
+                                onChange={(e) =>
+                                  setNewInterval(parseInt(e.target.value))
+                                }
+                                placeholder="Seconds"
+                                autoFocus
+                                onKeyDown={(e) => {
+                                  if (e.key === "Enter") {
+                                    updateProbeMutation
+                                      .mutateAsync({
+                                        id: modelProbe.id,
+                                        data: { interval_seconds: newInterval },
+                                      })
+                                      .then(() => {
+                                        setEditingInterval(false);
+                                        toast.success("Interval updated");
+                                      })
+                                      .catch(() => {
+                                        toast.error(
+                                          "Failed to update interval",
+                                        );
+                                      });
+                                  } else if (e.key === "Escape") {
+                                    setEditingInterval(false);
+                                    setNewInterval(modelProbe.interval_seconds);
+                                  }
+                                }}
+                              />
+                              <span className="text-sm text-gray-600">s</span>
+                            </div>
+                            <Button
+                              size="icon"
+                              variant="ghost"
+                              className="h-8 w-8"
+                              onClick={async () => {
+                                try {
+                                  await updateProbeMutation.mutateAsync({
+                                    id: modelProbe.id,
+                                    data: { interval_seconds: newInterval },
+                                  });
                                   setEditingInterval(false);
-                                  setNewInterval(modelProbe.interval_seconds);
+                                  toast.success("Interval updated");
+                                } catch {
+                                  toast.error("Failed to update interval");
                                 }
                               }}
-                            />
-                            <span className="text-sm text-gray-600">s</span>
-                          </div>
-                          <Button
-                            size="icon"
-                            variant="ghost"
-                            className="h-8 w-8"
-                            onClick={async () => {
-                              try {
-                                await updateProbeMutation.mutateAsync({
-                                  id: modelProbe.id,
-                                  data: { interval_seconds: newInterval },
-                                });
+                            >
+                              <Check className="h-4 w-4" />
+                            </Button>
+                            <Button
+                              size="icon"
+                              variant="ghost"
+                              className="h-8 w-8"
+                              onClick={() => {
                                 setEditingInterval(false);
-                                toast.success("Interval updated");
-                              } catch {
-                                toast.error("Failed to update interval");
-                              }
-                            }}
-                          >
-                            <Check className="h-4 w-4" />
-                          </Button>
-                          <Button
-                            size="icon"
-                            variant="ghost"
-                            className="h-8 w-8"
-                            onClick={() => {
-                              setEditingInterval(false);
-                              setNewInterval(modelProbe.interval_seconds);
-                            }}
-                          >
-                            <X className="h-4 w-4" />
-                          </Button>
+                                setNewInterval(modelProbe.interval_seconds);
+                              }}
+                            >
+                              <X className="h-4 w-4" />
+                            </Button>
+                          </div>
                         </div>
-                      </div>
-                    </PopoverContent>
-                  </Popover>
+                      </PopoverContent>
+                    </Popover>
                   )}
                 </div>
               </div>

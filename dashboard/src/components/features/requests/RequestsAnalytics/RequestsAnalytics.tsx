@@ -235,7 +235,7 @@ export function RequestsAnalytics({
         <Card>
           <CardHeader>
             <CardTitle className="text-sm flex items-center gap-1">
-              Pending Queue (SLA)
+              Pending Queue (Priority)
               <HoverCard openDelay={100} closeDelay={100}>
                 <HoverCardTrigger asChild>
                   <Info className="h-3 w-3 text-muted-foreground " />
@@ -243,7 +243,7 @@ export function RequestsAnalytics({
                 <HoverCardContent className="w-80">
                   <p className="text-sm">
                     Shows how many batch requests are currently waiting for the
-                    selected model, grouped by completion window (SLA).
+                    selected model, grouped by priority.
                   </p>
                 </HoverCardContent>
               </HoverCard>

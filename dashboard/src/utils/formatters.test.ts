@@ -220,12 +220,16 @@ describe("formatters", () => {
     });
 
     it("should format days ago", () => {
-      const daysAgo = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString();
+      const daysAgo = new Date(
+        Date.now() - 2 * 24 * 60 * 60 * 1000,
+      ).toISOString();
       expect(formatRelativeTime(daysAgo)).toBe("2d ago");
     });
 
     it("should format older dates as locale string", () => {
-      const longAgo = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString();
+      const longAgo = new Date(
+        Date.now() - 10 * 24 * 60 * 60 * 1000,
+      ).toISOString();
       const result = formatRelativeTime(longAgo);
       expect(result).toBeTruthy();
       expect(result).not.toContain("ago");
@@ -277,7 +281,9 @@ describe("formatters", () => {
       expect(formatTariffPricing("0.00001", "0.00003")).toBe("$10.00 / $30.00");
 
       // GPT-3.5: $0.50 input / $1.50 output per million tokens
-      expect(formatTariffPricing("0.0000005", "0.0000015")).toBe("$0.50 / $1.50");
+      expect(formatTariffPricing("0.0000005", "0.0000015")).toBe(
+        "$0.50 / $1.50",
+      );
     });
   });
 });

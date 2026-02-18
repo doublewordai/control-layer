@@ -297,6 +297,12 @@ pub struct FallbackConfig {
     /// HTTP status codes that trigger fallback (default: [429, 500, 502, 503, 504])
     #[serde(default = "default_fallback_status_codes")]
     pub on_status: Vec<i32>,
+    /// When true, weighted random failover samples with replacement (default: false)
+    #[serde(default)]
+    pub with_replacement: bool,
+    /// Maximum number of failover attempts (default: provider count)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_attempts: Option<i32>,
 }
 
 impl FallbackConfig {
@@ -305,6 +311,8 @@ impl FallbackConfig {
             enabled: true,
             on_rate_limit: true,
             on_status: default_fallback_status_codes(),
+            with_replacement: false,
+            max_attempts: None,
         }
     }
 }
@@ -382,6 +390,8 @@ pub struct DeploymentCreateDBRequest {
     pub fallback_enabled: Option<bool>,
     pub fallback_on_rate_limit: Option<bool>,
     pub fallback_on_status: Option<Vec<i32>>,
+    pub fallback_with_replacement: Option<bool>,
+    pub fallback_max_attempts: Option<i32>,
     /// Whether to sanitize/filter sensitive data from model responses (defaults to true)
     #[builder(default = true)]
     pub sanitize_responses: bool,
@@ -424,6 +434,8 @@ impl DeploymentCreateDBRequest {
                 .fallback_enabled(composite.fallback_enabled)
                 .fallback_on_rate_limit(composite.fallback_on_rate_limit)
                 .fallback_on_status(composite.fallback_on_status)
+                .fallback_with_replacement(composite.fallback_with_replacement)
+                .maybe_fallback_max_attempts(composite.fallback_max_attempts)
                 .sanitize_responses(composite.sanitize_responses)
                 .build(),
         }
@@ -453,6 +465,8 @@ pub struct DeploymentUpdateDBRequest {
     pub fallback_enabled: Option<bool>,
     pub fallback_on_rate_limit: Option<bool>,
     pub fallback_on_status: Option<Vec<i32>>,
+    pub fallback_with_replacement: Option<bool>,
+    pub fallback_max_attempts: Option<Option<i32>>,
     /// Whether to sanitize/filter sensitive data from model responses
     pub sanitize_responses: Option<bool>,
 }
@@ -474,6 +488,8 @@ impl From<DeployedModelUpdate> for DeploymentUpdateDBRequest {
             .maybe_fallback_enabled(update.fallback_enabled)
             .maybe_fallback_on_rate_limit(update.fallback_on_rate_limit)
             .maybe_fallback_on_status(update.fallback_on_status)
+            .maybe_fallback_with_replacement(update.fallback_with_replacement)
+            .maybe_fallback_max_attempts(update.fallback_max_attempts)
             .maybe_sanitize_responses(update.sanitize_responses)
             .build()
     }
@@ -518,7 +534,7 @@ pub struct DeploymentDBResponse {
     pub burst_size: Option<i32>,
     pub capacity: Option<i32>,
     pub batch_capacity: Option<i32>,
-    /// Throughput in requests/second for batch SLA capacity calculations
+    /// Throughput in requests/second for batch capacity calculations
     pub throughput: Option<f32>,
     // Provider/downstream pricing
     pub provider_pricing: Option<ProviderPricing>,
@@ -531,6 +547,8 @@ pub struct DeploymentDBResponse {
     pub fallback_enabled: bool,
     pub fallback_on_rate_limit: bool,
     pub fallback_on_status: Vec<i32>,
+    pub fallback_with_replacement: bool,
+    pub fallback_max_attempts: Option<i32>,
     /// Whether to sanitize/filter sensitive data from model responses
     pub sanitize_responses: bool,
 }
