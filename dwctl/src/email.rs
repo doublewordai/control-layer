@@ -233,7 +233,7 @@ impl EmailService {
         let base = self.base_url.trim_end_matches('/');
         let dashboard_link = format!("{base}/batches/{}", info.batch_id);
         let profile_link = format!("{base}/profile");
-        let priority = if info.completion_window == "1h" { "High" } else { "Standard" };
+        let priority = if info.completion_window == "1h" { "Priority" } else { "Standard" };
 
         env.get_template("email")?.render(context! {
             to_name,
