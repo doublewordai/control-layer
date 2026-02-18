@@ -7,7 +7,7 @@ import {
 } from "@/components/ui/chart";
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Legend, Tooltip, PieChart, Pie, Cell } from "recharts";
 import type { TooltipProps } from "recharts";
-import { BarChart3, CircleHelp, DollarSign, PieChartIcon, TrendingDown } from "lucide-react";
+import { BarChart3, CircleHelp, DollarSign, Layers, PieChartIcon, TrendingDown, Zap } from "lucide-react";
 import { formatDollars } from "@/utils/money";
 
 function formatNumber(n: number): string {
@@ -21,53 +21,6 @@ function formatCompact(n: number): string {
   return n.toString();
 }
 
-
-function TokenBreakdownCard({
-  input,
-  output,
-}: {
-  input: number;
-  output: number;
-}) {
-  const total = input + output;
-  const inputPct = total > 0 ? (input / total) * 100 : 50;
-  const outputPct = total > 0 ? (output / total) * 100 : 50;
-
-  return (
-    <Card className="py-4">
-      <CardContent className="px-5 py-0 space-y-2">
-        <div className="flex items-baseline justify-between">
-          <p className="text-sm font-medium text-muted-foreground">Total Tokens</p>
-          <p className="text-2xl font-bold tabular-nums text-right">{formatNumber(total)}</p>
-        </div>
-        <div className="h-3 rounded-full bg-muted overflow-hidden flex">
-          <div
-            className="h-full bg-blue-500 transition-all"
-            style={{ width: `${inputPct}%` }}
-          />
-          <div
-            className="h-full bg-emerald-500 transition-all"
-            style={{ width: `${outputPct}%` }}
-          />
-        </div>
-        <div className="flex justify-between text-sm">
-          <div className="flex items-center gap-1.5">
-            <span className="inline-block w-2.5 h-2.5 rounded-full bg-blue-500" />
-            <span className="text-muted-foreground">Input</span>
-            <span className="font-medium tabular-nums">{formatCompact(input)}</span>
-            <span className="text-muted-foreground">({inputPct.toFixed(1)}%)</span>
-          </div>
-          <div className="flex items-center gap-1.5">
-            <span className="inline-block w-2.5 h-2.5 rounded-full bg-emerald-500" />
-            <span className="text-muted-foreground">Output</span>
-            <span className="font-medium tabular-nums">{formatCompact(output)}</span>
-            <span className="text-muted-foreground">({outputPct.toFixed(1)}%)</span>
-          </div>
-        </div>
-      </CardContent>
-    </Card>
-  );
-}
 
 const tokenChartConfig = {
   input_tokens: { label: "Input Tokens", color: "#3b82f6" },
@@ -142,7 +95,7 @@ function BarTooltip({ active, payload, label }: TooltipProps<number, string>) {
 
 export function Usage() {
   const { data: usage, isLoading } = useUsage();
-  const [costView, setCostView] = useState<"bar" | "pie">("bar");
+  const [costView, setCostView] = useState<"bar" | "pie">("pie");
 
   const chartData = useMemo(() => {
     if (!usage?.by_model.length) return [];
@@ -193,73 +146,98 @@ export function Usage() {
     <div className="p-6 md:p-8 space-y-6">
       <h1 className="text-2xl font-bold tracking-tight">Usage</h1>
 
-      <div className="grid gap-3 grid-cols-1 lg:grid-cols-3">
-        <Card className="py-4">
-          <CardContent className="px-5 py-0">
-            {realtimeCost > 0 ? (
-              <div className="flex items-stretch gap-4">
-                <div className="flex-1 space-y-1">
-                  <p className="text-sm font-medium text-muted-foreground flex items-center gap-1.5">
-                    <DollarSign className="h-4 w-4 text-violet-500" />
-                    Total Spend
-                  </p>
-                  <p className="text-2xl font-bold tabular-nums">{formatDollars(totalCost, 2)}</p>
-                </div>
-                <div className="w-px bg-border self-stretch" />
-                <div className="flex-1 space-y-1">
-                  <p className="text-sm font-medium text-muted-foreground flex items-center gap-1.5">
-                    <TrendingDown className="h-4 w-4 text-emerald-500" />
-                    Realtime API Equivalent
-                    <span className="relative group">
-                      <CircleHelp className="h-3.5 w-3.5 text-muted-foreground/60" />
-                      <span className="pointer-events-none absolute bottom-full left-1/2 -translate-x-1/2 mb-1.5 w-48 rounded-md border bg-popover px-2.5 py-1.5 text-xs leading-snug text-popover-foreground shadow-md opacity-0 group-hover:opacity-100 transition-opacity z-50">
-                        Estimated cost if all tokens were charged at current realtime tariffs.
+      <div className="grid gap-3 grid-cols-1 md:grid-cols-3">
+        {/* Tokens */}
+        <Card>
+          <CardContent className="p-6">
+            <div className="flex items-center gap-2 text-sm text-muted-foreground mb-3">
+              <Zap className="h-4 w-4" />
+              Total Tokens
+            </div>
+            <div className="text-4xl font-bold tabular-nums mb-4">
+              {formatCompact(usage.total_input_tokens + usage.total_output_tokens)}
+            </div>
+            <div className="flex items-center gap-6 text-muted-foreground">
+              <div>
+                <span className="text-xs">In</span>
+                <p className="text-lg font-semibold tabular-nums text-foreground">
+                  {formatCompact(usage.total_input_tokens)}
+                </p>
+              </div>
+              <div className="w-px h-8 bg-border" />
+              <div>
+                <span className="text-xs">Out</span>
+                <p className="text-lg font-semibold tabular-nums text-foreground">
+                  {formatCompact(usage.total_output_tokens)}
+                </p>
+              </div>
+            </div>
+          </CardContent>
+        </Card>
+
+        {/* Batches */}
+        <Card>
+          <CardContent className="p-6">
+            <div className="flex items-center gap-2 text-sm text-muted-foreground mb-3">
+              <Layers className="h-4 w-4" />
+              Total Batches
+            </div>
+            <div className="text-4xl font-bold tabular-nums mb-4">
+              {formatNumber(usage.total_batch_count)}
+            </div>
+            <div className="flex items-center gap-6 text-muted-foreground">
+              <div>
+                <span className="text-xs">Avg Batch Size</span>
+                <p className="text-lg font-semibold tabular-nums text-foreground">
+                  {usage.avg_requests_per_batch.toFixed(1)} reqs
+                </p>
+              </div>
+            </div>
+          </CardContent>
+        </Card>
+
+        {/* Cost & Savings */}
+        <Card>
+          <CardContent className="p-6">
+            <div className="flex items-center gap-2 text-sm text-muted-foreground mb-3">
+              <DollarSign className="h-4 w-4" />
+              Cost
+            </div>
+            <div className="flex items-center gap-6">
+              <div>
+                <span className="text-xs text-muted-foreground">Total Spent</span>
+                <p className="text-4xl font-bold tabular-nums">
+                  {formatDollars(totalCost, 2)}
+                </p>
+              </div>
+              {realtimeCost > 0 && (
+                <>
+                  <div className="w-px h-14 bg-border" />
+                  <div>
+                    <span className="text-xs text-muted-foreground flex items-center gap-1">
+                      <TrendingDown className="h-3 w-3 text-emerald-500" />
+                      Saved vs. Sync
+                      <span className="relative group">
+                        <CircleHelp className="h-3.5 w-3.5 text-muted-foreground/60" />
+                        <span className="pointer-events-none absolute bottom-full left-1/2 -translate-x-1/2 mb-1.5 w-48 rounded-md border bg-popover px-2.5 py-1.5 text-xs leading-snug text-popover-foreground shadow-md opacity-0 group-hover:opacity-100 transition-opacity z-50">
+                          Estimated cost if all tokens were charged at current realtime tariffs.
+                        </span>
                       </span>
                     </span>
-                  </p>
-                  <div className="flex items-baseline gap-2">
-                    <p className="text-2xl font-bold tabular-nums">{formatDollars(realtimeCost, 2)}</p>
+                    <p className="text-4xl font-bold tabular-nums text-emerald-600 dark:text-emerald-400">
+                      {formatDollars(realtimeCost - totalCost, 2)}
+                    </p>
                     {savings > 0 && (
-                      <span className="inline-flex items-center rounded-full bg-emerald-500/10 px-2 py-0.5 text-sm font-semibold text-emerald-600 dark:text-emerald-400">
-                        {savings.toFixed(1)}% saved
+                      <span className="text-xs font-medium text-emerald-600 dark:text-emerald-400">
+                        {savings.toFixed(0)}% saved
                       </span>
                     )}
                   </div>
-                </div>
-              </div>
-            ) : (
-              <div className="space-y-1">
-                <p className="text-sm font-medium text-muted-foreground flex items-center gap-1.5">
-                  <DollarSign className="h-4 w-4 text-violet-500" />
-                  Total Cost
-                </p>
-                <p className="text-2xl font-bold tabular-nums">{formatDollars(totalCost, 2)}</p>
-              </div>
-            )}
-          </CardContent>
-        </Card>
-        <Card className="py-4">
-          <CardContent className="px-5 py-0 flex items-stretch gap-4">
-            <div className="flex-1 space-y-1">
-              <p className="text-sm font-medium text-muted-foreground">Requests</p>
-              <p className="text-2xl font-bold tabular-nums">{formatNumber(usage.total_request_count)}</p>
-            </div>
-            <div className="w-px bg-border self-stretch" />
-            <div className="flex-1 space-y-1">
-              <p className="text-sm font-medium text-muted-foreground">Batches</p>
-              <p className="text-2xl font-bold tabular-nums">{formatNumber(usage.total_batch_count)}</p>
-            </div>
-            <div className="w-px bg-border self-stretch" />
-            <div className="flex-1 space-y-1">
-              <p className="text-sm font-medium text-muted-foreground">Avg Requests / Batch</p>
-              <p className="text-2xl font-bold tabular-nums">{usage.avg_requests_per_batch.toFixed(1)}</p>
+                </>
+              )}
             </div>
           </CardContent>
         </Card>
-        <TokenBreakdownCard
-          input={usage.total_input_tokens}
-          output={usage.total_output_tokens}
-        />
       </div>
 
       {usage.by_model.length > 0 && (
