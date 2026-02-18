@@ -6,7 +6,7 @@
 
 use sqlx_pool_router::PoolProvider;
 
-use super::sla_capacity::check_sla_capacity;
+use super::sla_capacity::{check_sla_capacity, parse_window_to_seconds};
 use crate::AppState;
 use crate::api::models::batches::{
     BatchAnalytics, BatchErrors, BatchListResponse, BatchObjectType, BatchResponse, BatchResultsQuery, CreateBatchRequest,
@@ -244,38 +244,29 @@ pub async fn create_batch<P: PoolProvider>(
         .map_err(|e| Error::Internal {
             operation: format!("get file template stats: {}", e),
         })?;
-
+        
     let file_model_counts: HashMap<String, i64> = file_stats.iter().map(|s| (s.model.clone(), s.request_count)).collect();
-
-    // Get pending counts by model and completion window
-    let pending_counts = state
-        .request_manager
-        .get_pending_request_counts_by_model_and_completion_window()
-        .await
-        .map_err(|e| Error::Internal {
-            operation: format!("get pending counts: {}", e),
-        })?;
-
-    // Get model throughputs from database
+    
     let model_aliases: Vec<String> = file_model_counts.keys().cloned().collect();
+        
+    let windows = vec![(
+        req.completion_window.clone(),
+        parse_window_to_seconds(&req.completion_window),
+    )];
+    let states = vec![
+        "pending".to_string(),
+        "claimed".to_string(),
+        "processing".to_string(),
+    ];
+
     let model_throughputs = get_model_throughputs(&state, &model_aliases).await?;
     let model_ids_by_alias = get_model_ids_by_aliases(&state, &model_aliases).await?;
-
-    let reservation_ids = reserve_capacity_for_batch(
-        &state,
-        &req.completion_window,
-        &file_model_counts,
-        &pending_counts,
-        &model_throughputs,
-        &model_ids_by_alias,
-    )
-    .await?;
-
+    
     // Determine request_source from authentication method
     // - API key present -> "api"
     // - No API key (cookie auth) -> "frontend"
     let request_source = if has_api_key.0 { "api" } else { "frontend" };
-
+    
     // Convert metadata to HashMap and inject request_source and user info
     // Note: created_by_email is NOT stored in metadata to avoid PII in denormalized storage.
     // The email is fetched via user lookup when building API responses.
@@ -283,7 +274,7 @@ pub async fn create_batch<P: PoolProvider>(
     metadata_map.insert("request_source".to_string(), request_source.to_string());
     metadata_map.insert("created_by".to_string(), current_user.id.to_string());
     let metadata = serde_json::to_value(metadata_map).ok();
-
+    
     // Create batch input
     let batch_input = fusillade::BatchInput {
         file_id: fusillade::FileId(file_id),
@@ -292,6 +283,18 @@ pub async fn create_batch<P: PoolProvider>(
         metadata,
         created_by: Some(current_user.id.to_string()),
     };
+
+    let reservation_ids = reserve_capacity_for_batch(
+        &state,
+        &req.completion_window,
+        &file_model_counts,
+        &model_throughputs,
+        &model_ids_by_alias,
+        &windows,
+        &states,
+        &model_aliases,
+    )
+    .await?;
 
     let batch = state.request_manager.create_batch(batch_input).await;
 
@@ -348,13 +351,70 @@ async fn get_model_ids_by_aliases<P: PoolProvider>(state: &AppState<P>, model_al
     Ok(result)
 }
 
+/// Reserve capacity for a batch before it is created, then release it once fusillade
+/// has committed the batch to its own database.
+///
+/// ## Three-phase pipeline
+///
+/// ```text
+/// Phase 1 — Reserve   (this fn, ~1 ms)
+///   ├─ BEGIN tx on dwctl write pool
+///   ├─ pg_advisory_xact_lock per (model_id, window)  ← serialises concurrent reservations
+///   ├─ read active reservations         (dwctl write pool, inside tx)
+///   ├─ read pending request counts      (fusillade write pool, separate connection)
+///   ├─ check combined capacity
+///   ├─ INSERT reservation rows
+///   └─ COMMIT  ← lock released, reservation visible to peers
+///
+/// Phase 2 — create_batch   (fusillade, ms – seconds depending on batch size)
+///   └─ single atomic tx: INSERT batches → INSERT requests → UPDATE totals → COMMIT
+///
+/// Phase 3 — Release   (~1 ms)
+///   └─ UPDATE reservations SET released_at = now()
+/// ```
+///
+/// ## Advisory lock scope
+///
+/// `pg_advisory_xact_lock` is transaction-scoped and per `(model_id, window)` pair.
+/// All concurrent callers for the same model+window queue behind this lock — only one
+/// can read-check-then-insert at a time. Locks are acquired in deterministic UUID order
+/// to prevent deadlocks when a batch spans multiple models.
+///
+/// ## Read ordering and the fail-safe race window
+///
+/// The two capacity reads come from **different connection pools** (dwctl vs. fusillade),
+/// so they hold independent PostgreSQL snapshots under `READ COMMITTED`. There is an
+/// unavoidable, tiny race window at the exact moment a concurrent batch finishes
+/// `create_batch` and its reservation is released — the "swap point" where requests
+/// transition from a reservation into committed pending rows. A new caller straddling
+/// this swap point could theoretically see inconsistent state across the two reads.
+///
+/// The read order here is deliberately chosen to make that race **fail-safe**:
+///
+/// - Reservations are read **first** (dwctl tx, inside the advisory lock).
+/// - Pending counts are read **second** (fusillade pool, outside the lock).
+///
+/// If the swap point falls between these two reads, the concurrent batch appears in
+/// **both** counts — as a reservation that hasn't been released yet, and as committed
+/// pending requests that have just landed. This double-counts the batch, causing a
+/// conservative over-estimate of load that leads to **under-acceptance** rather than
+/// over-acceptance.
+///
+/// The opposite ordering (pending first, reservations second) produces the dangerous
+/// case: the swap point could cause both reads to return zero, making the system
+/// appear completely idle and over-accepting the incoming batch.
+///
+/// In short: the race is an inherent consequence of reading across two independent
+/// connections, but the read order ensures it always errs on the side of caution.
 async fn reserve_capacity_for_batch<P: PoolProvider>(
     state: &AppState<P>,
     completion_window: &str,
     file_model_counts: &HashMap<String, i64>,
-    pending_counts: &HashMap<String, HashMap<String, i64>>,
     model_throughputs: &HashMap<String, f32>,
     model_ids_by_alias: &HashMap<String, Uuid>,
+    windows: &[(String, i64)],
+    states: &[String],
+    model_filter: &[String],
 ) -> Result<Vec<Uuid>> {
     use crate::db::handlers::BatchCapacityReservations;
 
@@ -380,13 +440,22 @@ async fn reserve_capacity_for_batch<P: PoolProvider>(
     // Sum active reservations and add to pending_counts
     let model_ids: Vec<Uuid> = model_pairs.iter().map(|(_, id)| *id).collect();
     let id_to_alias: HashMap<Uuid, String> = model_pairs.iter().map(|(a, id)| (*id, a.clone())).collect();
-
     let mut reservations = BatchCapacityReservations::new(&mut tx);
+
     let reserved_rows = reservations
         .sum_active_by_model_window(&model_ids, completion_window)
         .await
         .map_err(|e| Error::Internal {
             operation: format!("sum active reservations: {}", e),
+        })?;
+
+    // Fetch pending counts AFTER locks to avoid stale snapshots
+    let pending_counts = state
+        .request_manager
+        .get_pending_request_counts_by_model_and_completion_window(windows, states, model_filter, true)
+        .await
+        .map_err(|e| Error::Internal {
+            operation: format!("get pending counts: {}", e),
         })?;
 
     let mut pending_with_reservations = pending_counts.clone();
@@ -2119,17 +2188,22 @@ mod tests {
         let model_id = create_test_model(&pool, "model-a", &alias, endpoint_id, user.id).await;
 
         let file_model_counts: HashMap<String, i64> = HashMap::from([(alias.clone(), 5_i64)]);
-        let pending_counts: HashMap<String, HashMap<String, i64>> = HashMap::new();
         let model_throughputs = HashMap::from([(alias.clone(), 1000.0_f32)]);
         let model_ids_by_alias = HashMap::from([(alias.clone(), model_id)]);
+
+        let windows = vec![("24h".to_string(), super::parse_window_to_seconds("24h"))];
+        let states = vec!["pending".to_string(), "claimed".to_string(), "processing".to_string()];
+        let model_filter = vec![alias.clone()];
 
         let reservation_ids = super::reserve_capacity_for_batch(
             &state,
             "24h",
             &file_model_counts,
-            &pending_counts,
             &model_throughputs,
             &model_ids_by_alias,
+            &windows,
+            &states,
+            &model_filter,
         )
         .await
         .unwrap();
@@ -2175,17 +2249,22 @@ mod tests {
         let model_id = create_test_model(&pool, "model-a", &alias, endpoint_id, user.id).await;
 
         let file_model_counts: HashMap<String, i64> = HashMap::from([(alias.clone(), 1_i64)]);
-        let pending_counts: HashMap<String, HashMap<String, i64>> = HashMap::new();
         let model_throughputs = HashMap::from([(alias.clone(), 0.0_f32)]);
         let model_ids_by_alias = HashMap::from([(alias.clone(), model_id)]);
+
+        let windows = vec![("1h".to_string(), super::parse_window_to_seconds("1h"))];
+        let states = vec!["pending".to_string(), "claimed".to_string(), "processing".to_string()];
+        let model_filter = vec![alias.clone()];
 
         let err = super::reserve_capacity_for_batch(
             &state,
             "1h",
             &file_model_counts,
-            &pending_counts,
             &model_throughputs,
             &model_ids_by_alias,
+            &windows,
+            &states,
+            &model_filter,
         )
         .await
         .unwrap_err();
@@ -2206,4 +2285,6 @@ mod tests {
 
         assert_eq!(count.unwrap_or(0), 0);
     }
+
+
 }
