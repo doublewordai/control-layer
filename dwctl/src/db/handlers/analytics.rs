@@ -1048,11 +1048,9 @@ pub async fn get_user_batch_counts(pool: &PgPool, user_id: Uuid) -> Result<(i64,
 pub async fn refresh_user_model_usage(pool: &PgPool) -> Result<()> {
     let mut tx = pool.begin().await?;
 
-    let cursor: i64 = sqlx::query_scalar!(
-        "SELECT last_processed_id FROM user_model_usage_cursor WHERE id = TRUE FOR UPDATE"
-    )
-    .fetch_one(&mut *tx)
-    .await?;
+    let cursor: i64 = sqlx::query_scalar!("SELECT last_processed_id FROM user_model_usage_cursor WHERE id = TRUE FOR UPDATE")
+        .fetch_one(&mut *tx)
+        .await?;
 
     let new_max: Option<i64> = sqlx::query_scalar!(
         r#"
