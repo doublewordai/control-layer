@@ -8,7 +8,31 @@ use lettre::{
     transport::smtp::authentication::Credentials,
 };
 use minijinja::{Environment, context};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+
+struct EmailTemplates {
+    password_reset: String,
+    batch_complete: String,
+    first_batch: String,
+}
+
+impl EmailTemplates {
+    fn load(dir: &Path) -> Result<Self, Error> {
+        let load = |name: &str| -> Result<String, Error> {
+            let path = dir.join(name);
+            std::fs::read_to_string(&path).map_err(|e| Error::Internal {
+                operation: format!("load email template {}: {e}", path.display()),
+            })
+        };
+
+        Ok(Self {
+            password_reset: load("password_reset.html")?,
+            batch_complete: load("batch_complete.html")?,
+            first_batch: load("first_batch.html")?,
+        })
+    }
+
+}
 
 pub struct EmailService {
     transport: EmailTransport,
@@ -16,7 +40,7 @@ pub struct EmailService {
     from_name: String,
     base_url: String,
     reply_to: Option<String>,
-    templates_dir: PathBuf,
+    templates: EmailTemplates,
 }
 
 enum EmailTransport {
@@ -67,13 +91,15 @@ impl EmailService {
             }
         };
 
+        let templates = EmailTemplates::load(Path::new(&email_config.templates_dir))?;
+
         Ok(Self {
             transport,
             from_email: email_config.from_email.clone(),
             from_name: email_config.from_name.clone(),
             base_url: config.dashboard_url.clone(),
             reply_to: email_config.reply_to.clone(),
-            templates_dir: PathBuf::from(&email_config.templates_dir),
+            templates,
         })
     }
 
@@ -165,26 +191,19 @@ impl EmailService {
         self.send_email(to_email, to_name, &subject, &body).await
     }
 
-    fn load_template(&self, name: &str) -> Result<String, minijinja::Error> {
-        let path = self.templates_dir.join(name);
-        std::fs::read_to_string(&path).map_err(|e| {
-            minijinja::Error::new(
-                minijinja::ErrorKind::InvalidOperation,
-                format!("read email template {}: {e}", path.display()),
-            )
-        })
-    }
-
     pub fn render_batch_completion_body(
         &self,
         to_name: String,
         info: &BatchNotificationInfo,
         first_batch: bool,
     ) -> Result<String, minijinja::Error> {
-        let template_name = if first_batch { "first_batch.html" } else { "batch_complete.html" };
-        let template_src = self.load_template(template_name)?;
+        let template_src = if first_batch {
+            &self.templates.first_batch
+        } else {
+            &self.templates.batch_complete
+        };
         let mut env = Environment::new();
-        env.add_template("email", &template_src)?;
+        env.add_template("email", template_src)?;
 
         let (outcome_label, outcome_icon, header_color, outcome_message) = match info.outcome {
             BatchOutcome::Completed => ("Completed", "✓", "#16a34a", "Your batch has finished processing successfully."),
@@ -242,9 +261,8 @@ impl EmailService {
     }
 
     fn render_password_reset_body(&self, to_name: &str, reset_link: &str) -> Result<String, minijinja::Error> {
-        let template_src = self.load_template("password_reset.html")?;
         let mut env = Environment::new();
-        env.add_template("email", &template_src)?;
+        env.add_template("email", &self.templates.password_reset)?;
 
         env.get_template("email")?.render(context! {
             to_name,

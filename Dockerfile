@@ -54,6 +54,9 @@ WORKDIR /app
 # Copy the binary from builder stage (frontend is already embedded in the binary)
 COPY --from=builder /app/target/release/dwctl /app/dwctl
 
+# Copy default email templates (can be overridden via volume mount)
+COPY dwctl/default_templates/ /app/default_templates/
+
 # Change ownership of the app directory to the ubuntu user
 RUN chown -R ubuntu:ubuntu /app
 
