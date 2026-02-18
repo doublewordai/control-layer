@@ -1352,4 +1352,3 @@ export function useRotateWebhookSecret() {
     }) => dwctlApi.users.webhooks.rotateSecret(webhookId, userId),
   });
 }
-

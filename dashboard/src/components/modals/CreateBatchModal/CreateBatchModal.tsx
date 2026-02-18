@@ -70,7 +70,8 @@ export function CreateBatchModal({
   );
   const [expirationSeconds, setExpirationSeconds] = useState<number>(2592000); // 30 days default
   const [endpoint, setEndpoint] = useState<string>("/v1/chat/completions");
-  const [completionWindow, setCompletionWindow] = useState<string>("24h"); // Default SLA
+  const [completionWindow, setCompletionWindow] =
+    useState<string>("Standard (24h)"); // Default: standard priority
   const [description, setDescription] = useState<string>("");
   const [error, setError] = useState<string | null>(null);
   const [dragActive, setDragActive] = useState(false);
@@ -85,10 +86,10 @@ export function CreateBatchModal({
   const createBatchMutation = useCreateBatch();
   const uploadMutation = useUploadFileWithProgress();
 
-  // Fetch config to get available SLAs
+  // Fetch config to get available priority options (formatted labels like "Standard (24h)")
   const { data: config } = useConfig();
-  const availableSLAs = useMemo(
-    () => config?.batches?.allowed_completion_windows || ["24h"],
+  const availableWindows = useMemo(
+    () => config?.batches?.allowed_completion_windows || ["Standard (24h)"],
     [config?.batches?.allowed_completion_windows],
   );
 
@@ -110,18 +111,28 @@ export function CreateBatchModal({
     }
   }, [availableFiles.length, hasLoadedFiles]);
 
-  // Fetch cost estimate for selected file with current SLA
+  // Extract raw completion window value for cost estimate API
+  // "Standard (24h)" -> "24h", "High (1h)" -> "1h"
+  const rawCompletionWindow = useMemo(() => {
+    const match = completionWindow.match(/\(([^)]+)\)/);
+    return match ? match[1] : completionWindow;
+  }, [completionWindow]);
+
+  // Fetch cost estimate for selected file with current completion window
   const { data: costEstimate, isLoading: isLoadingCost } = useFileCostEstimate(
     selectedFileId || undefined,
-    completionWindow,
+    rawCompletionWindow,
   );
 
-  // Update default SLA when available SLAs change
+  // Update default when available windows change
   useEffect(() => {
-    if (availableSLAs.length > 0 && !availableSLAs.includes(completionWindow)) {
-      setCompletionWindow(availableSLAs[0]);
+    if (
+      availableWindows.length > 0 &&
+      !availableWindows.includes(completionWindow)
+    ) {
+      setCompletionWindow(availableWindows[0]);
     }
-  }, [availableSLAs, completionWindow]);
+  }, [availableWindows, completionWindow]);
 
   // Update selected file when preselected file changes
   useEffect(() => {
@@ -272,7 +283,7 @@ export function CreateBatchModal({
       setSelectedFileId(null);
       setFileToUpload(null);
       setEndpoint("/v1/chat/completions");
-      setCompletionWindow(availableSLAs[0] || "24h");
+      setCompletionWindow(availableWindows[0] || "Standard (24h)");
       setDescription("");
       setExpirationSeconds(2592000);
       setFilename("");
@@ -291,7 +302,7 @@ export function CreateBatchModal({
     setSelectedFileId(preselectedFile?.id || null);
     setFileToUpload(null);
     setEndpoint("/v1/chat/completions");
-    setCompletionWindow(availableSLAs[0] || "24h");
+    setCompletionWindow(availableWindows[0] || "Standard (24h)");
     setDescription("");
     setExpirationSeconds(2592000);
     setFilename("");
@@ -573,21 +584,21 @@ export function CreateBatchModal({
               </p>
             </div>
 
-            {/* SLA Selection */}
+            {/* Priority Selection */}
             <div className="space-y-2">
-              <Label htmlFor="completion-window">Completion Window (SLA)</Label>
+              <Label htmlFor="completion-window">Priority</Label>
               <Select
                 value={completionWindow}
                 onValueChange={setCompletionWindow}
                 disabled={isPending}
               >
                 <SelectTrigger id="completion-window">
-                  <SelectValue />
+                  <SelectValue>{completionWindow}</SelectValue>
                 </SelectTrigger>
                 <SelectContent>
-                  {availableSLAs.map((sla) => (
-                    <SelectItem key={sla} value={sla}>
-                      {sla}
+                  {availableWindows.map((window) => (
+                    <SelectItem key={window} value={window}>
+                      {window}
                     </SelectItem>
                   ))}
                 </SelectContent>
@@ -610,7 +621,7 @@ export function CreateBatchModal({
                         <Info className="w-3.5 h-3.5 text-gray-400 cursor-help" />
                       </TooltipTrigger>
                       <TooltipContent side="top" className="max-w-[250px]">
-                        Based on {completionWindow} SLA pricing and average
+                        Based on {completionWindow} priority pricing and average
                         output tokens for the requested model(s). Actual cost
                         may vary.
                       </TooltipContent>

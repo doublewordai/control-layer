@@ -160,7 +160,9 @@ export function formatRelativeTime(dateString?: string): string {
  * @param pricePerToken - Price per token as a decimal string (e.g., "0.000001")
  * @returns Formatted price per million tokens (e.g., "$1.00")
  */
-export function formatTariffPrice(pricePerToken: string | number | null | undefined): string {
+export function formatTariffPrice(
+  pricePerToken: string | number | null | undefined,
+): string {
   if (!pricePerToken || pricePerToken === "0" || pricePerToken === 0) {
     return "$0";
   }
@@ -180,7 +182,7 @@ export function formatTariffPrice(pricePerToken: string | number | null | undefi
  */
 export function formatTariffPricing(
   inputPrice: string | number | null | undefined,
-  outputPrice: string | number | null | undefined
+  outputPrice: string | number | null | undefined,
 ): string {
   return `${formatTariffPrice(inputPrice)} / ${formatTariffPrice(outputPrice)}`;
 }

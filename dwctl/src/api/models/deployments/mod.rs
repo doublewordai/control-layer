@@ -89,8 +89,8 @@ pub struct TariffDefinition {
     pub output_price_per_token: rust_decimal::Decimal,
     /// Optional API key purpose this tariff applies to (realtime, batch, playground)
     pub api_key_purpose: Option<crate::db::models::api_keys::ApiKeyPurpose>,
-    /// Optional completion window (SLA) for batch tariffs (e.g., "24h", "1h")
-    /// Required when api_key_purpose is Batch to support multiple pricing tiers per SLA
+    /// Optional completion window (priority) for batch tariffs (e.g., "24h", "1h")
+    /// Required when api_key_purpose is Batch to support multiple pricing tiers per priority
     #[serde(skip_serializing_if = "Option::is_none")]
     pub completion_window: Option<String>,
 }
@@ -129,7 +129,7 @@ pub struct StandardModelCreate {
     pub capacity: Option<i32>,
     /// Maximum number of concurrent batch requests allowed for this model (null = defaults to capacity or no limit)
     pub batch_capacity: Option<i32>,
-    /// Throughput in requests/second for batch SLA capacity calculations (null = use config default)
+    /// Throughput in requests/second for batch capacity calculations (null = use config default)
     pub throughput: Option<f32>,
     /// Provider/downstream pricing details (admin only)
     pub provider_pricing: Option<ProviderPricing>,
@@ -158,7 +158,7 @@ pub struct CompositeModelCreate {
     pub capacity: Option<i32>,
     /// Maximum number of concurrent batch requests allowed for this model (null = defaults to capacity or no limit)
     pub batch_capacity: Option<i32>,
-    /// Throughput in requests/second for batch SLA capacity calculations (null = use config default)
+    /// Throughput in requests/second for batch capacity calculations (null = use config default)
     pub throughput: Option<f32>,
     /// Tariffs for this model - if provided, these will be created as active tariffs
     pub tariffs: Option<Vec<TariffDefinition>>,
@@ -296,7 +296,7 @@ pub struct DeployedModelResponse {
     /// Maximum number of concurrent batch requests allowed for this model (null = defaults to capacity or no limit)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub batch_capacity: Option<i32>,
-    /// Throughput in requests/second for batch SLA capacity calculations (null = use config default)
+    /// Throughput in requests/second for batch capacity calculations (null = use config default)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub throughput: Option<f32>,
     /// Groups that have access to this model (only included if requested)

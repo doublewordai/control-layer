@@ -239,14 +239,14 @@ batches:
   # TTL for batch capacity reservations (seconds)
   reservation_ttl_secs: 600
 
-  # Allowed completion windows (SLAs) for batch processing
+  # Allowed completion windows for batch processing
   # These define the maximum time from batch creation to completion
   # Default: ["24h"] - only 24 hour completion window is allowed
   allowed_completion_windows:
     - "24h"
     - "1h"
-    # - "12h"  # Uncomment to allow 12 hour SLA
-    # - "48h"  # Uncomment to allow 48 hour SLA
+    # - "12h"  # Uncomment to allow 12 hour 
+    # - "48h"  # Uncomment to allow 48 hour
 
   # Allowed OpenAI-compatible URL paths for batch requests.
   # This is used by both /files upload validation and /batches endpoint validation.
@@ -330,7 +330,7 @@ background_services:
     # All retry parameters are optional and default to fusillade's built-in defaults
     # min_retries: 3 - Minimum retries guaranteed regardless of other limits
     # max_retries: None - No cap on retries (only limited by deadline if set)
-    stop_before_deadline_ms: 0 # When to stop retrying/escalating relative to the batch SLA Deadline. Positive means before deadline, negative means after deadline (default: 0, stop on expiration deadline)
+    stop_before_deadline_ms: 0 # When to stop retrying/escalating relative to the batch completion window. Positive means before deadline, negative means after deadline (default: 0, stop on expiration deadline)
 
     backoff_ms: 1000 # Initial backoff duration in milliseconds
     backoff_factor: 2 # Exponential backoff multiplier

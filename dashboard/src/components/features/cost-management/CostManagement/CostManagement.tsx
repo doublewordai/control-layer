@@ -1,6 +1,13 @@
 import { useEffect, useState } from "react";
 import { useSearchParams } from "react-router-dom";
-import { useUser, useAddFunds, useConfig, useCreatePayment, useProcessPayment, useCreateBillingPortalSession } from "@/api/control-layer";
+import {
+  useUser,
+  useAddFunds,
+  useConfig,
+  useCreatePayment,
+  useProcessPayment,
+  useCreateBillingPortalSession,
+} from "@/api/control-layer";
 import { toast } from "sonner";
 import { useSettings } from "@/contexts";
 import { TransactionHistory } from "@/components/features/cost-management/CostManagement/TransactionHistory.tsx";
@@ -31,7 +38,9 @@ export function CostManagement() {
 
   // Fetch current user and display user (the one we're viewing billing for)
   const { data: currentUser, refetch: refetchCurrentUser } = useUser("current");
-  const { data: displayUser, refetch: refetchDisplayUser } = useUser(filterUserId || "current");
+  const { data: displayUser, refetch: refetchDisplayUser } = useUser(
+    filterUserId || "current",
+  );
 
   const addFundsMutation = useAddFunds();
   const createPaymentMutation = useCreatePayment();
@@ -49,7 +58,7 @@ export function CostManagement() {
 
   // Check if user has permission to add funds (PlatformManager or BillingManager)
   const canManageFunds = currentUser?.roles?.some(
-    (role) => role === "PlatformManager" || role === "BillingManager"
+    (role) => role === "PlatformManager" || role === "BillingManager",
   );
 
   const handleAddFundsSuccess = () => {
@@ -120,7 +129,7 @@ export function CostManagement() {
           source_id: displayUser?.id || "",
           user_id: displayUser?.id || "",
           amount: fundAmount,
-          description: "Funds purchase - Demo top up"
+          description: "Funds purchase - Demo top up",
         });
         toast.success(`Added $${fundAmount.toFixed(2)}`);
       } catch {
@@ -130,7 +139,9 @@ export function CostManagement() {
       // Payment processing enabled: Get checkout URL and redirect using the mutation hook
       try {
         // Pass filterUserId as creditee_id when viewing another user's billing
-        const data = await createPaymentMutation.mutateAsync(filterUserId || undefined);
+        const data = await createPaymentMutation.mutateAsync(
+          filterUserId || undefined,
+        );
         if (data.url) {
           // Navigate to payment provider checkout page
           window.location.href = data.url;
@@ -173,18 +184,22 @@ export function CostManagement() {
 
     if (!hasPaymentEnabled && !hasPaymentProvider) {
       // No payment processing configured at all
-      return canManageFunds ? {
-        type: 'admin-only' as const,
-        onGiftFunds: handleGiftFunds
-      } : undefined;
+      return canManageFunds
+        ? {
+            type: "admin-only" as const,
+            onGiftFunds: handleGiftFunds,
+          }
+        : undefined;
     }
 
     // Payment processing is configured (either Stripe or external provider)
     // Show split button if user is admin OR has a customer ID
     if (canManageFunds || hasCustomerId) {
       return {
-        type: 'split' as const,
-        onPurchaseFunds: hasPaymentProvider ? handlePurchaseFundsExternal : handlePurchaseFunds,
+        type: "split" as const,
+        onPurchaseFunds: hasPaymentProvider
+          ? handlePurchaseFundsExternal
+          : handlePurchaseFunds,
         // Only show "Gift Funds" option if user is actually an admin
         onGiftFunds: canManageFunds ? handleGiftFunds : undefined,
         // Only show "Billing Portal" if user has a customer ID
@@ -193,8 +208,10 @@ export function CostManagement() {
     } else {
       // Non-admin without customer ID: simple payment button
       return {
-        type: 'purchase-only' as const,
-        onPurchaseFunds: hasPaymentProvider ? handlePurchaseFundsExternal : handlePurchaseFunds
+        type: "purchase-only" as const,
+        onPurchaseFunds: hasPaymentProvider
+          ? handlePurchaseFundsExternal
+          : handlePurchaseFunds,
       };
     }
   })();
@@ -248,14 +265,21 @@ export function CostManagement() {
                 "Processing your payment and updating your account balance..."
               ) : processPaymentMutation.isError ? (
                 <div className="space-y-2">
-                  <p>Your payment has been captured but not yet applied to your account.</p>
+                  <p>
+                    Your payment has been captured but not yet applied to your
+                    account.
+                  </p>
                   <p className="text-sm text-gray-600">
-                    Your balance should update automatically within a few minutes. If it doesn't, please contact support.
+                    Your balance should update automatically within a few
+                    minutes. If it doesn't, please contact support.
                   </p>
                 </div>
               ) : (
                 <div className="space-y-2">
-                  <p>Thank you for your payment! Your account balance has been updated.</p>
+                  <p>
+                    Thank you for your payment! Your account balance has been
+                    updated.
+                  </p>
                   <p className="text-sm text-gray-600">
                     You can now use your credits for API requests.
                   </p>
@@ -265,13 +289,14 @@ export function CostManagement() {
           </DialogHeader>
           <div className="flex justify-end gap-2 mt-4">
             {processPaymentMutation.isPending ? (
-              <Button variant="outline" onClick={() => setShowSuccessModal(false)}>
+              <Button
+                variant="outline"
+                onClick={() => setShowSuccessModal(false)}
+              >
                 Close (processing in background)
               </Button>
             ) : (
-              <Button onClick={() => setShowSuccessModal(false)}>
-                Close
-              </Button>
+              <Button onClick={() => setShowSuccessModal(false)}>Close</Button>
             )}
           </div>
         </DialogContent>
@@ -287,7 +312,10 @@ export function CostManagement() {
             </DialogTitle>
             <DialogDescription>
               <div className="space-y-2">
-                <p>Your payment was cancelled. No charges have been made to your account.</p>
+                <p>
+                  Your payment was cancelled. No charges have been made to your
+                  account.
+                </p>
                 <p className="text-sm text-gray-600">
                   You can try adding funds again whenever you're ready.
                 </p>
@@ -295,13 +323,18 @@ export function CostManagement() {
             </DialogDescription>
           </DialogHeader>
           <div className="flex justify-end gap-2 mt-4">
-            <Button variant="outline" onClick={() => setShowCancelledModal(false)}>
+            <Button
+              variant="outline"
+              onClick={() => setShowCancelledModal(false)}
+            >
               Close
             </Button>
-            <Button onClick={() => {
-              setShowCancelledModal(false);
-              handlePurchaseFunds();
-            }}>
+            <Button
+              onClick={() => {
+                setShowCancelledModal(false);
+                handlePurchaseFunds();
+              }}
+            >
               Try Again
             </Button>
           </div>

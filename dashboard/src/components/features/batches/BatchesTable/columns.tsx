@@ -158,10 +158,10 @@ export const createBatchColumns = (
   },
   {
     accessorKey: "completion_window",
-    header: "SLA",
+    header: "Priority",
     cell: ({ row }) => {
-      const completionWindow = row.getValue("completion_window") as string;
-      return <span className="text-sm text-gray-700">{completionWindow}</span>;
+      const priority = row.getValue("completion_window") as string;
+      return <span className="text-sm text-gray-700">{priority}</span>;
     },
   },
   {

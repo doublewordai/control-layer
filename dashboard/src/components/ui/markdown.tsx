@@ -26,7 +26,10 @@ export function Markdown({
             // Check if this paragraph contains a code block
             // Code blocks should not be wrapped in <p> tags (invalid HTML)
             const hasCodeBlock = node?.children?.some(
-              (child: any) => child.type === "element" && child.tagName === "code" && !child.properties?.inline
+              (child: any) =>
+                child.type === "element" &&
+                child.tagName === "code" &&
+                !child.properties?.inline,
             );
 
             // If it contains a code block, return children unwrapped
