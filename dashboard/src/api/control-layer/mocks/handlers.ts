@@ -57,6 +57,8 @@ interface DemoRequest {
       completion_tokens: number;
       total_tokens: number;
     };
+    created?: number;
+    [key: string]: unknown;
   };
   duration_ms: number;
   metadata?: {
@@ -66,7 +68,7 @@ interface DemoRequest {
 }
 
 // Type assert the imported JSON data
-const usersData = usersDataRaw as User[];
+const usersData = usersDataRaw as unknown as User[];
 const groupsData = groupsDataRaw as Group[];
 const endpointsData = endpointsDataRaw as Endpoint[];
 const modelsData = modelsDataRaw.data as Model[];
