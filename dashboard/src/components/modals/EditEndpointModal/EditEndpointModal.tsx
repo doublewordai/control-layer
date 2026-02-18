@@ -286,6 +286,7 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
 
   const handleConfigureManually = () => {
     setManualMode(true);
+    setCurrentStep(2);
     setValidationState("idle");
     setValidationError(null);
 
