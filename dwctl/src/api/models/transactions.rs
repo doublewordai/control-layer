@@ -72,7 +72,8 @@ pub struct CreditTransactionResponse {
     /// Only present for usage transactions
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_origin: Option<String>,
-    /// Batch SLA completion window: "1h", "24h", or empty string for non-batch
+    /// Batch priority: "Standard (24h)", "High (1h)", or empty string for non-batch
+    /// API responses return priority names (converted from internal "1h"/"24h" storage)
     /// Only present for usage transactions
     #[serde(skip_serializing_if = "Option::is_none")]
     pub batch_sla: Option<String>,
@@ -197,8 +198,14 @@ impl CreditTransactionResponse {
         batch_sla: Option<String>,
         batch_count: i32,
     ) -> Self {
+        use super::completion_window::format_completion_window;
+
         // Only include batch_request_count for actual batches (count > 1)
         let batch_request_count = if batch_count > 1 { Some(batch_count) } else { None };
+
+        // Format batch_sla for API responses ("24h" → "Standard (24h)")
+        let batch_sla = batch_sla.map(|sla| format_completion_window(&sla));
+
         Self {
             id: db.id,
             user_id: db.user_id,

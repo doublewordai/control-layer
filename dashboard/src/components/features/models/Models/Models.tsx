@@ -22,11 +22,7 @@ import {
 import { Tabs, TabsList, TabsTrigger } from "../../../ui/tabs";
 import { Input } from "../../../ui/input";
 import { Button } from "../../../ui/button";
-import {
-  Popover,
-  PopoverContent,
-  PopoverTrigger,
-} from "../../../ui/popover";
+import { Popover, PopoverContent, PopoverTrigger } from "../../../ui/popover";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -55,7 +51,9 @@ const Models: React.FC = () => {
 
   const [filterProvider, setFilterProvider] = useState("all");
   const [filterGroups, setFilterGroups] = useState<string[]>([]);
-  const [filterModelType, setFilterModelType] = useState<"all" | "virtual" | "hosted">("all");
+  const [filterModelType, setFilterModelType] = useState<
+    "all" | "virtual" | "hosted"
+  >("all");
   const [searchQuery, setSearchQuery] = useState(
     searchParams.get("search") || "",
   );
@@ -184,7 +182,10 @@ const Models: React.FC = () => {
                       <SlidersHorizontal className="h-4 w-4" />
                       <span className="hidden sm:inline">Filter</span>
                       <ChevronDown className="h-3 w-3 opacity-50" />
-                      {(filterProvider !== "all" || filterGroups.length > 0 || (canManageGroups && filterModelType !== "all") || showAccessibleOnly) && (
+                      {(filterProvider !== "all" ||
+                        filterGroups.length > 0 ||
+                        (canManageGroups && filterModelType !== "all") ||
+                        showAccessibleOnly) && (
                         <span className="absolute -top-1 -right-1 h-2 w-2 rounded-full bg-blue-500" />
                       )}
                     </Button>
@@ -208,7 +209,9 @@ const Models: React.FC = () => {
                             <SelectContent>
                               {providers.map((provider) => (
                                 <SelectItem key={provider} value={provider}>
-                                  {provider === "all" ? "All Endpoints" : provider}
+                                  {provider === "all"
+                                    ? "All Endpoints"
+                                    : provider}
                                 </SelectItem>
                               ))}
                             </SelectContent>
@@ -233,7 +236,9 @@ const Models: React.FC = () => {
                                   ) : (
                                     <span className="flex gap-1 flex-wrap">
                                       {filterGroups.map((groupId) => {
-                                        const group = groups.find((g) => g.id === groupId);
+                                        const group = groups.find(
+                                          (g) => g.id === groupId,
+                                        );
                                         return group ? (
                                           <span
                                             key={groupId}
@@ -245,7 +250,9 @@ const Models: React.FC = () => {
                                               onClick={(e) => {
                                                 e.stopPropagation();
                                                 setFilterGroups(
-                                                  filterGroups.filter((id) => id !== groupId)
+                                                  filterGroups.filter(
+                                                    (id) => id !== groupId,
+                                                  ),
                                                 );
                                               }}
                                             />
@@ -266,17 +273,24 @@ const Models: React.FC = () => {
                                   </div>
                                 ) : (
                                   groups.map((group) => {
-                                    const isSelected = filterGroups.includes(group.id);
+                                    const isSelected = filterGroups.includes(
+                                      group.id,
+                                    );
                                     return (
                                       <button
                                         key={group.id}
                                         onClick={() => {
                                           if (isSelected) {
                                             setFilterGroups(
-                                              filterGroups.filter((id) => id !== group.id)
+                                              filterGroups.filter(
+                                                (id) => id !== group.id,
+                                              ),
                                             );
                                           } else {
-                                            setFilterGroups([...filterGroups, group.id]);
+                                            setFilterGroups([
+                                              ...filterGroups,
+                                              group.id,
+                                            ]);
                                           }
                                         }}
                                         className="w-full flex items-center gap-2 rounded-sm py-1.5 pl-2 pr-2 text-sm hover:bg-accent hover:text-accent-foreground transition-colors text-left cursor-default"
@@ -300,26 +314,35 @@ const Models: React.FC = () => {
                         <div className="space-y-2">
                           <Label>Model Type</Label>
                           <div className="flex rounded-md border border-input overflow-hidden">
-                            {(["all", "virtual", "hosted"] as const).map((type) => (
-                              <button
-                                key={type}
-                                onClick={() => setFilterModelType(type)}
-                                className={`flex-1 px-2 py-1.5 text-xs font-medium transition-colors ${
-                                  filterModelType === type
-                                    ? "bg-primary text-primary-foreground"
-                                    : "bg-background hover:bg-muted text-muted-foreground"
-                                }`}
-                                aria-label={`Show ${type === "all" ? "all models" : type + " models"}`}
-                              >
-                                {type === "all" ? "All" : type === "virtual" ? "Virtual" : "Hosted"}
-                              </button>
-                            ))}
+                            {(["all", "virtual", "hosted"] as const).map(
+                              (type) => (
+                                <button
+                                  key={type}
+                                  onClick={() => setFilterModelType(type)}
+                                  className={`flex-1 px-2 py-1.5 text-xs font-medium transition-colors ${
+                                    filterModelType === type
+                                      ? "bg-primary text-primary-foreground"
+                                      : "bg-background hover:bg-muted text-muted-foreground"
+                                  }`}
+                                  aria-label={`Show ${type === "all" ? "all models" : type + " models"}`}
+                                >
+                                  {type === "all"
+                                    ? "All"
+                                    : type === "virtual"
+                                      ? "Virtual"
+                                      : "Hosted"}
+                                </button>
+                              ),
+                            )}
                           </div>
                         </div>
                       )}
                       {!isStatusMode && canManageGroups && (
                         <div className="flex items-center justify-between">
-                          <Label htmlFor="access-toggle" className="cursor-pointer">
+                          <Label
+                            htmlFor="access-toggle"
+                            className="cursor-pointer"
+                          >
                             Accessible only
                           </Label>
                           <Switch

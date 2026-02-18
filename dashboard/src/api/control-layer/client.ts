@@ -106,9 +106,7 @@ const fetchAiApi = (path: string, init?: RequestInit): Promise<Response> => {
   // When making cross-origin requests, include credentials for session cookies
   const options: RequestInit = {
     ...init,
-    credentials: aiApiBaseUrl
-      ? "include"
-      : init?.credentials || "same-origin",
+    credentials: aiApiBaseUrl ? "include" : init?.credentials || "same-origin",
   };
   return fetch(url, options);
 };
@@ -246,9 +244,7 @@ const userApi = {
   // Nested webhooks under users
   webhooks: {
     async list(userId: string = "current"): Promise<Webhook[]> {
-      const response = await fetch(
-        `/admin/api/v1/users/${userId}/webhooks`,
-      );
+      const response = await fetch(`/admin/api/v1/users/${userId}/webhooks`);
       if (!response.ok) {
         throw new Error(`Failed to fetch webhooks: ${response.status}`);
       }
@@ -259,14 +255,11 @@ const userApi = {
       data: WebhookCreateRequest,
       userId: string = "current",
     ): Promise<WebhookWithSecret> {
-      const response = await fetch(
-        `/admin/api/v1/users/${userId}/webhooks`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(data),
-        },
-      );
+      const response = await fetch(`/admin/api/v1/users/${userId}/webhooks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(data),
+      });
       if (!response.ok) {
         throw new Error(`Failed to create webhook: ${response.status}`);
       }
@@ -292,10 +285,7 @@ const userApi = {
       return response.json();
     },
 
-    async delete(
-      webhookId: string,
-      userId: string = "current",
-    ): Promise<void> {
+    async delete(webhookId: string, userId: string = "current"): Promise<void> {
       const response = await fetch(
         `/admin/api/v1/users/${userId}/webhooks/${webhookId}`,
         {
@@ -322,7 +312,6 @@ const userApi = {
       }
       return response.json();
     },
-
   },
 };
 
@@ -394,7 +383,9 @@ const modelApi = {
 
     if (!response.ok) {
       const errorText = await response.text();
-      throw new Error(errorText || `Failed to create model: ${response.status}`);
+      throw new Error(
+        errorText || `Failed to create model: ${response.status}`,
+      );
     }
 
     return response.json();
@@ -403,7 +394,9 @@ const modelApi = {
   // Composite model component operations
   components: {
     async list(modelId: string): Promise<ModelComponent[]> {
-      const response = await fetch(`/admin/api/v1/models/${modelId}/components`);
+      const response = await fetch(
+        `/admin/api/v1/models/${modelId}/components`,
+      );
       if (!response.ok) {
         throw new Error(`Failed to fetch model components: ${response.status}`);
       }
@@ -1094,7 +1087,8 @@ const paymentsApi = {
     if (!response.ok) {
       const errorData = await response.json().catch(() => ({}));
       throw new Error(
-        errorData.message || `Failed to create billing portal session: ${response.status}`,
+        errorData.message ||
+          `Failed to create billing portal session: ${response.status}`,
       );
     }
 

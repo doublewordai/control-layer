@@ -52,10 +52,7 @@ import {
   DialogFooter,
 } from "../../../ui/dialog";
 import { AVAILABLE_ROLES, getRoleDisplayName } from "../../../../utils/roles";
-import type {
-  Role,
-  Webhook,
-} from "../../../../api/control-layer/types";
+import type { Role, Webhook } from "../../../../api/control-layer/types";
 import { dwctlApi } from "../../../../api/control-layer/client";
 import { ApiError } from "../../../../api/control-layer/errors";
 
@@ -475,7 +472,9 @@ export const Profile: React.FC = () => {
                     </h3>
                   </TooltipTrigger>
                   <TooltipContent>
-                    <p>Display name: {currentUser?.display_name || "Not set"}</p>
+                    <p>
+                      Display name: {currentUser?.display_name || "Not set"}
+                    </p>
                   </TooltipContent>
                 </Tooltip>
                 <Tooltip>
@@ -842,7 +841,6 @@ export const Profile: React.FC = () => {
                     </p>
                   </div>
                 )}
-
               </div>
             </div>
 
@@ -988,9 +986,7 @@ export const Profile: React.FC = () => {
                                   variant="ghost"
                                   size="icon"
                                   className="h-7 w-7"
-                                  onClick={() =>
-                                    openEditWebhookDialog(webhook)
-                                  }
+                                  onClick={() => openEditWebhookDialog(webhook)}
                                   aria-label={`Edit webhook ${webhook.url}`}
                                 >
                                   <Pencil className="w-3.5 h-3.5" />
@@ -1134,9 +1130,7 @@ export const Profile: React.FC = () => {
                   />
                 </div>
                 <div>
-                  <Label className="text-sm font-medium">
-                    Event Types
-                  </Label>
+                  <Label className="text-sm font-medium">Event Types</Label>
                   <p className="text-xs text-gray-500 mt-0.5 mb-2">
                     Select at least one event to listen for.
                   </p>
@@ -1161,7 +1155,11 @@ export const Profile: React.FC = () => {
                               {option.value}
                             </code>
                           </HoverCardTrigger>
-                          <HoverCardContent side="left" align="start" className="w-72">
+                          <HoverCardContent
+                            side="left"
+                            align="start"
+                            className="w-72"
+                          >
                             <p className="text-xs font-medium text-gray-700 mb-1">
                               Example payload
                             </p>
@@ -1232,8 +1230,8 @@ export const Profile: React.FC = () => {
           <DialogHeader>
             <DialogTitle>Delete Webhook</DialogTitle>
             <DialogDescription>
-              Are you sure you want to delete this webhook? This action cannot be
-              undone.
+              Are you sure you want to delete this webhook? This action cannot
+              be undone.
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>

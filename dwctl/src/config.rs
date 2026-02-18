@@ -866,8 +866,10 @@ impl Default for FileLimitsConfig {
 pub struct BatchConfig {
     /// Enable batches API endpoints (default: true)
     pub enabled: bool,
-    /// Allowed completion windows (SLAs) for batch processing.
+    /// Allowed completion windows for batch processing.
     /// These define the maximum time from batch creation to completion.
+    /// Values are stored as time-based strings ("1h", "24h") for OpenAI API compatibility,
+    /// Accepts formatted labels ("Standard (24h)", "High (1h)") or raw time values ("24h", "1h").
     /// Default: vec!["24h".to_string()]
     pub allowed_completion_windows: Vec<String>,
     /// Allowed OpenAI-compatible URL paths for batch requests.
@@ -876,7 +878,7 @@ pub struct BatchConfig {
     /// Files configuration for batch file uploads/downloads
     pub files: FilesConfig,
     /// Default throughput (requests/second) for models without explicit throughput configured.
-    /// Used for SLA capacity calculations when accepting new batches.
+    /// Used for capacity calculations when accepting new batches.
     /// If not specified or null, defaults to 100.0 req/s. This is quite high, in favour of over-acceptance.
     /// Must be positive (> 0) when specified.
     #[serde(default = "default_batch_throughput", deserialize_with = "deserialize_positive_throughput")]
@@ -978,7 +980,7 @@ pub struct DaemonConfig {
     /// and returned to pending (milliseconds). This handles daemon crashes during execution. (default: 600000 = 10 minutes)
     pub processing_timeout_ms: u64,
 
-    /// Per-model configurations for SLA escalation via route-at-claim-time.
+    /// Per-model configurations for completion window escalation via route-at-claim-time.
     /// When a request is claimed with less than `escalation_threshold_seconds` remaining
     /// before batch expiry, it's routed to the `escalation_model` instead.
     ///

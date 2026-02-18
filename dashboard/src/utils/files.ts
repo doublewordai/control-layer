@@ -24,10 +24,13 @@ export function validateBatchFile(file: File): FileValidationResult {
   if (!file.name.toLowerCase().endsWith(".jsonl")) {
     return { isValid: false, error: "Please upload a .jsonl file" };
   }
-  
+
   if (file.size > FILE_SIZE_LIMITS.MAX_FILE_SIZE_BYTES) {
-    return { isValid: false, error: `File size exceeds ${FILE_SIZE_LIMITS.MAX_FILE_SIZE_MB}MB limit` };
+    return {
+      isValid: false,
+      error: `File size exceeds ${FILE_SIZE_LIMITS.MAX_FILE_SIZE_MB}MB limit`,
+    };
   }
-  
+
   return { isValid: true };
 }
