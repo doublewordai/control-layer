@@ -31,7 +31,6 @@ impl EmailTemplates {
             first_batch: load("first_batch.html")?,
         })
     }
-
 }
 
 pub struct EmailService {
@@ -234,6 +233,7 @@ impl EmailService {
         let base = self.base_url.trim_end_matches('/');
         let dashboard_link = format!("{base}/batches/{}", info.batch_id);
         let profile_link = format!("{base}/profile");
+        let priority = if info.completion_window == "1h" { "High" } else { "Standard" };
 
         env.get_template("email")?.render(context! {
             to_name,
@@ -252,6 +252,7 @@ impl EmailService {
             total_requests => info.total_requests,
             dashboard_link,
             profile_link,
+            priority,
             completion_window => &info.completion_window,
             filename => info.filename.as_deref().unwrap_or(""),
             description => info.description.as_deref().unwrap_or(""),
