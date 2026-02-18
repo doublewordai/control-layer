@@ -348,9 +348,14 @@ pub async fn login<P: PoolProvider>(State(state): State<AppState<P>>, Json(reque
 #[tracing::instrument(skip_all)]
 pub async fn logout<P: PoolProvider>(State(state): State<AppState<P>>) -> Result<LogoutResponse, Error> {
     // Create expired cookie to clear session
+    let secure = if state.config.auth.native.session.cookie_secure {
+        "; Secure"
+    } else {
+        ""
+    };
     let cookie = format!(
-        "{}=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0",
-        state.config.auth.native.session.cookie_name
+        "{}=; Path=/; HttpOnly{}; SameSite=Strict; Max-Age=0",
+        state.config.auth.native.session.cookie_name, secure
     );
 
     let auth_response = AuthSuccessResponse {
@@ -624,9 +629,10 @@ fn create_session_cookie(token: &str, config: &crate::config::Config) -> String 
     let session_config = &config.auth.native.session;
     let max_age = session_config.timeout.as_secs();
 
+    let secure = if session_config.cookie_secure { "; Secure" } else { "" };
     format!(
-        "{}={}; Path=/; HttpOnly; Secure={}; SameSite={}; Max-Age={}",
-        session_config.cookie_name, token, session_config.cookie_secure, session_config.cookie_same_site, max_age
+        "{}={}; Path=/; HttpOnly{}; SameSite={}; Max-Age={}",
+        session_config.cookie_name, token, secure, session_config.cookie_same_site, max_age
     )
 }
 
