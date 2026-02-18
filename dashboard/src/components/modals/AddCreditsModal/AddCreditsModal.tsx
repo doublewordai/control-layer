@@ -60,7 +60,9 @@ export function AddFundsModal({
 
       const sentAmount = Number(result.amount).toFixed(2);
 
-      toast.success(`Successfully added $${sentAmount} to ${targetUser.display_name || targetUser.email}`);
+      toast.success(
+        `Successfully added $${sentAmount} to ${targetUser.display_name || targetUser.email}`,
+      );
       onSuccess?.();
       onClose();
 
@@ -79,7 +81,8 @@ export function AddFundsModal({
         <DialogHeader>
           <DialogTitle className="text-2xl">Add to Credit Balance</DialogTitle>
           <DialogDescription>
-            You are about to add funds to <strong>{targetUser.display_name || targetUser.email}</strong>
+            You are about to add funds to{" "}
+            <strong>{targetUser.display_name || targetUser.email}</strong>
             {targetUser.display_name && ` (${targetUser.email})`}
           </DialogDescription>
         </DialogHeader>
@@ -89,7 +92,6 @@ export function AddFundsModal({
         </AlertBox>
 
         <form onSubmit={handleSubmit} className="space-y-4 mt-4">
-
           <div>
             <label
               htmlFor="amount"
@@ -134,11 +136,10 @@ export function AddFundsModal({
             >
               Cancel
             </Button>
-            <Button
-              type="submit"
-              disabled={addFundsMutation.isPending}
-            >
-              {addFundsMutation.isPending ? "Adding..." : "Add to Credit Balance"}
+            <Button type="submit" disabled={addFundsMutation.isPending}>
+              {addFundsMutation.isPending
+                ? "Adding..."
+                : "Add to Credit Balance"}
             </Button>
           </div>
         </form>

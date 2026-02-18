@@ -509,12 +509,9 @@ export const handlers = [
     },
   ),
 
-  http.delete(
-    "/admin/api/v1/users/:userId/webhooks/:webhookId",
-    () => {
-      return HttpResponse.json(null, { status: 204 });
-    },
-  ),
+  http.delete("/admin/api/v1/users/:userId/webhooks/:webhookId", () => {
+    return HttpResponse.json(null, { status: 204 });
+  }),
 
   http.post(
     "/admin/api/v1/users/:userId/webhooks/:webhookId/rotate-secret",
@@ -1025,6 +1022,10 @@ export const handlers = [
       organization: "ACME Corp",
       payment_enabled: true,
       docs_url: "https://docs.doubleword.ai/control-layer",
+      batches: {
+        enabled: true,
+        allowed_completion_windows: ["Standard (24h)", "High (1h)"],
+      },
     });
   }),
 
@@ -1434,7 +1435,10 @@ export const handlers = [
     const currentBalance = computeUserBalance(userId || "");
 
     // Apply pagination
-    const paginatedTransactions = filteredTransactions.slice(skip, skip + limit);
+    const paginatedTransactions = filteredTransactions.slice(
+      skip,
+      skip + limit,
+    );
 
     // Return new response format with page_start_balance
     return HttpResponse.json({

@@ -1,5 +1,12 @@
 import { useState, useEffect, useCallback } from "react";
-import { Upload, X, FileText, AlertCircle, ExternalLink, AlertTriangle } from "lucide-react";
+import {
+  Upload,
+  X,
+  FileText,
+  AlertCircle,
+  ExternalLink,
+  AlertTriangle,
+} from "lucide-react";
 import {
   Dialog,
   DialogContent,
@@ -11,17 +18,14 @@ import {
 import { Button } from "../../ui/button";
 import { Label } from "../../ui/label";
 import { Input } from "../../ui/input";
-import { useUploadFileWithProgress, useConfig } from "../../../api/control-layer/hooks";
+import {
+  useUploadFileWithProgress,
+  useConfig,
+} from "../../../api/control-layer/hooks";
 import { toast } from "sonner";
 import { AlertBox } from "@/components/ui/alert-box";
-import { 
-  validateBatchFile, 
-  FILE_SIZE_LIMITS 
-} from "../../../utils/files";
-import { 
-  formatBytes, 
-} from "../../../utils/formatters";
-
+import { validateBatchFile, FILE_SIZE_LIMITS } from "../../../utils/files";
+import { formatBytes } from "../../../utils/formatters";
 
 interface UploadFileModalProps {
   isOpen: boolean;
@@ -59,7 +63,7 @@ export function UploadFileModal({
     // Cap at 95% to show there's still processing happening
     const cappedPercent = Math.min(percent, 95);
     setUploadProgress(cappedPercent);
-    
+
     // If we've reached 95%, mark as processing
     if (cappedPercent >= 95) {
       setIsProcessing(true);
@@ -122,7 +126,8 @@ export function UploadFileModal({
     }
   };
 
-  const isLargeFile = file && file.size > FILE_SIZE_LIMITS.LARGE_FILE_WARNING_BYTES;
+  const isLargeFile =
+    file && file.size > FILE_SIZE_LIMITS.LARGE_FILE_WARNING_BYTES;
 
   const handleSubmit = async () => {
     if (!file) {
@@ -198,7 +203,9 @@ export function UploadFileModal({
               "JSONL file"
             )}{" "}
             to process multiple requests asynchronously.{" "}
-            <span className="font-semibold text-gray-900">Maximum file size: {FILE_SIZE_LIMITS.MAX_FILE_SIZE_MB}MB</span>
+            <span className="font-semibold text-gray-900">
+              Maximum file size: {FILE_SIZE_LIMITS.MAX_FILE_SIZE_MB}MB
+            </span>
           </DialogDescription>
         </DialogHeader>
 
@@ -272,7 +279,10 @@ export function UploadFileModal({
                 <div className="text-sm text-amber-800">
                   <p className="font-medium mb-1">Large File Detected</p>
                   <p className="text-amber-700">
-                    This file is over {FILE_SIZE_LIMITS.LARGE_FILE_WARNING_MB}MB. Large files may take a while to upload depending on your connection speed. Please be patient and keep this window open until the upload completes.
+                    This file is over {FILE_SIZE_LIMITS.LARGE_FILE_WARNING_MB}
+                    MB. Large files may take a while to upload depending on your
+                    connection speed. Please be patient and keep this window
+                    open until the upload completes.
                   </p>
                 </div>
               </div>
@@ -287,17 +297,19 @@ export function UploadFileModal({
                   {isProcessing ? "Processing on server..." : "Uploading..."}
                 </span>
                 {!isProcessing && (
-                  <span className="text-gray-900 font-medium">{uploadProgress}%</span>
+                  <span className="text-gray-900 font-medium">
+                    {uploadProgress}%
+                  </span>
                 )}
               </div>
               <div className="h-2 bg-gray-200 rounded-full overflow-hidden">
                 <div
                   className="h-full rounded-full transition-all duration-150 ease-out bg-blue-600"
-                  style={{ 
+                  style={{
                     width: `${uploadProgress}%`,
                     ...(isProcessing && {
-                      animation: 'gentlePulse 3s ease-in-out infinite'
-                    })
+                      animation: "gentlePulse 3s ease-in-out infinite",
+                    }),
                   }}
                 />
               </div>
