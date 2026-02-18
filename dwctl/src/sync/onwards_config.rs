@@ -790,6 +790,7 @@ fn convert_composite_to_target_spec(
         providers,
         response_headers: None,
         sanitize_response: composite.sanitize_responses,
+        trusted: false,
     };
 
     (composite.alias.clone(), TargetSpecOrList::Pool(pool_spec))
@@ -874,6 +875,7 @@ fn convert_to_config_file(targets: Vec<OnwardsTarget>, composites: Vec<OnwardsCo
                 weight: 1, // Default weight for single-provider targets
                 sanitize_response: target.sanitize_responses,
                 request_timeout_secs: None,
+                trusted: false,
             };
 
             (target.alias, TargetSpecOrList::Single(target_spec))
