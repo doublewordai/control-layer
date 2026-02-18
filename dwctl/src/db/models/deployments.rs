@@ -392,8 +392,8 @@ pub struct DeploymentCreateDBRequest {
     pub fallback_on_status: Option<Vec<i32>>,
     pub fallback_with_replacement: Option<bool>,
     pub fallback_max_attempts: Option<i32>,
-    /// Whether to sanitize/filter sensitive data from model responses (defaults to true)
-    #[builder(default = true)]
+    /// Whether to sanitize/filter sensitive data from model responses (defaults to false)
+    #[builder(default = false)]
     pub sanitize_responses: bool,
     /// Whether to mark provider as trusted in strict mode (bypasses sanitization)
     #[builder(default = false)]

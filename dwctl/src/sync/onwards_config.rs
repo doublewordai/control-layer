@@ -712,7 +712,7 @@ fn convert_composite_to_target_spec(
             on_rate_limit: composite.fallback_on_rate_limit,
             // Convert i32 status codes to u16 for onwards
             on_status: composite.fallback_on_status.iter().map(|&s| s as u16).collect(),
-with_replacement: composite.fallback_with_replacement,
+            with_replacement: composite.fallback_with_replacement,
             max_attempts: composite
                 .fallback_max_attempts
                 .and_then(|n| usize::try_from(n).ok().filter(|&v| v >= 1)),

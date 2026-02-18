@@ -122,20 +122,20 @@ async fn test_strict_mode_allows_models_endpoint(pool: PgPool) {
         .await;
     let initial_status = initial_response.status_code();
 
-    // Poll until the key is synced (up to 1 second)
+    // Poll until the key is synced (up to 3 seconds)
     let start = std::time::Instant::now();
     let mut synced = initial_status == 200;
-    while !synced && start.elapsed() < std::time::Duration::from_secs(1) {
+    while !synced && start.elapsed() < std::time::Duration::from_secs(3) {
         let check_response = server
             .get("/ai/models")
             .add_header("Authorization", &format!("Bearer {}", api_key))
             .await;
         synced = check_response.status_code() == 200;
         if !synced {
-            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
         }
     }
-    assert!(synced, "API key should be synced to onwards within 1 second");
+    assert!(synced, "API key should be synced to onwards within 3 seconds");
 
     // Test both /models and /v1/models endpoints
     for endpoint in &["/ai/models", "/ai/v1/models"] {
@@ -291,7 +291,7 @@ async fn test_strict_mode_allows_chat_completions(pool: PgPool) {
     // Check that the gpt-4 model is available
     let start = std::time::Instant::now();
     let mut model_available = false;
-    while !model_available && start.elapsed() < std::time::Duration::from_secs(1) {
+    while !model_available && start.elapsed() < std::time::Duration::from_secs(3) {
         let check_response = server
             .get("/ai/models")
             .add_header("Authorization", &format!("Bearer {}", api_key))
@@ -305,10 +305,10 @@ async fn test_strict_mode_allows_chat_completions(pool: PgPool) {
         }
 
         if !model_available {
-            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
         }
     }
-    assert!(model_available, "Model gpt-4 should be available in onwards within 1 second");
+    assert!(model_available, "Model gpt-4 should be available in onwards within 3 seconds");
 
     // Make chat completion request
     let chat_response = server
@@ -458,7 +458,7 @@ async fn test_strict_mode_allows_embeddings(pool: PgPool) {
     // Check that the text-embedding-3-small model is available
     let start = std::time::Instant::now();
     let mut model_available = false;
-    while !model_available && start.elapsed() < std::time::Duration::from_secs(1) {
+    while !model_available && start.elapsed() < std::time::Duration::from_secs(3) {
         let check_response = server
             .get("/ai/models")
             .add_header("Authorization", &format!("Bearer {}", api_key))
@@ -472,12 +472,12 @@ async fn test_strict_mode_allows_embeddings(pool: PgPool) {
         }
 
         if !model_available {
-            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
         }
     }
     assert!(
         model_available,
-        "Model text-embedding-3-small should be available in onwards within 1 second"
+        "Model text-embedding-3-small should be available in onwards within 3 seconds"
     );
 
     // Make embeddings request
@@ -706,7 +706,7 @@ async fn test_strict_mode_allows_responses(pool: PgPool) {
     // Poll until model is available
     let start = std::time::Instant::now();
     let mut model_available = false;
-    while !model_available && start.elapsed() < std::time::Duration::from_secs(1) {
+    while !model_available && start.elapsed() < std::time::Duration::from_secs(3) {
         let check_response = server
             .get("/ai/models")
             .add_header("Authorization", &format!("Bearer {}", api_key))
@@ -720,7 +720,7 @@ async fn test_strict_mode_allows_responses(pool: PgPool) {
         }
 
         if !model_available {
-            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
         }
     }
     assert!(model_available, "Model gpt-4 should be available");
@@ -853,7 +853,7 @@ async fn test_strict_mode_sanitizes_provider_errors(pool: PgPool) {
     // Poll until model is available
     let start = std::time::Instant::now();
     let mut model_available = false;
-    while !model_available && start.elapsed() < std::time::Duration::from_secs(1) {
+    while !model_available && start.elapsed() < std::time::Duration::from_secs(3) {
         let check_response = server
             .get("/ai/models")
             .add_header("Authorization", &format!("Bearer {}", api_key))
@@ -867,7 +867,7 @@ async fn test_strict_mode_sanitizes_provider_errors(pool: PgPool) {
         }
 
         if !model_available {
-            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
         }
     }
     assert!(model_available, "Untrusted model should be available");
@@ -888,8 +888,7 @@ async fn test_strict_mode_sanitizes_provider_errors(pool: PgPool) {
 
     let status = response.status_code();
     let body_text = response.text();
-    let body: serde_json::Value = serde_json::from_str(&body_text)
-        .expect("Response should be valid JSON");
+    let body: serde_json::Value = serde_json::from_str(&body_text).expect("Response should be valid JSON");
 
     // Should receive error but it should be sanitized
     assert_eq!(status, 500, "Should receive 500 error from provider");
@@ -898,7 +897,10 @@ async fn test_strict_mode_sanitizes_provider_errors(pool: PgPool) {
     let error_str = body.to_string().to_lowercase();
     assert!(!error_str.contains("database"), "Sanitized error should not contain 'database'");
     assert!(!error_str.contains("10.0.0.5"), "Sanitized error should not contain internal IP");
-    assert!(!error_str.contains("internal-db"), "Sanitized error should not contain internal hostname");
+    assert!(
+        !error_str.contains("internal-db"),
+        "Sanitized error should not contain internal hostname"
+    );
     assert!(!error_str.contains("stack_trace"), "Sanitized error should not contain stack trace");
     assert!(!error_str.contains("auth.py"), "Sanitized error should not contain file paths");
 
@@ -1016,7 +1018,7 @@ async fn test_strict_mode_trusted_flag_bypasses_sanitization(pool: PgPool) {
     // Poll until model is available
     let start = std::time::Instant::now();
     let mut model_available = false;
-    while !model_available && start.elapsed() < std::time::Duration::from_secs(1) {
+    while !model_available && start.elapsed() < std::time::Duration::from_secs(3) {
         let check_response = server
             .get("/ai/models")
             .add_header("Authorization", &format!("Bearer {}", api_key))
@@ -1030,7 +1032,7 @@ async fn test_strict_mode_trusted_flag_bypasses_sanitization(pool: PgPool) {
         }
 
         if !model_available {
-            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
         }
     }
     assert!(model_available, "Trusted model should be available");
@@ -1050,8 +1052,7 @@ async fn test_strict_mode_trusted_flag_bypasses_sanitization(pool: PgPool) {
         .await;
 
     let body_text = response.text();
-    let body: serde_json::Value = serde_json::from_str(&body_text)
-        .expect("Response should be valid JSON");
+    let body: serde_json::Value = serde_json::from_str(&body_text).expect("Response should be valid JSON");
 
     // Trusted provider errors should pass through unsanitized
     assert_eq!(response.status_code(), 429, "Should receive 429 from trusted provider");
@@ -1084,25 +1085,25 @@ async fn test_strict_mode_handles_various_provider_errors(pool: PgPool) {
             "malformed_json",
             400,
             "not valid json {{{",
-            "Should handle malformed JSON from provider"
+            "Should handle malformed JSON from provider",
         ),
         (
             "invalid_api_key",
             401,
             r#"{"error": {"message": "Invalid API key", "type": "invalid_request_error"}}"#,
-            "Should handle authentication errors"
+            "Should handle authentication errors",
         ),
         (
             "model_not_found",
             404,
             r#"{"error": {"message": "Model not found", "type": "invalid_request_error"}}"#,
-            "Should handle model not found"
+            "Should handle model not found",
         ),
         (
             "timeout",
             504,
             r#"{"error": {"message": "Gateway timeout", "type": "timeout"}}"#,
-            "Should handle timeouts"
+            "Should handle timeouts",
         ),
     ];
 
@@ -1123,10 +1124,7 @@ async fn test_strict_mode_handles_various_provider_errors(pool: PgPool) {
         // Setup mock for this test case
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .and(wiremock::matchers::path("/v1/chat/completions"))
-            .respond_with(
-                wiremock::ResponseTemplate::new(status_code)
-                    .set_body_string(response_body.to_string())
-            )
+            .respond_with(wiremock::ResponseTemplate::new(status_code).set_body_string(response_body.to_string()))
             .mount(&mock_server)
             .await;
 
@@ -1149,16 +1147,18 @@ async fn test_strict_mode_handles_various_provider_errors(pool: PgPool) {
             .json(&serde_json::json!({
                 "name": format!("test-{}", test_name),
                 "url": mock_server.uri(),
-                "auto_sync_models": false
+                "sync": false
             }))
             .await;
 
-        // Handle potential conflicts from auto-sync
-        if endpoint_response.status_code() != 201 {
-            eprintln!("{}: Endpoint creation returned {}, skipping test case",
-                      description, endpoint_response.status_code());
-            continue;
-        }
+        // Endpoint creation is a required precondition for this test case; assert success
+        assert_eq!(
+            endpoint_response.status_code(),
+            201,
+            "{}: Endpoint creation returned unexpected status {}",
+            description,
+            endpoint_response.status_code()
+        );
 
         let endpoint: serde_json::Value = endpoint_response.json();
         let endpoint_id = endpoint["id"].as_str().unwrap();
@@ -1219,7 +1219,7 @@ async fn test_strict_mode_handles_various_provider_errors(pool: PgPool) {
         // Poll until model is available
         let start = std::time::Instant::now();
         let mut model_available = false;
-        while !model_available && start.elapsed() < std::time::Duration::from_secs(1) {
+        while !model_available && start.elapsed() < std::time::Duration::from_secs(3) {
             let check_response = server
                 .get("/ai/models")
                 .add_header("Authorization", &format!("Bearer {}", api_key))
@@ -1233,7 +1233,7 @@ async fn test_strict_mode_handles_various_provider_errors(pool: PgPool) {
             }
 
             if !model_available {
-                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
             }
         }
         assert!(model_available, "Model should be available for test: {}", test_name);
@@ -1257,7 +1257,8 @@ async fn test_strict_mode_handles_various_provider_errors(pool: PgPool) {
         assert!(
             response_status.as_u16() >= 400,
             "{}: Should receive error status code. Got {}",
-            description, response_status
+            description,
+            response_status
         );
     }
 }

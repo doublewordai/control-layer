@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        UPDATE deployed_models SET\n            model_name   = COALESCE($2, model_name),\n            alias        = COALESCE($3, alias),\n            description  = CASE\n                WHEN $4 THEN $5\n                ELSE description\n            END,\n\n            -- Three-state update for model_type\n            type = CASE\n                WHEN $6 THEN $7\n                ELSE type\n            END,\n\n            -- Three-state update for capabilities\n            capabilities = CASE\n                WHEN $8 THEN $9\n                ELSE capabilities\n            END,\n\n            status     = COALESCE($10, status),\n            last_sync  = CASE\n                WHEN $11 THEN $12\n                ELSE last_sync\n            END,\n            deleted    = COALESCE($13, deleted),\n\n            -- Three-state update for rate limiting\n            requests_per_second = CASE\n                WHEN $14 THEN $15\n                ELSE requests_per_second\n            END,\n            burst_size = CASE\n                WHEN $16 THEN $17\n                ELSE burst_size\n            END,\n\n            -- Three-state update for capacity\n            capacity = CASE\n                WHEN $18 THEN $19\n                ELSE capacity\n            END,\n            batch_capacity = CASE\n                WHEN $20 THEN $21\n                ELSE batch_capacity\n            END,\n\n            -- Three-state update for throughput\n            throughput = CASE\n                WHEN $37 THEN $38\n                ELSE throughput\n            END,\n\n            -- Individual field updates for provider/downstream pricing\n            downstream_pricing_mode = CASE\n                WHEN $22 THEN $23\n                ELSE downstream_pricing_mode\n            END,\n            downstream_input_price_per_token = CASE\n                WHEN $24 THEN $25\n                ELSE downstream_input_price_per_token\n            END,\n            downstream_output_price_per_token = CASE\n                WHEN $26 THEN $27\n                ELSE downstream_output_price_per_token\n            END,\n            downstream_hourly_rate = CASE\n                WHEN $28 THEN $29\n                ELSE downstream_hourly_rate\n            END,\n            downstream_input_token_cost_ratio = CASE\n                WHEN $30 THEN $31\n                ELSE downstream_input_token_cost_ratio\n            END,\n\n            -- Composite model fields\n            lb_strategy = COALESCE($32, lb_strategy),\n            fallback_enabled = COALESCE($33, fallback_enabled),\n            fallback_on_rate_limit = COALESCE($34, fallback_on_rate_limit),\n            fallback_on_status = COALESCE($35, fallback_on_status),\n            sanitize_responses = COALESCE($36, sanitize_responses),\n            fallback_with_replacement = COALESCE($39, fallback_with_replacement),\n            fallback_max_attempts = CASE\n                WHEN $40 THEN $41\n                ELSE fallback_max_attempts\n            END,\n\n            updated_at = NOW()\n        WHERE id = $1\n        RETURNING *\n        ",
+  "query": "\n            INSERT INTO deployed_models (\n                model_name, alias, description, type, capabilities, created_by, hosted_on, created_at, updated_at,\n                requests_per_second, burst_size, capacity, batch_capacity, throughput,\n                downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token,\n                downstream_hourly_rate, downstream_input_token_cost_ratio,\n                is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status,\n                fallback_with_replacement, fallback_max_attempts,\n                sanitize_responses, trusted\n            )\n            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28)\n            RETURNING *\n            ",
   "describe": {
     "columns": [
       {
@@ -157,51 +157,43 @@
         "ordinal": 30,
         "name": "fallback_max_attempts",
         "type_info": "Int4"
+      },
+      {
+        "ordinal": 31,
+        "name": "trusted",
+        "type_info": "Bool"
       }
     ],
     "parameters": {
       "Left": [
-        "Uuid",
         "Varchar",
         "Varchar",
-        "Bool",
         "Text",
-        "Bool",
         "Varchar",
-        "Bool",
         "TextArray",
-        "Varchar",
-        "Bool",
+        "Uuid",
+        "Uuid",
         "Timestamptz",
-        "Bool",
-        "Bool",
+        "Timestamptz",
         "Float4",
-        "Bool",
         "Int4",
-        "Bool",
         "Int4",
-        "Bool",
         "Int4",
-        "Bool",
+        "Float4",
         "Varchar",
-        "Bool",
+        "Numeric",
+        "Numeric",
+        "Numeric",
         "Numeric",
         "Bool",
-        "Numeric",
-        "Bool",
-        "Numeric",
-        "Bool",
-        "Numeric",
         "Varchar",
         "Bool",
         "Bool",
         "Int4Array",
         "Bool",
+        "Int4",
         "Bool",
-        "Float4",
-        "Bool",
-        "Bool",
-        "Int4"
+        "Bool"
       ]
     },
     "nullable": [
@@ -235,8 +227,9 @@
       false,
       true,
       true,
-      true
+      true,
+      false
     ]
   },
-  "hash": "51cffaba3eaa046a5472746436a82cb8da50e558cce928950905288ff8fca0a6"
+  "hash": "72d530ad8f618c079abb80d7ced708ad90dd15cda5d99bcbe6f82e169f356378"
 }

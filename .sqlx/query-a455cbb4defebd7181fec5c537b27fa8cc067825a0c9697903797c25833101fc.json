@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, model_name, alias, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_with_replacement, fallback_max_attempts, sanitize_responses FROM deployed_models WHERE id = $1",
+  "query": "SELECT id, model_name, alias, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_with_replacement, fallback_max_attempts, sanitize_responses, trusted FROM deployed_models WHERE id = ANY($1)",
   "describe": {
     "columns": [
       {
@@ -157,11 +157,16 @@
         "ordinal": 30,
         "name": "sanitize_responses",
         "type_info": "Bool"
+      },
+      {
+        "ordinal": 31,
+        "name": "trusted",
+        "type_info": "Bool"
       }
     ],
     "parameters": {
       "Left": [
-        "Uuid"
+        "UuidArray"
       ]
     },
     "nullable": [
@@ -195,8 +200,9 @@
       true,
       true,
       true,
+      false,
       false
     ]
   },
-  "hash": "a345c860c5f14133ba818df9da8dd041094bf2fecf7db38a201ab1c56da73bc9"
+  "hash": "a455cbb4defebd7181fec5c537b27fa8cc067825a0c9697903797c25833101fc"
 }
