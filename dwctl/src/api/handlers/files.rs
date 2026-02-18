@@ -2051,7 +2051,7 @@ mod tests {
         let mut conn = pool.acquire().await.unwrap();
         let mut tariffs_repo = Tariffs::new(&mut conn);
 
-        // Create batch tariff for 24h SLA (standard pricing)
+        // Create batch tariff for 24h priority (standard pricing)
         tariffs_repo
             .create(&TariffCreateDBRequest {
                 deployed_model_id: deployment.id,
@@ -2065,7 +2065,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Create batch tariff for 1h SLA (higher pricing for faster turnaround)
+        // Create batch tariff for 1h priority (higher pricing for faster turnaround)
         tariffs_repo
             .create(&TariffCreateDBRequest {
                 deployed_model_id: deployment.id,
@@ -2102,7 +2102,7 @@ mod tests {
         let file: FileResponse = upload_response.json();
         let file_id = file.id;
 
-        // Get cost estimate with default (24h) SLA
+        // Get cost estimate with default (24h) priority
         let estimate_24h_response = app
             .get(&format!("/ai/v1/files/{}/cost-estimate", file_id))
             .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
@@ -2112,7 +2112,7 @@ mod tests {
         estimate_24h_response.assert_status(axum::http::StatusCode::OK);
         let estimate_24h: crate::api::models::files::FileCostEstimate = estimate_24h_response.json();
 
-        // Get cost estimate with 1h SLA
+        // Get cost estimate with 1h priority
         let estimate_1h_response = app
             .get(&format!("/ai/v1/files/{}/cost-estimate?completion_window=1h", file_id))
             .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
@@ -2129,18 +2129,18 @@ mod tests {
             estimate_1h.total_estimated_output_tokens
         );
 
-        // Verify 1h SLA costs more than 24h SLA (should be 2x)
+        // Verify 1h priority costs more than 24h priority (should be 2x)
         let cost_24h = Decimal::from_str(&estimate_24h.total_estimated_cost).unwrap();
         let cost_1h = Decimal::from_str(&estimate_1h.total_estimated_cost).unwrap();
 
-        assert!(cost_1h > cost_24h, "1h SLA should cost more than 24h SLA");
-        assert!(cost_24h > Decimal::ZERO, "24h SLA cost should be greater than zero");
+        assert!(cost_1h > cost_24h, "1h priority should cost more than 24h priority");
+        assert!(cost_24h > Decimal::ZERO, "24h priority cost should be greater than zero");
 
         // Verify the ratio is approximately 2x (allowing for rounding)
         let ratio = cost_1h / cost_24h;
         assert!(
             ratio > Decimal::from_str("1.9").unwrap() && ratio < Decimal::from_str("2.1").unwrap(),
-            "1h SLA should be approximately 2x the cost of 24h SLA, got ratio: {}",
+            "1h priority should be approximately 2x the cost of 24h priority, got ratio: {}",
             ratio
         );
     }

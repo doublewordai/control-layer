@@ -353,15 +353,23 @@ pub async fn create_deployed_model<P: PoolProvider>(
 
     // Create tariffs if provided
     if let Some(tariff_defs) = tariffs {
+        use crate::api::models::completion_window::normalize_completion_window;
+
         let mut tariffs_repo = Tariffs::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
         for tariff_def in tariff_defs {
+            // Normalize completion_window using shared utility
+            let completion_window = match tariff_def.completion_window {
+                Some(w) => Some(normalize_completion_window(&w)?),
+                None => None,
+            };
+
             let tariff_request = TariffCreateDBRequest {
                 deployed_model_id: model.id,
                 name: tariff_def.name,
                 input_price_per_token: tariff_def.input_price_per_token,
                 output_price_per_token: tariff_def.output_price_per_token,
                 api_key_purpose: tariff_def.api_key_purpose,
-                completion_window: tariff_def.completion_window,
+                completion_window,
                 valid_from: None, // Use NOW()
             };
             tariffs_repo.create(&tariff_request).await?;
@@ -450,11 +458,16 @@ pub async fn update_deployed_model<P: PoolProvider>(
         // Helper function to check if a tariff matches the definition
         let tariff_matches = |existing: &crate::db::models::tariffs::ModelTariff,
                               def: &crate::api::models::deployments::TariffDefinition| {
+            use crate::api::models::completion_window::normalize_completion_window;
+
+            // Normalize def's completion_window for comparison
+            let normalized_def_window = def.completion_window.as_ref().and_then(|w| normalize_completion_window(w).ok());
+
             existing.name == def.name
                 && existing.input_price_per_token == def.input_price_per_token
                 && existing.output_price_per_token == def.output_price_per_token
                 && existing.api_key_purpose == def.api_key_purpose
-                && existing.completion_window == def.completion_window
+                && existing.completion_window == normalized_def_window
         };
 
         // Collect IDs of tariffs to close (those not in the new set or have changed)
@@ -471,10 +484,18 @@ pub async fn update_deployed_model<P: PoolProvider>(
 
         // Create new or changed tariffs (skip those that already exist unchanged)
         for tariff_def in tariff_defs {
+            use crate::api::models::completion_window::normalize_completion_window;
+
             // Skip if this tariff already exists with the same values
             if current_tariffs.iter().any(|existing| tariff_matches(existing, &tariff_def)) {
                 continue;
             }
+
+            // Normalize completion_window using shared utility
+            let completion_window = match tariff_def.completion_window {
+                Some(w) => Some(normalize_completion_window(&w)?),
+                None => None,
+            };
 
             let tariff_request = TariffCreateDBRequest {
                 deployed_model_id: deployment_id,
@@ -482,7 +503,7 @@ pub async fn update_deployed_model<P: PoolProvider>(
                 input_price_per_token: tariff_def.input_price_per_token,
                 output_price_per_token: tariff_def.output_price_per_token,
                 api_key_purpose: tariff_def.api_key_purpose,
-                completion_window: tariff_def.completion_window,
+                completion_window,
                 valid_from: None, // Use NOW()
             };
             tariffs_repo.create(&tariff_request).await?;

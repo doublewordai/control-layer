@@ -161,90 +161,102 @@ const ProviderRow: React.FC<{
               : "bg-gray-50 border-gray-200 opacity-60"
           }`}
         >
-        <div className="flex items-center gap-4 min-w-0 flex-1 overflow-hidden">
-          <div className="min-w-0 flex-1 overflow-hidden">
-            <div className="flex items-center gap-2 min-w-0">
-              <p className="font-medium text-gray-900 truncate min-w-0 flex-shrink">
-                {component.model.alias}
-              </p>
-              {isPriorityMode && priorityIndex === 1 && component.enabled && (
-                <Badge variant="outline" className="text-xs text-blue-600 border-blue-200 bg-blue-50 shrink-0">
-                  Primary
-                </Badge>
-              )}
-              {!component.enabled && (
-                <Badge variant="outline" className="text-xs text-gray-500 shrink-0">
-                  Disabled
-                </Badge>
+          <div className="flex items-center gap-4 min-w-0 flex-1 overflow-hidden">
+            <div className="min-w-0 flex-1 overflow-hidden">
+              <div className="flex items-center gap-2 min-w-0">
+                <p className="font-medium text-gray-900 truncate min-w-0 flex-shrink">
+                  {component.model.alias}
+                </p>
+                {isPriorityMode && priorityIndex === 1 && component.enabled && (
+                  <Badge
+                    variant="outline"
+                    className="text-xs text-blue-600 border-blue-200 bg-blue-50 shrink-0"
+                  >
+                    Primary
+                  </Badge>
+                )}
+                {!component.enabled && (
+                  <Badge
+                    variant="outline"
+                    className="text-xs text-gray-500 shrink-0"
+                  >
+                    Disabled
+                  </Badge>
+                )}
+              </div>
+              {component.model.endpoint?.name && (
+                <div className="flex items-center gap-1 mt-0.5 min-w-0">
+                  <Server className="h-3 w-3 text-gray-400 shrink-0" />
+                  <p className="text-sm text-gray-500 truncate min-w-0">
+                    {component.model.endpoint.name}
+                  </p>
+                </div>
               )}
             </div>
-            {component.model.endpoint?.name && (
-              <div className="flex items-center gap-1 mt-0.5 min-w-0">
-                <Server className="h-3 w-3 text-gray-400 shrink-0" />
-                <p className="text-sm text-gray-500 truncate min-w-0">
-                  {component.model.endpoint.name}
-                </p>
+
+            {/* Weight display - only for weighted mode */}
+            {!isPriorityMode && (
+              <div className="flex items-center gap-3 shrink-0">
+                <div className="text-right">
+                  <p className="font-medium text-gray-900">
+                    {component.weight}
+                  </p>
+                  <p className="text-xs text-gray-500">{percentage}%</p>
+                </div>
+                <div className="w-20 h-2 bg-gray-200 rounded-full overflow-hidden">
+                  <div
+                    className="h-full bg-blue-500 rounded-full transition-all duration-300"
+                    style={{ width: `${percentage}%` }}
+                  />
+                </div>
               </div>
             )}
           </div>
 
-          {/* Weight display - only for weighted mode */}
-          {!isPriorityMode && (
-            <div className="flex items-center gap-3 shrink-0">
-              <div className="text-right">
-                <p className="font-medium text-gray-900">{component.weight}</p>
-                <p className="text-xs text-gray-500">{percentage}%</p>
-              </div>
-              <div className="w-20 h-2 bg-gray-200 rounded-full overflow-hidden">
-                <div
-                  className="h-full bg-blue-500 rounded-full transition-all duration-300"
-                  style={{ width: `${percentage}%` }}
-                />
-              </div>
-            </div>
-          )}
-        </div>
-
-        {canManage && (
-          <div className="flex items-center gap-1 ml-4">
-            <Button
-              variant="ghost"
-              size="icon"
-              onClick={onToggle}
-              disabled={isUpdating}
-              className="h-8 w-8"
-              title={component.enabled ? "Disable hosted model" : "Enable hosted model"}
-            >
-              {component.enabled ? (
-                <ToggleRight className="h-4 w-4 text-green-600" />
-              ) : (
-                <ToggleLeft className="h-4 w-4 text-gray-400" />
-              )}
-            </Button>
-            {!isPriorityMode && (
+          {canManage && (
+            <div className="flex items-center gap-1 ml-4">
               <Button
                 variant="ghost"
                 size="icon"
-                onClick={onEdit}
+                onClick={onToggle}
                 disabled={isUpdating}
                 className="h-8 w-8"
-                title="Edit weight"
+                title={
+                  component.enabled
+                    ? "Disable hosted model"
+                    : "Enable hosted model"
+                }
               >
-                <Edit className="h-4 w-4" />
+                {component.enabled ? (
+                  <ToggleRight className="h-4 w-4 text-green-600" />
+                ) : (
+                  <ToggleLeft className="h-4 w-4 text-gray-400" />
+                )}
               </Button>
-            )}
-            <Button
-              variant="ghost"
-              size="icon"
-              onClick={onRemove}
-              disabled={isUpdating}
-              className="h-8 w-8 text-red-600 hover:text-red-700 hover:bg-red-50"
-              title="Remove hosted model"
-            >
-              <Trash2 className="h-4 w-4" />
-            </Button>
-          </div>
-        )}
+              {!isPriorityMode && (
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  onClick={onEdit}
+                  disabled={isUpdating}
+                  className="h-8 w-8"
+                  title="Edit weight"
+                >
+                  <Edit className="h-4 w-4" />
+                </Button>
+              )}
+              <Button
+                variant="ghost"
+                size="icon"
+                onClick={onRemove}
+                disabled={isUpdating}
+                className="h-8 w-8 text-red-600 hover:text-red-700 hover:bg-red-50"
+                title="Remove hosted model"
+              >
+                <Trash2 className="h-4 w-4" />
+              </Button>
+            </div>
+          )}
         </div>
       </div>
 
@@ -420,8 +432,8 @@ const AddProviderModal: React.FC<{
                   </HoverCardTrigger>
                   <HoverCardContent className="w-64" sideOffset={5}>
                     <p className="text-sm text-muted-foreground">
-                      Weight determines the proportion of traffic this hosted model
-                      receives relative to others.
+                      Weight determines the proportion of traffic this hosted
+                      model receives relative to others.
                     </p>
                   </HoverCardContent>
                 </HoverCard>
@@ -527,8 +539,8 @@ const EditWeightModal: React.FC<{
                 </HoverCardTrigger>
                 <HoverCardContent className="w-64" sideOffset={5}>
                   <p className="text-sm text-muted-foreground">
-                    Weight determines the proportion of traffic this hosted model
-                    receives relative to others.
+                    Weight determines the proportion of traffic this hosted
+                    model receives relative to others.
                   </p>
                 </HoverCardContent>
               </HoverCard>
@@ -587,9 +599,7 @@ const ConfirmRemoveDialog: React.FC<{
           <DialogTitle>Remove Hosted Model</DialogTitle>
           <DialogDescription>
             Are you sure you want to remove{" "}
-            <strong>
-              {component?.model.alias || component?.model.id}
-            </strong>{" "}
+            <strong>{component?.model.alias || component?.model.id}</strong>{" "}
             from this virtual model?
           </DialogDescription>
         </DialogHeader>
@@ -625,19 +635,19 @@ const EditRoutingModal: React.FC<{
   model: Model;
 }> = ({ open, onClose, model }) => {
   const [strategy, setStrategy] = useState<LoadBalancingStrategy>(
-    model.lb_strategy || "weighted_random"
+    model.lb_strategy || "weighted_random",
   );
   const [fallbackEnabled, setFallbackEnabled] = useState(
-    model.fallback?.enabled ?? false
+    model.fallback?.enabled ?? false,
   );
   const [fallbackOnRateLimit, setFallbackOnRateLimit] = useState(
-    model.fallback?.on_rate_limit ?? false
+    model.fallback?.on_rate_limit ?? false,
   );
   const [fallbackOn429, setFallbackOn429] = useState(
-    model.fallback?.on_status?.includes(429) ?? false
+    model.fallback?.on_status?.includes(429) ?? false,
   );
   const [fallbackOn5xx, setFallbackOn5xx] = useState(
-    model.fallback?.on_status?.some((s) => s >= 500 && s < 600) ?? false
+    model.fallback?.on_status?.some((s) => s >= 500 && s < 600) ?? false,
   );
   const [withReplacement, setWithReplacement] = useState(
     model.fallback?.with_replacement ?? false
@@ -655,7 +665,7 @@ const EditRoutingModal: React.FC<{
     setFallbackOnRateLimit(model.fallback?.on_rate_limit ?? false);
     setFallbackOn429(model.fallback?.on_status?.includes(429) ?? false);
     setFallbackOn5xx(
-      model.fallback?.on_status?.some((s) => s >= 500 && s < 600) ?? false
+      model.fallback?.on_status?.some((s) => s >= 500 && s < 600) ?? false,
     );
     setWithReplacement(model.fallback?.with_replacement ?? false);
     setMaxAttempts(model.fallback?.max_attempts ?? null);
@@ -702,7 +712,9 @@ const EditRoutingModal: React.FC<{
         <div className="space-y-6 py-4">
           {/* Load Balancing Strategy */}
           <div className="space-y-3">
-            <Label className="text-sm font-medium">Load Balancing Strategy</Label>
+            <Label className="text-sm font-medium">
+              Load Balancing Strategy
+            </Label>
             <Select
               value={strategy}
               onValueChange={(v) => setStrategy(v as LoadBalancingStrategy)}
@@ -736,7 +748,9 @@ const EditRoutingModal: React.FC<{
           <div className="space-y-4">
             <div className="flex items-center justify-between">
               <div>
-                <Label className="text-sm font-medium">Automatic Failover</Label>
+                <Label className="text-sm font-medium">
+                  Automatic Failover
+                </Label>
                 <p className="text-xs text-gray-500">
                   {strategy === "priority"
                     ? "Try next hosted model in order on failure"
@@ -760,7 +774,8 @@ const EditRoutingModal: React.FC<{
                   <div>
                     <Label className="text-sm">Gateway rate limit</Label>
                     <p className="text-xs text-gray-500">
-                      When this hosted model's RPS or concurrency limits are exceeded
+                      When this hosted model's RPS or concurrency limits are
+                      exceeded
                     </p>
                   </div>
                   <Switch
@@ -891,10 +906,7 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
   const isPriorityMode = model.lb_strategy === "priority";
 
   const totalWeight =
-    components?.reduce(
-      (sum, c) => (c.enabled ? sum + c.weight : sum),
-      0,
-    ) || 0;
+    components?.reduce((sum, c) => (c.enabled ? sum + c.weight : sum), 0) || 0;
 
   // Sort components by sort_order asc for priority mode display
   const sortedComponents = React.useMemo(() => {
@@ -914,19 +926,24 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
     }),
     useSensor(KeyboardSensor, {
       coordinateGetter: sortableKeyboardCoordinates,
-    })
+    }),
   );
 
   // Handle drag end - update sort_order to reflect new order
   const handleDragEnd = async (event: DragEndEvent) => {
     const { active, over } = event;
 
-    if (!over || active.id === over.id || !sortedComponents.length || !components) {
+    if (
+      !over ||
+      active.id === over.id ||
+      !sortedComponents.length ||
+      !components
+    ) {
       return;
     }
 
     const oldIndex = sortedComponents.findIndex(
-      (c) => c.model.id === active.id
+      (c) => c.model.id === active.id,
     );
     const newIndex = sortedComponents.findIndex((c) => c.model.id === over.id);
 
@@ -944,11 +961,14 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
 
     // Optimistically update the cache immediately for smooth UX
     const queryKey = queryKeys.models.components(model.id);
-    const previousComponents = queryClient.getQueryData<ModelComponent[]>(queryKey);
+    const previousComponents =
+      queryClient.getQueryData<ModelComponent[]>(queryKey);
 
     // Create optimistically updated components with new sort_order
     const optimisticComponents = components.map((component) => {
-      const update = updates.find((u) => u.componentModelId === component.model.id);
+      const update = updates.find(
+        (u) => u.componentModelId === component.model.id,
+      );
       if (update) {
         return { ...component, sort_order: update.newSortOrder };
       }
@@ -963,10 +983,13 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
     try {
       for (const update of updates) {
         const currentComponent = previousComponents?.find(
-          (c) => c.model.id === update.componentModelId
+          (c) => c.model.id === update.componentModelId,
         );
         // Only update if sort_order actually changed
-        if (currentComponent && currentComponent.sort_order !== update.newSortOrder) {
+        if (
+          currentComponent &&
+          currentComponent.sort_order !== update.newSortOrder
+        ) {
           await updateComponentMutation.mutateAsync({
             modelId: model.id,
             componentModelId: update.componentModelId,
@@ -1053,8 +1076,10 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
     }
     if (model.fallback.on_status && model.fallback.on_status.length > 0) {
       const has429 = model.fallback.on_status.includes(429);
-      const serverErrors = model.fallback.on_status.filter(s => s >= 500);
-      const otherErrors = model.fallback.on_status.filter(s => s < 500 && s !== 429);
+      const serverErrors = model.fallback.on_status.filter((s) => s >= 500);
+      const otherErrors = model.fallback.on_status.filter(
+        (s) => s < 500 && s !== 429,
+      );
       // Upstream 429 = when the provider returns rate limit errors
       if (has429) {
         fallbackTriggers.push("Provider rate limit (429)");
@@ -1082,7 +1107,9 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
                   ) : (
                     <Shuffle className="h-5 w-5" />
                   )}
-                  {isPriorityMode ? "Priority Failover" : "Weighted Distribution"}
+                  {isPriorityMode
+                    ? "Priority Failover"
+                    : "Weighted Distribution"}
                 </CardTitle>
                 <CardDescription className="line-clamp-2">
                   {isPriorityMode
@@ -1109,7 +1136,9 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
               <div className="p-4 bg-gray-50 rounded-lg">
                 <div className="flex items-center gap-2 mb-2">
                   <GitMerge className="h-4 w-4 text-gray-500" />
-                  <p className="text-sm font-medium text-gray-700">Automatic Failover</p>
+                  <p className="text-sm font-medium text-gray-700">
+                    Automatic Failover
+                  </p>
                   <HoverCard openDelay={100} closeDelay={50}>
                     <HoverCardTrigger asChild>
                       <Info className="h-3 w-3 text-gray-400 hover:text-gray-600 cursor-help" />
@@ -1117,19 +1146,24 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
                     <HoverCardContent className="w-80" sideOffset={5}>
                       <div className="space-y-2 text-sm text-muted-foreground">
                         <p>
-                          When enabled, failed requests automatically failover to another hosted model.
+                          When enabled, failed requests automatically failover
+                          to another hosted model.
                           {isPriorityMode
                             ? " In priority mode, this means trying the next hosted model in order."
                             : " In weighted mode, this means resampling from the remaining hosted models."}
                         </p>
                         <p>
-                          <strong>Gateway rate limit:</strong> The hosted model's configured RPS or concurrency limits were exceeded.
+                          <strong>Gateway rate limit:</strong> The hosted
+                          model's configured RPS or concurrency limits were
+                          exceeded.
                         </p>
                         <p>
-                          <strong>Provider rate limit (429):</strong> The upstream provider returned a rate limit error.
+                          <strong>Provider rate limit (429):</strong> The
+                          upstream provider returned a rate limit error.
                         </p>
                         <p>
-                          <strong>Server errors (5xx):</strong> The upstream provider returned a server error.
+                          <strong>Server errors (5xx):</strong> The upstream
+                          provider returned a server error.
                         </p>
                       </div>
                     </HoverCardContent>
@@ -1146,7 +1180,9 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
                     </Badge>
                     {fallbackTriggers.length > 0 && (
                       <div className="text-sm text-gray-600 space-y-1 mt-2">
-                        <p className="text-xs text-gray-500 uppercase tracking-wide">Failover on:</p>
+                        <p className="text-xs text-gray-500 uppercase tracking-wide">
+                          Failover on:
+                        </p>
                         {fallbackTriggers.map((trigger, i) => (
                           <p key={i} className="flex items-center gap-2">
                             <span className="w-1.5 h-1.5 rounded-full bg-gray-400" />
@@ -1188,7 +1224,8 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
                   {isPriorityMode ? "Hosted Model Priority" : "Hosted Models"}
                 </CardTitle>
                 <CardDescription>
-                  {sortedComponents.length} hosted model{sortedComponents.length !== 1 ? "s" : ""}{" "}
+                  {sortedComponents.length} hosted model
+                  {sortedComponents.length !== 1 ? "s" : ""}{" "}
                   {isPriorityMode
                     ? `in failover order${canManage ? " — drag to reorder" : ""}`
                     : "configured"}
@@ -1210,7 +1247,9 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
             {!components || components.length === 0 ? (
               <div className="text-center py-8">
                 <GitMerge className="h-12 w-12 text-gray-300 mx-auto mb-3" />
-                <p className="text-gray-500 mb-4">No hosted models configured</p>
+                <p className="text-gray-500 mb-4">
+                  No hosted models configured
+                </p>
                 {canManage && (
                   <Button
                     variant="outline"
@@ -1251,7 +1290,8 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
                         onToggle={() => handleToggle(component)}
                         canManage={canManage}
                         isUpdating={
-                          updateComponentMutation.isPending || removeMutation.isPending
+                          updateComponentMutation.isPending ||
+                          removeMutation.isPending
                         }
                         isAnyDragging={isAnyDragging}
                       />
@@ -1274,7 +1314,8 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
                     onToggle={() => handleToggle(component)}
                     canManage={canManage}
                     isUpdating={
-                      updateComponentMutation.isPending || removeMutation.isPending
+                      updateComponentMutation.isPending ||
+                      removeMutation.isPending
                     }
                   />
                 ))}
@@ -1289,9 +1330,7 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
         open={showAddModal}
         onClose={() => setShowAddModal(false)}
         modelId={model.id}
-        existingComponentIds={
-          components?.map((c) => c.model.id) || []
-        }
+        existingComponentIds={components?.map((c) => c.model.id) || []}
         isPriorityMode={isPriorityMode}
       />
 

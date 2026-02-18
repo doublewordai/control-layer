@@ -103,7 +103,7 @@ pub struct HttpAnalyticsRow {
     pub custom_id: Option<String>,
     /// Request origin: "api", "frontend", or "fusillade"
     pub request_origin: String,
-    /// Batch SLA completion window: "1h", "24h", etc.
+    /// Batch completion window (priority): "1h", "24h", etc.
     ///
     /// This is recorded as an empty string (`""`) for non-batch requests rather than
     /// using `None`/`NULL`. The empty-string sentinel is intentional so that

@@ -454,7 +454,8 @@ const ModelInfo: React.FC = () => {
                           {model.status?.uptime_percentage !== undefined &&
                             model.status?.uptime_percentage !== null && (
                               <span className="text-sm text-doubleword-neutral-600">
-                                {model.status.uptime_percentage.toFixed(2)}% uptime (24h)
+                                {model.status.uptime_percentage.toFixed(2)}%
+                                uptime (24h)
                               </span>
                             )}
                         </div>
@@ -976,8 +977,14 @@ const ModelInfo: React.FC = () => {
                             />
                             {runningDaemonCount > 0 && (
                               <p className="text-xs text-gray-500 mt-1">
-                                {runningDaemonCount} {runningDaemonCount === 1 ? "daemon" : "daemons"} running
-                                {updateData.batch_capacity ? ` · ${(updateData.batch_capacity * runningDaemonCount).toLocaleString()} total capacity` : ""}
+                                {runningDaemonCount}{" "}
+                                {runningDaemonCount === 1
+                                  ? "daemon"
+                                  : "daemons"}{" "}
+                                running
+                                {updateData.batch_capacity
+                                  ? ` · ${(updateData.batch_capacity * runningDaemonCount).toLocaleString()} total capacity`
+                                  : ""}
                               </p>
                             )}
                           </div>
@@ -1022,12 +1029,22 @@ const ModelInfo: React.FC = () => {
                         {updateData.batch_capacity &&
                           updateData.capacity &&
                           runningDaemonCount > 0 &&
-                          updateData.batch_capacity * runningDaemonCount > updateData.capacity && (
+                          updateData.batch_capacity * runningDaemonCount >
+                            updateData.capacity && (
                             <div className="mt-2 p-2 bg-yellow-50 border border-yellow-200 rounded-md">
                               <p className="text-xs text-yellow-700">
-                                ⚠️ Total batch capacity ({(updateData.batch_capacity * runningDaemonCount).toLocaleString()} = {updateData.batch_capacity.toLocaleString()} × {runningDaemonCount} {runningDaemonCount === 1 ? "daemon" : "daemons"}) exceeds
-                                the maximum concurrent requests limit ({updateData.capacity.toLocaleString()}).
-                                Batch requests may be rate limited.
+                                ⚠️ Total batch capacity (
+                                {(
+                                  updateData.batch_capacity * runningDaemonCount
+                                ).toLocaleString()}{" "}
+                                = {updateData.batch_capacity.toLocaleString()} ×{" "}
+                                {runningDaemonCount}{" "}
+                                {runningDaemonCount === 1
+                                  ? "daemon"
+                                  : "daemons"}
+                                ) exceeds the maximum concurrent requests limit
+                                ({updateData.capacity.toLocaleString()}). Batch
+                                requests may be rate limited.
                               </p>
                             </div>
                           )}
@@ -1077,10 +1094,13 @@ const ModelInfo: React.FC = () => {
                                 <HoverCardTrigger asChild>
                                   <Info className="h-3 w-3 text-gray-400 hover:text-gray-600 " />
                                 </HoverCardTrigger>
-                                <HoverCardContent className="w-80" sideOffset={5}>
+                                <HoverCardContent
+                                  className="w-80"
+                                  sideOffset={5}
+                                >
                                   <p className="text-sm text-muted-foreground">
-                                    The name under which the model is available at
-                                    the upstream endpoint.
+                                    The name under which the model is available
+                                    at the upstream endpoint.
                                   </p>
                                 </HoverCardContent>
                               </HoverCard>
@@ -1096,7 +1116,10 @@ const ModelInfo: React.FC = () => {
                                 <HoverCardTrigger asChild>
                                   <Info className="h-3 w-3 text-gray-400 hover:text-gray-600 " />
                                 </HoverCardTrigger>
-                                <HoverCardContent className="w-80" sideOffset={5}>
+                                <HoverCardContent
+                                  className="w-80"
+                                  sideOffset={5}
+                                >
                                   <p className="text-sm text-muted-foreground">
                                     The name under which the model will be made
                                     available in the control layer API.
@@ -1115,7 +1138,10 @@ const ModelInfo: React.FC = () => {
                                 <HoverCardTrigger asChild>
                                   <Info className="h-3 w-3 text-gray-400 hover:text-gray-600" />
                                 </HoverCardTrigger>
-                                <HoverCardContent className="w-80" sideOffset={5}>
+                                <HoverCardContent
+                                  className="w-80"
+                                  sideOffset={5}
+                                >
                                   <p className="text-sm text-muted-foreground">
                                     The type of the model. Determines which
                                     playground is used.
@@ -1177,7 +1203,10 @@ const ModelInfo: React.FC = () => {
                                     }
                                     onChange={async (e) => {
                                       const newCapabilities = e.target.checked
-                                        ? [...(model.capabilities || []), "vision"]
+                                        ? [
+                                            ...(model.capabilities || []),
+                                            "vision",
+                                          ]
                                         : (model.capabilities || []).filter(
                                             (c) => c !== "vision",
                                           );
@@ -1213,7 +1242,8 @@ const ModelInfo: React.FC = () => {
                                         sideOffset={5}
                                       >
                                         <p className="text-sm text-muted-foreground">
-                                          Enables image upload in the playground.
+                                          Enables image upload in the
+                                          playground.
                                         </p>
                                       </HoverCardContent>
                                     </HoverCard>
@@ -1448,11 +1478,16 @@ const ModelInfo: React.FC = () => {
                                   {model.batch_capacity
                                     ? `${model.batch_capacity.toLocaleString()} per daemon`
                                     : "No limit"}
-                                  {model.batch_capacity && runningDaemonCount > 0 && (
-                                    <span className="text-xs text-gray-500 font-normal ml-1">
-                                      · {runningDaemonCount} {runningDaemonCount === 1 ? "daemon" : "daemons"} running
-                                    </span>
-                                  )}
+                                  {model.batch_capacity &&
+                                    runningDaemonCount > 0 && (
+                                      <span className="text-xs text-gray-500 font-normal ml-1">
+                                        · {runningDaemonCount}{" "}
+                                        {runningDaemonCount === 1
+                                          ? "daemon"
+                                          : "daemons"}{" "}
+                                        running
+                                      </span>
+                                    )}
                                 </p>
                               </div>
                             </div>
@@ -1468,11 +1503,21 @@ const ModelInfo: React.FC = () => {
                             {model.batch_capacity &&
                               model.capacity &&
                               runningDaemonCount > 0 &&
-                              model.batch_capacity * runningDaemonCount > model.capacity && (
+                              model.batch_capacity * runningDaemonCount >
+                                model.capacity && (
                                 <div className="mt-4 p-2 bg-yellow-50 border border-yellow-200 rounded-md">
                                   <p className="text-xs text-yellow-700">
-                                    ⚠️ Total batch capacity ({(model.batch_capacity * runningDaemonCount).toLocaleString()} = {model.batch_capacity.toLocaleString()} × {runningDaemonCount} {runningDaemonCount === 1 ? "daemon" : "daemons"}) exceeds
-                                    the maximum concurrent requests limit ({model.capacity.toLocaleString()}).
+                                    ⚠️ Total batch capacity (
+                                    {(
+                                      model.batch_capacity * runningDaemonCount
+                                    ).toLocaleString()}{" "}
+                                    = {model.batch_capacity.toLocaleString()} ×{" "}
+                                    {runningDaemonCount}{" "}
+                                    {runningDaemonCount === 1
+                                      ? "daemon"
+                                      : "daemons"}
+                                    ) exceeds the maximum concurrent requests
+                                    limit ({model.capacity.toLocaleString()}).
                                     Batch requests may be rate limited.
                                   </p>
                                 </div>

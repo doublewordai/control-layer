@@ -1576,7 +1576,7 @@ async fn setup_background_services(
     #[cfg_attr(not(test), allow(unused_variables))]
     let (initial_targets, onwards_sender) = if config.background_services.onwards_sync.enabled {
         // Extract escalation model names from batch daemon config
-        // Batch API keys automatically get access to these models for SLA escalation
+        // Batch API keys automatically get access to these models for completion window escalation
         let escalation_models: Vec<String> = config
             .background_services
             .batch_daemon
