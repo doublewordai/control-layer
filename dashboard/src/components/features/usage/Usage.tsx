@@ -21,34 +21,6 @@ function formatCompact(n: number): string {
   return n.toString();
 }
 
-function StatCard({
-  title,
-  value,
-  tooltip,
-}: {
-  title: string;
-  value: string;
-  tooltip?: string;
-}) {
-  return (
-    <Card className="py-3">
-      <CardContent className="px-4 py-0">
-        <p className="text-sm font-medium text-muted-foreground flex items-center gap-1">
-          {title}
-          {tooltip && (
-            <span className="relative group">
-              <CircleHelp className="h-3.5 w-3.5 text-muted-foreground/60" />
-              <span className="pointer-events-none absolute bottom-full left-1/2 -translate-x-1/2 mb-1.5 w-48 rounded-md border bg-popover px-2.5 py-1.5 text-xs leading-snug text-popover-foreground shadow-md opacity-0 group-hover:opacity-100 transition-opacity z-50">
-                {tooltip}
-              </span>
-            </span>
-          )}
-        </p>
-        <p className="text-2xl font-bold tabular-nums mt-0.5">{value}</p>
-      </CardContent>
-    </Card>
-  );
-}
 
 function TokenBreakdownCard({
   input,
