@@ -350,5 +350,7 @@ pub struct UserBatchUsageResponse {
     pub total_batch_count: i64,
     pub avg_requests_per_batch: f64,
     pub total_cost: String,
+    /// Estimated cost if all tokens were charged at realtime tariff rates.
+    pub estimated_realtime_cost: String,
     pub by_model: Vec<ModelBreakdownEntry>,
 }

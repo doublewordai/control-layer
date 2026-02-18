@@ -731,6 +731,7 @@ export interface UserBatchUsageResponse {
   total_batch_count: number;
   avg_requests_per_batch: number;
   total_cost: string;
+  estimated_realtime_cost: string;
   by_model: ModelBreakdownEntry[];
 }
 

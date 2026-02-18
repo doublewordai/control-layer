@@ -1106,6 +1106,32 @@ pub async fn refresh_user_model_usage(pool: &PgPool) -> Result<()> {
     Ok(())
 }
 
+/// Estimate what the user's total cost would have been at realtime tariff rates.
+/// Joins user_model_usage → deployed_models (by alias) → model_tariffs (realtime, active).
+/// Models with no matching realtime tariff are excluded from the estimate.
+#[instrument(skip(pool), err)]
+pub async fn estimate_realtime_cost(pool: &PgPool, user_id: Uuid) -> Result<String> {
+    let cost: Option<Decimal> = sqlx::query_scalar!(
+        r#"
+        SELECT SUM(
+            u.input_tokens::NUMERIC * t.input_price_per_token +
+            u.output_tokens::NUMERIC * t.output_price_per_token
+        ) as "cost"
+        FROM user_model_usage u
+        JOIN deployed_models dm ON dm.alias = u.model
+        JOIN model_tariffs t ON t.deployed_model_id = dm.id
+            AND t.api_key_purpose = 'realtime'
+            AND t.valid_until IS NULL
+        WHERE u.user_id = $1
+        "#,
+        user_id
+    )
+    .fetch_one(pool)
+    .await?;
+
+    Ok(cost.map(|d| d.to_string()).unwrap_or_else(|| "0".to_string()))
+}
+
 /// Get per-model breakdown from the pre-aggregated user_model_usage table.
 /// Totals (tokens, cost, request count) are derived from these results by the handler.
 #[instrument(skip(pool), err)]

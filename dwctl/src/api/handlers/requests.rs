@@ -22,8 +22,8 @@ use crate::{
     },
     auth::permissions::{RequiresPermission, operation, resource},
     db::handlers::analytics::{
-        get_model_user_usage, get_requests_aggregate, get_user_batch_counts, get_user_model_breakdown,
-        list_http_analytics, refresh_user_model_usage,
+        estimate_realtime_cost, get_model_user_usage, get_requests_aggregate, get_user_batch_counts,
+        get_user_model_breakdown, list_http_analytics, refresh_user_model_usage,
     },
     errors::Error,
 };
@@ -196,9 +196,10 @@ pub async fn get_usage<P: PoolProvider>(
     refresh_user_model_usage(write_pool).await?;
 
     let read_pool = state.db.read();
-    let ((total_batch_count, avg_requests_per_batch, total_cost), by_model) = tokio::try_join!(
+    let ((total_batch_count, avg_requests_per_batch, total_cost), by_model, estimated_realtime_cost) = tokio::try_join!(
         get_user_batch_counts(read_pool, current_user.id),
         get_user_model_breakdown(write_pool, current_user.id),
+        estimate_realtime_cost(write_pool, current_user.id),
     )?;
 
     // Derive token/request totals from per-model breakdown
@@ -218,6 +219,7 @@ pub async fn get_usage<P: PoolProvider>(
         total_batch_count,
         avg_requests_per_batch,
         total_cost,
+        estimated_realtime_cost,
         by_model,
     };
 
