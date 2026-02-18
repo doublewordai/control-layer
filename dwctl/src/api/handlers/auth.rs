@@ -348,7 +348,11 @@ pub async fn login<P: PoolProvider>(State(state): State<AppState<P>>, Json(reque
 #[tracing::instrument(skip_all)]
 pub async fn logout<P: PoolProvider>(State(state): State<AppState<P>>) -> Result<LogoutResponse, Error> {
     // Create expired cookie to clear session
-    let secure = if state.config.auth.native.session.cookie_secure { "; Secure" } else { "" };
+    let secure = if state.config.auth.native.session.cookie_secure {
+        "; Secure"
+    } else {
+        ""
+    };
     let cookie = format!(
         "{}=; Path=/; HttpOnly{}; SameSite=Strict; Max-Age=0",
         state.config.auth.native.session.cookie_name, secure
