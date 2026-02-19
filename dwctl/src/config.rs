@@ -884,7 +884,7 @@ pub struct BatchConfig {
     /// Keys must match entries in `allowed_completion_windows`. Any allowed
     /// window without an explicit entry defaults to `1.0`. Specifying a window
     /// that is not in `allowed_completion_windows` is a configuration error.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_relaxation_factors")]
     pub window_relaxation_factors: HashMap<String, f32>,
     /// Allowed OpenAI-compatible URL paths for batch requests.
     /// These paths are validated during file upload and batch creation.
@@ -913,6 +913,31 @@ fn default_batch_throughput() -> f32 {
 
 fn default_reservation_ttl_secs() -> i64 {
     10 * 60
+}
+
+fn deserialize_relaxation_factors<'de, D>(deserializer: D) -> Result<HashMap<String, f32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    let map: HashMap<String, f32> = HashMap::deserialize(deserializer)?;
+    for (window, &factor) in &map {
+        if factor < 0.0 {
+            return Err(D::Error::custom(format!(
+                "relaxation_factors[{}] must be >= 0.0, got {}",
+                window, factor
+            )));
+        }
+    }
+    Ok(map)
+}
+
+impl BatchConfig {
+    /// Get the relaxation factor for a completion window.
+    /// Returns 1.0 if no explicit factor is configured (strict mode).
+    pub fn relaxation_factor(&self, completion_window: &str) -> f32 {
+        self.window_relaxation_factors.get(completion_window).copied().unwrap_or(1.0)
+    }
 }
 
 fn deserialize_positive_reservation_ttl<'de, D>(deserializer: D) -> Result<i64, D::Error>
@@ -958,6 +983,7 @@ impl Default for BatchConfig {
         Self {
             enabled: true,
             allowed_completion_windows: vec!["24h".to_string()],
+            window_relaxation_factors: HashMap::new(),
             allowed_url_paths: vec![
                 "/v1/chat/completions".to_string(),
                 "/v1/embeddings".to_string(),
@@ -1716,6 +1742,25 @@ impl Config {
 
         // Validate batches API-specific configuration (only if batches API is enabled)
         if self.batches.enabled {
+            let unknown_windows: Vec<&str> = self
+                .batches
+                .window_relaxation_factors
+                .keys()
+                .filter(|w| !self.batches.allowed_completion_windows.contains(w))
+                .map(|w| w.as_str())
+                .collect();
+
+            if !unknown_windows.is_empty() {
+                return Err(Error::Internal {
+                    operation: format!(
+                        "Config validation: window_relaxation_factors contains window(s) not in \
+                        allowed_completion_windows: {}. Add them to allowed_completion_windows or \
+                        remove them from window_relaxation_factors.",
+                        unknown_windows.join(", ")
+                    ),
+                });
+            }
+
             if self.batches.allowed_url_paths.is_empty() {
                 return Err(Error::Internal {
                     operation: "Config validation: batches.allowed_url_paths cannot be empty. Add at least one supported URL path."
@@ -2427,5 +2472,131 @@ batches:
     fn test_reservation_ttl_default() {
         let config = Config::default();
         assert_eq!(config.batches.reservation_ttl_secs, 600);
+    }
+
+    #[test]
+    fn test_relaxation_factor_defaults_to_one() {
+        let config = Config::default();
+        assert_eq!(config.batches.relaxation_factor("1h"), 1.0);
+        assert_eq!(config.batches.relaxation_factor("24h"), 1.0);
+    }
+
+    #[test]
+    fn test_relaxation_factor_explicit_value() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+batches:
+  allowed_completion_windows: ["1h", "24h"]
+  window_relaxation_factors:
+    "1h": 1.0
+    "24h": 1.5
+"#,
+            )?;
+            let args = Args {
+                config: "test.yaml".to_string(),
+                validate: false,
+            };
+            let config = Config::load(&args)?;
+            assert_eq!(config.batches.relaxation_factor("1h"), 1.0);
+            assert_eq!(config.batches.relaxation_factor("24h"), 1.5);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_relaxation_factor_unknown_window_rejected() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+batches:
+  allowed_completion_windows: ["1h", "24h"]
+  window_relaxation_factors:
+    "12h": 1.5
+"#,
+            )?;
+            let args = Args {
+                config: "test.yaml".to_string(),
+                validate: false,
+            };
+            let result = Config::load(&args);
+            assert!(result.is_err());
+            assert!(result.unwrap_err().to_string().contains("12h"));
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_relaxation_factor_negative_rejected() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+batches:
+  allowed_completion_windows: ["1h", "24h"]
+  window_relaxation_factors:
+    "24h": -0.5
+"#,
+            )?;
+            let args = Args {
+                config: "test.yaml".to_string(),
+                validate: false,
+            };
+            let result = Config::load(&args);
+            assert!(result.is_err());
+            assert!(result.unwrap_err().to_string().contains("window_relaxation_factors"));
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_relaxation_factor_zero_allowed() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+batches:
+  allowed_completion_windows: ["1h", "24h"]
+  window_relaxation_factors:
+    "1h": 0.0
+"#,
+            )?;
+            let args = Args {
+                config: "test.yaml".to_string(),
+                validate: false,
+            };
+            let config = Config::load(&args)?;
+            assert_eq!(config.batches.relaxation_factor("1h"), 0.0);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_relaxation_factor_empty_map_backwards_compatible() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+batches:
+  allowed_completion_windows: ["1h", "24h"]
+"#,
+            )?;
+            let args = Args {
+                config: "test.yaml".to_string(),
+                validate: false,
+            };
+            let config = Config::load(&args)?;
+            // No relaxation_factors key — all windows default to 1.0
+            assert_eq!(config.batches.relaxation_factor("1h"), 1.0);
+            assert_eq!(config.batches.relaxation_factor("24h"), 1.0);
+            Ok(())
+        });
     }
 }

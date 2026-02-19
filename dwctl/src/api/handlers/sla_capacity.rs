@@ -46,6 +46,7 @@ pub fn check_sla_capacity(
     model_throughputs: &HashMap<String, f32>,
     default_throughput: f32,
     completion_window: &str,
+    relaxation_factor: f32,
 ) -> SlaCapacityCheckResult {
     let window_seconds = parse_window_to_seconds(completion_window);
     let mut overloaded_models = HashMap::new();
@@ -65,7 +66,7 @@ pub fn check_sla_capacity(
         // Calculate capacity using f64 throughout to avoid overflow,
         // then clamp to i64 range for final comparison
         let capacity_f64 = (throughput as f64) * (window_seconds as f64);
-        let capacity = if capacity_f64 >= i64::MAX as f64 {
+        let base_capacity = if capacity_f64 >= i64::MAX as f64 {
             i64::MAX
         } else if capacity_f64 <= 0.0 {
             0
@@ -73,15 +74,20 @@ pub fn check_sla_capacity(
             capacity_f64 as i64
         };
 
+        // Apply relaxation factor: how many requests we're willing to accept for this window.
+        // factor > 1.0 = over-accept (rely on autoscaling), 1.0 = strict, 0.0 = block window.
+        let effective_capacity = ((base_capacity as f64) * (relaxation_factor as f64)) as i64;
+
         // Check if we exceed capacity
         let total_requests = pending + new_requests;
-        if total_requests > capacity {
-            let deficit = total_requests - capacity;
+        if total_requests > effective_capacity {
+            let deficit = total_requests - effective_capacity;
             info!(
                 model = %model_alias,
                 pending = pending,
                 new_requests = new_requests,
-                capacity = capacity,
+                capacity = base_capacity,
+                effective_capacity = effective_capacity,
                 throughput = throughput,
                 window = completion_window,
                 deficit = deficit,
@@ -213,7 +219,7 @@ mod tests {
         let pending_counts = HashMap::new();
         let model_throughputs = HashMap::new();
 
-        let result = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 1.0, "24h");
+        let result = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 1.0, "24h", 1.0);
 
         assert!(result.has_capacity);
         assert!(result.overloaded_models.is_empty());
@@ -225,7 +231,7 @@ mod tests {
         let pending_counts = HashMap::from([("gpt-4".to_string(), HashMap::from([("24h".to_string(), 5000)]))]);
         let model_throughputs = HashMap::from([("gpt-4".to_string(), 1.0)]); // 1 req/s = 86400/day
 
-        let result = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 1.0, "24h");
+        let result = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 1.0, "24h", 1.0);
 
         assert!(result.has_capacity);
         assert!(result.overloaded_models.is_empty());
@@ -237,7 +243,7 @@ mod tests {
         let pending_counts = HashMap::from([("gpt-4".to_string(), HashMap::from([("24h".to_string(), 50000)]))]);
         let model_throughputs = HashMap::from([("gpt-4".to_string(), 1.0)]); // 1 req/s = 86400/day
 
-        let result = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 1.0, "24h");
+        let result = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 1.0, "24h", 1.0);
 
         assert!(!result.has_capacity);
         assert!(result.overloaded_models.contains_key("gpt-4"));
@@ -252,7 +258,7 @@ mod tests {
         let pending_counts = HashMap::from([("gpt-4".to_string(), HashMap::from([("24h".to_string(), 46400)]))]);
         let model_throughputs = HashMap::from([("gpt-4".to_string(), 1.0)]);
 
-        let result = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 1.0, "24h");
+        let result = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 1.0, "24h", 1.0);
 
         // 40000 + 46400 = 86400 = capacity, should pass
         assert!(result.has_capacity);
@@ -266,7 +272,7 @@ mod tests {
         let pending_counts = HashMap::from([("gpt-4".to_string(), HashMap::from([("24h".to_string(), 46400)]))]);
         let model_throughputs = HashMap::from([("gpt-4".to_string(), 1.0)]);
 
-        let result = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 1.0, "24h");
+        let result = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 1.0, "24h", 1.0);
 
         // 40001 + 46400 = 86401 > 86400, should fail
         assert!(!result.has_capacity);
@@ -293,7 +299,7 @@ mod tests {
             ("claude".to_string(), 1.0),  // 86400 capacity
         ]);
 
-        let result = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 1.0, "24h");
+        let result = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 1.0, "24h", 1.0);
 
         assert!(result.has_capacity);
         assert!(result.overloaded_models.is_empty());
@@ -317,7 +323,7 @@ mod tests {
             ("claude".to_string(), 1.0),  // 86400 capacity
         ]);
 
-        let result = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 1.0, "24h");
+        let result = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 1.0, "24h", 1.0);
 
         assert!(!result.has_capacity);
         assert_eq!(result.overloaded_models.len(), 1);
@@ -338,7 +344,7 @@ mod tests {
             ("gpt-3.5".to_string(), 1.0), // 86400 capacity
         ]);
 
-        let result = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 1.0, "24h");
+        let result = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 1.0, "24h", 1.0);
 
         assert!(!result.has_capacity);
         assert_eq!(result.overloaded_models.len(), 2);
@@ -360,6 +366,7 @@ mod tests {
             &model_throughputs,
             1.0, // Default: 1 req/s = 86400 capacity
             "24h",
+            1.0,
         );
 
         assert!(result.has_capacity); // 1000 < 86400
@@ -377,6 +384,7 @@ mod tests {
             &model_throughputs,
             1.0, // Default: 1 req/s = 86400 capacity
             "24h",
+            1.0,
         );
 
         assert!(!result.has_capacity);
@@ -397,6 +405,7 @@ mod tests {
             &model_throughputs,
             0.5, // Default: 0.5 req/s = 43200 capacity
             "24h",
+            1.0,
         );
 
         assert!(!result.has_capacity);
@@ -415,7 +424,7 @@ mod tests {
         let pending_counts = HashMap::from([("gpt-4".to_string(), HashMap::from([("1h".to_string(), 1000)]))]);
         let model_throughputs = HashMap::from([("gpt-4".to_string(), 1.0)]);
 
-        let result = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 1.0, "1h");
+        let result = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 1.0, "1h", 1.0);
 
         // 2000 + 1000 = 3000 < 3600
         assert!(result.has_capacity);
@@ -428,7 +437,7 @@ mod tests {
         let pending_counts = HashMap::from([("gpt-4".to_string(), HashMap::from([("1h".to_string(), 1000)]))]);
         let model_throughputs = HashMap::from([("gpt-4".to_string(), 1.0)]);
 
-        let result = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 1.0, "1h");
+        let result = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 1.0, "1h", 1.0);
 
         // 3000 + 1000 = 4000 > 3600
         assert!(!result.has_capacity);
@@ -449,11 +458,11 @@ mod tests {
         let model_throughputs = HashMap::from([("gpt-4".to_string(), 1.0)]);
 
         // Check 1h window: 1000 + 3000 = 4000 > 3600, should fail
-        let result_1h = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 1.0, "1h");
+        let result_1h = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 1.0, "1h", 1.0);
         assert!(!result_1h.has_capacity);
 
         // Check 24h window: 1000 + 10000 = 11000 < 86400, should pass
-        let result_24h = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 1.0, "24h");
+        let result_24h = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 1.0, "24h", 1.0);
         assert!(result_24h.has_capacity);
     }
 
@@ -465,7 +474,7 @@ mod tests {
         let pending_counts = HashMap::new(); // No pending at all
         let model_throughputs = HashMap::from([("gpt-4".to_string(), 1.0)]);
 
-        let result = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 1.0, "24h");
+        let result = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 1.0, "24h", 1.0);
 
         // 1000 + 0 = 1000 < 86400
         assert!(result.has_capacity);
@@ -480,7 +489,7 @@ mod tests {
         let model_throughputs = HashMap::from([("gpt-4".to_string(), 1.0)]);
 
         // Checking 24h window - no 24h pending exists, so treated as 0
-        let result = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 1.0, "24h");
+        let result = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 1.0, "24h", 1.0);
 
         // 1000 + 0 = 1000 < 86400
         assert!(result.has_capacity);
@@ -494,7 +503,7 @@ mod tests {
         ]);
         let model_throughputs = HashMap::from([("gpt-4".to_string(), 1.0)]);
 
-        let result = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 1.0, "24h");
+        let result = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 1.0, "24h", 1.0);
 
         // gpt-4: 1000 + 0 = 1000 < 86400
         assert!(result.has_capacity);
@@ -509,7 +518,7 @@ mod tests {
         let pending_counts = HashMap::new();
         let model_throughputs = HashMap::from([("gpt-4".to_string(), 100.0)]);
 
-        let result = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 1.0, "24h");
+        let result = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 1.0, "24h", 1.0);
 
         // 5,000,000 < 8,640,000
         assert!(result.has_capacity);
@@ -522,7 +531,7 @@ mod tests {
         let pending_counts = HashMap::new();
         let model_throughputs = HashMap::from([("gpt-4".to_string(), 0.5)]);
 
-        let result = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 1.0, "24h");
+        let result = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 1.0, "24h", 1.0);
 
         // 40000 < 43200
         assert!(result.has_capacity);
@@ -535,7 +544,7 @@ mod tests {
         let pending_counts = HashMap::new();
         let model_throughputs = HashMap::from([("gpt-4".to_string(), 0.5)]);
 
-        let result = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 1.0, "24h");
+        let result = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 1.0, "24h", 1.0);
 
         // 50000 > 43200
         assert!(!result.has_capacity);
@@ -550,7 +559,7 @@ mod tests {
         let pending_counts = HashMap::from([("gpt-4".to_string(), HashMap::from([("24h".to_string(), 50000)]))]);
         let model_throughputs = HashMap::from([("gpt-4".to_string(), 1.0)]);
 
-        let result = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 1.0, "24h");
+        let result = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 1.0, "24h", 1.0);
 
         // 0 + 50000 < 86400
         assert!(result.has_capacity);
@@ -562,7 +571,7 @@ mod tests {
         let pending_counts = HashMap::from([("gpt-4".to_string(), HashMap::from([("24h".to_string(), 0)]))]);
         let model_throughputs = HashMap::from([("gpt-4".to_string(), 1.0)]);
 
-        let result = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 1.0, "24h");
+        let result = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 1.0, "24h", 1.0);
 
         // 50000 + 0 < 86400
         assert!(result.has_capacity);
@@ -575,7 +584,7 @@ mod tests {
         let pending_counts = HashMap::new();
         let model_throughputs = HashMap::from([("gpt-4".to_string(), 0.0)]);
 
-        let result = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 1.0, "24h");
+        let result = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 1.0, "24h", 1.0);
 
         // capacity = 0, any requests exceed
         assert!(!result.has_capacity);
@@ -589,7 +598,7 @@ mod tests {
         let pending_counts = HashMap::new();
         let model_throughputs = HashMap::from([("gpt-4".to_string(), -5.0)]);
 
-        let result = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 1.0, "24h");
+        let result = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 1.0, "24h", 1.0);
 
         // capacity = 0 (clamped from negative), any requests exceed
         assert!(!result.has_capacity);
@@ -609,6 +618,7 @@ mod tests {
             &model_throughputs,
             -10.0, // Negative default
             "24h",
+            1.0,
         );
 
         // capacity = 0 (clamped), any requests exceed
@@ -622,7 +632,7 @@ mod tests {
         let pending_counts = HashMap::new();
         let model_throughputs = HashMap::from([("gpt-4".to_string(), 0.001)]);
 
-        let result = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 1.0, "24h");
+        let result = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 1.0, "24h", 1.0);
 
         // 50 < 86
         assert!(result.has_capacity);
@@ -635,7 +645,7 @@ mod tests {
         let pending_counts = HashMap::new();
         let model_throughputs = HashMap::from([("gpt-4".to_string(), 1_000_000.0)]); // 1M req/s
 
-        let result = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 1.0, "24h");
+        let result = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 1.0, "24h", 1.0);
 
         // 1M req/s * 86400s = 86.4 billion capacity, should not overflow
         // 1 billion < 86.4 billion
@@ -651,7 +661,7 @@ mod tests {
         let pending_counts = HashMap::new();
         let model_throughputs = HashMap::from([("gpt-4-composite".to_string(), 1.0)]);
 
-        let result = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 1.0, "24h");
+        let result = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 1.0, "24h", 1.0);
 
         assert!(result.has_capacity);
     }
@@ -677,7 +687,7 @@ mod tests {
             ("claude-3-sonnet".to_string(), 1.0), // 86400 capacity
         ]);
 
-        let result = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 1.0, "24h");
+        let result = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 1.0, "24h", 1.0);
 
         // gpt-4-turbo: 50000 + 100000 = 150000 < 172800 ✓
         // gpt-3.5-turbo: 200000 + 500000 = 700000 < 864000 ✓
@@ -692,7 +702,7 @@ mod tests {
         let pending_counts = HashMap::from([("gpt-4".to_string(), HashMap::from([("24h".to_string(), 10000)]))]);
         let model_throughputs = HashMap::from([("gpt-4".to_string(), 1.0)]);
 
-        let result = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 1.0, "24h");
+        let result = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 1.0, "24h", 1.0);
 
         // 80000 + 10000 = 90000 > 86400
         assert!(!result.has_capacity);
@@ -706,7 +716,7 @@ mod tests {
         let pending_counts = HashMap::from([("gpt-4".to_string(), HashMap::from([("24h".to_string(), 85000)]))]);
         let model_throughputs = HashMap::from([("gpt-4".to_string(), 1.0)]);
 
-        let result = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 1.0, "24h");
+        let result = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 1.0, "24h", 1.0);
 
         // 1000 + 85000 = 86000 < 86400 - just squeaks through
         assert!(result.has_capacity);
@@ -736,7 +746,7 @@ mod tests {
         let model_throughputs = HashMap::from([("gpt-4".to_string(), 1.0)]);
 
         // Check 1h window: should only consider 1h pending (0), NOT 24h pending
-        let result_1h = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 1.0, "1h");
+        let result_1h = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 1.0, "1h", 1.0);
 
         // 300 + 0 = 300 < 3600, should PASS
         assert!(
@@ -764,7 +774,7 @@ mod tests {
         let model_throughputs = HashMap::from([("gpt-4".to_string(), 1.0)]);
 
         // Check 24h window: should only consider 24h pending (10000)
-        let result_24h = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 1.0, "24h");
+        let result_24h = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 1.0, "24h", 1.0);
 
         // 50000 + 10000 = 60000 < 86400, should PASS
         assert!(result_24h.has_capacity, "24h batch should be accepted based on 24h queue only");
@@ -786,12 +796,12 @@ mod tests {
         let model_throughputs = HashMap::from([("gpt-4".to_string(), 1.0)]);
 
         // 1h check: 1000 + 3000 = 4000 > 3600, should FAIL
-        let result_1h = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 1.0, "1h");
+        let result_1h = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 1.0, "1h", 1.0);
         assert!(!result_1h.has_capacity);
         assert_eq!(result_1h.overloaded_models.get("gpt-4"), Some(&400)); // 4000 - 3600
 
         // 24h check: 1000 + 0 = 1000 < 86400, should PASS
-        let result_24h = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 1.0, "24h");
+        let result_24h = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 1.0, "24h", 1.0);
         assert!(result_24h.has_capacity);
     }
 
@@ -813,12 +823,12 @@ mod tests {
         let model_throughputs = HashMap::from([("model".to_string(), 0.1)]);
 
         // 1h check: 1000 + 0 = 1000 > 360 (1h capacity), should FAIL due to 1h capacity limit
-        let result_1h = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 0.1, "1h");
+        let result_1h = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 0.1, "1h", 1.0);
         assert!(!result_1h.has_capacity);
         assert_eq!(result_1h.overloaded_models.get("model"), Some(&640)); // 1000 - 360
 
         // 24h check: 1000 + 8000 = 9000 > 8640 (24h capacity), should FAIL
-        let result_24h = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 0.1, "24h");
+        let result_24h = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 0.1, "24h", 1.0);
         assert!(!result_24h.has_capacity);
         assert_eq!(result_24h.overloaded_models.get("model"), Some(&360)); // 9000 - 8640
     }
@@ -841,7 +851,7 @@ mod tests {
         let model_throughputs = HashMap::from([("model".to_string(), 0.1)]);
 
         // 1h check: 300 + 0 = 300 < 360, should PASS
-        let result_1h = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 0.1, "1h");
+        let result_1h = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 0.1, "1h", 1.0);
         assert!(result_1h.has_capacity, "Small batch (300) should fit in 1h window capacity (360)");
     }
 
@@ -862,7 +872,83 @@ mod tests {
 
         // 1h check: 1h pending is missing, should default to 0
         // 1000 + 0 = 1000 < 3600, should PASS
-        let result_1h = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 1.0, "1h");
+        let result_1h = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 1.0, "1h", 1.0);
         assert!(result_1h.has_capacity);
+    }
+
+    // ==================== Relaxation factor tests ====================
+
+    #[test]
+    fn test_relaxation_factor_one_is_strict() {
+        // factor=1.0 should behave identically to no relaxation
+        let file_model_counts = HashMap::from([("gpt-4".to_string(), 40001)]);
+        let pending_counts = HashMap::from([("gpt-4".to_string(), HashMap::from([("24h".to_string(), 46400)]))]);
+        let model_throughputs = HashMap::from([("gpt-4".to_string(), 1.0)]);
+
+        let result = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 1.0, "24h", 1.0);
+
+        // 40001 + 46400 = 86401 > 86400, rejected
+        assert!(!result.has_capacity);
+        assert_eq!(result.overloaded_models.get("gpt-4"), Some(&1));
+    }
+
+    #[test]
+    fn test_relaxation_factor_above_one_expands_capacity() {
+        // factor=1.5 expands 1h capacity from 3600 to 5400
+        let file_model_counts = HashMap::from([("gpt-4".to_string(), 4000)]);
+        let pending_counts = HashMap::from([("gpt-4".to_string(), HashMap::from([("1h".to_string(), 1000)]))]);
+        let model_throughputs = HashMap::from([("gpt-4".to_string(), 1.0)]);
+
+        // Without relaxation: 4000 + 1000 = 5000 > 3600, would be rejected
+        let strict = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 1.0, "1h", 1.0);
+        assert!(!strict.has_capacity);
+
+        // With factor=1.5: effective capacity = 3600 * 1.5 = 5400, 5000 < 5400, accepted
+        let relaxed = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 1.0, "1h", 1.5);
+        assert!(relaxed.has_capacity);
+    }
+
+    #[test]
+    fn test_relaxation_factor_zero_blocks_all_requests() {
+        // factor=0.0 means effective capacity=0, any request is rejected
+        let file_model_counts = HashMap::from([("gpt-4".to_string(), 1)]);
+        let pending_counts = HashMap::new();
+        let model_throughputs = HashMap::from([("gpt-4".to_string(), 1.0)]);
+
+        let result = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 1.0, "24h", 0.0);
+
+        assert!(!result.has_capacity);
+        assert_eq!(result.overloaded_models.get("gpt-4"), Some(&1));
+    }
+
+    #[test]
+    fn test_relaxation_factor_deficit_reflects_effective_capacity() {
+        // factor=2.0 doubles 1h capacity from 3600 to 7200
+        // total=8000, effective_capacity=7200, deficit=800
+        let file_model_counts = HashMap::from([("gpt-4".to_string(), 8000)]);
+        let pending_counts = HashMap::new();
+        let model_throughputs = HashMap::from([("gpt-4".to_string(), 1.0)]);
+
+        let result = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 1.0, "1h", 2.0);
+
+        assert!(!result.has_capacity);
+        assert_eq!(result.overloaded_models.get("gpt-4"), Some(&800)); // 8000 - 7200
+    }
+
+    #[test]
+    fn test_relaxation_factor_does_not_affect_other_windows() {
+        // Relaxation on 24h should not bleed into a 1h check — they are called separately
+        // This test just confirms the factor is applied to the window being checked
+        let file_model_counts = HashMap::from([("gpt-4".to_string(), 5000)]);
+        let pending_counts = HashMap::from([("gpt-4".to_string(), HashMap::from([("1h".to_string(), 0)]))]);
+        let model_throughputs = HashMap::from([("gpt-4".to_string(), 1.0)]);
+
+        // 1h strict (factor=1.0): 5000 > 3600, rejected
+        let strict_1h = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 1.0, "1h", 1.0);
+        assert!(!strict_1h.has_capacity);
+
+        // 1h relaxed (factor=2.0): effective=7200, 5000 < 7200, accepted
+        let relaxed_1h = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 1.0, "1h", 2.0);
+        assert!(relaxed_1h.has_capacity);
     }
 }
