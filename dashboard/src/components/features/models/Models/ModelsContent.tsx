@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from "react";
+import React, { useState, useCallback, useMemo } from "react";
 import { useNavigate } from "react-router-dom";
 import {
   Users,
@@ -16,6 +16,9 @@ import {
   ArrowDownToLine,
   ArrowUpToLine,
   GitMerge,
+  Copy,
+  Check,
+  Zap,
 } from "lucide-react";
 import {
   useModels,
@@ -49,8 +52,75 @@ import {
   formatRelativeTime,
 } from "../../../../utils/formatters";
 import { Skeleton } from "../../../ui/skeleton";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "../../../ui/tooltip";
 import { StatusRow } from "./StatusRow";
 import { Markdown } from "../../../ui/markdown";
+
+const COMPLETION_WINDOWS: Record<
+  string,
+  { label: string; icon: typeof Clock }
+> = {
+  "24h": { label: "Standard", icon: Clock },
+  "1h": { label: "High", icon: Zap },
+};
+
+const CopyableModelName: React.FC<{
+  alias: string;
+  className: string;
+}> = ({ alias, className }) => {
+  const [copied, setCopied] = useState(false);
+  const [truncated, setTruncated] = useState(false);
+  const titleRef = useCallback((el: HTMLHeadingElement | null) => {
+    if (el) setTruncated(el.scrollWidth > el.clientWidth);
+  }, []);
+
+  const handleCopy = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    navigator.clipboard.writeText(alias).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    });
+  };
+
+  const title = (
+    <CardTitle
+      ref={titleRef}
+      className={`${className} cursor-default hover:opacity-70 transition-opacity`}
+      onClick={handleCopy}
+    >
+      {alias}
+    </CardTitle>
+  );
+
+  const content = (
+    <div className="flex items-center gap-1.5 min-w-0">
+      {title}
+      {copied ? (
+        <Check className="h-3.5 w-3.5 text-green-600 shrink-0" />
+      ) : (
+        <Copy
+          className="h-3.5 w-3.5 text-gray-400 shrink-0 cursor-default"
+          onClick={handleCopy}
+        />
+      )}
+    </div>
+  );
+
+  if (!truncated) return content;
+
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>{content}</TooltipTrigger>
+      <TooltipContent sideOffset={5}>
+        <p className="text-xs break-all max-w-sm">{alias}</p>
+      </TooltipContent>
+    </Tooltip>
+  );
+};
 
 export interface ModelsContentProps {
   pagination: ReturnType<
@@ -291,7 +361,7 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                   className="hover:shadow-md transition-shadow rounded-lg p-0 gap-0 overflow-hidden flex flex-col"
                 >
                   <div
-                    className="cursor-pointer hover:bg-gray-50 transition-colors group grow flex flex-col"
+                    className="cursor-pointer hover:bg-gray-50 transition-colors group grow flex flex-col min-w-0"
                     onClick={() => {
                       navigate(
                         `/models/${model.id}?from=${encodeURIComponent("/models")}`,
@@ -300,36 +370,15 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                   >
                     <CardHeader className="px-6 pt-5 pb-0">
                       <div
-                        className={canViewEndpoints ? "space-y-0" : "space-y-2"}
+                        className={`min-w-0 ${canViewEndpoints ? "space-y-0" : "space-y-2"}`}
                       >
                         {/* ROW 1: Alias on left, groups/chevron on right */}
                         <div className="flex items-center justify-between gap-1">
-                          <div className="flex items-center gap-2">
-                            {model.alias.length > 30 ? (
-                              <HoverCard openDelay={200} closeDelay={100}>
-                                <HoverCardTrigger asChild>
-                                  <CardTitle
-                                    className={`text-lg truncate ${canManageGroups ? "max-w-[460px] md:max-w-[420px] lg:max-w-[270px] xl:max-w-[360px] 2xl:max-w-[230px] 3xl:max-w-[300px] 4xl:max-w-[360px] 5xl:max-w-[420px]" : "max-w-[460px] md:max-w-[500px] lg:max-w-[320px] xl:max-w-[480px] 2xl:max-w-[360px] 3xl:max-w-[450px] 4xl:max-w-[520px] 5xl:max-w-[600px]"} break-all hover:opacity-70 transition-opacity cursor-default`}
-                                  >
-                                    {model.alias}
-                                  </CardTitle>
-                                </HoverCardTrigger>
-                                <HoverCardContent
-                                  className="w-auto max-w-sm"
-                                  sideOffset={5}
-                                >
-                                  <p className="text-sm break-all">
-                                    {model.alias}
-                                  </p>
-                                </HoverCardContent>
-                              </HoverCard>
-                            ) : (
-                              <CardTitle
-                                className={`text-lg truncate ${canManageGroups ? "max-w-[460px] md:max-w-[420px] lg:max-w-[270px] xl:max-w-[360px] 2xl:max-w-[230px] 3xl:max-w-[300px] 4xl:max-w-[360px] 5xl:max-w-[420px]" : "max-w-[460px] md:max-w-[500px] lg:max-w-[320px] xl:max-w-[480px] 2xl:max-w-[360px] 3xl:max-w-[450px] 4xl:max-w-[520px] 5xl:max-w-[600px]"} break-all`}
-                              >
-                                {model.alias}
-                              </CardTitle>
-                            )}
+                          <div className="flex items-center gap-2 min-w-0">
+                            <CopyableModelName
+                              alias={model.alias}
+                              className="text-lg truncate break-all min-w-0"
+                            />
 
                             {canManageGroups && model.is_composite && (
                               <HoverCard openDelay={200} closeDelay={100}>
@@ -442,7 +491,7 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                                   </button>
                                 </HoverCardTrigger>
                                 <HoverCardContent
-                                  className="w-96"
+                                  className="w-96 max-h-80 overflow-y-auto"
                                   sideOffset={5}
                                 >
                                   {model.description ? (
@@ -582,7 +631,7 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                         )}
 
                         {/* ROW 3: Tariffs */}
-                        <CardDescription className="flex items-center gap-1.5 min-w-0">
+                        <CardDescription className="flex items-center flex-wrap gap-1.5 min-w-0">
                           {/* Show pricing for users with pricing permissions */}
                           {showPricing && (
                             <>
@@ -610,12 +659,18 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                                                 e.stopPropagation()
                                               }
                                             >
-                                              {batchTariff.completion_window
-                                                ? batchTariff.completion_window
-                                                    .match(/^([^(]+)/)?.[1]
-                                                    ?.trim() ||
-                                                  batchTariff.completion_window
-                                                : "Batch"}
+                                              {(() => {
+                                                const cw = batchTariff.completion_window
+                                                  ? COMPLETION_WINDOWS[batchTariff.completion_window]
+                                                  : null;
+                                                const Icon = cw?.icon;
+                                                return (
+                                                  <>
+                                                    {Icon && <Icon className="h-2.5 w-2.5 text-gray-500 shrink-0" />}
+                                                    <span className="hidden sm:inline">{cw?.label ?? batchTariff.completion_window ?? "Batch"}</span>
+                                                  </>
+                                                );
+                                              })()}
                                               :
                                               {!batchTariff.input_price_per_token &&
                                               !batchTariff.output_price_per_token ? (
@@ -677,7 +732,12 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                                             sideOffset={5}
                                           >
                                             <p className="font-medium text-sm mb-1">
-                                              {batchTariff.name}
+                                              {COMPLETION_WINDOWS[batchTariff.completion_window ?? ""]?.label ?? batchTariff.completion_window}{" "}
+                                              priority
+                                            </p>
+                                            <p className="text-xs text-muted-foreground mb-2">
+                                              {batchTariff.completion_window ?? ""}{" "}
+                                              completion window
                                             </p>
                                             {!batchTariff.input_price_per_token &&
                                             !batchTariff.output_price_per_token ? (
@@ -896,48 +956,37 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                           style={{ minHeight: "90px" }}
                         >
                           {model.description ? (
-                            <div className="relative">
-                              <div
-                                className="text-sm text-gray-700"
-                                style={{
-                                  display: "-webkit-box",
-                                  WebkitLineClamp: 2,
-                                  WebkitBoxOrient: "vertical",
-                                  overflow: "hidden",
-                                  wordBreak: "break-word",
-                                }}
-                              >
-                                <Markdown className="inline" compact>
-                                  {(() => {
-                                    // Get first line only (split by newlines)
-                                    const firstLine =
-                                      model.description.split("\n")[0];
-                                    // Roughly estimate how many characters fit in 2 lines
-                                    const maxChars = 150;
-                                    if (firstLine.length <= maxChars) {
-                                      return firstLine;
-                                    }
-                                    // Find the last complete word before the limit
-                                    let truncated = firstLine.substring(
+                            <div className="text-sm text-gray-700 break-words [&_p]:inline">
+                              <Markdown className="inline" compact>
+                                {(() => {
+                                  const firstLine =
+                                    model.description.split("\n")[0];
+                                  const hasMore =
+                                    firstLine.length > 120 ||
+                                    model.description.split("\n").length >
+                                      1;
+                                  const maxChars = 120;
+                                  if (!hasMore) return firstLine;
+                                  let truncated = firstLine.substring(
+                                    0,
+                                    maxChars,
+                                  );
+                                  const lastSpace =
+                                    truncated.lastIndexOf(" ");
+                                  if (lastSpace > 0) {
+                                    truncated = truncated.substring(
                                       0,
-                                      maxChars,
+                                      lastSpace,
                                     );
-                                    const lastSpace =
-                                      truncated.lastIndexOf(" ");
-                                    if (lastSpace > 0) {
-                                      truncated = truncated.substring(
-                                        0,
-                                        lastSpace,
-                                      );
-                                    }
-                                    return truncated + "...";
-                                  })()}
-                                </Markdown>
-                              </div>
-                              {(model.description.split("\n")[0].length > 150 ||
-                                model.description.split("\n").length > 1 ||
-                                model.description.length > 150) && (
-                                <span className="text-xs text-blue-600 hover:text-blue-700 cursor-pointer">
+                                  }
+                                  return truncated + "…";
+                                })()}
+                              </Markdown>
+                              {(model.description.split("\n")[0].length >
+                                120 ||
+                                model.description.split("\n").length > 1) && (
+                                <span className="italic text-gray-400 group-hover:underline decoration-gray-300">
+                                  {" "}
                                   read more
                                 </span>
                               )}

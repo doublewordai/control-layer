@@ -35,6 +35,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "../../ui/select";
+import { Switch } from "../../ui/switch";
 
 interface ApiExamplesModalProps {
   isOpen: boolean;
@@ -44,6 +45,11 @@ interface ApiExamplesModalProps {
 
 type Language = "python" | "javascript" | "curl";
 type ExampleType = "batch" | "realtime";
+type CompletionWindow = "standard" | "high";
+const completionWindowValues: Record<CompletionWindow, string> = {
+  standard: "24h",
+  high: "1h",
+};
 
 const ApiExamplesModal: React.FC<ApiExamplesModalProps> = ({
   isOpen,
@@ -52,6 +58,8 @@ const ApiExamplesModal: React.FC<ApiExamplesModalProps> = ({
 }) => {
   const [selectedLanguage, setSelectedLanguage] = useState<Language>("python");
   const [exampleType, setExampleType] = useState<ExampleType>("batch");
+  const [completionWindow, setCompletionWindow] =
+    useState<CompletionWindow>("high");
   const [apiKey, setApiKey] = useState<string | null>(null);
   const [copiedCode, setCopiedCode] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -105,8 +113,16 @@ const ApiExamplesModal: React.FC<ApiExamplesModalProps> = ({
     }
   };
 
+  const isEmbeddingsModel =
+    model?.model_type?.toLowerCase() === "embeddings";
+
   const getExampleJsonl = () => {
     const modelAlias = model?.alias || "model-name";
+    if (isEmbeddingsModel) {
+      return `{"custom_id": "request-1", "method": "POST", "url": "/v1/embeddings", "body": {"model": "${modelAlias}", "input": "What is the capital of France?"}}
+{"custom_id": "request-2", "method": "POST", "url": "/v1/embeddings", "body": {"model": "${modelAlias}", "input": "Explain quantum computing in simple terms"}}
+{"custom_id": "request-3", "method": "POST", "url": "/v1/embeddings", "body": {"model": "${modelAlias}", "input": "Write a haiku about programming"}}`;
+    }
     return `{"custom_id": "request-1", "method": "POST", "url": "/v1/chat/completions", "body": {"model": "${modelAlias}", "messages": [{"role": "user", "content": "What is the capital of France?"}]}}
 {"custom_id": "request-2", "method": "POST", "url": "/v1/chat/completions", "body": {"model": "${modelAlias}", "messages": [{"role": "user", "content": "Explain quantum computing in simple terms"}]}}
 {"custom_id": "request-3", "method": "POST", "url": "/v1/chat/completions", "body": {"model": "${modelAlias}", "messages": [{"role": "user", "content": "Write a haiku about programming"}]}}`;
@@ -130,6 +146,10 @@ const ApiExamplesModal: React.FC<ApiExamplesModalProps> = ({
 
   const generateBatchApiCode = (language: Language) => {
     const keyValue = apiKey || "your-api-key-here";
+    const batchEndpoint = isEmbeddingsModel
+      ? "/v1/embeddings"
+      : "/v1/chat/completions";
+    const windowValue = completionWindowValues[completionWindow];
     if (language === "python") {
       return `from openai import OpenAI
 
@@ -150,8 +170,8 @@ print(f"File ID: {batch_file.id}")
 # Step 2: Create a batch job
 batch = client.batches.create(
     input_file_id=batch_file.id,
-    endpoint="/v1/chat/completions",
-    completion_window="Standard (24h)"
+    endpoint="${batchEndpoint}",
+    completion_window="${windowValue}"
 )
 
 print(f"Batch ID: {batch.id}")
@@ -181,8 +201,8 @@ async function runBatch() {
     // Step 2: Create a batch job
     const batch = await client.batches.create({
         input_file_id: batchFile.id,
-        endpoint: '/v1/chat/completions',
-        completion_window: 'Standard (24h)'
+        endpoint: '${batchEndpoint}',
+        completion_window: '${windowValue}'
     });
 
     console.log(\`Batch ID: \${batch.id}\`);
@@ -208,8 +228,8 @@ BATCH_ID=$(curl -s -X POST "${getBaseUrl()}/batches" \\
   -H "Authorization: Bearer ${keyValue}" \\
   -d '{
     "input_file_id": "'"$FILE_ID"'",
-    "endpoint": "/v1/chat/completions",
-    "completion_window": "Standard (24h)"
+    "endpoint": "${batchEndpoint}",
+    "completion_window": "${windowValue}"
   }' | jq -r '.id')
 
 echo "Batch ID: $BATCH_ID"
@@ -482,9 +502,8 @@ chatCompletion();`;
           </AlertBox>
 
           <div className="w-full overflow-hidden">
-            {/* Example Type Selection - Only show for non-embeddings models */}
-            {model?.model_type?.toLowerCase() !== "embeddings" && (
-              <div className="mb-6">
+            {/* Example Type Selection */}
+            <div className="mb-6">
                 <ToggleGroup
                   type="single"
                   value={exampleType}
@@ -559,7 +578,6 @@ chatCompletion();`;
                   </div>
                 )}
               </div>
-            )}
 
             {/* Code Example */}
             <div className="bg-white border border-gray-200 rounded-lg overflow-hidden max-w-full">
@@ -620,6 +638,22 @@ chatCompletion();`;
                   </div>
                 </div>
                 <div className="flex items-center gap-2">
+                  {exampleType === "batch" && (
+                    <label className="flex items-center gap-1.5 text-xs text-gray-500 cursor-pointer">
+                      <Switch
+                        checked={completionWindow === "high"}
+                        onCheckedChange={(checked) =>
+                          setCompletionWindow(checked ? "high" : "standard")
+                        }
+                        className="scale-75"
+                      />
+                      <span className="w-[100px]">
+                        {completionWindow === "high"
+                          ? "High priority"
+                          : "Standard priority"}
+                      </span>
+                    </label>
+                  )}
                   {!apiKey && (
                     <Popover
                       open={showCreateForm}

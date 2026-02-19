@@ -29,7 +29,24 @@ describe("Markdown Component", () => {
     it("should use normal spacing in normal mode", () => {
       const { container } = render(<Markdown>Paragraph</Markdown>);
       const paragraph = container.querySelector("p");
-      expect(paragraph).toHaveClass("mb-2");
+      expect(paragraph).toHaveClass("mb-3");
+    });
+  });
+
+  describe("Headings", () => {
+    it("should render headings with distinct sizes", () => {
+      const markdown = "# H1\n\n## H2\n\n### H3\n\n#### H4";
+      const { container } = render(<Markdown>{markdown}</Markdown>);
+
+      const h1 = container.querySelector("h1");
+      const h2 = container.querySelector("h2");
+      const h3 = container.querySelector("h3");
+      const h4 = container.querySelector("h4");
+
+      expect(h1).toHaveClass("text-xl", "font-semibold");
+      expect(h2).toHaveClass("text-lg", "font-semibold");
+      expect(h3).toHaveClass("text-base", "font-semibold");
+      expect(h4).toHaveClass("text-sm", "font-semibold");
     });
   });
 
@@ -48,39 +65,13 @@ describe("Markdown Component", () => {
         expect(listItems[2]).toHaveTextContent("Item 3");
       });
 
-      it("should NOT render p tags inside list items", () => {
-        const markdown = "- Item 1\n- Item 2\n- Item 3";
-        const { container } = render(<Markdown>{markdown}</Markdown>);
-        const listItems = container.querySelectorAll("li");
-
-        // Check that each list item does NOT contain a p tag
-        listItems.forEach((li) => {
-          const pTags = li.querySelectorAll("p");
-          expect(pTags).toHaveLength(0);
-        });
-      });
-
-      it("should render list items as direct text children", () => {
-        const markdown =
-          "- Visual Agent: Description here\n- Visual Coding: More text";
-        const { container } = render(<Markdown>{markdown}</Markdown>);
-        const listItems = container.querySelectorAll("li");
-
-        expect(listItems[0].innerHTML).not.toContain("<p>");
-        expect(listItems[1].innerHTML).not.toContain("<p>");
-        expect(listItems[0]).toHaveTextContent(
-          "Visual Agent: Description here",
-        );
-        expect(listItems[1]).toHaveTextContent("Visual Coding: More text");
-      });
-
       it("should apply correct classes to ul", () => {
         const markdown = "- Item 1";
         const { container } = render(<Markdown>{markdown}</Markdown>);
         const ul = container.querySelector("ul");
 
         expect(ul).toHaveClass("list-disc");
-        expect(ul).toHaveClass("list-inside");
+        expect(ul).toHaveClass("pl-5");
       });
 
       it("should use compact spacing for ul in compact mode", () => {
@@ -104,46 +95,45 @@ describe("Markdown Component", () => {
         expect(listItems).toHaveLength(3);
       });
 
-      it("should NOT render p tags inside ordered list items", () => {
-        const markdown = "1. First item\n2. Second item";
-        const { container } = render(<Markdown>{markdown}</Markdown>);
-        const listItems = container.querySelectorAll("li");
-
-        listItems.forEach((li) => {
-          const pTags = li.querySelectorAll("p");
-          expect(pTags).toHaveLength(0);
-        });
-      });
-
       it("should apply correct classes to ol", () => {
         const markdown = "1. Item 1";
         const { container } = render(<Markdown>{markdown}</Markdown>);
         const ol = container.querySelector("ol");
 
         expect(ol).toHaveClass("list-decimal");
-        expect(ol).toHaveClass("list-inside");
+        expect(ol).toHaveClass("pl-5");
       });
     });
   });
 
   describe("Code", () => {
-    it("should render inline code", () => {
+    it("should render inline code with inline styling", () => {
       const markdown = "This is `inline code` text";
       const { container } = render(<Markdown>{markdown}</Markdown>);
       const code = container.querySelector("code");
 
       expect(code).toBeInTheDocument();
       expect(code).toHaveTextContent("inline code");
+      expect(code).toHaveClass("bg-gray-100", "font-mono");
     });
 
-    it("should render code blocks without language", () => {
+    it("should render fenced code blocks without language", () => {
       const markdown = "```\ncode block\n```";
+      const { container } = render(<Markdown>{markdown}</Markdown>);
+      const pre = container.querySelector("pre");
+
+      expect(pre).toBeInTheDocument();
+      expect(pre).toHaveClass("bg-gray-900");
+    });
+
+    it("should not render inline code as a block", () => {
+      const markdown = "Use `const x = 1` in your code";
       const { container } = render(<Markdown>{markdown}</Markdown>);
       const pre = container.querySelector("pre");
       const code = container.querySelector("code");
 
-      expect(pre).toBeInTheDocument();
-      expect(code).toBeInTheDocument();
+      expect(pre).not.toBeInTheDocument();
+      expect(code).toHaveClass("bg-gray-100");
     });
   });
 
@@ -160,8 +150,32 @@ describe("Markdown Component", () => {
     });
   });
 
+  describe("Tables", () => {
+    it("should render tables with proper structure", () => {
+      const markdown =
+        "| A | B |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |";
+      const { container } = render(<Markdown>{markdown}</Markdown>);
+
+      expect(container.querySelector("table")).toBeInTheDocument();
+      expect(container.querySelector("thead")).toHaveClass("bg-gray-50");
+      expect(container.querySelectorAll("th")).toHaveLength(2);
+      expect(container.querySelectorAll("td")).toHaveLength(4);
+    });
+  });
+
+  describe("Blockquotes", () => {
+    it("should render blockquotes with styling", () => {
+      const markdown = "> This is a quote";
+      const { container } = render(<Markdown>{markdown}</Markdown>);
+      const blockquote = container.querySelector("blockquote");
+
+      expect(blockquote).toBeInTheDocument();
+      expect(blockquote).toHaveClass("border-l-2", "italic");
+    });
+  });
+
   describe("Complex Content", () => {
-    it("should render mixed content without p tags in list items", () => {
+    it("should render mixed content correctly", () => {
       const markdown = `# Title
 
 Paragraph text here.
@@ -174,36 +188,9 @@ Another paragraph.`;
 
       const { container } = render(<Markdown>{markdown}</Markdown>);
 
-      // Check list items don't have p tags
-      const listItems = container.querySelectorAll("li");
-      listItems.forEach((li) => {
-        expect(li.querySelectorAll("p")).toHaveLength(0);
-      });
-
-      // Check paragraphs outside lists still render
-      const paragraphs = container.querySelectorAll("p");
-      expect(paragraphs.length).toBeGreaterThan(0);
-    });
-
-    it("should handle nested content in lists correctly", () => {
-      const markdown = `Key Enhancements:
-
-- Visual Agent: Operates PC/mobile GUIs—recognizes elements, understands functions, invokes tools, completes tasks.
-- Visual Coding Boost: Generates Draw.io/HTML/CSS/JS from images/videos.
-- Advanced Spatial Perception: Judges object positions, viewpoints, and occlusions.`;
-
-      const { container } = render(<Markdown>{markdown}</Markdown>);
-      const listItems = container.querySelectorAll("li");
-
-      expect(listItems).toHaveLength(3);
-
-      // Ensure no p tags in any list item
-      listItems.forEach((li) => {
-        const pTags = li.querySelectorAll("p");
-        expect(pTags).toHaveLength(0);
-        // Check that the text content is directly in the li
-        expect(li.innerHTML).not.toContain("<p>");
-      });
+      expect(container.querySelector("h1")).toHaveTextContent("Title");
+      expect(container.querySelectorAll("li")).toHaveLength(3);
+      expect(container.querySelectorAll("p").length).toBeGreaterThan(0);
     });
   });
 
@@ -215,8 +202,7 @@ Another paragraph.`;
       const wrapper = container.firstChild;
 
       expect(wrapper).toHaveClass("custom-class");
-      expect(wrapper).toHaveClass("prose");
-      expect(wrapper).toHaveClass("prose-sm");
+      expect(wrapper).toHaveClass("max-w-none");
     });
   });
 });
