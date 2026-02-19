@@ -340,7 +340,7 @@ export function CreateBatchModal({
     <Dialog open={isOpen} onOpenChange={handleClose}>
       <DialogContent className="sm:max-w-lg max-h-[90vh] overflow-hidden flex flex-col">
         <DialogHeader>
-          <DialogTitle>Create New Batch</DialogTitle>
+          <DialogTitle>Create New Batch: TESTING 123</DialogTitle>
           <DialogDescription>
             Select or upload a{" "}
             {config?.docs_jsonl_url ? (
