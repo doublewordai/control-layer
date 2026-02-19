@@ -870,6 +870,22 @@ pub struct BatchConfig {
     /// These define the maximum time from batch creation to completion (e.g., "24h", "1h").
     /// Default: vec!["24h".to_string()]
     pub allowed_completion_windows: Vec<String>,
+    /// Per-completion-window relaxation factors for capacity checks.
+    ///
+    /// A multiplier applied to the model's throughput capacity when deciding
+    /// whether to accept a batch for a given completion window. This allows
+    /// deliberate over-acceptance when there is enough time to provision
+    /// additional capacity before requests are due.
+    ///
+    /// - `1.0` (default): strict — only accept what the model can handle
+    /// - `1.5`: accept up to 50% more than current capacity
+    /// - `0.0`: block all new batches for this window
+    ///
+    /// Keys must match entries in `allowed_completion_windows`. Any allowed
+    /// window without an explicit entry defaults to `1.0`. Specifying a window
+    /// that is not in `allowed_completion_windows` is a configuration error.
+    #[serde(default)]
+    pub window_relaxation_factors: HashMap<String, f32>,
     /// Allowed OpenAI-compatible URL paths for batch requests.
     /// These paths are validated during file upload and batch creation.
     pub allowed_url_paths: Vec<String>,
