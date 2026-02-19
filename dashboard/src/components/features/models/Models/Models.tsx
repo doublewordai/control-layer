@@ -36,6 +36,15 @@ import { SupportRequestModal, CreateVirtualModelModal } from "../../../modals";
 import { useEndpoints, useGroups } from "@/api/control-layer/hooks";
 import { useDebounce } from "@/hooks/useDebounce";
 import { useServerPagination } from "@/hooks/useServerPagination";
+import {
+  usePersistedFilter,
+  clearPersistedFilters,
+} from "@/hooks/usePersistedFilter";
+
+const EMPTY_GROUPS: string[] = [];
+const MODEL_TYPES = ["all", "virtual", "hosted"] as const;
+type ModelType = (typeof MODEL_TYPES)[number];
+const FILTER_PARAM_NAMES = ["endpoint", "groups", "type", "accessible"];
 
 const Models: React.FC = () => {
   const [searchParams, setSearchParams] = useSearchParams();
@@ -49,16 +58,19 @@ const Models: React.FC = () => {
   const showPricing = true;
   const canManageModels = hasPermission("manage-models");
 
-  const [filterProvider, setFilterProvider] = useState("all");
-  const [filterGroups, setFilterGroups] = useState<string[]>([]);
-  const [filterModelType, setFilterModelType] = useState<
-    "all" | "virtual" | "hosted"
-  >("all");
+  const [filterProvider, setFilterProvider] = usePersistedFilter("endpoint", "all");
+  const [filterGroups, setFilterGroups] = usePersistedFilter("groups", EMPTY_GROUPS);
+  const [rawModelType, setFilterModelType] = usePersistedFilter("type", "all");
+  const filterModelType: ModelType = (MODEL_TYPES as readonly string[]).includes(rawModelType)
+    ? (rawModelType as ModelType)
+    : "all";
+  const [accessibleOnly, setAccessibleOnly] = usePersistedFilter("accessible", "false");
+  const showAccessibleOnly = accessibleOnly === "true";
+
   const [searchQuery, setSearchQuery] = useState(
     searchParams.get("search") || "",
   );
   const debouncedSearch = useDebounce(searchQuery, 300);
-  const [showAccessibleOnly, setShowAccessibleOnly] = useState(false);
 
   // Use pagination hook for URL-based pagination state
   const pagination = useServerPagination({ defaultPageSize: 12 });
@@ -107,15 +119,19 @@ const Models: React.FC = () => {
   const isStatusMode = viewMode === "status";
 
   const handleTabChange = (value: string) => {
-    setSearchParams({ view: value }, { replace: true });
+    setSearchParams(
+      (prev) => {
+        const next = new URLSearchParams(prev);
+        next.set("view", value);
+        return next;
+      },
+      { replace: true },
+    );
   };
 
   const handleClearFilters = () => {
     setSearchQuery("");
-    setFilterProvider("all");
-    setFilterGroups([]);
-    setFilterModelType("all");
-    setShowAccessibleOnly(false);
+    clearPersistedFilters(setSearchParams, FILTER_PARAM_NAMES);
   };
 
   return (
@@ -348,7 +364,9 @@ const Models: React.FC = () => {
                           <Switch
                             id="access-toggle"
                             checked={showAccessibleOnly}
-                            onCheckedChange={setShowAccessibleOnly}
+                            onCheckedChange={(checked) =>
+                              setAccessibleOnly(checked ? "true" : "false")
+                            }
                             aria-label="Show only my accessible models"
                           />
                         </div>
