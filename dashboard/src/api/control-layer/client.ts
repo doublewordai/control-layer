@@ -1585,8 +1585,16 @@ const monitoringApi = {
 };
 
 const usageApi = {
-  async get(): Promise<UserBatchUsageResponse> {
-    const response = await fetch("/admin/api/v1/usage");
+  async get(options?: {
+    startDate?: string;
+    endDate?: string;
+  }): Promise<UserBatchUsageResponse> {
+    const params = new URLSearchParams();
+    if (options?.startDate) params.set("start_date", options.startDate);
+    if (options?.endDate) params.set("end_date", options.endDate);
+
+    const url = `/admin/api/v1/usage${params.toString() ? "?" + params.toString() : ""}`;
+    const response = await fetch(url);
     if (!response.ok) {
       throw new Error(`Failed to fetch usage data: ${response.status}`);
     }

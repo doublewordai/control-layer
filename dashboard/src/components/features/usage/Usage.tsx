@@ -9,6 +9,7 @@ import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Legend, Tooltip, PieChart, 
 import type { TooltipProps } from "recharts";
 import { BarChart3, CircleHelp, DollarSign, Layers, PieChartIcon, TrendingDown, Zap } from "lucide-react";
 import { formatDollars } from "@/utils/money";
+import { DateTimeRangeSelector } from "@/components/ui/date-time-range-selector";
 
 function formatNumber(n: number): string {
   return new Intl.NumberFormat("en-US").format(n);
@@ -94,7 +95,21 @@ function BarTooltip({ active, payload, label }: TooltipProps<number, string>) {
 }
 
 export function Usage() {
-  const { data: usage, isLoading } = useUsage();
+  const [dateRange, setDateRange] = useState<{ from: Date; to: Date }>(() => {
+    const now = new Date();
+    const from = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+    return { from, to: now };
+  });
+
+  const { startDate, endDate } = useMemo(
+    () => ({
+      startDate: dateRange.from.toISOString(),
+      endDate: dateRange.to.toISOString(),
+    }),
+    [dateRange],
+  );
+
+  const { data: usage, isLoading } = useUsage(startDate, endDate);
   const [costView, setCostView] = useState<"bar" | "pie">("pie");
 
   const chartData = useMemo(() => {
@@ -109,10 +124,22 @@ export function Usage() {
     }));
   }, [usage?.by_model]);
 
+  const datePicker = (
+    <DateTimeRangeSelector
+      value={dateRange}
+      onChange={(range) => {
+        if (range) setDateRange(range);
+      }}
+    />
+  );
+
   if (isLoading) {
     return (
       <div className="p-6 md:p-8 space-y-6">
-        <h1 className="text-2xl font-bold tracking-tight">Usage</h1>
+        <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+          <h1 className="text-2xl font-bold tracking-tight">Usage</h1>
+          {datePicker}
+        </div>
         <div className="grid gap-4 grid-cols-2 lg:grid-cols-4">
           {Array.from({ length: 6 }).map((_, i) => (
             <Card key={i} className={i === 0 ? "col-span-2" : ""}>
@@ -132,7 +159,10 @@ export function Usage() {
   if (!usage) {
     return (
       <div className="p-6 md:p-8 space-y-6">
-        <h1 className="text-2xl font-bold tracking-tight">Usage</h1>
+        <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+          <h1 className="text-2xl font-bold tracking-tight">Usage</h1>
+          {datePicker}
+        </div>
         <p className="text-muted-foreground">No usage data available.</p>
       </div>
     );
@@ -144,7 +174,10 @@ export function Usage() {
 
   return (
     <div className="p-6 md:p-8 space-y-6">
-      <h1 className="text-2xl font-bold tracking-tight">Usage</h1>
+      <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+        <h1 className="text-2xl font-bold tracking-tight">Usage</h1>
+        {datePicker}
+      </div>
 
       <div className="grid gap-3 grid-cols-1 md:grid-cols-3">
         {/* Tokens */}

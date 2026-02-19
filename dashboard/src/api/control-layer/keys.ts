@@ -133,6 +133,8 @@ export const queryKeys = {
   // Usage
   usage: {
     all: ["usage"] as const,
+    forRange: (startDate?: string, endDate?: string) =>
+      ["usage", "range", startDate, endDate] as const,
   },
 
   // Webhooks
