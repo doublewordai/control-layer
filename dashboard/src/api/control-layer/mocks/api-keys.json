@@ -1,16 +1,37 @@
 [
   {
     "id": "key-1",
-    "name": "Development Key",
-    "description": "For local development",
-    "created_at": "2024-01-01T10:00:00Z",
-    "last_used": "2024-01-20T15:30:00Z"
+    "name": "CI/CD Pipeline",
+    "description": "Automated testing and evaluation pipeline",
+    "created_at": "2025-04-01T10:00:00Z",
+    "last_used": "2026-02-18T06:15:00Z"
   },
   {
     "id": "key-2",
-    "name": "Production Key",
-    "description": "For production use",
-    "created_at": "2024-01-02T09:15:00Z",
-    "last_used": "2024-01-21T11:45:00Z"
+    "name": "Batch Processing - Production",
+    "description": "Production batch job submissions",
+    "created_at": "2025-05-15T09:15:00Z",
+    "last_used": "2026-02-17T22:30:00Z"
+  },
+  {
+    "id": "key-3",
+    "name": "Partner Integration - ClientCorp",
+    "description": "API access for ClientCorp partner integration",
+    "created_at": "2025-06-01T14:00:00Z",
+    "last_used": "2026-02-16T18:45:00Z"
+  },
+  {
+    "id": "key-4",
+    "name": "Development - Local",
+    "description": "Local development and testing",
+    "created_at": "2025-03-10T11:30:00Z",
+    "last_used": "2026-02-14T10:20:00Z"
+  },
+  {
+    "id": "key-5",
+    "name": "Monitoring & Health Checks",
+    "description": "Automated endpoint health monitoring",
+    "created_at": "2025-08-20T08:00:00Z",
+    "last_used": "2026-02-18T07:00:00Z"
   }
 ]

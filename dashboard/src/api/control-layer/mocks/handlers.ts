@@ -14,6 +14,7 @@ import type {
   ApiKey,
   Endpoint,
   Group,
+  ModelTariff,
   FileObject,
   Batch,
   BatchRequest,
@@ -56,6 +57,8 @@ interface DemoRequest {
       completion_tokens: number;
       total_tokens: number;
     };
+    created?: number;
+    [key: string]: unknown;
   };
   duration_ms: number;
   metadata?: {
@@ -65,7 +68,7 @@ interface DemoRequest {
 }
 
 // Type assert the imported JSON data
-const usersData = usersDataRaw as User[];
+const usersData = usersDataRaw as unknown as User[];
 const groupsData = groupsDataRaw as Group[];
 const endpointsData = endpointsDataRaw as Endpoint[];
 const modelsData = modelsDataRaw.data as Model[];
@@ -104,6 +107,177 @@ const getGroupUsersData = (): Record<string, string[]> => {
   return groupUsersData;
 };
 
+// Model tariff data - maps model ID to tariffs
+const modelTariffs: Record<string, ModelTariff[]> = {
+  // Claude Sonnet 4
+  "f914c573-4c00-4a37-a878-53318a6d5a5b": [
+    {
+      id: "tariff-001",
+      deployed_model_id: "f914c573-4c00-4a37-a878-53318a6d5a5b",
+      name: "Standard",
+      input_price_per_token: "0.000003",
+      output_price_per_token: "0.000015",
+      valid_from: "2025-06-01T00:00:00Z",
+      valid_until: null,
+      api_key_purpose: null,
+      completion_window: null,
+      is_active: true,
+    },
+    {
+      id: "tariff-002",
+      deployed_model_id: "f914c573-4c00-4a37-a878-53318a6d5a5b",
+      name: "Batch",
+      input_price_per_token: "0.0000015",
+      output_price_per_token: "0.0000075",
+      valid_from: "2025-06-01T00:00:00Z",
+      valid_until: null,
+      api_key_purpose: "batch" as const,
+      completion_window: "Standard (24h)",
+      is_active: true,
+    },
+  ],
+  // Claude Opus 4
+  "a1b2c3d4-0001-4a37-a878-53318a6d5001": [
+    {
+      id: "tariff-003",
+      deployed_model_id: "a1b2c3d4-0001-4a37-a878-53318a6d5001",
+      name: "Standard",
+      input_price_per_token: "0.000015",
+      output_price_per_token: "0.000075",
+      valid_from: "2025-06-01T00:00:00Z",
+      valid_until: null,
+      api_key_purpose: null,
+      completion_window: null,
+      is_active: true,
+    },
+    {
+      id: "tariff-004",
+      deployed_model_id: "a1b2c3d4-0001-4a37-a878-53318a6d5001",
+      name: "Batch",
+      input_price_per_token: "0.0000075",
+      output_price_per_token: "0.0000375",
+      valid_from: "2025-06-01T00:00:00Z",
+      valid_until: null,
+      api_key_purpose: "batch" as const,
+      completion_window: "Standard (24h)",
+      is_active: true,
+    },
+  ],
+  // GPT-4o
+  "4c561f35-4823-4d25-aa70-72bbf314a6ba": [
+    {
+      id: "tariff-005",
+      deployed_model_id: "4c561f35-4823-4d25-aa70-72bbf314a6ba",
+      name: "Standard",
+      input_price_per_token: "0.0000025",
+      output_price_per_token: "0.00001",
+      valid_from: "2025-04-15T00:00:00Z",
+      valid_until: null,
+      api_key_purpose: null,
+      completion_window: null,
+      is_active: true,
+    },
+    {
+      id: "tariff-006",
+      deployed_model_id: "4c561f35-4823-4d25-aa70-72bbf314a6ba",
+      name: "Batch",
+      input_price_per_token: "0.00000125",
+      output_price_per_token: "0.000005",
+      valid_from: "2025-04-15T00:00:00Z",
+      valid_until: null,
+      api_key_purpose: "batch" as const,
+      completion_window: "Standard (24h)",
+      is_active: true,
+    },
+    {
+      id: "tariff-007",
+      deployed_model_id: "4c561f35-4823-4d25-aa70-72bbf314a6ba",
+      name: "Batch (High Priority)",
+      input_price_per_token: "0.0000025",
+      output_price_per_token: "0.00001",
+      valid_from: "2025-04-15T00:00:00Z",
+      valid_until: null,
+      api_key_purpose: "batch" as const,
+      completion_window: "High (1h)",
+      is_active: true,
+    },
+  ],
+  // GPT-4o Mini
+  "a1b2c3d4-0002-4a37-a878-53318a6d5002": [
+    {
+      id: "tariff-008",
+      deployed_model_id: "a1b2c3d4-0002-4a37-a878-53318a6d5002",
+      name: "Standard",
+      input_price_per_token: "0.00000015",
+      output_price_per_token: "0.0000006",
+      valid_from: "2025-05-20T00:00:00Z",
+      valid_until: null,
+      api_key_purpose: null,
+      completion_window: null,
+      is_active: true,
+    },
+    {
+      id: "tariff-009",
+      deployed_model_id: "a1b2c3d4-0002-4a37-a878-53318a6d5002",
+      name: "Batch",
+      input_price_per_token: "0.000000075",
+      output_price_per_token: "0.0000003",
+      valid_from: "2025-05-20T00:00:00Z",
+      valid_until: null,
+      api_key_purpose: "batch" as const,
+      completion_window: "Standard (24h)",
+      is_active: true,
+    },
+  ],
+  // Gemini 2.0 Flash
+  "a1b2c3d4-0005-4a37-a878-53318a6d5005": [
+    {
+      id: "tariff-010",
+      deployed_model_id: "a1b2c3d4-0005-4a37-a878-53318a6d5005",
+      name: "Standard",
+      input_price_per_token: "0.0000001",
+      output_price_per_token: "0.0000004",
+      valid_from: "2025-10-05T00:00:00Z",
+      valid_until: null,
+      api_key_purpose: null,
+      completion_window: null,
+      is_active: true,
+    },
+  ],
+  // text-embedding-3-small
+  "c9d0e1f2-3456-7890-1234-cdef12345678": [
+    {
+      id: "tariff-011",
+      deployed_model_id: "c9d0e1f2-3456-7890-1234-cdef12345678",
+      name: "Standard",
+      input_price_per_token: "0.00000002",
+      output_price_per_token: "0.00000002",
+      valid_from: "2025-04-01T00:00:00Z",
+      valid_until: null,
+      api_key_purpose: null,
+      completion_window: null,
+      is_active: true,
+    },
+  ],
+  // text-embedding-3-large
+  "a1b2c3d4-0007-4a37-a878-53318a6d5007": [
+    {
+      id: "tariff-012",
+      deployed_model_id: "a1b2c3d4-0007-4a37-a878-53318a6d5007",
+      name: "Standard",
+      input_price_per_token: "0.00000013",
+      output_price_per_token: "0.00000013",
+      valid_from: "2025-04-01T00:00:00Z",
+      valid_until: null,
+      api_key_purpose: null,
+      completion_window: null,
+      is_active: true,
+    },
+  ],
+  // Self-hosted models (DeepSeek, Llama, Qwen, BGE reranker) have no tariffs
+  // since they run on-premise with no per-token cost
+};
+
 // Compute user balance from transactions (sum of credits minus debits)
 function computeUserBalance(userId: string): number {
   const userTransactions = transactionsData.filter((t) => t.user_id === userId);
@@ -113,6 +287,33 @@ function computeUserBalance(userId: string): number {
       tx.transaction_type === "purchase";
     return isCredit ? balance + tx.amount : balance - tx.amount;
   }, 0);
+}
+
+// Compute the time shift needed to make request data appear recent.
+// The raw JSON has fixed timestamps; we shift them so the latest request is "now".
+function getRequestsTimeShift(): number {
+  if (requestsData.length === 0) return 0;
+  const latestOriginal = Math.max(
+    ...requestsData.map((req) => new Date(req.timestamp).getTime()),
+  );
+  return Date.now() - latestOriginal;
+}
+
+// Return a shifted copy of a request (timestamp + response.created)
+function shiftRequest(req: DemoRequest, timeShift: number): DemoRequest {
+  const shiftedTs = new Date(
+    new Date(req.timestamp).getTime() + timeShift,
+  ).toISOString();
+  return {
+    ...req,
+    timestamp: shiftedTs,
+    response: {
+      ...req.response,
+      created: Math.floor(
+        (new Date(req.timestamp).getTime() + timeShift) / 1000,
+      ),
+    },
+  };
 }
 
 // Function to compute real metrics from requests data, shifted to appear as today's activity
@@ -601,6 +802,13 @@ export const handlers = [
       }));
     }
 
+    if (include?.includes("pricing")) {
+      models = models.map((model) => ({
+        ...model,
+        tariffs: modelTariffs[model.id] || [],
+      }));
+    }
+
     return HttpResponse.json({
       data: models,
       total_count,
@@ -609,12 +817,28 @@ export const handlers = [
     });
   }),
 
-  http.get("/admin/api/v1/models/:id", ({ params }) => {
+  http.get("/admin/api/v1/models/:id", ({ params, request }) => {
+    const url = new URL(request.url);
+    const include = url.searchParams.get("include");
     const model = modelsData.find((m) => m.id === params.id);
     if (!model) {
       return HttpResponse.json({ error: "Model not found" }, { status: 404 });
     }
-    return HttpResponse.json(model);
+    let result: Model = { ...model };
+    if (include?.includes("pricing")) {
+      result = { ...result, tariffs: modelTariffs[model.id] || [] };
+    }
+    if (include?.includes("groups")) {
+      const modelsGroupsData = getModelsGroupsData();
+      result = {
+        ...result,
+        groups:
+          modelsGroupsData[model.id]
+            ?.map((id) => groupsData.find((g) => g.id === id))
+            .filter((g): g is Group => g !== undefined) ?? [],
+      };
+    }
+    return HttpResponse.json(result);
   }),
 
   http.patch("/admin/api/v1/models/:id", async ({ params, request }) => {
@@ -669,20 +893,20 @@ export const handlers = [
     if (url.includes("openai")) {
       mockModels = [
         {
-          id: "gpt-4",
-          created: 1687882411,
+          id: "gpt-4o",
+          created: 1715367049,
           object: "model" as const,
           owned_by: "openai",
         },
         {
-          id: "gpt-3.5-turbo",
-          created: 1677610602,
+          id: "gpt-4o-mini",
+          created: 1721172049,
           object: "model" as const,
           owned_by: "openai",
         },
         {
-          id: "text-embedding-ada-002",
-          created: 1671217299,
+          id: "text-embedding-3-small",
+          created: 1705948997,
           object: "model" as const,
           owned_by: "openai",
         },
@@ -1018,8 +1242,8 @@ export const handlers = [
   // Config API
   http.get("/admin/api/v1/config", () => {
     return HttpResponse.json({
-      region: "UK South",
-      organization: "ACME Corp",
+      region: "EU West",
+      organization: "Acme Corp",
       payment_enabled: true,
       docs_url: "https://docs.doubleword.ai/control-layer",
       batches: {
@@ -1272,15 +1496,39 @@ export const handlers = [
     });
   }),
 
-  // List requests
+  // List requests — returns { entries: AnalyticsEntry[] } matching ListAnalyticsResponse
   http.get("/admin/api/v1/requests", ({ request }) => {
     const url = new URL(request.url);
     const limitParam = url.searchParams.get("limit");
+    const skipParam = url.searchParams.get("skip");
     const orderDesc = url.searchParams.get("order_desc") === "true";
     const timestampAfter = url.searchParams.get("timestamp_after");
     const timestampBefore = url.searchParams.get("timestamp_before");
+    const modelFilter = url.searchParams.get("model");
+    const customIdFilter = url.searchParams.get("custom_id");
 
-    let filtered = [...requestsData];
+    // Build model alias -> tariff lookup for pricing
+    const aliasTariffMap: Record<
+      string,
+      { input: string; output: string }
+    > = {};
+    for (const model of modelsData) {
+      const tariffs = modelTariffs[model.id];
+      if (tariffs) {
+        // Use standard (non-batch) tariff
+        const std = tariffs.find((t) => t.api_key_purpose === null) || tariffs[0];
+        if (std) {
+          aliasTariffMap[model.alias] = {
+            input: std.input_price_per_token,
+            output: std.output_price_per_token,
+          };
+        }
+      }
+    }
+
+    // Shift all request timestamps to be relative to now
+    const timeShift = getRequestsTimeShift();
+    let filtered = requestsData.map((req) => shiftRequest(req, timeShift));
 
     // Filter by timestamp range
     if (timestampAfter) {
@@ -1294,6 +1542,22 @@ export const handlers = [
       );
     }
 
+    // Filter by model
+    if (modelFilter) {
+      filtered = filtered.filter((req) => req.model === modelFilter);
+    }
+
+    // Filter by custom_id (substring match)
+    if (customIdFilter) {
+      filtered = filtered.filter(
+        (req) =>
+          req.metadata?.custom_id &&
+          req.metadata.custom_id
+            .toLowerCase()
+            .includes(customIdFilter.toLowerCase()),
+      );
+    }
+
     // Sort by timestamp
     filtered.sort((a, b) => {
       const aTime = new Date(a.timestamp).getTime();
@@ -1301,14 +1565,40 @@ export const handlers = [
       return orderDesc ? bTime - aTime : aTime - bTime;
     });
 
-    // Apply limit
+    // Apply skip + limit pagination
+    const skip = skipParam ? parseInt(skipParam, 10) : 0;
     const limit = limitParam ? parseInt(limitParam, 10) : 50;
-    const limited = filtered.slice(0, limit);
+    const paginated = filtered.slice(skip, skip + limit);
 
-    return HttpResponse.json({
-      requests: limited,
-      total: filtered.length,
+    // Transform DemoRequest[] -> AnalyticsEntry[]
+    const entries = paginated.map((req, idx) => {
+      const pricing = aliasTariffMap[req.model];
+      return {
+        id: skip + idx + 1,
+        timestamp: req.timestamp,
+        method: "POST",
+        uri: req.model.includes("embedding")
+          ? "/v1/embeddings"
+          : req.model.includes("rerank")
+            ? "/v1/rerank"
+            : "/v1/chat/completions",
+        model: req.model,
+        status_code: 200,
+        duration_ms: req.duration_ms,
+        prompt_tokens: req.response?.usage?.prompt_tokens ?? 0,
+        completion_tokens: req.response?.usage?.completion_tokens ?? 0,
+        total_tokens: req.response?.usage?.total_tokens ?? 0,
+        response_type: req.model.includes("embedding")
+          ? "embeddings"
+          : req.model.includes("rerank")
+            ? "rerank"
+            : "chat_completions",
+        input_price_per_token: pricing?.input ?? null,
+        output_price_per_token: pricing?.output ?? null,
+      };
     });
+
+    return HttpResponse.json({ entries });
   }),
 
   // Requests aggregate
@@ -1318,7 +1608,9 @@ export const handlers = [
     const timestampAfter = url.searchParams.get("timestamp_after");
     const timestampBefore = url.searchParams.get("timestamp_before");
 
-    let filtered = [...requestsData];
+    // Shift all request timestamps to be relative to now
+    const timeShift = getRequestsTimeShift();
+    let filtered = requestsData.map((req) => shiftRequest(req, timeShift));
 
     // Filter by model
     if (model) {
@@ -1337,22 +1629,37 @@ export const handlers = [
       );
     }
 
-    // Aggregate by model
-    const modelCounts: Record<string, { model: string; count: number }> = {};
+    // Aggregate by model (ModelUsage[])
+    const modelAgg: Record<
+      string,
+      { count: number; totalLatency: number; inputTokens: number; outputTokens: number }
+    > = {};
     filtered.forEach((req) => {
-      if (!modelCounts[req.model]) {
-        modelCounts[req.model] = { model: req.model, count: 0 };
+      if (!modelAgg[req.model]) {
+        modelAgg[req.model] = { count: 0, totalLatency: 0, inputTokens: 0, outputTokens: 0 };
       }
-      modelCounts[req.model].count++;
+      modelAgg[req.model].count++;
+      modelAgg[req.model].totalLatency += req.duration_ms || 0;
+      modelAgg[req.model].inputTokens += req.response?.usage?.prompt_tokens || 0;
+      modelAgg[req.model].outputTokens += req.response?.usage?.completion_tokens || 0;
     });
+    const totalReqs = filtered.length;
+    const models = Object.entries(modelAgg).map(([name, agg]) => ({
+      model: name,
+      count: agg.count,
+      percentage: totalReqs > 0 ? Math.round((agg.count / totalReqs) * 100) : 0,
+      avg_latency_ms: agg.count > 0 ? Math.round(agg.totalLatency / agg.count) : 0,
+    }));
 
-    // Aggregate by status code (extract from metadata if available)
-    const statusCounts: Record<number, number> = { 200: filtered.length };
+    // Aggregate by status code (StatusCodeBreakdown[])
+    const statusCodes = [
+      { status: "200", count: totalReqs, percentage: 100 },
+    ];
 
-    // Time series data (group by hour)
+    // Time series data (group by hour, matching TimeSeriesPoint)
     const timeSeriesMap: Record<
       string,
-      { timestamp: string; count: number; tokens: number }
+      { timestamp: string; requests: number; input_tokens: number; output_tokens: number; totalLatency: number }
     > = {};
     filtered.forEach((req) => {
       const date = new Date(req.timestamp);
@@ -1364,22 +1671,29 @@ export const handlers = [
       ).toISOString();
 
       if (!timeSeriesMap[hourKey]) {
-        timeSeriesMap[hourKey] = { timestamp: hourKey, count: 0, tokens: 0 };
+        timeSeriesMap[hourKey] = { timestamp: hourKey, requests: 0, input_tokens: 0, output_tokens: 0, totalLatency: 0 };
       }
-      timeSeriesMap[hourKey].count++;
-      timeSeriesMap[hourKey].tokens += req.response?.usage?.total_tokens || 0;
+      timeSeriesMap[hourKey].requests++;
+      timeSeriesMap[hourKey].input_tokens += req.response?.usage?.prompt_tokens || 0;
+      timeSeriesMap[hourKey].output_tokens += req.response?.usage?.completion_tokens || 0;
+      timeSeriesMap[hourKey].totalLatency += req.duration_ms || 0;
     });
 
-    const timeSeries = Object.values(timeSeriesMap).sort(
-      (a, b) =>
-        new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime(),
-    );
+    const timeSeries = Object.values(timeSeriesMap)
+      .map(({ totalLatency, ...point }) => ({
+        ...point,
+        avg_latency_ms: point.requests > 0 ? Math.round(totalLatency / point.requests) : null,
+      }))
+      .sort(
+        (a, b) =>
+          new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime(),
+      );
 
     return HttpResponse.json({
-      models: Object.values(modelCounts),
-      status_codes: statusCounts,
+      models,
+      status_codes: statusCodes,
       time_series: timeSeries,
-      total_requests: filtered.length,
+      total_requests: totalReqs,
       total_tokens: filtered.reduce(
         (sum, req) => sum + (req.response?.usage?.total_tokens || 0),
         0,
@@ -1402,8 +1716,9 @@ export const handlers = [
   http.get("/admin/api/v1/monitoring/pending-request-counts", () => {
     // Demo mode: static example data (real data comes from fusillade)
     return HttpResponse.json({
-      "claude-sonnet-3.5": { "1h": 2, "24h": 7 },
-      "gpt-4": { "1h": 1, "24h": 3 },
+      "claude-sonnet-4": { "1h": 12, "24h": 87 },
+      "gpt-4o": { "1h": 8, "24h": 45 },
+      "llama-3.3-70b": { "1h": 3, "24h": 22 },
     });
   }),
 
