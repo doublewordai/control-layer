@@ -216,41 +216,38 @@ pub async fn get_usage<P: PoolProvider>(
         return Ok(Json(cached));
     }
 
-    // Fetch per-model breakdown, batch counts, and tariffs
-    let (by_model, total_batch_count, avg_requests_per_batch, total_cost, tariffs) = if has_dates {
+    // Two paths: all-time uses fast pre-aggregated tables, date-filtered
+    // queries http_analytics directly (bounded by covering index).
+    let (batch_count, by_model, tariffs) = if has_dates {
         let end_date = query.end_date.unwrap_or_else(Utc::now);
-        let start_date = query.start_date.unwrap_or_else(|| end_date - Duration::days(180));
+        let start = query.start_date.unwrap_or_else(|| end_date - Duration::days(180));
         let max_start = end_date - Duration::days(180);
-        let start_date = if start_date < max_start { max_start } else { start_date };
+        let start_date = if start < max_start { max_start } else { start };
 
-        let (batch_count, by_model, tariffs) = tokio::try_join!(
+        tokio::try_join!(
             get_user_batch_count_for_range(state.db.read(), current_user.id, start_date, end_date),
             get_user_model_breakdown_for_range(state.db.read(), current_user.id, start_date, end_date),
             get_realtime_tariffs(state.db.read()),
-        )?;
-
-        let total_cost = by_model
-            .iter()
-            .fold(Decimal::ZERO, |acc, e| acc + e.cost.parse::<Decimal>().unwrap_or(Decimal::ZERO))
-            .to_string();
-        let total_requests: i64 = by_model.iter().map(|e| e.request_count).sum();
-        let avg = if batch_count > 0 {
-            total_requests as f64 / batch_count as f64
-        } else {
-            0.0
-        };
-
-        (by_model, batch_count, avg, total_cost, tariffs)
+        )?
     } else {
-        refresh_user_model_usage(state.db.read()).await?;
-
-        let ((batch_count, avg, total_cost), by_model, tariffs) = tokio::try_join!(
+        refresh_user_model_usage(state.db.write()).await?;
+        let (batch_stats, by_model, tariffs) = tokio::try_join!(
             get_user_batch_counts(state.db.read(), current_user.id),
             get_user_model_breakdown(state.db.read(), current_user.id),
             get_realtime_tariffs(state.db.read()),
         )?;
+        (batch_stats.0, by_model, tariffs)
+    };
 
-        (by_model, batch_count, avg, total_cost, tariffs)
+    let total_cost = by_model
+        .iter()
+        .fold(Decimal::ZERO, |acc, e| acc + e.cost.parse::<Decimal>().unwrap_or(Decimal::ZERO))
+        .to_string();
+    let total_requests: i64 = by_model.iter().map(|e| e.request_count).sum();
+    let avg_requests_per_batch = if batch_count > 0 {
+        total_requests as f64 / batch_count as f64
+    } else {
+        0.0
     };
 
     let mut total_input_tokens: i64 = 0;
@@ -270,7 +267,7 @@ pub async fn get_usage<P: PoolProvider>(
         total_input_tokens,
         total_output_tokens,
         total_request_count,
-        total_batch_count,
+        total_batch_count: batch_count,
         avg_requests_per_batch,
         total_cost,
         estimated_realtime_cost: estimated_realtime_cost.to_string(),
