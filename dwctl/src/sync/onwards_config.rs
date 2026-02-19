@@ -883,7 +883,6 @@ fn convert_to_config_file(targets: Vec<OnwardsTarget>, composites: Vec<OnwardsCo
                 sanitize_response: target.sanitize_responses,
                 trusted: target.trusted,
                 request_timeout_secs: None,
-                trusted: false,
             };
 
             (target.alias, TargetSpecOrList::Single(target_spec))
