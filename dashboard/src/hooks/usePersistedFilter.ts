@@ -5,10 +5,6 @@ const STORAGE_KEY = "models-filters";
 
 type FilterValue = string | string[];
 
-interface FilterDefaults {
-  [key: string]: FilterValue;
-}
-
 /**
  * Read all persisted filter defaults from localStorage.
  */
@@ -31,8 +27,7 @@ function loadDefaults(): Record<string, FilterValue> {
  */
 function saveDefault(key: string, value: FilterValue, fallback: FilterValue) {
   const defaults = loadDefaults();
-  const isDefault =
-    JSON.stringify(value) === JSON.stringify(fallback);
+  const isDefault = JSON.stringify(value) === JSON.stringify(fallback);
   if (isDefault) {
     delete defaults[key];
   } else {
@@ -45,12 +40,41 @@ function saveDefault(key: string, value: FilterValue, fallback: FilterValue) {
   }
 }
 
+function serialize(value: FilterValue): string {
+  return Array.isArray(value) ? value.join(",") : value;
+}
+
+/**
+ * Clear all persisted filter params from URL and localStorage.
+ * Useful for a "clear all filters" action that avoids the race condition
+ * of calling multiple individual setters back-to-back.
+ */
+export function clearPersistedFilters(
+  setSearchParams: ReturnType<typeof useSearchParams>[1],
+  paramNames: string[],
+) {
+  // Clear localStorage
+  localStorage.removeItem(STORAGE_KEY);
+
+  // Clear URL params in one batch
+  setSearchParams(
+    (prev) => {
+      const next = new URLSearchParams(prev);
+      for (const name of paramNames) {
+        next.delete(name);
+      }
+      return next;
+    },
+    { replace: true },
+  );
+}
+
 /**
  * Hook for filter state that uses URL search params as source of truth,
  * falling back to localStorage-persisted defaults when a param is absent.
  *
- * - URL params present → use them (shareable links work)
- * - URL params absent → fall back to localStorage defaults
+ * - URL params present -> use them (shareable links work)
+ * - URL params absent -> fall back to localStorage defaults
  * - Changes are written to both URL params and localStorage
  *
  * Supports both single-value (string) and multi-value (string[]) filters.
@@ -58,7 +82,7 @@ function saveDefault(key: string, value: FilterValue, fallback: FilterValue) {
  * @example
  * ```tsx
  * const [provider, setProvider] = usePersistedFilter("endpoint", "all");
- * const [groups, setGroups] = usePersistedFilter("groups", []);
+ * const [groups, setGroups] = usePersistedFilter("groups", EMPTY_GROUPS);
  * ```
  */
 export function usePersistedFilter(
@@ -69,10 +93,7 @@ export function usePersistedFilter(
   paramName: string,
   fallback: string[],
 ): [string[], (value: string[]) => void];
-export function usePersistedFilter(
-  paramName: string,
-  fallback: FilterValue,
-): [FilterValue, (value: FilterValue) => void] {
+export function usePersistedFilter(paramName: string, fallback: any): any {
   const [searchParams, setSearchParams] = useSearchParams();
   const isArray = Array.isArray(fallback);
 
@@ -81,35 +102,26 @@ export function usePersistedFilter(
 
   let value: FilterValue;
   if (urlValue !== null) {
-    // URL param present — parse it
     if (isArray) {
       value = urlValue === "" ? [] : urlValue.split(",");
     } else {
       value = urlValue;
     }
   } else if (paramName in defaults) {
-    // No URL param — use persisted default
     value = defaults[paramName];
   } else {
-    // Nothing persisted — use fallback
     value = fallback;
   }
 
   const setValue = useCallback(
-    (newValue: FilterValue) => {
-      // Persist to localStorage as the new default
+    (newValue: string | string[]) => {
       saveDefault(paramName, newValue, fallback);
 
-      // Update URL params
       setSearchParams(
         (prev) => {
           const next = new URLSearchParams(prev);
-          const serialized = Array.isArray(newValue)
-            ? newValue.join(",")
-            : newValue;
-          const fallbackSerialized = Array.isArray(fallback)
-            ? fallback.join(",")
-            : fallback;
+          const serialized = serialize(newValue);
+          const fallbackSerialized = serialize(fallback);
 
           if (serialized === fallbackSerialized) {
             next.delete(paramName);
@@ -124,5 +136,5 @@ export function usePersistedFilter(
     [paramName, fallback, setSearchParams],
   );
 
-  return [value, setValue] as [FilterValue, (value: FilterValue) => void];
+  return [value, setValue];
 }

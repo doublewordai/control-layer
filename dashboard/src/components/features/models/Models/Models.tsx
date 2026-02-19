@@ -36,7 +36,15 @@ import { SupportRequestModal, CreateVirtualModelModal } from "../../../modals";
 import { useEndpoints, useGroups } from "@/api/control-layer/hooks";
 import { useDebounce } from "@/hooks/useDebounce";
 import { useServerPagination } from "@/hooks/useServerPagination";
-import { usePersistedFilter } from "@/hooks/usePersistedFilter";
+import {
+  usePersistedFilter,
+  clearPersistedFilters,
+} from "@/hooks/usePersistedFilter";
+
+const EMPTY_GROUPS: string[] = [];
+const MODEL_TYPES = ["all", "virtual", "hosted"] as const;
+type ModelType = (typeof MODEL_TYPES)[number];
+const FILTER_PARAM_NAMES = ["endpoint", "groups", "type", "accessible"];
 
 const Models: React.FC = () => {
   const [searchParams, setSearchParams] = useSearchParams();
@@ -51,8 +59,11 @@ const Models: React.FC = () => {
   const canManageModels = hasPermission("manage-models");
 
   const [filterProvider, setFilterProvider] = usePersistedFilter("endpoint", "all");
-  const [filterGroups, setFilterGroups] = usePersistedFilter("groups", [] as string[]);
-  const [filterModelType, setFilterModelType] = usePersistedFilter("type", "all");
+  const [filterGroups, setFilterGroups] = usePersistedFilter("groups", EMPTY_GROUPS);
+  const [rawModelType, setFilterModelType] = usePersistedFilter("type", "all");
+  const filterModelType: ModelType = (MODEL_TYPES as readonly string[]).includes(rawModelType)
+    ? (rawModelType as ModelType)
+    : "all";
   const [accessibleOnly, setAccessibleOnly] = usePersistedFilter("accessible", "false");
   const showAccessibleOnly = accessibleOnly === "true";
 
@@ -120,10 +131,7 @@ const Models: React.FC = () => {
 
   const handleClearFilters = () => {
     setSearchQuery("");
-    setFilterProvider("all");
-    setFilterGroups([]);
-    setFilterModelType("all");
-    setAccessibleOnly("false");
+    clearPersistedFilters(setSearchParams, FILTER_PARAM_NAMES);
   };
 
   return (
@@ -400,7 +408,7 @@ const Models: React.FC = () => {
           pagination={pagination}
           searchQuery={debouncedSearch}
           filterProvider={filterProvider}
-          filterModelType={filterModelType as "all" | "virtual" | "hosted"}
+          filterModelType={filterModelType}
           endpointId={selectedEndpointId}
           groupId={selectedGroupIds}
           showAccessibleOnly={showAccessibleOnly}
