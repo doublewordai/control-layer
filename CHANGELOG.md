@@ -1,5 +1,18 @@
 # Changelog
 
+## [8.1.0](https://github.com/doublewordai/control-layer/compare/v8.0.1...v8.1.0) (2026-02-19)
+
+
+### Features
+
+* make demo mode data more realistic ([#731](https://github.com/doublewordai/control-layer/issues/731)) ([17aa9bf](https://github.com/doublewordai/control-layer/commit/17aa9bf874b1c5251fc6e164d60f9a351fcfc01d))
+
+
+### Bug Fixes
+
+* advance to step 2 when manually configuring models in edit endpoint modal ([#728](https://github.com/doublewordai/control-layer/issues/728)) ([fdcf360](https://github.com/doublewordai/control-layer/commit/fdcf36051948ea61b478d5ec741824a23b461d90))
+* omit Secure attribute from cookies when cookie_secure is false ([#730](https://github.com/doublewordai/control-layer/issues/730)) ([e6f936e](https://github.com/doublewordai/control-layer/commit/e6f936ee0ccd2e62edcfca636668bd85d0cf4631))
+
 ## [8.0.1](https://github.com/doublewordai/control-layer/compare/v8.0.0...v8.0.1) (2026-02-18)
 
 
