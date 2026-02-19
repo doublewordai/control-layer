@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.3.0](https://github.com/doublewordai/control-layer/compare/v8.2.0...v8.3.0) (2026-02-19)
+
+
+### Features
+
+* UI tweaks got merged onto a lost branch ([#740](https://github.com/doublewordai/control-layer/issues/740)) ([1c7445b](https://github.com/doublewordai/control-layer/commit/1c7445be50cddf23bc5ee7fb9950944e4f9bc1e3))
+
 ## [8.2.0](https://github.com/doublewordai/control-layer/compare/v8.1.0...v8.2.0) (2026-02-19)
 
 
