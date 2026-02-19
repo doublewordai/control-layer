@@ -27,7 +27,6 @@ use bytes::Bytes;
 use chrono::{Duration, Utc};
 use fusillade::Storage;
 use futures::StreamExt;
-use sqlx::Row;
 use std::collections::HashMap;
 use std::pin::Pin;
 use uuid::Uuid;
@@ -301,7 +300,12 @@ pub async fn create_batch<P: PoolProvider>(
 
     let batch = state.request_manager.create_batch(batch_input).await;
 
-    let _ = release_capacity_reservations(&state, &reservation_ids).await;
+    if let Err(err) = release_capacity_reservations(&state, &reservation_ids).await {
+        tracing::warn!(
+            error = ?err,
+            "Failed to release capacity reservations after batch creation"
+        );
+    }
 
     let batch = batch.map_err(|e| Error::Internal {
         operation: format!("create batch: {}", e),
@@ -325,30 +329,27 @@ async fn get_model_ids_by_aliases<P: PoolProvider>(state: &AppState<P>, model_al
         operation: format!("get db connection: {}", e),
     })?;
 
-    let rows = sqlx::query(
-        r#"
-        SELECT id, alias
-        FROM deployed_models
-        WHERE alias = ANY($1)
-          AND deleted = false
-        "#,
-    )
-    .bind(model_aliases)
-    .fetch_all(&mut *conn)
-    .await
-    .map_err(|e| Error::Internal {
-        operation: format!("get model ids: {}", e),
-    })?;
+    let result = crate::db::handlers::deployments::Deployments::new(&mut conn)
+        .get_model_ids_by_aliases(model_aliases)
+        .await
+        .map_err(|e| Error::Internal {
+            operation: format!("get model ids: {}", e),
+        })?;
 
-    let mut result = HashMap::new();
-    for row in rows {
-        let id: Uuid = row.try_get("id").map_err(|e| Error::Internal {
-            operation: format!("read model id: {}", e),
-        })?;
-        let alias: String = row.try_get("alias").map_err(|e| Error::Internal {
-            operation: format!("read model alias: {}", e),
-        })?;
-        result.insert(alias, id);
+    let missing: Vec<&str> = model_aliases
+        .iter()
+        .filter(|alias| !result.contains_key(*alias))
+        .map(|alias| alias.as_str())
+        .collect();
+
+    if !missing.is_empty() {
+        return Err(Error::BadRequest {
+            message: format!(
+                "The following model(s) are no longer available: {}. \
+                 The batch file references models that have been removed.",
+                missing.join(", ")
+            ),
+        });
     }
 
     Ok(result)

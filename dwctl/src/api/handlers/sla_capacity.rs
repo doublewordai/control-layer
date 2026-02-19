@@ -102,7 +102,7 @@ pub fn check_sla_capacity(
 /// Returns the window duration in seconds. Invalid or negative values
 /// default to 24 hours (86400 seconds). Very large values are clamped
 /// to MAX_WINDOW_SECONDS to prevent overflow in capacity calculations.
-pub fn parse_window_to_seconds(window: &str) -> i64 {
+pub(super) fn parse_window_to_seconds(window: &str) -> i64 {
     let parsed = if window.ends_with('h') {
         window.trim_end_matches('h').parse::<i64>().ok().map(|h| h * 3600)
     } else if window.ends_with('m') {
