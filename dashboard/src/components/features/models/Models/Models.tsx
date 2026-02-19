@@ -36,6 +36,7 @@ import { SupportRequestModal, CreateVirtualModelModal } from "../../../modals";
 import { useEndpoints, useGroups } from "@/api/control-layer/hooks";
 import { useDebounce } from "@/hooks/useDebounce";
 import { useServerPagination } from "@/hooks/useServerPagination";
+import { usePersistedFilter } from "@/hooks/usePersistedFilter";
 
 const Models: React.FC = () => {
   const [searchParams, setSearchParams] = useSearchParams();
@@ -49,16 +50,16 @@ const Models: React.FC = () => {
   const showPricing = true;
   const canManageModels = hasPermission("manage-models");
 
-  const [filterProvider, setFilterProvider] = useState("all");
-  const [filterGroups, setFilterGroups] = useState<string[]>([]);
-  const [filterModelType, setFilterModelType] = useState<
-    "all" | "virtual" | "hosted"
-  >("all");
+  const [filterProvider, setFilterProvider] = usePersistedFilter("endpoint", "all");
+  const [filterGroups, setFilterGroups] = usePersistedFilter("groups", [] as string[]);
+  const [filterModelType, setFilterModelType] = usePersistedFilter("type", "all");
+  const [accessibleOnly, setAccessibleOnly] = usePersistedFilter("accessible", "false");
+  const showAccessibleOnly = accessibleOnly === "true";
+
   const [searchQuery, setSearchQuery] = useState(
     searchParams.get("search") || "",
   );
   const debouncedSearch = useDebounce(searchQuery, 300);
-  const [showAccessibleOnly, setShowAccessibleOnly] = useState(false);
 
   // Use pagination hook for URL-based pagination state
   const pagination = useServerPagination({ defaultPageSize: 12 });
@@ -107,7 +108,14 @@ const Models: React.FC = () => {
   const isStatusMode = viewMode === "status";
 
   const handleTabChange = (value: string) => {
-    setSearchParams({ view: value }, { replace: true });
+    setSearchParams(
+      (prev) => {
+        const next = new URLSearchParams(prev);
+        next.set("view", value);
+        return next;
+      },
+      { replace: true },
+    );
   };
 
   const handleClearFilters = () => {
@@ -115,7 +123,7 @@ const Models: React.FC = () => {
     setFilterProvider("all");
     setFilterGroups([]);
     setFilterModelType("all");
-    setShowAccessibleOnly(false);
+    setAccessibleOnly("false");
   };
 
   return (
@@ -348,7 +356,9 @@ const Models: React.FC = () => {
                           <Switch
                             id="access-toggle"
                             checked={showAccessibleOnly}
-                            onCheckedChange={setShowAccessibleOnly}
+                            onCheckedChange={(checked) =>
+                              setAccessibleOnly(checked ? "true" : "false")
+                            }
                             aria-label="Show only my accessible models"
                           />
                         </div>
@@ -390,7 +400,7 @@ const Models: React.FC = () => {
           pagination={pagination}
           searchQuery={debouncedSearch}
           filterProvider={filterProvider}
-          filterModelType={filterModelType}
+          filterModelType={filterModelType as "all" | "virtual" | "hosted"}
           endpointId={selectedEndpointId}
           groupId={selectedGroupIds}
           showAccessibleOnly={showAccessibleOnly}
