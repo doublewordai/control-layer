@@ -262,6 +262,15 @@ impl Default for ListRequestsQuery {
     }
 }
 
+/// Query parameters for the usage endpoint (date filtering)
+#[derive(Debug, Deserialize, ToSchema, IntoParams)]
+pub struct UsageDateQuery {
+    /// Start of the date range (inclusive). When provided, queries http_analytics directly.
+    pub start_date: Option<DateTime<Utc>>,
+    /// End of the date range (inclusive). When provided, queries http_analytics directly.
+    pub end_date: Option<DateTime<Utc>>,
+}
+
 // ===== AGGREGATE/ANALYTICS RESPONSE TYPES =====
 
 /// Status code breakdown for analytics

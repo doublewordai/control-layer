@@ -16,18 +16,19 @@ use crate::{
     api::models::{
         requests::{
             AggregateRequestsQuery, HttpAnalyticsFilter, ListAnalyticsResponse, ListRequestsQuery, ModelUserUsageResponse,
-            RequestsAggregateResponse, UserBatchUsageResponse,
+            RequestsAggregateResponse, UsageDateQuery, UserBatchUsageResponse,
         },
         users::CurrentUser,
     },
     auth::permissions::{RequiresPermission, operation, resource},
     db::handlers::analytics::{
-        estimate_realtime_cost, get_model_user_usage, get_requests_aggregate, get_user_batch_counts, get_user_model_breakdown,
-        list_http_analytics, refresh_user_model_usage,
+        get_model_user_usage, get_realtime_tariffs, get_requests_aggregate, get_user_batch_count_for_range, get_user_batch_counts,
+        get_user_model_breakdown, get_user_model_breakdown_for_range, list_http_analytics, refresh_user_model_usage,
     },
     errors::Error,
 };
 use chrono::{DateTime, Duration, Utc};
+use rust_decimal::Decimal;
 use serde::Deserialize;
 use utoipa::IntoParams;
 
@@ -165,12 +166,17 @@ pub async fn aggregate_by_user<P: PoolProvider>(
 
 /// Get the current user's batch usage metrics
 ///
-/// Returns all-time batch usage including total tokens, costs, request/batch counts,
+/// Returns batch usage including total tokens, costs, request/batch counts,
 /// and per-model breakdown. Only includes batched requests. Any authenticated user
 /// can access their own usage data.
+///
+/// When `start_date` and/or `end_date` are provided, queries http_analytics directly
+/// for the given range (capped at 30 days). Without date params, returns all-time
+/// stats from pre-aggregated tables (with 60s cache).
 #[utoipa::path(
     get,
     path = "/admin/api/v1/usage",
+    params(UsageDateQuery),
     responses(
         (status = 200, description = "User batch usage metrics", body = UserBatchUsageResponse),
         (status = 401, description = "Unauthorized"),
@@ -185,31 +191,64 @@ pub async fn aggregate_by_user<P: PoolProvider>(
 )]
 #[tracing::instrument(skip_all)]
 pub async fn get_usage<P: PoolProvider>(
+    Query(query): Query<UsageDateQuery>,
     State(state): State<AppState<P>>,
     current_user: CurrentUser,
 ) -> Result<Json<UserBatchUsageResponse>, Error> {
-    if let Some(cached) = USAGE_CACHE.get(&current_user.id).await {
-        return Ok(Json(cached));
+    let has_dates = query.start_date.is_some() || query.end_date.is_some();
+
+    // Check cache for all-time path
+    if !has_dates {
+        if let Some(cached) = USAGE_CACHE.get(&current_user.id).await {
+            return Ok(Json(cached));
+        }
     }
 
-    let write_pool = state.db.write();
-    refresh_user_model_usage(write_pool).await?;
+    // Fetch per-model breakdown, batch counts, and tariffs
+    let (by_model, total_batch_count, avg_requests_per_batch, total_cost, tariffs) = if has_dates {
+        let end_date = query.end_date.unwrap_or_else(Utc::now);
+        let start_date = query.start_date.unwrap_or_else(|| end_date - Duration::days(30));
+        let max_start = end_date - Duration::days(30);
+        let start_date = if start_date < max_start { max_start } else { start_date };
 
-    let read_pool = state.db.read();
-    let ((total_batch_count, avg_requests_per_batch, total_cost), by_model, estimated_realtime_cost) = tokio::try_join!(
-        get_user_batch_counts(read_pool, current_user.id),
-        get_user_model_breakdown(write_pool, current_user.id),
-        estimate_realtime_cost(write_pool, current_user.id),
-    )?;
+        let (batch_count, by_model, tariffs) = tokio::try_join!(
+            get_user_batch_count_for_range(state.db.read(), current_user.id, start_date, end_date),
+            get_user_model_breakdown_for_range(state.db.read(), current_user.id, start_date, end_date),
+            get_realtime_tariffs(state.db.read()),
+        )?;
 
-    // Derive token/request totals from per-model breakdown
+        let total_cost = by_model
+            .iter()
+            .fold(Decimal::ZERO, |acc, e| acc + e.cost.parse::<Decimal>().unwrap_or(Decimal::ZERO))
+            .to_string();
+        let total_requests: i64 = by_model.iter().map(|e| e.request_count).sum();
+        let avg = if batch_count > 0 { total_requests as f64 / batch_count as f64 } else { 0.0 };
+
+        (by_model, batch_count, avg, total_cost, tariffs)
+    } else {
+        refresh_user_model_usage(state.db.read()).await?;
+
+        let ((batch_count, avg, total_cost), by_model, tariffs) = tokio::try_join!(
+            get_user_batch_counts(state.db.read(), current_user.id),
+            get_user_model_breakdown(state.db.read(), current_user.id),
+            get_realtime_tariffs(state.db.read()),
+        )?;
+
+        (by_model, batch_count, avg, total_cost, tariffs)
+    };
+
     let mut total_input_tokens: i64 = 0;
     let mut total_output_tokens: i64 = 0;
     let mut total_request_count: i64 = 0;
+    let mut estimated_realtime_cost = Decimal::ZERO;
     for entry in &by_model {
         total_input_tokens += entry.input_tokens;
         total_output_tokens += entry.output_tokens;
         total_request_count += entry.request_count;
+        if let Some(&(input_price, output_price)) = tariffs.get(&entry.model) {
+            estimated_realtime_cost +=
+                Decimal::from(entry.input_tokens) * input_price + Decimal::from(entry.output_tokens) * output_price;
+        }
     }
 
     let usage = UserBatchUsageResponse {
@@ -219,11 +258,13 @@ pub async fn get_usage<P: PoolProvider>(
         total_batch_count,
         avg_requests_per_batch,
         total_cost,
-        estimated_realtime_cost,
+        estimated_realtime_cost: estimated_realtime_cost.to_string(),
         by_model,
     };
 
-    USAGE_CACHE.insert(current_user.id, usage.clone()).await;
+    if !has_dates {
+        USAGE_CACHE.insert(current_user.id, usage.clone()).await;
+    }
 
     Ok(Json(usage))
 }

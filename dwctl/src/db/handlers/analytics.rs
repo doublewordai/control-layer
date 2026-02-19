@@ -1104,30 +1104,26 @@ pub async fn refresh_user_model_usage(pool: &PgPool) -> Result<()> {
     Ok(())
 }
 
-/// Estimate what the user's total cost would have been at realtime tariff rates.
-/// Joins user_model_usage → deployed_models (by alias) → model_tariffs (realtime, active).
-/// Models with no matching realtime tariff are excluded from the estimate.
+/// Load current realtime tariff rates keyed by model alias.
+/// Returns a map of model alias → (input_price_per_token, output_price_per_token).
+/// This is a tiny table (~12 rows) so it's efficient to load entirely.
 #[instrument(skip(pool), err)]
-pub async fn estimate_realtime_cost(pool: &PgPool, user_id: Uuid) -> Result<String> {
-    let cost: Option<Decimal> = sqlx::query_scalar!(
+pub async fn get_realtime_tariffs(pool: &PgPool) -> Result<HashMap<String, (Decimal, Decimal)>> {
+    let rows = sqlx::query!(
         r#"
-        SELECT SUM(
-            u.input_tokens::NUMERIC * t.input_price_per_token +
-            u.output_tokens::NUMERIC * t.output_price_per_token
-        ) as "cost"
-        FROM user_model_usage u
-        JOIN deployed_models dm ON dm.alias = u.model
-        JOIN model_tariffs t ON t.deployed_model_id = dm.id
-            AND t.api_key_purpose = 'realtime'
-            AND t.valid_until IS NULL
-        WHERE u.user_id = $1
-        "#,
-        user_id
+        SELECT dm.alias, t.input_price_per_token, t.output_price_per_token
+        FROM model_tariffs t
+        JOIN deployed_models dm ON dm.id = t.deployed_model_id
+        WHERE t.api_key_purpose = 'realtime' AND t.valid_until IS NULL
+        "#
     )
-    .fetch_one(pool)
+    .fetch_all(pool)
     .await?;
 
-    Ok(cost.map(|d| d.to_string()).unwrap_or_else(|| "0".to_string()))
+    Ok(rows
+        .into_iter()
+        .map(|r| (r.alias, (r.input_price_per_token, r.output_price_per_token)))
+        .collect())
 }
 
 /// Get per-model breakdown from the pre-aggregated user_model_usage table.
@@ -1163,6 +1159,74 @@ pub async fn get_user_model_breakdown(pool: &PgPool, user_id: Uuid) -> Result<Ve
             })
         })
         .collect())
+}
+
+// ===== DATE-FILTERED USAGE QUERIES (bypass pre-aggregated tables) =====
+
+/// Get per-model breakdown directly from http_analytics for a date range.
+/// Used when the user requests date-filtered usage data.
+#[instrument(skip(pool), err)]
+pub async fn get_user_model_breakdown_for_range(
+    pool: &PgPool,
+    user_id: Uuid,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+) -> Result<Vec<ModelBreakdownEntry>> {
+    let rows = sqlx::query_as!(
+        ModelBreakdownRow,
+        r#"
+        SELECT model,
+               COALESCE(SUM(prompt_tokens), 0)::bigint as input_tokens,
+               COALESCE(SUM(completion_tokens), 0)::bigint as output_tokens,
+               COALESCE(SUM(total_cost), 0) as cost,
+               COUNT(*) as request_count
+        FROM http_analytics
+        WHERE user_id = $1
+          AND timestamp >= $2 AND timestamp <= $3
+          AND fusillade_batch_id IS NOT NULL
+        GROUP BY model
+        ORDER BY request_count DESC
+        "#,
+        user_id,
+        start,
+        end
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            row.model.map(|model| ModelBreakdownEntry {
+                model,
+                input_tokens: row.input_tokens.unwrap_or(0),
+                output_tokens: row.output_tokens.unwrap_or(0),
+                cost: row.cost.map(|d| d.to_string()).unwrap_or_else(|| "0".to_string()),
+                request_count: row.request_count.unwrap_or(0),
+            })
+        })
+        .collect())
+}
+
+/// Get distinct batch count directly from http_analytics for a date range.
+#[instrument(skip(pool), err)]
+pub async fn get_user_batch_count_for_range(pool: &PgPool, user_id: Uuid, start: DateTime<Utc>, end: DateTime<Utc>) -> Result<i64> {
+    let row = sqlx::query_scalar!(
+        r#"
+        SELECT COUNT(DISTINCT fusillade_batch_id) as "count!"
+        FROM http_analytics
+        WHERE user_id = $1
+          AND timestamp >= $2 AND timestamp <= $3
+          AND fusillade_batch_id IS NOT NULL
+        "#,
+        user_id,
+        start,
+        end
+    )
+    .fetch_one(pool)
+    .await?;
+
+    Ok(row)
 }
 
 #[cfg(test)]
