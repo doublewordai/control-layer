@@ -189,7 +189,6 @@ export function TransactionHistory({
       // Format priority - should always be present for batches
       let priorityText = "";
       if (tx.batch_sla) {
-        // API returns formatted priority labels like "Standard (24h)" or "High (1h)"
         priorityText = ` - ${tx.batch_sla}`;
       }
 

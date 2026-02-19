@@ -1024,7 +1024,7 @@ export const handlers = [
       docs_url: "https://docs.doubleword.ai/control-layer",
       batches: {
         enabled: true,
-        allowed_completion_windows: ["Standard (24h)", "High (1h)"],
+        allowed_completion_windows: ["24h", "1h"],
       },
     });
   }),

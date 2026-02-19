@@ -30,7 +30,7 @@ interface TariffFormData {
   input_price_per_million: string;
   output_price_per_million: string;
   api_key_purpose: TariffApiKeyPurpose | "none";
-  completion_window: string; // Priority like "Standard (24h)", "High (1h)", etc.
+  completion_window: string; // Completion window like "24h", "1h"
 }
 
 // Internal representation with temporary IDs for editing
@@ -44,7 +44,7 @@ interface ModelTariffTableProps {
   onChange: (tariffs: TariffDefinition[]) => void;
   isLoading?: boolean;
   readOnly?: boolean;
-  availableSLAs?: string[]; // Available priorities like ["Standard (24h)", "High (1h)"]
+  availableSLAs?: string[]; // Available completion windows like ["24h", "1h"]
 }
 
 const EMPTY_FORM: TariffFormData = {
@@ -67,7 +67,7 @@ export const ModelTariffTable: React.FC<ModelTariffTableProps> = ({
   onChange,
   isLoading = false,
   readOnly = false,
-  availableSLAs = ["Standard (24h)"], // Default to standard priority if not provided
+  availableSLAs = ["24h"], // Default to standard priority if not provided
 }) => {
   // Local state: convert ModelTariff[] to TariffEdit[] for editing
   const [localTariffs, setLocalTariffs] = useState<TariffEdit[]>([]);
@@ -108,7 +108,7 @@ export const ModelTariffTable: React.FC<ModelTariffTableProps> = ({
   ): string => {
     if (purpose === "none") return "";
     if (purpose === "batch" && priority) {
-      return priority; // Priority already includes display name like "Standard (24h)"
+      return priority; // Completion window value like "24h", "1h"
     }
     return API_KEY_PURPOSE_LABELS[purpose];
   };
