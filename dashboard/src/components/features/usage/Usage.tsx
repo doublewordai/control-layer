@@ -7,9 +7,31 @@ import {
 } from "@/components/ui/chart";
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Legend, Tooltip, PieChart, Pie, Cell } from "recharts";
 import type { TooltipProps } from "recharts";
-import { BarChart3, CircleHelp, DollarSign, Layers, PieChartIcon, TrendingDown, Zap } from "lucide-react";
+import { BarChart3, CircleHelp, DollarSign, Layers, Loader2, PieChartIcon, TrendingDown, Zap } from "lucide-react";
 import { formatDollars } from "@/utils/money";
-import { DateTimeRangeSelector } from "@/components/ui/date-time-range-selector";
+import { Select, SelectContent, SelectGroup, SelectItem, SelectLabel, SelectSeparator, SelectTrigger, SelectValue } from "@/components/ui/select";
+
+const RANGE_OPTIONS: { value: string; label: string; minutes: number }[] = [
+  { value: "5m", label: "5 minutes", minutes: 5 },
+  { value: "15m", label: "15 minutes", minutes: 15 },
+  { value: "30m", label: "30 minutes", minutes: 30 },
+  { value: "1h", label: "1 hour", minutes: 60 },
+  { value: "3h", label: "3 hours", minutes: 180 },
+  { value: "8h", label: "8 hours", minutes: 480 },
+  { value: "1d", label: "1 day", minutes: 1440 },
+  { value: "3d", label: "3 days", minutes: 4320 },
+  { value: "7d", label: "7 days", minutes: 10080 },
+  { value: "30d", label: "30 days", minutes: 43200 },
+  { value: "60d", label: "60 days", minutes: 86400 },
+  { value: "90d", label: "90 days", minutes: 129600 },
+  { value: "180d", label: "180 days", minutes: 259200 },
+];
+
+const RANGE_GROUPS: { label: string; values: string[] }[] = [
+  { label: "Minutes", values: ["5m", "15m", "30m"] },
+  { label: "Hours", values: ["1h", "3h", "8h"] },
+  { label: "Days", values: ["1d", "3d", "7d", "30d", "60d", "90d", "180d"] },
+];
 
 function formatNumber(n: number): string {
   return new Intl.NumberFormat("en-US").format(n);
@@ -95,21 +117,18 @@ function BarTooltip({ active, payload, label }: TooltipProps<number, string>) {
 }
 
 export function Usage() {
-  const [dateRange, setDateRange] = useState<{ from: Date; to: Date }>(() => {
+  const [range, setRange] = useState("all");
+
+  const { startDate, endDate } = useMemo(() => {
+    if (range === "all") return { startDate: undefined, endDate: undefined };
+    const option = RANGE_OPTIONS.find((o) => o.value === range);
+    if (!option) return { startDate: undefined, endDate: undefined };
     const now = new Date();
-    const from = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
-    return { from, to: now };
-  });
+    const from = new Date(now.getTime() - option.minutes * 60 * 1000);
+    return { startDate: from.toISOString(), endDate: now.toISOString() };
+  }, [range]);
 
-  const { startDate, endDate } = useMemo(
-    () => ({
-      startDate: dateRange.from.toISOString(),
-      endDate: dateRange.to.toISOString(),
-    }),
-    [dateRange],
-  );
-
-  const { data: usage, isLoading } = useUsage(startDate, endDate);
+  const { data: usage, isLoading, isFetching } = useUsage(startDate, endDate);
   const [costView, setCostView] = useState<"bar" | "pie">("pie");
 
   const chartData = useMemo(() => {
@@ -124,13 +143,30 @@ export function Usage() {
     }));
   }, [usage?.by_model]);
 
-  const datePicker = (
-    <DateTimeRangeSelector
-      value={dateRange}
-      onChange={(range) => {
-        if (range) setDateRange(range);
-      }}
-    />
+  const rangePicker = (
+    <Select value={range} onValueChange={setRange}>
+      <SelectTrigger className="w-[180px]" size="sm">
+        <SelectValue />
+      </SelectTrigger>
+      <SelectContent>
+        {RANGE_GROUPS.map((group, i) => (
+          <SelectGroup key={group.label}>
+            {i > 0 && <SelectSeparator />}
+            <SelectLabel>{group.label}</SelectLabel>
+            {group.values.map((v) => {
+              const opt = RANGE_OPTIONS.find((o) => o.value === v)!;
+              return (
+                <SelectItem key={v} value={v}>
+                  {opt.label}
+                </SelectItem>
+              );
+            })}
+          </SelectGroup>
+        ))}
+        <SelectSeparator />
+        <SelectItem value="all">All time</SelectItem>
+      </SelectContent>
+    </Select>
   );
 
   if (isLoading) {
@@ -138,19 +174,11 @@ export function Usage() {
       <div className="p-6 md:p-8 space-y-6">
         <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
           <h1 className="text-2xl font-bold tracking-tight">Usage</h1>
-          {datePicker}
+          {rangePicker}
         </div>
-        <div className="grid gap-4 grid-cols-2 lg:grid-cols-4">
-          {Array.from({ length: 6 }).map((_, i) => (
-            <Card key={i} className={i === 0 ? "col-span-2" : ""}>
-              <CardHeader className="pb-2">
-                <div className="h-4 w-24 bg-muted rounded animate-pulse" />
-              </CardHeader>
-              <CardContent>
-                <div className="h-8 w-32 bg-muted rounded animate-pulse" />
-              </CardContent>
-            </Card>
-          ))}
+        <div className="flex items-center gap-3 text-sm text-muted-foreground py-12 justify-center">
+          <Loader2 className="h-4 w-4 animate-spin" />
+          <span>Collecting usage data — this can take up to 30 seconds for larger date ranges</span>
         </div>
       </div>
     );
@@ -161,7 +189,7 @@ export function Usage() {
       <div className="p-6 md:p-8 space-y-6">
         <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
           <h1 className="text-2xl font-bold tracking-tight">Usage</h1>
-          {datePicker}
+          {rangePicker}
         </div>
         <p className="text-muted-foreground">No usage data available.</p>
       </div>
@@ -175,8 +203,16 @@ export function Usage() {
   return (
     <div className="p-6 md:p-8 space-y-6">
       <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-        <h1 className="text-2xl font-bold tracking-tight">Usage</h1>
-        {datePicker}
+        <div className="flex items-center gap-3">
+          <h1 className="text-2xl font-bold tracking-tight">Usage</h1>
+          {isFetching && (
+            <div className="flex items-center gap-2 text-xs text-muted-foreground">
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              <span>Updating</span>
+            </div>
+          )}
+        </div>
+        {rangePicker}
       </div>
 
       <div className="grid gap-3 grid-cols-1 md:grid-cols-3">

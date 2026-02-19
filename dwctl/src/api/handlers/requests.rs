@@ -32,11 +32,16 @@ use rust_decimal::Decimal;
 use serde::Deserialize;
 use utoipa::IntoParams;
 
-/// Cache for user usage data (60 second TTL, keyed by user ID)
-static USAGE_CACHE: Lazy<Cache<Uuid, UserBatchUsageResponse>> = Lazy::new(|| {
+/// Cache key: (user_id, optional start-day-timestamp, optional end-day-timestamp).
+type UsageCacheKey = (Uuid, Option<i64>, Option<i64>);
+
+/// Unified cache for user usage data (60-minute TTL).
+/// All-time requests use (user_id, None, None). Date-filtered requests truncate
+/// timestamps to midnight UTC so the same preset always hits cache.
+static USAGE_CACHE: Lazy<Cache<UsageCacheKey, UserBatchUsageResponse>> = Lazy::new(|| {
     Cache::builder()
-        .max_capacity(1_000)
-        .time_to_live(std::time::Duration::from_secs(60))
+        .max_capacity(5_000)
+        .time_to_live(std::time::Duration::from_secs(3600))
         .build()
 });
 
@@ -171,8 +176,8 @@ pub async fn aggregate_by_user<P: PoolProvider>(
 /// can access their own usage data.
 ///
 /// When `start_date` and/or `end_date` are provided, queries http_analytics directly
-/// for the given range (capped at 30 days). Without date params, returns all-time
-/// stats from pre-aggregated tables (with 60s cache).
+/// for the given range (capped at 180 days). Without date params, returns all-time
+/// stats from pre-aggregated tables. Both paths use a shared 60-minute cache.
 #[utoipa::path(
     get,
     path = "/admin/api/v1/usage",
@@ -197,18 +202,25 @@ pub async fn get_usage<P: PoolProvider>(
 ) -> Result<Json<UserBatchUsageResponse>, Error> {
     let has_dates = query.start_date.is_some() || query.end_date.is_some();
 
-    // Check cache for all-time path
-    if !has_dates {
-        if let Some(cached) = USAGE_CACHE.get(&current_user.id).await {
-            return Ok(Json(cached));
-        }
+    // Build cache key: truncate dates to midnight UTC so preset windows always hit cache.
+    let cache_key = if has_dates {
+        let end_date = query.end_date.unwrap_or_else(Utc::now);
+        let start_date = query.start_date.unwrap_or_else(|| end_date - Duration::days(180));
+        let truncate = |dt: DateTime<Utc>| dt.date_naive().and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp();
+        (current_user.id, Some(truncate(start_date)), Some(truncate(end_date)))
+    } else {
+        (current_user.id, None, None)
+    };
+
+    if let Some(cached) = USAGE_CACHE.get(&cache_key).await {
+        return Ok(Json(cached));
     }
 
     // Fetch per-model breakdown, batch counts, and tariffs
     let (by_model, total_batch_count, avg_requests_per_batch, total_cost, tariffs) = if has_dates {
         let end_date = query.end_date.unwrap_or_else(Utc::now);
-        let start_date = query.start_date.unwrap_or_else(|| end_date - Duration::days(30));
-        let max_start = end_date - Duration::days(30);
+        let start_date = query.start_date.unwrap_or_else(|| end_date - Duration::days(180));
+        let max_start = end_date - Duration::days(180);
         let start_date = if start_date < max_start { max_start } else { start_date };
 
         let (batch_count, by_model, tariffs) = tokio::try_join!(
@@ -222,7 +234,11 @@ pub async fn get_usage<P: PoolProvider>(
             .fold(Decimal::ZERO, |acc, e| acc + e.cost.parse::<Decimal>().unwrap_or(Decimal::ZERO))
             .to_string();
         let total_requests: i64 = by_model.iter().map(|e| e.request_count).sum();
-        let avg = if batch_count > 0 { total_requests as f64 / batch_count as f64 } else { 0.0 };
+        let avg = if batch_count > 0 {
+            total_requests as f64 / batch_count as f64
+        } else {
+            0.0
+        };
 
         (by_model, batch_count, avg, total_cost, tariffs)
     } else {
@@ -246,8 +262,7 @@ pub async fn get_usage<P: PoolProvider>(
         total_output_tokens += entry.output_tokens;
         total_request_count += entry.request_count;
         if let Some(&(input_price, output_price)) = tariffs.get(&entry.model) {
-            estimated_realtime_cost +=
-                Decimal::from(entry.input_tokens) * input_price + Decimal::from(entry.output_tokens) * output_price;
+            estimated_realtime_cost += Decimal::from(entry.input_tokens) * input_price + Decimal::from(entry.output_tokens) * output_price;
         }
     }
 
@@ -262,9 +277,7 @@ pub async fn get_usage<P: PoolProvider>(
         by_model,
     };
 
-    if !has_dates {
-        USAGE_CACHE.insert(current_user.id, usage.clone()).await;
-    }
+    USAGE_CACHE.insert(cache_key, usage.clone()).await;
 
     Ok(Json(usage))
 }
