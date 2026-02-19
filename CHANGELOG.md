@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.2.0](https://github.com/doublewordai/control-layer/compare/v8.1.0...v8.2.0) (2026-02-19)
+
+
+### Features
+
+* persist models page filters across navigations ([#733](https://github.com/doublewordai/control-layer/issues/733)) ([dd7cc9d](https://github.com/doublewordai/control-layer/commit/dd7cc9df24dbb5cfaa744f770767c407e1711e12))
+
 ## [8.1.0](https://github.com/doublewordai/control-layer/compare/v8.0.1...v8.1.0) (2026-02-19)
 
 
