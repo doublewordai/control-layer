@@ -1,5 +1,39 @@
 # Changelog
 
+## [8.3.0](https://github.com/doublewordai/control-layer/compare/v8.2.0...v8.3.0) (2026-02-19)
+
+
+### Features
+
+* UI tweaks got merged onto a lost branch ([#740](https://github.com/doublewordai/control-layer/issues/740)) ([1c7445b](https://github.com/doublewordai/control-layer/commit/1c7445be50cddf23bc5ee7fb9950944e4f9bc1e3))
+
+## [8.2.0](https://github.com/doublewordai/control-layer/compare/v8.1.0...v8.2.0) (2026-02-19)
+
+
+### Features
+
+* persist models page filters across navigations ([#733](https://github.com/doublewordai/control-layer/issues/733)) ([dd7cc9d](https://github.com/doublewordai/control-layer/commit/dd7cc9df24dbb5cfaa744f770767c407e1711e12))
+
+## [8.1.0](https://github.com/doublewordai/control-layer/compare/v8.0.1...v8.1.0) (2026-02-19)
+
+
+### Features
+
+* make demo mode data more realistic ([#731](https://github.com/doublewordai/control-layer/issues/731)) ([17aa9bf](https://github.com/doublewordai/control-layer/commit/17aa9bf874b1c5251fc6e164d60f9a351fcfc01d))
+
+
+### Bug Fixes
+
+* advance to step 2 when manually configuring models in edit endpoint modal ([#728](https://github.com/doublewordai/control-layer/issues/728)) ([fdcf360](https://github.com/doublewordai/control-layer/commit/fdcf36051948ea61b478d5ec741824a23b461d90))
+* omit Secure attribute from cookies when cookie_secure is false ([#730](https://github.com/doublewordai/control-layer/issues/730)) ([e6f936e](https://github.com/doublewordai/control-layer/commit/e6f936ee0ccd2e62edcfca636668bd85d0cf4631))
+
+## [8.0.1](https://github.com/doublewordai/control-layer/compare/v8.0.0...v8.0.1) (2026-02-18)
+
+
+### Bug Fixes
+
+* bump onwards to 0.15.1 ([#726](https://github.com/doublewordai/control-layer/issues/726)) ([b567f15](https://github.com/doublewordai/control-layer/commit/b567f1512ebc9ecdfcb719f7f4ff80ca4c0829bc))
+
 ## [8.0.0](https://github.com/doublewordai/control-layer/compare/v7.5.1...v8.0.0) (2026-02-17)
 
 

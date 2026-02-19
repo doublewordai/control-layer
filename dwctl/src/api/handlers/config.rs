@@ -4,18 +4,14 @@ use axum::{Json, extract::State, response::IntoResponse};
 use serde::Serialize;
 use utoipa::ToSchema;
 
-use crate::{
-    AppState,
-    api::models::{completion_window::format_completion_window, users::CurrentUser},
-};
+use crate::{AppState, api::models::users::CurrentUser};
 
 /// Batch processing configuration
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct BatchConfigResponse {
     /// Whether batch processing is enabled on this instance
     pub enabled: bool,
-    /// Available priority options in display format: "Standard (24h)", "High (1h)".
-    /// Frontend should display these values as-is in dropdowns.
+    /// Available completion windows (e.g., "24h", "1h").
     pub allowed_completion_windows: Vec<String>,
 }
 
@@ -73,18 +69,9 @@ pub async fn get_config(State(state): State<AppState>, _user: CurrentUser) -> im
     let metadata = &state.config.metadata;
 
     let batches_config = if state.config.batches.enabled {
-        // Format internal completion windows for display in UI
-        let allowed_completion_windows = state
-            .config
-            .batches
-            .allowed_completion_windows
-            .iter()
-            .map(|w| format_completion_window(w))
-            .collect();
-
         Some(BatchConfigResponse {
             enabled: state.config.batches.enabled,
-            allowed_completion_windows,
+            allowed_completion_windows: state.config.batches.allowed_completion_windows.clone(),
         })
     } else {
         None
@@ -168,7 +155,7 @@ mod tests {
             .and_then(|v| v.as_array())
             .expect("allowed_completion_windows should be an array");
 
-        // Default config should have formatted "Standard (24h)" priority (converted from "24h")
-        assert!(slas.iter().any(|v| v.as_str() == Some("Standard (24h)")));
+        // Default config should have "24h" completion window
+        assert!(slas.iter().any(|v| v.as_str() == Some("24h")));
     }
 }

@@ -65,9 +65,8 @@ export type Role =
 export type ApiKeyPurpose = "platform" | "realtime" | "batch" | "playground";
 export type TariffApiKeyPurpose = "realtime" | "batch" | "playground";
 
-// Batch priority types
-// API returns formatted priority labels: "Standard (24h)" or "High (1h)"
-export type BatchPriority = "Standard (24h)" | "High (1h)";
+// Batch completion window types
+export type BatchCompletionWindow = "24h" | "1h";
 
 // Config/Metadata types
 export interface ConfigResponse {
@@ -79,7 +78,7 @@ export interface ConfigResponse {
   docs_url: string;
   batches?: {
     enabled: boolean;
-    allowed_completion_windows: string[]; // Formatted priority labels like ["Standard (24h)", "High (1h)"]
+    allowed_completion_windows: string[]; // Raw completion windows like ["24h", "1h"]
   };
   /** Base URL for AI API endpoints (files, batches, daemons). If not set, use relative paths. */
   ai_api_base_url?: string;
@@ -126,7 +125,7 @@ export interface ModelTariff {
   valid_from: string; // ISO 8601 timestamp
   valid_until?: string | null; // ISO 8601 timestamp, null means currently active
   api_key_purpose?: TariffApiKeyPurpose | null;
-  completion_window?: string | null; // Priority name: "Standard (24h)", "High (1h)" (API returns priority names)
+  completion_window?: string | null; // Completion window like "24h", "1h"
   is_active: boolean;
 }
 
@@ -797,7 +796,7 @@ export interface Transaction {
   created_at: string; // ISO 8601 timestamp
   /** Request origin: "api" (direct API), "frontend" (playground), or "fusillade" (batch) */
   request_origin?: string;
-  /** Batch priority: "High (1h)", "Standard (24h)", or empty string for non-batch */
+  /** Batch completion window: "1h", "24h", or empty string for non-batch */
   batch_sla?: string;
   /** Number of requests in this batch (only present for batch transactions) */
   batch_request_count?: number;
@@ -1006,7 +1005,7 @@ export interface Batch {
   endpoint: string;
   errors?: BatchErrors | null;
   input_file_id: string;
-  completion_window: string; // Priority like "Standard (24h)", "High (1h)"
+  completion_window: string; // Completion window like "24h", "1h"
   status: BatchStatus;
   output_file_id?: string | null;
   error_file_id?: string | null;
@@ -1037,7 +1036,7 @@ export interface BatchListResponse {
 export interface BatchCreateRequest {
   input_file_id: string;
   endpoint: string;
-  completion_window: string; // Priority like "Standard (24h)", "High (1h)"
+  completion_window: string; // Completion window like "24h", "1h"
   metadata?: Record<string, string>;
   output_expires_after?: {
     anchor: "created_at";

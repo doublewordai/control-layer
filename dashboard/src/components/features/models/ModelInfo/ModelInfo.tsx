@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from "react";
+import React, { useState, useEffect, useMemo, useCallback } from "react";
 import { useParams, useNavigate, useSearchParams } from "react-router-dom";
 import {
   ArrowLeft,
@@ -11,6 +11,7 @@ import {
   Info,
   Edit,
   Check,
+  Copy,
   GitMerge,
 } from "lucide-react";
 import {
@@ -42,11 +43,7 @@ import { Badge } from "../../../ui/badge";
 import { Button } from "../../../ui/button";
 import { Input } from "../../../ui/input";
 import { Textarea } from "../../../ui/textarea";
-import {
-  HoverCard,
-  HoverCardContent,
-  HoverCardTrigger,
-} from "../../../ui/hover-card";
+import { InfoTip } from "../../../ui/info-tip";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "../../../ui/tabs";
 import {
   Select,
@@ -61,6 +58,11 @@ import { zodResolver } from "@hookform/resolvers/zod";
 import * as z from "zod";
 import { Sparkline } from "../../../ui/sparkline";
 import { Markdown } from "../../../ui/markdown";
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "../../../ui/popover";
 
 // Form schema for alias editing
 const aliasFormSchema = z.object({
@@ -128,9 +130,15 @@ const ModelInfo: React.FC = () => {
   const [settingsError, setSettingsError] = useState<string | null>(null);
   const [showApiExamples, setShowApiExamples] = useState(false);
   const [isEditingAlias, setIsEditingAlias] = useState(false);
+  const [aliasTruncated, setAliasTruncated] = useState(false);
+  const [aliasPopoverOpen, setAliasPopoverOpen] = useState(false);
+  const aliasRef = useCallback((el: HTMLHeadingElement | null) => {
+    if (el) setAliasTruncated(el.scrollWidth > el.clientWidth);
+  }, []);
   const [showAccessModal, setShowAccessModal] = useState(false);
   const [isEditingModelDetails, setIsEditingModelDetails] = useState(false);
   const [showPricingModal, setShowPricingModal] = useState(false);
+  const [aliasCopied, setAliasCopied] = useState(false);
 
   // Alias form
   const aliasForm = useForm<z.infer<typeof aliasFormSchema>>({
@@ -378,9 +386,9 @@ const ModelInfo: React.FC = () => {
             >
               <ArrowLeft className="w-5 h-5" />
             </button>
-            <div className="flex-1">
+            <div className="flex-1 min-w-0">
               <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
-                <div>
+                <div className="min-w-0">
                   {isEditingAlias ? (
                     <div className="space-y-2">
                       <Form {...aliasForm}>
@@ -435,10 +443,53 @@ const ModelInfo: React.FC = () => {
                       )}
                     </div>
                   ) : (
-                    <div className="flex items-center gap-3">
-                      <h1 className="text-3xl font-bold text-doubleword-neutral-900">
-                        {model.alias}
-                      </h1>
+                    <div className="flex items-center gap-3 min-w-0">
+                      {aliasTruncated ? (
+                        <Popover open={aliasPopoverOpen} onOpenChange={setAliasPopoverOpen}>
+                          <PopoverTrigger asChild>
+                            <h1
+                              ref={aliasRef}
+                              className="text-3xl font-bold text-doubleword-neutral-900 truncate min-w-0 cursor-default"
+                              onMouseEnter={() => setAliasPopoverOpen(true)}
+                              onMouseLeave={() => setAliasPopoverOpen(false)}
+                            >
+                              {model.alias}
+                            </h1>
+                          </PopoverTrigger>
+                          <PopoverContent
+                            side="bottom"
+                            align="start"
+                            className="w-auto max-w-sm px-3 py-2 pointer-events-none"
+                            onOpenAutoFocus={(e) => e.preventDefault()}
+                          >
+                            <p className="text-sm break-all font-medium">{model.alias}</p>
+                          </PopoverContent>
+                        </Popover>
+                      ) : (
+                        <h1
+                          ref={aliasRef}
+                          className="text-3xl font-bold text-doubleword-neutral-900 truncate min-w-0"
+                        >
+                          {model.alias}
+                        </h1>
+                      )}
+                      <button
+                        type="button"
+                        className="shrink-0 p-1 text-gray-400 hover:text-gray-600 transition-colors"
+                        aria-label="Copy model alias"
+                        onClick={() => {
+                          navigator.clipboard.writeText(model.alias).then(() => {
+                            setAliasCopied(true);
+                            setTimeout(() => setAliasCopied(false), 1500);
+                          });
+                        }}
+                      >
+                        {aliasCopied ? (
+                          <Check className="h-4 w-4 text-green-600" />
+                        ) : (
+                          <Copy className="h-4 w-4" />
+                        )}
+                      </button>
                       {/* Status indicator */}
                       {modelProbe && (
                         <div className="flex items-center gap-2">
@@ -489,8 +540,8 @@ const ModelInfo: React.FC = () => {
                       </p>
                     )}
                 </div>
-                <div className="flex items-center justify-center sm:justify-start gap-3">
-                  {canManageGroups && (
+                {canManageGroups && (
+                  <div className="flex items-center justify-center sm:justify-start gap-3">
                     <TabsList className="w-full sm:w-auto">
                       <TabsTrigger
                         value="overview"
@@ -523,8 +574,8 @@ const ModelInfo: React.FC = () => {
                         </TabsTrigger>
                       )}
                     </TabsList>
-                  )}
-                </div>
+                  </div>
+                )}
               </div>
             </div>
           </div>
@@ -611,18 +662,13 @@ const ModelInfo: React.FC = () => {
                           <label className="text-sm text-gray-600">
                             Description
                           </label>
-                          <HoverCard openDelay={100} closeDelay={50}>
-                            <HoverCardTrigger asChild>
-                              <Info className="h-3 w-3 text-gray-400 hover:text-gray-600" />
-                            </HoverCardTrigger>
-                            <HoverCardContent className="w-80" sideOffset={5}>
-                              <p className="text-sm text-muted-foreground">
-                                User provided description for the model.
-                                Displayed to all users when viewing the model on
-                                the overview page.
-                              </p>
-                            </HoverCardContent>
-                          </HoverCard>
+                          <InfoTip>
+                            <p className="text-sm text-muted-foreground">
+                              User provided description for the model.
+                              Displayed to all users when viewing the model on
+                              the overview page.
+                            </p>
+                          </InfoTip>
                         </div>
                         <Textarea
                           value={updateData.description}
@@ -676,19 +722,11 @@ const ModelInfo: React.FC = () => {
                                 className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70 flex items-center gap-1"
                               >
                                 Vision
-                                <HoverCard openDelay={100} closeDelay={50}>
-                                  <HoverCardTrigger asChild>
-                                    <Info className="h-3 w-3 text-gray-400 hover:text-gray-600" />
-                                  </HoverCardTrigger>
-                                  <HoverCardContent
-                                    className="w-80"
-                                    sideOffset={5}
-                                  >
-                                    <p className="text-sm text-muted-foreground">
-                                      Enables image upload in the playground.
-                                    </p>
-                                  </HoverCardContent>
-                                </HoverCard>
+                                <InfoTip>
+                                  <p className="text-sm text-muted-foreground">
+                                    Enables image upload in the playground.
+                                  </p>
+                                </InfoTip>
                               </label>
                             </div>
                           </div>
@@ -702,16 +740,12 @@ const ModelInfo: React.FC = () => {
                             <label className="text-sm text-gray-600 font-medium">
                               Response Configuration
                             </label>
-                            <HoverCard openDelay={100} closeDelay={50}>
-                              <HoverCardTrigger asChild>
-                                <Info className="h-3 w-3 text-gray-400 hover:text-gray-600" />
-                              </HoverCardTrigger>
-                              <HoverCardContent className="w-80" sideOffset={5}>
-                                <p className="text-sm text-muted-foreground">
-                                  Configure how responses from this model are processed before being returned to clients.
-                                </p>
-                              </HoverCardContent>
-                            </HoverCard>
+                            <InfoTip>
+                              <p className="text-sm text-muted-foreground">
+                                Configure how responses from this model are
+                                processed before being returned to clients.
+                              </p>
+                            </InfoTip>
                           </div>
 
                           {/* Show sanitize_responses for virtual models */}
@@ -734,19 +768,13 @@ const ModelInfo: React.FC = () => {
                                 className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70 flex items-center gap-1"
                               >
                                 Sanitize Responses
-                                <HoverCard openDelay={100} closeDelay={50}>
-                                  <HoverCardTrigger asChild>
-                                    <Info className="h-3 w-3 text-gray-400 hover:text-gray-600" />
-                                  </HoverCardTrigger>
-                                  <HoverCardContent
-                                    className="w-80"
-                                    sideOffset={5}
-                                  >
-                                    <p className="text-sm text-muted-foreground">
-                                      Filter out third-party provider fields from OpenAI compatible responses to ensure clean, standardized API responses.
-                                    </p>
-                                  </HoverCardContent>
-                                </HoverCard>
+                                <InfoTip>
+                                  <p className="text-sm text-muted-foreground">
+                                    Filter out third-party provider fields from
+                                    OpenAI compatible responses to ensure clean,
+                                    standardized API responses.
+                                  </p>
+                                </InfoTip>
                               </label>
                             </div>
                           )}
@@ -771,19 +799,15 @@ const ModelInfo: React.FC = () => {
                                 className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70 flex items-center gap-1"
                               >
                                 Trusted Provider
-                                <HoverCard openDelay={100} closeDelay={50}>
-                                  <HoverCardTrigger asChild>
-                                    <Info className="h-3 w-3 text-gray-400 hover:text-gray-600" />
-                                  </HoverCardTrigger>
-                                  <HoverCardContent
-                                    className="w-80"
-                                    sideOffset={5}
-                                  >
-                                    <p className="text-sm text-muted-foreground">
-                                      Mark this provider as trusted in strict mode. Trusted providers bypass error sanitization, allowing full error details to be returned. Non-trusted providers have sensitive error information removed.
-                                    </p>
-                                  </HoverCardContent>
-                                </HoverCard>
+                                <InfoTip>
+                                  <p className="text-sm text-muted-foreground">
+                                    Mark this provider as trusted in strict mode.
+                                    Trusted providers bypass error sanitization,
+                                    allowing full error details to be returned.
+                                    Non-trusted providers have sensitive error
+                                    information removed.
+                                  </p>
+                                </InfoTip>
                               </label>
                             </div>
                           )}
@@ -796,38 +820,25 @@ const ModelInfo: React.FC = () => {
                           <label className="text-sm text-gray-600 font-medium">
                             Global Rate Limiting
                           </label>
-                          <HoverCard openDelay={100} closeDelay={50}>
-                            <HoverCardTrigger asChild>
-                              <Info className="h-3 w-3 text-gray-400 hover:text-gray-600" />
-                            </HoverCardTrigger>
-                            <HoverCardContent className="w-80" sideOffset={5}>
-                              <p className="text-sm text-muted-foreground">
-                                Set system-wide rate limits for this model.
-                                These apply to all users and override individual
-                                API key limits.
-                              </p>
-                            </HoverCardContent>
-                          </HoverCard>
+                          <InfoTip>
+                            <p className="text-sm text-muted-foreground">
+                              Set system-wide rate limits for this model.
+                              These apply to all users and override individual
+                              API key limits.
+                            </p>
+                          </InfoTip>
                         </div>
                         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                           <div>
                             <label className="text-sm text-gray-600 mb-2 flex items-center gap-1">
                               Requests per Second
-                              <HoverCard openDelay={100} closeDelay={50}>
-                                <HoverCardTrigger asChild>
-                                  <Info className="h-3 w-3 text-gray-400 hover:text-gray-600" />
-                                </HoverCardTrigger>
-                                <HoverCardContent
-                                  className="w-80"
-                                  sideOffset={5}
-                                >
-                                  <p className="text-sm text-muted-foreground">
-                                    Sustained request rate limit. Temporary
-                                    bursts can exceed this up to the burst size.
-                                    Exceeding this limit returns 429 errors.
-                                  </p>
-                                </HoverCardContent>
-                              </HoverCard>
+                              <InfoTip>
+                                <p className="text-sm text-muted-foreground">
+                                  Sustained request rate limit. Temporary
+                                  bursts can exceed this up to the burst size.
+                                  Exceeding this limit returns 429 errors.
+                                </p>
+                              </InfoTip>
                             </label>
                             <Input
                               type="number"
@@ -855,20 +866,12 @@ const ModelInfo: React.FC = () => {
                           <div>
                             <label className="text-sm text-gray-600 mb-2 flex items-center gap-1">
                               Burst Size
-                              <HoverCard openDelay={100} closeDelay={50}>
-                                <HoverCardTrigger asChild>
-                                  <Info className="h-3 w-3 text-gray-400 hover:text-gray-600" />
-                                </HoverCardTrigger>
-                                <HoverCardContent
-                                  className="w-80"
-                                  sideOffset={5}
-                                >
-                                  <p className="text-sm text-muted-foreground">
-                                    Maximum number of requests allowed in a
-                                    temporary burst above the sustained rate.
-                                  </p>
-                                </HoverCardContent>
-                              </HoverCard>
+                              <InfoTip>
+                                <p className="text-sm text-muted-foreground">
+                                  Maximum number of requests allowed in a
+                                  temporary burst above the sustained rate.
+                                </p>
+                              </InfoTip>
                             </label>
                             <Input
                               type="number"
@@ -895,21 +898,13 @@ const ModelInfo: React.FC = () => {
                           <div>
                             <label className="text-sm text-gray-600 mb-2 flex items-center gap-1">
                               Maximum Concurrent Requests
-                              <HoverCard openDelay={100} closeDelay={50}>
-                                <HoverCardTrigger asChild>
-                                  <Info className="h-3 w-3 text-gray-400 hover:text-gray-600" />
-                                </HoverCardTrigger>
-                                <HoverCardContent
-                                  className="w-80"
-                                  sideOffset={5}
-                                >
-                                  <p className="text-sm text-muted-foreground">
-                                    Maximum number of requests that can be
-                                    processed concurrently. Exceeding this limit
-                                    returns 429 errors.
-                                  </p>
-                                </HoverCardContent>
-                              </HoverCard>
+                              <InfoTip>
+                                <p className="text-sm text-muted-foreground">
+                                  Maximum number of requests that can be
+                                  processed concurrently. Exceeding this limit
+                                  returns 429 errors.
+                                </p>
+                              </InfoTip>
                             </label>
                             <Input
                               type="number"
@@ -936,22 +931,14 @@ const ModelInfo: React.FC = () => {
                           <div>
                             <label className="text-sm text-gray-600 mb-2 flex items-center gap-1">
                               Per-Daemon Batch Concurrency
-                              <HoverCard openDelay={100} closeDelay={50}>
-                                <HoverCardTrigger asChild>
-                                  <Info className="h-3 w-3 text-gray-400 hover:text-gray-600" />
-                                </HoverCardTrigger>
-                                <HoverCardContent
-                                  className="w-80"
-                                  sideOffset={5}
-                                >
-                                  <p className="text-sm text-muted-foreground">
-                                    Maximum concurrent batch requests each
-                                    daemon can send to this model. Total
-                                    capacity scales with the number of running
-                                    daemons.
-                                  </p>
-                                </HoverCardContent>
-                              </HoverCard>
+                              <InfoTip>
+                                <p className="text-sm text-muted-foreground">
+                                  Maximum concurrent batch requests each
+                                  daemon can send to this model. Total
+                                  capacity scales with the number of running
+                                  daemons.
+                                </p>
+                              </InfoTip>
                             </label>
                             <Input
                               type="number"
@@ -1085,91 +1072,60 @@ const ModelInfo: React.FC = () => {
                     </div>
                   ) : (
                     <div className="space-y-6">
+                      {canManageGroups && (
                       <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-                        {canManageGroups && (
                           <div>
                             <div className="flex items-center gap-1 mb-1">
                               <p className="text-sm text-gray-600">Full Name</p>
-                              <HoverCard openDelay={100} closeDelay={50}>
-                                <HoverCardTrigger asChild>
-                                  <Info className="h-3 w-3 text-gray-400 hover:text-gray-600 " />
-                                </HoverCardTrigger>
-                                <HoverCardContent
-                                  className="w-80"
-                                  sideOffset={5}
-                                >
-                                  <p className="text-sm text-muted-foreground">
-                                    The name under which the model is available
-                                    at the upstream endpoint.
-                                  </p>
-                                </HoverCardContent>
-                              </HoverCard>
+                              <InfoTip>
+                                <p className="text-sm text-muted-foreground">
+                                  The name under which the model is available
+                                  at the upstream endpoint.
+                                </p>
+                              </InfoTip>
                             </div>
                             <p className="font-medium">{model.model_name}</p>
                           </div>
-                        )}
-                        {canManageGroups && (
                           <div>
                             <div className="flex items-center gap-1 mb-1">
                               <p className="text-sm text-gray-600">Alias</p>
-                              <HoverCard openDelay={100} closeDelay={50}>
-                                <HoverCardTrigger asChild>
-                                  <Info className="h-3 w-3 text-gray-400 hover:text-gray-600 " />
-                                </HoverCardTrigger>
-                                <HoverCardContent
-                                  className="w-80"
-                                  sideOffset={5}
-                                >
-                                  <p className="text-sm text-muted-foreground">
-                                    The name under which the model will be made
-                                    available in the control layer API.
-                                  </p>
-                                </HoverCardContent>
-                              </HoverCard>
+                              <InfoTip>
+                                <p className="text-sm text-muted-foreground">
+                                  The name under which the model will be made
+                                  available in the control layer API.
+                                </p>
+                              </InfoTip>
                             </div>
                             <p className="font-medium">{model.alias}</p>
                           </div>
-                        )}
-                        {canManageGroups && (
                           <div>
                             <div className="flex items-center gap-1 mb-1">
                               <p className="text-sm text-gray-600">Type</p>
-                              <HoverCard openDelay={100} closeDelay={50}>
-                                <HoverCardTrigger asChild>
-                                  <Info className="h-3 w-3 text-gray-400 hover:text-gray-600" />
-                                </HoverCardTrigger>
-                                <HoverCardContent
-                                  className="w-80"
-                                  sideOffset={5}
-                                >
-                                  <p className="text-sm text-muted-foreground">
-                                    The type of the model. Determines which
-                                    playground is used.
-                                  </p>
-                                </HoverCardContent>
-                              </HoverCard>
+                              <InfoTip>
+                                <p className="text-sm text-muted-foreground">
+                                  The type of the model. Determines which
+                                  playground is used.
+                                </p>
+                              </InfoTip>
                             </div>
                             <Badge variant="outline">
                               {model.model_type || "UNKNOWN"}
                             </Badge>
                           </div>
-                        )}
                       </div>
+                      )}
                       <div>
                         <div className="flex items-center gap-1 mb-1">
                           <p className="text-sm text-gray-600">Description</p>
-                          <HoverCard openDelay={100} closeDelay={50}>
-                            <HoverCardTrigger asChild>
-                              <Info className="h-3 w-3 text-gray-400 hover:text-gray-600" />
-                            </HoverCardTrigger>
-                            <HoverCardContent className="w-80" sideOffset={5}>
+                          {canManageGroups && (
+                            <InfoTip>
                               <p className="text-sm text-muted-foreground">
                                 User provided description for the model.
                                 Displayed to all users when viewing the model on
                                 the overview page.
                               </p>
-                            </HoverCardContent>
-                          </HoverCard>
+                            </InfoTip>
+                          )}
                         </div>
                         {model.description ? (
                           <Markdown className="text-sm text-gray-700">
@@ -1233,20 +1189,12 @@ const ModelInfo: React.FC = () => {
                                     className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70 flex items-center gap-1"
                                   >
                                     Vision
-                                    <HoverCard openDelay={100} closeDelay={50}>
-                                      <HoverCardTrigger asChild>
-                                        <Info className="h-3 w-3 text-gray-400 hover:text-gray-600" />
-                                      </HoverCardTrigger>
-                                      <HoverCardContent
-                                        className="w-80"
-                                        sideOffset={5}
-                                      >
-                                        <p className="text-sm text-muted-foreground">
-                                          Enables image upload in the
-                                          playground.
-                                        </p>
-                                      </HoverCardContent>
-                                    </HoverCard>
+                                    <InfoTip>
+                                      <p className="text-sm text-muted-foreground">
+                                        Enables image upload in the
+                                        playground.
+                                      </p>
+                                    </InfoTip>
                                   </label>
                                 </div>
                               </div>
@@ -1262,23 +1210,16 @@ const ModelInfo: React.FC = () => {
                               <p className="text-sm text-gray-600">
                                 Pricing Tariffs
                               </p>
-                              <HoverCard openDelay={100} closeDelay={50}>
-                                <HoverCardTrigger asChild>
-                                  <Info className="h-3 w-3 text-gray-400 hover:text-gray-600" />
-                                </HoverCardTrigger>
-                                <HoverCardContent
-                                  className="w-80"
-                                  sideOffset={5}
-                                >
+                              {canManageGroups && (
+                                <InfoTip>
                                   <p className="text-sm text-muted-foreground">
                                     Pricing tiers for different API key
                                     purposes. Set different rates for realtime,
-                                    batch, and playground usage.
-                                    {canManageGroups &&
-                                      ` Click "Manage Tariffs" to configure pricing.`}
+                                    batch, and playground usage. Click "Manage
+                                    Tariffs" to configure pricing.
                                   </p>
-                                </HoverCardContent>
-                              </HoverCard>
+                                </InfoTip>
+                              )}
                             </div>
                             {canManageGroups && (
                               <Button
@@ -1362,41 +1303,25 @@ const ModelInfo: React.FC = () => {
                               <p className="text-sm text-gray-600">
                                 Rate Limiting & Capacity
                               </p>
-                              <HoverCard openDelay={100} closeDelay={50}>
-                                <HoverCardTrigger asChild>
-                                  <Info className="h-3 w-3 text-gray-400 hover:text-gray-600" />
-                                </HoverCardTrigger>
-                                <HoverCardContent
-                                  className="w-80"
-                                  sideOffset={5}
-                                >
-                                  <p className="text-sm text-muted-foreground">
-                                    Rate limits control request throughput.
-                                    Capacity limits control concurrent requests.
-                                  </p>
-                                </HoverCardContent>
-                              </HoverCard>
+                              <InfoTip>
+                                <p className="text-sm text-muted-foreground">
+                                  Rate limits control request throughput.
+                                  Capacity limits control concurrent requests.
+                                </p>
+                              </InfoTip>
                             </div>
                             <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                               <div>
                                 <p className="text-xs text-gray-500 mb-1 flex items-center gap-1">
                                   Requests per Second
-                                  <HoverCard openDelay={100} closeDelay={50}>
-                                    <HoverCardTrigger asChild>
-                                      <Info className="h-3 w-3 text-gray-400 hover:text-gray-600" />
-                                    </HoverCardTrigger>
-                                    <HoverCardContent
-                                      className="w-80"
-                                      sideOffset={5}
-                                    >
-                                      <p className="text-sm text-muted-foreground">
-                                        Sustained request rate limit. Temporary
-                                        bursts can exceed this up to the burst
-                                        size. Exceeding this limit returns 429
-                                        errors.
-                                      </p>
-                                    </HoverCardContent>
-                                  </HoverCard>
+                                  <InfoTip>
+                                    <p className="text-sm text-muted-foreground">
+                                      Sustained request rate limit. Temporary
+                                      bursts can exceed this up to the burst
+                                      size. Exceeding this limit returns 429
+                                      errors.
+                                    </p>
+                                  </InfoTip>
                                 </p>
                                 <p className="font-medium">
                                   {model.requests_per_second
@@ -1407,21 +1332,13 @@ const ModelInfo: React.FC = () => {
                               <div>
                                 <p className="text-xs text-gray-500 mb-1 flex items-center gap-1">
                                   Burst Size
-                                  <HoverCard openDelay={100} closeDelay={50}>
-                                    <HoverCardTrigger asChild>
-                                      <Info className="h-3 w-3 text-gray-400 hover:text-gray-600" />
-                                    </HoverCardTrigger>
-                                    <HoverCardContent
-                                      className="w-80"
-                                      sideOffset={5}
-                                    >
-                                      <p className="text-sm text-muted-foreground">
-                                        Maximum number of requests allowed in a
-                                        temporary burst above the sustained
-                                        rate.
-                                      </p>
-                                    </HoverCardContent>
-                                  </HoverCard>
+                                  <InfoTip>
+                                    <p className="text-sm text-muted-foreground">
+                                      Maximum number of requests allowed in a
+                                      temporary burst above the sustained
+                                      rate.
+                                    </p>
+                                  </InfoTip>
                                 </p>
                                 <p className="font-medium">
                                   {model.burst_size
@@ -1432,21 +1349,13 @@ const ModelInfo: React.FC = () => {
                               <div>
                                 <p className="text-xs text-gray-500 mb-1 flex items-center gap-1">
                                   Maximum Concurrent Requests
-                                  <HoverCard openDelay={100} closeDelay={50}>
-                                    <HoverCardTrigger asChild>
-                                      <Info className="h-3 w-3 text-gray-400 hover:text-gray-600" />
-                                    </HoverCardTrigger>
-                                    <HoverCardContent
-                                      className="w-80"
-                                      sideOffset={5}
-                                    >
-                                      <p className="text-sm text-muted-foreground">
-                                        Maximum number of requests that can be
-                                        processed concurrently. Exceeding this
-                                        limit returns 429 errors.
-                                      </p>
-                                    </HoverCardContent>
-                                  </HoverCard>
+                                  <InfoTip>
+                                    <p className="text-sm text-muted-foreground">
+                                      Maximum number of requests that can be
+                                      processed concurrently. Exceeding this
+                                      limit returns 429 errors.
+                                    </p>
+                                  </InfoTip>
                                 </p>
                                 <p className="font-medium">
                                   {model.capacity
@@ -1457,22 +1366,14 @@ const ModelInfo: React.FC = () => {
                               <div>
                                 <p className="text-xs text-gray-500 mb-1 flex items-center gap-1">
                                   Per-Daemon Batch Concurrency
-                                  <HoverCard openDelay={100} closeDelay={50}>
-                                    <HoverCardTrigger asChild>
-                                      <Info className="h-3 w-3 text-gray-400 hover:text-gray-600" />
-                                    </HoverCardTrigger>
-                                    <HoverCardContent
-                                      className="w-80"
-                                      sideOffset={5}
-                                    >
-                                      <p className="text-sm text-muted-foreground">
-                                        Maximum concurrent batch requests each
-                                        daemon can send to this model. Total
-                                        capacity scales with the number of
-                                        running daemons.
-                                      </p>
-                                    </HoverCardContent>
-                                  </HoverCard>
+                                  <InfoTip>
+                                    <p className="text-sm text-muted-foreground">
+                                      Maximum concurrent batch requests each
+                                      daemon can send to this model. Total
+                                      capacity scales with the number of
+                                      running daemons.
+                                    </p>
+                                  </InfoTip>
                                 </p>
                                 <p className="font-medium">
                                   {model.batch_capacity
@@ -1545,16 +1446,11 @@ const ModelInfo: React.FC = () => {
                           <p className="text-sm text-gray-600">
                             Total Requests
                           </p>
-                          <HoverCard openDelay={100} closeDelay={50}>
-                            <HoverCardTrigger asChild>
-                              <Info className="h-3 w-3 text-gray-400 hover:text-gray-600 " />
-                            </HoverCardTrigger>
-                            <HoverCardContent className="w-40" sideOffset={5}>
-                              <p className="text-xs text-muted-foreground">
-                                Total requests made to this model
-                              </p>
-                            </HoverCardContent>
-                          </HoverCard>
+                          <InfoTip className="w-40">
+                            <p className="text-xs text-muted-foreground">
+                              Total requests made to this model
+                            </p>
+                          </InfoTip>
                         </div>
                         <p className="text-xl font-bold text-gray-900">
                           {model.metrics.total_requests.toLocaleString()}
@@ -1563,16 +1459,11 @@ const ModelInfo: React.FC = () => {
                       <div>
                         <div className="flex items-center gap-1 mb-1">
                           <p className="text-sm text-gray-600">Avg Latency</p>
-                          <HoverCard openDelay={100} closeDelay={50}>
-                            <HoverCardTrigger asChild>
-                              <Info className="h-3 w-3 text-gray-400 hover:text-gray-600 " />
-                            </HoverCardTrigger>
-                            <HoverCardContent className="w-40" sideOffset={5}>
-                              <p className="text-xs text-muted-foreground">
-                                Average response time across all requests
-                              </p>
-                            </HoverCardContent>
-                          </HoverCard>
+                          <InfoTip className="w-40">
+                            <p className="text-xs text-muted-foreground">
+                              Average response time across all requests
+                            </p>
+                          </InfoTip>
                         </div>
                         <p className="text-xl font-bold text-gray-900">
                           {model.metrics.avg_latency_ms
@@ -1585,26 +1476,21 @@ const ModelInfo: React.FC = () => {
                       <div>
                         <div className="flex items-center gap-1 mb-1">
                           <p className="text-sm text-gray-600">Total Tokens</p>
-                          <HoverCard openDelay={100} closeDelay={50}>
-                            <HoverCardTrigger asChild>
-                              <Info className="h-3 w-3 text-gray-400 hover:text-gray-600 " />
-                            </HoverCardTrigger>
-                            <HoverCardContent className="w-48" sideOffset={5}>
-                              <div className="text-xs text-muted-foreground">
-                                <p>
-                                  Input:{" "}
-                                  {model.metrics.total_input_tokens.toLocaleString()}
-                                </p>
-                                <p>
-                                  Output:{" "}
-                                  {model.metrics.total_output_tokens.toLocaleString()}
-                                </p>
-                                <p className="mt-1 font-medium">
-                                  Total tokens processed
-                                </p>
-                              </div>
-                            </HoverCardContent>
-                          </HoverCard>
+                          <InfoTip className="w-48">
+                            <div className="text-xs text-muted-foreground">
+                              <p>
+                                Input:{" "}
+                                {model.metrics.total_input_tokens.toLocaleString()}
+                              </p>
+                              <p>
+                                Output:{" "}
+                                {model.metrics.total_output_tokens.toLocaleString()}
+                              </p>
+                              <p className="mt-1 font-medium">
+                                Total tokens processed
+                              </p>
+                            </div>
+                          </InfoTip>
                         </div>
                         <p className="text-xl font-bold text-gray-900">
                           {(
@@ -1621,16 +1507,11 @@ const ModelInfo: React.FC = () => {
                       <div>
                         <div className="flex items-center gap-1 mb-1">
                           <p className="text-sm text-gray-600">Last Active</p>
-                          <HoverCard openDelay={100} closeDelay={50}>
-                            <HoverCardTrigger asChild>
-                              <Info className="h-3 w-3 text-gray-400 hover:text-gray-600 " />
-                            </HoverCardTrigger>
-                            <HoverCardContent className="w-36" sideOffset={5}>
-                              <p className="text-xs text-muted-foreground">
-                                Last request received
-                              </p>
-                            </HoverCardContent>
-                          </HoverCard>
+                          <InfoTip className="w-36">
+                            <p className="text-xs text-muted-foreground">
+                              Last request received
+                            </p>
+                          </InfoTip>
                         </div>
                         <p className="text-xl font-bold text-gray-900">
                           {model.metrics.last_active_at
