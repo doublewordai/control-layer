@@ -268,7 +268,7 @@ describe("Playground Component - Functional Tests", () => {
   it("loads embedding playground and compares text similarity", async () => {
     const user = userEvent.setup();
     const { container } = render(<Playground />, {
-      wrapper: createWrapper(["/?model=embedding-small"]),
+      wrapper: createWrapper(["/?model=text-embedding-3-small"]),
     });
 
     // Wait for embedding playground to load

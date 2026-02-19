@@ -286,6 +286,7 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
 
   const handleConfigureManually = () => {
     setManualMode(true);
+    setCurrentStep(2);
     setValidationState("idle");
     setValidationError(null);
 
@@ -696,18 +697,19 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
                   )}
                 />
 
-                {endpoint.requires_api_key && (
-                  <FormField
-                    control={form.control}
-                    name="apiKey"
-                    render={({ field }) => (
-                      <FormItem>
-                        <FormLabel>
-                          API Key (optional)
+                <FormField
+                  control={form.control}
+                  name="apiKey"
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>
+                        API Key (optional)
+                        {endpoint.requires_api_key && (
                           <span className="text-xs text-gray-500 ml-2">
                             Leave empty to keep existing key
                           </span>
-                        </FormLabel>
+                        )}
+                      </FormLabel>
                         <FormControl>
                           <div className="relative">
                             <Input
@@ -735,7 +737,6 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
                       </FormItem>
                     )}
                   />
-                )}
 
                 {/* Advanced Configuration and Auto-discover */}
                 <div className="flex items-center justify-between">

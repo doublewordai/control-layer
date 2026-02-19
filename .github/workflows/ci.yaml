@@ -54,22 +54,22 @@ jobs:
 
           if [ -f coverage/lcov.info ]; then
             echo "Found lcov.info, extracting coverage..."
-            
+
             # Parse coverage/lcov.info using awk (clean and always available)
             COVERAGE=$(awk '
               /^LF:/ { lf += $2 }
               /^LH:/ { lh += $2 }
-              END { 
-                if (lf > 0) 
+              END {
+                if (lf > 0)
                   printf "%.2f", (lh * 100) / lf
-                else 
+                else
                   print "0"
               }
             ' FS=: coverage/lcov.info)
-            
+
             echo "coverage=$COVERAGE" >> $GITHUB_OUTPUT
             echo "Frontend code coverage: ${COVERAGE}%"
-            
+
             # Report coverage to Somnial
             curl -X POST "https://charts.somnial.co/doubleword-control-layer/frontend-code-coverage?value=${COVERAGE}" || true
           else
@@ -158,22 +158,22 @@ jobs:
 
           if [ -f lcov.info ]; then
             echo "Found lcov.info, parsing coverage data..."
-            
+
             # Parse lcov.info using awk (clean and always available)
             COVERAGE=$(awk '
               /^LF:/ { lf += $2 }
               /^LH:/ { lh += $2 }
-              END { 
-                if (lf > 0) 
+              END {
+                if (lf > 0)
                   printf "%.2f", (lh * 100) / lf
-                else 
+                else
                   print "0"
               }
             ' FS=: lcov.info)
-            
+
             echo "coverage=$COVERAGE" >> $GITHUB_OUTPUT
             echo "Backend code coverage: ${COVERAGE}%"
-            
+
             # Report coverage to Somnial
             curl -X POST "https://charts.somnial.co/doubleword-control-layer/backend-code-coverage?value=${COVERAGE}" || true
           else
@@ -210,7 +210,7 @@ jobs:
           images: ghcr.io/doublewordai/control-layer
           sep-tags: "\n"
           tags: |
-            type=sha,event=branch,prefix=sha-
+            type=sha,prefix=sha-
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest,enable=${{ github.event_name == 'release' }}
@@ -404,26 +404,6 @@ jobs:
               }
             })
             console.log(`Triggered deployment for version ${{ github.event.release.tag_name }}`)
-
-  notify-downstream:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [build]
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Dispatch to downstream
-        uses: actions/github-script@v8
-        with:
-          github-token: ${{ secrets.DEPLOY_PAT }}
-          script: |
-            await github.rest.repos.createDispatchEvent({
-              owner: '${{ secrets.DEPLOY_TARGET_OWNER }}',
-              repo: '${{ secrets.DEPLOY_TARGET_REPO }}',
-              event_type: 'control-layer-main-push',
-              client_payload: {
-                sha: context.sha
-              }
-            })
 
   publish-crates:
     if: github.event_name == 'release' && !github.event.release.prerelease

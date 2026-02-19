@@ -4,66 +4,169 @@
       "id": "f914c573-4c00-4a37-a878-53318a6d5a5b",
       "alias": "claude-sonnet-4",
       "model_name": "claude-sonnet-4-20250514",
-      "description": "Claude Sonnet 4 model by Anthropic",
+      "description": "Claude Sonnet 4 by Anthropic - fast, capable chat model",
       "model_type": "CHAT",
       "capabilities": ["text"],
       "hosted_on": "b2c3d4e5-f678-9012-3456-7890abcdef01",
-      "pricing": {
-        "input_price_per_token": "0.000003",
-        "output_price_per_token": "0.000015"
-      }
+      "created_by": "550e8400-e29b-41d4-a716-446655440001",
+      "created_at": "2025-06-01T10:00:00Z",
+      "updated_at": "2025-12-15T14:30:00Z",
+      "is_composite": false,
+      "sanitize_responses": false
+    },
+    {
+      "id": "a1b2c3d4-0001-4a37-a878-53318a6d5001",
+      "alias": "claude-opus-4",
+      "model_name": "claude-opus-4-20250514",
+      "description": "Claude Opus 4 by Anthropic - highest capability model",
+      "model_type": "CHAT",
+      "capabilities": ["text"],
+      "hosted_on": "b2c3d4e5-f678-9012-3456-7890abcdef01",
+      "created_by": "550e8400-e29b-41d4-a716-446655440001",
+      "created_at": "2025-06-01T10:00:00Z",
+      "updated_at": "2025-12-15T14:30:00Z",
+      "is_composite": false,
+      "sanitize_responses": false
     },
     {
       "id": "4c561f35-4823-4d25-aa70-72bbf314a6ba",
       "alias": "gpt-4o",
       "model_name": "gpt-4o",
-      "description": "OpenAI GPT-4o model with vision capabilities",
+      "description": "OpenAI GPT-4o with vision capabilities",
       "model_type": "CHAT",
       "capabilities": ["text", "vision"],
       "hosted_on": "c3d4e5f6-7890-1234-5678-90abcdef0123",
-      "pricing": {
-        "input_price_per_token": "0.0000025",
-        "output_price_per_token": "0.00001"
-      }
+      "created_by": "550e8400-e29b-41d4-a716-446655440001",
+      "created_at": "2025-04-15T11:00:00Z",
+      "updated_at": "2025-11-20T09:45:00Z",
+      "is_composite": false,
+      "sanitize_responses": false
+    },
+    {
+      "id": "a1b2c3d4-0002-4a37-a878-53318a6d5002",
+      "alias": "gpt-4o-mini",
+      "model_name": "gpt-4o-mini",
+      "description": "OpenAI GPT-4o Mini - fast and cost-effective",
+      "model_type": "CHAT",
+      "capabilities": ["text", "vision"],
+      "hosted_on": "c3d4e5f6-7890-1234-5678-90abcdef0123",
+      "created_by": "550e8400-e29b-41d4-a716-446655440001",
+      "created_at": "2025-05-20T08:30:00Z",
+      "updated_at": "2025-10-10T16:15:00Z",
+      "is_composite": false,
+      "sanitize_responses": false
     },
     {
       "id": "beb5ecb0-8f93-499f-aae0-a9aee9512adf",
       "alias": "deepseek-v3",
       "model_name": "deepseek-v3",
-      "description": "DeepSeek V3 model for reasoning and coding",
+      "description": "DeepSeek V3 - open-source reasoning model",
       "model_type": "CHAT",
       "capabilities": ["text", "reasoning"],
       "hosted_on": "a1b2c3d4-e5f6-7890-1234-567890abcdef",
-      "pricing": {
-        "input_price_per_token": null,
-        "output_price_per_token": null
-      }
+      "created_by": "550e8400-e29b-41d4-a716-446655440001",
+      "created_at": "2025-07-10T14:00:00Z",
+      "updated_at": "2025-12-05T11:30:00Z",
+      "is_composite": false,
+      "sanitize_responses": false
     },
     {
-      "id": "b8c9d0e1-2345-6789-0123-bcdef1234567",
-      "alias": "llama-3-2-11b-vision",
-      "model_name": "llama-3-2-11b-vision",
-      "description": "Meta Llama 3.2 11B with vision capabilities",
+      "id": "a1b2c3d4-0003-4a37-a878-53318a6d5003",
+      "alias": "llama-3.3-70b",
+      "model_name": "meta-llama/Llama-3.3-70B-Instruct",
+      "description": "Meta Llama 3.3 70B - open-weight instruction-tuned model",
+      "model_type": "CHAT",
+      "capabilities": ["text"],
+      "hosted_on": "a1b2c3d4-e5f6-7890-1234-567890abcdef",
+      "created_by": "550e8400-e29b-41d4-a716-446655440001",
+      "created_at": "2025-08-01T09:00:00Z",
+      "updated_at": "2026-01-15T10:20:00Z",
+      "is_composite": false,
+      "sanitize_responses": false
+    },
+    {
+      "id": "a1b2c3d4-0004-4a37-a878-53318a6d5004",
+      "alias": "qwen-2.5-72b",
+      "model_name": "Qwen/Qwen2.5-72B-Instruct",
+      "description": "Qwen 2.5 72B - multilingual instruction-tuned model",
+      "model_type": "CHAT",
+      "capabilities": ["text"],
+      "hosted_on": "a1b2c3d4-e5f6-7890-1234-567890abcdef",
+      "created_by": "550e8400-e29b-41d4-a716-446655440001",
+      "created_at": "2025-09-12T13:45:00Z",
+      "updated_at": "2026-01-08T15:00:00Z",
+      "is_composite": false,
+      "sanitize_responses": true
+    },
+    {
+      "id": "a1b2c3d4-0005-4a37-a878-53318a6d5005",
+      "alias": "gemini-2.0-flash",
+      "model_name": "gemini-2.0-flash",
+      "description": "Google Gemini 2.0 Flash - fast multimodal model",
       "model_type": "CHAT",
       "capabilities": ["text", "vision"],
-      "hosted_on": "a1b2c3d4-e5f6-7890-1234-567890abcdef",
-      "pricing": {
-        "input_price_per_token": null,
-        "output_price_per_token": null
-      }
+      "hosted_on": "e5f6a7b8-9012-3456-7890-abcdef012345",
+      "created_by": "550e8400-e29b-41d4-a716-446655440001",
+      "created_at": "2025-10-05T10:30:00Z",
+      "updated_at": "2026-02-01T08:15:00Z",
+      "is_composite": false,
+      "sanitize_responses": false
+    },
+    {
+      "id": "a1b2c3d4-0006-4a37-a878-53318a6d5006",
+      "alias": "smart-router",
+      "model_name": "smart-router",
+      "description": "Composite model - routes to best available model based on task",
+      "model_type": "CHAT",
+      "capabilities": ["text", "vision"],
+      "hosted_on": null,
+      "created_by": "550e8400-e29b-41d4-a716-446655440001",
+      "created_at": "2025-11-20T16:00:00Z",
+      "updated_at": "2026-02-10T12:00:00Z",
+      "is_composite": true,
+      "sanitize_responses": false
     },
     {
       "id": "c9d0e1f2-3456-7890-1234-cdef12345678",
-      "alias": "embedding-small",
+      "alias": "text-embedding-3-small",
       "model_name": "text-embedding-3-small",
-      "description": "OpenAI embeddings model",
+      "description": "OpenAI text embeddings model - 1536 dimensions",
       "model_type": "EMBEDDINGS",
       "capabilities": ["embeddings"],
       "hosted_on": "c3d4e5f6-7890-1234-5678-90abcdef0123",
-      "pricing": {
-        "input_price_per_token": "0.00000002",
-        "output_price_per_token": "0.00000002"
-      }
+      "created_by": "550e8400-e29b-41d4-a716-446655440001",
+      "created_at": "2025-04-01T12:00:00Z",
+      "updated_at": "2025-09-15T14:30:00Z",
+      "is_composite": false,
+      "sanitize_responses": false
+    },
+    {
+      "id": "a1b2c3d4-0007-4a37-a878-53318a6d5007",
+      "alias": "text-embedding-3-large",
+      "model_name": "text-embedding-3-large",
+      "description": "OpenAI text embeddings model - 3072 dimensions",
+      "model_type": "EMBEDDINGS",
+      "capabilities": ["embeddings"],
+      "hosted_on": "c3d4e5f6-7890-1234-5678-90abcdef0123",
+      "created_by": "550e8400-e29b-41d4-a716-446655440001",
+      "created_at": "2025-04-01T12:00:00Z",
+      "updated_at": "2025-09-15T14:30:00Z",
+      "is_composite": false,
+      "sanitize_responses": false
+    },
+    {
+      "id": "b8c9d0e1-2345-6789-0123-bcdef1234567",
+      "alias": "bge-reranker-v2",
+      "model_name": "BAAI/bge-reranker-v2-m3",
+      "description": "BGE Reranker v2 - multilingual document reranking",
+      "model_type": "RERANK",
+      "capabilities": ["rerank"],
+      "hosted_on": "a1b2c3d4-e5f6-7890-1234-567890abcdef",
+      "created_by": "550e8400-e29b-41d4-a716-446655440001",
+      "created_at": "2025-08-20T09:00:00Z",
+      "updated_at": "2025-12-10T11:45:00Z",
+      "is_composite": false,
+      "sanitize_responses": false
     }
   ]
 }
