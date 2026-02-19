@@ -17,7 +17,15 @@ struct EmailTemplates {
 }
 
 impl EmailTemplates {
-    fn load(dir: &Path) -> Result<Self, Error> {
+    fn embedded() -> Self {
+        Self {
+            password_reset: include_str!("../default_templates/password_reset.html").to_string(),
+            batch_complete: include_str!("../default_templates/batch_complete.html").to_string(),
+            first_batch: include_str!("../default_templates/first_batch.html").to_string(),
+        }
+    }
+
+    fn load_from_dir(dir: &Path) -> Result<Self, Error> {
         let load = |name: &str| -> Result<String, Error> {
             let path = dir.join(name);
             std::fs::read_to_string(&path).map_err(|e| Error::Internal {
@@ -90,7 +98,10 @@ impl EmailService {
             }
         };
 
-        let templates = EmailTemplates::load(Path::new(&email_config.templates_dir))?;
+        let templates = match &email_config.templates_dir {
+            Some(dir) => EmailTemplates::load_from_dir(Path::new(dir))?,
+            None => EmailTemplates::embedded(),
+        };
 
         Ok(Self {
             transport,
