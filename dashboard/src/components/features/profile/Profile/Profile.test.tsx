@@ -97,7 +97,7 @@ describe("Profile Component", () => {
     // Check that user data from mock is displayed
     expect(within(container).getByText("Sarah Chen")).toBeInTheDocument();
     expect(
-      within(container).getAllByText("sarah.chen@doubleword.ai")[0],
+      within(container).getAllByText("sarah.chen@acme.com")[0],
     ).toBeInTheDocument();
 
     // Check form fields are accessible via roles
@@ -134,7 +134,7 @@ describe("Profile Component", () => {
 
     // Verify initial values (from mock data)
     expect(displayNameInput).toHaveValue("Sarah Chen");
-    expect(avatarUrlInput).toHaveValue("/avatars/user-1.png");
+    expect(avatarUrlInput).toHaveValue("");
 
     // Edit display name
     await user.clear(displayNameInput);
@@ -189,14 +189,14 @@ describe("Email Notifications", () => {
       http.get("/admin/api/v1/users/:id", () => {
         return HttpResponse.json({
           id: "550e8400-e29b-41d4-a716-446655440001",
-          username: "sarah.chen",
-          email: "sarah.chen@doubleword.ai",
+          username: "github|109540503",
+          email: "sarah.chen@acme.com",
           display_name: "Sarah Chen",
-          avatar_url: "/avatars/user-1.png",
+          avatar_url: null,
           roles: ["PlatformManager", "RequestViewer"],
-          created_at: "2024-01-10T10:00:00Z",
-          updated_at: "2024-01-20T15:30:00Z",
-          auth_source: "vouch",
+          created_at: "2025-03-10T10:00:00Z",
+          updated_at: "2025-12-20T15:30:00Z",
+          auth_source: "proxy-header",
           batch_notifications_enabled: true,
         });
       }),
@@ -217,14 +217,14 @@ describe("Email Notifications", () => {
         patchedData = (await request.json()) as Record<string, unknown>;
         return HttpResponse.json({
           id: "550e8400-e29b-41d4-a716-446655440001",
-          username: "sarah.chen",
-          email: "sarah.chen@doubleword.ai",
+          username: "github|109540503",
+          email: "sarah.chen@acme.com",
           display_name: "Sarah Chen",
-          avatar_url: "/avatars/user-1.png",
+          avatar_url: null,
           roles: ["PlatformManager", "RequestViewer"],
-          created_at: "2024-01-10T10:00:00Z",
-          updated_at: "2024-01-20T15:30:00Z",
-          auth_source: "vouch",
+          created_at: "2025-03-10T10:00:00Z",
+          updated_at: "2025-12-20T15:30:00Z",
+          auth_source: "proxy-header",
           batch_notifications_enabled: true,
         });
       }),
@@ -238,7 +238,7 @@ describe("Email Notifications", () => {
     await user.click(toggle);
 
     await waitFor(() => {
-      expect(patchedData).toEqual({ batch_notifications_enabled: true });
+      expect(patchedData).toEqual({ batch_notifications_enabled: false });
     });
 
     // "Saved" confirmation text appears briefly
