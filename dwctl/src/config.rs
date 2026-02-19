@@ -867,9 +867,7 @@ pub struct BatchConfig {
     /// Enable batches API endpoints (default: true)
     pub enabled: bool,
     /// Allowed completion windows for batch processing.
-    /// These define the maximum time from batch creation to completion.
-    /// Values are stored as time-based strings ("1h", "24h") for OpenAI API compatibility,
-    /// Accepts formatted labels ("Standard (24h)", "High (1h)") or raw time values ("24h", "1h").
+    /// These define the maximum time from batch creation to completion (e.g., "24h", "1h").
     /// Default: vec!["24h".to_string()]
     pub allowed_completion_windows: Vec<String>,
     /// Allowed OpenAI-compatible URL paths for batch requests.
