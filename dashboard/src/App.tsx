@@ -31,15 +31,22 @@ class ErrorBoundary extends Component<
   }
   render() {
     if (this.state.error) {
+      const showDetails = import.meta.env.DEV;
       return (
         <div style={{ padding: 32, fontFamily: "monospace" }}>
           <h2 style={{ color: "red" }}>Something went wrong</h2>
-          <pre style={{ whiteSpace: "pre-wrap", fontSize: 14 }}>
-            {this.state.error.message}
-          </pre>
-          <pre style={{ whiteSpace: "pre-wrap", fontSize: 12, color: "#666" }}>
-            {this.state.error.stack}
-          </pre>
+          {showDetails ? (
+            <>
+              <pre style={{ whiteSpace: "pre-wrap", fontSize: 14 }}>
+                {this.state.error.message}
+              </pre>
+              <pre style={{ whiteSpace: "pre-wrap", fontSize: 12, color: "#666" }}>
+                {this.state.error.stack}
+              </pre>
+            </>
+          ) : (
+            <p>An unexpected error occurred. Please try reloading the page.</p>
+          )}
           <button
             onClick={() => {
               localStorage.removeItem("demo-mode-state");
@@ -47,7 +54,7 @@ class ErrorBoundary extends Component<
             }}
             style={{ marginTop: 16, padding: "8px 16px" }}
           >
-            Clear demo state &amp; reload
+            Clear demo state & reload
           </button>
         </div>
       );
