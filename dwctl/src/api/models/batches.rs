@@ -50,7 +50,7 @@ pub struct BatchError {
 #[schema(example = json!({
     "input_file_id": "file-abc123",
     "endpoint": "/v1/chat/completions",
-    "completion_window": "Standard (24h)"
+    "completion_window": "24h"
 }))]
 pub struct CreateBatchRequest {
     /// The ID of an uploaded file that contains requests for the new batch
@@ -62,25 +62,14 @@ pub struct CreateBatchRequest {
     #[schema(example = "/v1/chat/completions")]
     pub endpoint: String,
 
-    /// Processing priority for the batch.
-    /// Accepts formatted labels ("Standard (24h)", "High (1h)") or raw time values ("24h", "1h").
-    /// Values are normalized to raw format for internal storage.
-    #[schema(example = "Standard (24h)")]
-    #[serde(deserialize_with = "deserialize_completion_window")]
+    /// The time window within which the batch should be processed (e.g., "24h", "1h").
+    /// Allowed values are configured per instance.
+    #[schema(example = "24h")]
     pub completion_window: String,
 
     /// Optional metadata (up to 16 key-value pairs)
     #[serde(default)]
     pub metadata: Option<HashMap<String, String>>,
-}
-
-/// Custom deserializer for completion_window that normalizes input
-fn deserialize_completion_window<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let s = String::deserialize(deserializer)?;
-    super::completion_window::normalize_completion_window(&s).map_err(serde::de::Error::custom)
 }
 
 /// Request body for retrying specific requests
@@ -100,7 +89,7 @@ pub struct RetryRequestsRequest {
     "object": "batch",
     "endpoint": "/v1/chat/completions",
     "input_file_id": "file-abc123",
-    "completion_window": "Standard (24h)",
+    "completion_window": "24h",
     "status": "completed",
     "output_file_id": "file-xyz789",
     "created_at": 1703187200,
@@ -127,10 +116,8 @@ pub struct BatchResponse {
     #[schema(example = "file-abc123")]
     pub input_file_id: String,
 
-    /// Processing priority for the batch.
-    /// API responses always return formatted priority labels: "Standard (24h)" or "High (1h)".
-    /// Requests can use either formatted labels or raw time values ("24h", "1h").
-    #[schema(example = "Standard (24h)")]
+    /// The time window within which the batch should be processed (e.g., "24h", "1h").
+    #[schema(example = "24h")]
     pub completion_window: String,
 
     #[schema(example = "completed")]
@@ -257,7 +244,7 @@ pub struct RequestCounts {
         "object": "batch",
         "endpoint": "/v1/chat/completions",
         "input_file_id": "file-abc123",
-        "completion_window": "Standard (24h)",
+        "completion_window": "24h",
         "status": "completed",
         "created_at": 1703187200,
         "request_counts": {"total": 100, "completed": 98, "failed": 2}
