@@ -2194,7 +2194,8 @@ mod tests {
     #[test_log::test]
     async fn test_reserve_capacity_for_batch_inserts_and_releases(pool: PgPool) {
         let config = create_test_config();
-        let state = create_test_app_state_with_config(pool.clone(), config).await;
+        // Use create_test_app_with_config to run all migrations (dwctl + fusillade)
+        let state = create_test_app_state_with_fusillade(pool.clone(), config).await;
 
         let user = create_test_user(&pool, Role::StandardUser).await;
         let endpoint_id = create_test_endpoint(&pool, &format!("test-{}", Uuid::new_v4()), user.id).await;
@@ -2255,7 +2256,7 @@ mod tests {
         let mut config = create_test_config();
         config.batches.default_throughput = 0.0;
 
-        let state = create_test_app_state_with_config(pool.clone(), config).await;
+        let state = create_test_app_state_with_fusillade(pool.clone(), config).await;
 
         let user = create_test_user(&pool, Role::StandardUser).await;
         let endpoint_id = create_test_endpoint(&pool, &format!("test-{}", Uuid::new_v4()), user.id).await;
