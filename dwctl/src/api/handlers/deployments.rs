@@ -2830,4 +2830,404 @@ mod tests {
         let all_models: PaginatedResponse<DeployedModelResponse> = response.json();
         assert!(all_models.data.len() >= 3, "Empty group list should return all models");
     }
+
+    // ===== Traffic Routing Rules Tests =====
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_create_model_with_traffic_rules(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        // Create a redirect target first
+        create_test_deployment(&pool, admin_user.id, "traffic-target", "traffic-target-alias").await;
+
+        // Create model with traffic routing rules
+        let response = app
+            .post("/admin/api/v1/models")
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
+            .json(&json!({
+                "type": "standard",
+                "model_name": "traffic-source",
+                "alias": "traffic-source-alias",
+                "hosted_on": test_endpoint_id,
+                "traffic_routing_rules": [
+                    { "api_key_purpose": "batch", "action": { "type": "deny" } },
+                    { "api_key_purpose": "realtime", "action": { "type": "redirect", "target": "traffic-target-alias" } }
+                ]
+            }))
+            .await;
+
+        response.assert_status_ok();
+        let model: DeployedModelResponse = response.json();
+        assert_eq!(model.alias, "traffic-source-alias");
+
+        let rules = model.traffic_routing_rules.expect("expected traffic_routing_rules in response");
+        assert_eq!(rules.len(), 2);
+
+        // Verify deny rule
+        let batch_rule = rules
+            .iter()
+            .find(|r| r.api_key_purpose == crate::db::models::api_keys::ApiKeyPurpose::Batch)
+            .unwrap();
+        assert!(matches!(
+            batch_rule.action,
+            crate::api::models::deployments::TrafficRoutingAction::Deny
+        ));
+
+        // Verify redirect rule
+        let realtime_rule = rules
+            .iter()
+            .find(|r| r.api_key_purpose == crate::db::models::api_keys::ApiKeyPurpose::Realtime)
+            .unwrap();
+        match &realtime_rule.action {
+            crate::api::models::deployments::TrafficRoutingAction::Redirect { target } => {
+                assert_eq!(target, "traffic-target-alias");
+            }
+            _ => panic!("expected redirect action"),
+        }
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_get_model_includes_traffic_rules(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        // Create target and source with rules via API
+        create_test_deployment(&pool, admin_user.id, "get-tr-target", "get-tr-target-alias").await;
+
+        let create_resp = app
+            .post("/admin/api/v1/models")
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
+            .json(&json!({
+                "type": "standard",
+                "model_name": "get-tr-source",
+                "alias": "get-tr-source-alias",
+                "hosted_on": test_endpoint_id,
+                "traffic_routing_rules": [
+                    { "api_key_purpose": "batch", "action": { "type": "deny" } }
+                ]
+            }))
+            .await;
+        create_resp.assert_status_ok();
+        let created: DeployedModelResponse = create_resp.json();
+
+        // GET the model
+        let response = app
+            .get(&format!("/admin/api/v1/models/{}", created.id))
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
+            .await;
+
+        response.assert_status_ok();
+        let model: DeployedModelResponse = response.json();
+        let rules = model.traffic_routing_rules.expect("expected traffic_routing_rules");
+        assert_eq!(rules.len(), 1);
+        assert!(matches!(
+            rules[0].action,
+            crate::api::models::deployments::TrafficRoutingAction::Deny
+        ));
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_list_models_includes_traffic_rules(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        // Create source model with rules via API
+        let create_resp = app
+            .post("/admin/api/v1/models")
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
+            .json(&json!({
+                "type": "standard",
+                "model_name": "list-tr-source",
+                "alias": "list-tr-source-alias",
+                "hosted_on": test_endpoint_id,
+                "traffic_routing_rules": [
+                    { "api_key_purpose": "playground", "action": { "type": "deny" } }
+                ]
+            }))
+            .await;
+        create_resp.assert_status_ok();
+        let created: DeployedModelResponse = create_resp.json();
+
+        // List models
+        let response = app
+            .get("/admin/api/v1/models?limit=100")
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
+            .await;
+
+        response.assert_status_ok();
+        let list: PaginatedResponse<DeployedModelResponse> = response.json();
+        let model = get_model_by_id(created.id, &list).expect("model should be in list");
+        let rules = model.traffic_routing_rules.as_ref().expect("traffic rules should be present");
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].api_key_purpose, crate::db::models::api_keys::ApiKeyPurpose::Playground);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_update_model_set_traffic_rules(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
+
+        // Create model without rules
+        let model = create_test_deployment(&pool, admin_user.id, "update-tr-model", "update-tr-alias").await;
+
+        // PATCH with traffic rules
+        let response = app
+            .patch(&format!("/admin/api/v1/models/{}", model.id))
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
+            .json(&json!({
+                "traffic_routing_rules": [
+                    { "api_key_purpose": "batch", "action": { "type": "deny" } }
+                ]
+            }))
+            .await;
+
+        response.assert_status_ok();
+        let updated: DeployedModelResponse = response.json();
+        let rules = updated.traffic_routing_rules.expect("traffic rules should be set");
+        assert_eq!(rules.len(), 1);
+
+        // Verify via GET
+        let response = app
+            .get(&format!("/admin/api/v1/models/{}", model.id))
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
+            .await;
+
+        response.assert_status_ok();
+        let fetched: DeployedModelResponse = response.json();
+        assert_eq!(fetched.traffic_routing_rules.unwrap().len(), 1);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_update_model_clear_traffic_rules(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        // Create model with rules
+        let create_resp = app
+            .post("/admin/api/v1/models")
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
+            .json(&json!({
+                "type": "standard",
+                "model_name": "clear-tr-model",
+                "alias": "clear-tr-alias",
+                "hosted_on": test_endpoint_id,
+                "traffic_routing_rules": [
+                    { "api_key_purpose": "batch", "action": { "type": "deny" } }
+                ]
+            }))
+            .await;
+        create_resp.assert_status_ok();
+        let created: DeployedModelResponse = create_resp.json();
+        assert!(created.traffic_routing_rules.is_some());
+
+        // PATCH with traffic_routing_rules: null → clear rules
+        let response = app
+            .patch(&format!("/admin/api/v1/models/{}", created.id))
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
+            .json(&json!({
+                "traffic_routing_rules": null
+            }))
+            .await;
+
+        response.assert_status_ok();
+        let updated: DeployedModelResponse = response.json();
+        assert!(updated.traffic_routing_rules.is_none());
+
+        // Verify via GET
+        let response = app
+            .get(&format!("/admin/api/v1/models/{}", created.id))
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
+            .await;
+
+        response.assert_status_ok();
+        let fetched: DeployedModelResponse = response.json();
+        assert!(fetched.traffic_routing_rules.is_none());
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_update_model_no_change_to_traffic_rules(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        // Create model with rules
+        let create_resp = app
+            .post("/admin/api/v1/models")
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
+            .json(&json!({
+                "type": "standard",
+                "model_name": "nochange-tr-model",
+                "alias": "nochange-tr-alias",
+                "hosted_on": test_endpoint_id,
+                "traffic_routing_rules": [
+                    { "api_key_purpose": "batch", "action": { "type": "deny" } }
+                ]
+            }))
+            .await;
+        create_resp.assert_status_ok();
+        let created: DeployedModelResponse = create_resp.json();
+
+        // PATCH another field without mentioning traffic_routing_rules
+        let response = app
+            .patch(&format!("/admin/api/v1/models/{}", created.id))
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
+            .json(&json!({
+                "description": "updated description"
+            }))
+            .await;
+
+        response.assert_status_ok();
+        let updated: DeployedModelResponse = response.json();
+        // Rules should still be present
+        let rules = updated.traffic_routing_rules.expect("traffic rules should be unchanged");
+        assert_eq!(rules.len(), 1);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_create_model_self_redirect_rejected(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        let response = app
+            .post("/admin/api/v1/models")
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
+            .json(&json!({
+                "type": "standard",
+                "model_name": "self-redirect",
+                "alias": "self-redirect-alias",
+                "hosted_on": test_endpoint_id,
+                "traffic_routing_rules": [
+                    { "api_key_purpose": "realtime", "action": { "type": "redirect", "target": "self-redirect-alias" } }
+                ]
+            }))
+            .await;
+
+        response.assert_status(axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_create_model_nonexistent_redirect_target(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        let response = app
+            .post("/admin/api/v1/models")
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
+            .json(&json!({
+                "type": "standard",
+                "model_name": "bad-redirect",
+                "alias": "bad-redirect-alias",
+                "hosted_on": test_endpoint_id,
+                "traffic_routing_rules": [
+                    { "api_key_purpose": "realtime", "action": { "type": "redirect", "target": "nonexistent-model" } }
+                ]
+            }))
+            .await;
+
+        response.assert_status(axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_create_model_empty_redirect_target(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        let response = app
+            .post("/admin/api/v1/models")
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
+            .json(&json!({
+                "type": "standard",
+                "model_name": "empty-redirect",
+                "alias": "empty-redirect-alias",
+                "hosted_on": test_endpoint_id,
+                "traffic_routing_rules": [
+                    { "api_key_purpose": "realtime", "action": { "type": "redirect", "target": "" } }
+                ]
+            }))
+            .await;
+
+        response.assert_status(axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_delete_redirect_target_cascades(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        // Create target model (model B)
+        let target = create_test_deployment(&pool, admin_user.id, "cascade-target", "cascade-target-alias").await;
+
+        // Create source model (model A) with redirect to model B
+        let create_resp = app
+            .post("/admin/api/v1/models")
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
+            .json(&json!({
+                "type": "standard",
+                "model_name": "cascade-source",
+                "alias": "cascade-source-alias",
+                "hosted_on": test_endpoint_id,
+                "traffic_routing_rules": [
+                    { "api_key_purpose": "realtime", "action": { "type": "redirect", "target": "cascade-target-alias" } }
+                ]
+            }))
+            .await;
+        create_resp.assert_status_ok();
+        let source: DeployedModelResponse = create_resp.json();
+        assert!(source.traffic_routing_rules.is_some());
+
+        // Hard-delete model B to trigger CASCADE (API uses soft delete which won't trigger CASCADE)
+        sqlx::query!("DELETE FROM deployed_models WHERE id = $1", target.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // GET model A → traffic rules should be gone (CASCADE removed the redirect rule)
+        let response = app
+            .get(&format!("/admin/api/v1/models/{}", source.id))
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
+            .await;
+
+        response.assert_status_ok();
+        let fetched: DeployedModelResponse = response.json();
+        assert!(
+            fetched.traffic_routing_rules.is_none(),
+            "traffic rules should be cleared after cascade delete of redirect target"
+        );
+    }
 }
