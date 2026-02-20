@@ -1292,47 +1292,86 @@ export const handlers = [
     if (stream) {
       // Return a streaming response
       const encoder = new TextEncoder();
+
+      // Check if this model has reasoning capability
+      const modelEntry = modelsData.find(
+        (m) => m.alias === model || m.model_name === model,
+      );
+      const isReasoningModel =
+        modelEntry?.capabilities?.includes("reasoning") ?? false;
+
+      // Build reasoning chunks if applicable
+      const reasoningText = isReasoningModel
+        ? `Let me think about this step by step...\n\nThe user asked: "${userContent}"\n\nI need to consider the key aspects of this question and formulate a clear, helpful response. Let me break this down into parts and address each one carefully.`
+        : "";
+      const reasoningChunkSize = Math.max(
+        10,
+        Math.floor(reasoningText.length / 6),
+      );
+      const reasoningChunks: string[] = [];
+      for (let i = 0; i < reasoningText.length; i += reasoningChunkSize) {
+        reasoningChunks.push(
+          reasoningText.substring(i, i + reasoningChunkSize),
+        );
+      }
+
       // Split response into chunks for streaming (roughly 10-20 chars per chunk)
       const chunkSize = Math.max(10, Math.floor(responseContent.length / 5));
-      const chunks: string[] = [];
+      const contentChunks: string[] = [];
       for (let i = 0; i < responseContent.length; i += chunkSize) {
-        chunks.push(responseContent.substring(i, i + chunkSize));
+        contentChunks.push(responseContent.substring(i, i + chunkSize));
       }
 
       const stream = new ReadableStream({
         start(controller) {
-          let chunkIndex = 0;
+          let reasoningIndex = 0;
+          let contentIndex = 0;
+          let sentRole = false;
 
           const sendChunk = () => {
-            if (chunkIndex < chunks.length) {
-              const chunk = {
-                id: `chatcmpl-${Date.now()}`,
-                object: "chat.completion.chunk",
-                created: Math.floor(Date.now() / 1000),
-                model: model,
-                choices: [
-                  {
-                    index: 0,
-                    delta:
-                      chunkIndex === 0
-                        ? { role: "assistant", content: chunks[chunkIndex] }
-                        : { content: chunks[chunkIndex] },
-                    finish_reason: null,
-                  },
-                ],
+            const chunkBase = {
+              id: `chatcmpl-${Date.now()}`,
+              object: "chat.completion.chunk",
+              created: Math.floor(Date.now() / 1000),
+              model: model,
+            };
+
+            if (reasoningIndex < reasoningChunks.length) {
+              // Send reasoning_content chunks first
+              const delta: Record<string, string> = {
+                reasoning_content: reasoningChunks[reasoningIndex],
               };
+              if (!sentRole) {
+                delta.role = "assistant";
+                sentRole = true;
+              }
               controller.enqueue(
-                encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`),
+                encoder.encode(
+                  `data: ${JSON.stringify({ ...chunkBase, choices: [{ index: 0, delta, finish_reason: null }] })}\n\n`,
+                ),
               );
-              chunkIndex++;
+              reasoningIndex++;
+              setTimeout(sendChunk, 80);
+            } else if (contentIndex < contentChunks.length) {
+              // Then send content chunks
+              const delta: Record<string, string> = {
+                content: contentChunks[contentIndex],
+              };
+              if (!sentRole) {
+                delta.role = "assistant";
+                sentRole = true;
+              }
+              controller.enqueue(
+                encoder.encode(
+                  `data: ${JSON.stringify({ ...chunkBase, choices: [{ index: 0, delta, finish_reason: null }] })}\n\n`,
+                ),
+              );
+              contentIndex++;
               setTimeout(sendChunk, 100);
             } else {
               // Send final chunk with usage
               const finalChunk = {
-                id: `chatcmpl-${Date.now()}`,
-                object: "chat.completion.chunk",
-                created: Math.floor(Date.now() / 1000),
-                model: model,
+                ...chunkBase,
                 choices: [
                   {
                     index: 0,
