@@ -139,7 +139,6 @@ export const Profile: React.FC = () => {
     null,
   );
   const [copiedSecret, setCopiedSecret] = useState(false);
-  const [emailNotifSaved, setEmailNotifSaved] = useState(false);
 
   const handleRoleChange = (role: Role) => {
     setRoles((prev) =>
@@ -272,8 +271,6 @@ export const Profile: React.FC = () => {
         data: { batch_notifications_enabled: enabled },
       });
       await refetchUser();
-      setEmailNotifSaved(true);
-      setTimeout(() => setEmailNotifSaved(false), 2000);
     } catch {
       // Revert will happen via refetchUser
     }
@@ -869,12 +866,6 @@ export const Profile: React.FC = () => {
                   </div>
                 </div>
                 <div className="flex items-center gap-2 shrink-0">
-                  {emailNotifSaved && (
-                    <span className="text-xs text-green-600 flex items-center gap-1">
-                      <Check className="w-3 h-3" />
-                      Saved
-                    </span>
-                  )}
                   <Switch
                     id="emailNotifications"
                     checked={currentUser?.batch_notifications_enabled ?? false}

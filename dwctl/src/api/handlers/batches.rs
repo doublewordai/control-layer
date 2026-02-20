@@ -284,16 +284,24 @@ pub async fn create_batch<P: PoolProvider>(
     )
     .await?;
 
-    let batch = state.request_manager.create_batch(batch_input).await;
+    // RAII guard: releases reservations when this scope exits, whether by normal
+    // return, early return (e.g. create_batch error), or unwind panic.
+    // The spawn is best-effort — the TTL is the true safety net if the runtime
+    // is unavailable at drop time.
+    let _release_guard = scopeguard::guard(reservation_ids.clone(), |ids| {
+        let state = state.clone();
+        tokio::runtime::Handle::current().spawn(async move {
+            if let Err(e) = release_capacity_reservations(&state, &ids).await {
+                tracing::warn!(
+                    reservation_ids = ?ids,
+                    error = %e,
+                    "Failed to release capacity reservations — will expire via TTL"
+                );
+            }
+        });
+    });
 
-    if let Err(err) = release_capacity_reservations(&state, &reservation_ids).await {
-        tracing::warn!(
-            error = ?err,
-            "Failed to release capacity reservations after batch creation"
-        );
-    }
-
-    let batch = batch.map_err(|e| Error::Internal {
+    let batch = state.request_manager.create_batch(batch_input).await.map_err(|e| Error::Internal {
         operation: format!("create batch: {}", e),
     })?;
 
@@ -419,14 +427,16 @@ async fn reserve_capacity_for_batch<P: PoolProvider>(
     model_pairs.sort_by_key(|(_, id)| *id);
 
     for (alias, model_id) in &model_pairs {
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))")
-            .bind(model_id.to_string())
-            .bind(completion_window)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| Error::Internal {
-                operation: format!("lock reservation for {}: {}", alias, e),
-            })?;
+        sqlx::query!(
+            "SELECT pg_advisory_xact_lock(hashtext($1::text), hashtext($2::text))",
+            model_id.to_string(),
+            completion_window
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| Error::Internal {
+            operation: format!("lock reservation for {}: {}", alias, e),
+        })?;
     }
 
     // Sum active reservations and add to pending_counts
@@ -2183,7 +2193,7 @@ mod tests {
     #[test_log::test]
     async fn test_reserve_capacity_for_batch_inserts_and_releases(pool: PgPool) {
         let config = create_test_config();
-        // Use create_test_app_with_config to run all migrations (dwctl + fusillade)
+        // Use create_test_app_state_with_fusillade to run all migrations (dwctl + fusillade)
         let state = create_test_app_state_with_fusillade(pool.clone(), config).await;
 
         let user = create_test_user(&pool, Role::StandardUser).await;

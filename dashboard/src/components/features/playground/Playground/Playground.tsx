@@ -41,8 +41,14 @@ interface MessageMetrics {
 interface Message {
   role: "user" | "assistant" | "system";
   content: MessageContent;
+  reasoningContent?: string;
   timestamp: Date;
   metrics?: MessageMetrics;
+}
+
+interface DeltaWithReasoning {
+  content?: string | null;
+  reasoning_content?: string | null;
 }
 
 const Playground: React.FC = () => {
@@ -56,6 +62,8 @@ const Playground: React.FC = () => {
   const [uploadedImages, setUploadedImages] = useState<string[]>([]);
   const [isStreaming, setIsStreaming] = useState(false);
   const [streamingContent, setStreamingContent] = useState("");
+  const [streamingReasoningContent, setStreamingReasoningContent] =
+    useState("");
   const [error, setError] = useState<string | null>(null);
   const [selectedModel, setSelectedModel] = useState<Model | null>(null);
   const [modelType, setModelType] = useState<ModelType>("chat");
@@ -122,6 +130,7 @@ const Playground: React.FC = () => {
     if (selectedModel) {
       setMessages([]);
       setStreamingContent("");
+      setStreamingReasoningContent("");
       setSimilarityResult(null);
       setRerankResult(null);
       setError(null);
@@ -142,6 +151,7 @@ const Playground: React.FC = () => {
       setComparisonModel(null);
       setMessagesModelB([]);
       setStreamingContentModelB("");
+      setStreamingReasoningContentModelB("");
       setCurrentMessageModelB("");
       setIsSplitInput(false);
     }
@@ -330,6 +340,7 @@ const Playground: React.FC = () => {
       setAbortController(null);
       setIsStreaming(false);
       setStreamingContent("");
+      setStreamingReasoningContent("");
     }
   };
 
@@ -426,6 +437,7 @@ const Playground: React.FC = () => {
     setUploadedImages([]);
     setIsStreaming(true);
     setStreamingContent("");
+    setStreamingReasoningContent("");
     setError(null);
 
     const controller = new AbortController();
@@ -436,6 +448,7 @@ const Playground: React.FC = () => {
       setMessagesModelB((prev) => [...prev, userMessage]);
       setIsStreamingModelB(true);
       setStreamingContentModelB("");
+      setStreamingReasoningContentModelB("");
       const controllerB = new AbortController();
       setAbortControllerModelB(controllerB);
 
@@ -486,20 +499,30 @@ const Playground: React.FC = () => {
           );
 
           let fullContentB = "";
+          let fullReasoningContentB = "";
           let chunkCountB = 0;
 
           for await (const chunk of streamB) {
-            const content = chunk.choices[0]?.delta?.content || "";
+            const delta = chunk.choices[0]?.delta as
+              | DeltaWithReasoning
+              | undefined;
+            const content = delta?.content || "";
+            const reasoning = delta?.reasoning_content || "";
+
+            if (reasoning) {
+              fullReasoningContentB += reasoning;
+              setStreamingReasoningContentModelB(fullReasoningContentB);
+            }
+
             if (content) {
               chunkCountB++;
               fullContentB += content;
-
-              // Track time to first token
-              if (firstTokenTimeB === undefined) {
-                firstTokenTimeB = performance.now() - startTimeB;
-              }
-
               setStreamingContentModelB(fullContentB);
+            }
+
+            // Track time to first token (either content or reasoning)
+            if ((content || reasoning) && firstTokenTimeB === undefined) {
+              firstTokenTimeB = performance.now() - startTimeB;
             }
 
             // Track tokens from usage info
@@ -529,11 +552,13 @@ const Playground: React.FC = () => {
           const assistantMessageB: Message = {
             role: "assistant",
             content: fullContentB,
+            reasoningContent: fullReasoningContentB || undefined,
             timestamp: new Date(),
             metrics: metricsB,
           };
           setMessagesModelB((prev) => [...prev, assistantMessageB]);
           setStreamingContentModelB("");
+          setStreamingReasoningContentModelB("");
         } catch (err) {
           console.error("Error sending message to Model B:", err);
         } finally {
@@ -587,21 +612,32 @@ const Playground: React.FC = () => {
       );
 
       let fullContent = "";
+      let fullReasoningContent = "";
       let chunkCount = 0;
 
       for await (const chunk of stream) {
-        const content = chunk.choices[0]?.delta?.content || "";
+        const delta = chunk.choices[0]?.delta as
+          | DeltaWithReasoning
+          | undefined;
+        const content = delta?.content || "";
+        const reasoning = delta?.reasoning_content || "";
+
+        if (reasoning) {
+          fullReasoningContent += reasoning;
+          setStreamingReasoningContent(fullReasoningContent);
+        }
+
         if (content) {
           chunkCount++;
           fullContent += content;
 
-          // Track time to first token
-          if (firstTokenTime === undefined) {
-            firstTokenTime = performance.now() - startTime;
-          }
-
           // Update immediately without requestAnimationFrame to avoid batching
           setStreamingContent(fullContent);
+        }
+
+        // Track time to first token (either content or reasoning)
+        if ((content || reasoning) && firstTokenTime === undefined) {
+          firstTokenTime = performance.now() - startTime;
         }
 
         // Track tokens from usage info
@@ -632,12 +668,14 @@ const Playground: React.FC = () => {
       const assistantMessage: Message = {
         role: "assistant",
         content: fullContent,
+        reasoningContent: fullReasoningContent || undefined,
         timestamp: new Date(),
         metrics,
       };
 
       setMessages((prev) => [...prev, assistantMessage]);
       setStreamingContent("");
+      setStreamingReasoningContent("");
     } catch (err) {
       console.error("Error sending message:", err);
       if (err instanceof Error && err.name === "AbortError") {
@@ -666,6 +704,7 @@ const Playground: React.FC = () => {
     setCurrentMessageModelB("");
     setIsStreamingModelB(true);
     setStreamingContentModelB("");
+    setStreamingReasoningContentModelB("");
 
     const controller = new AbortController();
     setAbortControllerModelB(controller);
@@ -714,20 +753,30 @@ const Playground: React.FC = () => {
       );
 
       let fullContent = "";
+      let fullReasoningContent = "";
       let chunkCount = 0;
 
       for await (const chunk of stream) {
-        const content = chunk.choices[0]?.delta?.content || "";
+        const delta = chunk.choices[0]?.delta as
+          | DeltaWithReasoning
+          | undefined;
+        const content = delta?.content || "";
+        const reasoning = delta?.reasoning_content || "";
+
+        if (reasoning) {
+          fullReasoningContent += reasoning;
+          setStreamingReasoningContentModelB(fullReasoningContent);
+        }
+
         if (content) {
           chunkCount++;
           fullContent += content;
-
-          // Track time to first token
-          if (firstTokenTime === undefined) {
-            firstTokenTime = performance.now() - startTime;
-          }
-
           setStreamingContentModelB(fullContent);
+        }
+
+        // Track time to first token (either content or reasoning)
+        if ((content || reasoning) && firstTokenTime === undefined) {
+          firstTokenTime = performance.now() - startTime;
         }
 
         // Track tokens from usage info
@@ -757,12 +806,14 @@ const Playground: React.FC = () => {
       const assistantMessage: Message = {
         role: "assistant",
         content: fullContent,
+        reasoningContent: fullReasoningContent || undefined,
         timestamp: new Date(),
         metrics,
       };
 
       setMessagesModelB((prev) => [...prev, assistantMessage]);
       setStreamingContentModelB("");
+      setStreamingReasoningContentModelB("");
     } catch (err) {
       console.error("Error sending message to Model B:", err);
       setError(
@@ -792,6 +843,7 @@ const Playground: React.FC = () => {
   const clearConversation = () => {
     setMessages([]);
     setStreamingContent("");
+    setStreamingReasoningContent("");
     setSimilarityResult(null);
     setRerankResult(null);
     setError(null);
@@ -810,6 +862,7 @@ const Playground: React.FC = () => {
     if (isComparisonMode) {
       setMessagesModelB([]);
       setStreamingContentModelB("");
+      setStreamingReasoningContentModelB("");
       setCurrentMessageModelB("");
     }
   };
@@ -820,6 +873,7 @@ const Playground: React.FC = () => {
       setIsComparisonMode(true);
       setMessagesModelB([]);
       setStreamingContentModelB("");
+      setStreamingReasoningContentModelB("");
       setCurrentMessageModelB("");
     }
   };
@@ -829,6 +883,7 @@ const Playground: React.FC = () => {
     setComparisonModel(null);
     setMessagesModelB([]);
     setStreamingContentModelB("");
+    setStreamingReasoningContentModelB("");
     setCurrentMessageModelB("");
     setIsSplitInput(false);
   };
@@ -864,6 +919,8 @@ const Playground: React.FC = () => {
   const [comparisonModel, setComparisonModel] = useState<Model | null>(null);
   const [messagesModelB, setMessagesModelB] = useState<Message[]>([]);
   const [streamingContentModelB, setStreamingContentModelB] = useState("");
+  const [streamingReasoningContentModelB, setStreamingReasoningContentModelB] =
+    useState("");
   const [isStreamingModelB, setIsStreamingModelB] = useState(false);
   const [_abortControllerModelB, setAbortControllerModelB] =
     useState<AbortController | null>(null);
@@ -1029,6 +1086,7 @@ const Playground: React.FC = () => {
           currentMessage={currentMessage}
           uploadedImages={uploadedImages}
           streamingContent={streamingContent}
+          streamingReasoningContent={streamingReasoningContent}
           isStreaming={isStreaming}
           error={error}
           copiedMessageIndex={copiedMessageIndex}
@@ -1052,6 +1110,7 @@ const Playground: React.FC = () => {
           comparisonModel={comparisonModel}
           messagesModelB={messagesModelB}
           streamingContentModelB={streamingContentModelB}
+          streamingReasoningContentModelB={streamingReasoningContentModelB}
           isStreamingModelB={isStreamingModelB}
           isSplitInput={isSplitInput}
           currentMessageModelB={currentMessageModelB}

@@ -1459,7 +1459,7 @@ checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
 name = "dwctl"
-version = "8.3.0"
+version = "8.4.1"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -1513,6 +1513,7 @@ dependencies = [
  "rust-embed",
  "rust_decimal",
  "rustls",
+ "scopeguard",
  "serde",
  "serde_json",
  "serde_urlencoded",

@@ -1,6 +1,6 @@
 [package]
 name = "dwctl"
-version = "8.3.0"
+version = "8.4.1"
 edition = "2024"
 description = "The Doubleword Control Layer - A self-hostable observability and analytics platform for LLM applications"
 license = "MIT OR Apache-2.0"
@@ -31,6 +31,7 @@ sqlx = { version = "0.8", features = [
   "migrate",
   "rust_decimal",
 ] }
+scopeguard = "1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 uuid = { version = "1.0", features = ["v4", "serde"] }
