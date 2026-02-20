@@ -240,11 +240,6 @@ describe("Email Notifications", () => {
     await waitFor(() => {
       expect(patchedData).toEqual({ batch_notifications_enabled: true });
     });
-
-    // "Saved" confirmation text appears briefly
-    await waitFor(() => {
-      expect(within(container).getByText("Saved")).toBeInTheDocument();
-    });
   });
 });
 

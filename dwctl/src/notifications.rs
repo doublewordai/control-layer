@@ -129,7 +129,7 @@ pub async fn run_notification_poller(
         Ok(svc) => {
             tracing::info!("Launched email service successfully");
             Some(svc)
-        },
+        }
         Err(e) => {
             tracing::warn!(error = %e, "Failed to create email service, email notifications disabled");
             None
