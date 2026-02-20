@@ -925,9 +925,15 @@ where
     use serde::de::Error;
     let map: HashMap<String, f32> = HashMap::deserialize(deserializer)?;
     for (window, &factor) in &map {
+        if !factor.is_finite() {
+            return Err(D::Error::custom(format!(
+                "window_relaxation_factors[{}] must be a finite number, got {}",
+                window, factor
+            )));
+        }
         if factor < 0.0 {
             return Err(D::Error::custom(format!(
-                "relaxation_factors[{}] must be >= 0.0, got {}",
+                "window_relaxation_factors[{}] must be >= 0.0, got {}",
                 window, factor
             )));
         }

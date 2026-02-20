@@ -257,7 +257,7 @@ batches:
   # Windows not listed here default to 1.0.
   window_relaxation_factors:
     "1h": 1.0    # strict — no over-acceptance for high priority window
-    "24h": 1.25   # 50% over-acceptance — time to provision more capacity
+    "24h": 1.25   # 25% over-acceptance — time to provision more capacity
 
   # Allowed OpenAI-compatible URL paths for batch requests.
   # This is used by both /files upload validation and /batches endpoint validation.

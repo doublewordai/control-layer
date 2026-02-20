@@ -37,6 +37,12 @@ pub struct SlaCapacityCheckResult {
 /// * `model_throughputs` - Map of model alias to throughput (req/s)
 /// * `default_throughput` - Default throughput for models not in `model_throughputs`
 /// * `completion_window` - The completion window (e.g., "24h", "1h")
+/// * `relaxation_factor` - Multiplier applied to the model's computed capacity before comparing
+///   against pending + new requests. Expected range:
+///   - `0.0`: block all new batches for this window (effective capacity = 0)
+///   - `1.0`: strict — only accept what current throughput supports
+///   - `> 1.0`: over-accept by this factor (e.g. `1.5` allows 50% more than strict capacity),
+///     relying on capacity being provisioned before the window expires
 ///
 /// # Returns
 /// `SlaCapacityCheckResult` indicating whether there's capacity and which models are overloaded
@@ -63,20 +69,16 @@ pub fn check_sla_capacity(
         // Treat non-positive throughput as effectively zero capacity
         let throughput = model_throughputs.get(model_alias).copied().unwrap_or(default_throughput).max(0.0); // Clamp to non-negative
 
-        // Calculate capacity using f64 throughout to avoid overflow,
-        // then clamp to i64 range for final comparison
-        let capacity_f64 = (throughput as f64) * (window_seconds as f64);
-        let base_capacity = if capacity_f64 >= i64::MAX as f64 {
+        // Apply relaxation factor to the raw f64 capacity before clamping to i64,
+        // preserving fractional precision especially at low throughputs/short windows.
+        let capacity_f64 = (throughput as f64) * (window_seconds as f64) * (relaxation_factor as f64);
+        let effective_capacity = if capacity_f64 >= i64::MAX as f64 {
             i64::MAX
         } else if capacity_f64 <= 0.0 {
             0
         } else {
             capacity_f64 as i64
         };
-
-        // Apply relaxation factor: how many requests we're willing to accept for this window.
-        // factor > 1.0 = over-accept (rely on autoscaling), 1.0 = strict, 0.0 = block window.
-        let effective_capacity = ((base_capacity as f64) * (relaxation_factor as f64)) as i64;
 
         // Check if we exceed capacity
         let total_requests = pending + new_requests;
@@ -86,7 +88,7 @@ pub fn check_sla_capacity(
                 model = %model_alias,
                 pending = pending,
                 new_requests = new_requests,
-                capacity = base_capacity,
+                capacity = capacity_f64,
                 effective_capacity = effective_capacity,
                 throughput = throughput,
                 window = completion_window,
