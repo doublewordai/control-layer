@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.4.0](https://github.com/doublewordai/control-layer/compare/v8.3.0...v8.4.0) (2026-02-20)
+
+
+### Features
+
+* **playground:** stream reasoning tokens into collapsible thinking block ([#744](https://github.com/doublewordai/control-layer/issues/744)) ([943b9b2](https://github.com/doublewordai/control-layer/commit/943b9b2b6fdc2c1be41d095b6a658de6977d4b10))
+
 ## [8.3.0](https://github.com/doublewordai/control-layer/compare/v8.2.0...v8.3.0) (2026-02-19)
 
 
