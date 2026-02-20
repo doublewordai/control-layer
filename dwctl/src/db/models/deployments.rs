@@ -420,7 +420,7 @@ impl DeploymentCreateDBRequest {
                 .maybe_throughput(standard.throughput)
                 .maybe_provider_pricing(standard.provider_pricing)
                 .is_composite(false)
-                .maybe_traffic_routing_rules(standard.traffic_routing_rules.map(|rules| serde_json::to_value(rules).unwrap()))
+                .maybe_traffic_routing_rules(standard.traffic_routing_rules.and_then(|rules| serde_json::to_value(rules).ok()))
                 .maybe_allowed_batch_completion_windows(standard.allowed_batch_completion_windows)
                 .build(),
             DeployedModelCreate::Composite(composite) => Self::builder()
@@ -443,7 +443,7 @@ impl DeploymentCreateDBRequest {
                 .fallback_with_replacement(composite.fallback_with_replacement)
                 .maybe_fallback_max_attempts(composite.fallback_max_attempts)
                 .sanitize_responses(composite.sanitize_responses)
-                .maybe_traffic_routing_rules(composite.traffic_routing_rules.map(|rules| serde_json::to_value(rules).unwrap()))
+                .maybe_traffic_routing_rules(composite.traffic_routing_rules.and_then(|rules| serde_json::to_value(rules).ok()))
                 .maybe_allowed_batch_completion_windows(composite.allowed_batch_completion_windows)
                 .build(),
         }
@@ -506,7 +506,7 @@ impl From<DeployedModelUpdate> for DeploymentUpdateDBRequest {
             .maybe_traffic_routing_rules(
                 update
                     .traffic_routing_rules
-                    .map(|opt| opt.map(|rules| serde_json::to_value(rules).unwrap())),
+                    .map(|opt| opt.and_then(|rules| serde_json::to_value(rules).ok())),
             )
             .maybe_allowed_batch_completion_windows(update.allowed_batch_completion_windows)
             .build()

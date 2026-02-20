@@ -3,8 +3,8 @@
 -- traffic_routing_rules: JSONB array of routing rules matching onwards RoutingRule format
 --   Each rule has match_labels (key-value pairs to match against API key labels)
 --   and an action (deny or redirect to another model alias).
---   Example: [{"match_labels": {"purpose": "playground"}, "action": "deny"},
---             {"match_labels": {"purpose": "batch"}, "action": {"redirect": "gpt-4o-mini"}}]
+--   Example: [{"match_labels": {"purpose": "playground"}, "action": {"type": "deny"}},
+--             {"match_labels": {"purpose": "batch"}, "action": {"type": "redirect", "target": "gpt-4o-mini"}}]
 --
 -- allowed_batch_completion_windows: Per-model override for which batch completion
 --   windows are accepted. NULL means use the global config default.

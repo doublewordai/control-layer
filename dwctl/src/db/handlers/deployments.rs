@@ -1102,6 +1102,27 @@ impl<'c> Deployments<'c> {
             .filter_map(|r| r.allowed_batch_completion_windows.map(|windows| (r.alias, windows)))
             .collect())
     }
+
+    /// Check which of the given aliases exist as non-deleted deployed models.
+    pub async fn get_aliases_that_exist(&mut self, aliases: &[String]) -> Result<Vec<String>> {
+        if aliases.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let rows = sqlx::query_scalar!(
+            r#"
+            SELECT alias
+            FROM deployed_models
+            WHERE alias = ANY($1)
+              AND deleted = false
+            "#,
+            aliases
+        )
+        .fetch_all(&mut *self.db)
+        .await?;
+
+        Ok(rows)
+    }
 }
 
 #[cfg(test)]

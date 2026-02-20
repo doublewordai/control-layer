@@ -54,6 +54,34 @@ fn validate_traffic_routing_rules(rules: &[TrafficRoutingRule], model_alias: &st
     Ok(())
 }
 
+/// Validate that all redirect targets in routing rules reference existing model aliases.
+async fn validate_redirect_targets_exist(rules: &[TrafficRoutingRule], repo: &mut Deployments<'_>) -> Result<()> {
+    let redirect_targets: Vec<String> = rules
+        .iter()
+        .filter_map(|rule| {
+            if let TrafficRoutingAction::Redirect { target } = &rule.action {
+                Some(target.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if redirect_targets.is_empty() {
+        return Ok(());
+    }
+
+    let existing = repo.get_aliases_that_exist(&redirect_targets).await?;
+    for target in &redirect_targets {
+        if !existing.contains(target) {
+            return Err(Error::BadRequest {
+                message: format!("Redirect target model '{}' does not exist", target),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Validate allowed batch completion windows against globally configured values.
 fn validate_allowed_batch_windows(windows: &[String], allowed: &[String]) -> Result<()> {
     for window in windows {
@@ -399,6 +427,12 @@ pub async fn create_deployed_model<P: PoolProvider>(
         }
     }
 
+    // Validate redirect targets exist in the database
+    if let Some(rules) = traffic_rules {
+        let mut repo = Deployments::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
+        validate_redirect_targets_exist(rules, &mut repo).await?;
+    }
+
     // Create the deployment - let database constraints handle uniqueness
     let mut repo = Deployments::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
     let db_request = DeploymentCreateDBRequest::from_api_create(current_user.id, create);
@@ -488,38 +522,43 @@ pub async fn update_deployed_model<P: PoolProvider>(
     }
 
     let mut tx = state.db.write().begin().await.map_err(|e| Error::Database(e.into()))?;
-    let mut repo = Deployments::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
 
     // Verify deployment exists and check access based on permissions
-    let model_alias = match repo.get_by_id(deployment_id).await {
-        Ok(Some(model)) => {
-            // Only allow non-admin users to access non-deleted models
-            if model.deleted && !has_system_access {
+    let model_alias = {
+        let mut repo = Deployments::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
+        match repo.get_by_id(deployment_id).await {
+            Ok(Some(model)) => {
+                // Only allow non-admin users to access non-deleted models
+                if model.deleted && !has_system_access {
+                    return Err(Error::NotFound {
+                        resource: "Deployment".to_string(),
+                        id: deployment_id.to_string(),
+                    });
+                }
+                model.alias.clone()
+            }
+            Ok(None) => {
                 return Err(Error::NotFound {
                     resource: "Deployment".to_string(),
                     id: deployment_id.to_string(),
                 });
             }
-            model.alias.clone()
+            Err(e) => return Err(e.into()),
         }
-        Ok(None) => {
-            return Err(Error::NotFound {
-                resource: "Deployment".to_string(),
-                id: deployment_id.to_string(),
-            });
-        }
-        Err(e) => return Err(e.into()),
     };
 
-    // Check self-redirect now that we have the model alias
+    // Check self-redirect now that we have the model alias, and validate redirect targets exist
     if let Some(Some(rules)) = &update.traffic_routing_rules {
-        // Use the updated alias if provided, otherwise use the existing one
         let effective_alias = update.alias.as_deref().unwrap_or(&model_alias);
         validate_traffic_routing_rules(rules, effective_alias)?;
+
+        let mut repo = Deployments::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
+        validate_redirect_targets_exist(rules, &mut repo).await?;
     }
 
     let tariffs = update.tariffs.clone();
     let db_request = DeploymentUpdateDBRequest::from(update);
+    let mut repo = Deployments::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
     let model = repo.update(deployment_id, &db_request).await?;
 
     // Handle tariff replacement if provided
