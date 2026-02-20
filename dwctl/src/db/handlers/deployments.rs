@@ -14,7 +14,17 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sqlx::PgConnection;
 use sqlx::{FromRow, query_builder::QueryBuilder};
+use std::collections::HashMap;
 use tracing::instrument;
+
+/// Per-model batch info: throughputs and allowed completion windows.
+#[derive(Debug, Default)]
+pub struct BatchModelInfo {
+    /// alias → throughput (only models with throughput set)
+    pub throughputs: HashMap<String, f32>,
+    /// alias → allowed windows (only models with explicit restrictions; absent = all allowed)
+    pub allowed_windows: HashMap<String, Vec<String>>,
+}
 
 /// Filter options for listing deployments
 #[derive(Debug, Clone)]
@@ -1052,55 +1062,35 @@ impl<'c> Deployments<'c> {
 
     /// Get throughput values for the given model aliases
     /// Returns a map of alias -> throughput for models that have throughput configured
+    /// Get batch-relevant model info (throughput + allowed completion windows) in a single query.
     #[instrument(skip(self, aliases), fields(count = aliases.len()), err)]
-    pub async fn get_throughputs_by_aliases(&mut self, aliases: &[String]) -> Result<std::collections::HashMap<String, f32>> {
+    pub async fn get_batch_model_info(&mut self, aliases: &[String]) -> Result<BatchModelInfo> {
         if aliases.is_empty() {
-            return Ok(std::collections::HashMap::new());
+            return Ok(BatchModelInfo::default());
         }
 
         let rows = sqlx::query!(
             r#"
-            SELECT alias, throughput
+            SELECT alias, throughput, allowed_batch_completion_windows
             FROM deployed_models
             WHERE alias = ANY($1)
               AND deleted = false
-              AND throughput IS NOT NULL
             "#,
             aliases
         )
         .fetch_all(&mut *self.db)
         .await?;
 
-        Ok(rows.into_iter().filter_map(|r| r.throughput.map(|t| (r.alias, t))).collect())
-    }
-
-    /// Get allowed batch completion windows for models by their aliases.
-    /// Returns a map of alias → allowed windows. Models with NULL (no restriction) are omitted.
-    pub async fn get_allowed_batch_windows_by_aliases(
-        &mut self,
-        aliases: &[String],
-    ) -> Result<std::collections::HashMap<String, Vec<String>>> {
-        if aliases.is_empty() {
-            return Ok(std::collections::HashMap::new());
+        let mut info = BatchModelInfo::default();
+        for row in rows {
+            if let Some(t) = row.throughput {
+                info.throughputs.insert(row.alias.clone(), t);
+            }
+            if let Some(w) = row.allowed_batch_completion_windows {
+                info.allowed_windows.insert(row.alias, w);
+            }
         }
-
-        let rows = sqlx::query!(
-            r#"
-            SELECT alias, allowed_batch_completion_windows
-            FROM deployed_models
-            WHERE alias = ANY($1)
-              AND deleted = false
-              AND allowed_batch_completion_windows IS NOT NULL
-            "#,
-            aliases
-        )
-        .fetch_all(&mut *self.db)
-        .await?;
-
-        Ok(rows
-            .into_iter()
-            .filter_map(|r| r.allowed_batch_completion_windows.map(|windows| (r.alias, windows)))
-            .collect())
+        Ok(info)
     }
 
     /// Check which of the given aliases exist as non-deleted deployed models.

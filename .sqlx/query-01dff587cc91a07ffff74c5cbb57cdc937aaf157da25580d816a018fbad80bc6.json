@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT alias, allowed_batch_completion_windows\n            FROM deployed_models\n            WHERE alias = ANY($1)\n              AND deleted = false\n              AND allowed_batch_completion_windows IS NOT NULL\n            ",
+  "query": "\n            SELECT alias, throughput, allowed_batch_completion_windows\n            FROM deployed_models\n            WHERE alias = ANY($1)\n              AND deleted = false\n            ",
   "describe": {
     "columns": [
       {
@@ -10,6 +10,11 @@
       },
       {
         "ordinal": 1,
+        "name": "throughput",
+        "type_info": "Float4"
+      },
+      {
+        "ordinal": 2,
         "name": "allowed_batch_completion_windows",
         "type_info": "TextArray"
       }
@@ -21,8 +26,9 @@
     },
     "nullable": [
       false,
+      true,
       true
     ]
   },
-  "hash": "ca79cf42bd784dd1c9d7fe47a93b86771a4595554fa93da3f7065c6a3f52b36c"
+  "hash": "01dff587cc91a07ffff74c5cbb57cdc937aaf157da25580d816a018fbad80bc6"
 }

@@ -252,12 +252,23 @@ pub async fn create_batch<P: PoolProvider>(
             operation: format!("get pending counts: {}", e),
         })?;
 
-    // Get model aliases from file stats
+    // Get model aliases and fetch per-model batch info (throughputs + allowed windows) in one query
     let model_aliases: Vec<String> = file_model_counts.keys().cloned().collect();
+    let batch_model_info = {
+        use crate::db::handlers::deployments::Deployments;
+        let mut conn = state.db.read().acquire().await.map_err(|e| Error::Internal {
+            operation: format!("get db connection: {}", e),
+        })?;
+        Deployments::new(&mut conn)
+            .get_batch_model_info(&model_aliases)
+            .await
+            .map_err(|e| Error::Internal {
+                operation: format!("get batch model info: {}", e),
+            })?
+    };
 
     // Check per-model batch completion window restrictions
-    let model_allowed_windows = get_model_allowed_batch_windows(&state, &model_aliases).await?;
-    for (alias, allowed_windows) in &model_allowed_windows {
+    for (alias, allowed_windows) in &batch_model_info.allowed_windows {
         if !allowed_windows.contains(&req.completion_window) {
             if allowed_windows.is_empty() {
                 return Err(Error::BadRequest {
@@ -275,9 +286,6 @@ pub async fn create_batch<P: PoolProvider>(
         }
     }
 
-    // Get model throughputs from database
-    let model_throughputs = get_model_throughputs(&state, &model_aliases).await?;
-
     // Perform capacity check
     //
     // Note: This capacity check does not use locking, so concurrent batch creations
@@ -292,7 +300,7 @@ pub async fn create_batch<P: PoolProvider>(
     let capacity_result = check_sla_capacity(
         &file_model_counts,
         &pending_counts,
-        &model_throughputs,
+        &batch_model_info.throughputs,
         state.config.batches.default_throughput,
         &req.completion_window,
     );
@@ -355,42 +363,6 @@ pub async fn create_batch<P: PoolProvider>(
         StatusCode::CREATED,
         Json(to_batch_response_with_email(batch, Some(&current_user.email))),
     ))
-}
-
-/// Get per-model allowed batch completion windows from the database.
-/// Returns only models that have explicit restrictions (NULL = all allowed, omitted from result).
-async fn get_model_allowed_batch_windows<P: PoolProvider>(
-    state: &AppState<P>,
-    model_aliases: &[String],
-) -> Result<HashMap<String, Vec<String>>> {
-    use crate::db::handlers::deployments::Deployments;
-
-    let mut conn = state.db.read().acquire().await.map_err(|e| Error::Internal {
-        operation: format!("get db connection: {}", e),
-    })?;
-
-    Deployments::new(&mut conn)
-        .get_allowed_batch_windows_by_aliases(model_aliases)
-        .await
-        .map_err(|e| Error::Internal {
-            operation: format!("get model allowed batch windows: {}", e),
-        })
-}
-
-/// Get throughput values for the given model aliases from the database
-async fn get_model_throughputs<P: PoolProvider>(state: &AppState<P>, model_aliases: &[String]) -> Result<HashMap<String, f32>> {
-    use crate::db::handlers::deployments::Deployments;
-
-    let mut conn = state.db.read().acquire().await.map_err(|e| Error::Internal {
-        operation: format!("get db connection: {}", e),
-    })?;
-
-    Deployments::new(&mut conn)
-        .get_throughputs_by_aliases(model_aliases)
-        .await
-        .map_err(|e| Error::Internal {
-            operation: format!("get model throughputs: {}", e),
-        })
 }
 
 #[utoipa::path(

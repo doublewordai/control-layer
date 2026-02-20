@@ -30,8 +30,9 @@ use axum::{
 };
 use sqlx::Acquire;
 
-/// Validate traffic routing rules for a model.
-fn validate_traffic_routing_rules(rules: &[TrafficRoutingRule], model_alias: &str) -> Result<()> {
+/// Validate traffic routing rules: structural checks + redirect targets exist in DB.
+async fn validate_traffic_routing_rules(rules: &[TrafficRoutingRule], model_alias: &str, repo: &mut Deployments<'_>) -> Result<()> {
+    let mut redirect_targets = Vec::new();
     for rule in rules {
         if rule.match_labels.is_empty() {
             return Err(Error::BadRequest {
@@ -39,60 +40,28 @@ fn validate_traffic_routing_rules(rules: &[TrafficRoutingRule], model_alias: &st
             });
         }
         if let TrafficRoutingAction::Redirect { target } = &rule.action {
-            if target == model_alias {
-                return Err(Error::BadRequest {
-                    message: format!("Traffic routing rule cannot redirect model '{}' to itself", model_alias),
-                });
-            }
             if target.is_empty() {
                 return Err(Error::BadRequest {
                     message: "Redirect target must not be empty".to_string(),
                 });
             }
-        }
-    }
-    Ok(())
-}
-
-/// Validate that all redirect targets in routing rules reference existing model aliases.
-async fn validate_redirect_targets_exist(rules: &[TrafficRoutingRule], repo: &mut Deployments<'_>) -> Result<()> {
-    let redirect_targets: Vec<String> = rules
-        .iter()
-        .filter_map(|rule| {
-            if let TrafficRoutingAction::Redirect { target } = &rule.action {
-                Some(target.clone())
-            } else {
-                None
+            if target == model_alias {
+                return Err(Error::BadRequest {
+                    message: format!("Traffic routing rule cannot redirect model '{}' to itself", model_alias),
+                });
             }
-        })
-        .collect();
-
-    if redirect_targets.is_empty() {
-        return Ok(());
-    }
-
-    let existing = repo.get_aliases_that_exist(&redirect_targets).await?;
-    for target in &redirect_targets {
-        if !existing.contains(target) {
-            return Err(Error::BadRequest {
-                message: format!("Redirect target model '{}' does not exist", target),
-            });
+            redirect_targets.push(target.clone());
         }
     }
-    Ok(())
-}
 
-/// Validate allowed batch completion windows against globally configured values.
-fn validate_allowed_batch_windows(windows: &[String], allowed: &[String]) -> Result<()> {
-    for window in windows {
-        if !allowed.contains(window) {
-            return Err(Error::BadRequest {
-                message: format!(
-                    "Invalid batch completion window '{}'. Configured windows: {}",
-                    window,
-                    allowed.join(", ")
-                ),
-            });
+    if !redirect_targets.is_empty() {
+        let existing = repo.get_aliases_that_exist(&redirect_targets).await?;
+        for target in &redirect_targets {
+            if !existing.contains(target) {
+                return Err(Error::BadRequest {
+                    message: format!("Redirect target model '{}' does not exist", target),
+                });
+            }
         }
     }
     Ok(())
@@ -402,16 +371,24 @@ pub async fn create_deployed_model<P: PoolProvider>(
         });
     }
 
-    // Validate traffic routing rules and allowed batch completion windows
-    let (traffic_rules, batch_windows) = match &create {
-        DeployedModelCreate::Standard(s) => (&s.traffic_routing_rules, &s.allowed_batch_completion_windows),
-        DeployedModelCreate::Composite(c) => (&c.traffic_routing_rules, &c.allowed_batch_completion_windows),
+    // Validate allowed batch completion windows against global config
+    let batch_windows = match &create {
+        DeployedModelCreate::Standard(s) => &s.allowed_batch_completion_windows,
+        DeployedModelCreate::Composite(c) => &c.allowed_batch_completion_windows,
     };
-    if let Some(rules) = traffic_rules {
-        validate_traffic_routing_rules(rules, alias)?;
-    }
     if let Some(windows) = batch_windows {
-        validate_allowed_batch_windows(windows, &state.config.batches.allowed_completion_windows)?;
+        let allowed = &state.config.batches.allowed_completion_windows;
+        for window in windows {
+            if !allowed.contains(window) {
+                return Err(Error::BadRequest {
+                    message: format!(
+                        "Invalid batch completion window '{}'. Configured windows: {}",
+                        window,
+                        allowed.join(", ")
+                    ),
+                });
+            }
+        }
     }
 
     let mut tx = state.db.write().begin().await.map_err(|e| Error::Database(e.into()))?;
@@ -427,10 +404,14 @@ pub async fn create_deployed_model<P: PoolProvider>(
         }
     }
 
-    // Validate redirect targets exist in the database
+    // Validate traffic routing rules (structural checks + redirect targets exist)
+    let traffic_rules = match &create {
+        DeployedModelCreate::Standard(s) => &s.traffic_routing_rules,
+        DeployedModelCreate::Composite(c) => &c.traffic_routing_rules,
+    };
     if let Some(rules) = traffic_rules {
         let mut repo = Deployments::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
-        validate_redirect_targets_exist(rules, &mut repo).await?;
+        validate_traffic_routing_rules(rules, alias, &mut repo).await?;
     }
 
     // Create the deployment - let database constraints handle uniqueness
@@ -499,26 +480,20 @@ pub async fn update_deployed_model<P: PoolProvider>(
         });
     }
 
-    // Validate traffic routing rules and allowed batch completion windows (pre-DB)
-    if let Some(Some(rules)) = &update.traffic_routing_rules {
-        // We'll check self-redirect after we fetch the model alias below
-        for rule in rules {
-            if rule.match_labels.is_empty() {
+    // Validate allowed batch completion windows against global config
+    if let Some(Some(windows)) = &update.allowed_batch_completion_windows {
+        let allowed = &state.config.batches.allowed_completion_windows;
+        for window in windows {
+            if !allowed.contains(window) {
                 return Err(Error::BadRequest {
-                    message: "Traffic routing rule must have at least one match label".to_string(),
-                });
-            }
-            if let TrafficRoutingAction::Redirect { target } = &rule.action
-                && target.is_empty()
-            {
-                return Err(Error::BadRequest {
-                    message: "Redirect target must not be empty".to_string(),
+                    message: format!(
+                        "Invalid batch completion window '{}'. Configured windows: {}",
+                        window,
+                        allowed.join(", ")
+                    ),
                 });
             }
         }
-    }
-    if let Some(Some(windows)) = &update.allowed_batch_completion_windows {
-        validate_allowed_batch_windows(windows, &state.config.batches.allowed_completion_windows)?;
     }
 
     let mut tx = state.db.write().begin().await.map_err(|e| Error::Database(e.into()))?;
@@ -528,7 +503,6 @@ pub async fn update_deployed_model<P: PoolProvider>(
         let mut repo = Deployments::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
         match repo.get_by_id(deployment_id).await {
             Ok(Some(model)) => {
-                // Only allow non-admin users to access non-deleted models
                 if model.deleted && !has_system_access {
                     return Err(Error::NotFound {
                         resource: "Deployment".to_string(),
@@ -547,13 +521,11 @@ pub async fn update_deployed_model<P: PoolProvider>(
         }
     };
 
-    // Check self-redirect now that we have the model alias, and validate redirect targets exist
+    // Validate traffic routing rules (structural checks + redirect targets exist)
     if let Some(Some(rules)) = &update.traffic_routing_rules {
         let effective_alias = update.alias.as_deref().unwrap_or(&model_alias);
-        validate_traffic_routing_rules(rules, effective_alias)?;
-
         let mut repo = Deployments::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
-        validate_redirect_targets_exist(rules, &mut repo).await?;
+        validate_traffic_routing_rules(rules, effective_alias, &mut repo).await?;
     }
 
     let tariffs = update.tariffs.clone();
