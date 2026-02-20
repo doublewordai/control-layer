@@ -1,0 +1,25 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO batch_capacity_reservations\n                (model_id, completion_window, reserved_requests, expires_at)\n            SELECT * FROM UNNEST($1::uuid[], $2::text[], $3::bigint[], $4::timestamptz[])\n            RETURNING id\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray",
+        "TextArray",
+        "Int8Array",
+        "TimestamptzArray"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "16f8ca02a88267033af3cc45d7fef975d1ac825fd538a77676a12cd5f2e90a2e"
+}
