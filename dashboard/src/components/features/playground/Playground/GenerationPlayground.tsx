@@ -15,7 +15,9 @@ import {
   ArrowDown,
   ArrowUp,
   ChevronDown,
+  ChevronRight,
   Settings,
+  Brain,
 } from "lucide-react";
 import { toast } from "sonner";
 import ReactMarkdown from "react-markdown";
@@ -31,6 +33,11 @@ import {
   TooltipTrigger,
 } from "../../../ui/tooltip";
 import { AlertBox } from "@/components/ui/alert-box";
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from "../../../ui/collapsible";
 
 interface ImageContent {
   type: "image_url";
@@ -57,6 +64,7 @@ interface MessageMetrics {
 interface Message {
   role: "user" | "assistant" | "system";
   content: MessageContent;
+  reasoningContent?: string;
   timestamp: Date;
   metrics?: MessageMetrics;
 }
@@ -67,6 +75,7 @@ interface GenerationPlaygroundProps {
   currentMessage: string;
   uploadedImages: string[];
   streamingContent: string;
+  streamingReasoningContent?: string;
   isStreaming: boolean;
   error: string | null;
   copiedMessageIndex: number | null;
@@ -88,6 +97,7 @@ interface GenerationPlaygroundProps {
   comparisonModel?: Model | null;
   messagesModelB?: Message[];
   streamingContentModelB?: string;
+  streamingReasoningContentModelB?: string;
   isStreamingModelB?: boolean;
   isSplitInput?: boolean;
   currentMessageModelB?: string;
@@ -98,12 +108,39 @@ interface GenerationPlaygroundProps {
   onCopyMessagesToModelA?: () => void;
 }
 
+const ThinkingBlock: React.FC<{ content: string; streaming?: boolean }> = ({
+  content,
+  streaming = false,
+}) => {
+  const [isOpen, setIsOpen] = useState(false);
+
+  return (
+    <Collapsible open={isOpen} onOpenChange={setIsOpen} className="mb-3">
+      <CollapsibleTrigger className="flex items-center gap-1.5 text-xs text-gray-500 hover:text-gray-700 transition-colors py-1">
+        {isOpen ? (
+          <ChevronDown className="w-3 h-3" />
+        ) : (
+          <ChevronRight className="w-3 h-3" />
+        )}
+        <Brain className="w-3 h-3" />
+        <span>Thinking{streaming ? "..." : ""}</span>
+      </CollapsibleTrigger>
+      <CollapsibleContent>
+        <div className="mt-1 pl-5 border-l-2 border-gray-200 text-xs text-gray-500 whitespace-pre-wrap leading-relaxed max-h-64 overflow-y-auto">
+          {content}
+        </div>
+      </CollapsibleContent>
+    </Collapsible>
+  );
+};
+
 const GenerationPlayground: React.FC<GenerationPlaygroundProps> = ({
   selectedModel,
   messages,
   currentMessage,
   uploadedImages,
   streamingContent,
+  streamingReasoningContent = "",
   isStreaming,
   error,
   copiedMessageIndex,
@@ -125,6 +162,7 @@ const GenerationPlayground: React.FC<GenerationPlaygroundProps> = ({
   comparisonModel = null,
   messagesModelB = [],
   streamingContentModelB = "",
+  streamingReasoningContentModelB = "",
   isStreamingModelB = false,
   isSplitInput = false,
   currentMessageModelB = "",
@@ -187,8 +225,10 @@ const GenerationPlayground: React.FC<GenerationPlaygroundProps> = ({
   }, [
     messages,
     streamingContent,
+    streamingReasoningContent,
     messagesModelB,
     streamingContentModelB,
+    streamingReasoningContentModelB,
     scrollToBottom,
   ]);
 
@@ -212,9 +252,10 @@ const GenerationPlayground: React.FC<GenerationPlaygroundProps> = ({
     modelIsStreaming: boolean,
     messagesEndReference: React.RefObject<HTMLDivElement | null>,
     modelLabel: string,
+    modelStreamingReasoningContent = "",
   ) => (
     <div className="flex-1 overflow-y-auto px-8 py-4 bg-white scrollbar-thin scrollbar-thumb-gray-300 scrollbar-track-transparent hover:scrollbar-thumb-gray-400">
-      {modelMessages.length === 0 && !modelStreamingContent ? (
+      {modelMessages.length === 0 && !modelStreamingContent && !modelStreamingReasoningContent ? (
         <div className="flex items-center justify-center h-full">
           <div
             className="text-center"
@@ -279,6 +320,10 @@ const GenerationPlayground: React.FC<GenerationPlaygroundProps> = ({
                         )}
                       </span>
                     </div>
+
+                    {message.reasoningContent && (
+                      <ThinkingBlock content={message.reasoningContent} />
+                    )}
 
                     <div
                       className={`text-sm leading-relaxed prose prose-sm max-w-none ${
@@ -509,7 +554,7 @@ const GenerationPlayground: React.FC<GenerationPlaygroundProps> = ({
             ))}
 
             {/* Typing Indicator */}
-            {modelIsStreaming && !modelStreamingContent && (
+            {modelIsStreaming && !modelStreamingContent && !modelStreamingReasoningContent && (
               <div className="w-full">
                 <div className="flex items-center gap-2 mb-3">
                   <span className="text-sm font-medium text-gray-600">
@@ -531,7 +576,7 @@ const GenerationPlayground: React.FC<GenerationPlaygroundProps> = ({
             )}
 
             {/* Streaming message */}
-            {modelStreamingContent && (
+            {(modelStreamingContent || modelStreamingReasoningContent) && (
               <div className="w-full">
                 <div className="flex items-center gap-2 mb-3">
                   <span className="text-sm font-medium text-gray-600">
@@ -550,6 +595,14 @@ const GenerationPlayground: React.FC<GenerationPlaygroundProps> = ({
                   </div>
                 </div>
 
+                {modelStreamingReasoningContent && (
+                  <ThinkingBlock
+                    content={modelStreamingReasoningContent}
+                    streaming
+                  />
+                )}
+
+                {modelStreamingContent && (
                 <div className="text-sm leading-relaxed prose prose-sm max-w-none">
                   <ReactMarkdown
                     remarkPlugins={[remarkGfm]}
@@ -671,6 +724,7 @@ const GenerationPlayground: React.FC<GenerationPlaygroundProps> = ({
                     {modelStreamingContent}
                   </ReactMarkdown>
                 </div>
+                )}
               </div>
             )}
 
@@ -854,7 +908,7 @@ const GenerationPlayground: React.FC<GenerationPlaygroundProps> = ({
 
           {/* Model A */}
           <div className="flex-1 border-r border-gray-200 flex flex-col min-h-0">
-            {messages.length > 0 || streamingContent ? (
+            {messages.length > 0 || streamingContent || streamingReasoningContent ? (
               renderMessagesArea(
                 selectedModel,
                 messages,
@@ -862,6 +916,7 @@ const GenerationPlayground: React.FC<GenerationPlaygroundProps> = ({
                 isStreaming,
                 messagesEndRef,
                 "Model A",
+                streamingReasoningContent,
               )
             ) : (
               <div className="flex-1 overflow-y-auto px-8 py-4 bg-white" />
@@ -869,7 +924,7 @@ const GenerationPlayground: React.FC<GenerationPlaygroundProps> = ({
           </div>
           {/* Model B */}
           <div className="flex-1 flex flex-col min-h-0">
-            {messagesModelB.length > 0 || streamingContentModelB ? (
+            {messagesModelB.length > 0 || streamingContentModelB || streamingReasoningContentModelB ? (
               renderMessagesArea(
                 comparisonModel,
                 messagesModelB,
@@ -877,6 +932,7 @@ const GenerationPlayground: React.FC<GenerationPlaygroundProps> = ({
                 isStreamingModelB,
                 messagesEndRefModelB,
                 "Model B",
+                streamingReasoningContentModelB,
               )
             ) : (
               <div className="flex-1 overflow-y-auto px-8 py-4 bg-white" />
@@ -891,6 +947,7 @@ const GenerationPlayground: React.FC<GenerationPlaygroundProps> = ({
           isStreaming,
           messagesEndRef,
           "Send a message to start a conversation",
+          streamingReasoningContent,
         )
       )}
 
