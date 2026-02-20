@@ -709,6 +709,9 @@ pub struct EmailConfig {
     pub from_name: String,
     /// Who to set the reply to field from
     pub reply_to: Option<String>,
+    /// Directory to load email templates from at runtime.
+    /// If not set, uses templates embedded at compile time.
+    pub templates_dir: Option<String>,
 }
 
 /// Email transport configuration - either SMTP or file-based for testing.
@@ -1493,6 +1496,7 @@ impl Default for EmailConfig {
             from_email: "noreply@example.com".to_string(),
             from_name: "Control Layer".to_string(),
             reply_to: None,
+            templates_dir: None,
         }
     }
 }
