@@ -252,8 +252,30 @@ pub async fn create_batch<P: PoolProvider>(
             operation: format!("get pending counts: {}", e),
         })?;
 
-    // Get model throughputs from database
+    // Get model aliases from file stats
     let model_aliases: Vec<String> = file_model_counts.keys().cloned().collect();
+
+    // Check per-model batch completion window restrictions
+    let model_allowed_windows = get_model_allowed_batch_windows(&state, &model_aliases).await?;
+    for (alias, allowed_windows) in &model_allowed_windows {
+        if !allowed_windows.contains(&req.completion_window) {
+            if allowed_windows.is_empty() {
+                return Err(Error::BadRequest {
+                    message: format!("Model '{}' does not support batch processing.", alias),
+                });
+            }
+            return Err(Error::BadRequest {
+                message: format!(
+                    "Model '{}' does not support completion window '{}'. Allowed: {}",
+                    alias,
+                    req.completion_window,
+                    allowed_windows.join(", ")
+                ),
+            });
+        }
+    }
+
+    // Get model throughputs from database
     let model_throughputs = get_model_throughputs(&state, &model_aliases).await?;
 
     // Perform capacity check
@@ -333,6 +355,26 @@ pub async fn create_batch<P: PoolProvider>(
         StatusCode::CREATED,
         Json(to_batch_response_with_email(batch, Some(&current_user.email))),
     ))
+}
+
+/// Get per-model allowed batch completion windows from the database.
+/// Returns only models that have explicit restrictions (NULL = all allowed, omitted from result).
+async fn get_model_allowed_batch_windows<P: PoolProvider>(
+    state: &AppState<P>,
+    model_aliases: &[String],
+) -> Result<HashMap<String, Vec<String>>> {
+    use crate::db::handlers::deployments::Deployments;
+
+    let mut conn = state.db.read().acquire().await.map_err(|e| Error::Internal {
+        operation: format!("get db connection: {}", e),
+    })?;
+
+    Deployments::new(&mut conn)
+        .get_allowed_batch_windows_by_aliases(model_aliases)
+        .await
+        .map_err(|e| Error::Internal {
+            operation: format!("get model allowed batch windows: {}", e),
+        })
 }
 
 /// Get throughput values for the given model aliases from the database

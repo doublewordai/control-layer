@@ -2,6 +2,7 @@
 
 use sqlx_pool_router::PoolProvider;
 
+use crate::api::models::deployments::{TrafficRoutingAction, TrafficRoutingRule};
 use crate::db::models::tariffs::TariffCreateDBRequest;
 use crate::{
     AppState,
@@ -28,6 +29,46 @@ use axum::{
     response::Json,
 };
 use sqlx::Acquire;
+
+/// Validate traffic routing rules for a model.
+fn validate_traffic_routing_rules(rules: &[TrafficRoutingRule], model_alias: &str) -> Result<()> {
+    for rule in rules {
+        if rule.match_labels.is_empty() {
+            return Err(Error::BadRequest {
+                message: "Traffic routing rule must have at least one match label".to_string(),
+            });
+        }
+        if let TrafficRoutingAction::Redirect { target } = &rule.action {
+            if target == model_alias {
+                return Err(Error::BadRequest {
+                    message: format!("Traffic routing rule cannot redirect model '{}' to itself", model_alias),
+                });
+            }
+            if target.is_empty() {
+                return Err(Error::BadRequest {
+                    message: "Redirect target must not be empty".to_string(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate allowed batch completion windows against globally configured values.
+fn validate_allowed_batch_windows(windows: &[String], allowed: &[String]) -> Result<()> {
+    for window in windows {
+        if !allowed.contains(window) {
+            return Err(Error::BadRequest {
+                message: format!(
+                    "Invalid batch completion window '{}'. Configured windows: {}",
+                    window,
+                    allowed.join(", ")
+                ),
+            });
+        }
+    }
+    Ok(())
+}
 
 /// Convert a DB component response to an API component response
 fn db_component_to_response(c: DeploymentComponentDBResponse) -> ModelComponentResponse {
@@ -333,6 +374,18 @@ pub async fn create_deployed_model<P: PoolProvider>(
         });
     }
 
+    // Validate traffic routing rules and allowed batch completion windows
+    let (traffic_rules, batch_windows) = match &create {
+        DeployedModelCreate::Standard(s) => (&s.traffic_routing_rules, &s.allowed_batch_completion_windows),
+        DeployedModelCreate::Composite(c) => (&c.traffic_routing_rules, &c.allowed_batch_completion_windows),
+    };
+    if let Some(rules) = traffic_rules {
+        validate_traffic_routing_rules(rules, alias)?;
+    }
+    if let Some(windows) = batch_windows {
+        validate_allowed_batch_windows(windows, &state.config.batches.allowed_completion_windows)?;
+    }
+
     let mut tx = state.db.write().begin().await.map_err(|e| Error::Database(e.into()))?;
 
     // Validate endpoint exists (only for standard models)
@@ -412,11 +465,33 @@ pub async fn update_deployed_model<P: PoolProvider>(
         });
     }
 
+    // Validate traffic routing rules and allowed batch completion windows (pre-DB)
+    if let Some(Some(rules)) = &update.traffic_routing_rules {
+        // We'll check self-redirect after we fetch the model alias below
+        for rule in rules {
+            if rule.match_labels.is_empty() {
+                return Err(Error::BadRequest {
+                    message: "Traffic routing rule must have at least one match label".to_string(),
+                });
+            }
+            if let TrafficRoutingAction::Redirect { target } = &rule.action
+                && target.is_empty()
+            {
+                return Err(Error::BadRequest {
+                    message: "Redirect target must not be empty".to_string(),
+                });
+            }
+        }
+    }
+    if let Some(Some(windows)) = &update.allowed_batch_completion_windows {
+        validate_allowed_batch_windows(windows, &state.config.batches.allowed_completion_windows)?;
+    }
+
     let mut tx = state.db.write().begin().await.map_err(|e| Error::Database(e.into()))?;
     let mut repo = Deployments::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
 
     // Verify deployment exists and check access based on permissions
-    match repo.get_by_id(deployment_id).await {
+    let model_alias = match repo.get_by_id(deployment_id).await {
         Ok(Some(model)) => {
             // Only allow non-admin users to access non-deleted models
             if model.deleted && !has_system_access {
@@ -425,6 +500,7 @@ pub async fn update_deployed_model<P: PoolProvider>(
                     id: deployment_id.to_string(),
                 });
             }
+            model.alias.clone()
         }
         Ok(None) => {
             return Err(Error::NotFound {
@@ -433,6 +509,13 @@ pub async fn update_deployed_model<P: PoolProvider>(
             });
         }
         Err(e) => return Err(e.into()),
+    };
+
+    // Check self-redirect now that we have the model alias
+    if let Some(Some(rules)) = &update.traffic_routing_rules {
+        // Use the updated alias if provided, otherwise use the existing one
+        let effective_alias = update.alias.as_deref().unwrap_or(&model_alias);
+        validate_traffic_routing_rules(rules, effective_alias)?;
     }
 
     let tariffs = update.tariffs.clone();

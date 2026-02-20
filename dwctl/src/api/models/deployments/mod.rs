@@ -11,6 +11,7 @@ use crate::types::{DeploymentId, InferenceEndpointId, UserId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_with::rust::double_option;
+use std::collections::HashMap;
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
@@ -95,6 +96,30 @@ pub struct TariffDefinition {
     pub completion_window: Option<String>,
 }
 
+/// A traffic routing rule that matches on API key labels and takes an action.
+/// Rules are evaluated in order; first match wins.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct TrafficRoutingRule {
+    /// All label conditions must match for this rule to apply.
+    /// Example: {"purpose": "playground"} matches playground API keys.
+    pub match_labels: HashMap<String, String>,
+    /// Action to take when matched
+    pub action: TrafficRoutingAction,
+}
+
+/// Action taken when a traffic routing rule matches
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case", tag = "type")]
+pub enum TrafficRoutingAction {
+    /// Return 403 Forbidden - deny access for this traffic kind
+    Deny,
+    /// Redirect to another model alias transparently
+    Redirect {
+        /// The model alias to redirect traffic to
+        target: String,
+    },
+}
+
 /// The data required to create a new model (standard or composite).
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -135,6 +160,14 @@ pub struct StandardModelCreate {
     pub provider_pricing: Option<ProviderPricing>,
     /// Tariffs for this model - if provided, these will be created as active tariffs
     pub tariffs: Option<Vec<TariffDefinition>>,
+    /// Traffic routing rules evaluated against API key labels.
+    /// Each rule matches on key labels (e.g., purpose) and either denies or redirects traffic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub traffic_routing_rules: Option<Vec<TrafficRoutingRule>>,
+    /// Per-model allowed batch completion windows (overrides global config).
+    /// Example: ["24h"] to only allow 24-hour batches on an expensive model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_batch_completion_windows: Option<Vec<String>>,
 }
 
 /// Data for creating a composite model (routes across multiple providers)
@@ -183,6 +216,14 @@ pub struct CompositeModelCreate {
     /// Whether to sanitize/filter sensitive data from model responses (defaults to false)
     #[serde(default)]
     pub sanitize_responses: bool,
+    /// Traffic routing rules evaluated against API key labels.
+    /// Each rule matches on key labels (e.g., purpose) and either denies or redirects traffic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub traffic_routing_rules: Option<Vec<TrafficRoutingRule>>,
+    /// Per-model allowed batch completion windows (overrides global config).
+    /// Example: ["24h"] to only allow 24-hour batches on an expensive model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_batch_completion_windows: Option<Vec<String>>,
 }
 
 fn default_true() -> bool {
@@ -243,6 +284,12 @@ pub struct DeployedModelUpdate {
     /// Whether to sanitize/filter sensitive data from model responses (null = no change)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sanitize_responses: Option<bool>,
+    /// Traffic routing rules (null = no change, Some(None) = clear, Some(rules) = set)
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
+    pub traffic_routing_rules: Option<Option<Vec<TrafficRoutingRule>>>,
+    /// Per-model allowed batch completion windows (null = no change, Some(None) = clear, Some(windows) = set)
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
+    pub allowed_batch_completion_windows: Option<Option<Vec<String>>>,
 }
 
 /// A request to update a specific model (i.e. bundle a `DeployedModelUpdate` with a model id).
@@ -337,6 +384,12 @@ pub struct DeployedModelResponse {
     /// Whether to sanitize/filter sensitive data from model responses (only included for composite models)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sanitize_responses: Option<bool>,
+    /// Traffic routing rules evaluated against API key labels
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub traffic_routing_rules: Option<Vec<TrafficRoutingRule>>,
+    /// Per-model allowed batch completion windows (overrides global config)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed_batch_completion_windows: Option<Vec<String>>,
 }
 
 impl From<DeploymentDBResponse> for DeployedModelResponse {
@@ -382,6 +435,8 @@ impl From<DeploymentDBResponse> for DeployedModelResponse {
             fallback,
             components: None, // By default, components are not included
             sanitize_responses: Some(db.sanitize_responses),
+            traffic_routing_rules: db.traffic_routing_rules.and_then(|v| serde_json::from_value(v).ok()),
+            allowed_batch_completion_windows: db.allowed_batch_completion_windows,
         }
     }
 }

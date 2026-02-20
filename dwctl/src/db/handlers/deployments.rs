@@ -133,6 +133,9 @@ struct DeployedModel {
     pub fallback_with_replacement: Option<bool>,
     pub fallback_max_attempts: Option<i32>,
     pub sanitize_responses: bool,
+    // Traffic routing
+    pub traffic_routing_rules: Option<serde_json::Value>,
+    pub allowed_batch_completion_windows: Option<Vec<String>>,
 }
 
 pub struct Deployments<'c> {
@@ -185,6 +188,8 @@ impl From<(Option<ModelType>, DeployedModel)> for DeploymentDBResponse {
             fallback_with_replacement: m.fallback_with_replacement.unwrap_or(false),
             fallback_max_attempts: m.fallback_max_attempts,
             sanitize_responses: m.sanitize_responses,
+            traffic_routing_rules: m.traffic_routing_rules,
+            allowed_batch_completion_windows: m.allowed_batch_completion_windows,
         }
     }
 }
@@ -233,9 +238,10 @@ impl<'c> Repository for Deployments<'c> {
                 downstream_hourly_rate, downstream_input_token_cost_ratio,
                 is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status,
                 fallback_with_replacement, fallback_max_attempts,
-                sanitize_responses
+                sanitize_responses,
+                traffic_routing_rules, allowed_batch_completion_windows
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29)
             RETURNING *
             "#,
             request.model_name.trim(),
@@ -264,7 +270,9 @@ impl<'c> Repository for Deployments<'c> {
             request.fallback_on_status.as_ref().map(|s| s.as_slice()),
             request.fallback_with_replacement,
             request.fallback_max_attempts,
-            request.sanitize_responses
+            request.sanitize_responses,
+            request.traffic_routing_rules,
+            request.allowed_batch_completion_windows.as_ref().map(|w| w.as_slice())
         )
         .fetch_one(&mut *self.db)
         .await?;
@@ -283,7 +291,7 @@ impl<'c> Repository for Deployments<'c> {
     async fn get_by_id(&mut self, id: Self::Id) -> Result<Option<Self::Response>> {
         let model = sqlx::query_as!(
             DeployedModel,
-            "SELECT id, model_name, alias, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_with_replacement, fallback_max_attempts, sanitize_responses FROM deployed_models WHERE id = $1",
+            "SELECT id, model_name, alias, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_with_replacement, fallback_max_attempts, sanitize_responses, traffic_routing_rules, allowed_batch_completion_windows FROM deployed_models WHERE id = $1",
             id
         )
             .fetch_optional(&mut *self.db)
@@ -308,7 +316,7 @@ impl<'c> Repository for Deployments<'c> {
 
         let deployments = sqlx::query_as!(
             DeployedModel,
-            "SELECT id, model_name, alias, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_with_replacement, fallback_max_attempts, sanitize_responses FROM deployed_models WHERE id = ANY($1)",
+            "SELECT id, model_name, alias, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_with_replacement, fallback_max_attempts, sanitize_responses, traffic_routing_rules, allowed_batch_completion_windows FROM deployed_models WHERE id = ANY($1)",
             ids.as_slice()
         )
             .fetch_all(&mut *self.db)
@@ -469,6 +477,16 @@ impl<'c> Repository for Deployments<'c> {
                 ELSE fallback_max_attempts
             END,
 
+            -- Traffic routing
+            traffic_routing_rules = CASE
+                WHEN $42 THEN $43
+                ELSE traffic_routing_rules
+            END,
+            allowed_batch_completion_windows = CASE
+                WHEN $44 THEN $45
+                ELSE allowed_batch_completion_windows
+            END,
+
             updated_at = NOW()
         WHERE id = $1
         RETURNING *
@@ -512,16 +530,20 @@ impl<'c> Repository for Deployments<'c> {
             pricing_params.should_update_ratio,  // $30
             pricing_params.ratio,                // $31
             // For composite model fields
-            lb_strategy_str,                                                         // $32
-            request.fallback_enabled,                                                // $33
-            request.fallback_on_rate_limit,                                          // $34
-            request.fallback_on_status.as_ref().map(|s| s.as_slice()),               // $35
-            request.sanitize_responses,                                              // $36
-            request.throughput.is_some() as bool,                                    // $37
-            request.throughput.as_ref().and_then(|inner| inner.as_ref()),            // $38
-            request.fallback_with_replacement,                                       // $39
-            request.fallback_max_attempts.is_some() as bool,                         // $40
-            request.fallback_max_attempts.as_ref().and_then(|inner| inner.as_ref()), // $41
+            lb_strategy_str,                                                                                           // $32
+            request.fallback_enabled,                                                                                  // $33
+            request.fallback_on_rate_limit,                                                                            // $34
+            request.fallback_on_status.as_ref().map(|s| s.as_slice()),                                                 // $35
+            request.sanitize_responses,                                                                                // $36
+            request.throughput.is_some() as bool,                                                                      // $37
+            request.throughput.as_ref().and_then(|inner| inner.as_ref()),                                              // $38
+            request.fallback_with_replacement,                                                                         // $39
+            request.fallback_max_attempts.is_some() as bool,                                                           // $40
+            request.fallback_max_attempts.as_ref().and_then(|inner| inner.as_ref()),                                   // $41
+            request.traffic_routing_rules.is_some() as bool,                                                           // $42
+            request.traffic_routing_rules.as_ref().and_then(|inner| inner.as_ref()) as Option<&serde_json::Value>,     // $43
+            request.allowed_batch_completion_windows.is_some() as bool,                                                // $44
+            request.allowed_batch_completion_windows.as_ref().and_then(|inner| inner.as_deref()) as Option<&[String]>, // $45
         )
         .fetch_one(&mut *self.db)
         .await?;
@@ -1050,6 +1072,35 @@ impl<'c> Deployments<'c> {
         .await?;
 
         Ok(rows.into_iter().filter_map(|r| r.throughput.map(|t| (r.alias, t))).collect())
+    }
+
+    /// Get allowed batch completion windows for models by their aliases.
+    /// Returns a map of alias → allowed windows. Models with NULL (no restriction) are omitted.
+    pub async fn get_allowed_batch_windows_by_aliases(
+        &mut self,
+        aliases: &[String],
+    ) -> Result<std::collections::HashMap<String, Vec<String>>> {
+        if aliases.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+
+        let rows = sqlx::query!(
+            r#"
+            SELECT alias, allowed_batch_completion_windows
+            FROM deployed_models
+            WHERE alias = ANY($1)
+              AND deleted = false
+              AND allowed_batch_completion_windows IS NOT NULL
+            "#,
+            aliases
+        )
+        .fetch_all(&mut *self.db)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .filter_map(|r| r.allowed_batch_completion_windows.map(|windows| (r.alias, windows)))
+            .collect())
     }
 }
 

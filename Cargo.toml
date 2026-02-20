@@ -1,3 +1,6 @@
 [workspace]
 members = ["dwctl"]
 resolver = "2"
+
+[patch.crates-io]
+onwards = { path = "../onwards" }

@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT alias, allowed_batch_completion_windows\n            FROM deployed_models\n            WHERE alias = ANY($1)\n              AND deleted = false\n              AND allowed_batch_completion_windows IS NOT NULL\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "alias",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "allowed_batch_completion_windows",
+        "type_info": "TextArray"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      false,
+      true
+    ]
+  },
+  "hash": "ca79cf42bd784dd1c9d7fe47a93b86771a4595554fa93da3f7065c6a3f52b36c"
+}
