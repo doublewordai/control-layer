@@ -3,6 +3,7 @@
 use sqlx_pool_router::PoolProvider;
 
 use crate::api::models::deployments::{TrafficRoutingAction, TrafficRoutingRule};
+use crate::db::models::deployments::TrafficRuleAction;
 use crate::db::models::tariffs::TariffCreateDBRequest;
 use crate::{
     AppState,
@@ -17,8 +18,9 @@ use crate::{
     auth::permissions::{RequiresPermission, can_read_all_resources, has_permission, operation, resource},
     db::{
         handlers::{Deployments, InferenceEndpoints, Repository, Tariffs, deployments::DeploymentFilter},
-        models::deployments::{
-            DeploymentComponentDBResponse, DeploymentCreateDBRequest, DeploymentUpdateDBRequest, ModelStatus, ModelType,
+        models::{
+            api_keys::ApiKeyPurpose,
+            deployments::{DeploymentComponentDBResponse, DeploymentCreateDBRequest, DeploymentUpdateDBRequest, ModelStatus, ModelType},
         },
     },
     errors::{Error, Result},
@@ -30,41 +32,37 @@ use axum::{
 };
 use sqlx::Acquire;
 
-/// Validate traffic routing rules: structural checks + redirect targets exist in DB.
-async fn validate_traffic_routing_rules(rules: &[TrafficRoutingRule], model_alias: &str, repo: &mut Deployments<'_>) -> Result<()> {
-    let mut redirect_targets = Vec::new();
+/// Resolve API traffic routing rules to DB-layer actions (alias strings → UUIDs).
+/// Validates no self-redirects, no empty targets, and that redirect targets exist.
+async fn resolve_traffic_rules(
+    rules: &[TrafficRoutingRule],
+    model_alias: &str,
+    repo: &mut Deployments<'_>,
+) -> Result<Vec<(ApiKeyPurpose, TrafficRuleAction)>> {
+    let mut resolved = Vec::with_capacity(rules.len());
     for rule in rules {
-        if rule.match_labels.is_empty() {
-            return Err(Error::BadRequest {
-                message: "Traffic routing rule must have at least one match label".to_string(),
-            });
-        }
-        if let TrafficRoutingAction::Redirect { target } = &rule.action {
-            if target.is_empty() {
-                return Err(Error::BadRequest {
-                    message: "Redirect target must not be empty".to_string(),
-                });
-            }
-            if target == model_alias {
-                return Err(Error::BadRequest {
-                    message: format!("Traffic routing rule cannot redirect model '{}' to itself", model_alias),
-                });
-            }
-            redirect_targets.push(target.clone());
-        }
-    }
-
-    if !redirect_targets.is_empty() {
-        let existing = repo.get_aliases_that_exist(&redirect_targets).await?;
-        for target in &redirect_targets {
-            if !existing.contains(target) {
-                return Err(Error::BadRequest {
+        let action = match &rule.action {
+            TrafficRoutingAction::Deny => TrafficRuleAction::Deny,
+            TrafficRoutingAction::Redirect { target } => {
+                if target.is_empty() {
+                    return Err(Error::BadRequest {
+                        message: "Redirect target must not be empty".to_string(),
+                    });
+                }
+                if target == model_alias {
+                    return Err(Error::BadRequest {
+                        message: format!("Traffic routing rule cannot redirect model '{}' to itself", model_alias),
+                    });
+                }
+                let target_id = repo.resolve_alias_to_id(target).await?.ok_or_else(|| Error::BadRequest {
                     message: format!("Redirect target model '{}' does not exist", target),
-                });
+                })?;
+                TrafficRuleAction::Redirect(target_id)
             }
-        }
+        };
+        resolved.push((rule.api_key_purpose.clone(), action));
     }
-    Ok(())
+    Ok(resolved)
 }
 
 /// Convert a DB component response to an API component response
@@ -275,13 +273,26 @@ pub async fn list_deployed_models<P: PoolProvider>(
     let filtered_models = repo.list(&filter).await?;
 
     // Convert to API responses and add provider_pricing based on permissions and includes
-    let models: Vec<DeployedModelResponse> = filtered_models
+    let mut models: Vec<DeployedModelResponse> = filtered_models
         .into_iter()
         .map(|model| {
             let provider_pricing = if can_read_pricing { model.provider_pricing.clone() } else { None };
             DeployedModelResponse::from(model).with_provider_pricing(provider_pricing)
         })
         .collect();
+
+    // Fetch and attach traffic rules in bulk
+    {
+        let model_ids: Vec<DeploymentId> = models.iter().map(|m| m.id).collect();
+        let mut traffic_rules_map = repo.get_traffic_rules_bulk(&model_ids).await?;
+        models = models
+            .into_iter()
+            .map(|model| {
+                let rules = traffic_rules_map.remove(&model.id).unwrap_or_default();
+                model.with_traffic_rules(rules)
+            })
+            .collect();
+    }
 
     // Configure enrichment based on includes and permissions
     let include_groups = includes.contains(&"groups");
@@ -404,20 +415,28 @@ pub async fn create_deployed_model<P: PoolProvider>(
         }
     }
 
-    // Validate traffic routing rules (structural checks + redirect targets exist)
-    let traffic_rules = match &create {
+    // Resolve traffic routing rules (alias → UUID) before creating
+    let traffic_rules_input = match &create {
         DeployedModelCreate::Standard(s) => &s.traffic_routing_rules,
         DeployedModelCreate::Composite(c) => &c.traffic_routing_rules,
     };
-    if let Some(rules) = traffic_rules {
+    let resolved_rules = if let Some(rules) = traffic_rules_input {
         let mut repo = Deployments::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
-        validate_traffic_routing_rules(rules, alias, &mut repo).await?;
-    }
+        Some(resolve_traffic_rules(rules, alias, &mut repo).await?)
+    } else {
+        None
+    };
 
     // Create the deployment - let database constraints handle uniqueness
     let mut repo = Deployments::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
     let db_request = DeploymentCreateDBRequest::from_api_create(current_user.id, create);
     let model = repo.create(&db_request).await?;
+
+    // Set traffic routing rules if provided
+    if let Some(rules) = &resolved_rules {
+        let mut repo = Deployments::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
+        repo.set_traffic_rules(model.id, rules).await?;
+    }
 
     // Create tariffs if provided
     if let Some(tariff_defs) = tariffs {
@@ -438,7 +457,16 @@ pub async fn create_deployed_model<P: PoolProvider>(
 
     tx.commit().await.map_err(|e| Error::Database(e.into()))?;
 
-    Ok(Json(DeployedModelResponse::from(model)))
+    // Fetch and attach traffic rules for the response
+    let mut response = DeployedModelResponse::from(model);
+    if resolved_rules.is_some() {
+        let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
+        let mut repo = Deployments::new(&mut conn);
+        let rules = repo.get_traffic_rules(response.id).await?;
+        response = response.with_traffic_rules(rules);
+    }
+
+    Ok(Json(response))
 }
 
 #[utoipa::path(
@@ -521,17 +549,35 @@ pub async fn update_deployed_model<P: PoolProvider>(
         }
     };
 
-    // Validate traffic routing rules (structural checks + redirect targets exist)
-    if let Some(Some(rules)) = &update.traffic_routing_rules {
-        let effective_alias = update.alias.as_deref().unwrap_or(&model_alias);
-        let mut repo = Deployments::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
-        validate_traffic_routing_rules(rules, effective_alias, &mut repo).await?;
-    }
+    // Resolve traffic routing rules if provided
+    let resolved_rules = match &update.traffic_routing_rules {
+        Some(Some(rules)) => {
+            let effective_alias = update.alias.as_deref().unwrap_or(&model_alias);
+            let mut repo = Deployments::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
+            Some(Some(resolve_traffic_rules(rules, effective_alias, &mut repo).await?))
+        }
+        Some(None) => Some(None), // Clear all rules
+        None => None,             // No change
+    };
 
     let tariffs = update.tariffs.clone();
     let db_request = DeploymentUpdateDBRequest::from(update);
     let mut repo = Deployments::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
     let model = repo.update(deployment_id, &db_request).await?;
+
+    // Apply traffic rule changes
+    match &resolved_rules {
+        Some(Some(rules)) => {
+            let mut repo = Deployments::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
+            repo.set_traffic_rules(deployment_id, rules).await?;
+        }
+        Some(None) => {
+            // Clear all rules (pass empty slice)
+            let mut repo = Deployments::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
+            repo.set_traffic_rules(deployment_id, &[]).await?;
+        }
+        None => {} // No change
+    }
 
     // Handle tariff replacement if provided
     if let Some(tariff_defs) = tariffs {
@@ -585,7 +631,14 @@ pub async fn update_deployed_model<P: PoolProvider>(
 
     tx.commit().await.map_err(|e| Error::Database(e.into()))?;
 
-    Ok(Json(DeployedModelResponse::from(model)))
+    // Fetch and attach traffic rules for the response
+    let mut response = DeployedModelResponse::from(model);
+    let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
+    let mut repo = Deployments::new(&mut conn);
+    let rules = repo.get_traffic_rules(deployment_id).await?;
+    response = response.with_traffic_rules(rules);
+
+    Ok(Json(response))
 }
 
 #[utoipa::path(
@@ -734,6 +787,12 @@ pub async fn get_deployed_model<P: PoolProvider>(
         None
     };
     let mut response = DeployedModelResponse::from(model).with_provider_pricing(provider_pricing);
+
+    // Fetch and attach traffic rules
+    {
+        let traffic_rules = repo.get_traffic_rules(deployment_id).await?;
+        response = response.with_traffic_rules(traffic_rules);
+    }
 
     // Use ModelEnricher to add related data
     let enricher = DeployedModelEnricher {

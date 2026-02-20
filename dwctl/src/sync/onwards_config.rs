@@ -5,8 +5,8 @@ use std::{collections::HashMap, num::NonZeroU32, sync::Arc};
 use metrics::histogram;
 use onwards::target::{
     Auth, ConcurrencyLimitParameters, ConfigFile, FallbackConfig as OnwardsFallbackConfig, KeyDefinition,
-    LoadBalanceStrategy as OnwardsLoadBalanceStrategy, PoolSpec, ProviderSpec, RateLimitParameters, RoutingRule, TargetSpecOrList, Targets,
-    WatchTargetsStream,
+    LoadBalanceStrategy as OnwardsLoadBalanceStrategy, PoolSpec, ProviderSpec, RateLimitParameters, RoutingAction, RoutingRule,
+    TargetSpecOrList, Targets, WatchTargetsStream,
 };
 use sqlx::{PgPool, postgres::PgListener};
 use tokio::sync::{mpsc, watch};
@@ -56,7 +56,7 @@ struct OnwardsTarget {
     burst_size: Option<i32>,
     capacity: Option<i32>,
     sanitize_responses: bool,
-    /// Traffic routing rules from the database (JSONB deserialized to onwards RoutingRule)
+    /// Traffic routing rules from the model_traffic_rules table
     routing_rules: Vec<RoutingRule>,
 
     // Endpoint info
@@ -443,7 +443,6 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
             cm.fallback_with_replacement,
             cm.fallback_max_attempts,
             cm.sanitize_responses as composite_sanitize_responses,
-            cm.traffic_routing_rules as composite_traffic_routing_rules,
             -- Component info
             dmc.deployed_model_id,
             dmc.weight,
@@ -572,13 +571,6 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                 .and_then(LoadBalancingStrategy::try_parse)
                 .unwrap_or_default();
 
-            // Deserialize traffic routing rules from JSONB
-            let routing_rules: Vec<RoutingRule> = row
-                .composite_traffic_routing_rules
-                .as_ref()
-                .and_then(|v| serde_json::from_value(v.clone()).ok())
-                .unwrap_or_default();
-
             OnwardsCompositeModel {
                 id: row.composite_model_id,
                 alias: row.alias.clone(),
@@ -592,7 +584,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                 fallback_with_replacement: row.fallback_with_replacement.unwrap_or(false),
                 fallback_max_attempts: row.fallback_max_attempts,
                 sanitize_responses: row.composite_sanitize_responses,
-                routing_rules,
+                routing_rules: Vec::new(), // Populated from separate query below
                 components: Vec::new(),
                 api_keys: Vec::new(),
             }
@@ -990,7 +982,6 @@ pub async fn load_targets_from_db(db: &PgPool, escalation_models: &[String], str
             dm.burst_size as deployment_burst_size,
             dm.capacity,
             dm.sanitize_responses,
-            dm.traffic_routing_rules,
             ie.id as endpoint_id,
             ie.url as "endpoint_url!",
             ie.api_key as endpoint_api_key,
@@ -1070,13 +1061,6 @@ pub async fn load_targets_from_db(db: &PgPool, escalation_models: &[String], str
     for row in rows {
         let deployment_id = row.deployment_id;
         let target = targets_map.entry(deployment_id).or_insert_with(|| {
-            // Deserialize traffic routing rules from JSONB
-            let routing_rules: Vec<RoutingRule> = row
-                .traffic_routing_rules
-                .as_ref()
-                .and_then(|v| serde_json::from_value(v.clone()).ok())
-                .unwrap_or_default();
-
             OnwardsTarget {
                 model_name: row.model_name.clone(),
                 alias: row.alias.clone(),
@@ -1084,7 +1068,7 @@ pub async fn load_targets_from_db(db: &PgPool, escalation_models: &[String], str
                 burst_size: row.deployment_burst_size,
                 capacity: row.capacity,
                 sanitize_responses: row.sanitize_responses,
-                routing_rules,
+                routing_rules: Vec::new(), // Populated from separate query below
                 endpoint_url: url::Url::parse(&row.endpoint_url).expect("Invalid URL in database"),
                 endpoint_api_key: row.endpoint_api_key.clone(),
                 auth_header_name: row.auth_header_name.clone(),
@@ -1104,11 +1088,62 @@ pub async fn load_targets_from_db(db: &PgPool, escalation_models: &[String], str
         }
     }
 
-    let targets: Vec<_> = targets_map.into_values().collect();
-    info!("Loaded {} deployed models", targets.len());
+    info!("Loaded {} deployed models", targets_map.len());
 
     // Load composite models (pass escalation_models to grant batch API keys access)
     let composites = load_composite_models_from_db(db, escalation_models).await?;
+
+    // Load traffic routing rules for all non-deleted models (regular + composite)
+    let traffic_rule_rows = sqlx::query!(
+        r#"
+        SELECT mtr.deployed_model_id, mtr.api_key_purpose, mtr.action,
+               dm.alias as "redirect_target_alias?"
+        FROM model_traffic_rules mtr
+        LEFT JOIN deployed_models dm ON dm.id = mtr.redirect_target_id
+        WHERE mtr.deployed_model_id IN (
+            SELECT id FROM deployed_models WHERE deleted = FALSE
+        )
+        ORDER BY mtr.deployed_model_id, mtr.api_key_purpose
+        "#
+    )
+    .fetch_all(db)
+    .await?;
+
+    // Build a map of deployment_id → routing rules
+    let mut routing_rules_map: HashMap<DeploymentId, Vec<RoutingRule>> = HashMap::new();
+    for rule_row in traffic_rule_rows {
+        let routing_rule = RoutingRule {
+            match_labels: HashMap::from([("purpose".to_string(), rule_row.api_key_purpose)]),
+            action: match rule_row.action.as_str() {
+                "deny" => RoutingAction::Deny,
+                "redirect" => RoutingAction::Redirect {
+                    target: rule_row.redirect_target_alias.unwrap_or_default(),
+                },
+                _ => continue,
+            },
+        };
+        routing_rules_map.entry(rule_row.deployed_model_id).or_default().push(routing_rule);
+    }
+
+    // Attach routing rules to regular targets
+    for (deployment_id, target) in &mut targets_map {
+        if let Some(rules) = routing_rules_map.remove(deployment_id) {
+            target.routing_rules = rules;
+        }
+    }
+
+    let targets: Vec<_> = targets_map.into_values().collect();
+
+    // Attach routing rules to composite models
+    let composites: Vec<_> = composites
+        .into_iter()
+        .map(|mut c| {
+            if let Some(rules) = routing_rules_map.remove(&c.id) {
+                c.routing_rules = rules;
+            }
+            c
+        })
+        .collect();
 
     // Convert to ConfigFile format
     let config = convert_to_config_file(targets, composites, strict_mode);
@@ -1326,7 +1361,7 @@ mod tests {
                 fallback_with_replacement: None,
                 fallback_max_attempts: None,
                 sanitize_responses: true,
-                traffic_routing_rules: None,
+
                 allowed_batch_completion_windows: None,
             })
             .await
@@ -1443,7 +1478,7 @@ mod tests {
                 fallback_with_replacement: None,
                 fallback_max_attempts: None,
                 sanitize_responses: true,
-                traffic_routing_rules: None,
+
                 allowed_batch_completion_windows: None,
             })
             .await
@@ -1477,7 +1512,7 @@ mod tests {
                 fallback_with_replacement: None,
                 fallback_max_attempts: None,
                 sanitize_responses: true,
-                traffic_routing_rules: None,
+
                 allowed_batch_completion_windows: None,
             })
             .await

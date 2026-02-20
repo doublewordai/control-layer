@@ -5,13 +5,12 @@ pub mod enrichment;
 use super::pagination::Pagination;
 use crate::api::models::groups::GroupResponse;
 use crate::db::models::deployments::{
-    DeploymentDBResponse, FallbackConfig, LoadBalancingStrategy, ModelType, ProviderPricing, ProviderPricingUpdate,
+    DeploymentDBResponse, FallbackConfig, LoadBalancingStrategy, ModelType, ProviderPricing, ProviderPricingUpdate, TrafficRuleDBRow,
 };
 use crate::types::{DeploymentId, InferenceEndpointId, UserId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_with::rust::double_option;
-use std::collections::HashMap;
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
@@ -96,13 +95,12 @@ pub struct TariffDefinition {
     pub completion_window: Option<String>,
 }
 
-/// A traffic routing rule that matches on API key labels and takes an action.
-/// Rules are evaluated in order; first match wins.
+/// A traffic routing rule that controls access by API key purpose.
+/// Rules are evaluated in order; first match wins; no match = allow.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct TrafficRoutingRule {
-    /// All label conditions must match for this rule to apply.
-    /// Example: {"purpose": "playground"} matches playground API keys.
-    pub match_labels: HashMap<String, String>,
+    /// The API key purpose this rule applies to (realtime, batch, or playground).
+    pub api_key_purpose: crate::db::models::api_keys::ApiKeyPurpose,
     /// Action to take when matched
     pub action: TrafficRoutingAction,
 }
@@ -435,7 +433,7 @@ impl From<DeploymentDBResponse> for DeployedModelResponse {
             fallback,
             components: None, // By default, components are not included
             sanitize_responses: Some(db.sanitize_responses),
-            traffic_routing_rules: db.traffic_routing_rules.and_then(|v| serde_json::from_value(v).ok()),
+            traffic_routing_rules: None, // Populated via enrichment (with_traffic_rules)
             allowed_batch_completion_windows: db.allowed_batch_completion_windows,
         }
     }
@@ -511,6 +509,35 @@ impl DeployedModelResponse {
     /// Create a response with components included (for composite models)
     pub fn with_components(mut self, components: Vec<ModelComponentResponse>) -> Self {
         self.components = Some(components);
+        self
+    }
+
+    /// Create a response with traffic routing rules included
+    pub fn with_traffic_rules(mut self, rules: Vec<TrafficRuleDBRow>) -> Self {
+        self.traffic_routing_rules = if rules.is_empty() {
+            None
+        } else {
+            Some(
+                rules
+                    .into_iter()
+                    .filter_map(|r| {
+                        let purpose: crate::db::models::api_keys::ApiKeyPurpose =
+                            serde_json::from_value(serde_json::Value::String(r.api_key_purpose)).ok()?;
+                        let action = match r.action.as_str() {
+                            "deny" => TrafficRoutingAction::Deny,
+                            "redirect" => TrafficRoutingAction::Redirect {
+                                target: r.redirect_target_alias.unwrap_or_default(),
+                            },
+                            _ => return None,
+                        };
+                        Some(TrafficRoutingRule {
+                            api_key_purpose: purpose,
+                            action,
+                        })
+                    })
+                    .collect(),
+            )
+        };
         self
     }
 }

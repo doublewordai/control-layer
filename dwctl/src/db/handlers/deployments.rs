@@ -1,11 +1,13 @@
 //! Database repository for model deployments.
 
+use crate::db::models::api_keys::ApiKeyPurpose;
 use crate::db::{
     errors::{DbError, Result},
     handlers::repository::Repository,
     models::deployments::{
         DeploymentComponentCreateDBRequest, DeploymentComponentDBResponse, DeploymentCreateDBRequest, DeploymentDBResponse,
         DeploymentUpdateDBRequest, LoadBalancingStrategy, ModelStatus, ModelType, ProviderPricing, ProviderPricingFields,
+        TrafficRuleAction, TrafficRuleDBRow,
     },
 };
 use crate::types::{DeploymentId, InferenceEndpointId, UserId, abbrev_uuid};
@@ -144,7 +146,6 @@ struct DeployedModel {
     pub fallback_max_attempts: Option<i32>,
     pub sanitize_responses: bool,
     // Traffic routing
-    pub traffic_routing_rules: Option<serde_json::Value>,
     pub allowed_batch_completion_windows: Option<Vec<String>>,
 }
 
@@ -198,7 +199,6 @@ impl From<(Option<ModelType>, DeployedModel)> for DeploymentDBResponse {
             fallback_with_replacement: m.fallback_with_replacement.unwrap_or(false),
             fallback_max_attempts: m.fallback_max_attempts,
             sanitize_responses: m.sanitize_responses,
-            traffic_routing_rules: m.traffic_routing_rules,
             allowed_batch_completion_windows: m.allowed_batch_completion_windows,
         }
     }
@@ -249,9 +249,9 @@ impl<'c> Repository for Deployments<'c> {
                 is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status,
                 fallback_with_replacement, fallback_max_attempts,
                 sanitize_responses,
-                traffic_routing_rules, allowed_batch_completion_windows
+                allowed_batch_completion_windows
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28)
             RETURNING *
             "#,
             request.model_name.trim(),
@@ -281,7 +281,6 @@ impl<'c> Repository for Deployments<'c> {
             request.fallback_with_replacement,
             request.fallback_max_attempts,
             request.sanitize_responses,
-            request.traffic_routing_rules,
             request.allowed_batch_completion_windows.as_ref().map(|w| w.as_slice())
         )
         .fetch_one(&mut *self.db)
@@ -301,7 +300,7 @@ impl<'c> Repository for Deployments<'c> {
     async fn get_by_id(&mut self, id: Self::Id) -> Result<Option<Self::Response>> {
         let model = sqlx::query_as!(
             DeployedModel,
-            "SELECT id, model_name, alias, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_with_replacement, fallback_max_attempts, sanitize_responses, traffic_routing_rules, allowed_batch_completion_windows FROM deployed_models WHERE id = $1",
+            "SELECT id, model_name, alias, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_with_replacement, fallback_max_attempts, sanitize_responses, allowed_batch_completion_windows FROM deployed_models WHERE id = $1",
             id
         )
             .fetch_optional(&mut *self.db)
@@ -326,7 +325,7 @@ impl<'c> Repository for Deployments<'c> {
 
         let deployments = sqlx::query_as!(
             DeployedModel,
-            "SELECT id, model_name, alias, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_with_replacement, fallback_max_attempts, sanitize_responses, traffic_routing_rules, allowed_batch_completion_windows FROM deployed_models WHERE id = ANY($1)",
+            "SELECT id, model_name, alias, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_with_replacement, fallback_max_attempts, sanitize_responses, allowed_batch_completion_windows FROM deployed_models WHERE id = ANY($1)",
             ids.as_slice()
         )
             .fetch_all(&mut *self.db)
@@ -487,13 +486,9 @@ impl<'c> Repository for Deployments<'c> {
                 ELSE fallback_max_attempts
             END,
 
-            -- Traffic routing
-            traffic_routing_rules = CASE
-                WHEN $42 THEN $43
-                ELSE traffic_routing_rules
-            END,
+            -- Batch completion windows
             allowed_batch_completion_windows = CASE
-                WHEN $44 THEN $45
+                WHEN $42 THEN $43
                 ELSE allowed_batch_completion_windows
             END,
 
@@ -540,20 +535,19 @@ impl<'c> Repository for Deployments<'c> {
             pricing_params.should_update_ratio,  // $30
             pricing_params.ratio,                // $31
             // For composite model fields
-            lb_strategy_str,                                                                                           // $32
-            request.fallback_enabled,                                                                                  // $33
-            request.fallback_on_rate_limit,                                                                            // $34
-            request.fallback_on_status.as_ref().map(|s| s.as_slice()),                                                 // $35
-            request.sanitize_responses,                                                                                // $36
-            request.throughput.is_some() as bool,                                                                      // $37
-            request.throughput.as_ref().and_then(|inner| inner.as_ref()),                                              // $38
-            request.fallback_with_replacement,                                                                         // $39
-            request.fallback_max_attempts.is_some() as bool,                                                           // $40
-            request.fallback_max_attempts.as_ref().and_then(|inner| inner.as_ref()),                                   // $41
-            request.traffic_routing_rules.is_some() as bool,                                                           // $42
-            request.traffic_routing_rules.as_ref().and_then(|inner| inner.as_ref()) as Option<&serde_json::Value>,     // $43
-            request.allowed_batch_completion_windows.is_some() as bool,                                                // $44
-            request.allowed_batch_completion_windows.as_ref().and_then(|inner| inner.as_deref()) as Option<&[String]>, // $45
+            lb_strategy_str,                                                         // $32
+            request.fallback_enabled,                                                // $33
+            request.fallback_on_rate_limit,                                          // $34
+            request.fallback_on_status.as_ref().map(|s| s.as_slice()),               // $35
+            request.sanitize_responses,                                              // $36
+            request.throughput.is_some() as bool,                                    // $37
+            request.throughput.as_ref().and_then(|inner| inner.as_ref()),            // $38
+            request.fallback_with_replacement,                                       // $39
+            request.fallback_max_attempts.is_some() as bool,                         // $40
+            request.fallback_max_attempts.as_ref().and_then(|inner| inner.as_ref()), // $41
+            // Batch completion windows
+            request.allowed_batch_completion_windows.is_some() as bool, // $42
+            request.allowed_batch_completion_windows.as_ref().and_then(|inner| inner.as_deref()) as Option<&[String]>, // $43
         )
         .fetch_one(&mut *self.db)
         .await?;
@@ -1093,25 +1087,128 @@ impl<'c> Deployments<'c> {
         Ok(info)
     }
 
-    /// Check which of the given aliases exist as non-deleted deployed models.
-    pub async fn get_aliases_that_exist(&mut self, aliases: &[String]) -> Result<Vec<String>> {
-        if aliases.is_empty() {
-            return Ok(Vec::new());
+    /// Resolve a model alias to its deployment ID. Returns None if not found or deleted.
+    #[instrument(skip(self), fields(alias = %alias), err)]
+    pub async fn resolve_alias_to_id(&mut self, alias: &str) -> Result<Option<DeploymentId>> {
+        let id = sqlx::query_scalar!(
+            r#"
+            SELECT id FROM deployed_models WHERE alias = $1 AND deleted = false
+            "#,
+            alias
+        )
+        .fetch_optional(&mut *self.db)
+        .await?;
+
+        Ok(id)
+    }
+
+    /// Set traffic routing rules for a model (replace-all pattern).
+    #[instrument(skip(self, rules), fields(deployment_id = %abbrev_uuid(&deployed_model_id), count = rules.len()), err)]
+    pub async fn set_traffic_rules(&mut self, deployed_model_id: DeploymentId, rules: &[(ApiKeyPurpose, TrafficRuleAction)]) -> Result<()> {
+        // Delete existing rules
+        sqlx::query!("DELETE FROM model_traffic_rules WHERE deployed_model_id = $1", deployed_model_id)
+            .execute(&mut *self.db)
+            .await?;
+
+        // Insert new rules
+        for (purpose, action) in rules {
+            let purpose_str = serde_json::to_value(purpose)
+                .ok()
+                .and_then(|v| v.as_str().map(String::from))
+                .unwrap_or_default();
+            let (action_str, redirect_target_id) = match action {
+                TrafficRuleAction::Deny => ("deny", None),
+                TrafficRuleAction::Redirect(target_id) => ("redirect", Some(*target_id)),
+            };
+
+            sqlx::query!(
+                r#"
+                INSERT INTO model_traffic_rules (deployed_model_id, api_key_purpose, action, redirect_target_id)
+                VALUES ($1, $2, $3, $4)
+                "#,
+                deployed_model_id,
+                purpose_str,
+                action_str,
+                redirect_target_id,
+            )
+            .execute(&mut *self.db)
+            .await?;
         }
 
-        let rows = sqlx::query_scalar!(
+        Ok(())
+    }
+
+    /// Get traffic routing rules for a single model.
+    #[instrument(skip(self), fields(deployment_id = %abbrev_uuid(&deployed_model_id)), err)]
+    pub async fn get_traffic_rules(&mut self, deployed_model_id: DeploymentId) -> Result<Vec<TrafficRuleDBRow>> {
+        let rows = sqlx::query!(
             r#"
-            SELECT alias
-            FROM deployed_models
-            WHERE alias = ANY($1)
-              AND deleted = false
+            SELECT mtr.id, mtr.deployed_model_id, mtr.api_key_purpose, mtr.action,
+                   mtr.redirect_target_id, dm.alias as "redirect_target_alias?",
+                   mtr.created_at
+            FROM model_traffic_rules mtr
+            LEFT JOIN deployed_models dm ON dm.id = mtr.redirect_target_id
+            WHERE mtr.deployed_model_id = $1
+            ORDER BY mtr.api_key_purpose
             "#,
-            aliases
+            deployed_model_id
         )
         .fetch_all(&mut *self.db)
         .await?;
 
-        Ok(rows)
+        Ok(rows
+            .into_iter()
+            .map(|r| TrafficRuleDBRow {
+                id: r.id,
+                deployed_model_id: r.deployed_model_id,
+                api_key_purpose: r.api_key_purpose,
+                action: r.action,
+                redirect_target_id: r.redirect_target_id,
+                redirect_target_alias: r.redirect_target_alias,
+                created_at: r.created_at,
+            })
+            .collect())
+    }
+
+    /// Get traffic routing rules for multiple models in bulk.
+    #[instrument(skip(self, deployment_ids), fields(count = deployment_ids.len()), err)]
+    pub async fn get_traffic_rules_bulk(
+        &mut self,
+        deployment_ids: &[DeploymentId],
+    ) -> Result<HashMap<DeploymentId, Vec<TrafficRuleDBRow>>> {
+        if deployment_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let rows = sqlx::query!(
+            r#"
+            SELECT mtr.id, mtr.deployed_model_id, mtr.api_key_purpose, mtr.action,
+                   mtr.redirect_target_id, dm.alias as "redirect_target_alias?",
+                   mtr.created_at
+            FROM model_traffic_rules mtr
+            LEFT JOIN deployed_models dm ON dm.id = mtr.redirect_target_id
+            WHERE mtr.deployed_model_id = ANY($1)
+            ORDER BY mtr.deployed_model_id, mtr.api_key_purpose
+            "#,
+            deployment_ids
+        )
+        .fetch_all(&mut *self.db)
+        .await?;
+
+        let mut map: HashMap<DeploymentId, Vec<TrafficRuleDBRow>> = HashMap::new();
+        for r in rows {
+            map.entry(r.deployed_model_id).or_default().push(TrafficRuleDBRow {
+                id: r.id,
+                deployed_model_id: r.deployed_model_id,
+                api_key_purpose: r.api_key_purpose,
+                action: r.action,
+                redirect_target_id: r.redirect_target_id,
+                redirect_target_alias: r.redirect_target_alias,
+                created_at: r.created_at,
+            });
+        }
+
+        Ok(map)
     }
 }
 

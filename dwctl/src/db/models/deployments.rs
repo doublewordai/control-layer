@@ -12,6 +12,7 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use serde_with::rust::double_option;
 use utoipa::ToSchema;
+use uuid::Uuid;
 
 // Mode constants for provider pricing
 const MODE_PER_TOKEN: &str = "per_token";
@@ -395,8 +396,6 @@ pub struct DeploymentCreateDBRequest {
     /// Whether to sanitize/filter sensitive data from model responses (defaults to true)
     #[builder(default = true)]
     pub sanitize_responses: bool,
-    /// Traffic routing rules (JSONB array of routing rules matching onwards RoutingRule format)
-    pub traffic_routing_rules: Option<serde_json::Value>,
     /// Per-model allowed batch completion windows (overrides global config when set)
     pub allowed_batch_completion_windows: Option<Vec<String>>,
 }
@@ -420,7 +419,6 @@ impl DeploymentCreateDBRequest {
                 .maybe_throughput(standard.throughput)
                 .maybe_provider_pricing(standard.provider_pricing)
                 .is_composite(false)
-                .maybe_traffic_routing_rules(standard.traffic_routing_rules.and_then(|rules| serde_json::to_value(rules).ok()))
                 .maybe_allowed_batch_completion_windows(standard.allowed_batch_completion_windows)
                 .build(),
             DeployedModelCreate::Composite(composite) => Self::builder()
@@ -443,7 +441,6 @@ impl DeploymentCreateDBRequest {
                 .fallback_with_replacement(composite.fallback_with_replacement)
                 .maybe_fallback_max_attempts(composite.fallback_max_attempts)
                 .sanitize_responses(composite.sanitize_responses)
-                .maybe_traffic_routing_rules(composite.traffic_routing_rules.and_then(|rules| serde_json::to_value(rules).ok()))
                 .maybe_allowed_batch_completion_windows(composite.allowed_batch_completion_windows)
                 .build(),
         }
@@ -477,8 +474,6 @@ pub struct DeploymentUpdateDBRequest {
     pub fallback_max_attempts: Option<Option<i32>>,
     /// Whether to sanitize/filter sensitive data from model responses
     pub sanitize_responses: Option<bool>,
-    /// Traffic routing rules (None = no change, Some(None) = clear, Some(rules) = set)
-    pub traffic_routing_rules: Option<Option<serde_json::Value>>,
     /// Per-model allowed batch completion windows (None = no change, Some(None) = clear, Some(windows) = set)
     pub allowed_batch_completion_windows: Option<Option<Vec<String>>>,
 }
@@ -503,11 +498,6 @@ impl From<DeployedModelUpdate> for DeploymentUpdateDBRequest {
             .maybe_fallback_with_replacement(update.fallback_with_replacement)
             .maybe_fallback_max_attempts(update.fallback_max_attempts)
             .maybe_sanitize_responses(update.sanitize_responses)
-            .maybe_traffic_routing_rules(
-                update
-                    .traffic_routing_rules
-                    .map(|opt| opt.and_then(|rules| serde_json::to_value(rules).ok())),
-            )
             .maybe_allowed_batch_completion_windows(update.allowed_batch_completion_windows)
             .build()
     }
@@ -569,8 +559,26 @@ pub struct DeploymentDBResponse {
     pub fallback_max_attempts: Option<i32>,
     /// Whether to sanitize/filter sensitive data from model responses
     pub sanitize_responses: bool,
-    /// Traffic routing rules (JSONB array of RoutingRule matching onwards format)
-    pub traffic_routing_rules: Option<serde_json::Value>,
     /// Per-model allowed batch completion windows (overrides global config when set)
     pub allowed_batch_completion_windows: Option<Vec<String>>,
+}
+
+/// DB action for a traffic routing rule (used at the repository layer)
+#[derive(Debug, Clone)]
+pub enum TrafficRuleAction {
+    Deny,
+    Redirect(DeploymentId),
+}
+
+/// Row returned from model_traffic_rules table (with joined redirect target alias)
+#[derive(Debug, Clone)]
+pub struct TrafficRuleDBRow {
+    pub id: Uuid,
+    pub deployed_model_id: DeploymentId,
+    pub api_key_purpose: String,
+    pub action: String,
+    pub redirect_target_id: Option<DeploymentId>,
+    /// Populated via LEFT JOIN on deployed_models
+    pub redirect_target_alias: Option<String>,
+    pub created_at: DateTime<Utc>,
 }
