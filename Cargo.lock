@@ -1513,6 +1513,7 @@ dependencies = [
  "rust-embed",
  "rust_decimal",
  "rustls",
+ "scopeguard",
  "serde",
  "serde_json",
  "serde_urlencoded",

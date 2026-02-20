@@ -283,16 +283,24 @@ pub async fn create_batch<P: PoolProvider>(
     )
     .await?;
 
-    let batch = state.request_manager.create_batch(batch_input).await;
+    // RAII guard: releases reservations when this scope exits, whether by normal
+    // return, early return (e.g. create_batch error), or unwind panic.
+    // The spawn is best-effort — the TTL is the true safety net if the runtime
+    // is unavailable at drop time.
+    let _release_guard = scopeguard::guard(reservation_ids.clone(), |ids| {
+        let state = state.clone();
+        tokio::runtime::Handle::current().spawn(async move {
+            if let Err(e) = release_capacity_reservations(&state, &ids).await {
+                tracing::warn!(
+                    reservation_ids = ?ids,
+                    error = %e,
+                    "Failed to release capacity reservations — will expire via TTL"
+                );
+            }
+        });
+    });
 
-    if let Err(err) = release_capacity_reservations(&state, &reservation_ids).await {
-        tracing::warn!(
-            error = ?err,
-            "Failed to release capacity reservations after batch creation"
-        );
-    }
-
-    let batch = batch.map_err(|e| Error::Internal {
+    let batch = state.request_manager.create_batch(batch_input).await.map_err(|e| Error::Internal {
         operation: format!("create batch: {}", e),
     })?;
 
