@@ -425,14 +425,16 @@ async fn reserve_capacity_for_batch<P: PoolProvider>(
     model_pairs.sort_by_key(|(_, id)| *id);
 
     for (alias, model_id) in &model_pairs {
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))")
-            .bind(model_id.to_string())
-            .bind(completion_window)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| Error::Internal {
-                operation: format!("lock reservation for {}: {}", alias, e),
-            })?;
+        sqlx::query!(
+            "SELECT pg_advisory_xact_lock(hashtext($1::text), hashtext($2::text))",
+            model_id.to_string(),
+            completion_window
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| Error::Internal {
+            operation: format!("lock reservation for {}: {}", alias, e),
+        })?;
     }
 
     // Sum active reservations and add to pending_counts
@@ -2188,7 +2190,7 @@ mod tests {
     #[test_log::test]
     async fn test_reserve_capacity_for_batch_inserts_and_releases(pool: PgPool) {
         let config = create_test_config();
-        // Use create_test_app_with_config to run all migrations (dwctl + fusillade)
+        // Use create_test_app_state_with_fusillade to run all migrations (dwctl + fusillade)
         let state = create_test_app_state_with_fusillade(pool.clone(), config).await;
 
         let user = create_test_user(&pool, Role::StandardUser).await;

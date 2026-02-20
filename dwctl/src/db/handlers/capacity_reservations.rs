@@ -42,24 +42,30 @@ impl<'c> BatchCapacityReservations<'c> {
 
     #[instrument(skip(self, rows), fields(count = rows.len()), err)]
     pub async fn insert_reservations(&mut self, rows: &[(Uuid, &str, i64, DateTime<Utc>)]) -> Result<Vec<Uuid>> {
-        let mut ids = Vec::new();
-        for (model_id, window, count, expires_at) in rows {
-            let id = sqlx::query_scalar!(
-                r#"
-                INSERT INTO batch_capacity_reservations
-                    (model_id, completion_window, reserved_requests, expires_at)
-                VALUES ($1, $2, $3, $4)
-                RETURNING id
-                "#,
-                model_id,
-                *window,
-                *count,
-                *expires_at
-            )
-            .fetch_one(&mut *self.db)
-            .await?;
-            ids.push(id);
+        if rows.is_empty() {
+            return Ok(vec![]);
         }
+
+        let model_ids: Vec<Uuid> = rows.iter().map(|(id, _, _, _)| *id).collect();
+        let windows: Vec<&str> = rows.iter().map(|(_, w, _, _)| *w).collect();
+        let counts: Vec<i64> = rows.iter().map(|(_, _, c, _)| *c).collect();
+        let expires_ats: Vec<DateTime<Utc>> = rows.iter().map(|(_, _, _, e)| *e).collect();
+
+        let ids = sqlx::query_scalar!(
+            r#"
+            INSERT INTO batch_capacity_reservations
+                (model_id, completion_window, reserved_requests, expires_at)
+            SELECT * FROM UNNEST($1::uuid[], $2::text[], $3::bigint[], $4::timestamptz[])
+            RETURNING id
+            "#,
+            &model_ids,
+            &windows as &[&str],
+            &counts,
+            &expires_ats as &[DateTime<Utc>],
+        )
+        .fetch_all(&mut *self.db)
+        .await?;
+
         Ok(ids)
     }
 
