@@ -452,6 +452,8 @@ mod tests {
             sanitize_responses: None,
             trusted: None,
             open_responses_adapter: None,
+            traffic_routing_rules: None,
+            allowed_batch_completion_windows: None,
         }
     }
 

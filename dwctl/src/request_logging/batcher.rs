@@ -1462,6 +1462,7 @@ mod integration_tests {
                 sanitize_responses: true,
                 trusted: false,
                 open_responses_adapter: true,
+                allowed_batch_completion_windows: None,
             })
             .await
             .unwrap();

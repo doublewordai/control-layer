@@ -1,5 +1,24 @@
 # Changelog
 
+## [8.6.0](https://github.com/doublewordai/control-layer/compare/v8.5.0...v8.6.0) (2026-02-23)
+
+
+### Features
+
+* per-model traffic routing rules and batch window control ([#743](https://github.com/doublewordai/control-layer/issues/743)) ([7163e75](https://github.com/doublewordai/control-layer/commit/7163e751a7d366929fe57e8f4a4692519c3c7c71))
+
+
+### Bug Fixes
+
+* **dev:** extra commas in just check ([#750](https://github.com/doublewordai/control-layer/issues/750)) ([12fdf56](https://github.com/doublewordai/control-layer/commit/12fdf56d56eb0108b64e02c39af7f220e79c403a))
+
+## [8.5.0](https://github.com/doublewordai/control-layer/compare/v8.4.1...v8.5.0) (2026-02-23)
+
+
+### Features
+
+* race condition guard on batch creation ([#723](https://github.com/doublewordai/control-layer/issues/723)) ([34d5340](https://github.com/doublewordai/control-layer/commit/34d5340e2c5afaed63df3c7d80911f7d0050ffdf))
+
 ## [8.4.1](https://github.com/doublewordai/control-layer/compare/v8.4.0...v8.4.1) (2026-02-20)
 
 

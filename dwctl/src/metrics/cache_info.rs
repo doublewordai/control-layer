@@ -363,6 +363,8 @@ mod tests {
                 sanitize_responses: true,
                 trusted: false,
                 open_responses_adapter: true,
+
+                allowed_batch_completion_windows: None,
             })
             .await
             .unwrap();
@@ -487,6 +489,8 @@ mod tests {
                 sanitize_responses: true,
                 trusted: false,
                 open_responses_adapter: true,
+
+                allowed_batch_completion_windows: None,
             })
             .await
             .unwrap();
@@ -520,6 +524,8 @@ mod tests {
                 sanitize_responses: true,
                 trusted: false,
                 open_responses_adapter: true,
+
+                allowed_batch_completion_windows: None,
             })
             .await
             .unwrap();
@@ -613,6 +619,7 @@ mod tests {
             sanitize_responses: false,
             trusted: false,
             open_responses_adapter: true,
+            allowed_batch_completion_windows: None,
         })
         .await
         .unwrap();
@@ -702,6 +709,8 @@ mod tests {
                 sanitize_responses: false,
                 trusted: false,
                 open_responses_adapter: true,
+
+                allowed_batch_completion_windows: None,
             })
             .await
             .unwrap();
@@ -837,6 +846,8 @@ mod tests {
                 sanitize_responses: false,
                 trusted: false,
                 open_responses_adapter: true,
+
+                allowed_batch_completion_windows: None,
             })
             .await
             .unwrap();
@@ -870,6 +881,8 @@ mod tests {
                 sanitize_responses: false,
                 trusted: false,
                 open_responses_adapter: true,
+
+                allowed_batch_completion_windows: None,
             })
             .await
             .unwrap();
@@ -994,6 +1007,8 @@ mod tests {
                 sanitize_responses: false,
                 trusted: false,
                 open_responses_adapter: true,
+
+                allowed_batch_completion_windows: None,
             })
             .await
             .unwrap();
@@ -1111,6 +1126,8 @@ mod tests {
                 sanitize_responses: false,
                 trusted: false,
                 open_responses_adapter: true,
+
+                allowed_batch_completion_windows: None,
             })
             .await
             .unwrap();
