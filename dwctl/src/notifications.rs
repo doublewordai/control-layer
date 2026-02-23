@@ -126,7 +126,10 @@ pub async fn run_notification_poller(
     };
 
     let email_service = match EmailService::new(&app_config) {
-        Ok(svc) => Some(svc),
+        Ok(svc) => {
+            tracing::info!("Launched email service successfully");
+            Some(svc)
+        }
         Err(e) => {
             tracing::warn!(error = %e, "Failed to create email service, email notifications disabled");
             None
