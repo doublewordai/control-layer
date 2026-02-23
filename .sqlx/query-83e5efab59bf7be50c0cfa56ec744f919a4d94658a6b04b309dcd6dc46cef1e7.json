@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, model_name, alias, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_with_replacement, fallback_max_attempts, sanitize_responses, trusted FROM deployed_models WHERE id = $1",
+  "query": "\n            INSERT INTO deployed_models (\n                model_name, alias, description, type, capabilities, created_by, hosted_on, created_at, updated_at,\n                requests_per_second, burst_size, capacity, batch_capacity, throughput,\n                downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token,\n                downstream_hourly_rate, downstream_input_token_cost_ratio,\n                is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status,\n                fallback_with_replacement, fallback_max_attempts,\n                sanitize_responses, trusted, open_responses_adapter\n            )\n            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29)\n            RETURNING *\n            ",
   "describe": {
     "columns": [
       {
@@ -40,33 +40,33 @@
       },
       {
         "ordinal": 7,
-        "name": "hosted_on",
-        "type_info": "Uuid"
-      },
-      {
-        "ordinal": 8,
-        "name": "status",
-        "type_info": "Varchar"
-      },
-      {
-        "ordinal": 9,
-        "name": "last_sync",
-        "type_info": "Timestamptz"
-      },
-      {
-        "ordinal": 10,
-        "name": "deleted",
-        "type_info": "Bool"
-      },
-      {
-        "ordinal": 11,
         "name": "created_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 12,
+        "ordinal": 8,
         "name": "updated_at",
         "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 9,
+        "name": "status",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 10,
+        "name": "last_sync",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 11,
+        "name": "deleted",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 12,
+        "name": "hosted_on",
+        "type_info": "Uuid"
       },
       {
         "ordinal": 13,
@@ -80,93 +80,126 @@
       },
       {
         "ordinal": 15,
-        "name": "capacity",
-        "type_info": "Int4"
-      },
-      {
-        "ordinal": 16,
-        "name": "batch_capacity",
-        "type_info": "Int4"
-      },
-      {
-        "ordinal": 17,
-        "name": "throughput",
-        "type_info": "Float4"
-      },
-      {
-        "ordinal": 18,
         "name": "downstream_pricing_mode",
         "type_info": "Varchar"
       },
       {
-        "ordinal": 19,
+        "ordinal": 16,
         "name": "downstream_input_price_per_token",
         "type_info": "Numeric"
       },
       {
-        "ordinal": 20,
+        "ordinal": 17,
         "name": "downstream_output_price_per_token",
         "type_info": "Numeric"
       },
       {
-        "ordinal": 21,
+        "ordinal": 18,
         "name": "downstream_hourly_rate",
         "type_info": "Numeric"
       },
       {
-        "ordinal": 22,
+        "ordinal": 19,
         "name": "downstream_input_token_cost_ratio",
         "type_info": "Numeric"
       },
       {
-        "ordinal": 23,
+        "ordinal": 20,
+        "name": "capacity",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 21,
+        "name": "batch_capacity",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 22,
         "name": "is_composite",
         "type_info": "Bool"
       },
       {
-        "ordinal": 24,
+        "ordinal": 23,
         "name": "lb_strategy",
         "type_info": "Varchar"
       },
       {
-        "ordinal": 25,
+        "ordinal": 24,
         "name": "fallback_enabled",
         "type_info": "Bool"
       },
       {
-        "ordinal": 26,
+        "ordinal": 25,
         "name": "fallback_on_rate_limit",
         "type_info": "Bool"
       },
       {
-        "ordinal": 27,
+        "ordinal": 26,
         "name": "fallback_on_status",
         "type_info": "Int4Array"
       },
       {
+        "ordinal": 27,
+        "name": "sanitize_responses",
+        "type_info": "Bool"
+      },
+      {
         "ordinal": 28,
+        "name": "throughput",
+        "type_info": "Float4"
+      },
+      {
+        "ordinal": 29,
         "name": "fallback_with_replacement",
         "type_info": "Bool"
       },
       {
-        "ordinal": 29,
+        "ordinal": 30,
         "name": "fallback_max_attempts",
         "type_info": "Int4"
-      },
-      {
-        "ordinal": 30,
-        "name": "sanitize_responses",
-        "type_info": "Bool"
       },
       {
         "ordinal": 31,
         "name": "trusted",
         "type_info": "Bool"
+      },
+      {
+        "ordinal": 32,
+        "name": "open_responses_adapter",
+        "type_info": "Bool"
       }
     ],
     "parameters": {
       "Left": [
-        "Uuid"
+        "Varchar",
+        "Varchar",
+        "Text",
+        "Varchar",
+        "TextArray",
+        "Uuid",
+        "Uuid",
+        "Timestamptz",
+        "Timestamptz",
+        "Float4",
+        "Int4",
+        "Int4",
+        "Int4",
+        "Float4",
+        "Varchar",
+        "Numeric",
+        "Numeric",
+        "Numeric",
+        "Numeric",
+        "Bool",
+        "Varchar",
+        "Bool",
+        "Bool",
+        "Int4Array",
+        "Bool",
+        "Int4",
+        "Bool",
+        "Bool",
+        "Bool"
       ]
     },
     "nullable": [
@@ -177,21 +210,9 @@
       true,
       true,
       false,
-      true,
-      false,
-      true,
       false,
       false,
       false,
-      true,
-      true,
-      true,
-      true,
-      true,
-      true,
-      true,
-      true,
-      true,
       true,
       false,
       true,
@@ -200,9 +221,22 @@
       true,
       true,
       true,
+      true,
+      true,
+      true,
+      true,
       false,
-      false
+      true,
+      true,
+      true,
+      true,
+      false,
+      true,
+      true,
+      true,
+      false,
+      true
     ]
   },
-  "hash": "ff7dfd937d2d176ecda4fc8c8cfd6986a4e30d7b5e7a2a8ba2989006fd28310f"
+  "hash": "83e5efab59bf7be50c0cfa56ec744f919a4d94658a6b04b309dcd6dc46cef1e7"
 }

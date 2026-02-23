@@ -141,6 +141,9 @@ pub struct StandardModelCreate {
     /// Whether to mark provider as trusted in strict mode (defaults to false, used when strict_mode=true)
     #[serde(default)]
     pub trusted: Option<bool>,
+    /// Whether to enable the open_responses adapter that converts /v1/responses to /v1/chat/completions (defaults to true)
+    #[serde(default)]
+    pub open_responses_adapter: Option<bool>,
 }
 
 /// Data for creating a composite model (routes across multiple providers)
@@ -192,6 +195,9 @@ pub struct CompositeModelCreate {
     /// Whether to mark provider as trusted in strict mode (defaults to false, used when strict_mode=true)
     #[serde(default)]
     pub trusted: Option<bool>,
+    /// Whether to enable the open_responses adapter that converts /v1/responses to /v1/chat/completions (defaults to true)
+    #[serde(default)]
+    pub open_responses_adapter: Option<bool>,
 }
 
 fn default_true() -> bool {
@@ -255,6 +261,9 @@ pub struct DeployedModelUpdate {
     /// Whether to mark provider as trusted in strict mode (null = no change, used when strict_mode=true)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trusted: Option<bool>,
+    /// Whether to enable the open_responses adapter (null = no change)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_responses_adapter: Option<bool>,
 }
 
 /// A request to update a specific model (i.e. bundle a `DeployedModelUpdate` with a model id).
@@ -352,6 +361,9 @@ pub struct DeployedModelResponse {
     /// Whether to mark provider as trusted in strict mode (used when strict_mode=true)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trusted: Option<bool>,
+    /// Whether the open_responses adapter is enabled (converts /v1/responses to /v1/chat/completions)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub open_responses_adapter: Option<bool>,
 }
 
 impl From<DeploymentDBResponse> for DeployedModelResponse {
@@ -398,6 +410,7 @@ impl From<DeploymentDBResponse> for DeployedModelResponse {
             components: None, // By default, components are not included
             sanitize_responses: Some(db.sanitize_responses),
             trusted: Some(db.trusted),
+            open_responses_adapter: Some(db.open_responses_adapter),
         }
     }
 }
@@ -461,6 +474,7 @@ impl DeployedModelResponse {
     pub fn mask_response_config(mut self) -> Self {
         self.sanitize_responses = None;
         self.trusted = None;
+        self.open_responses_adapter = None;
         self
     }
 
@@ -536,6 +550,8 @@ pub struct ComponentModelSummary {
     pub endpoint: Option<ComponentEndpointSummary>,
     /// Whether to mark provider as trusted in strict mode
     pub trusted: bool,
+    /// Whether the open_responses adapter is enabled
+    pub open_responses_adapter: bool,
 }
 
 /// Summary of an endpoint hosting a component model

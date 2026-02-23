@@ -34,6 +34,7 @@ export interface ComponentModelSummary {
   model_type?: ModelType;
   endpoint?: ComponentEndpointSummary;
   trusted?: boolean;
+  open_responses_adapter?: boolean;
 }
 
 export interface ModelComponent {
@@ -164,6 +165,7 @@ export interface Model {
   components?: ModelComponent[]; // only present when include=components
   sanitize_responses?: boolean | null; // only present for virtual models
   trusted?: boolean; // Mark provider as trusted in strict mode (bypasses error sanitization)
+  open_responses_adapter?: boolean; // Enable adapter that converts /v1/responses to /v1/chat/completions
 }
 
 // Model creation types - discriminated union with "type" field
@@ -180,6 +182,7 @@ export interface StandardModelCreate {
   capacity?: number;
   batch_capacity?: number;
   trusted?: boolean;
+  open_responses_adapter?: boolean;
 }
 
 // Virtual model creation - routes requests across multiple hosted models
@@ -384,6 +387,7 @@ export interface ModelUpdateRequest {
   fallback_max_attempts?: number | null;
   sanitize_responses?: boolean | null;
   trusted?: boolean | null;
+  open_responses_adapter?: boolean | null;
 }
 
 // Endpoint-specific types

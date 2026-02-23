@@ -474,6 +474,7 @@ pub async fn seed_database(sources: &[config::ModelSource], db: &PgPool) -> Resu
                             provider_pricing: None,
                             sanitize_responses: None,
                             trusted: None,
+                            open_responses_adapter: None,
                         }),
                     ))
                     .await

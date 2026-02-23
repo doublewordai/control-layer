@@ -659,7 +659,8 @@ async fn test_strict_mode_allows_responses(pool: PgPool) {
             "type": "standard",
             "model_name": "gpt-4",
             "alias": "gpt-4",
-            "hosted_on": endpoint_id
+            "hosted_on": endpoint_id,
+            "open_responses_adapter": false
         }))
         .await;
 

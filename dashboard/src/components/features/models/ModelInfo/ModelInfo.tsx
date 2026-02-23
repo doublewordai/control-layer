@@ -122,6 +122,7 @@ const ModelInfo: React.FC = () => {
     capabilities: [] as string[],
     sanitize_responses: false,
     trusted: false,
+    open_responses_adapter: true,
     requests_per_second: null as number | null,
     burst_size: null as number | null,
     capacity: null as number | null,
@@ -216,6 +217,7 @@ const ModelInfo: React.FC = () => {
         capabilities: model.capabilities || [],
         sanitize_responses: model.sanitize_responses ?? false,
         trusted: model.trusted ?? false,
+        open_responses_adapter: model.open_responses_adapter ?? true,
         requests_per_second: model.requests_per_second || null,
         burst_size: model.burst_size || null,
         capacity: model.capacity || null,
@@ -248,6 +250,7 @@ const ModelInfo: React.FC = () => {
           capabilities: updateData.capabilities,
           sanitize_responses: updateData.sanitize_responses,
           trusted: updateData.trusted,
+          open_responses_adapter: updateData.open_responses_adapter,
           // Always include rate limiting and capacity fields to handle clearing properly
           // Send null as the actual value when clearing (not undefined)
           requests_per_second: updateData.requests_per_second,
@@ -277,6 +280,7 @@ const ModelInfo: React.FC = () => {
         capabilities: model.capabilities || [],
         sanitize_responses: model.sanitize_responses ?? false,
         trusted: model.trusted ?? false,
+        open_responses_adapter: model.open_responses_adapter ?? true,
         requests_per_second: model.requests_per_second || null,
         burst_size: model.burst_size || null,
         capacity: model.capacity || null,
@@ -836,6 +840,39 @@ const ModelInfo: React.FC = () => {
                                   allowing full error details to be returned.
                                   Non-trusted providers have sensitive error
                                   information removed.
+                                </p>
+                              </InfoTip>
+                            </label>
+                          </div>
+                        )}
+
+                        {/* Show open_responses_adapter for standard models when strict mode is ON */}
+                        {!model.is_composite && strictModeEnabled && (
+                          <div className="flex items-center space-x-2">
+                            <input
+                              type="checkbox"
+                              id="open-responses-adapter"
+                              checked={updateData.open_responses_adapter ?? true}
+                              onChange={(e) => {
+                                setUpdateData((prev) => ({
+                                  ...prev,
+                                  open_responses_adapter: e.target.checked,
+                                }));
+                              }}
+                              className="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                            />
+                            <label
+                              htmlFor="open-responses-adapter"
+                              className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70 flex items-center gap-1"
+                            >
+                              Responses API Adapter
+                              <InfoTip>
+                                <p className="text-sm text-muted-foreground">
+                                  Enable the adapter that converts OpenAI
+                                  Responses API requests (/v1/responses) to
+                                  Chat Completions (/v1/chat/completions) for
+                                  providers that don&apos;t natively support
+                                  the Responses API.
                                 </p>
                               </InfoTip>
                             </label>

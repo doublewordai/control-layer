@@ -750,6 +750,7 @@ mod tests {
                 fallback_max_attempts: None,
                 sanitize_responses: true,
                 trusted: false,
+                open_responses_adapter: true,
             }
         }
     }

@@ -5,8 +5,8 @@ use std::{collections::HashMap, num::NonZeroU32, sync::Arc};
 use metrics::histogram;
 use onwards::target::{
     Auth, ConcurrencyLimitParameters, ConfigFile, FallbackConfig as OnwardsFallbackConfig, KeyDefinition,
-    LoadBalanceStrategy as OnwardsLoadBalanceStrategy, PoolSpec, ProviderSpec, RateLimitParameters, TargetSpec, TargetSpecOrList, Targets,
-    WatchTargetsStream,
+    LoadBalanceStrategy as OnwardsLoadBalanceStrategy, OpenResponsesConfig, PoolSpec, ProviderSpec, RateLimitParameters, TargetSpec,
+    TargetSpecOrList, Targets, WatchTargetsStream,
 };
 use sqlx::{PgPool, postgres::PgListener};
 use tokio::sync::{mpsc, watch};
@@ -57,6 +57,7 @@ struct OnwardsTarget {
     capacity: Option<i32>,
     sanitize_responses: bool,
     trusted: bool,
+    open_responses_adapter: bool,
 
     // Endpoint info
     endpoint_url: url::Url,
@@ -413,6 +414,8 @@ struct OnwardsCompositeModel {
     /// Whether to mark provider as trusted in strict mode
     #[allow(dead_code)] // Stored in DB but composite-level trust is not yet propagated to onwards
     trusted: bool,
+    /// Whether to enable the open_responses adapter at the pool level
+    open_responses_adapter: bool,
     components: Vec<CompositeModelComponent>,
     // API keys that have access to this composite model
     api_keys: Vec<OnwardsApiKey>,
@@ -443,6 +446,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
             cm.fallback_max_attempts,
             cm.sanitize_responses as composite_sanitize_responses,
             cm.trusted as composite_trusted,
+            cm.open_responses_adapter as "composite_open_responses_adapter?",
             -- Component info
             dmc.deployed_model_id,
             dmc.weight,
@@ -454,6 +458,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
             dm.capacity as deployment_capacity,
             dm.sanitize_responses as deployment_sanitize_responses,
             dm.trusted as deployment_trusted,
+            dm.open_responses_adapter as "deployment_open_responses_adapter?",
             -- Endpoint info
             ie.url as "endpoint_url!",
             ie.api_key as endpoint_api_key,
@@ -584,6 +589,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                 fallback_max_attempts: row.fallback_max_attempts,
                 sanitize_responses: row.composite_sanitize_responses,
                 trusted: row.composite_trusted,
+                open_responses_adapter: row.composite_open_responses_adapter.unwrap_or(true),
                 components: Vec::new(),
                 api_keys: Vec::new(),
             }
@@ -599,6 +605,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                 capacity: row.deployment_capacity,
                 sanitize_responses: row.deployment_sanitize_responses,
                 trusted: row.deployment_trusted,
+                open_responses_adapter: row.deployment_open_responses_adapter.unwrap_or(true),
                 endpoint_url,
                 endpoint_api_key: row.endpoint_api_key.clone(),
                 auth_header_name: row.auth_header_name.clone(),
@@ -774,7 +781,9 @@ fn convert_composite_to_target_spec(
                     // This ensures the virtual model's toggle controls all providers
                     sanitize_response: composite.sanitize_responses,
                     request_timeout_secs: None,
-                    open_responses: None,
+                    open_responses: Some(OpenResponsesConfig {
+                        adapter: target.open_responses_adapter,
+                    }),
                     // Each provider uses its own trusted setting from the database
                     // This allows fine-grained control over which providers bypass error sanitization
                     trusted: Some(target.trusted),
@@ -805,7 +814,9 @@ fn convert_composite_to_target_spec(
         response_headers: None,
         sanitize_response: composite.sanitize_responses,
         trusted: false, // Pool-level trusted defaults to false; providers set their own
-        open_responses: None,
+        open_responses: Some(OpenResponsesConfig {
+            adapter: composite.open_responses_adapter,
+        }),
     };
 
     (composite.alias.clone(), TargetSpecOrList::Pool(pool_spec))
@@ -891,7 +902,9 @@ fn convert_to_config_file(targets: Vec<OnwardsTarget>, composites: Vec<OnwardsCo
                 sanitize_response: target.sanitize_responses,
                 trusted: target.trusted,
                 request_timeout_secs: None,
-                open_responses: None,
+                open_responses: Some(OpenResponsesConfig {
+                    adapter: target.open_responses_adapter,
+                }),
             };
 
             (target.alias, TargetSpecOrList::Single(target_spec))
@@ -968,6 +981,7 @@ pub async fn load_targets_from_db(db: &PgPool, escalation_models: &[String], str
             dm.capacity,
             dm.sanitize_responses,
             dm.trusted,
+            dm.open_responses_adapter,
             ie.id as endpoint_id,
             ie.url as "endpoint_url!",
             ie.api_key as endpoint_api_key,
@@ -1052,6 +1066,7 @@ pub async fn load_targets_from_db(db: &PgPool, escalation_models: &[String], str
             capacity: row.capacity,
             sanitize_responses: row.sanitize_responses,
             trusted: row.trusted,
+            open_responses_adapter: row.open_responses_adapter.unwrap_or(true),
             endpoint_url: url::Url::parse(&row.endpoint_url).expect("Invalid URL in database"),
             endpoint_api_key: row.endpoint_api_key.clone(),
             auth_header_name: row.auth_header_name.clone(),
@@ -1135,6 +1150,7 @@ mod tests {
             capacity: None,
             sanitize_responses: true,
             trusted: false,
+            open_responses_adapter: true,
             endpoint_url: url::Url::parse(endpoint_url).unwrap(),
             endpoint_api_key: None,
             auth_header_name: "Authorization".to_string(),
@@ -1290,6 +1306,7 @@ mod tests {
                 fallback_max_attempts: None,
                 sanitize_responses: true,
                 trusted: false,
+                open_responses_adapter: true,
             })
             .await
             .unwrap();
@@ -1406,6 +1423,7 @@ mod tests {
                 fallback_max_attempts: None,
                 sanitize_responses: true,
                 trusted: false,
+                open_responses_adapter: true,
             })
             .await
             .unwrap();
@@ -1439,6 +1457,7 @@ mod tests {
                 fallback_max_attempts: None,
                 sanitize_responses: true,
                 trusted: false,
+                open_responses_adapter: true,
             })
             .await
             .unwrap();
