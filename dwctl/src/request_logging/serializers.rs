@@ -263,7 +263,10 @@ pub fn parse_ai_response(request_data: &RequestData, response_data: &ResponseDat
                 if responses_req.stream.unwrap_or(false) {
                     utils::parse_responses_streaming_response(&body_str)
                 } else {
-                    utils::parse_responses_non_streaming_response(&body_str)
+                    // Try the typed Response parser first. Fall back to the generic untagged
+                    // parser so that error bodies (4xx/5xx JSON) are captured as
+                    // AiResponse::Other rather than becoming a base64 SerializationError.
+                    utils::parse_responses_non_streaming_response(&body_str).or_else(|_| utils::parse_non_streaming_response(&body_str))
                 }
             } else {
                 match parsed_request.request {

@@ -121,6 +121,10 @@ pub(crate) fn parse_responses_streaming_response(body_str: &str) -> Result<AiRes
         .filter_map(|chunk| serde_json::from_str::<ResponseStreamEvent>(&chunk).ok())
         .collect();
 
+    if events.is_empty() {
+        return Err(Box::new(SseParseError::InvalidFormat));
+    }
+
     Ok(AiResponse::ResponsesStream(events))
 }
 
