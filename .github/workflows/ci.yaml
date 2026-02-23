@@ -1,13 +1,14 @@
-name: CI PR
+name: CI
 
 on:
   pull_request:
     branches: [main]
+  merge_group:
   workflow_dispatch:
 
 jobs:
   frontend-test:
-    if: !startsWith(github.head_ref, 'release-please--')
+    if: (github.event_name == 'pull_request' && !startsWith(github.head_ref, 'release-please--')) || github.event_name == 'merge_group'
     runs-on: depot-ubuntu-24.04-8
 
     steps:
@@ -92,7 +93,7 @@ jobs:
           curl -X POST "https://charts.somnial.co/doubleword-control-layer/gzipped-bundle-size?value=${GZIPPED_SIZE}" || true
 
   backend-test:
-    if: !startsWith(github.head_ref, 'release-please--')
+    if: (github.event_name == 'pull_request' && !startsWith(github.head_ref, 'release-please--')) || github.event_name == 'merge_group'
     runs-on: depot-ubuntu-24.04-16
 
     services:
@@ -180,7 +181,7 @@ jobs:
           fi
 
   build:
-    if: !startsWith(github.head_ref, 'release-please--') || github.event_name == 'workflow_dispatch'
+    if: (github.event_name == 'pull_request' && !startsWith(github.head_ref, 'release-please--')) || github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch'
     runs-on: depot-ubuntu-24.04
 
     permissions:
@@ -244,7 +245,7 @@ jobs:
       image-tag: ${{ steps.meta.outputs.tags }}
 
   security-scan:
-    if: !startsWith(github.head_ref, 'release-please--')
+    if: (github.event_name == 'pull_request' && !startsWith(github.head_ref, 'release-please--')) || github.event_name == 'merge_group'
     runs-on: depot-ubuntu-24.04
     needs: build
 
@@ -319,7 +320,7 @@ jobs:
           curl -X POST "https://charts.somnial.co/doubleword-control-layer/high-vulnerabilities?value=${HIGH}" || echo "Failed to report high vulnerabilities"
 
   e2e-test-docker:
-    if: !startsWith(github.head_ref, 'release-please--')
+    if: (github.event_name == 'pull_request' && !startsWith(github.head_ref, 'release-please--')) || github.event_name == 'merge_group'
     runs-on: depot-ubuntu-24.04
     needs: build
 
