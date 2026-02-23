@@ -233,6 +233,99 @@ async fn test_cache_shape_composite_pool_strategy_and_fallback(pool: sqlx::PgPoo
     assert!(providers[1].target.sanitize_response);
 }
 
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base", "cache_balance_batch_owner_positive")))]
+async fn test_cache_shape_composite_batch_escalation_access(pool: sqlx::PgPool) {
+    let alias = "composite-priority".to_string();
+
+    let without_escalation = super::load_targets_from_db(&pool, &[], false).await.unwrap();
+    let pool_without = without_escalation.targets.get(&alias).expect("target should exist");
+    assert!(!pool_has_key(pool_without.value(), KEY_BATCH_SECRET));
+
+    let with_escalation = super::load_targets_from_db(&pool, &[alias], false).await.unwrap();
+    let pool_with = with_escalation.targets.get("composite-priority").expect("target should exist");
+    assert!(pool_has_key(pool_with.value(), KEY_BATCH_SECRET));
+}
+
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base", "cache_components_all_disabled")))]
+async fn test_cache_shape_composite_with_all_components_disabled(pool: sqlx::PgPool) {
+    let targets = super::load_targets_from_db(&pool, &[], false).await.unwrap();
+    let composite = targets
+        .targets
+        .get("composite-priority")
+        .expect("composite alias should still exist");
+    assert_eq!(
+        composite.value().len(),
+        0,
+        "composite should have zero providers when all components are disabled"
+    );
+}
+
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base", "cache_regular_public_extra_group_assignment")))]
+async fn test_cache_shape_duplicate_access_paths_do_not_duplicate_keys(pool: sqlx::PgPool) {
+    let targets = super::load_targets_from_db(&pool, &[], false).await.unwrap();
+    let public = targets.targets.get("regular-public").expect("regular-public should exist");
+    assert_eq!(
+        pool_keys_len(public.value()),
+        4,
+        "user matching multiple access paths should not duplicate keys"
+    );
+}
+
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+async fn test_cache_shape_strict_mode_flag_propagates(pool: sqlx::PgPool) {
+    let strict_targets = super::load_targets_from_db(&pool, &[], true).await.unwrap();
+    assert!(strict_targets.strict_mode, "strict_mode=true should propagate to Targets");
+
+    let lax_targets = super::load_targets_from_db(&pool, &[], false).await.unwrap();
+    assert!(!lax_targets.strict_mode, "strict_mode=false should propagate to Targets");
+}
+
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base", "cache_user_b_in_private_group")))]
+async fn test_cache_shape_overlapping_group_memberships_expand_access(pool: sqlx::PgPool) {
+    let targets = super::load_targets_from_db(&pool, &[], false).await.unwrap();
+    let private = targets.targets.get("regular-private").expect("regular-private should exist");
+    let private_pool = private.value();
+
+    assert_eq!(
+        pool_keys_len(private_pool),
+        3,
+        "system + both private-group users should have access"
+    );
+    assert!(pool_has_key(private_pool, SYSTEM_KEY_SECRET));
+    assert!(pool_has_key(private_pool, KEY_A_SECRET));
+    assert!(pool_has_key(private_pool, KEY_B_SECRET));
+}
+
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base", "cache_delete_regular_public")))]
+async fn test_cache_shape_deleted_regular_model_is_excluded(pool: sqlx::PgPool) {
+    let targets = super::load_targets_from_db(&pool, &[], false).await.unwrap();
+    assert!(
+        targets.targets.get("regular-public").is_none(),
+        "deleted regular model should be excluded from cache"
+    );
+}
+
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base", "cache_delete_component_a_model")))]
+async fn test_cache_shape_deleted_component_model_is_excluded_from_composite(pool: sqlx::PgPool) {
+    let targets = super::load_targets_from_db(&pool, &[], false).await.unwrap();
+    let composite = targets.targets.get("composite-priority").expect("composite-priority should exist");
+    let providers = composite.value().providers();
+    assert_eq!(
+        providers.len(),
+        1,
+        "only one composite provider should remain after component model deletion"
+    );
+    assert_eq!(providers[0].target.onwards_model.as_deref(), Some("component-b-model"));
+}
+
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base", "cache_component_b_invalid_endpoint")))]
+#[ignore = "Known limitation: invalid component endpoint cannot be isolated because regular target loading panics on invalid endpoint URLs"]
+async fn test_known_issue_composite_invalid_component_endpoint_should_be_skipped(pool: sqlx::PgPool) {
+    // Placeholder known-issue test. We currently can't isolate invalid endpoint handling for
+    // a component model without also impacting regular model loading, which panics on invalid URLs.
+    let _ = super::load_targets_from_db(&pool, &[], false).await.unwrap();
+}
+
 #[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
 #[ignore = "Known issue: composite key visibility lacks the unmetered-model bypass used by regular models"]
 async fn test_known_issue_composite_unmetered_access_should_match_regular_model_policy(pool: sqlx::PgPool) {
