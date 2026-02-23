@@ -12,6 +12,10 @@ import {
   Shuffle,
   Server,
   GripVertical,
+  Shield,
+  ShieldOff,
+  Zap,
+  ZapOff,
 } from "lucide-react";
 import {
   DndContext,
@@ -38,6 +42,7 @@ import {
   useRemoveModelComponent,
   useUpdateModel,
   useModels,
+  useConfig,
   type Model,
   type ModelComponent,
   type LoadBalancingStrategy,
@@ -75,6 +80,11 @@ import {
 import { Input } from "../../../ui/input";
 import { Switch } from "../../../ui/switch";
 import { Label } from "../../../ui/label";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "../../../ui/tooltip";
 
 interface ProvidersTabProps {
   model: Model;
@@ -91,8 +101,11 @@ const ProviderRow: React.FC<{
   onEdit: () => void;
   onRemove: () => void;
   onToggle: () => void;
+  onToggleTrusted?: () => void;
+  onToggleAdapter?: () => void;
   canManage: boolean;
   isUpdating: boolean;
+  strictModeEnabled?: boolean;
   dragHandleProps?: {
     attributes: React.HTMLAttributes<HTMLElement>;
     listeners: Record<string, unknown> | undefined;
@@ -108,8 +121,11 @@ const ProviderRow: React.FC<{
   onEdit,
   onRemove,
   onToggle,
+  onToggleTrusted,
+  onToggleAdapter,
   canManage,
   isUpdating,
+  strictModeEnabled,
   dragHandleProps,
   isDragging,
   isAnyDragging,
@@ -233,6 +249,54 @@ const ProviderRow: React.FC<{
                   <ToggleLeft className="h-4 w-4 text-gray-400" />
                 )}
               </Button>
+              {strictModeEnabled && onToggleTrusted && (
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      onClick={onToggleTrusted}
+                      disabled={isUpdating}
+                      className="h-8 w-8"
+                    >
+                      {component.model.trusted ? (
+                        <Shield className="h-4 w-4 text-blue-600 fill-blue-100" />
+                      ) : (
+                        <ShieldOff className="h-4 w-4 text-gray-400" />
+                      )}
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent side="top">
+                    {component.model.trusted
+                      ? "Trusted — bypasses error sanitization"
+                      : "Untrusted — errors are sanitized"}
+                  </TooltipContent>
+                </Tooltip>
+              )}
+              {strictModeEnabled && onToggleAdapter && (
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      onClick={onToggleAdapter}
+                      disabled={isUpdating}
+                      className="h-8 w-8"
+                    >
+                      {(component.model.open_responses_adapter ?? true) ? (
+                        <Zap className="h-4 w-4 text-yellow-500 fill-yellow-100" />
+                      ) : (
+                        <ZapOff className="h-4 w-4 text-gray-400" />
+                      )}
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent side="top">
+                    {(component.model.open_responses_adapter ?? true)
+                      ? "Responses API adapter enabled"
+                      : "Responses API adapter disabled"}
+                  </TooltipContent>
+                </Tooltip>
+              )}
               {!isPriorityMode && (
                 <Button
                   variant="ghost"
@@ -287,8 +351,11 @@ const SortableProviderRow: React.FC<{
   onEdit: () => void;
   onRemove: () => void;
   onToggle: () => void;
+  onToggleTrusted?: () => void;
+  onToggleAdapter?: () => void;
   canManage: boolean;
   isUpdating: boolean;
+  strictModeEnabled?: boolean;
   isAnyDragging?: boolean;
 }> = (props) => {
   const {
@@ -902,6 +969,10 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
 
   const updateComponentMutation = useUpdateModelComponent();
   const removeMutation = useRemoveModelComponent();
+  const updateModelMutation = useUpdateModel();
+
+  const { data: configData } = useConfig();
+  const strictModeEnabled = configData?.onwards?.strict_mode ?? false;
 
   const isPriorityMode = model.lb_strategy === "priority";
 
@@ -1008,6 +1079,20 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
       modelId: model.id,
       componentModelId: component.model.id,
       data: { enabled: !component.enabled },
+    });
+  };
+
+  const handleToggleTrusted = async (component: ModelComponent) => {
+    await updateModelMutation.mutateAsync({
+      id: component.model.id,
+      data: { trusted: !component.model.trusted },
+    });
+  };
+
+  const handleToggleAdapter = async (component: ModelComponent) => {
+    await updateModelMutation.mutateAsync({
+      id: component.model.id,
+      data: { open_responses_adapter: !(component.model.open_responses_adapter ?? true) },
     });
   };
 
@@ -1288,11 +1373,14 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
                         onEdit={() => setEditingComponent(component)}
                         onRemove={() => setRemovingComponent(component)}
                         onToggle={() => handleToggle(component)}
+                        onToggleTrusted={() => handleToggleTrusted(component)}
+                        onToggleAdapter={() => handleToggleAdapter(component)}
                         canManage={canManage}
                         isUpdating={
                           updateComponentMutation.isPending ||
                           removeMutation.isPending
                         }
+                        strictModeEnabled={strictModeEnabled}
                         isAnyDragging={isAnyDragging}
                       />
                     ))}
@@ -1312,11 +1400,14 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
                     onEdit={() => setEditingComponent(component)}
                     onRemove={() => setRemovingComponent(component)}
                     onToggle={() => handleToggle(component)}
+                    onToggleTrusted={() => handleToggleTrusted(component)}
+                    onToggleAdapter={() => handleToggleAdapter(component)}
                     canManage={canManage}
                     isUpdating={
                       updateComponentMutation.isPending ||
                       removeMutation.isPending
                     }
+                    strictModeEnabled={strictModeEnabled}
                   />
                 ))}
               </div>
