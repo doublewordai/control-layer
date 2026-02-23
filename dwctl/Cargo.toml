@@ -88,6 +88,7 @@ async-openai = { version = "0.32.0", default-features = false, features = [
   "chat-completion-types",
   "completion-types",
   "embedding-types",
+  "response-types",
 ] }
 brotli = "8.0"
 lettre = { version = "0.11", features = [
