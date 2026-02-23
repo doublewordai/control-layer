@@ -773,8 +773,8 @@ fn convert_composite_to_target_spec(
                     // For composite models, use the composite model's sanitize_responses setting
                     // This ensures the virtual model's toggle controls all providers
                     sanitize_response: composite.sanitize_responses,
-                    request_timeout_secs: None,
                     open_responses: None,
+                    request_timeout_secs: None,
                     // Each provider uses its own trusted setting from the database
                     // This allows fine-grained control over which providers bypass error sanitization
                     trusted: Some(target.trusted),

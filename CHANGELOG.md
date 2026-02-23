@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.5.0](https://github.com/doublewordai/control-layer/compare/v8.4.1...v8.5.0) (2026-02-23)
+
+
+### Features
+
+* race condition guard on batch creation ([#723](https://github.com/doublewordai/control-layer/issues/723)) ([34d5340](https://github.com/doublewordai/control-layer/commit/34d5340e2c5afaed63df3c7d80911f7d0050ffdf))
+
 ## [8.4.1](https://github.com/doublewordai/control-layer/compare/v8.4.0...v8.4.1) (2026-02-20)
 
 
