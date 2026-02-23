@@ -751,133 +751,104 @@ const ModelInfo: React.FC = () => {
                           </InfoTip>
                         </div>
 
-                        {/* Show sanitize_responses for virtual models (only when strict mode is OFF) */}
-                        {model.is_composite && !strictModeEnabled && (
-                          <div className="flex items-center space-x-2">
-                            <input
-                              type="checkbox"
-                              id="sanitize-responses"
-                              checked={updateData.sanitize_responses ?? false}
-                              onChange={(e) => {
-                                setUpdateData((prev) => ({
-                                  ...prev,
-                                  sanitize_responses: e.target.checked,
-                                }));
-                              }}
-                              className="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
-                            />
-                            <label
-                              htmlFor="sanitize-responses"
-                              className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70 flex items-center gap-1"
-                            >
-                              Sanitize Responses
-                              <InfoTip>
-                                <p className="text-sm text-muted-foreground">
-                                  Filter out third-party provider fields from
-                                  OpenAI compatible responses to ensure clean,
-                                  standardized API responses.
-                                </p>
-                              </InfoTip>
-                            </label>
-                          </div>
-                        )}
+                        <div className="space-y-2">
+                          {/* Show sanitize_responses when strict mode is OFF */}
+                          {!strictModeEnabled && (
+                            <div className="flex items-center space-x-2">
+                              <input
+                                type="checkbox"
+                                id="sanitize-responses"
+                                checked={updateData.sanitize_responses ?? false}
+                                onChange={(e) => {
+                                  setUpdateData((prev) => ({
+                                    ...prev,
+                                    sanitize_responses: e.target.checked,
+                                  }));
+                                }}
+                                className="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                              />
+                              <label
+                                htmlFor="sanitize-responses"
+                                className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70 flex items-center gap-1"
+                              >
+                                Sanitize Responses
+                                <InfoTip>
+                                  <p className="text-sm text-muted-foreground">
+                                    Filter out third-party provider fields from
+                                    OpenAI compatible responses to ensure clean,
+                                    standardized API responses.
+                                  </p>
+                                </InfoTip>
+                              </label>
+                            </div>
+                          )}
 
-                        {/* For standard models: show sanitize_responses when strict mode is OFF */}
-                        {!model.is_composite && !strictModeEnabled && (
-                          <div className="flex items-center space-x-2">
-                            <input
-                              type="checkbox"
-                              id="sanitize-responses"
-                              checked={updateData.sanitize_responses ?? false}
-                              onChange={(e) => {
-                                setUpdateData((prev) => ({
-                                  ...prev,
-                                  sanitize_responses: e.target.checked,
-                                }));
-                              }}
-                              className="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
-                            />
-                            <label
-                              htmlFor="sanitize-responses"
-                              className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70 flex items-center gap-1"
-                            >
-                              Sanitize Responses
-                              <InfoTip>
-                                <p className="text-sm text-muted-foreground">
-                                  Filter out third-party provider fields from
-                                  OpenAI compatible responses to ensure clean,
-                                  standardized API responses.
-                                </p>
-                              </InfoTip>
-                            </label>
-                          </div>
-                        )}
-
-                        {/* Show trusted for standard models when strict mode is ON */}
-                        {!model.is_composite && strictModeEnabled && (
-                          <div className="flex items-center space-x-2">
-                            <input
-                              type="checkbox"
-                              id="trusted-provider"
-                              checked={updateData.trusted ?? false}
-                              onChange={(e) => {
-                                setUpdateData((prev) => ({
-                                  ...prev,
-                                  trusted: e.target.checked,
-                                }));
-                              }}
-                              className="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
-                            />
-                            <label
-                              htmlFor="trusted-provider"
-                              className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70 flex items-center gap-1"
-                            >
-                              Trusted Provider
-                              <InfoTip>
-                                <p className="text-sm text-muted-foreground">
-                                  Mark this provider as trusted in strict mode.
-                                  Trusted providers bypass error sanitization,
-                                  allowing full error details to be returned.
-                                  Non-trusted providers have sensitive error
-                                  information removed.
-                                </p>
-                              </InfoTip>
-                            </label>
-                          </div>
-                        )}
-
-                        {/* Show open_responses_adapter for standard models when strict mode is ON */}
-                        {!model.is_composite && strictModeEnabled && (
-                          <div className="flex items-center space-x-2">
-                            <input
-                              type="checkbox"
-                              id="open-responses-adapter"
-                              checked={updateData.open_responses_adapter ?? true}
-                              onChange={(e) => {
-                                setUpdateData((prev) => ({
-                                  ...prev,
-                                  open_responses_adapter: e.target.checked,
-                                }));
-                              }}
-                              className="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
-                            />
-                            <label
-                              htmlFor="open-responses-adapter"
-                              className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70 flex items-center gap-1"
-                            >
-                              Responses API Adapter
-                              <InfoTip>
-                                <p className="text-sm text-muted-foreground">
-                                  Enable the adapter that converts OpenAI
-                                  Responses API requests (/v1/responses) to
-                                  Chat Completions (/v1/chat/completions) for
-                                  providers that don&apos;t natively support
-                                  the Responses API.
-                                </p>
-                              </InfoTip>
-                            </label>
-                          </div>
-                        )}
+                          {/* Show trusted and responses adapter for standard models when strict mode is ON */}
+                          {!model.is_composite && strictModeEnabled && (
+                            <>
+                              <div className="flex items-center space-x-2">
+                                <input
+                                  type="checkbox"
+                                  id="trusted-provider"
+                                  checked={updateData.trusted ?? false}
+                                  onChange={(e) => {
+                                    setUpdateData((prev) => ({
+                                      ...prev,
+                                      trusted: e.target.checked,
+                                    }));
+                                  }}
+                                  className="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                                />
+                                <label
+                                  htmlFor="trusted-provider"
+                                  className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70 flex items-center gap-1"
+                                >
+                                  Trusted Provider
+                                  <InfoTip>
+                                    <p className="text-sm text-muted-foreground">
+                                      Mark this provider as trusted in strict
+                                      mode. Trusted providers bypass error
+                                      sanitization, allowing full error details
+                                      to be returned. Non-trusted providers have
+                                      sensitive error information removed.
+                                    </p>
+                                  </InfoTip>
+                                </label>
+                              </div>
+                              <div className="flex items-center space-x-2">
+                                <input
+                                  type="checkbox"
+                                  id="open-responses-adapter"
+                                  checked={
+                                    updateData.open_responses_adapter ?? true
+                                  }
+                                  onChange={(e) => {
+                                    setUpdateData((prev) => ({
+                                      ...prev,
+                                      open_responses_adapter: e.target.checked,
+                                    }));
+                                  }}
+                                  className="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                                />
+                                <label
+                                  htmlFor="open-responses-adapter"
+                                  className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70 flex items-center gap-1"
+                                >
+                                  Responses API Adapter
+                                  <InfoTip>
+                                    <p className="text-sm text-muted-foreground">
+                                      Enable the adapter that converts OpenAI
+                                      Responses API requests (/v1/responses) to
+                                      Chat Completions (/v1/chat/completions)
+                                      for providers that don&apos;t natively
+                                      support the Responses API.
+                                    </p>
+                                  </InfoTip>
+                                </label>
+                              </div>
+                            </>
+                          )}
+                        </div>
                       </div>
 
                       {/* Rate Limiting Section */}
