@@ -1,0 +1,123 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  build:
+    if: !github.event.release.prerelease
+    runs-on: depot-ubuntu-24.04
+
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/doublewordai/control-layer
+          sep-tags: "\n"
+          tags: |
+            type=sha,prefix=sha-
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest
+
+      - name: Build and push all images
+        id: build-step
+        run: |
+          START_TIME=$(date +%s)
+          echo "start_time=$START_TIME" >> $GITHUB_OUTPUT
+          echo "Starting Docker build at $(date)"
+
+      - name: Build and push with Depot
+        uses: depot/build-push-action@v1
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          sbom: true
+          provenance: true
+
+      - name: Record build time
+        id: build-time-step
+        run: |
+          END_TIME=$(date +%s)
+          BUILD_DURATION=$((END_TIME - ${{ steps.build-step.outputs.start_time }}))
+          echo "build_duration=$BUILD_DURATION" >> $GITHUB_OUTPUT
+          echo "Docker build completed in ${BUILD_DURATION}s"
+
+          # Report build time to Somnial
+          curl -X POST "https://charts.somnial.co/doubleword-control-layer/docker-build-duration?value=${BUILD_DURATION}" || true
+
+  notify-deploy:
+    if: !github.event.release.prerelease
+    needs: [build]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Trigger deployment
+        uses: actions/github-script@v8
+        with:
+          github-token: ${{ secrets.DEPLOY_PAT }}
+          script: |
+            await github.rest.repos.createDispatchEvent({
+              owner: '${{ secrets.DEPLOY_TARGET_OWNER }}',
+              repo: '${{ secrets.DEPLOY_TARGET_REPO }}',
+              event_type: 'control-layer-release',
+              client_payload: {
+                version: '${{ github.event.release.tag_name }}',
+                sha: context.sha
+              }
+            })
+            console.log(`Triggered deployment for version ${{ github.event.release.tag_name }}`)
+
+  publish-crates:
+    if: !github.event.release.prerelease
+    runs-on: depot-ubuntu-24.04
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: "npm"
+          cache-dependency-path: dashboard/package-lock.json
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install just
+        uses: extractions/setup-just@v3
+
+      - name: Copy SQLx metadata to dwctl package
+        run: |
+          echo "Copying .sqlx/ from workspace root to dwctl/"
+          cp -r .sqlx/ dwctl/.sqlx/
+          echo "SQLx metadata copied successfully"
+
+      - name: Publish to crates.io
+        run: just release
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
