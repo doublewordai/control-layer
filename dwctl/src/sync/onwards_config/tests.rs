@@ -249,14 +249,9 @@ async fn test_cache_shape_composite_batch_escalation_access(pool: sqlx::PgPool) 
 #[sqlx::test(fixtures(path = "fixtures", scripts("cache_base", "cache_components_all_disabled")))]
 async fn test_cache_shape_composite_with_all_components_disabled(pool: sqlx::PgPool) {
     let targets = super::load_targets_from_db(&pool, &[], false).await.unwrap();
-    let composite = targets
-        .targets
-        .get("composite-priority")
-        .expect("composite alias should still exist");
-    assert_eq!(
-        composite.value().len(),
-        0,
-        "composite should have zero providers when all components are disabled"
+    assert!(
+        targets.targets.get("composite-priority").is_none(),
+        "composite alias is removed from cache when all components are disabled"
     );
 }
 
@@ -343,8 +338,8 @@ async fn test_known_issue_composite_unmetered_access_should_match_regular_model_
     assert!(pool_has_key(composite_pool, KEY_A_SECRET));
 }
 
-#[sqlx::test]
 /// Test that tariff changes trigger onwards config reload via Postgres NOTIFY
+#[sqlx::test]
 async fn test_onwards_config_reloads_on_tariff_change(pool: sqlx::PgPool) {
     use crate::Role;
     use crate::db::handlers::{Deployments, InferenceEndpoints, Repository, Tariffs};
@@ -447,8 +442,8 @@ async fn test_onwards_config_reloads_on_tariff_change(pool: sqlx::PgPool) {
     );
 }
 
-#[sqlx::test]
 /// Test that batch API keys get automatic access to composite escalation targets
+#[sqlx::test]
 async fn test_batch_api_key_access_to_composite_escalation_target(pool: sqlx::PgPool) {
     use std::str::FromStr;
 
@@ -697,9 +692,9 @@ async fn test_onwards_config_reconnects_after_connection_loss(pool: sqlx::PgPool
     sync_handle.abort();
 }
 
+/// Test that fallback sync triggers periodic reloads even without LISTEN/NOTIFY activity
 #[sqlx::test]
 #[test_log::test]
-/// Test that fallback sync triggers periodic reloads even without LISTEN/NOTIFY activity
 async fn test_fallback_sync_triggers_without_notifications(pool: sqlx::PgPool) {
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
@@ -709,7 +704,7 @@ async fn test_fallback_sync_triggers_without_notifications(pool: sqlx::PgPool) {
         .await
         .expect("Failed to create OnwardsConfigSync");
 
-    // Create sync config with 200ms fallback interval for fast testing
+    // Create sync config with 20ms fallback interval for fast testing
     let (status_tx, mut status_rx) = mpsc::channel(10);
     let config = SyncConfig {
         status_tx: Some(status_tx),
@@ -730,7 +725,7 @@ async fn test_fallback_sync_triggers_without_notifications(pool: sqlx::PgPool) {
     println!("Initial connection established");
 
     // Poll task health to ensure fallback sync doesn't crash
-    // Use interval to poll every 100ms for 500ms total (at least 2 fallback syncs at 200ms each)
+    // Use interval to poll every 100ms for 500ms total (at least 2 fallback syncs at 20ms each)
     println!("Polling task health while waiting for fallback sync...");
     let mut poll_interval = tokio::time::interval(Duration::from_millis(100));
     poll_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
