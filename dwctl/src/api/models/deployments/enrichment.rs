@@ -442,6 +442,8 @@ mod tests {
             fallback: None,
             components: None,
             sanitize_responses: None,
+            traffic_routing_rules: None,
+            allowed_batch_completion_windows: None,
         }
     }
 

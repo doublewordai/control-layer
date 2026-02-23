@@ -1,0 +1,124 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        WITH user_balances AS (\n            SELECT\n                u.id as user_id,\n                COALESCE(c.balance, 0) + COALESCE(\n                    (SELECT SUM(\n                        CASE WHEN ct.transaction_type IN ('purchase', 'admin_grant')\n                        THEN ct.amount ELSE -ct.amount END\n                    )\n                    FROM credits_transactions ct\n                    WHERE ct.user_id = u.id\n                    AND ct.seq > COALESCE(c.checkpoint_seq, 0)),\n                    0\n                ) as balance\n            FROM users u\n            LEFT JOIN user_balance_checkpoints c ON c.user_id = u.id\n        )\n        SELECT\n            dm.id as deployment_id,\n            dm.model_name,\n            dm.alias,\n            dm.hosted_on,\n            dm.requests_per_second as deployment_requests_per_second,\n            dm.burst_size as deployment_burst_size,\n            dm.capacity,\n            dm.sanitize_responses,\n            ie.id as endpoint_id,\n            ie.url as \"endpoint_url!\",\n            ie.api_key as endpoint_api_key,\n            ie.auth_header_name,\n            ie.auth_header_prefix,\n            ak.id as \"api_key_id?\",\n            ak.secret as \"api_key_secret?\",\n            ak.purpose as \"api_key_purpose?\",\n            ak.requests_per_second as api_key_requests_per_second,\n            ak.burst_size as api_key_burst_size\n        FROM deployed_models dm\n        INNER JOIN inference_endpoints ie ON dm.hosted_on = ie.id\n        LEFT JOIN LATERAL (\n            SELECT DISTINCT\n                ak.id,\n                ak.secret,\n                ak.purpose,\n                ak.requests_per_second,\n                ak.burst_size\n            FROM api_keys ak\n            WHERE (\n                -- System user always has access\n                ak.user_id = '00000000-0000-0000-0000-000000000000'\n                -- OR user is in a group assigned to this model\n                OR EXISTS (\n                    SELECT 1 FROM user_groups ug\n                    INNER JOIN deployment_groups dg ON ug.group_id = dg.group_id\n                    WHERE dg.deployment_id = dm.id\n                      AND ug.user_id = ak.user_id\n                )\n                -- OR model is in public group\n                OR EXISTS (\n                    SELECT 1 FROM deployment_groups dg\n                    WHERE dg.deployment_id = dm.id\n                      AND dg.group_id = '00000000-0000-0000-0000-000000000000'\n                )\n                -- OR this is a batch API key and model is an escalation target\n                OR (\n                    ak.purpose = 'batch'\n                    AND dm.alias = ANY($1::text[])\n                )\n            )\n            AND (\n                ak.user_id = '00000000-0000-0000-0000-000000000000'\n                OR EXISTS (\n                    SELECT 1 FROM user_balances ub\n                    WHERE ub.user_id = ak.user_id AND ub.balance > 0\n                )\n                OR (\n                    NOT EXISTS (\n                        SELECT 1 FROM model_tariffs mt\n                        WHERE mt.deployed_model_id = dm.id\n                          AND mt.valid_until IS NULL\n                          AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)\n                    )\n                )\n            )\n        ) ak ON true\n        WHERE dm.deleted = FALSE\n          AND dm.is_composite = FALSE\n        ORDER BY dm.id, ak.id\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "deployment_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "model_name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "alias",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "hosted_on",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 4,
+        "name": "deployment_requests_per_second",
+        "type_info": "Float4"
+      },
+      {
+        "ordinal": 5,
+        "name": "deployment_burst_size",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 6,
+        "name": "capacity",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 7,
+        "name": "sanitize_responses",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 8,
+        "name": "endpoint_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 9,
+        "name": "endpoint_url!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 10,
+        "name": "endpoint_api_key",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 11,
+        "name": "auth_header_name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 12,
+        "name": "auth_header_prefix",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 13,
+        "name": "api_key_id?",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 14,
+        "name": "api_key_secret?",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 15,
+        "name": "api_key_purpose?",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 16,
+        "name": "api_key_requests_per_second",
+        "type_info": "Float4"
+      },
+      {
+        "ordinal": 17,
+        "name": "api_key_burst_size",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "6379b03defe825a2a111694955b66bf501b9351c57796b9336fda4eef16622b2"
+}

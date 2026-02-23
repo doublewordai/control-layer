@@ -3,7 +3,7 @@ use std::{str::FromStr, time::Duration};
 use onwards::{
     auth::ConstantTimeString,
     load_balancer::ProviderPool,
-    target::{LoadBalanceStrategy as OnwardsLoadBalanceStrategy, TargetSpecOrList},
+    target::{LoadBalanceStrategy as OnwardsLoadBalanceStrategy, RoutingAction, TargetSpecOrList},
 };
 use tokio::{sync::mpsc, time::timeout};
 use tokio_util::sync::CancellationToken;
@@ -20,6 +20,7 @@ fn create_test_target(model_name: &str, alias: &str, endpoint_url: &str) -> Onwa
         capacity: None,
         sanitize_responses: true,
         endpoint_url: url::Url::parse(endpoint_url).unwrap(),
+        routing_rules: Vec::new(),
         endpoint_api_key: None,
         auth_header_name: "Authorization".to_string(),
         auth_header_prefix: "Bearer ".to_string(),
@@ -55,23 +56,25 @@ fn test_convert_to_config_file() {
 
     // Check model1 (using alias as key)
     let target1 = &config.targets["gpt4-alias"];
-    if let TargetSpecOrList::Single(spec) = target1 {
-        assert_eq!(spec.url.as_str(), "https://api.openai.com/");
-        assert_eq!(spec.onwards_model, Some("gpt-4".to_string()));
+    if let TargetSpecOrList::Pool(pool) = target1 {
+        assert_eq!(pool.providers.len(), 1);
+        assert_eq!(pool.providers[0].url.as_str(), "https://api.openai.com/");
+        assert_eq!(pool.providers[0].onwards_model, Some("gpt-4".to_string()));
         // Since we provided empty key data, targets should have no keys configured
-        assert!(spec.keys.is_none() || spec.keys.as_ref().unwrap().is_empty());
+        assert!(pool.keys.is_none() || pool.keys.as_ref().unwrap().is_empty());
     } else {
-        panic!("Expected Single target spec");
+        panic!("Expected Pool target spec");
     }
 
     // Check model2 (using alias as key)
     let target2 = &config.targets["claude-alias"];
-    if let TargetSpecOrList::Single(spec) = target2 {
-        assert_eq!(spec.url.as_str(), "https://api.anthropic.com/");
-        assert_eq!(spec.onwards_model, Some("claude-3".to_string()));
-        assert!(spec.keys.is_none() || spec.keys.as_ref().unwrap().is_empty());
+    if let TargetSpecOrList::Pool(pool) = target2 {
+        assert_eq!(pool.providers.len(), 1);
+        assert_eq!(pool.providers[0].url.as_str(), "https://api.anthropic.com/");
+        assert_eq!(pool.providers[0].onwards_model, Some("claude-3".to_string()));
+        assert!(pool.keys.is_none() || pool.keys.as_ref().unwrap().is_empty());
     } else {
-        panic!("Expected Single target spec");
+        panic!("Expected Pool target spec");
     }
 }
 
@@ -313,6 +316,41 @@ async fn test_cache_shape_deleted_component_model_is_excluded_from_composite(poo
     assert_eq!(providers[0].target.onwards_model.as_deref(), Some("component-b-model"));
 }
 
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base", "cache_traffic_routing_rules")))]
+async fn test_cache_shape_regular_model_routing_rules(pool: sqlx::PgPool) {
+    let targets = super::load_targets_from_db(&pool, &[], false).await.unwrap();
+    let regular_private = targets.targets.get("regular-private").expect("regular-private should exist");
+    let rules = regular_private.value().routing_rules();
+
+    assert_eq!(rules.len(), 2, "regular-private should expose two routing rules");
+
+    assert_eq!(rules[0].match_labels.get("purpose"), Some(&"batch".to_string()));
+    assert!(matches!(rules[0].action, RoutingAction::Deny));
+
+    assert_eq!(rules[1].match_labels.get("purpose"), Some(&"realtime".to_string()));
+    match &rules[1].action {
+        RoutingAction::Redirect { target } => assert_eq!(target, "regular-public"),
+        _ => panic!("expected redirect rule for realtime"),
+    }
+}
+
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base", "cache_traffic_routing_rules")))]
+async fn test_cache_shape_composite_model_routing_rules(pool: sqlx::PgPool) {
+    let targets = super::load_targets_from_db(&pool, &[], false).await.unwrap();
+    let composite = targets.targets.get("composite-priority").expect("composite-priority should exist");
+    let rules = composite.value().routing_rules();
+
+    assert_eq!(rules.len(), 2, "composite-priority should expose two routing rules");
+
+    assert_eq!(rules[0].match_labels.get("purpose"), Some(&"batch".to_string()));
+    match &rules[0].action {
+        RoutingAction::Redirect { target } => assert_eq!(target, "escalation-private"),
+        _ => panic!("expected redirect rule for batch"),
+    }
+
+    assert_eq!(rules[1].match_labels.get("purpose"), Some(&"realtime".to_string()));
+    assert!(matches!(rules[1].action, RoutingAction::Deny));
+}
 #[sqlx::test(fixtures(path = "fixtures", scripts("cache_base", "cache_component_b_invalid_endpoint")))]
 #[ignore = "Known limitation: invalid component endpoint cannot be isolated because regular target loading panics on invalid endpoint URLs"]
 async fn test_known_issue_composite_invalid_component_endpoint_should_be_skipped(pool: sqlx::PgPool) {
@@ -412,6 +450,7 @@ async fn test_onwards_config_reloads_on_tariff_change(pool: sqlx::PgPool) {
             fallback_with_replacement: None,
             fallback_max_attempts: None,
             sanitize_responses: true,
+            allowed_batch_completion_windows: None,
         })
         .await
         .unwrap();
@@ -526,6 +565,7 @@ async fn test_batch_api_key_access_to_composite_escalation_target(pool: sqlx::Pg
             fallback_on_status: None,
             fallback_with_replacement: None,
             fallback_max_attempts: None,
+            allowed_batch_completion_windows: None,
             sanitize_responses: true,
         })
         .await
@@ -557,6 +597,7 @@ async fn test_batch_api_key_access_to_composite_escalation_target(pool: sqlx::Pg
             fallback_on_rate_limit: Some(true),
             fallback_on_status: Some(vec![429, 500, 502, 503, 504]),
             fallback_with_replacement: None,
+            allowed_batch_completion_windows: None,
             fallback_max_attempts: None,
             sanitize_responses: true,
         })

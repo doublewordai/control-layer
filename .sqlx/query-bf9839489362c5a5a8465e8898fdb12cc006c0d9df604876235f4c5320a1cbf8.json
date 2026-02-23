@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            INSERT INTO deployed_models (\n                model_name, alias, description, type, capabilities, created_by, hosted_on, created_at, updated_at,\n                requests_per_second, burst_size, capacity, batch_capacity, throughput,\n                downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token,\n                downstream_hourly_rate, downstream_input_token_cost_ratio,\n                is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status,\n                fallback_with_replacement, fallback_max_attempts,\n                sanitize_responses\n            )\n            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)\n            RETURNING *\n            ",
+  "query": "\n            INSERT INTO deployed_models (\n                model_name, alias, description, type, capabilities, created_by, hosted_on, created_at, updated_at,\n                requests_per_second, burst_size, capacity, batch_capacity, throughput,\n                downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token,\n                downstream_hourly_rate, downstream_input_token_cost_ratio,\n                is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status,\n                fallback_with_replacement, fallback_max_attempts,\n                sanitize_responses,\n                allowed_batch_completion_windows\n            )\n            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28)\n            RETURNING *\n            ",
   "describe": {
     "columns": [
       {
@@ -157,6 +157,11 @@
         "ordinal": 30,
         "name": "fallback_max_attempts",
         "type_info": "Int4"
+      },
+      {
+        "ordinal": 31,
+        "name": "allowed_batch_completion_windows",
+        "type_info": "TextArray"
       }
     ],
     "parameters": {
@@ -187,7 +192,8 @@
         "Int4Array",
         "Bool",
         "Int4",
-        "Bool"
+        "Bool",
+        "TextArray"
       ]
     },
     "nullable": [
@@ -221,8 +227,9 @@
       false,
       true,
       true,
+      true,
       true
     ]
   },
-  "hash": "c997a5bb21a5e37103c1313da98cbc8d3cbc2b6ec60e0ea22e16d82ecdb734e5"
+  "hash": "bf9839489362c5a5a8465e8898fdb12cc006c0d9df604876235f4c5320a1cbf8"
 }
