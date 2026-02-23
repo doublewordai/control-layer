@@ -5,8 +5,8 @@ use std::{collections::HashMap, num::NonZeroU32, sync::Arc};
 use metrics::histogram;
 use onwards::target::{
     Auth, ConcurrencyLimitParameters, ConfigFile, FallbackConfig as OnwardsFallbackConfig, KeyDefinition,
-    LoadBalanceStrategy as OnwardsLoadBalanceStrategy, PoolSpec, ProviderSpec, RateLimitParameters, RoutingAction, RoutingRule,
-    TargetSpecOrList, Targets, WatchTargetsStream,
+    LoadBalanceStrategy as OnwardsLoadBalanceStrategy, OpenResponsesConfig, PoolSpec, ProviderSpec, RateLimitParameters, RoutingAction,
+    RoutingRule, TargetSpecOrList, Targets, WatchTargetsStream,
 };
 use sqlx::{PgPool, postgres::PgListener};
 use tokio::sync::{mpsc, watch};
@@ -56,6 +56,8 @@ struct OnwardsTarget {
     burst_size: Option<i32>,
     capacity: Option<i32>,
     sanitize_responses: bool,
+    trusted: bool,
+    open_responses_adapter: bool,
     /// Traffic routing rules from the model_traffic_rules table
     routing_rules: Vec<RoutingRule>,
 
@@ -412,6 +414,11 @@ struct OnwardsCompositeModel {
     fallback_max_attempts: Option<i32>,
     /// Whether to sanitize/filter sensitive data from model responses
     sanitize_responses: bool,
+    /// Whether to mark provider as trusted in strict mode
+    #[allow(dead_code)] // Stored in DB but composite-level trust is not yet propagated to onwards
+    trusted: bool,
+    /// Whether to enable the open_responses adapter at the pool level
+    open_responses_adapter: bool,
     /// Traffic routing rules from the database
     routing_rules: Vec<RoutingRule>,
     components: Vec<CompositeModelComponent>,
@@ -443,6 +450,8 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
             cm.fallback_with_replacement,
             cm.fallback_max_attempts,
             cm.sanitize_responses as composite_sanitize_responses,
+            cm.trusted as composite_trusted,
+            cm.open_responses_adapter as "composite_open_responses_adapter?",
             -- Component info
             dmc.deployed_model_id,
             dmc.weight,
@@ -453,6 +462,8 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
             dm.burst_size as deployment_burst_size,
             dm.capacity as deployment_capacity,
             dm.sanitize_responses as deployment_sanitize_responses,
+            dm.trusted as deployment_trusted,
+            dm.open_responses_adapter as "deployment_open_responses_adapter?",
             -- Endpoint info
             ie.url as "endpoint_url!",
             ie.api_key as endpoint_api_key,
@@ -584,6 +595,8 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                 fallback_with_replacement: row.fallback_with_replacement.unwrap_or(false),
                 fallback_max_attempts: row.fallback_max_attempts,
                 sanitize_responses: row.composite_sanitize_responses,
+                trusted: row.composite_trusted,
+                open_responses_adapter: row.composite_open_responses_adapter.unwrap_or(true),
                 routing_rules: Vec::new(), // Populated from separate query below
                 components: Vec::new(),
                 api_keys: Vec::new(),
@@ -599,6 +612,8 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                 burst_size: row.deployment_burst_size,
                 capacity: row.deployment_capacity,
                 sanitize_responses: row.deployment_sanitize_responses,
+                trusted: row.deployment_trusted,
+                open_responses_adapter: row.deployment_open_responses_adapter.unwrap_or(true),
                 routing_rules: Vec::new(), // Components don't have their own routing rules
                 endpoint_url,
                 endpoint_api_key: row.endpoint_api_key.clone(),
@@ -754,8 +769,8 @@ fn convert_composite_to_target_spec(
 
             {
                 debug!(
-                    "  Provider '{}' ({}): weight={}, sanitize_response={}",
-                    target.alias, target.model_name, component.weight, composite.sanitize_responses
+                    "  Provider '{}' ({}): weight={}, sanitize_response={}, trusted={}",
+                    target.alias, target.model_name, component.weight, composite.sanitize_responses, target.trusted
                 );
                 ProviderSpec {
                     url: target.endpoint_url.clone(),
@@ -778,9 +793,13 @@ fn convert_composite_to_target_spec(
                     // For composite models, use the composite model's sanitize_responses setting
                     // This ensures the virtual model's toggle controls all providers
                     sanitize_response: composite.sanitize_responses,
-                    open_responses: None,
+                    open_responses: Some(OpenResponsesConfig {
+                        adapter: target.open_responses_adapter,
+                    }),
                     request_timeout_secs: None,
-                    trusted: None,
+                    // Each provider uses its own trusted setting from the database
+                    // This allows fine-grained control over which providers bypass error sanitization
+                    trusted: Some(target.trusted),
                 }
             }
         })
@@ -796,6 +815,8 @@ fn convert_composite_to_target_spec(
     );
 
     // Create PoolSpec with weighted providers
+    // Note: trusted is not set at the pool level for composite models
+    // Each provider uses its own trusted setting via ProviderSpec.trusted
     let pool_spec = PoolSpec {
         keys,
         rate_limit,
@@ -805,8 +826,10 @@ fn convert_composite_to_target_spec(
         providers,
         response_headers: None,
         sanitize_response: composite.sanitize_responses,
-        open_responses: None,
-        trusted: false,
+        trusted: false, // Pool-level trusted defaults to false; providers set their own
+        open_responses: Some(OpenResponsesConfig {
+            adapter: composite.open_responses_adapter,
+        }),
         routing_rules: composite.routing_rules.clone(),
     };
 
@@ -895,9 +918,11 @@ fn convert_to_config_file(targets: Vec<OnwardsTarget>, composites: Vec<OnwardsCo
                 response_headers: None,
                 weight: 1,
                 sanitize_response: target.sanitize_responses,
-                open_responses: None,
+                open_responses: Some(OpenResponsesConfig {
+                    adapter: target.open_responses_adapter,
+                }),
                 request_timeout_secs: None,
-                trusted: None,
+                trusted: Some(target.trusted),
             };
 
             // Use PoolSpec so routing_rules are carried through
@@ -988,6 +1013,8 @@ pub async fn load_targets_from_db(db: &PgPool, escalation_models: &[String], str
             dm.burst_size as deployment_burst_size,
             dm.capacity,
             dm.sanitize_responses,
+            dm.trusted,
+            dm.open_responses_adapter,
             ie.id as endpoint_id,
             ie.url as "endpoint_url!",
             ie.api_key as endpoint_api_key,
@@ -1074,6 +1101,8 @@ pub async fn load_targets_from_db(db: &PgPool, escalation_models: &[String], str
                 burst_size: row.deployment_burst_size,
                 capacity: row.capacity,
                 sanitize_responses: row.sanitize_responses,
+                trusted: row.trusted,
+                open_responses_adapter: row.open_responses_adapter.unwrap_or(true),
                 routing_rules: Vec::new(), // Populated from separate query below
                 endpoint_url: url::Url::parse(&row.endpoint_url).expect("Invalid URL in database"),
                 endpoint_api_key: row.endpoint_api_key.clone(),

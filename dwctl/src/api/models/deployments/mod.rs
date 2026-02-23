@@ -158,6 +158,15 @@ pub struct StandardModelCreate {
     pub provider_pricing: Option<ProviderPricing>,
     /// Tariffs for this model - if provided, these will be created as active tariffs
     pub tariffs: Option<Vec<TariffDefinition>>,
+    /// Whether to sanitize/filter sensitive data from model responses (defaults to false, used when strict_mode=false)
+    #[serde(default)]
+    pub sanitize_responses: Option<bool>,
+    /// Whether to mark provider as trusted in strict mode (defaults to false, used when strict_mode=true)
+    #[serde(default)]
+    pub trusted: Option<bool>,
+    /// Whether to enable the open_responses adapter that converts /v1/responses to /v1/chat/completions (defaults to true)
+    #[serde(default)]
+    pub open_responses_adapter: Option<bool>,
     /// Traffic routing rules evaluated against API key labels.
     /// Each rule matches on key labels (e.g., purpose) and either denies or redirects traffic.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -211,9 +220,15 @@ pub struct CompositeModelCreate {
     /// Maximum number of failover attempts (defaults to provider count)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback_max_attempts: Option<i32>,
-    /// Whether to sanitize/filter sensitive data from model responses (defaults to false)
+    /// Whether to sanitize/filter sensitive data from model responses (defaults to false, used when strict_mode=false)
     #[serde(default)]
     pub sanitize_responses: bool,
+    /// Whether to mark provider as trusted in strict mode (defaults to false, used when strict_mode=true)
+    #[serde(default)]
+    pub trusted: Option<bool>,
+    /// Whether to enable the open_responses adapter that converts /v1/responses to /v1/chat/completions (defaults to true)
+    #[serde(default)]
+    pub open_responses_adapter: Option<bool>,
     /// Traffic routing rules evaluated against API key labels.
     /// Each rule matches on key labels (e.g., purpose) and either denies or redirects traffic.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -279,9 +294,15 @@ pub struct DeployedModelUpdate {
     /// Maximum number of failover attempts (null = no change, Some(None) = reset to default)
     #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
     pub fallback_max_attempts: Option<Option<i32>>,
-    /// Whether to sanitize/filter sensitive data from model responses (null = no change)
+    /// Whether to sanitize/filter sensitive data from model responses (null = no change, used when strict_mode=false)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sanitize_responses: Option<bool>,
+    /// Whether to mark provider as trusted in strict mode (null = no change, used when strict_mode=true)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trusted: Option<bool>,
+    /// Whether to enable the open_responses adapter (null = no change)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_responses_adapter: Option<bool>,
     /// Traffic routing rules (null = no change, Some(None) = clear, Some(rules) = set)
     #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
     pub traffic_routing_rules: Option<Option<Vec<TrafficRoutingRule>>>,
@@ -379,9 +400,15 @@ pub struct DeployedModelResponse {
     /// Components of this composite model (only included if requested for composite models)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub components: Option<Vec<ModelComponentResponse>>,
-    /// Whether to sanitize/filter sensitive data from model responses (only included for composite models)
+    /// Whether to sanitize/filter sensitive data from model responses (used when strict_mode=false)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sanitize_responses: Option<bool>,
+    /// Whether to mark provider as trusted in strict mode (used when strict_mode=true)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trusted: Option<bool>,
+    /// Whether the open_responses adapter is enabled (converts /v1/responses to /v1/chat/completions)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub open_responses_adapter: Option<bool>,
     /// Traffic routing rules evaluated against API key labels
     #[serde(skip_serializing_if = "Option::is_none")]
     pub traffic_routing_rules: Option<Vec<TrafficRoutingRule>>,
@@ -433,6 +460,8 @@ impl From<DeploymentDBResponse> for DeployedModelResponse {
             fallback,
             components: None, // By default, components are not included
             sanitize_responses: Some(db.sanitize_responses),
+            trusted: Some(db.trusted),
+            open_responses_adapter: Some(db.open_responses_adapter),
             traffic_routing_rules: None, // Populated via enrichment (with_traffic_rules)
             allowed_batch_completion_windows: db.allowed_batch_completion_windows,
         }
@@ -491,6 +520,14 @@ impl DeployedModelResponse {
         self.lb_strategy = None;
         self.fallback = None;
         self.components = None;
+        self
+    }
+
+    /// Mask response configuration fields (sets to None for users without permission)
+    pub fn mask_response_config(mut self) -> Self {
+        self.sanitize_responses = None;
+        self.trusted = None;
+        self.open_responses_adapter = None;
         self
     }
 
@@ -593,6 +630,10 @@ pub struct ComponentModelSummary {
     pub model_type: Option<ModelType>,
     /// The endpoint hosting this model (if any)
     pub endpoint: Option<ComponentEndpointSummary>,
+    /// Whether to mark provider as trusted in strict mode
+    pub trusted: bool,
+    /// Whether the open_responses adapter is enabled
+    pub open_responses_adapter: bool,
 }
 
 /// Summary of an endpoint hosting a component model

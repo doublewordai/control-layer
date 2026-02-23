@@ -33,6 +33,8 @@ export interface ComponentModelSummary {
   description?: string;
   model_type?: ModelType;
   endpoint?: ComponentEndpointSummary;
+  trusted?: boolean;
+  open_responses_adapter?: boolean;
 }
 
 export interface ModelComponent {
@@ -82,6 +84,11 @@ export interface ConfigResponse {
   };
   /** Base URL for AI API endpoints (files, batches, daemons). If not set, use relative paths. */
   ai_api_base_url?: string;
+  /** Onwards AI proxy configuration */
+  onwards: {
+    /** Whether strict mode is enabled (uses trusted flag for providers) */
+    strict_mode: boolean;
+  };
 }
 
 // Model metrics time series point
@@ -158,6 +165,8 @@ export interface Model {
   fallback?: FallbackConfig | null;
   components?: ModelComponent[]; // only present when include=components
   sanitize_responses?: boolean | null; // only present for virtual models
+  trusted?: boolean; // Mark provider as trusted in strict mode (bypasses error sanitization)
+  open_responses_adapter?: boolean; // Enable adapter that converts /v1/responses to /v1/chat/completions
 }
 
 // Model creation types - discriminated union with "type" field
@@ -174,6 +183,8 @@ export interface StandardModelCreate {
   capacity?: number;
   batch_capacity?: number;
   throughput?: number;
+  trusted?: boolean;
+  open_responses_adapter?: boolean;
 }
 
 // Virtual model creation - routes requests across multiple hosted models
@@ -379,6 +390,8 @@ export interface ModelUpdateRequest {
   fallback_with_replacement?: boolean | null;
   fallback_max_attempts?: number | null;
   sanitize_responses?: boolean | null;
+  trusted?: boolean | null;
+  open_responses_adapter?: boolean | null;
 }
 
 // Endpoint-specific types

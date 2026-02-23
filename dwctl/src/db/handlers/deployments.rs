@@ -145,6 +145,8 @@ struct DeployedModel {
     pub fallback_with_replacement: Option<bool>,
     pub fallback_max_attempts: Option<i32>,
     pub sanitize_responses: bool,
+    pub trusted: bool,
+    pub open_responses_adapter: Option<bool>,
     // Traffic routing
     pub allowed_batch_completion_windows: Option<Vec<String>>,
 }
@@ -199,6 +201,8 @@ impl From<(Option<ModelType>, DeployedModel)> for DeploymentDBResponse {
             fallback_with_replacement: m.fallback_with_replacement.unwrap_or(false),
             fallback_max_attempts: m.fallback_max_attempts,
             sanitize_responses: m.sanitize_responses,
+            trusted: m.trusted,
+            open_responses_adapter: m.open_responses_adapter.unwrap_or(true),
             allowed_batch_completion_windows: m.allowed_batch_completion_windows,
         }
     }
@@ -248,10 +252,9 @@ impl<'c> Repository for Deployments<'c> {
                 downstream_hourly_rate, downstream_input_token_cost_ratio,
                 is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status,
                 fallback_with_replacement, fallback_max_attempts,
-                sanitize_responses,
-                allowed_batch_completion_windows
+                sanitize_responses, trusted, open_responses_adapter, allowed_batch_completion_windows
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30)
             RETURNING *
             "#,
             request.model_name.trim(),
@@ -281,6 +284,8 @@ impl<'c> Repository for Deployments<'c> {
             request.fallback_with_replacement,
             request.fallback_max_attempts,
             request.sanitize_responses,
+            request.trusted,
+            Some(request.open_responses_adapter),
             request.allowed_batch_completion_windows.as_ref().map(|w| w.as_slice())
         )
         .fetch_one(&mut *self.db)
@@ -300,7 +305,7 @@ impl<'c> Repository for Deployments<'c> {
     async fn get_by_id(&mut self, id: Self::Id) -> Result<Option<Self::Response>> {
         let model = sqlx::query_as!(
             DeployedModel,
-            "SELECT id, model_name, alias, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_with_replacement, fallback_max_attempts, sanitize_responses, allowed_batch_completion_windows FROM deployed_models WHERE id = $1",
+            "SELECT id, model_name, alias, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_with_replacement, fallback_max_attempts, sanitize_responses, trusted, open_responses_adapter, allowed_batch_completion_windows FROM deployed_models WHERE id = $1",
             id
         )
             .fetch_optional(&mut *self.db)
@@ -325,7 +330,7 @@ impl<'c> Repository for Deployments<'c> {
 
         let deployments = sqlx::query_as!(
             DeployedModel,
-            "SELECT id, model_name, alias, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_with_replacement, fallback_max_attempts, sanitize_responses, allowed_batch_completion_windows FROM deployed_models WHERE id = ANY($1)",
+            "SELECT id, model_name, alias, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_with_replacement, fallback_max_attempts, sanitize_responses, trusted, open_responses_adapter, allowed_batch_completion_windows FROM deployed_models WHERE id = ANY($1)",
             ids.as_slice()
         )
             .fetch_all(&mut *self.db)
@@ -485,10 +490,12 @@ impl<'c> Repository for Deployments<'c> {
                 WHEN $40 THEN $41
                 ELSE fallback_max_attempts
             END,
+            trusted = COALESCE($42, trusted),
+            open_responses_adapter = COALESCE($43, open_responses_adapter),
 
             -- Batch completion windows
             allowed_batch_completion_windows = CASE
-                WHEN $42 THEN $43
+                WHEN $44 THEN $45
                 ELSE allowed_batch_completion_windows
             END,
 
@@ -545,9 +552,11 @@ impl<'c> Repository for Deployments<'c> {
             request.fallback_with_replacement,                                       // $39
             request.fallback_max_attempts.is_some() as bool,                         // $40
             request.fallback_max_attempts.as_ref().and_then(|inner| inner.as_ref()), // $41
+            request.trusted,                                                         // $42
+            request.open_responses_adapter,                                          // $43
             // Batch completion windows
-            request.allowed_batch_completion_windows.is_some() as bool, // $42
-            request.allowed_batch_completion_windows.as_ref().and_then(|inner| inner.as_deref()) as Option<&[String]>, // $43
+            request.allowed_batch_completion_windows.is_some() as bool, // $44
+            request.allowed_batch_completion_windows.as_ref().and_then(|inner| inner.as_deref()) as Option<&[String]>, // $45
         )
         .fetch_one(&mut *self.db)
         .await?;
@@ -802,6 +811,8 @@ impl<'c> Deployments<'c> {
                 dm.model_name,
                 dm.description as model_description,
                 dm.type as model_type,
+                dm.trusted as model_trusted,
+                dm.open_responses_adapter as "model_open_responses_adapter?",
                 dm.hosted_on as endpoint_id,
                 e.name as "endpoint_name?"
             FROM inserted
@@ -831,6 +842,8 @@ impl<'c> Deployments<'c> {
             model_type: result.model_type,
             endpoint_id: result.endpoint_id,
             endpoint_name: result.endpoint_name,
+            model_trusted: result.model_trusted,
+            model_open_responses_adapter: result.model_open_responses_adapter.unwrap_or(true),
         })
     }
 
@@ -865,6 +878,8 @@ impl<'c> Deployments<'c> {
                 dm.model_name,
                 dm.description as model_description,
                 dm.type as model_type,
+                dm.trusted as model_trusted,
+                dm.open_responses_adapter as "model_open_responses_adapter?",
                 dm.hosted_on as endpoint_id,
                 e.name as "endpoint_name?"
             FROM deployed_model_components dmc
@@ -894,6 +909,8 @@ impl<'c> Deployments<'c> {
                 model_type: r.model_type,
                 endpoint_id: r.endpoint_id,
                 endpoint_name: r.endpoint_name,
+                model_trusted: r.model_trusted,
+                model_open_responses_adapter: r.model_open_responses_adapter.unwrap_or(true),
             })
             .collect())
     }
@@ -922,6 +939,8 @@ impl<'c> Deployments<'c> {
                 dm.model_name,
                 dm.description as model_description,
                 dm.type as model_type,
+                dm.trusted as model_trusted,
+                dm.open_responses_adapter as "model_open_responses_adapter?",
                 dm.hosted_on as endpoint_id,
                 e.name as "endpoint_name?"
             FROM deployed_model_components dmc
@@ -952,6 +971,8 @@ impl<'c> Deployments<'c> {
                 model_type: r.model_type,
                 endpoint_id: r.endpoint_id,
                 endpoint_name: r.endpoint_name,
+                model_trusted: r.model_trusted,
+                model_open_responses_adapter: r.model_open_responses_adapter.unwrap_or(true),
             });
         }
 
@@ -1022,6 +1043,8 @@ impl<'c> Deployments<'c> {
                 dm.model_name,
                 dm.description as model_description,
                 dm.type as model_type,
+                dm.trusted as model_trusted,
+                dm.open_responses_adapter as "model_open_responses_adapter?",
                 dm.hosted_on as endpoint_id,
                 e.name as "endpoint_name?"
             FROM updated
@@ -1051,6 +1074,8 @@ impl<'c> Deployments<'c> {
             model_type: r.model_type,
             endpoint_id: r.endpoint_id,
             endpoint_name: r.endpoint_name,
+            model_trusted: r.model_trusted,
+            model_open_responses_adapter: r.model_open_responses_adapter.unwrap_or(true),
         }))
     }
 

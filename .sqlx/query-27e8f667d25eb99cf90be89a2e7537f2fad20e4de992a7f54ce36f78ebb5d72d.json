@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            INSERT INTO deployed_models (\n                model_name, alias, description, type, capabilities, created_by, hosted_on, created_at, updated_at,\n                requests_per_second, burst_size, capacity, batch_capacity, throughput,\n                downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token,\n                downstream_hourly_rate, downstream_input_token_cost_ratio,\n                is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status,\n                fallback_with_replacement, fallback_max_attempts,\n                sanitize_responses,\n                allowed_batch_completion_windows\n            )\n            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28)\n            RETURNING *\n            ",
+  "query": "\n            INSERT INTO deployed_models (\n                model_name, alias, description, type, capabilities, created_by, hosted_on, created_at, updated_at,\n                requests_per_second, burst_size, capacity, batch_capacity, throughput,\n                downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token,\n                downstream_hourly_rate, downstream_input_token_cost_ratio,\n                is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status,\n                fallback_with_replacement, fallback_max_attempts,\n                sanitize_responses, trusted, open_responses_adapter, allowed_batch_completion_windows\n            )\n            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30)\n            RETURNING *\n            ",
   "describe": {
     "columns": [
       {
@@ -162,6 +162,16 @@
         "ordinal": 31,
         "name": "allowed_batch_completion_windows",
         "type_info": "TextArray"
+      },
+      {
+        "ordinal": 32,
+        "name": "trusted",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 33,
+        "name": "open_responses_adapter",
+        "type_info": "Bool"
       }
     ],
     "parameters": {
@@ -192,6 +202,8 @@
         "Int4Array",
         "Bool",
         "Int4",
+        "Bool",
+        "Bool",
         "Bool",
         "TextArray"
       ]
@@ -228,8 +240,10 @@
       true,
       true,
       true,
+      true,
+      false,
       true
     ]
   },
-  "hash": "bf9839489362c5a5a8465e8898fdb12cc006c0d9df604876235f4c5320a1cbf8"
+  "hash": "27e8f667d25eb99cf90be89a2e7537f2fad20e4de992a7f54ce36f78ebb5d72d"
 }
