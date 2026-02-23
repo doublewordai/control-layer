@@ -316,20 +316,31 @@ async fn test_cache_shape_deleted_component_model_is_excluded_from_composite(poo
 #[sqlx::test(fixtures(path = "fixtures", scripts("cache_base", "cache_component_b_invalid_endpoint")))]
 #[ignore = "Known limitation: invalid component endpoint cannot be isolated because regular target loading panics on invalid endpoint URLs"]
 async fn test_known_issue_composite_invalid_component_endpoint_should_be_skipped(pool: sqlx::PgPool) {
-    // Placeholder known-issue test. We currently can't isolate invalid endpoint handling for
-    // a component model without also impacting regular model loading, which panics on invalid URLs.
+    // Expected behavior:
+    // - A composite component with an invalid endpoint URL is skipped.
+    // - Remaining valid models/components still load.
+    // - Loader returns Result::Ok without panicking.
+    //
+    // Bug outline:
+    // - Composite path is defensive and skips invalid URLs.
+    // - Regular-model path uses Url::parse(...).expect(...), which panics on invalid DB URL.
+    // - Because endpoints are shared across deployments in this fixture, regular loading panics
+    //   before we can assert composite skip behavior.
     let _ = super::load_targets_from_db(&pool, &[], false).await.unwrap();
 }
 
 #[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
 #[ignore = "Known issue: composite key visibility lacks the unmetered-model bypass used by regular models"]
 async fn test_known_issue_composite_unmetered_access_should_match_regular_model_policy(pool: sqlx::PgPool) {
-    // Desired behavior:
-    // For unmetered aliases (no active non-zero tariff), group-authorized keys should be allowed
-    // even when user balance is non-positive, matching regular-model policy.
+    // Expected behavior:
+    // - For unmetered aliases (no active non-zero tariff), group-authorized keys are allowed
+    //   even when user balance is non-positive.
+    // - Composite and regular aliases follow the same key visibility policy.
     //
-    // Current behavior:
-    // Composite aliases require positive balance for non-system users, so this assertion fails.
+    // Bug outline:
+    // - Regular-model query includes an "unmetered bypass" for non-positive balances.
+    // - Composite query currently requires positive balance for non-system users.
+    // - This creates policy mismatch: keys visible for regular aliases may be hidden for composites.
     let targets = super::load_targets_from_db(&pool, &[], false).await.unwrap();
     let composite = targets.targets.get("composite-priority").expect("composite-priority should exist");
     let composite_pool = composite.value();
