@@ -709,6 +709,9 @@ pub struct EmailConfig {
     pub from_name: String,
     /// Who to set the reply to field from
     pub reply_to: Option<String>,
+    /// Directory to load email templates from at runtime.
+    /// If not set, uses templates embedded at compile time.
+    pub templates_dir: Option<String>,
 }
 
 /// Email transport configuration - either SMTP or file-based for testing.
@@ -881,10 +884,40 @@ pub struct BatchConfig {
     /// Must be positive (> 0) when specified.
     #[serde(default = "default_batch_throughput", deserialize_with = "deserialize_positive_throughput")]
     pub default_throughput: f32,
+    /// TTL for batch capacity reservations (seconds).
+    /// Used to prevent stale reservations from reducing capacity forever.
+    /// Must be positive (> 0). Setting this too low risks disabling the race guard.
+    #[serde(
+        default = "default_reservation_ttl_secs",
+        deserialize_with = "deserialize_positive_reservation_ttl"
+    )]
+    pub reservation_ttl_secs: i64,
 }
 
 fn default_batch_throughput() -> f32 {
     100.0
+}
+
+fn default_reservation_ttl_secs() -> i64 {
+    10 * 60
+}
+
+fn deserialize_positive_reservation_ttl<'de, D>(deserializer: D) -> Result<i64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+
+    let opt: Option<i64> = Option::deserialize(deserializer)?;
+
+    match opt {
+        None => Ok(default_reservation_ttl_secs()),
+        Some(value) if value <= 0 => Err(D::Error::custom(format!(
+            "reservation_ttl_secs must be positive (> 0), got {}",
+            value
+        ))),
+        Some(value) => Ok(value),
+    }
 }
 
 /// Custom deserializer that validates throughput is positive, with null/missing defaulting to 100.0
@@ -919,6 +952,7 @@ impl Default for BatchConfig {
             ],
             files: FilesConfig::default(),
             default_throughput: default_batch_throughput(),
+            reservation_ttl_secs: default_reservation_ttl_secs(),
         }
     }
 }
@@ -1493,6 +1527,7 @@ impl Default for EmailConfig {
             from_email: "noreply@example.com".to_string(),
             from_name: "Control Layer".to_string(),
             reply_to: None,
+            templates_dir: None,
         }
     }
 }
@@ -2303,5 +2338,82 @@ secret_key: "test-secret-key"
 
             Ok(())
         });
+    }
+
+    #[test]
+    fn test_reservation_ttl_zero_rejected() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+batches:
+  reservation_ttl_secs: 0
+"#,
+            )?;
+
+            let args = Args {
+                config: "test.yaml".to_string(),
+                validate: false,
+            };
+            let result = Config::load(&args);
+            assert!(result.is_err());
+            assert!(result.unwrap_err().to_string().contains("reservation_ttl_secs must be positive"));
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_reservation_ttl_negative_rejected() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+batches:
+  reservation_ttl_secs: -60
+"#,
+            )?;
+
+            let args = Args {
+                config: "test.yaml".to_string(),
+                validate: false,
+            };
+            let result = Config::load(&args);
+            assert!(result.is_err());
+            assert!(result.unwrap_err().to_string().contains("reservation_ttl_secs must be positive"));
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_reservation_ttl_null_uses_default() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+batches:
+  reservation_ttl_secs: null
+"#,
+            )?;
+
+            let args = Args {
+                config: "test.yaml".to_string(),
+                validate: false,
+            };
+            let config = Config::load(&args)?;
+            assert_eq!(config.batches.reservation_ttl_secs, 600);
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_reservation_ttl_default() {
+        let config = Config::default();
+        assert_eq!(config.batches.reservation_ttl_secs, 600);
     }
 }

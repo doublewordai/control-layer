@@ -1064,6 +1064,30 @@ impl<'c> Deployments<'c> {
 
         Ok(rows.into_iter().filter_map(|r| r.throughput.map(|t| (r.alias, t))).collect())
     }
+
+    /// Get model UUIDs keyed by alias for the given aliases.
+    /// Aliases are enforced to be unique, so this should be a one to one mapping
+    /// Only returns rows where `deleted = false`.
+    #[instrument(skip(self, aliases), fields(count = aliases.len()), err)]
+    pub async fn get_model_ids_by_aliases(&mut self, aliases: &[String]) -> Result<std::collections::HashMap<String, uuid::Uuid>> {
+        if aliases.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+
+        let rows = sqlx::query!(
+            r#"
+            SELECT id, alias
+            FROM deployed_models
+            WHERE alias = ANY($1)
+              AND deleted = false
+            "#,
+            aliases
+        )
+        .fetch_all(&mut *self.db)
+        .await?;
+
+        Ok(rows.into_iter().map(|r| (r.alias, r.id)).collect())
+    }
 }
 
 #[cfg(test)]
