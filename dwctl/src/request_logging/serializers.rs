@@ -40,7 +40,8 @@
 //! [outlet]: https://github.com/doublewordai/outlet
 
 use crate::config::Config;
-use crate::request_logging::models::{AiRequest, AiResponse, ChatCompletionChunk, ParsedAIRequest};
+use crate::request_logging::models::{AiRequest, AiResponse, ChatCompletionChunk, ParsedAIRequest, ResponsesRequest};
+use async_openai::types::responses::ResponseStreamEvent;
 use outlet::{RequestData, ResponseData};
 use outlet_postgres::SerializationError;
 use serde_json::Value;
@@ -142,12 +143,15 @@ pub struct UsageMetrics {
 /// * `request_data` - The HTTP request data containing body and metadata
 ///
 /// # Returns
-/// * `Ok(AiRequest)` - Successfully parsed request as chat completion, completion, embeddings, or other
+/// * `Ok(ParsedAIRequest)` - Successfully parsed request as chat completion, completion,
+///   embeddings, responses, or other
 /// * `Err(SerializationError)` - Parse error with base64-encoded fallback data for storage
 ///
 /// # Behavior
 /// - Returns `AiRequest::Other(Value::Null)` for missing or empty bodies
 /// - On parse failure, returns error with base64-encoded body for safe PostgreSQL storage
+/// - For `/v1/responses` paths, uses path-based detection to avoid serde disambiguation
+///   issues with the embeddings variant (both use an `input` field).
 #[instrument(skip_all)]
 pub fn parse_ai_request(request_data: &RequestData) -> Result<ParsedAIRequest, SerializationError> {
     let headers = request_data
@@ -159,11 +163,10 @@ pub fn parse_ai_request(request_data: &RequestData) -> Result<ParsedAIRequest, S
     let bytes = match &request_data.body {
         Some(body) => body.as_ref(),
         None => {
-            return Ok({
-                ParsedAIRequest {
-                    headers,
-                    request: AiRequest::Other(Value::Null),
-                }
+            return Ok(ParsedAIRequest {
+                headers,
+                request: AiRequest::Other(Value::Null),
+                responses_request: None,
             });
         }
     };
@@ -171,16 +174,43 @@ pub fn parse_ai_request(request_data: &RequestData) -> Result<ParsedAIRequest, S
     let body_str = String::from_utf8_lossy(bytes);
 
     if body_str.trim().is_empty() {
-        return Ok({
-            ParsedAIRequest {
-                headers,
-                request: AiRequest::Other(Value::Null),
-            }
+        return Ok(ParsedAIRequest {
+            headers,
+            request: AiRequest::Other(Value::Null),
+            responses_request: None,
         });
     }
 
+    // Use path-based detection for /v1/responses to avoid serde disambiguation issues
+    // (both embeddings and responses requests have an `input` field).
+    let is_responses_path = request_data.uri.path().ends_with("/responses");
+    if is_responses_path {
+        return match serde_json::from_str::<Value>(&body_str) {
+            Ok(value) => {
+                let model = value.get("model").and_then(|v| v.as_str()).map(|s| s.to_string());
+                let stream = value.get("stream").and_then(|v| v.as_bool());
+                Ok(ParsedAIRequest {
+                    headers,
+                    request: AiRequest::Other(value),
+                    responses_request: Some(ResponsesRequest { model, stream }),
+                })
+            }
+            Err(e) => {
+                let base64_encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes);
+                Err(SerializationError {
+                    fallback_data: format!("base64:{base64_encoded}"),
+                    error: Box::new(e),
+                })
+            }
+        };
+    }
+
     match serde_json::from_str(&body_str) {
-        Ok(request) => Ok(ParsedAIRequest { headers, request }),
+        Ok(request) => Ok(ParsedAIRequest {
+            headers,
+            request,
+            responses_request: None,
+        }),
         Err(e) => {
             // Always base64 encode unparseable content to avoid PostgreSQL issues
             let base64_encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes);
@@ -227,11 +257,24 @@ pub fn parse_ai_response(request_data: &RequestData, response_data: &ResponseDat
 
     // Parse response based on request type
     let result = match parse_ai_request(request_data) {
-        Ok(parsed_request) => match parsed_request.request {
-            AiRequest::ChatCompletions(chat_req) if chat_req.stream.unwrap_or(false) => utils::parse_streaming_response(&body_str),
-            AiRequest::Completions(completion_req) if completion_req.stream.unwrap_or(false) => utils::parse_streaming_response(&body_str),
-            _ => utils::parse_non_streaming_response(&body_str),
-        },
+        Ok(parsed_request) => {
+            // /v1/responses has its own SSE event format distinct from chat completions.
+            if let Some(responses_req) = &parsed_request.responses_request {
+                if responses_req.stream.unwrap_or(false) {
+                    utils::parse_responses_streaming_response(&body_str)
+                } else {
+                    utils::parse_responses_non_streaming_response(&body_str)
+                }
+            } else {
+                match parsed_request.request {
+                    AiRequest::ChatCompletions(chat_req) if chat_req.stream.unwrap_or(false) => utils::parse_streaming_response(&body_str),
+                    AiRequest::Completions(completion_req) if completion_req.stream.unwrap_or(false) => {
+                        utils::parse_streaming_response(&body_str)
+                    }
+                    _ => utils::parse_non_streaming_response(&body_str),
+                }
+            }
+        }
         _ => utils::parse_non_streaming_response(&body_str),
     };
 
@@ -266,12 +309,18 @@ impl UsageMetrics {
     ) -> Self {
         // Extract model from request
         let request_model = match parse_ai_request(request_data) {
-            Ok(parsed_request) => match parsed_request.request {
-                AiRequest::ChatCompletions(req) => Some(req.model),
-                AiRequest::Completions(req) => Some(req.model),
-                AiRequest::Embeddings(req) => Some(req.model),
-                _ => None,
-            },
+            Ok(parsed_request) => {
+                if let Some(responses_req) = parsed_request.responses_request {
+                    responses_req.model
+                } else {
+                    match parsed_request.request {
+                        AiRequest::ChatCompletions(req) => Some(req.model),
+                        AiRequest::Completions(req) => Some(req.model),
+                        AiRequest::Embeddings(req) => Some(req.model),
+                        _ => None,
+                    }
+                }
+            }
             _ => None,
         };
 
@@ -437,6 +486,55 @@ impl From<&AiResponse> for TokenMetrics {
                     total_tokens: usage.total_tokens as i64,
                     response_type: "base64_embeddings".to_string(),
                     response_model: Some(response.model.clone()),
+                }
+            }
+            AiResponse::Responses(response) => {
+                if let Some(usage) = &response.usage {
+                    Self {
+                        prompt_tokens: usage.input_tokens as i64,
+                        completion_tokens: usage.output_tokens as i64,
+                        total_tokens: usage.total_tokens as i64,
+                        response_type: "response".to_string(),
+                        response_model: Some(response.model.clone()),
+                    }
+                } else {
+                    Self {
+                        prompt_tokens: 0,
+                        completion_tokens: 0,
+                        total_tokens: 0,
+                        response_type: "response".to_string(),
+                        response_model: Some(response.model.clone()),
+                    }
+                }
+            }
+            AiResponse::ResponsesStream(events) => {
+                // Usage is reported in the response.completed event.
+                let completed = events.iter().find_map(|e| {
+                    if let ResponseStreamEvent::ResponseCompleted(ev) = e {
+                        Some(&ev.response)
+                    } else {
+                        None
+                    }
+                });
+
+                let model = completed.map(|r| r.model.clone());
+
+                if let Some(usage) = completed.and_then(|r| r.usage.as_ref()) {
+                    Self {
+                        prompt_tokens: usage.input_tokens as i64,
+                        completion_tokens: usage.output_tokens as i64,
+                        total_tokens: usage.total_tokens as i64,
+                        response_type: "response_stream".to_string(),
+                        response_model: model,
+                    }
+                } else {
+                    Self {
+                        prompt_tokens: 0,
+                        completion_tokens: 0,
+                        total_tokens: 0,
+                        response_type: "response_stream".to_string(),
+                        response_model: model,
+                    }
                 }
             }
             AiResponse::Other(_) => Self {

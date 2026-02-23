@@ -1,6 +1,7 @@
 //! Request logging utility functions.
 
 use crate::request_logging::models::AiResponse;
+use async_openai::types::responses::{Response, ResponseStreamEvent};
 use outlet_postgres::SerializationError;
 use std::io::Read as _;
 use tracing::instrument;
@@ -89,6 +90,38 @@ pub(crate) fn parse_streaming_response(body_str: &str) -> Result<AiResponse, Box
 #[instrument(skip_all)]
 pub(crate) fn parse_non_streaming_response(body_str: &str) -> Result<AiResponse, Box<dyn std::error::Error>> {
     serde_json::from_str(body_str).map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+}
+
+/// Parses a non-streaming /v1/responses response body.
+///
+/// # Errors
+/// Returns error if JSON deserialization into [`Response`] fails.
+#[instrument(skip_all)]
+pub(crate) fn parse_responses_non_streaming_response(body_str: &str) -> Result<AiResponse, Box<dyn std::error::Error>> {
+    serde_json::from_str::<Response>(body_str)
+        .map(AiResponse::Responses)
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+}
+
+/// Parses a streaming /v1/responses SSE body into collected events.
+///
+/// The Responses API streaming format uses named SSE events (`event: response.completed`, etc.)
+/// with a JSON payload on each `data:` line. This parser collects all the SSE data chunks,
+/// deserializes each as a [`ResponseStreamEvent`], and returns the full collection so that the
+/// caller (e.g. [`TokenMetrics`]) can extract usage from the final `response.completed` event.
+///
+/// # Errors
+/// Returns error if no valid SSE data fields are found or all chunks fail to parse.
+#[instrument(skip_all)]
+pub(crate) fn parse_responses_streaming_response(body_str: &str) -> Result<AiResponse, Box<dyn std::error::Error>> {
+    let chunks = parse_sse_chunks(body_str).map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+
+    let events: Vec<ResponseStreamEvent> = chunks
+        .into_iter()
+        .filter_map(|chunk| serde_json::from_str::<ResponseStreamEvent>(&chunk).ok())
+        .collect();
+
+    Ok(AiResponse::ResponsesStream(events))
 }
 
 /// Decompress response body if it's compressed according to headers
