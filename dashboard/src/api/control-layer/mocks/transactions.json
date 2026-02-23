@@ -3,72 +3,216 @@
     "id": "txn-001",
     "user_id": "550e8400-e29b-41d4-a716-446655440001",
     "transaction_type": "admin_grant",
-    "amount": 100.0,
+    "amount": 5000.0,
     "source_id": "admin",
-    "description": "Initial credit allocation",
-    "created_at": "2024-01-15T10:00:00Z"
+    "description": "Initial platform credit allocation",
+    "created_at": "2025-03-15T10:00:00Z"
   },
   {
     "id": "txn-002",
     "user_id": "550e8400-e29b-41d4-a716-446655440001",
     "transaction_type": "usage",
-    "amount": 5.25,
-    "source_id": "request-123",
-    "description": "API usage for gpt-4",
-    "created_at": "2024-01-15T14:30:00Z"
+    "amount": 125.50,
+    "source_id": "batch-demo-1",
+    "description": "Batch processing - claude-sonnet-4 (250 requests)",
+    "created_at": "2025-04-02T14:30:00Z"
   },
   {
     "id": "txn-003",
     "user_id": "550e8400-e29b-41d4-a716-446655440002",
     "transaction_type": "admin_grant",
-    "amount": 50.0,
+    "amount": 2000.0,
     "source_id": "admin",
-    "description": "Welcome bonus",
-    "created_at": "2024-01-16T09:00:00Z"
+    "description": "Team budget allocation Q2",
+    "created_at": "2025-04-01T09:00:00Z"
   },
   {
     "id": "txn-004",
-    "user_id": "550e8400-e29b-41d4-a716-446655440001",
+    "user_id": "550e8400-e29b-41d4-a716-446655440002",
     "transaction_type": "usage",
-    "amount": 2.5,
-    "source_id": "request-124",
-    "description": "API usage for claude-3-sonnet",
-    "created_at": "2024-01-16T11:20:00Z"
+    "amount": 45.25,
+    "source_id": "request-batch-456",
+    "description": "API usage - gpt-4o (batch evaluation)",
+    "created_at": "2025-05-10T11:20:00Z"
   },
   {
     "id": "txn-005",
-    "user_id": "550e8400-e29b-41d4-a716-446655440002",
-    "transaction_type": "usage",
-    "amount": 1.75,
-    "source_id": "request-125",
-    "description": "API usage for gpt-3.5-turbo",
-    "created_at": "2024-01-16T15:45:00Z"
+    "user_id": "550e8400-e29b-41d4-a716-446655440005",
+    "transaction_type": "admin_grant",
+    "amount": 10000.0,
+    "source_id": "admin",
+    "description": "ML research budget - H2 2025",
+    "created_at": "2025-07-01T08:00:00Z"
   },
   {
     "id": "txn-006",
-    "user_id": "550e8400-e29b-41d4-a716-446655440003",
-    "transaction_type": "purchase",
-    "amount": 200.0,
-    "source_id": "payment-001",
-    "description": "Credit purchase via Stripe",
-    "created_at": "2024-01-17T08:30:00Z"
+    "user_id": "550e8400-e29b-41d4-a716-446655440005",
+    "transaction_type": "usage",
+    "amount": 342.75,
+    "source_id": "batch-demo-5",
+    "description": "Batch processing - claude-opus-4 (large eval suite)",
+    "created_at": "2025-08-15T16:45:00Z"
   },
   {
     "id": "txn-007",
-    "user_id": "550e8400-e29b-41d4-a716-446655440001",
-    "transaction_type": "admin_removal",
-    "amount": 10.0,
-    "source_id": "admin",
-    "description": "Account adjustment",
-    "created_at": "2024-01-17T12:00:00Z"
+    "user_id": "550e8400-e29b-41d4-a716-446655440004",
+    "transaction_type": "purchase",
+    "amount": 5000.0,
+    "source_id": "stripe-pi-3QK8x2",
+    "description": "Credit purchase via Stripe",
+    "created_at": "2025-06-20T13:30:00Z"
   },
   {
     "id": "txn-008",
+    "user_id": "550e8400-e29b-41d4-a716-446655440004",
+    "transaction_type": "usage",
+    "amount": 1819.50,
+    "source_id": "batch-demo-8",
+    "description": "Batch processing - gpt-4o (customer data classification)",
+    "created_at": "2025-09-05T10:15:00Z"
+  },
+  {
+    "id": "txn-009",
+    "user_id": "550e8400-e29b-41d4-a716-446655440008",
+    "transaction_type": "admin_grant",
+    "amount": 15000.0,
+    "source_id": "admin",
+    "description": "Enterprise tier allocation",
+    "created_at": "2025-05-01T09:00:00Z"
+  },
+  {
+    "id": "txn-010",
+    "user_id": "550e8400-e29b-41d4-a716-446655440008",
+    "transaction_type": "usage",
+    "amount": 2600.0,
+    "source_id": "batch-demo-10",
+    "description": "Batch processing - smart-router (10K requests)",
+    "created_at": "2025-11-20T08:30:00Z"
+  },
+  {
+    "id": "txn-011",
+    "user_id": "550e8400-e29b-41d4-a716-446655440010",
+    "transaction_type": "purchase",
+    "amount": 8000.0,
+    "source_id": "stripe-pi-7YM3n9",
+    "description": "Credit purchase via Stripe",
+    "created_at": "2025-06-01T14:00:00Z"
+  },
+  {
+    "id": "txn-012",
+    "user_id": "550e8400-e29b-41d4-a716-446655440010",
+    "transaction_type": "usage",
+    "amount": 2800.0,
+    "source_id": "batch-demo-12",
+    "description": "Batch processing - gpt-4o-mini (content moderation)",
+    "created_at": "2025-10-15T12:45:00Z"
+  },
+  {
+    "id": "txn-013",
+    "user_id": "550e8400-e29b-41d4-a716-446655440013",
+    "transaction_type": "admin_grant",
+    "amount": 10000.0,
+    "source_id": "admin",
+    "description": "Partner onboarding credit grant",
+    "created_at": "2025-08-01T10:00:00Z"
+  },
+  {
+    "id": "txn-014",
+    "user_id": "550e8400-e29b-41d4-a716-446655440013",
+    "transaction_type": "usage",
+    "amount": 2700.0,
+    "source_id": "batch-demo-14",
+    "description": "Batch processing - llama-3.3-70b (translation pipeline)",
+    "created_at": "2025-12-01T09:30:00Z"
+  },
+  {
+    "id": "txn-015",
+    "user_id": "550e8400-e29b-41d4-a716-446655440003",
+    "transaction_type": "admin_grant",
+    "amount": 500.0,
+    "source_id": "admin",
+    "description": "Trial credit allocation",
+    "created_at": "2025-05-15T11:00:00Z"
+  },
+  {
+    "id": "txn-016",
     "user_id": "550e8400-e29b-41d4-a716-446655440003",
     "transaction_type": "usage",
-    "amount": 8.5,
-    "source_id": "request-126",
-    "description": "API usage for gpt-4-vision",
-    "created_at": "2024-01-17T14:15:00Z"
+    "amount": 250.0,
+    "source_id": "request-789",
+    "description": "API usage - deepseek-v3 (code review automation)",
+    "created_at": "2025-09-20T15:00:00Z"
+  },
+  {
+    "id": "txn-017",
+    "user_id": "550e8400-e29b-41d4-a716-446655440001",
+    "transaction_type": "admin_removal",
+    "amount": 500.0,
+    "source_id": "admin",
+    "description": "Budget reallocation to partner accounts",
+    "created_at": "2025-10-01T12:00:00Z"
+  },
+  {
+    "id": "txn-018",
+    "user_id": "550e8400-e29b-41d4-a716-446655440015",
+    "transaction_type": "admin_grant",
+    "amount": 3000.0,
+    "source_id": "admin",
+    "description": "Team lead allocation",
+    "created_at": "2025-07-01T08:00:00Z"
+  },
+  {
+    "id": "txn-019",
+    "user_id": "550e8400-e29b-41d4-a716-446655440015",
+    "transaction_type": "usage",
+    "amount": 900.0,
+    "source_id": "batch-demo-19",
+    "description": "Batch processing - claude-sonnet-4 (document summarization)",
+    "created_at": "2025-12-15T14:20:00Z"
+  },
+  {
+    "id": "txn-020",
+    "user_id": "550e8400-e29b-41d4-a716-446655440007",
+    "transaction_type": "purchase",
+    "amount": 1000.0,
+    "source_id": "stripe-pi-2AB5k7",
+    "description": "Credit purchase via Stripe",
+    "created_at": "2025-09-10T10:00:00Z"
+  },
+  {
+    "id": "txn-021",
+    "user_id": "550e8400-e29b-41d4-a716-446655440007",
+    "transaction_type": "usage",
+    "amount": 380.0,
+    "source_id": "batch-demo-21",
+    "description": "Batch processing - gpt-4o (sentiment analysis)",
+    "created_at": "2025-11-08T11:30:00Z"
+  },
+  {
+    "id": "txn-022",
+    "user_id": "550e8400-e29b-41d4-a716-446655440011",
+    "transaction_type": "admin_grant",
+    "amount": 1500.0,
+    "source_id": "admin",
+    "description": "Data science team quarterly allocation",
+    "created_at": "2025-10-15T09:00:00Z"
+  },
+  {
+    "id": "txn-023",
+    "user_id": "550e8400-e29b-41d4-a716-446655440011",
+    "transaction_type": "usage",
+    "amount": 520.0,
+    "source_id": "batch-demo-23",
+    "description": "Batch processing - text-embedding-3-large (vector indexing)",
+    "created_at": "2025-12-20T16:00:00Z"
+  },
+  {
+    "id": "txn-024",
+    "user_id": "550e8400-e29b-41d4-a716-446655440005",
+    "transaction_type": "usage",
+    "amount": 907.0,
+    "source_id": "batch-demo-24",
+    "description": "Batch processing - qwen-2.5-72b (multilingual eval)",
+    "created_at": "2026-01-10T13:15:00Z"
   }
 ]

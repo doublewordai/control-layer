@@ -7,6 +7,8 @@ use fusillade::Storage;
 use sqlx_pool_router::PoolProvider;
 use std::collections::HashMap;
 
+use crate::api::handlers::sla_capacity::parse_window_to_seconds;
+
 use crate::{
     AppState,
     auth::permissions::{RequiresPermission, operation, resource},
@@ -41,9 +43,19 @@ pub async fn get_pending_request_counts<P: PoolProvider>(
     _: RequiresPermission<resource::System, operation::ReadAll>,
 ) -> Result<Json<PendingCountsByModelAndWindow>, Error> {
     // Call fusillade storage API to get pending request counts
+    let windows = state
+        .config
+        .batches
+        .allowed_completion_windows
+        .iter()
+        .map(|window| (window.clone(), parse_window_to_seconds(window)))
+        .collect::<Vec<_>>();
+    let states = vec!["pending".to_string()];
+    let model_filter: Vec<String> = Vec::new();
+
     let counts = state
         .request_manager
-        .get_pending_request_counts_by_model_and_completion_window()
+        .get_pending_request_counts_by_model_and_completion_window(&windows, &states, &model_filter, false)
         .await
         .map_err(|e| Error::Internal {
             operation: format!("get pending request counts: {}", e),

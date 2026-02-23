@@ -71,7 +71,7 @@ export function CreateBatchModal({
   const [expirationSeconds, setExpirationSeconds] = useState<number>(2592000); // 30 days default
   const [endpoint, setEndpoint] = useState<string>("/v1/chat/completions");
   const [completionWindow, setCompletionWindow] =
-    useState<string>("Standard (24h)"); // Default: standard priority
+    useState<string>("24h");
   const [description, setDescription] = useState<string>("");
   const [error, setError] = useState<string | null>(null);
   const [dragActive, setDragActive] = useState(false);
@@ -86,10 +86,10 @@ export function CreateBatchModal({
   const createBatchMutation = useCreateBatch();
   const uploadMutation = useUploadFileWithProgress();
 
-  // Fetch config to get available priority options (formatted labels like "Standard (24h)")
+  // Fetch config to get available completion windows
   const { data: config } = useConfig();
   const availableWindows = useMemo(
-    () => config?.batches?.allowed_completion_windows || ["Standard (24h)"],
+    () => config?.batches?.allowed_completion_windows || ["24h"],
     [config?.batches?.allowed_completion_windows],
   );
 
@@ -111,17 +111,10 @@ export function CreateBatchModal({
     }
   }, [availableFiles.length, hasLoadedFiles]);
 
-  // Extract raw completion window value for cost estimate API
-  // "Standard (24h)" -> "24h", "High (1h)" -> "1h"
-  const rawCompletionWindow = useMemo(() => {
-    const match = completionWindow.match(/\(([^)]+)\)/);
-    return match ? match[1] : completionWindow;
-  }, [completionWindow]);
-
   // Fetch cost estimate for selected file with current completion window
   const { data: costEstimate, isLoading: isLoadingCost } = useFileCostEstimate(
     selectedFileId || undefined,
-    rawCompletionWindow,
+    completionWindow,
   );
 
   // Update default when available windows change
@@ -283,7 +276,7 @@ export function CreateBatchModal({
       setSelectedFileId(null);
       setFileToUpload(null);
       setEndpoint("/v1/chat/completions");
-      setCompletionWindow(availableWindows[0] || "Standard (24h)");
+      setCompletionWindow(availableWindows[0] || "24h");
       setDescription("");
       setExpirationSeconds(2592000);
       setFilename("");
@@ -302,7 +295,7 @@ export function CreateBatchModal({
     setSelectedFileId(preselectedFile?.id || null);
     setFileToUpload(null);
     setEndpoint("/v1/chat/completions");
-    setCompletionWindow(availableWindows[0] || "Standard (24h)");
+    setCompletionWindow(availableWindows[0] || "24h");
     setDescription("");
     setExpirationSeconds(2592000);
     setFilename("");

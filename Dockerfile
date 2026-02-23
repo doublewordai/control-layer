@@ -33,7 +33,6 @@ WORKDIR /app
 COPY .sqlx/ .sqlx/
 COPY Cargo.toml Cargo.lock ./
 COPY dwctl/ dwctl/
-COPY email_templates/ email_templates/
 RUN rm -rf dwctl/static && cp -r dashboard/dist dwctl/static
 ENV SQLX_OFFLINE=true
 RUN cargo build --release -p dwctl
@@ -54,6 +53,9 @@ WORKDIR /app
 
 # Copy the binary from builder stage (frontend is already embedded in the binary)
 COPY --from=builder /app/target/release/dwctl /app/dwctl
+
+# Copy default email templates (can be overridden via volume mount)
+COPY dwctl/default_templates/ /app/default_templates/
 
 # Change ownership of the app directory to the ubuntu user
 RUN chown -R ubuntu:ubuntu /app

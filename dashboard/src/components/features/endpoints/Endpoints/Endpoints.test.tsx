@@ -50,7 +50,7 @@ describe("Endpoints Component", () => {
 
     await waitFor(() => {
       // Check that endpoint data from mock is displayed
-      expect(within(container).getByText("Internal")).toBeInTheDocument();
+      expect(within(container).getByText("vLLM - On-premise")).toBeInTheDocument();
       expect(
         within(container).getByText(
           /Manage inference endpoints and their model synchronization/,
