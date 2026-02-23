@@ -200,9 +200,8 @@ pub(crate) fn extract_header_as_string(request_data: &outlet::RequestData, heade
 #[cfg(test)]
 mod tests {
     use super::{
-        decompress_response_if_needed, extract_header_as_string, parse_non_streaming_response,
-        parse_responses_non_streaming_response, parse_responses_streaming_response, parse_sse_chunks,
-        parse_streaming_response, process_sse_chunks,
+        decompress_response_if_needed, extract_header_as_string, parse_non_streaming_response, parse_responses_non_streaming_response,
+        parse_responses_streaming_response, parse_sse_chunks, parse_streaming_response, process_sse_chunks,
     };
     use crate::request_logging::models::{AiResponse, ChatCompletionChunk, SseParseError};
     use async_openai::types::responses::ResponseStreamEvent;

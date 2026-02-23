@@ -1340,9 +1340,9 @@ mod tests {
         match result {
             AiResponse::ResponsesStream(events) => {
                 assert!(!events.is_empty(), "should have parsed at least the completed event");
-                let has_completed = events.iter().any(|e| {
-                    matches!(e, async_openai::types::responses::ResponseStreamEvent::ResponseCompleted(_))
-                });
+                let has_completed = events
+                    .iter()
+                    .any(|e| matches!(e, async_openai::types::responses::ResponseStreamEvent::ResponseCompleted(_)));
                 assert!(has_completed, "should contain a ResponseCompleted event");
             }
             _ => panic!("expected AiResponse::ResponsesStream"),
@@ -1379,9 +1379,7 @@ mod tests {
         let request_data = responses_request_data(Some(true));
 
         let completed_data = responses_api_body(true);
-        let sse_body = format!(
-            "data: {{\"type\":\"response.completed\",\"sequence_number\":5,\"response\":{completed_data}}}\n\n"
-        );
+        let sse_body = format!("data: {{\"type\":\"response.completed\",\"sequence_number\":5,\"response\":{completed_data}}}\n\n");
         let response_data = responses_response_data(sse_body);
 
         let parsed_response = parse_ai_response(&request_data, &response_data).unwrap();
