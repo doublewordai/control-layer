@@ -26,7 +26,7 @@ check:
     missing_tools=()
 
     # Required tools
-    required_tools=("docker" "hurl" "psql" "createdb", "cargo", "npm")
+    required_tools=("docker" "hurl" "psql" "createdb" "cargo" "npm")
     for tool in "${required_tools[@]}"; do
         if ! command -v "$tool" >/dev/null 2>&1; then
             missing_tools+=("$tool")

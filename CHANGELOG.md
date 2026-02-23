@@ -1,5 +1,26 @@
 # Changelog
 
+## [8.5.0](https://github.com/doublewordai/control-layer/compare/v8.4.1...v8.5.0) (2026-02-23)
+
+
+### Features
+
+* race condition guard on batch creation ([#723](https://github.com/doublewordai/control-layer/issues/723)) ([34d5340](https://github.com/doublewordai/control-layer/commit/34d5340e2c5afaed63df3c7d80911f7d0050ffdf))
+
+## [8.4.1](https://github.com/doublewordai/control-layer/compare/v8.4.0...v8.4.1) (2026-02-20)
+
+
+### Bug Fixes
+
+* Parameterise email templates to repair crate publishing ([#719](https://github.com/doublewordai/control-layer/issues/719)) ([4939b12](https://github.com/doublewordai/control-layer/commit/4939b12d0d68e740ff5c646d0ba1c913629c57c0))
+
+## [8.4.0](https://github.com/doublewordai/control-layer/compare/v8.3.0...v8.4.0) (2026-02-20)
+
+
+### Features
+
+* **playground:** stream reasoning tokens into collapsible thinking block ([#744](https://github.com/doublewordai/control-layer/issues/744)) ([943b9b2](https://github.com/doublewordai/control-layer/commit/943b9b2b6fdc2c1be41d095b6a658de6977d4b10))
+
 ## [8.3.0](https://github.com/doublewordai/control-layer/compare/v8.2.0...v8.3.0) (2026-02-19)
 
 

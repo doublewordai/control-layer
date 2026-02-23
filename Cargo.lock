@@ -250,6 +250,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "async-stream"
+version = "0.3.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b5a71a6f37880a80d1d7f19efd781e4b5de42c88f0722cc13bcb6cc2cfe8476"
+dependencies = [
+ "async-stream-impl",
+ "futures-core",
+ "pin-project-lite",
+]
+
+[[package]]
+name = "async-stream-impl"
+version = "0.3.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c7c24de15d275a1ecfd47a380fb4d5ec9bfe0933f309ed5e705b775596a3574d"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.116",
+]
+
+[[package]]
 name = "async-stripe"
 version = "1.0.0-rc.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1459,7 +1481,7 @@ checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
 name = "dwctl"
-version = "8.3.0"
+version = "8.5.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -1513,6 +1535,7 @@ dependencies = [
  "rust-embed",
  "rust_decimal",
  "rustls",
+ "scopeguard",
  "serde",
  "serde_json",
  "serde_urlencoded",
@@ -1817,9 +1840,9 @@ checksum = "e6d5a32815ae3f33302d95fdcb2ce17862f8c65363dcfd29360480ba1001fc9c"
 
 [[package]]
 name = "fusillade"
-version = "6.0.0"
+version = "7.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6d5d98e06222453cbbc3ee34e9d81fa8cce5236d409b4c7b0f04f731bb680677"
+checksum = "7cf722f64b6b1084ed44046497ccf4a7be1f40e6ca61de9bb0d210a26141b390"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3159,9 +3182,12 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "onwards"
-version = "0.15.1"
+version = "0.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "de3f35f63d62cd6fe8ac1eb96c969fedc66adccef6542ee1fc0088eb7bd779e3"
 dependencies = [
  "anyhow",
+ "async-stream",
  "async-trait",
  "axum",
  "axum-prometheus",

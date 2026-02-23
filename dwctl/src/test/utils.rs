@@ -47,6 +47,44 @@ pub async fn create_test_app_state_with_config(pool: PgPool, config: crate::conf
         .build()
 }
 
+/// Like `create_test_app_state_with_config` but also runs fusillade migrations.
+/// Use this in tests that call functions which use `state.request_manager` directly.
+pub async fn create_test_app_state_with_fusillade(pool: PgPool, config: crate::config::Config) -> crate::AppState<TestDbPools> {
+    use sqlx::Executor;
+    use sqlx::postgres::PgConnectOptions;
+
+    pool.execute("CREATE SCHEMA IF NOT EXISTS fusillade")
+        .await
+        .expect("Failed to create fusillade schema");
+
+    let base_opts: PgConnectOptions = pool.connect_options().as_ref().clone();
+    let fusillade_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(4)
+        .min_connections(0)
+        .connect_with(base_opts.options([("search_path", "fusillade")]))
+        .await
+        .expect("Failed to create fusillade pool");
+
+    fusillade::migrator()
+        .run(&fusillade_pool)
+        .await
+        .expect("Failed to run fusillade migrations");
+
+    let test_pools = TestDbPools::new(pool.clone()).await.expect("Failed to create TestDbPools");
+    let fusillade_test_pools = TestDbPools::new(fusillade_pool)
+        .await
+        .expect("Failed to create fusillade TestDbPools");
+    let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(fusillade_test_pools));
+    let limiters = crate::limits::Limiters::new(&config.limits);
+
+    crate::AppState::builder()
+        .db(test_pools)
+        .config(config)
+        .request_manager(request_manager)
+        .limiters(limiters)
+        .build()
+}
+
 pub async fn create_test_app(pool: PgPool, _enable_sync: bool) -> (TestServer, crate::BackgroundServices) {
     let config = create_test_config();
 
