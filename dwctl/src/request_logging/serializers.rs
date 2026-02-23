@@ -1217,4 +1217,188 @@ mod tests {
         assert_eq!(metrics.total_tokens, 4);
         assert_eq!(metrics.response_type, "base64_embeddings");
     }
+
+    // Minimal valid Response JSON (only non-Option fields filled in)
+    fn responses_api_body(usage: bool) -> String {
+        let usage_json = if usage {
+            r#","usage":{"input_tokens":15,"input_tokens_details":{"cached_tokens":0},"output_tokens":25,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":40}"#
+        } else {
+            ""
+        };
+        format!(
+            r#"{{"id":"resp_123","object":"response","created_at":1234567890,"model":"gpt-4o","status":"completed","output":[]{usage_json}}}"#
+        )
+    }
+
+    fn responses_request_data(stream: Option<bool>) -> RequestData {
+        let stream_field = match stream {
+            Some(true) => r#","stream":true"#,
+            Some(false) => r#","stream":false"#,
+            None => "",
+        };
+        let body = format!(r#"{{"model":"gpt-4o","input":"tell me a joke"{stream_field}}}"#);
+        RequestData {
+            correlation_id: 1,
+            timestamp: SystemTime::now(),
+            method: Method::POST,
+            uri: "/v1/responses".parse::<Uri>().unwrap(),
+            headers: HashMap::new(),
+            body: Some(Bytes::from(body)),
+        }
+    }
+
+    fn responses_response_data(body: String) -> ResponseData {
+        ResponseData {
+            correlation_id: 1,
+            timestamp: SystemTime::now(),
+            status: StatusCode::OK,
+            headers: HashMap::new(),
+            body: Some(Bytes::from(body)),
+            duration: Duration::from_millis(100),
+            duration_to_first_byte: Duration::from_millis(50),
+        }
+    }
+
+    #[test]
+    fn test_parse_ai_request_responses_path_not_classified_as_embeddings() {
+        // Both embeddings and responses requests have an `input` field.
+        // Path-based detection must prevent /v1/responses bodies being classified as Embeddings.
+        let result = parse_ai_request(&responses_request_data(None)).unwrap();
+
+        let rr = result.responses_request.expect("responses_request should be set");
+        assert_eq!(rr.model, Some("gpt-4o".to_string()));
+        assert_eq!(rr.stream, None);
+
+        match result.request {
+            AiRequest::Other(_) => {}
+            _ => panic!("expected AiRequest::Other for /v1/responses, not Embeddings or ChatCompletions"),
+        }
+    }
+
+    #[test]
+    fn test_parse_ai_request_responses_path_stream_flag() {
+        let result = parse_ai_request(&responses_request_data(Some(true))).unwrap();
+        let rr = result.responses_request.unwrap();
+        assert_eq!(rr.stream, Some(true));
+    }
+
+    #[test]
+    fn test_parse_ai_response_responses_non_streaming() {
+        let request_data = responses_request_data(None);
+        let response_data = responses_response_data(responses_api_body(true));
+
+        let result = parse_ai_response(&request_data, &response_data).unwrap();
+
+        match result {
+            AiResponse::Responses(resp) => {
+                assert_eq!(resp.model, "gpt-4o");
+                let usage = resp.usage.expect("usage should be present");
+                assert_eq!(usage.input_tokens, 15);
+                assert_eq!(usage.output_tokens, 25);
+                assert_eq!(usage.total_tokens, 40);
+            }
+            _ => panic!("expected AiResponse::Responses"),
+        }
+    }
+
+    #[test]
+    fn test_parse_ai_response_responses_error_body_falls_back_to_other() {
+        // 4xx/5xx error responses from the provider don't match the Response schema;
+        // they should be stored as AiResponse::Other rather than returning a SerializationError.
+        let request_data = responses_request_data(None);
+        let error_json = r#"{"error":{"message":"invalid request","type":"invalid_request_error","code":"model_not_found"}}"#;
+        let response_data = ResponseData {
+            correlation_id: 1,
+            timestamp: SystemTime::now(),
+            status: StatusCode::BAD_REQUEST,
+            headers: HashMap::new(),
+            body: Some(Bytes::from(error_json)),
+            duration: Duration::from_millis(100),
+            duration_to_first_byte: Duration::from_millis(50),
+        };
+
+        let result = parse_ai_response(&request_data, &response_data).unwrap();
+        match result {
+            AiResponse::Other(_) => {}
+            _ => panic!("expected AiResponse::Other for error body, got something else"),
+        }
+    }
+
+    #[test]
+    fn test_parse_ai_response_responses_streaming() {
+        let request_data = responses_request_data(Some(true));
+
+        // SSE body with a response.completed event carrying usage
+        let completed_data = responses_api_body(true);
+        let sse_body = format!(
+            "data: {{\"type\":\"response.output_text.delta\",\"sequence_number\":1,\"item_id\":\"item_1\",\"output_index\":0,\"content_index\":0,\"delta\":\"Hello\"}}\n\ndata: {{\"type\":\"response.completed\",\"sequence_number\":5,\"response\":{completed_data}}}\n\n"
+        );
+        let response_data = responses_response_data(sse_body);
+
+        let result = parse_ai_response(&request_data, &response_data).unwrap();
+
+        match result {
+            AiResponse::ResponsesStream(events) => {
+                assert!(!events.is_empty(), "should have parsed at least the completed event");
+                let has_completed = events.iter().any(|e| {
+                    matches!(e, async_openai::types::responses::ResponseStreamEvent::ResponseCompleted(_))
+                });
+                assert!(has_completed, "should contain a ResponseCompleted event");
+            }
+            _ => panic!("expected AiResponse::ResponsesStream"),
+        }
+    }
+
+    #[test]
+    fn test_analytics_metrics_extract_responses_tokens() {
+        let instance_id = Uuid::new_v4();
+        let request_data = responses_request_data(None);
+        let response_data = responses_response_data(responses_api_body(true));
+
+        let parsed_response = parse_ai_response(&request_data, &response_data).unwrap();
+
+        let metrics = UsageMetrics::extract(
+            instance_id,
+            &request_data,
+            &response_data,
+            &parsed_response,
+            &crate::test::utils::create_test_config(),
+        );
+
+        assert_eq!(metrics.request_model, Some("gpt-4o".to_string()));
+        assert_eq!(metrics.response_model, Some("gpt-4o".to_string()));
+        assert_eq!(metrics.prompt_tokens, 15);
+        assert_eq!(metrics.completion_tokens, 25);
+        assert_eq!(metrics.total_tokens, 40);
+        assert_eq!(metrics.response_type, "response");
+    }
+
+    #[test]
+    fn test_analytics_metrics_extract_responses_streaming_tokens() {
+        let instance_id = Uuid::new_v4();
+        let request_data = responses_request_data(Some(true));
+
+        let completed_data = responses_api_body(true);
+        let sse_body = format!(
+            "data: {{\"type\":\"response.completed\",\"sequence_number\":5,\"response\":{completed_data}}}\n\n"
+        );
+        let response_data = responses_response_data(sse_body);
+
+        let parsed_response = parse_ai_response(&request_data, &response_data).unwrap();
+
+        let metrics = UsageMetrics::extract(
+            instance_id,
+            &request_data,
+            &response_data,
+            &parsed_response,
+            &crate::test::utils::create_test_config(),
+        );
+
+        assert_eq!(metrics.request_model, Some("gpt-4o".to_string()));
+        assert_eq!(metrics.response_model, Some("gpt-4o".to_string()));
+        assert_eq!(metrics.prompt_tokens, 15);
+        assert_eq!(metrics.completion_tokens, 25);
+        assert_eq!(metrics.total_tokens, 40);
+        assert_eq!(metrics.response_type, "response_stream");
+    }
 }

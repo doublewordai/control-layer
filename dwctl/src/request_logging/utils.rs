@@ -200,10 +200,12 @@ pub(crate) fn extract_header_as_string(request_data: &outlet::RequestData, heade
 #[cfg(test)]
 mod tests {
     use super::{
-        decompress_response_if_needed, extract_header_as_string, parse_non_streaming_response, parse_sse_chunks, parse_streaming_response,
-        process_sse_chunks,
+        decompress_response_if_needed, extract_header_as_string, parse_non_streaming_response,
+        parse_responses_non_streaming_response, parse_responses_streaming_response, parse_sse_chunks,
+        parse_streaming_response, process_sse_chunks,
     };
     use crate::request_logging::models::{AiResponse, ChatCompletionChunk, SseParseError};
+    use async_openai::types::responses::ResponseStreamEvent;
     use axum::http::{Method, Uri};
     use bytes::Bytes;
     use outlet::RequestData;
@@ -541,5 +543,81 @@ mod tests {
         assert!(result.is_some());
         let uuid = result.unwrap();
         assert_eq!(uuid.to_string(), "00000000-0000-0000-0000-000000000000");
+    }
+
+    // Minimal valid Response JSON (only the non-Option required fields).
+    fn minimal_response_json(with_usage: bool) -> String {
+        let usage = if with_usage {
+            r#","usage":{"input_tokens":15,"input_tokens_details":{"cached_tokens":0},"output_tokens":25,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":40}"#
+        } else {
+            ""
+        };
+        format!(r#"{{"id":"resp_1","object":"response","created_at":1000,"model":"gpt-4o","status":"completed","output":[]{usage}}}"#)
+    }
+
+    #[test]
+    fn test_parse_responses_non_streaming_valid() {
+        let body = minimal_response_json(true);
+        let result = parse_responses_non_streaming_response(&body).unwrap();
+
+        match result {
+            AiResponse::Responses(resp) => {
+                assert_eq!(resp.model, "gpt-4o");
+                let usage = resp.usage.unwrap();
+                assert_eq!(usage.input_tokens, 15);
+                assert_eq!(usage.output_tokens, 25);
+                assert_eq!(usage.total_tokens, 40);
+            }
+            _ => panic!("expected AiResponse::Responses"),
+        }
+    }
+
+    #[test]
+    fn test_parse_responses_non_streaming_not_a_response_object() {
+        // Error JSON from a provider (4xx body) should fail so callers can fall back.
+        let result = parse_responses_non_streaming_response(r#"{"error":{"message":"bad request"}}"#);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_responses_streaming_valid() {
+        let response_json = minimal_response_json(true);
+        let sse = format!(
+            "data: {{\"type\":\"response.output_text.delta\",\"sequence_number\":1,\"item_id\":\"i\",\"output_index\":0,\"content_index\":0,\"delta\":\"Hi\"}}\n\ndata: {{\"type\":\"response.completed\",\"sequence_number\":5,\"response\":{response_json}}}\n\n"
+        );
+
+        let result = parse_responses_streaming_response(&sse).unwrap();
+
+        match result {
+            AiResponse::ResponsesStream(events) => {
+                assert!(!events.is_empty());
+                let completed = events.iter().find(|e| matches!(e, ResponseStreamEvent::ResponseCompleted(_)));
+                assert!(completed.is_some(), "should contain a ResponseCompleted event");
+
+                if let ResponseStreamEvent::ResponseCompleted(ev) = completed.unwrap() {
+                    let usage = ev.response.usage.as_ref().unwrap();
+                    assert_eq!(usage.input_tokens, 15);
+                    assert_eq!(usage.output_tokens, 25);
+                    assert_eq!(usage.total_tokens, 40);
+                }
+            }
+            _ => panic!("expected AiResponse::ResponsesStream"),
+        }
+    }
+
+    #[test]
+    fn test_parse_responses_streaming_empty_events_is_error() {
+        // If no SSE data chunks parse as ResponseStreamEvent (e.g. garbage data or a
+        // non-standard provider format), we must return an error rather than silently
+        // returning an empty event list with zero token counts.
+        let sse = "data: {\"not_a_response_event\":true}\n\ndata: {\"also_not\":true}\n\n";
+        let result = parse_responses_streaming_response(sse);
+        assert!(result.is_err(), "empty parsed events should return an error");
+    }
+
+    #[test]
+    fn test_parse_responses_streaming_no_sse_is_error() {
+        let result = parse_responses_streaming_response("not sse format at all");
+        assert!(result.is_err());
     }
 }
