@@ -361,6 +361,8 @@ mod tests {
                 fallback_with_replacement: None,
                 fallback_max_attempts: None,
                 sanitize_responses: true,
+
+                allowed_batch_completion_windows: None,
             })
             .await
             .unwrap();
@@ -483,6 +485,8 @@ mod tests {
                 fallback_with_replacement: None,
                 fallback_max_attempts: None,
                 sanitize_responses: true,
+
+                allowed_batch_completion_windows: None,
             })
             .await
             .unwrap();
@@ -514,6 +518,8 @@ mod tests {
                 fallback_with_replacement: None,
                 fallback_max_attempts: None,
                 sanitize_responses: true,
+
+                allowed_batch_completion_windows: None,
             })
             .await
             .unwrap();
@@ -605,6 +611,7 @@ mod tests {
             fallback_with_replacement: None,
             fallback_max_attempts: None,
             sanitize_responses: false,
+            allowed_batch_completion_windows: None,
         })
         .await
         .unwrap();
@@ -692,6 +699,8 @@ mod tests {
                 fallback_with_replacement: None,
                 fallback_max_attempts: None,
                 sanitize_responses: false,
+
+                allowed_batch_completion_windows: None,
             })
             .await
             .unwrap();
@@ -825,6 +834,8 @@ mod tests {
                 fallback_with_replacement: None,
                 fallback_max_attempts: None,
                 sanitize_responses: false,
+
+                allowed_batch_completion_windows: None,
             })
             .await
             .unwrap();
@@ -856,6 +867,8 @@ mod tests {
                 fallback_with_replacement: None,
                 fallback_max_attempts: None,
                 sanitize_responses: false,
+
+                allowed_batch_completion_windows: None,
             })
             .await
             .unwrap();
@@ -978,6 +991,8 @@ mod tests {
                 fallback_with_replacement: None,
                 fallback_max_attempts: None,
                 sanitize_responses: false,
+
+                allowed_batch_completion_windows: None,
             })
             .await
             .unwrap();
@@ -1093,6 +1108,8 @@ mod tests {
                 fallback_with_replacement: None,
                 fallback_max_attempts: None,
                 sanitize_responses: false,
+
+                allowed_batch_completion_windows: None,
             })
             .await
             .unwrap();

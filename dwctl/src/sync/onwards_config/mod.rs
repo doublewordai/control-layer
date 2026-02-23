@@ -5,8 +5,8 @@ use std::{collections::HashMap, num::NonZeroU32, sync::Arc};
 use metrics::histogram;
 use onwards::target::{
     Auth, ConcurrencyLimitParameters, ConfigFile, FallbackConfig as OnwardsFallbackConfig, KeyDefinition,
-    LoadBalanceStrategy as OnwardsLoadBalanceStrategy, PoolSpec, ProviderSpec, RateLimitParameters, TargetSpec, TargetSpecOrList, Targets,
-    WatchTargetsStream,
+    LoadBalanceStrategy as OnwardsLoadBalanceStrategy, PoolSpec, ProviderSpec, RateLimitParameters, RoutingAction, RoutingRule,
+    TargetSpecOrList, Targets, WatchTargetsStream,
 };
 use sqlx::{PgPool, postgres::PgListener};
 use tokio::sync::{mpsc, watch};
@@ -56,6 +56,8 @@ struct OnwardsTarget {
     burst_size: Option<i32>,
     capacity: Option<i32>,
     sanitize_responses: bool,
+    /// Traffic routing rules from the model_traffic_rules table
+    routing_rules: Vec<RoutingRule>,
 
     // Endpoint info
     endpoint_url: url::Url,
@@ -72,6 +74,7 @@ struct OnwardsTarget {
 struct OnwardsApiKey {
     id: ApiKeyId,
     secret: String,
+    purpose: String,
     requests_per_second: Option<f32>,
     burst_size: Option<i32>,
 }
@@ -409,6 +412,8 @@ struct OnwardsCompositeModel {
     fallback_max_attempts: Option<i32>,
     /// Whether to sanitize/filter sensitive data from model responses
     sanitize_responses: bool,
+    /// Traffic routing rules from the database
+    routing_rules: Vec<RoutingRule>,
     components: Vec<CompositeModelComponent>,
     // API keys that have access to this composite model
     api_keys: Vec<OnwardsApiKey>,
@@ -490,6 +495,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
             cm.id as composite_model_id,
             ak.id as api_key_id,
             ak.secret as api_key_secret,
+            ak.purpose as api_key_purpose,
             ak.requests_per_second,
             ak.burst_size
         FROM deployed_models cm
@@ -497,6 +503,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
             SELECT DISTINCT
                 ak.id,
                 ak.secret,
+                ak.purpose,
                 ak.requests_per_second,
                 ak.burst_size
             FROM api_keys ak
@@ -577,6 +584,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                 fallback_with_replacement: row.fallback_with_replacement.unwrap_or(false),
                 fallback_max_attempts: row.fallback_max_attempts,
                 sanitize_responses: row.composite_sanitize_responses,
+                routing_rules: Vec::new(), // Populated from separate query below
                 components: Vec::new(),
                 api_keys: Vec::new(),
             }
@@ -591,6 +599,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                 burst_size: row.deployment_burst_size,
                 capacity: row.deployment_capacity,
                 sanitize_responses: row.deployment_sanitize_responses,
+                routing_rules: Vec::new(), // Components don't have their own routing rules
                 endpoint_url,
                 endpoint_api_key: row.endpoint_api_key.clone(),
                 auth_header_name: row.auth_header_name.clone(),
@@ -608,6 +617,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                 composite.api_keys.push(OnwardsApiKey {
                     id: row.api_key_id,
                     secret: row.api_key_secret,
+                    purpose: row.api_key_purpose.clone(),
                     requests_per_second: row.requests_per_second,
                     burst_size: row.burst_size,
                 });
@@ -647,12 +657,15 @@ fn convert_composite_to_target_spec(
             _ => None,
         };
 
+        let labels = HashMap::from([("purpose".to_string(), api_key.purpose.clone())]);
+
         key_definitions.insert(
             api_key.id.to_string(),
             KeyDefinition {
                 key: api_key.secret.clone(),
                 rate_limit,
                 concurrency_limit: None,
+                labels,
             },
         );
     }
@@ -794,6 +807,7 @@ fn convert_composite_to_target_spec(
         sanitize_response: composite.sanitize_responses,
         open_responses: None,
         trusted: false,
+        routing_rules: composite.routing_rules.clone(),
     };
 
     (composite.alias.clone(), TargetSpecOrList::Pool(pool_spec))
@@ -804,7 +818,7 @@ fn convert_composite_to_target_spec(
 fn convert_to_config_file(targets: Vec<OnwardsTarget>, composites: Vec<OnwardsCompositeModel>, strict_mode: bool) -> ConfigFile {
     let mut key_definitions = HashMap::new();
 
-    // Convert regular deployed models (wrapped in TargetSpecOrList::Single)
+    // Convert regular deployed models (wrapped in TargetSpecOrList::Pool)
     let mut target_specs: HashMap<String, TargetSpecOrList> = targets
         .into_iter()
         .map(|target| {
@@ -822,12 +836,16 @@ fn convert_to_config_file(targets: Vec<OnwardsTarget>, composites: Vec<OnwardsCo
                     _ => None,
                 };
 
+                // Build labels from API key purpose
+                let labels = HashMap::from([("purpose".to_string(), api_key.purpose.clone())]);
+
                 key_definitions.insert(
                     api_key.id.to_string(),
                     KeyDefinition {
                         key: api_key.secret.clone(),
                         rate_limit,
                         concurrency_limit: None,
+                        labels,
                     },
                 );
             }
@@ -865,9 +883,9 @@ fn convert_to_config_file(targets: Vec<OnwardsTarget>, composites: Vec<OnwardsCo
                 max_concurrent_requests: capacity as usize,
             });
 
-            let target_spec = TargetSpec {
+            // Build provider spec from target
+            let provider = ProviderSpec {
                 url: target.endpoint_url.clone(),
-                keys,
                 onwards_key: target.endpoint_api_key.clone(),
                 onwards_model: Some(target.model_name.clone()),
                 rate_limit,
@@ -875,14 +893,29 @@ fn convert_to_config_file(targets: Vec<OnwardsTarget>, composites: Vec<OnwardsCo
                 upstream_auth_header_name,
                 upstream_auth_header_prefix,
                 response_headers: None,
-                weight: 1, // Default weight for single-provider targets
+                weight: 1,
                 sanitize_response: target.sanitize_responses,
                 open_responses: None,
                 request_timeout_secs: None,
-                trusted: false,
+                trusted: None,
             };
 
-            (target.alias, TargetSpecOrList::Single(target_spec))
+            // Use PoolSpec so routing_rules are carried through
+            let pool_spec = PoolSpec {
+                keys,
+                rate_limit: None,
+                concurrency_limit: None,
+                fallback: None,
+                strategy: OnwardsLoadBalanceStrategy::default(),
+                providers: vec![provider],
+                response_headers: None,
+                open_responses: None,
+                sanitize_response: target.sanitize_responses,
+                trusted: false,
+                routing_rules: target.routing_rules,
+            };
+
+            (target.alias, TargetSpecOrList::Pool(pool_spec))
         })
         .collect();
 
@@ -962,6 +995,7 @@ pub async fn load_targets_from_db(db: &PgPool, escalation_models: &[String], str
             ie.auth_header_prefix,
             ak.id as "api_key_id?",
             ak.secret as "api_key_secret?",
+            ak.purpose as "api_key_purpose?",
             ak.requests_per_second as api_key_requests_per_second,
             ak.burst_size as api_key_burst_size
         FROM deployed_models dm
@@ -970,6 +1004,7 @@ pub async fn load_targets_from_db(db: &PgPool, escalation_models: &[String], str
             SELECT DISTINCT
                 ak.id,
                 ak.secret,
+                ak.purpose,
                 ak.requests_per_second,
                 ak.burst_size
             FROM api_keys ak
@@ -1031,35 +1066,90 @@ pub async fn load_targets_from_db(db: &PgPool, escalation_models: &[String], str
     let mut targets_map: HashMap<DeploymentId, OnwardsTarget> = HashMap::new();
     for row in rows {
         let deployment_id = row.deployment_id;
-        let target = targets_map.entry(deployment_id).or_insert_with(|| OnwardsTarget {
-            model_name: row.model_name.clone(),
-            alias: row.alias.clone(),
-            requests_per_second: row.deployment_requests_per_second,
-            burst_size: row.deployment_burst_size,
-            capacity: row.capacity,
-            sanitize_responses: row.sanitize_responses,
-            endpoint_url: url::Url::parse(&row.endpoint_url).expect("Invalid URL in database"),
-            endpoint_api_key: row.endpoint_api_key.clone(),
-            auth_header_name: row.auth_header_name.clone(),
-            auth_header_prefix: row.auth_header_prefix.clone(),
-            api_keys: Vec::new(),
+        let target = targets_map.entry(deployment_id).or_insert_with(|| {
+            OnwardsTarget {
+                model_name: row.model_name.clone(),
+                alias: row.alias.clone(),
+                requests_per_second: row.deployment_requests_per_second,
+                burst_size: row.deployment_burst_size,
+                capacity: row.capacity,
+                sanitize_responses: row.sanitize_responses,
+                routing_rules: Vec::new(), // Populated from separate query below
+                endpoint_url: url::Url::parse(&row.endpoint_url).expect("Invalid URL in database"),
+                endpoint_api_key: row.endpoint_api_key.clone(),
+                auth_header_name: row.auth_header_name.clone(),
+                auth_header_prefix: row.auth_header_prefix.clone(),
+                api_keys: Vec::new(),
+            }
         });
 
-        if let (Some(api_key_id), Some(api_key_secret)) = (row.api_key_id, row.api_key_secret) {
+        if let (Some(api_key_id), Some(api_key_secret), Some(api_key_purpose)) = (row.api_key_id, row.api_key_secret, row.api_key_purpose) {
             target.api_keys.push(OnwardsApiKey {
                 id: api_key_id,
                 secret: api_key_secret,
+                purpose: api_key_purpose,
                 requests_per_second: row.api_key_requests_per_second,
                 burst_size: row.api_key_burst_size,
             });
         }
     }
 
-    let targets: Vec<_> = targets_map.into_values().collect();
-    info!("Loaded {} deployed models", targets.len());
+    info!("Loaded {} deployed models", targets_map.len());
 
     // Load composite models (pass escalation_models to grant batch API keys access)
     let composites = load_composite_models_from_db(db, escalation_models).await?;
+
+    // Load traffic routing rules for all non-deleted models (regular + composite)
+    let traffic_rule_rows = sqlx::query!(
+        r#"
+        SELECT mtr.deployed_model_id, mtr.api_key_purpose, mtr.action,
+               dm.alias as "redirect_target_alias?"
+        FROM model_traffic_rules mtr
+        LEFT JOIN deployed_models dm ON dm.id = mtr.redirect_target_id
+        WHERE mtr.deployed_model_id IN (
+            SELECT id FROM deployed_models WHERE deleted = FALSE
+        )
+        ORDER BY mtr.deployed_model_id, mtr.api_key_purpose
+        "#
+    )
+    .fetch_all(db)
+    .await?;
+
+    // Build a map of deployment_id → routing rules
+    let mut routing_rules_map: HashMap<DeploymentId, Vec<RoutingRule>> = HashMap::new();
+    for rule_row in traffic_rule_rows {
+        let routing_rule = RoutingRule {
+            match_labels: HashMap::from([("purpose".to_string(), rule_row.api_key_purpose)]),
+            action: match rule_row.action.as_str() {
+                "deny" => RoutingAction::Deny,
+                "redirect" => RoutingAction::Redirect {
+                    target: rule_row.redirect_target_alias.unwrap_or_default(),
+                },
+                _ => continue,
+            },
+        };
+        routing_rules_map.entry(rule_row.deployed_model_id).or_default().push(routing_rule);
+    }
+
+    // Attach routing rules to regular targets
+    for (deployment_id, target) in &mut targets_map {
+        if let Some(rules) = routing_rules_map.remove(deployment_id) {
+            target.routing_rules = rules;
+        }
+    }
+
+    let targets: Vec<_> = targets_map.into_values().collect();
+
+    // Attach routing rules to composite models
+    let composites: Vec<_> = composites
+        .into_iter()
+        .map(|mut c| {
+            if let Some(rules) = routing_rules_map.remove(&c.id) {
+                c.routing_rules = rules;
+            }
+            c
+        })
+        .collect();
 
     // Convert to ConfigFile format
     let config = convert_to_config_file(targets, composites, strict_mode);
