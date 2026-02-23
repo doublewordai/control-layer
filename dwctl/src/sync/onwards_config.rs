@@ -411,6 +411,7 @@ struct OnwardsCompositeModel {
     /// Whether to sanitize/filter sensitive data from model responses
     sanitize_responses: bool,
     /// Whether to mark provider as trusted in strict mode
+    #[allow(dead_code)] // Stored in DB but composite-level trust is not yet propagated to onwards
     trusted: bool,
     components: Vec<CompositeModelComponent>,
     // API keys that have access to this composite model
@@ -748,8 +749,8 @@ fn convert_composite_to_target_spec(
 
             {
                 debug!(
-                    "  Provider '{}' ({}): weight={}, sanitize_response={}",
-                    target.alias, target.model_name, component.weight, composite.sanitize_responses
+                    "  Provider '{}' ({}): weight={}, sanitize_response={}, trusted={}",
+                    target.alias, target.model_name, component.weight, composite.sanitize_responses, target.trusted
                 );
                 ProviderSpec {
                     url: target.endpoint_url.clone(),
@@ -773,6 +774,10 @@ fn convert_composite_to_target_spec(
                     // This ensures the virtual model's toggle controls all providers
                     sanitize_response: composite.sanitize_responses,
                     request_timeout_secs: None,
+                    open_responses: None,
+                    // Each provider uses its own trusted setting from the database
+                    // This allows fine-grained control over which providers bypass error sanitization
+                    trusted: Some(target.trusted),
                 }
             }
         })
@@ -788,6 +793,8 @@ fn convert_composite_to_target_spec(
     );
 
     // Create PoolSpec with weighted providers
+    // Note: trusted is not set at the pool level for composite models
+    // Each provider uses its own trusted setting via ProviderSpec.trusted
     let pool_spec = PoolSpec {
         keys,
         rate_limit,
@@ -797,7 +804,8 @@ fn convert_composite_to_target_spec(
         providers,
         response_headers: None,
         sanitize_response: composite.sanitize_responses,
-        trusted: composite.trusted,
+        trusted: false, // Pool-level trusted defaults to false; providers set their own
+        open_responses: None,
     };
 
     (composite.alias.clone(), TargetSpecOrList::Pool(pool_spec))
@@ -883,6 +891,7 @@ fn convert_to_config_file(targets: Vec<OnwardsTarget>, composites: Vec<OnwardsCo
                 sanitize_response: target.sanitize_responses,
                 trusted: target.trusted,
                 request_timeout_secs: None,
+                open_responses: None,
             };
 
             (target.alias, TargetSpecOrList::Single(target_spec))

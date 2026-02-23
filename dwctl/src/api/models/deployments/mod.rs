@@ -457,6 +457,13 @@ impl DeployedModelResponse {
         self
     }
 
+    /// Mask response configuration fields (sets to None for users without permission)
+    pub fn mask_response_config(mut self) -> Self {
+        self.sanitize_responses = None;
+        self.trusted = None;
+        self
+    }
+
     /// Create a response with endpoint information included
     pub fn with_endpoint(mut self, endpoint: super::inference_endpoints::InferenceEndpointResponse) -> Self {
         self.endpoint = Some(endpoint);
@@ -527,6 +534,8 @@ pub struct ComponentModelSummary {
     pub model_type: Option<ModelType>,
     /// The endpoint hosting this model (if any)
     pub endpoint: Option<ComponentEndpointSummary>,
+    /// Whether to mark provider as trusted in strict mode
+    pub trusted: bool,
 }
 
 /// Summary of an endpoint hosting a component model

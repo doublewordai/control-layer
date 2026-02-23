@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            WITH updated AS (\n                UPDATE deployed_model_components\n                SET weight = COALESCE($3, weight),\n                    enabled = COALESCE($4, enabled),\n                    sort_order = COALESCE($5, sort_order)\n                WHERE composite_model_id = $1 AND deployed_model_id = $2\n                RETURNING id, composite_model_id, deployed_model_id, weight, enabled, sort_order, created_at\n            )\n            SELECT\n                updated.id,\n                updated.composite_model_id,\n                updated.deployed_model_id,\n                updated.weight,\n                updated.enabled,\n                updated.sort_order,\n                updated.created_at,\n                dm.alias as model_alias,\n                dm.model_name,\n                dm.description as model_description,\n                dm.type as model_type,\n                dm.hosted_on as endpoint_id,\n                e.name as \"endpoint_name?\"\n            FROM updated\n            JOIN deployed_models dm ON dm.id = updated.deployed_model_id\n            LEFT JOIN inference_endpoints e ON e.id = dm.hosted_on\n            ",
+  "query": "\n            SELECT\n                dmc.id,\n                dmc.composite_model_id,\n                dmc.deployed_model_id,\n                dmc.weight,\n                dmc.enabled,\n                dmc.sort_order,\n                dmc.created_at,\n                dm.alias as model_alias,\n                dm.model_name,\n                dm.description as model_description,\n                dm.type as model_type,\n                dm.trusted as model_trusted,\n                dm.hosted_on as endpoint_id,\n                e.name as \"endpoint_name?\"\n            FROM deployed_model_components dmc\n            JOIN deployed_models dm ON dm.id = dmc.deployed_model_id\n            LEFT JOIN inference_endpoints e ON e.id = dm.hosted_on\n            WHERE dmc.composite_model_id = $1\n            ORDER BY dmc.sort_order ASC, dmc.weight DESC, dmc.created_at ASC\n            ",
   "describe": {
     "columns": [
       {
@@ -60,22 +60,23 @@
       },
       {
         "ordinal": 11,
+        "name": "model_trusted",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 12,
         "name": "endpoint_id",
         "type_info": "Uuid"
       },
       {
-        "ordinal": 12,
+        "ordinal": 13,
         "name": "endpoint_name?",
         "type_info": "Varchar"
       }
     ],
     "parameters": {
       "Left": [
-        "Uuid",
-        "Uuid",
-        "Int4",
-        "Bool",
-        "Int4"
+        "Uuid"
       ]
     },
     "nullable": [
@@ -90,9 +91,10 @@
       false,
       true,
       true,
+      false,
       true,
-      true
+      false
     ]
   },
-  "hash": "a7f4c2af451b045a5710335ea46127eeb7833cb096af4713d4f0dbd46078bd63"
+  "hash": "86eae5c1cadf8e42ec9a1f6c74df2822241f6b8dd15afcd77a0db4c6fa75b8bb"
 }

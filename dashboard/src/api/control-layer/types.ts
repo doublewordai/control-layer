@@ -33,6 +33,7 @@ export interface ComponentModelSummary {
   description?: string;
   model_type?: ModelType;
   endpoint?: ComponentEndpointSummary;
+  trusted?: boolean;
 }
 
 export interface ModelComponent {

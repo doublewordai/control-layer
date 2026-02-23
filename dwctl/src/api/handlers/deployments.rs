@@ -51,6 +51,7 @@ fn db_component_to_response(c: DeploymentComponentDBResponse) -> ModelComponentR
                 id,
                 name: c.endpoint_name.unwrap_or_default(),
             }),
+            trusted: c.model_trusted,
         },
     }
 }

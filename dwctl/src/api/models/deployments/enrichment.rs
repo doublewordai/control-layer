@@ -245,6 +245,12 @@ impl<'a> DeployedModelEnricher<'a> {
                 model_response = model_response.mask_composite_fields();
             }
 
+            // Mask response configuration fields for users without permission
+            // These are internal proxy configuration details that standard users don't need to see
+            if !self.can_read_composite_info {
+                model_response = model_response.mask_response_config();
+            }
+
             enriched_models.push(model_response);
         }
 
@@ -400,6 +406,7 @@ impl<'a> DeployedModelEnricher<'a> {
                     id,
                     name: c.endpoint_name.unwrap_or_default(),
                 }),
+                trusted: c.model_trusted,
             },
         }
     }
@@ -588,6 +595,19 @@ mod tests {
         assert_eq!(masked.burst_size, None);
         // Capacity is not a rate limit, should remain
         assert_eq!(masked.capacity, Some(50));
+    }
+
+    #[test]
+    fn test_mask_response_config() {
+        let mut model = create_test_model();
+        model.sanitize_responses = Some(true);
+        model.trusted = Some(false);
+
+        let masked = model.mask_response_config();
+
+        // Response config fields should be masked
+        assert_eq!(masked.sanitize_responses, None);
+        assert_eq!(masked.trusted, None);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            WITH inserted AS (\n                INSERT INTO deployed_model_components (composite_model_id, deployed_model_id, weight, enabled, sort_order)\n                VALUES ($1, $2, $3, $4, $5)\n                RETURNING id, composite_model_id, deployed_model_id, weight, enabled, sort_order, created_at\n            )\n            SELECT\n                inserted.id,\n                inserted.composite_model_id,\n                inserted.deployed_model_id,\n                inserted.weight,\n                inserted.enabled,\n                inserted.sort_order,\n                inserted.created_at,\n                dm.alias as model_alias,\n                dm.model_name,\n                dm.description as model_description,\n                dm.type as model_type,\n                dm.hosted_on as endpoint_id,\n                e.name as \"endpoint_name?\"\n            FROM inserted\n            JOIN deployed_models dm ON dm.id = inserted.deployed_model_id\n            LEFT JOIN inference_endpoints e ON e.id = dm.hosted_on\n            ",
+  "query": "\n            SELECT\n                dmc.id,\n                dmc.composite_model_id,\n                dmc.deployed_model_id,\n                dmc.weight,\n                dmc.enabled,\n                dmc.sort_order,\n                dmc.created_at,\n                dm.alias as model_alias,\n                dm.model_name,\n                dm.description as model_description,\n                dm.type as model_type,\n                dm.trusted as model_trusted,\n                dm.hosted_on as endpoint_id,\n                e.name as \"endpoint_name?\"\n            FROM deployed_model_components dmc\n            JOIN deployed_models dm ON dm.id = dmc.deployed_model_id\n            LEFT JOIN inference_endpoints e ON e.id = dm.hosted_on\n            WHERE dmc.composite_model_id = ANY($1)\n            ORDER BY dmc.composite_model_id, dmc.sort_order ASC, dmc.weight DESC, dmc.created_at ASC\n            ",
   "describe": {
     "columns": [
       {
@@ -60,22 +60,23 @@
       },
       {
         "ordinal": 11,
+        "name": "model_trusted",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 12,
         "name": "endpoint_id",
         "type_info": "Uuid"
       },
       {
-        "ordinal": 12,
+        "ordinal": 13,
         "name": "endpoint_name?",
         "type_info": "Varchar"
       }
     ],
     "parameters": {
       "Left": [
-        "Uuid",
-        "Uuid",
-        "Int4",
-        "Bool",
-        "Int4"
+        "UuidArray"
       ]
     },
     "nullable": [
@@ -90,9 +91,10 @@
       false,
       true,
       true,
+      false,
       true,
-      true
+      false
     ]
   },
-  "hash": "f8d0ced67cd6f9a9ec27efd70294d1079b6bb6420a4b9e30ee6915379146dbe1"
+  "hash": "35fb05257f8f99a64f460d629de37c0abf1d2b05e9c93bf8d59d7ae4cc657a5f"
 }

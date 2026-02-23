@@ -360,6 +360,7 @@ pub struct DeploymentComponentDBResponse {
     // Joined endpoint fields
     pub endpoint_id: Option<InferenceEndpointId>,
     pub endpoint_name: Option<String>,
+    pub model_trusted: bool,
 }
 
 /// Database request for creating a new deployment

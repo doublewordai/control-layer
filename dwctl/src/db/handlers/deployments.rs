@@ -781,6 +781,7 @@ impl<'c> Deployments<'c> {
                 dm.model_name,
                 dm.description as model_description,
                 dm.type as model_type,
+                dm.trusted as model_trusted,
                 dm.hosted_on as endpoint_id,
                 e.name as "endpoint_name?"
             FROM inserted
@@ -810,6 +811,7 @@ impl<'c> Deployments<'c> {
             model_type: result.model_type,
             endpoint_id: result.endpoint_id,
             endpoint_name: result.endpoint_name,
+            model_trusted: result.model_trusted,
         })
     }
 
@@ -844,6 +846,7 @@ impl<'c> Deployments<'c> {
                 dm.model_name,
                 dm.description as model_description,
                 dm.type as model_type,
+                dm.trusted as model_trusted,
                 dm.hosted_on as endpoint_id,
                 e.name as "endpoint_name?"
             FROM deployed_model_components dmc
@@ -873,6 +876,7 @@ impl<'c> Deployments<'c> {
                 model_type: r.model_type,
                 endpoint_id: r.endpoint_id,
                 endpoint_name: r.endpoint_name,
+                model_trusted: r.model_trusted,
             })
             .collect())
     }
@@ -901,6 +905,7 @@ impl<'c> Deployments<'c> {
                 dm.model_name,
                 dm.description as model_description,
                 dm.type as model_type,
+                dm.trusted as model_trusted,
                 dm.hosted_on as endpoint_id,
                 e.name as "endpoint_name?"
             FROM deployed_model_components dmc
@@ -931,6 +936,7 @@ impl<'c> Deployments<'c> {
                 model_type: r.model_type,
                 endpoint_id: r.endpoint_id,
                 endpoint_name: r.endpoint_name,
+                model_trusted: r.model_trusted,
             });
         }
 
@@ -1001,6 +1007,7 @@ impl<'c> Deployments<'c> {
                 dm.model_name,
                 dm.description as model_description,
                 dm.type as model_type,
+                dm.trusted as model_trusted,
                 dm.hosted_on as endpoint_id,
                 e.name as "endpoint_name?"
             FROM updated
@@ -1030,6 +1037,7 @@ impl<'c> Deployments<'c> {
             model_type: r.model_type,
             endpoint_id: r.endpoint_id,
             endpoint_name: r.endpoint_name,
+            model_trusted: r.model_trusted,
         }))
     }
 
