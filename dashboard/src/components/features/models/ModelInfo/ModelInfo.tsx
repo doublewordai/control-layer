@@ -780,7 +780,8 @@ const ModelInfo: React.FC = () => {
                             <p className="text-sm text-muted-foreground">
                               Set system-wide rate limits for this model.
                               These apply to all users and override individual
-                              API key limits.
+                              API key limits. Leave fields blank for no
+                              limits/defaults.
                             </p>
                           </InfoTip>
                         </div>
@@ -895,6 +896,19 @@ const ModelInfo: React.FC = () => {
                                   daemons.
                                 </p>
                               </InfoTip>
+                              {runningDaemonCount > 0 && (
+                                <span className="text-xs text-gray-500">
+                                  ({runningDaemonCount}{" "}
+                                  {runningDaemonCount === 1
+                                    ? "daemon"
+                                    : "daemons"}{" "}
+                                  running
+                                  {updateData.batch_capacity
+                                    ? ` · ${(updateData.batch_capacity * runningDaemonCount).toLocaleString()} total capacity`
+                                    : ""}
+                                  )
+                                </span>
+                              )}
                             </label>
                             <Input
                               type="number"
@@ -918,37 +932,17 @@ const ModelInfo: React.FC = () => {
                                   : "None"
                               }
                             />
-                            {runningDaemonCount > 0 && (
-                              <p className="text-xs text-gray-500 mt-1">
-                                {runningDaemonCount}{" "}
-                                {runningDaemonCount === 1
-                                  ? "daemon"
-                                  : "daemons"}{" "}
-                                running
-                                {updateData.batch_capacity
-                                  ? ` · ${(updateData.batch_capacity * runningDaemonCount).toLocaleString()} total capacity`
-                                  : ""}
-                              </p>
-                            )}
                           </div>
                           <div>
                             <label className="text-sm text-gray-600 mb-2 flex items-center gap-1">
                               Throughput
-                              <HoverCard openDelay={100} closeDelay={50}>
-                                <HoverCardTrigger asChild>
-                                  <Info className="h-3 w-3 text-gray-400 hover:text-gray-600" />
-                                </HoverCardTrigger>
-                                <HoverCardContent
-                                  className="w-80"
-                                  sideOffset={5}
-                                >
-                                  <p className="text-sm text-muted-foreground">
-                                    Model throughput in requests per second,
-                                    used for batch SLA capacity calculations. If
-                                    not set, the system default is used.
-                                  </p>
-                                </HoverCardContent>
-                              </HoverCard>
+                              <InfoTip>
+                                <p className="text-sm text-muted-foreground">
+                                  Model throughput in requests per second,
+                                  used for batch SLA capacity calculations.
+                                  Defaults to 100 req/s if not set.
+                                </p>
+                              </InfoTip>
                             </label>
                             <Input
                               type="number"
@@ -971,9 +965,6 @@ const ModelInfo: React.FC = () => {
                                   : "None"
                               }
                             />
-                            <p className="text-xs text-gray-500 mt-1">
-                              Defaults to 100 req/s if not set.
-                            </p>
                           </div>
                         </div>
                         {(updateData.requests_per_second ||
@@ -1002,9 +993,6 @@ const ModelInfo: React.FC = () => {
                             </Button>
                           </div>
                         )}
-                        <p className="text-xs text-gray-500 mt-2">
-                          Leave fields blank for no limits/defaults.
-                        </p>
                         {updateData.burst_size &&
                           !updateData.requests_per_second && (
                             <div className="mt-2 p-2 bg-yellow-50 border border-yellow-200 rounded-md">
@@ -1377,42 +1365,33 @@ const ModelInfo: React.FC = () => {
                                       running daemons.
                                     </p>
                                   </InfoTip>
+                                  {runningDaemonCount > 0 && (
+                                    <span className="text-xs text-gray-500">
+                                      ({runningDaemonCount}{" "}
+                                      {runningDaemonCount === 1
+                                        ? "daemon"
+                                        : "daemons"}{" "}
+                                      running)
+                                    </span>
+                                  )}
                                 </p>
                                 <p className="font-medium">
                                   {model.batch_capacity
                                     ? `${model.batch_capacity.toLocaleString()} per daemon`
                                     : "No limit"}
-                                  {model.batch_capacity &&
-                                    runningDaemonCount > 0 && (
-                                      <span className="text-xs text-gray-500 font-normal ml-1">
-                                        · {runningDaemonCount}{" "}
-                                        {runningDaemonCount === 1
-                                          ? "daemon"
-                                          : "daemons"}{" "}
-                                        running
-                                      </span>
-                                    )}
                                 </p>
                               </div>
                               <div>
                                 <p className="text-xs text-gray-500 mb-1 flex items-center gap-1">
                                   Throughput
-                                  <HoverCard openDelay={100} closeDelay={50}>
-                                    <HoverCardTrigger asChild>
-                                      <Info className="h-3 w-3 text-gray-400 hover:text-gray-600" />
-                                    </HoverCardTrigger>
-                                    <HoverCardContent
-                                      className="w-80"
-                                      sideOffset={5}
-                                    >
-                                      <p className="text-sm text-muted-foreground">
-                                        Model throughput in requests per second,
-                                        used for batch SLA capacity
-                                        calculations. If not set, the system
-                                        default is used.
-                                      </p>
-                                    </HoverCardContent>
-                                  </HoverCard>
+                                  <InfoTip>
+                                    <p className="text-sm text-muted-foreground">
+                                      Model throughput in requests per second,
+                                      used for batch SLA capacity
+                                      calculations. Defaults to 100 req/s if
+                                      not set.
+                                    </p>
+                                  </InfoTip>
                                 </p>
                                 <p className="font-medium">
                                   {model.throughput
