@@ -81,6 +81,7 @@ export interface ConfigResponse {
   batches?: {
     enabled: boolean;
     allowed_completion_windows: string[]; // Raw completion windows like ["24h", "1h"]
+    allowed_url_paths: string[]; // Allowed endpoint paths like ["/v1/chat/completions", "/v1/responses"]
   };
   /** Base URL for AI API endpoints (files, batches, daemons). If not set, use relative paths. */
   ai_api_base_url?: string;
