@@ -46,7 +46,7 @@ use outlet_postgres::SerializationError;
 use serde_json::Value;
 use std::fmt;
 use std::str;
-use tracing::instrument;
+use tracing::{error, instrument};
 use uuid::Uuid;
 
 use super::utils;
@@ -264,13 +264,30 @@ impl UsageMetrics {
         parsed_response: &AiResponse,
         config: &Config,
     ) -> Self {
-        // Extract model from request
+        // Extract model from request.
+        // First try typed deserialization (ChatCompletions, Completions, Embeddings).
+        // If that fails (e.g. request uses content types async_openai doesn't know about,
+        // like Responses API's input_text/input_image), fall back to extracting the
+        // "model" field from raw JSON.
         let request_model = match parse_ai_request(request_data) {
             Ok(parsed_request) => match parsed_request.request {
                 AiRequest::ChatCompletions(req) => Some(req.model),
                 AiRequest::Completions(req) => Some(req.model),
                 AiRequest::Embeddings(req) => Some(req.model),
-                _ => None,
+                AiRequest::Other(ref value) => {
+                    let model = value
+                        .get("model")
+                        .and_then(|v| v.as_str())
+                        .map(String::from);
+                    if model.is_some() {
+                        error!(
+                            uri = %request_data.uri,
+                            "Request body has a model field but failed typed deserialization — \
+                             likely uses unsupported content types"
+                        );
+                    }
+                    model
+                }
             },
             _ => None,
         };
