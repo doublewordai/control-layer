@@ -3,7 +3,7 @@ use std::{str::FromStr, time::Duration};
 use onwards::{
     auth::ConstantTimeString,
     load_balancer::ProviderPool,
-    target::{LoadBalanceStrategy as OnwardsLoadBalanceStrategy, TargetSpecOrList},
+    target::{LoadBalanceStrategy as OnwardsLoadBalanceStrategy, RoutingAction, TargetSpecOrList},
 };
 use tokio::{sync::mpsc, time::timeout};
 use tokio_util::sync::CancellationToken;
@@ -316,6 +316,41 @@ async fn test_cache_shape_deleted_component_model_is_excluded_from_composite(poo
     assert_eq!(providers[0].target.onwards_model.as_deref(), Some("component-b-model"));
 }
 
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base", "cache_traffic_routing_rules")))]
+async fn test_cache_shape_regular_model_routing_rules(pool: sqlx::PgPool) {
+    let targets = super::load_targets_from_db(&pool, &[], false).await.unwrap();
+    let regular_private = targets.targets.get("regular-private").expect("regular-private should exist");
+    let rules = regular_private.value().routing_rules();
+
+    assert_eq!(rules.len(), 2, "regular-private should expose two routing rules");
+
+    assert_eq!(rules[0].match_labels.get("purpose"), Some(&"batch".to_string()));
+    assert!(matches!(rules[0].action, RoutingAction::Deny));
+
+    assert_eq!(rules[1].match_labels.get("purpose"), Some(&"realtime".to_string()));
+    match &rules[1].action {
+        RoutingAction::Redirect { target } => assert_eq!(target, "regular-public"),
+        _ => panic!("expected redirect rule for realtime"),
+    }
+}
+
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base", "cache_traffic_routing_rules")))]
+async fn test_cache_shape_composite_model_routing_rules(pool: sqlx::PgPool) {
+    let targets = super::load_targets_from_db(&pool, &[], false).await.unwrap();
+    let composite = targets.targets.get("composite-priority").expect("composite-priority should exist");
+    let rules = composite.value().routing_rules();
+
+    assert_eq!(rules.len(), 2, "composite-priority should expose two routing rules");
+
+    assert_eq!(rules[0].match_labels.get("purpose"), Some(&"batch".to_string()));
+    match &rules[0].action {
+        RoutingAction::Redirect { target } => assert_eq!(target, "escalation-private"),
+        _ => panic!("expected redirect rule for batch"),
+    }
+
+    assert_eq!(rules[1].match_labels.get("purpose"), Some(&"realtime".to_string()));
+    assert!(matches!(rules[1].action, RoutingAction::Deny));
+}
 #[sqlx::test(fixtures(path = "fixtures", scripts("cache_base", "cache_component_b_invalid_endpoint")))]
 #[ignore = "Known limitation: invalid component endpoint cannot be isolated because regular target loading panics on invalid endpoint URLs"]
 async fn test_known_issue_composite_invalid_component_endpoint_should_be_skipped(pool: sqlx::PgPool) {
