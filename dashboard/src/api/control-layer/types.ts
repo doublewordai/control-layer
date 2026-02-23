@@ -146,6 +146,7 @@ export interface Model {
   burst_size?: number | null; // Global rate limiting: burst capacity
   capacity?: number | null; // Maximum concurrent requests allowed
   batch_capacity?: number | null; // Maximum concurrent batch requests allowed
+  throughput?: number | null; // Throughput in requests/second for batch SLA capacity calculations
   groups?: Group[]; // array of group IDs - only present when include=groups
   metrics?: ModelMetrics; // only present when include=metrics
   status?: ModelProbeStatus; // only present when include=status
@@ -172,6 +173,7 @@ export interface StandardModelCreate {
   burst_size?: number;
   capacity?: number;
   batch_capacity?: number;
+  throughput?: number;
 }
 
 // Virtual model creation - routes requests across multiple hosted models
@@ -187,6 +189,7 @@ export interface VirtualModelCreate {
   burst_size?: number;
   capacity?: number;
   batch_capacity?: number;
+  throughput?: number;
   lb_strategy?: LoadBalancingStrategy;
   fallback_enabled?: boolean;
   fallback_on_rate_limit?: boolean;
@@ -366,6 +369,7 @@ export interface ModelUpdateRequest {
   burst_size?: number | null;
   capacity?: number | null;
   batch_capacity?: number | null;
+  throughput?: number | null;
   tariffs?: TariffDefinition[];
   // Composite model fields
   lb_strategy?: LoadBalancingStrategy | null;
