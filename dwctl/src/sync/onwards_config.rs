@@ -765,7 +765,9 @@ fn convert_composite_to_target_spec(
                     // For composite models, use the composite model's sanitize_responses setting
                     // This ensures the virtual model's toggle controls all providers
                     sanitize_response: composite.sanitize_responses,
+                    open_responses: None,
                     request_timeout_secs: None,
+                    trusted: None,
                 }
             }
         })
@@ -790,6 +792,7 @@ fn convert_composite_to_target_spec(
         providers,
         response_headers: None,
         sanitize_response: composite.sanitize_responses,
+        open_responses: None,
         trusted: false,
     };
 
@@ -874,6 +877,7 @@ fn convert_to_config_file(targets: Vec<OnwardsTarget>, composites: Vec<OnwardsCo
                 response_headers: None,
                 weight: 1, // Default weight for single-provider targets
                 sanitize_response: target.sanitize_responses,
+                open_responses: None,
                 request_timeout_secs: None,
                 trusted: false,
             };
