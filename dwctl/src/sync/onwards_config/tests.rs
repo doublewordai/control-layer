@@ -20,6 +20,7 @@ fn create_test_target(model_name: &str, alias: &str, endpoint_url: &str) -> Onwa
         capacity: None,
         sanitize_responses: true,
         endpoint_url: url::Url::parse(endpoint_url).unwrap(),
+        routing_rules: Vec::new(),
         endpoint_api_key: None,
         auth_header_name: "Authorization".to_string(),
         auth_header_prefix: "Bearer ".to_string(),
@@ -55,23 +56,25 @@ fn test_convert_to_config_file() {
 
     // Check model1 (using alias as key)
     let target1 = &config.targets["gpt4-alias"];
-    if let TargetSpecOrList::Single(spec) = target1 {
-        assert_eq!(spec.url.as_str(), "https://api.openai.com/");
-        assert_eq!(spec.onwards_model, Some("gpt-4".to_string()));
+    if let TargetSpecOrList::Pool(pool) = target1 {
+        assert_eq!(pool.providers.len(), 1);
+        assert_eq!(pool.providers[0].url.as_str(), "https://api.openai.com/");
+        assert_eq!(pool.providers[0].onwards_model, Some("gpt-4".to_string()));
         // Since we provided empty key data, targets should have no keys configured
-        assert!(spec.keys.is_none() || spec.keys.as_ref().unwrap().is_empty());
+        assert!(pool.keys.is_none() || pool.keys.as_ref().unwrap().is_empty());
     } else {
-        panic!("Expected Single target spec");
+        panic!("Expected Pool target spec");
     }
 
     // Check model2 (using alias as key)
     let target2 = &config.targets["claude-alias"];
-    if let TargetSpecOrList::Single(spec) = target2 {
-        assert_eq!(spec.url.as_str(), "https://api.anthropic.com/");
-        assert_eq!(spec.onwards_model, Some("claude-3".to_string()));
-        assert!(spec.keys.is_none() || spec.keys.as_ref().unwrap().is_empty());
+    if let TargetSpecOrList::Pool(pool) = target2 {
+        assert_eq!(pool.providers.len(), 1);
+        assert_eq!(pool.providers[0].url.as_str(), "https://api.anthropic.com/");
+        assert_eq!(pool.providers[0].onwards_model, Some("claude-3".to_string()));
+        assert!(pool.keys.is_none() || pool.keys.as_ref().unwrap().is_empty());
     } else {
-        panic!("Expected Single target spec");
+        panic!("Expected Pool target spec");
     }
 }
 
@@ -412,6 +415,7 @@ async fn test_onwards_config_reloads_on_tariff_change(pool: sqlx::PgPool) {
             fallback_with_replacement: None,
             fallback_max_attempts: None,
             sanitize_responses: true,
+            allowed_batch_completion_windows: None,
         })
         .await
         .unwrap();
@@ -526,6 +530,7 @@ async fn test_batch_api_key_access_to_composite_escalation_target(pool: sqlx::Pg
             fallback_on_status: None,
             fallback_with_replacement: None,
             fallback_max_attempts: None,
+            allowed_batch_completion_windows: None,
             sanitize_responses: true,
         })
         .await
@@ -557,6 +562,7 @@ async fn test_batch_api_key_access_to_composite_escalation_target(pool: sqlx::Pg
             fallback_on_rate_limit: Some(true),
             fallback_on_status: Some(vec![429, 500, 502, 503, 504]),
             fallback_with_replacement: None,
+            allowed_batch_completion_windows: None,
             fallback_max_attempts: None,
             sanitize_responses: true,
         })

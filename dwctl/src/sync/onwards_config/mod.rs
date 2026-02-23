@@ -897,6 +897,7 @@ fn convert_to_config_file(targets: Vec<OnwardsTarget>, composites: Vec<OnwardsCo
                 sanitize_response: target.sanitize_responses,
                 open_responses: None,
                 request_timeout_secs: None,
+                trusted: None,
             };
 
             // Use PoolSpec so routing_rules are carried through
@@ -908,6 +909,7 @@ fn convert_to_config_file(targets: Vec<OnwardsTarget>, composites: Vec<OnwardsCo
                 strategy: OnwardsLoadBalanceStrategy::default(),
                 providers: vec![provider],
                 response_headers: None,
+                open_responses: None,
                 sanitize_response: target.sanitize_responses,
                 trusted: false,
                 routing_rules: target.routing_rules,
