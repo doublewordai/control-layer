@@ -243,10 +243,43 @@ pub async fn create_batch<P: PoolProvider>(
 
     let model_aliases: Vec<String> = file_model_counts.keys().cloned().collect();
 
+    // Get per-model batch info (throughputs + allowed windows) in one query
+    let batch_model_info = {
+        use crate::db::handlers::deployments::Deployments;
+        let mut conn = state.db.read().acquire().await.map_err(|e| Error::Internal {
+            operation: format!("get db connection: {}", e),
+        })?;
+        Deployments::new(&mut conn)
+            .get_batch_model_info(&model_aliases)
+            .await
+            .map_err(|e| Error::Internal {
+                operation: format!("get batch model info: {}", e),
+            })?
+    };
+
+    // Check per-model batch completion window restrictions
+    for (alias, allowed_windows) in &batch_model_info.allowed_windows {
+        if !allowed_windows.contains(&req.completion_window) {
+            if allowed_windows.is_empty() {
+                return Err(Error::BadRequest {
+                    message: format!("Model '{}' does not support batch processing.", alias),
+                });
+            }
+            return Err(Error::BadRequest {
+                message: format!(
+                    "Model '{}' does not support completion window '{}'. Allowed: {}",
+                    alias,
+                    req.completion_window,
+                    allowed_windows.join(", ")
+                ),
+            });
+        }
+    }
+
     let windows = vec![(req.completion_window.clone(), parse_window_to_seconds(&req.completion_window))];
     let states = vec!["pending".to_string(), "claimed".to_string(), "processing".to_string()];
 
-    let model_throughputs = get_model_throughputs(&state, &model_aliases).await?;
+    let model_throughputs = batch_model_info.throughputs;
     let model_ids_by_alias = get_model_ids_by_aliases(&state, &model_aliases).await?;
 
     // Determine request_source from authentication method
@@ -367,9 +400,7 @@ async fn get_model_ids_by_aliases<P: PoolProvider>(state: &AppState<P>, model_al
 /// Phase 2 — create_batch   (fusillade, ms – seconds depending on batch size)
 ///   └─ single atomic tx: INSERT batches → INSERT requests → UPDATE totals → COMMIT
 ///
-/// Phase 3 — Release   (~1 ms)
 ///   └─ UPDATE reservations SET released_at = now()
-/// ```
 ///
 /// ## Advisory lock scope
 ///
@@ -545,22 +576,6 @@ async fn release_capacity_reservations<P: PoolProvider>(state: &AppState<P>, res
         })
 }
 
-/// Get throughput values for the given model aliases from the database
-async fn get_model_throughputs<P: PoolProvider>(state: &AppState<P>, model_aliases: &[String]) -> Result<HashMap<String, f32>> {
-    use crate::db::handlers::deployments::Deployments;
-
-    let mut conn = state.db.read().acquire().await.map_err(|e| Error::Internal {
-        operation: format!("get db connection: {}", e),
-    })?;
-
-    Deployments::new(&mut conn)
-        .get_throughputs_by_aliases(model_aliases)
-        .await
-        .map_err(|e| Error::Internal {
-            operation: format!("get model throughputs: {}", e),
-        })
-}
-
 #[utoipa::path(
     get,
     path = "/batches/{batch_id}",
@@ -617,7 +632,6 @@ pub async fn get_batch<P: PoolProvider>(
 #[utoipa::path(
     get,
     path = "/batches/{batch_id}/analytics",
-    tag = "batches",
     summary = "Get batch analytics",
     description = "Retrieve aggregated metrics for a batch including token usage, costs, and latency statistics.
 

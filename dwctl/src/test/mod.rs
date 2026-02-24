@@ -425,6 +425,306 @@ async fn test_e2e_ai_proxy_with_mocked_inference(pool: PgPool) {
     bg_services.shutdown().await;
 }
 
+/// End-to-end test: Traffic routing rules are enforced by onwards after sync.
+/// Covers three scenarios: baseline allow, deny by purpose, and redirect by purpose.
+#[sqlx::test]
+#[test_log::test]
+async fn test_e2e_traffic_routing_rules(pool: PgPool) {
+    // Setup wiremock server to mock inference endpoint
+    let mock_server = wiremock::MockServer::start().await;
+
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/v1/chat/completions"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-routing-test",
+            "object": "chat.completion",
+            "created": 1677652288,
+            "model": "gpt-3.5-turbo",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "Routed successfully"
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 5,
+                "completion_tokens": 3,
+                "total_tokens": 8
+            }
+        })))
+        .mount(&mock_server)
+        .await;
+
+    // Create app with onwards sync enabled
+    let mut config = create_test_config();
+    config.background_services.onwards_sync.enabled = true;
+
+    let app = crate::Application::new_with_pool(config, Some(pool.clone()), None)
+        .await
+        .expect("Failed to create application");
+    let (server, bg_services) = app.into_test_server();
+
+    // --- Setup: admin, user, group, endpoint, model ---
+
+    let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
+    let admin_headers = add_auth_headers(&admin_user);
+
+    let regular_user = create_test_user(&pool, Role::StandardUser).await;
+    let regular_headers = add_auth_headers(&regular_user);
+
+    // Create group
+    let group: GroupResponse = server
+        .post("/admin/api/v1/groups")
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .json(&serde_json::json!({
+            "name": "routing-test-group",
+            "description": "Group for traffic routing test"
+        }))
+        .await
+        .json();
+
+    // Add user to group
+    server
+        .post(&format!("/admin/api/v1/groups/{}/users/{}", group.id, regular_user.id))
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .await;
+
+    // Grant credits
+    server
+        .post("/admin/api/v1/transactions")
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .json(&serde_json::json!({
+            "user_id": regular_user.id,
+            "transaction_type": "admin_grant",
+            "amount": 1000,
+            "source_id": admin_user.id,
+            "description": "Credits for routing test"
+        }))
+        .await;
+
+    // Create endpoint
+    let mock_endpoint_url = format!("{}/v1", mock_server.uri());
+    let endpoint: crate::api::models::inference_endpoints::InferenceEndpointResponse = server
+        .post("/admin/api/v1/endpoints")
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .json(&serde_json::json!({
+            "name": "Routing Test Endpoint",
+            "url": mock_endpoint_url,
+        }))
+        .await
+        .json();
+
+    // Create source model (no traffic rules initially)
+    let source_model: crate::api::models::deployments::DeployedModelResponse = server
+        .post("/admin/api/v1/models")
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .json(&serde_json::json!({
+            "type": "standard",
+            "model_name": "traffic-src-model",
+            "alias": "traffic-src",
+            "hosted_on": endpoint.id,
+            "tariffs": [{
+                "name": "default",
+                "input_price_per_token": "0.001",
+                "output_price_per_token": "0.003",
+                "api_key_purpose": "realtime"
+            }]
+        }))
+        .await
+        .json();
+
+    // Add model to group
+    server
+        .post(&format!("/admin/api/v1/groups/{}/models/{}", group.id, source_model.id))
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .await;
+
+    // Create realtime API key
+    let realtime_key: crate::api::models::api_keys::ApiKeyResponse = server
+        .post(&format!("/admin/api/v1/users/{}/api-keys", regular_user.id))
+        .add_header(&regular_headers[0].0, &regular_headers[0].1)
+        .add_header(&regular_headers[1].0, &regular_headers[1].1)
+        .json(&serde_json::json!({
+            "name": "Realtime Key",
+            "purpose": "realtime"
+        }))
+        .await
+        .json();
+
+    // Sync and poll until model available (baseline allow)
+    bg_services.sync_onwards_config(&pool).await.expect("Failed to sync onwards config");
+
+    let chat_body = serde_json::json!({
+        "model": "traffic-src",
+        "messages": [{"role": "user", "content": "test"}]
+    });
+
+    for i in 0..50 {
+        let resp = server
+            .post("/ai/v1/chat/completions")
+            .add_header("authorization", format!("Bearer {}", realtime_key.key))
+            .json(&chat_body)
+            .await;
+        if resp.status_code().as_u16() != 404 {
+            assert_eq!(resp.status_code().as_u16(), 200, "Baseline request should succeed");
+            break;
+        }
+        assert!(i < 49, "Model never became available after polling");
+        tokio::task::yield_now().await;
+    }
+
+    // ===== Scenario 1: Deny batch purpose =====
+
+    // Get batch API key (auto-created as hidden key during user setup)
+    let batch_key_secret: String = sqlx::query_scalar!(
+        "SELECT secret FROM api_keys WHERE user_id = $1 AND purpose = 'batch' AND hidden = true",
+        regular_user.id,
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("Batch hidden key should exist");
+
+    // Add deny rule for batch purpose
+    let patch_resp = server
+        .patch(&format!("/admin/api/v1/models/{}", source_model.id))
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .json(&serde_json::json!({
+            "traffic_routing_rules": [
+                { "api_key_purpose": "batch", "action": { "type": "deny" } }
+            ]
+        }))
+        .await;
+    assert_eq!(patch_resp.status_code(), 200, "Should update model with deny rule");
+
+    // Sync onwards config
+    bg_services.sync_onwards_config(&pool).await.expect("Failed to sync onwards config");
+
+    // Small delay to let the config watcher task finish updating DashMaps
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Poll with batch key until deny rule takes effect
+    let mut deny_status = 0u16;
+    for i in 0..50 {
+        let resp = server
+            .post("/ai/v1/chat/completions")
+            .add_header("authorization", format!("Bearer {}", batch_key_secret))
+            .json(&chat_body)
+            .await;
+        deny_status = resp.status_code().as_u16();
+        if deny_status == 403 {
+            break;
+        }
+        assert!(i < 49, "Deny rule never took effect, last status: {deny_status}");
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(deny_status, 403, "Batch key should be denied");
+
+    // Realtime key should still work (not affected by batch deny rule)
+    let realtime_resp = server
+        .post("/ai/v1/chat/completions")
+        .add_header("authorization", format!("Bearer {}", realtime_key.key))
+        .json(&chat_body)
+        .await;
+    assert_eq!(
+        realtime_resp.status_code().as_u16(),
+        200,
+        "Realtime key should still work despite batch deny rule"
+    );
+
+    // ===== Scenario 2: Redirect playground purpose =====
+
+    // Create redirect target model on same endpoint
+    let target_model: crate::api::models::deployments::DeployedModelResponse = server
+        .post("/admin/api/v1/models")
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .json(&serde_json::json!({
+            "type": "standard",
+            "model_name": "traffic-redirect-target-model",
+            "alias": "traffic-redirect-target",
+            "hosted_on": endpoint.id,
+            "tariffs": [{
+                "name": "default",
+                "input_price_per_token": "0.001",
+                "output_price_per_token": "0.003",
+                "api_key_purpose": "realtime"
+            }]
+        }))
+        .await
+        .json();
+
+    // Add target model to group
+    server
+        .post(&format!("/admin/api/v1/groups/{}/models/{}", group.id, target_model.id))
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .await;
+
+    // Get playground API key (auto-created as hidden key during user setup)
+    let playground_key_secret: String = sqlx::query_scalar!(
+        "SELECT secret FROM api_keys WHERE user_id = $1 AND purpose = 'playground' AND hidden = true",
+        regular_user.id,
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("Playground hidden key should exist");
+
+    // Add redirect rule on source model (keep existing deny rule, add playground redirect)
+    let patch_resp = server
+        .patch(&format!("/admin/api/v1/models/{}", source_model.id))
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .json(&serde_json::json!({
+            "traffic_routing_rules": [
+                { "api_key_purpose": "batch", "action": { "type": "deny" } },
+                { "api_key_purpose": "playground", "action": { "type": "redirect", "target": "traffic-redirect-target" } }
+            ]
+        }))
+        .await;
+    assert_eq!(patch_resp.status_code(), 200, "Should update model with redirect rule");
+
+    // Sync onwards config
+    bg_services.sync_onwards_config(&pool).await.expect("Failed to sync onwards config");
+
+    // Small delay to let the config watcher task finish updating DashMaps
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Poll with playground key: request targets "traffic-src" but should be transparently
+    // redirected to "traffic-redirect-target" and succeed (same mock endpoint responds)
+    for i in 0..50 {
+        let resp = server
+            .post("/ai/v1/chat/completions")
+            .add_header("authorization", format!("Bearer {}", playground_key_secret))
+            .json(&chat_body)
+            .await;
+        let status = resp.status_code().as_u16();
+        if status == 200 {
+            break; // Redirect worked, mock server responded
+        }
+        assert!(i < 49, "Redirect never took effect, last status: {status}");
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    // Cleanup
+    let delete_resp = server
+        .delete(&format!("/admin/api/v1/groups/{}", group.id))
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .await;
+    assert_eq!(delete_resp.status_code(), 204, "Should delete test group");
+
+    bg_services.shutdown().await;
+}
+
 #[sqlx::test]
 #[test_log::test]
 async fn test_database_seeding_behavior(pool: PgPool) {

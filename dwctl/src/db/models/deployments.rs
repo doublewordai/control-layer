@@ -12,6 +12,7 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use serde_with::rust::double_option;
 use utoipa::ToSchema;
+use uuid::Uuid;
 
 // Mode constants for provider pricing
 const MODE_PER_TOKEN: &str = "per_token";
@@ -360,6 +361,8 @@ pub struct DeploymentComponentDBResponse {
     // Joined endpoint fields
     pub endpoint_id: Option<InferenceEndpointId>,
     pub endpoint_name: Option<String>,
+    pub model_trusted: bool,
+    pub model_open_responses_adapter: bool,
 }
 
 /// Database request for creating a new deployment
@@ -392,9 +395,17 @@ pub struct DeploymentCreateDBRequest {
     pub fallback_on_status: Option<Vec<i32>>,
     pub fallback_with_replacement: Option<bool>,
     pub fallback_max_attempts: Option<i32>,
-    /// Whether to sanitize/filter sensitive data from model responses (defaults to true)
-    #[builder(default = true)]
+    /// Whether to sanitize/filter sensitive data from model responses (defaults to false)
+    #[builder(default = false)]
     pub sanitize_responses: bool,
+    /// Whether to mark provider as trusted in strict mode (bypasses sanitization)
+    #[builder(default = false)]
+    pub trusted: bool,
+    /// Whether to enable the open_responses adapter (converts /v1/responses to /v1/chat/completions)
+    #[builder(default = true)]
+    pub open_responses_adapter: bool,
+    /// Per-model allowed batch completion windows (overrides global config when set)
+    pub allowed_batch_completion_windows: Option<Vec<String>>,
 }
 
 impl DeploymentCreateDBRequest {
@@ -416,6 +427,10 @@ impl DeploymentCreateDBRequest {
                 .maybe_throughput(standard.throughput)
                 .maybe_provider_pricing(standard.provider_pricing)
                 .is_composite(false)
+                .sanitize_responses(standard.sanitize_responses.unwrap_or(false))
+                .trusted(standard.trusted.unwrap_or(false))
+                .open_responses_adapter(standard.open_responses_adapter.unwrap_or(true))
+                .maybe_allowed_batch_completion_windows(standard.allowed_batch_completion_windows)
                 .build(),
             DeployedModelCreate::Composite(composite) => Self::builder()
                 .created_by(created_by)
@@ -437,6 +452,9 @@ impl DeploymentCreateDBRequest {
                 .fallback_with_replacement(composite.fallback_with_replacement)
                 .maybe_fallback_max_attempts(composite.fallback_max_attempts)
                 .sanitize_responses(composite.sanitize_responses)
+                .trusted(composite.trusted.unwrap_or(false))
+                .open_responses_adapter(composite.open_responses_adapter.unwrap_or(true))
+                .maybe_allowed_batch_completion_windows(composite.allowed_batch_completion_windows)
                 .build(),
         }
     }
@@ -469,6 +487,12 @@ pub struct DeploymentUpdateDBRequest {
     pub fallback_max_attempts: Option<Option<i32>>,
     /// Whether to sanitize/filter sensitive data from model responses
     pub sanitize_responses: Option<bool>,
+    /// Whether to mark provider as trusted in strict mode (bypasses sanitization)
+    pub trusted: Option<bool>,
+    /// Whether to enable the open_responses adapter (converts /v1/responses to /v1/chat/completions)
+    pub open_responses_adapter: Option<bool>,
+    /// Per-model allowed batch completion windows (None = no change, Some(None) = clear, Some(windows) = set)
+    pub allowed_batch_completion_windows: Option<Option<Vec<String>>>,
 }
 
 impl From<DeployedModelUpdate> for DeploymentUpdateDBRequest {
@@ -491,6 +515,9 @@ impl From<DeployedModelUpdate> for DeploymentUpdateDBRequest {
             .maybe_fallback_with_replacement(update.fallback_with_replacement)
             .maybe_fallback_max_attempts(update.fallback_max_attempts)
             .maybe_sanitize_responses(update.sanitize_responses)
+            .maybe_trusted(update.trusted)
+            .maybe_open_responses_adapter(update.open_responses_adapter)
+            .maybe_allowed_batch_completion_windows(update.allowed_batch_completion_windows)
             .build()
     }
 }
@@ -551,4 +578,30 @@ pub struct DeploymentDBResponse {
     pub fallback_max_attempts: Option<i32>,
     /// Whether to sanitize/filter sensitive data from model responses
     pub sanitize_responses: bool,
+    /// Whether to mark provider as trusted in strict mode (bypasses sanitization)
+    pub trusted: bool,
+    /// Whether the open_responses adapter is enabled (converts /v1/responses to /v1/chat/completions)
+    pub open_responses_adapter: bool,
+    /// Per-model allowed batch completion windows (overrides global config when set)
+    pub allowed_batch_completion_windows: Option<Vec<String>>,
+}
+
+/// DB action for a traffic routing rule (used at the repository layer)
+#[derive(Debug, Clone)]
+pub enum TrafficRuleAction {
+    Deny,
+    Redirect(DeploymentId),
+}
+
+/// Row returned from model_traffic_rules table (with joined redirect target alias)
+#[derive(Debug, Clone)]
+pub struct TrafficRuleDBRow {
+    pub id: Uuid,
+    pub deployed_model_id: DeploymentId,
+    pub api_key_purpose: String,
+    pub action: String,
+    pub redirect_target_id: Option<DeploymentId>,
+    /// Populated via LEFT JOIN on deployed_models
+    pub redirect_target_alias: Option<String>,
+    pub created_at: DateTime<Utc>,
 }
