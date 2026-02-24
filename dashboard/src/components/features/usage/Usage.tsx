@@ -98,13 +98,17 @@ function DonutChart({ data, size = 190, thickness = 24, centerLabel }: { data: D
     const angle = total > 0 ? (d.value / total) * 360 : 0;
     const s = cum;
     cum += angle;
+    const fullCircle = angle >= 359.99;
     const sRad = (s * Math.PI) / 180;
     const eRad = (cum * Math.PI) / 180;
     const large = angle > 180 ? 1 : 0;
     const gap = data.length > 1 ? 0.015 : 0;
     const sG = sRad + gap, eG = eRad - gap;
     return {
-      path: `M ${cx + r * Math.cos(sG)} ${cy + r * Math.sin(sG)} A ${r} ${r} 0 ${large} 1 ${cx + r * Math.cos(eG)} ${cy + r * Math.sin(eG)}`,
+      fullCircle,
+      path: fullCircle
+        ? ""
+        : `M ${cx + r * Math.cos(sG)} ${cy + r * Math.sin(sG)} A ${r} ${r} 0 ${large} 1 ${cx + r * Math.cos(eG)} ${cy + r * Math.sin(eG)}`,
       color: PALETTE[i % PALETTE.length],
       ...d,
     };
@@ -116,7 +120,21 @@ function DonutChart({ data, size = 190, thickness = 24, centerLabel }: { data: D
       <div style={{ position: "relative", width: size, height: size }}>
         <svg width={size} height={size} style={{ overflow: "visible" }}>
           {arcs.map((arc, i) => (
-              <path
+              arc.fullCircle ? (
+                <circle
+                  key={i} cx={cx} cy={cy} r={r} fill="none"
+                  stroke={arc.color}
+                  strokeWidth={hovered === i ? thickness + 5 : thickness}
+                  style={{
+                    transition: "stroke-width 0.2s, opacity 0.2s",
+                    opacity: hovered !== null && hovered !== i ? 0.3 : 1,
+                    cursor: "pointer",
+                  }}
+                  onMouseEnter={() => setHovered(i)}
+                  onMouseLeave={() => setHovered(null)}
+                />
+              ) : (
+                <path
                   key={i} d={arc.path} fill="none"
                   stroke={arc.color}
                   strokeWidth={hovered === i ? thickness + 5 : thickness}
@@ -128,7 +146,8 @@ function DonutChart({ data, size = 190, thickness = 24, centerLabel }: { data: D
                   }}
                   onMouseEnter={() => setHovered(i)}
                   onMouseLeave={() => setHovered(null)}
-              />
+                />
+              )
           ))}
         </svg>
         <div style={{
@@ -412,26 +431,17 @@ export function Usage() {
 
             {/* Left: donuts stacked */}
             <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
-              <div style={{ ...card, padding: "20px 24px", display: "flex", flexDirection: "column", alignItems: "center" }}>
+              <div style={{ ...card, padding: "20px 24px", display: "flex", flexDirection: "column", alignItems: "center", flex: 1, justifyContent: "center" }}>
                 <div style={{ fontSize: 13, fontWeight: 600, color: "#475569", marginBottom: 12, alignSelf: "flex-start" }}>
                   Cost by Model
                 </div>
                 <DonutChart data={costPieData} size={180} thickness={22} centerLabel="Total" />
               </div>
-              <div style={{ ...card, padding: "20px 24px", display: "flex", flexDirection: "column", alignItems: "center" }}>
+              <div style={{ ...card, padding: "20px 24px", display: "flex", flexDirection: "column", alignItems: "center", flex: 1, justifyContent: "center" }}>
                 <div style={{ fontSize: 13, fontWeight: 600, color: "#475569", marginBottom: 12, alignSelf: "flex-start" }}>
                   Requests by Model
                 </div>
                 <DonutChart data={requestPieData} size={180} thickness={22} centerLabel="Total" />
-              </div>
-              {/* Legend */}
-              <div style={{ display: "flex", flexWrap: "wrap", gap: "6px 16px", padding: "0 4px" }}>
-                {chartData.map((d, i) => (
-                    <div key={d.model} style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                      <div style={{ width: 8, height: 8, borderRadius: 2, background: PALETTE[i % PALETTE.length], flexShrink: 0 }} />
-                      <span style={{ fontSize: 12, color: "#64748b" }}>{d.model}</span>
-                    </div>
-                ))}
               </div>
             </div>
 
