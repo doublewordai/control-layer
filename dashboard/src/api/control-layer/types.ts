@@ -67,6 +67,15 @@ export type Role =
 export type ApiKeyPurpose = "platform" | "realtime" | "batch" | "playground";
 export type TariffApiKeyPurpose = "realtime" | "batch" | "playground";
 
+export type TrafficRoutingAction =
+  | { type: "deny" }
+  | { type: "redirect"; target: string };
+
+export interface TrafficRoutingRule {
+  api_key_purpose: ApiKeyPurpose;
+  action: TrafficRoutingAction;
+}
+
 // Batch completion window types
 export type BatchCompletionWindow = "24h" | "1h";
 
@@ -168,6 +177,8 @@ export interface Model {
   sanitize_responses?: boolean | null; // only present for virtual models
   trusted?: boolean; // Mark provider as trusted in strict mode (bypasses error sanitization)
   open_responses_adapter?: boolean; // Enable adapter that converts /v1/responses to /v1/chat/completions
+  traffic_routing_rules?: TrafficRoutingRule[] | null;
+  allowed_batch_completion_windows?: string[] | null;
 }
 
 // Model creation types - discriminated union with "type" field
@@ -186,6 +197,8 @@ export interface StandardModelCreate {
   throughput?: number;
   trusted?: boolean;
   open_responses_adapter?: boolean;
+  traffic_routing_rules?: TrafficRoutingRule[];
+  allowed_batch_completion_windows?: string[];
 }
 
 // Virtual model creation - routes requests across multiple hosted models
@@ -209,6 +222,8 @@ export interface VirtualModelCreate {
   fallback_with_replacement?: boolean;
   fallback_max_attempts?: number | null;
   sanitize_responses?: boolean;
+  traffic_routing_rules?: TrafficRoutingRule[];
+  allowed_batch_completion_windows?: string[];
 }
 
 // Backwards compatibility alias
@@ -393,6 +408,8 @@ export interface ModelUpdateRequest {
   sanitize_responses?: boolean | null;
   trusted?: boolean | null;
   open_responses_adapter?: boolean | null;
+  traffic_routing_rules?: TrafficRoutingRule[] | null;
+  allowed_batch_completion_windows?: string[] | null;
 }
 
 // Endpoint-specific types
