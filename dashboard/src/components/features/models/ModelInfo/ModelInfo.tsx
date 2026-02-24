@@ -139,7 +139,7 @@ const ModelInfo: React.FC = () => {
     capacity: null as number | null,
     batch_capacity: null as number | null,
     throughput: null as number | null,
-    allowed_batch_completion_windows: [] as string[],
+    allowed_batch_completion_windows: null as string[] | null,
     traffic_routing_rules: [] as TrafficRoutingRule[],
   });
   const [settingsError, setSettingsError] = useState<string | null>(null);
@@ -242,7 +242,7 @@ const ModelInfo: React.FC = () => {
         batch_capacity: model.batch_capacity || null,
         throughput: model.throughput || null,
         allowed_batch_completion_windows:
-          model.allowed_batch_completion_windows || [],
+          model.allowed_batch_completion_windows ?? null,
         traffic_routing_rules: model.traffic_routing_rules || [],
       });
       aliasForm.reset({
@@ -336,7 +336,7 @@ const ModelInfo: React.FC = () => {
         batch_capacity: model.batch_capacity || null,
         throughput: model.throughput || null,
         allowed_batch_completion_windows:
-          model.allowed_batch_completion_windows || [],
+          model.allowed_batch_completion_windows ?? null,
         traffic_routing_rules: model.traffic_routing_rules || [],
       });
     }
@@ -920,14 +920,10 @@ const ModelInfo: React.FC = () => {
                         </div>
                         <div className="space-y-2">
                           {availableCompletionWindows.map((window) => {
-                            const usingDefaults =
-                              updateData.allowed_batch_completion_windows
-                                .length === 0;
+                            const current =
+                              updateData.allowed_batch_completion_windows;
                             const isChecked =
-                              usingDefaults ||
-                              updateData.allowed_batch_completion_windows.includes(
-                                window,
-                              );
+                              current === null || current.includes(window);
                             return (
                               <label
                                 key={window}
@@ -937,17 +933,16 @@ const ModelInfo: React.FC = () => {
                                   checked={isChecked}
                                   onCheckedChange={(checked) =>
                                     setUpdateData((prev) => {
-                                      const wasUsingDefaults =
-                                        prev.allowed_batch_completion_windows
-                                          .length === 0;
+                                      const current =
+                                        prev.allowed_batch_completion_windows;
                                       let next: string[];
                                       if (checked) {
-                                        // Re-checking: add back
-                                        next = [
-                                          ...prev.allowed_batch_completion_windows,
-                                          window,
-                                        ];
-                                      } else if (wasUsingDefaults) {
+                                        if (current === null) return prev;
+                                        // Re-checking: add back (guard against duplicates)
+                                        next = current.includes(window)
+                                          ? current
+                                          : [...current, window];
+                                      } else if (current === null) {
                                         // First uncheck from defaults: populate with all except this one
                                         next =
                                           availableCompletionWindows.filter(
@@ -955,12 +950,11 @@ const ModelInfo: React.FC = () => {
                                           );
                                       } else {
                                         // Already restricted: remove this one
-                                        next =
-                                          prev.allowed_batch_completion_windows.filter(
-                                            (w) => w !== window,
-                                          );
+                                        next = current.filter(
+                                          (w) => w !== window,
+                                        );
                                       }
-                                      // If all are checked again, clear back to defaults
+                                      // If all are checked again, clear back to defaults (null)
                                       const allChecked =
                                         availableCompletionWindows.every((w) =>
                                           next.includes(w),
@@ -968,7 +962,7 @@ const ModelInfo: React.FC = () => {
                                       return {
                                         ...prev,
                                         allowed_batch_completion_windows:
-                                          allChecked ? [] : next,
+                                          allChecked ? null : next,
                                       };
                                     })
                                   }
@@ -980,8 +974,10 @@ const ModelInfo: React.FC = () => {
                             );
                           })}
                         </div>
-                        {updateData.allowed_batch_completion_windows.length >
-                          0 && (
+                        {updateData.allowed_batch_completion_windows !==
+                          null &&
+                          updateData.allowed_batch_completion_windows.length >=
+                            0 && (
                           <Button
                             type="button"
                             variant="outline"
@@ -990,7 +986,7 @@ const ModelInfo: React.FC = () => {
                             onClick={() =>
                               setUpdateData((prev) => ({
                                 ...prev,
-                                allowed_batch_completion_windows: [],
+                                allowed_batch_completion_windows: null,
                               }))
                             }
                           >
@@ -1048,7 +1044,14 @@ const ModelInfo: React.FC = () => {
                                     <SelectValue />
                                   </SelectTrigger>
                                   <SelectContent>
-                                    {TRAFFIC_PURPOSE_OPTIONS.map((purpose) => (
+                                    {TRAFFIC_PURPOSE_OPTIONS.filter(
+                                      (purpose) =>
+                                        purpose === rule.api_key_purpose ||
+                                        !updateData.traffic_routing_rules.some(
+                                          (r) =>
+                                            r.api_key_purpose === purpose,
+                                        ),
+                                    ).map((purpose) => (
                                       <SelectItem key={purpose} value={purpose}>
                                         {purpose}
                                       </SelectItem>
@@ -1148,26 +1151,41 @@ const ModelInfo: React.FC = () => {
                             </div>
                           ))}
                         </div>
-                        <Button
-                          type="button"
-                          variant="outline"
-                          size="sm"
-                          className="mt-3"
-                          onClick={() =>
-                            setUpdateData((prev) => ({
-                              ...prev,
-                              traffic_routing_rules: [
-                                ...prev.traffic_routing_rules,
-                                {
-                                  api_key_purpose: "realtime",
-                                  action: { type: "deny" },
-                                },
-                              ],
-                            }))
-                          }
-                        >
-                          Add Rule
-                        </Button>
+                        {(() => {
+                          const usedPurposes = new Set(
+                            updateData.traffic_routing_rules.map(
+                              (r) => r.api_key_purpose,
+                            ),
+                          );
+                          const nextPurpose =
+                            TRAFFIC_PURPOSE_OPTIONS.find(
+                              (p) => !usedPurposes.has(p),
+                            );
+                          return (
+                            <Button
+                              type="button"
+                              variant="outline"
+                              size="sm"
+                              className="mt-3"
+                              disabled={!nextPurpose}
+                              onClick={() => {
+                                if (!nextPurpose) return;
+                                setUpdateData((prev) => ({
+                                  ...prev,
+                                  traffic_routing_rules: [
+                                    ...prev.traffic_routing_rules,
+                                    {
+                                      api_key_purpose: nextPurpose,
+                                      action: { type: "deny" },
+                                    },
+                                  ],
+                                }));
+                              }}
+                            >
+                              Add Rule
+                            </Button>
+                          );
+                        })()}
                       </div>
 
                       {/* Rate Limiting Section */}
