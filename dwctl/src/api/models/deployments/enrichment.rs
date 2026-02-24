@@ -807,6 +807,42 @@ mod tests {
     }
 
     #[test]
+    fn test_filter_disabled_batch_tariffs_generic_fallback_kept() {
+        let mut model = create_test_model();
+        model.allowed_batch_completion_windows = Some(vec!["24h".to_string()]);
+        model.tariffs = Some(vec![
+            create_test_tariff(Some(ApiKeyPurpose::Batch), Some("24h")),
+            create_test_tariff(Some(ApiKeyPurpose::Batch), None), // generic fallback
+            create_test_tariff(Some(ApiKeyPurpose::Batch), Some("1h")),
+        ]);
+
+        let result = model.filter_disabled_batch_tariffs();
+
+        // Generic batch tariff (no window) kept as billing fallback, 1h filtered out
+        let tariffs = result.tariffs.unwrap();
+        assert_eq!(tariffs.len(), 2);
+        assert_eq!(tariffs[0].completion_window.as_deref(), Some("24h"));
+        assert_eq!(tariffs[1].completion_window, None);
+    }
+
+    #[test]
+    fn test_filter_disabled_batch_tariffs_generic_fallback_removed_when_empty() {
+        let mut model = create_test_model();
+        model.allowed_batch_completion_windows = Some(vec![]);
+        model.tariffs = Some(vec![
+            create_test_tariff(Some(ApiKeyPurpose::Batch), None), // generic fallback
+            create_test_tariff(Some(ApiKeyPurpose::Realtime), None),
+        ]);
+
+        let result = model.filter_disabled_batch_tariffs();
+
+        // Empty allowed = no batch at all, generic fallback removed too
+        let tariffs = result.tariffs.unwrap();
+        assert_eq!(tariffs.len(), 1);
+        assert_eq!(tariffs[0].api_key_purpose, Some(ApiKeyPurpose::Realtime));
+    }
+
+    #[test]
     fn test_filter_disabled_batch_tariffs_realtime_unaffected() {
         let mut model = create_test_model();
         model.allowed_batch_completion_windows = Some(vec!["24h".to_string()]);

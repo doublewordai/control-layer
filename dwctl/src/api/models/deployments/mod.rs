@@ -533,19 +533,18 @@ impl DeployedModelResponse {
     }
 
     /// Filter out batch tariffs for completion windows that aren't in allowed_batch_completion_windows.
-    /// When allowed_batch_completion_windows is None, all tariffs pass through (global defaults apply).
-    /// When it is Some (even if empty), only batch tariffs whose completion_window is in the list are kept.
-    /// An empty list means no batch windows are allowed, so all batch tariffs are removed.
+    /// - `None` → all tariffs pass through (global defaults apply).
+    /// - `Some([])` → no batch windows allowed, all batch tariffs removed.
+    /// - `Some(["24h", ...])` → keep batch tariffs whose window is in the list, plus generic
+    ///   batch tariffs (no window) since they serve as billing fallbacks for allowed windows.
     pub fn filter_disabled_batch_tariffs(mut self) -> Self {
         if let Some(ref allowed) = self.allowed_batch_completion_windows
             && let Some(ref mut tariffs) = self.tariffs
         {
-            tariffs.retain(|t| {
-                match (&t.api_key_purpose, &t.completion_window) {
-                    (Some(ApiKeyPurpose::Batch), Some(window)) => allowed.contains(window),
-                    (Some(ApiKeyPurpose::Batch), None) => false, // Batch tariff without window removed when model restricts windows
-                    _ => true,                                   // Non-batch tariffs always pass through
-                }
+            tariffs.retain(|t| match (&t.api_key_purpose, &t.completion_window) {
+                (Some(ApiKeyPurpose::Batch), Some(window)) => allowed.contains(window),
+                (Some(ApiKeyPurpose::Batch), None) => !allowed.is_empty(), // Generic fallback kept when batch is allowed
+                _ => true,                                                 // Non-batch tariffs always pass through
             });
         }
         self
