@@ -270,10 +270,7 @@ where
             let start = std::time::Instant::now();
 
             // Collect trace IDs for log correlation with Loki/Tempo
-            let trace_ids: Vec<&str> = buffer
-                .iter()
-                .filter_map(|r| r.trace_id.as_deref())
-                .collect();
+            let trace_ids: Vec<&str> = buffer.iter().filter_map(|r| r.trace_id.as_deref()).collect();
 
             // Phase 1: Batch enrich (no retry - enrichment failures are usually data issues)
             let enriched = match self.enrich_batch(buffer).await {
@@ -292,7 +289,12 @@ where
                 match self.write_batch_transactional(&enriched).await {
                     Ok(()) => {
                         if attempt > 0 {
-                            debug!(attempt = attempt, batch_size = batch_size, ?trace_ids, "Batch write succeeded after retry");
+                            debug!(
+                                attempt = attempt,
+                                batch_size = batch_size,
+                                ?trace_ids,
+                                "Batch write succeeded after retry"
+                            );
                             counter!("dwctl_analytics_batch_retries_total", "outcome" => "success").increment(1);
                         }
                         last_error = None;

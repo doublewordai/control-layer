@@ -275,10 +275,7 @@ impl UsageMetrics {
                 AiRequest::Completions(req) => Some(req.model),
                 AiRequest::Embeddings(req) => Some(req.model),
                 AiRequest::Other(ref value) => {
-                    let model = value
-                        .get("model")
-                        .and_then(|v| v.as_str())
-                        .map(String::from);
+                    let model = value.get("model").and_then(|v| v.as_str()).map(String::from);
                     if model.is_some() {
                         error!(
                             uri = %request_data.uri,
