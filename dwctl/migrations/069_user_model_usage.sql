@@ -20,18 +20,6 @@ CREATE TABLE user_model_usage_cursor (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Backfill from existing data
-INSERT INTO user_model_usage (user_id, model, input_tokens, output_tokens, cost, request_count)
-SELECT user_id,
-       model,
-       COALESCE(SUM(prompt_tokens), 0),
-       COALESCE(SUM(completion_tokens), 0),
-       COALESCE(SUM(total_cost), 0),
-       COUNT(*)
-FROM http_analytics
-WHERE user_id IS NOT NULL AND model IS NOT NULL AND fusillade_batch_id IS NOT NULL
-GROUP BY user_id, model;
-
--- Set cursor to current max id
-INSERT INTO user_model_usage_cursor (last_processed_id)
-VALUES (COALESCE((SELECT MAX(id) FROM http_analytics), 0));
+-- Seed cursor so incremental refresh works immediately.
+-- The first all-time usage request will backfill from id 0.
+INSERT INTO user_model_usage_cursor (last_processed_id) VALUES (0);
