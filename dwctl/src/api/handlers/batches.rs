@@ -338,7 +338,7 @@ pub async fn create_batch<P: PoolProvider>(
         operation: format!("create batch: {}", e),
     })?;
 
-    tracing::info!("Batch {} created successfully", batch.id);
+    tracing::debug!("Batch {} created successfully", batch.id);
 
     // For create, we have the current user's email directly
     Ok((
@@ -918,7 +918,7 @@ pub async fn cancel_batch<P: PoolProvider>(
             id: batch_id_str.clone(),
         })?;
 
-    tracing::info!("Batch {} cancelled", batch_id);
+    tracing::debug!("Batch {} cancelled", batch_id);
 
     // Fetch creator email for the response
     let creator_email = fetch_creator_email(state.db.read(), &batch).await;
@@ -984,7 +984,7 @@ pub async fn delete_batch<P: PoolProvider>(
             operation: format!("delete batch: {}", e),
         })?;
 
-    tracing::info!("Batch {} deleted", batch_id);
+    tracing::debug!("Batch {} deleted", batch_id);
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1054,7 +1054,7 @@ pub async fn retry_failed_batch_requests<P: PoolProvider>(
         });
     }
 
-    tracing::info!(
+    tracing::debug!(
         batch_id = %batch_id,
         retried_count,
         "Retried failed requests"
@@ -1140,7 +1140,7 @@ pub async fn retry_specific_requests<P: PoolProvider>(
         });
     }
 
-    tracing::info!(
+    tracing::debug!(
         batch_id = %batch_id,
         request_count = request_ids.len(),
         "Retrying specific requests"
@@ -1171,7 +1171,7 @@ pub async fn retry_specific_requests<P: PoolProvider>(
     }
 
     let successful_retries = results.iter().filter(|r| r.is_ok()).count();
-    tracing::info!(
+    tracing::debug!(
         batch_id = %batch_id,
         retried_count = successful_retries,
         "Successfully retried specific requests"

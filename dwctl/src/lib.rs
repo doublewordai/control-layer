@@ -1368,6 +1368,7 @@ pub async fn build_router(
                 span.set_attribute("url.query", request.uri().query().unwrap_or("").to_string());
                 span
             })
+            .on_request(tower_http::trace::DefaultOnRequest::new().level(tracing::Level::TRACE))
             .on_response(|response: &http::Response<_>, latency: std::time::Duration, span: &tracing::Span| {
                 let status = response.status().as_u16();
                 span.set_attribute("http.response.status_code", i64::from(status));

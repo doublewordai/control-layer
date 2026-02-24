@@ -215,17 +215,17 @@ impl OnwardsConfigSync {
 
                     // Handle database notifications
                     notification_result = listener.try_recv() => {
-                        info!("Received notification from database");
+                        debug!("Received notification from database");
                         match notification_result {
                             Ok(None) => {
                                 info!("Connection lost, attempting to reconnect");
                                 if let Some(tx) = &config.status_tx {
-                                    info!("Sending Disconnected status");
+                                    debug!("Sending Disconnected status");
                                     tx.send(SyncStatus::Disconnected).await?;
                                 }
                                 // Try to reconnect for other errors
                                 if let Some(tx) = &config.status_tx {
-                                    info!("Sending Reconnecting status");
+                                    debug!("Sending Reconnecting status");
                                     tx.send(SyncStatus::Reconnecting).await?;
                                 }
                                 break;
@@ -249,7 +249,7 @@ impl OnwardsConfigSync {
                                 last_reload_time = std::time::Instant::now();
                                 match load_targets_from_db(&self.db, &self.escalation_models, self.strict_mode).await {
                                     Ok(new_targets) => {
-                                        info!("Loaded {} targets from database", new_targets.targets.len());
+                                        debug!("Loaded {} targets from database", new_targets.targets.len());
                                         for entry in new_targets.targets.iter() {
                                             let alias = entry.key();
                                             debug!("Target '{}' loaded", alias);
@@ -336,7 +336,7 @@ impl OnwardsConfigSync {
                         last_reload_time = std::time::Instant::now();
                         match load_targets_from_db(&self.db, &self.escalation_models, self.strict_mode).await {
                             Ok(new_targets) => {
-                                info!("Fallback sync: loaded {} targets from database", new_targets.targets.len());
+                                debug!("Fallback sync: loaded {} targets from database", new_targets.targets.len());
 
                                 // Update daemon capacity limits if configured
                                 if let Some(ref limits) = self.daemon_capacity_limits
@@ -358,7 +358,7 @@ impl OnwardsConfigSync {
 
                                 // Record metric for fallback sync
                                 metrics::counter!("dwctl_cache_sync_total", "source" => "fallback").increment(1);
-                                info!("Fallback sync: updated onwards configuration successfully");
+                                debug!("Fallback sync: updated onwards configuration successfully");
                             }
                             Err(e) => {
                                 error!("Fallback sync: failed to load targets from database: {}", e);
@@ -641,7 +641,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
     }
 
     let composites: Vec<_> = composite_map.into_values().collect();
-    info!(
+    debug!(
         "Loaded {} composite models with {} total components",
         composites.len(),
         composites.iter().map(|c| c.components.len()).sum::<usize>()
@@ -1083,7 +1083,7 @@ pub async fn load_targets_from_db(db: &PgPool, escalation_models: &[String], str
     .await?;
 
     let query_duration = query_start.elapsed();
-    info!(
+    debug!(
         "Regular (non-composite) deployed models query completed in {:?}, fetched {} rows",
         query_duration,
         rows.len()
@@ -1123,7 +1123,7 @@ pub async fn load_targets_from_db(db: &PgPool, escalation_models: &[String], str
         }
     }
 
-    info!("Loaded {} deployed models", targets_map.len());
+    debug!("Loaded {} deployed models", targets_map.len());
 
     // Load composite models (pass escalation_models to grant batch API keys access)
     let composites = load_composite_models_from_db(db, escalation_models).await?;
@@ -1216,7 +1216,7 @@ async fn update_daemon_capacity_limits(db: &PgPool, limits: &Arc<dashmap::DashMa
     // Remove limits for models that no longer have batch_capacity or were deleted
     limits.retain(|model_alias, _| models_with_limits.contains(model_alias));
 
-    info!("Updated {} model capacity limits for daemon", limits.len());
+    debug!("Updated {} model capacity limits for daemon", limits.len());
     Ok(())
 }
 

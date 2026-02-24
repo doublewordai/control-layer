@@ -115,7 +115,7 @@ impl PaymentProvider for StripeProvider {
             PaymentError::ProviderApi(e.to_string())
         })?;
 
-        tracing::info!(
+        tracing::debug!(
             "Created checkout session {} for user {} (payer: {})",
             checkout_session.id,
             creditee_id.unwrap_or(&user.id.to_string()),
@@ -246,7 +246,7 @@ impl PaymentProvider for StripeProvider {
                     .set_payment_provider_id_if_empty(payment_session.creditor_id, provider_id)
                     .await?
             {
-                tracing::info!(
+                tracing::debug!(
                     "Saved newly created stripe ID {} for user ID {}",
                     provider_id,
                     payment_session.creditor_id
@@ -269,7 +269,7 @@ impl PaymentProvider for StripeProvider {
         let mut credits = Credits::new(&mut conn);
         credits.create_transaction(&request).await?;
 
-        tracing::info!(
+        tracing::debug!(
             "Successfully fulfilled checkout session {} for user {}",
             session_id,
             payment_session.creditee_id
