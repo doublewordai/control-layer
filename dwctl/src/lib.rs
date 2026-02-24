@@ -1098,6 +1098,7 @@ pub async fn build_router(
         .route("/requests", get(api::handlers::requests::list_requests))
         .route("/requests/aggregate", get(api::handlers::requests::aggregate_requests))
         .route("/requests/aggregate-by-user", get(api::handlers::requests::aggregate_by_user))
+        .route("/usage", get(api::handlers::requests::get_usage))
         // Probes management
         .route("/probes", get(api::handlers::probes::list_probes))
         .route("/probes", post(api::handlers::probes::create_probe))

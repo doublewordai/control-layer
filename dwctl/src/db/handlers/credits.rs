@@ -751,7 +751,7 @@ impl<'c> Credits<'c> {
     /// This aggregates new transactions into batch_aggregates and marks them as aggregated.
     /// Uses a single atomic UPDATE + aggregate approach to handle concurrent reads safely.
     #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
-    async fn aggregate_user_batches(&mut self, user_id: UserId) -> Result<()> {
+    pub async fn aggregate_user_batches(&mut self, user_id: UserId) -> Result<()> {
         // Atomically mark transactions as aggregated and aggregate them in one query
         // This uses UPDATE ... RETURNING with aggregation via CTE to avoid race conditions
         let result = sqlx::query!(

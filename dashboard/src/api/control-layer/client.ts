@@ -66,6 +66,7 @@ import type {
   WebhookWithSecret,
   WebhookCreateRequest,
   WebhookUpdateRequest,
+  UserBatchUsageResponse,
 } from "./types";
 import { ApiError } from "./errors";
 
@@ -1583,6 +1584,26 @@ const monitoringApi = {
   },
 };
 
+const usageApi = {
+  async get(options?: {
+    startDate?: string;
+    endDate?: string;
+    refresh?: boolean;
+  }): Promise<UserBatchUsageResponse> {
+    const params = new URLSearchParams();
+    if (options?.startDate) params.set("start_date", options.startDate);
+    if (options?.endDate) params.set("end_date", options.endDate);
+    if (options?.refresh) params.set("refresh", "true");
+
+    const url = `/admin/api/v1/usage${params.toString() ? "?" + params.toString() : ""}`;
+    const response = await fetch(url);
+    if (!response.ok) {
+      throw new Error(`Failed to fetch usage data: ${response.status}`);
+    }
+    return response.json();
+  },
+};
+
 // Main nested API object
 export const dwctlApi = {
   users: userApi,
@@ -1599,4 +1620,5 @@ export const dwctlApi = {
   files: filesApi,
   batches: batchesApi,
   daemons: daemonsApi,
+  usage: usageApi,
 };

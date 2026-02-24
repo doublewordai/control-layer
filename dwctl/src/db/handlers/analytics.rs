@@ -12,8 +12,8 @@ use crate::{
         batches::BatchAnalytics,
         deployments::{ModelMetrics, ModelTimeSeriesPoint},
         requests::{
-            AnalyticsEntry, HttpAnalyticsFilter, ModelUsage, ModelUserUsageResponse, RequestsAggregateResponse, StatusCodeBreakdown,
-            TimeSeriesPoint, UserUsage,
+            AnalyticsEntry, HttpAnalyticsFilter, ModelBreakdownEntry, ModelUsage, ModelUserUsageResponse, RequestsAggregateResponse,
+            StatusCodeBreakdown, TimeSeriesPoint, UserUsage,
         },
     },
     db::errors::Result,
@@ -994,6 +994,239 @@ pub async fn list_http_analytics(
     }
 
     Ok(entries)
+}
+
+/// Row type for batch aggregate stats from pre-aggregated table
+#[derive(FromRow)]
+struct BatchCountRow {
+    pub total_batch_count: Option<i64>,
+    pub avg_requests_per_batch: Option<Decimal>,
+    pub total_cost: Option<Decimal>,
+}
+
+/// Row type for per-model breakdown query
+#[derive(FromRow)]
+struct ModelBreakdownRow {
+    pub model: Option<String>,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub cost: Option<Decimal>,
+    pub request_count: Option<i64>,
+}
+
+/// Get batch-level metrics from pre-aggregated batch_aggregates table.
+/// Returns (batch_count, avg_requests_per_batch, total_cost).
+/// Batch count and avg can't be derived from per-model breakdown
+/// (batches may span multiple models). Cost is already aggregated here.
+#[instrument(skip(pool), err)]
+pub async fn get_user_batch_counts(pool: &PgPool, user_id: Uuid) -> Result<(i64, f64, String)> {
+    let row = sqlx::query_as!(
+        BatchCountRow,
+        r#"
+        SELECT
+            COUNT(*) as total_batch_count,
+            COALESCE(AVG(transaction_count), 0) as avg_requests_per_batch,
+            COALESCE(SUM(total_amount), 0) as total_cost
+        FROM batch_aggregates
+        WHERE user_id = $1
+        "#,
+        user_id
+    )
+    .fetch_one(pool)
+    .await?;
+
+    Ok((
+        row.total_batch_count.unwrap_or(0),
+        row.avg_requests_per_batch.and_then(|d| d.to_f64()).unwrap_or(0.0),
+        row.total_cost.map(|d| d.to_string()).unwrap_or_else(|| "0".to_string()),
+    ))
+}
+
+/// Incrementally aggregate new http_analytics rows into the user_model_usage summary table.
+/// Uses a cursor to track the last processed id, so only new rows are scanned.
+#[instrument(skip(pool), err)]
+pub async fn refresh_user_model_usage(pool: &PgPool) -> Result<()> {
+    let mut tx = pool.begin().await?;
+
+    let cursor: i64 = sqlx::query_scalar!("SELECT last_processed_id FROM user_model_usage_cursor WHERE id = TRUE FOR UPDATE")
+        .fetch_one(&mut *tx)
+        .await?;
+
+    let new_max: Option<i64> = sqlx::query_scalar!(
+        r#"
+        SELECT MAX(id) FROM http_analytics
+        WHERE id > $1 AND user_id IS NOT NULL AND model IS NOT NULL AND fusillade_batch_id IS NOT NULL
+        "#,
+        cursor
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+
+    let Some(new_max) = new_max else {
+        return Ok(());
+    };
+
+    sqlx::query!(
+        r#"
+        INSERT INTO user_model_usage (user_id, model, input_tokens, output_tokens, cost, request_count)
+        SELECT user_id,
+               model,
+               COALESCE(SUM(prompt_tokens), 0),
+               COALESCE(SUM(completion_tokens), 0),
+               COALESCE(SUM(total_cost), 0),
+               COUNT(*)
+        FROM http_analytics
+        WHERE id > $1 AND id <= $2
+              AND user_id IS NOT NULL AND model IS NOT NULL AND fusillade_batch_id IS NOT NULL
+        GROUP BY user_id, model
+        ON CONFLICT (user_id, model)
+        DO UPDATE SET
+            input_tokens = user_model_usage.input_tokens + EXCLUDED.input_tokens,
+            output_tokens = user_model_usage.output_tokens + EXCLUDED.output_tokens,
+            cost = user_model_usage.cost + EXCLUDED.cost,
+            request_count = user_model_usage.request_count + EXCLUDED.request_count,
+            updated_at = NOW()
+        "#,
+        cursor,
+        new_max
+    )
+    .execute(&mut *tx)
+    .await?;
+
+    sqlx::query!(
+        "UPDATE user_model_usage_cursor SET last_processed_id = $1, updated_at = NOW() WHERE id = TRUE",
+        new_max
+    )
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Load current realtime tariff rates keyed by model alias.
+/// Returns a map of model alias → (input_price_per_token, output_price_per_token).
+/// This is a tiny table (~12 rows) so it's efficient to load entirely.
+#[instrument(skip(pool), err)]
+pub async fn get_realtime_tariffs(pool: &PgPool) -> Result<HashMap<String, (Decimal, Decimal)>> {
+    let rows = sqlx::query!(
+        r#"
+        SELECT dm.alias, t.input_price_per_token, t.output_price_per_token
+        FROM model_tariffs t
+        JOIN deployed_models dm ON dm.id = t.deployed_model_id
+        WHERE t.api_key_purpose = 'realtime' AND t.valid_until IS NULL
+        "#
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| (r.alias, (r.input_price_per_token, r.output_price_per_token)))
+        .collect())
+}
+
+/// Get per-model breakdown from the pre-aggregated user_model_usage table.
+/// Totals (tokens, cost, request count) are derived from these results by the handler.
+#[instrument(skip(pool), err)]
+pub async fn get_user_model_breakdown(pool: &PgPool, user_id: Uuid) -> Result<Vec<ModelBreakdownEntry>> {
+    let rows = sqlx::query_as!(
+        ModelBreakdownRow,
+        r#"
+        SELECT model,
+               input_tokens,
+               output_tokens,
+               cost,
+               request_count
+        FROM user_model_usage
+        WHERE user_id = $1
+        ORDER BY request_count DESC
+        "#,
+        user_id
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            row.model.map(|model| ModelBreakdownEntry {
+                model,
+                input_tokens: row.input_tokens.unwrap_or(0),
+                output_tokens: row.output_tokens.unwrap_or(0),
+                cost: row.cost.map(|d| d.to_string()).unwrap_or_else(|| "0".to_string()),
+                request_count: row.request_count.unwrap_or(0),
+            })
+        })
+        .collect())
+}
+
+// ===== DATE-FILTERED USAGE QUERIES (bypass pre-aggregated tables) =====
+
+/// Get per-model breakdown directly from http_analytics for a date range.
+/// Used when the user requests date-filtered usage data.
+#[instrument(skip(pool), err)]
+pub async fn get_user_model_breakdown_for_range(
+    pool: &PgPool,
+    user_id: Uuid,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+) -> Result<Vec<ModelBreakdownEntry>> {
+    let rows = sqlx::query_as!(
+        ModelBreakdownRow,
+        r#"
+        SELECT model,
+               COALESCE(SUM(prompt_tokens), 0)::bigint as input_tokens,
+               COALESCE(SUM(completion_tokens), 0)::bigint as output_tokens,
+               COALESCE(SUM(total_cost), 0) as cost,
+               COUNT(*) as request_count
+        FROM http_analytics
+        WHERE user_id = $1
+          AND timestamp >= $2 AND timestamp <= $3
+          AND fusillade_batch_id IS NOT NULL
+        GROUP BY model
+        ORDER BY request_count DESC
+        "#,
+        user_id,
+        start,
+        end
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            row.model.map(|model| ModelBreakdownEntry {
+                model,
+                input_tokens: row.input_tokens.unwrap_or(0),
+                output_tokens: row.output_tokens.unwrap_or(0),
+                cost: row.cost.map(|d| d.to_string()).unwrap_or_else(|| "0".to_string()),
+                request_count: row.request_count.unwrap_or(0),
+            })
+        })
+        .collect())
+}
+
+/// Get distinct batch count directly from http_analytics for a date range.
+#[instrument(skip(pool), err)]
+pub async fn get_user_batch_count_for_range(pool: &PgPool, user_id: Uuid, start: DateTime<Utc>, end: DateTime<Utc>) -> Result<i64> {
+    let row = sqlx::query_scalar!(
+        r#"
+        SELECT COUNT(DISTINCT fusillade_batch_id) as "count!"
+        FROM http_analytics
+        WHERE user_id = $1
+          AND timestamp >= $2 AND timestamp <= $3
+          AND fusillade_batch_id IS NOT NULL
+        "#,
+        user_id,
+        start,
+        end
+    )
+    .fetch_one(pool)
+    .await?;
+
+    Ok(row)
 }
 
 #[cfg(test)]

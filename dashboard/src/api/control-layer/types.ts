@@ -753,6 +753,26 @@ export interface ModelUserUsageResponse {
   users: UserUsage[];
 }
 
+// User batch usage types
+export interface ModelBreakdownEntry {
+  model: string;
+  input_tokens: number;
+  output_tokens: number;
+  cost: string;
+  request_count: number;
+}
+
+export interface UserBatchUsageResponse {
+  total_input_tokens: number;
+  total_output_tokens: number;
+  total_request_count: number;
+  total_batch_count: number;
+  avg_requests_per_batch: number;
+  total_cost: string;
+  estimated_realtime_cost: string;
+  by_model: ModelBreakdownEntry[];
+}
+
 // Authentication types
 export interface LoginRequest {
   email: string;

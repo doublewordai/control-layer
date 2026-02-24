@@ -6,21 +6,45 @@ use axum::{
     extract::{Query, State},
     response::Json,
 };
+use moka::future::Cache;
+use once_cell::sync::Lazy;
 use sqlx_pool_router::PoolProvider;
+use uuid::Uuid;
 
 use crate::{
     AppState,
-    api::models::requests::{
-        AggregateRequestsQuery, HttpAnalyticsFilter, ListAnalyticsResponse, ListRequestsQuery, ModelUserUsageResponse,
-        RequestsAggregateResponse,
+    api::models::{
+        requests::{
+            AggregateRequestsQuery, HttpAnalyticsFilter, ListAnalyticsResponse, ListRequestsQuery, ModelUserUsageResponse,
+            RequestsAggregateResponse, UsageDateQuery, UserBatchUsageResponse,
+        },
+        users::CurrentUser,
     },
     auth::permissions::{RequiresPermission, operation, resource},
-    db::handlers::analytics::{get_model_user_usage, get_requests_aggregate, list_http_analytics},
+    db::handlers::analytics::{
+        get_model_user_usage, get_realtime_tariffs, get_requests_aggregate, get_user_batch_count_for_range, get_user_batch_counts,
+        get_user_model_breakdown, get_user_model_breakdown_for_range, list_http_analytics, refresh_user_model_usage,
+    },
+    db::handlers::credits::Credits,
     errors::Error,
 };
 use chrono::{DateTime, Duration, Utc};
+use rust_decimal::Decimal;
 use serde::Deserialize;
 use utoipa::IntoParams;
+
+/// Cache key: (user_id, optional start-day-timestamp, optional end-day-timestamp).
+type UsageCacheKey = (Uuid, Option<i64>, Option<i64>);
+
+/// Unified cache for user usage data (60-minute TTL).
+/// All-time requests use (user_id, None, None). Date-filtered requests truncate
+/// timestamps to midnight UTC so the same preset always hits cache.
+static USAGE_CACHE: Lazy<Cache<UsageCacheKey, UserBatchUsageResponse>> = Lazy::new(|| {
+    Cache::builder()
+        .max_capacity(5_000)
+        .time_to_live(std::time::Duration::from_secs(3600))
+        .build()
+});
 
 /// List HTTP analytics entries with filtering and pagination
 ///
@@ -144,6 +168,147 @@ pub async fn aggregate_by_user<P: PoolProvider>(
     let usage_data = get_model_user_usage(state.db.read(), &model_alias, start_date, end_date).await?;
 
     Ok(Json(usage_data))
+}
+
+/// Get the current user's batch usage metrics
+///
+/// Returns batch usage including total tokens, costs, request/batch counts,
+/// and per-model breakdown. Only includes batched requests. Any authenticated user
+/// can access their own usage data.
+///
+/// When `start_date` and/or `end_date` are provided, queries http_analytics directly
+/// for the given range (capped at 180 days). Without date params, returns all-time
+/// stats from pre-aggregated tables. Both paths use a shared 60-minute cache.
+#[utoipa::path(
+    get,
+    path = "/admin/api/v1/usage",
+    params(UsageDateQuery),
+    responses(
+        (status = 200, description = "User batch usage metrics", body = UserBatchUsageResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "usage",
+    security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
+        ("X-Doubleword-User" = [])
+    )
+)]
+#[tracing::instrument(skip_all)]
+pub async fn get_usage<P: PoolProvider>(
+    Query(query): Query<UsageDateQuery>,
+    State(state): State<AppState<P>>,
+    current_user: CurrentUser,
+) -> Result<Json<UserBatchUsageResponse>, Error> {
+    let has_dates = query.start_date.is_some() || query.end_date.is_some();
+    let refresh = query.refresh.unwrap_or(false);
+
+    // Build cache key: truncate dates to midnight UTC so preset windows always hit cache.
+    // Skip cache for ranges under 30 days — the data moves too fast to cache usefully.
+    let (cache_key, use_cache) = if has_dates {
+        let end_date = query.end_date.unwrap_or_else(Utc::now);
+        let start_date = query.start_date.unwrap_or_else(|| end_date - Duration::days(180));
+        let span = end_date - start_date;
+        let truncate = |dt: DateTime<Utc>| dt.date_naive().and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp();
+        (
+            (current_user.id, Some(truncate(start_date)), Some(truncate(end_date))),
+            span.num_days() >= 30,
+        )
+    } else {
+        ((current_user.id, None, None), true)
+    };
+
+    if refresh {
+        USAGE_CACHE.invalidate(&cache_key).await;
+    } else if use_cache && let Some(cached) = USAGE_CACHE.get(&cache_key).await {
+        return Ok(Json(cached));
+    }
+
+    // Two paths: all-time uses fast pre-aggregated tables, date-filtered
+    // queries http_analytics directly (bounded by covering index).
+    let (batch_count, by_model, tariffs) = if has_dates {
+        let end_date = query.end_date.unwrap_or_else(Utc::now);
+        let start = query.start_date.unwrap_or_else(|| end_date - Duration::days(180));
+        let max_start = end_date - Duration::days(180);
+        let start_date = if start < max_start { max_start } else { start };
+
+        tokio::try_join!(
+            get_user_batch_count_for_range(state.db.read(), current_user.id, start_date, end_date),
+            get_user_model_breakdown_for_range(state.db.read(), current_user.id, start_date, end_date),
+            get_realtime_tariffs(state.db.read()),
+        )?
+    } else {
+        // All-time usage combines two pre-aggregated tables:
+        //
+        // 1. `user_model_usage` — incrementally updated from http_analytics
+        //    via a cursor (refresh_user_model_usage). Tokens, cost, and
+        //    request count are additive, so splitting rows across refresh
+        //    windows produces correct totals.
+        //
+        // 2. `batch_aggregates` — needed for batch *count* because counting
+        //    distinct batches is NOT additive. A single batch's analytics
+        //    rows can land in two different refresh windows (some rows
+        //    processed in window N, the rest in window N+1), so an
+        //    incremental COUNT(DISTINCT batch_id) per window would
+        //    double-count that batch. Time-windowed queries avoid this by
+        //    counting distinct IDs over a fixed timestamp range, but
+        //    all-time has no fixed range — the cursor moves forward.
+        //    `batch_aggregates` only contains completed batches (all rows
+        //    written), so a simple COUNT(*) is safe.
+        refresh_user_model_usage(state.db.write()).await?;
+        if refresh {
+            let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
+            Credits::new(&mut conn).aggregate_user_batches(current_user.id).await?;
+        }
+        let (batch_stats, by_model, tariffs) = tokio::try_join!(
+            get_user_batch_counts(state.db.read(), current_user.id),
+            get_user_model_breakdown(state.db.read(), current_user.id),
+            get_realtime_tariffs(state.db.read()),
+        )?;
+        (batch_stats.0, by_model, tariffs)
+    };
+
+    let total_cost = by_model
+        .iter()
+        .fold(Decimal::ZERO, |acc, e| acc + e.cost.parse::<Decimal>().unwrap_or(Decimal::ZERO))
+        .to_string();
+    let total_requests: i64 = by_model.iter().map(|e| e.request_count).sum();
+    let avg_requests_per_batch = if batch_count > 0 {
+        total_requests as f64 / batch_count as f64
+    } else {
+        0.0
+    };
+
+    let mut total_input_tokens: i64 = 0;
+    let mut total_output_tokens: i64 = 0;
+    let mut total_request_count: i64 = 0;
+    let mut estimated_realtime_cost = Decimal::ZERO;
+    for entry in &by_model {
+        total_input_tokens += entry.input_tokens;
+        total_output_tokens += entry.output_tokens;
+        total_request_count += entry.request_count;
+        if let Some(&(input_price, output_price)) = tariffs.get(&entry.model) {
+            estimated_realtime_cost += Decimal::from(entry.input_tokens) * input_price + Decimal::from(entry.output_tokens) * output_price;
+        }
+    }
+
+    let usage = UserBatchUsageResponse {
+        total_input_tokens,
+        total_output_tokens,
+        total_request_count,
+        total_batch_count: batch_count,
+        avg_requests_per_batch,
+        total_cost,
+        estimated_realtime_cost: estimated_realtime_cost.to_string(),
+        by_model,
+    };
+
+    if use_cache {
+        USAGE_CACHE.insert(cache_key, usage.clone()).await;
+    }
+
+    Ok(Json(usage))
 }
 
 #[cfg(test)]

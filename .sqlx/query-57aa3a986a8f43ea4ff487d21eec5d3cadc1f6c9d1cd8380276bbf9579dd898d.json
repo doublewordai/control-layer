@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT COUNT(DISTINCT fusillade_batch_id) as \"count!\"\n        FROM http_analytics\n        WHERE user_id = $1\n          AND timestamp >= $2 AND timestamp <= $3\n          AND fusillade_batch_id IS NOT NULL\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "count!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Timestamptz",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "57aa3a986a8f43ea4ff487d21eec5d3cadc1f6c9d1cd8380276bbf9579dd898d"
+}
