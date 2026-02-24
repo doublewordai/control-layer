@@ -661,15 +661,27 @@ export function usePendingRequestCounts(options?: { enabled?: boolean }) {
 // Usage hooks
 export function useUsage(startDate?: string, endDate?: string) {
   const hasDates = !!startDate || !!endDate;
-  return useQuery({
-    queryKey: hasDates
-      ? queryKeys.usage.forRange(startDate, endDate)
-      : queryKeys.usage.all,
+  const queryClient = useQueryClient();
+  const queryKey = hasDates
+    ? queryKeys.usage.forRange(startDate, endDate)
+    : queryKeys.usage.all;
+
+  const query = useQuery({
+    queryKey,
     queryFn: () =>
       hasDates
         ? dwctlApi.usage.get({ startDate, endDate })
         : dwctlApi.usage.get(),
   });
+
+  const refresh = async () => {
+    const data = hasDates
+      ? await dwctlApi.usage.get({ startDate, endDate, refresh: true })
+      : await dwctlApi.usage.get({ refresh: true });
+    queryClient.setQueryData(queryKey, data);
+  };
+
+  return { ...query, refresh };
 }
 
 // Authentication hooks

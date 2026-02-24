@@ -1,4 +1,6 @@
 import { useState, useMemo, useEffect } from "react";
+import { RefreshCw } from "lucide-react";
+import { Button } from "@/components";
 import { useUsage } from "@/api/control-layer/hooks";
 
 // Keyframe for inline-style spinner (Tailwind's animate-spin only works with class names)
@@ -133,32 +135,35 @@ function DonutChart({ data, size = 190, thickness = 24, centerLabel }: { data: D
           position: "absolute", inset: 0, display: "flex", flexDirection: "column",
           alignItems: "center", justifyContent: "center", pointerEvents: "none",
         }}>
-          {hovered !== null ? (
-              <>
-            <span style={{ fontSize: 10, color: "#94a3b8", textTransform: "uppercase", letterSpacing: "0.06em", fontWeight: 600 }}>
-              {arcs[hovered].label}
-            </span>
-                <span style={{ fontSize: 18, fontWeight: 700, color: "#1e293b", fontVariantNumeric: "tabular-nums" }}>
-              {arcs[hovered].format(arcs[hovered].value)}
-            </span>
-              </>
-          ) : (
-              <>
-            <span style={{ fontSize: 10, color: "#94a3b8", textTransform: "uppercase", letterSpacing: "0.06em", fontWeight: 600 }}>
-              {centerLabel}
-            </span>
-                <span style={{ fontSize: 18, fontWeight: 700, color: "#1e293b", fontVariantNumeric: "tabular-nums" }}>
-              {data[0]?.totalFormat(total)}
-            </span>
-              </>
+          {hovered !== null && (
+              <div style={{
+                position: "absolute", top: -8, left: "50%", transform: "translateX(-50%)",
+                background: "white", borderRadius: 8, padding: "6px 12px",
+                boxShadow: "0 2px 8px rgba(0,0,0,0.12)", border: "1px solid #e2e8f0",
+                display: "flex", flexDirection: "column", alignItems: "center", gap: 2,
+                whiteSpace: "nowrap", pointerEvents: "none",
+              }}>
+                <span style={{ fontSize: 11, color: "#475569", fontWeight: 600 }}>
+                  {arcs[hovered].label}
+                </span>
+                <span style={{ fontSize: 16, fontWeight: 700, color: "#1e293b", fontVariantNumeric: "tabular-nums" }}>
+                  {arcs[hovered].format(arcs[hovered].value)}
+                </span>
+              </div>
           )}
+          <span style={{ fontSize: 10, color: "#94a3b8", textTransform: "uppercase", letterSpacing: "0.06em", fontWeight: 600 }}>
+            {centerLabel}
+          </span>
+          <span style={{ fontSize: 18, fontWeight: 700, color: "#1e293b", fontVariantNumeric: "tabular-nums" }}>
+            {data[0]?.totalFormat(total)}
+          </span>
         </div>
       </div>
   );
 }
 
 export function Usage() {
-  const [range, setRange] = useState("all");
+  const [range, setRange] = useState("1h");
   const [mounted, setMounted] = useState(false);
   useEffect(() => setMounted(true), []);
 
@@ -170,7 +175,8 @@ export function Usage() {
     return { startDate: from.toISOString(), endDate: now.toISOString() };
   }, [range]);
 
-  const { data: usage, isLoading, isFetching } = useUsage(startDate, endDate);
+  const { data: usage, isLoading, isFetching, refresh } = useUsage(startDate, endDate);
+  const busy = isLoading || isFetching;
 
   const chartData = useMemo(() => {
     if (!usage?.by_model.length) return [];
@@ -198,22 +204,25 @@ export function Usage() {
             display: "flex", alignItems: "center", justifyContent: "space-between",
             marginBottom: 28, flexWrap: "wrap", gap: 12,
           }}>
-            <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-              <div>
+            <div>
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                 <h1 style={{ fontSize: 22, fontWeight: 700, color: "#0f172a", margin: 0 }}>Usage</h1>
-                <p style={{ fontSize: 13, color: "#94a3b8", margin: "2px 0 0" }}>
-                  API consumption &amp; cost breakdown
-                </p>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={refresh}
+                  disabled={busy}
+                  className="h-8 w-8 p-0"
+                  title="Refresh usage data"
+                >
+                  <RefreshCw
+                    className={`h-4 w-4 ${busy ? "animate-spin" : ""}`}
+                  />
+                </Button>
               </div>
-              {isFetching && !isLoading && (
-                <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: "#94a3b8" }}>
-                  <svg width="14" height="14" viewBox="0 0 14 14" style={{ animation: "spin 1s linear infinite" }}>
-                    <circle cx="7" cy="7" r="5.5" fill="none" stroke="#cbd5e1" strokeWidth="2" />
-                    <path d="M7 1.5A5.5 5.5 0 0 1 12.5 7" fill="none" stroke="#64748b" strokeWidth="2" strokeLinecap="round" />
-                  </svg>
-                  Updating
-                </div>
-              )}
+              <p style={{ fontSize: 13, color: "#94a3b8", margin: "2px 0 0" }}>
+                API consumption &amp; cost breakdown
+              </p>
             </div>
             <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
               <div style={{

@@ -273,6 +273,8 @@ pub struct UsageDateQuery {
     pub start_date: Option<DateTime<Utc>>,
     /// End of the date range (inclusive). When provided, queries http_analytics directly.
     pub end_date: Option<DateTime<Utc>>,
+    /// When true, bypasses the server-side cache and forces fresh aggregation.
+    pub refresh: Option<bool>,
 }
 
 // ===== AGGREGATE/ANALYTICS RESPONSE TYPES =====

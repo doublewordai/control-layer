@@ -25,6 +25,7 @@ use crate::{
         get_model_user_usage, get_realtime_tariffs, get_requests_aggregate, get_user_batch_count_for_range, get_user_batch_counts,
         get_user_model_breakdown, get_user_model_breakdown_for_range, list_http_analytics, refresh_user_model_usage,
     },
+    db::handlers::credits::Credits,
     errors::Error,
 };
 use chrono::{DateTime, Duration, Utc};
@@ -201,18 +202,26 @@ pub async fn get_usage<P: PoolProvider>(
     current_user: CurrentUser,
 ) -> Result<Json<UserBatchUsageResponse>, Error> {
     let has_dates = query.start_date.is_some() || query.end_date.is_some();
+    let refresh = query.refresh.unwrap_or(false);
 
     // Build cache key: truncate dates to midnight UTC so preset windows always hit cache.
-    let cache_key = if has_dates {
+    // Skip cache for ranges under 30 days — the data moves too fast to cache usefully.
+    let (cache_key, use_cache) = if has_dates {
         let end_date = query.end_date.unwrap_or_else(Utc::now);
         let start_date = query.start_date.unwrap_or_else(|| end_date - Duration::days(180));
+        let span = end_date - start_date;
         let truncate = |dt: DateTime<Utc>| dt.date_naive().and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp();
-        (current_user.id, Some(truncate(start_date)), Some(truncate(end_date)))
+        (
+            (current_user.id, Some(truncate(start_date)), Some(truncate(end_date))),
+            span.num_days() >= 30,
+        )
     } else {
-        (current_user.id, None, None)
+        ((current_user.id, None, None), true)
     };
 
-    if let Some(cached) = USAGE_CACHE.get(&cache_key).await {
+    if refresh {
+        USAGE_CACHE.invalidate(&cache_key).await;
+    } else if use_cache && let Some(cached) = USAGE_CACHE.get(&cache_key).await {
         return Ok(Json(cached));
     }
 
@@ -230,7 +239,28 @@ pub async fn get_usage<P: PoolProvider>(
             get_realtime_tariffs(state.db.read()),
         )?
     } else {
+        // All-time usage combines two pre-aggregated tables:
+        //
+        // 1. `user_model_usage` — incrementally updated from http_analytics
+        //    via a cursor (refresh_user_model_usage). Tokens, cost, and
+        //    request count are additive, so splitting rows across refresh
+        //    windows produces correct totals.
+        //
+        // 2. `batch_aggregates` — needed for batch *count* because counting
+        //    distinct batches is NOT additive. A single batch's analytics
+        //    rows can land in two different refresh windows (some rows
+        //    processed in window N, the rest in window N+1), so an
+        //    incremental COUNT(DISTINCT batch_id) per window would
+        //    double-count that batch. Time-windowed queries avoid this by
+        //    counting distinct IDs over a fixed timestamp range, but
+        //    all-time has no fixed range — the cursor moves forward.
+        //    `batch_aggregates` only contains completed batches (all rows
+        //    written), so a simple COUNT(*) is safe.
         refresh_user_model_usage(state.db.write()).await?;
+        if refresh {
+            let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
+            Credits::new(&mut conn).aggregate_user_batches(current_user.id).await?;
+        }
         let (batch_stats, by_model, tariffs) = tokio::try_join!(
             get_user_batch_counts(state.db.read(), current_user.id),
             get_user_model_breakdown(state.db.read(), current_user.id),
@@ -274,7 +304,9 @@ pub async fn get_usage<P: PoolProvider>(
         by_model,
     };
 
-    USAGE_CACHE.insert(cache_key, usage.clone()).await;
+    if use_cache {
+        USAGE_CACHE.insert(cache_key, usage.clone()).await;
+    }
 
     Ok(Json(usage))
 }
