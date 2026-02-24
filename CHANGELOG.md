@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.7.1](https://github.com/doublewordai/control-layer/compare/v8.7.0...v8.7.1) (2026-02-24)
+
+
+### Bug Fixes
+
+* if statement in release ([#760](https://github.com/doublewordai/control-layer/issues/760)) ([00b5f16](https://github.com/doublewordai/control-layer/commit/00b5f163d0970652757589681bfd904f224057eb))
+
 ## [8.7.0](https://github.com/doublewordai/control-layer/compare/v8.6.0...v8.7.0) (2026-02-24)
 
 
