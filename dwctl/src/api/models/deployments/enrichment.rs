@@ -795,12 +795,15 @@ mod tests {
         model.tariffs = Some(vec![
             create_test_tariff(Some(ApiKeyPurpose::Batch), Some("24h")),
             create_test_tariff(Some(ApiKeyPurpose::Batch), Some("1h")),
+            create_test_tariff(Some(ApiKeyPurpose::Realtime), None),
         ]);
 
         let result = model.filter_disabled_batch_tariffs();
 
-        // All tariffs pass through when allowed_batch_completion_windows is empty
-        assert_eq!(result.tariffs.unwrap().len(), 2);
+        // Empty allowed list means no batch windows allowed — all batch tariffs removed, realtime kept
+        let tariffs = result.tariffs.unwrap();
+        assert_eq!(tariffs.len(), 1);
+        assert_eq!(tariffs[0].api_key_purpose, Some(ApiKeyPurpose::Realtime));
     }
 
     #[test]

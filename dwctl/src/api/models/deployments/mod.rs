@@ -533,17 +533,18 @@ impl DeployedModelResponse {
     }
 
     /// Filter out batch tariffs for completion windows that aren't in allowed_batch_completion_windows.
-    /// When allowed_batch_completion_windows is None or empty, all tariffs pass through (global defaults).
+    /// When allowed_batch_completion_windows is None, all tariffs pass through (global defaults apply).
+    /// When it is Some (even if empty), only batch tariffs whose completion_window is in the list are kept.
+    /// An empty list means no batch windows are allowed, so all batch tariffs are removed.
     pub fn filter_disabled_batch_tariffs(mut self) -> Self {
         if let Some(ref allowed) = self.allowed_batch_completion_windows
-            && !allowed.is_empty()
             && let Some(ref mut tariffs) = self.tariffs
         {
             tariffs.retain(|t| {
-                // Only filter batch tariffs with a completion_window
                 match (&t.api_key_purpose, &t.completion_window) {
                     (Some(ApiKeyPurpose::Batch), Some(window)) => allowed.contains(window),
-                    _ => true, // Non-batch tariffs, or batch without window, pass through
+                    (Some(ApiKeyPurpose::Batch), None) => false, // Batch tariff without window removed when model restricts windows
+                    _ => true,                                   // Non-batch tariffs always pass through
                 }
             });
         }
