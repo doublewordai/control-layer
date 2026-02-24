@@ -6,7 +6,7 @@ on:
 
 jobs:
   build:
-    if: !github.event.release.prerelease
+    if: ${{ !github.event.release.prerelease }}
     runs-on: depot-ubuntu-24.04
 
     permissions:
@@ -67,7 +67,7 @@ jobs:
           curl -X POST "https://charts.somnial.co/doubleword-control-layer/docker-build-duration?value=${BUILD_DURATION}" || true
 
   notify-deploy:
-    if: !github.event.release.prerelease
+    if: ${{ !github.event.release.prerelease }}
     needs: [build]
     runs-on: ubuntu-latest
 
@@ -89,7 +89,7 @@ jobs:
             console.log(`Triggered deployment for version ${{ github.event.release.tag_name }}`)
 
   publish-crates:
-    if: !github.event.release.prerelease
+    if: ${{ !github.event.release.prerelease }}
     runs-on: depot-ubuntu-24.04
 
     steps:
