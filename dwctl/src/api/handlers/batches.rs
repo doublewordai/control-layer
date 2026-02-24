@@ -243,10 +243,43 @@ pub async fn create_batch<P: PoolProvider>(
 
     let model_aliases: Vec<String> = file_model_counts.keys().cloned().collect();
 
+    // Get per-model batch info (throughputs + allowed windows) in one query
+    let batch_model_info = {
+        use crate::db::handlers::deployments::Deployments;
+        let mut conn = state.db.read().acquire().await.map_err(|e| Error::Internal {
+            operation: format!("get db connection: {}", e),
+        })?;
+        Deployments::new(&mut conn)
+            .get_batch_model_info(&model_aliases)
+            .await
+            .map_err(|e| Error::Internal {
+                operation: format!("get batch model info: {}", e),
+            })?
+    };
+
+    // Check per-model batch completion window restrictions
+    for (alias, allowed_windows) in &batch_model_info.allowed_windows {
+        if !allowed_windows.contains(&req.completion_window) {
+            if allowed_windows.is_empty() {
+                return Err(Error::BadRequest {
+                    message: format!("Model '{}' does not support batch processing.", alias),
+                });
+            }
+            return Err(Error::BadRequest {
+                message: format!(
+                    "Model '{}' does not support completion window '{}'. Allowed: {}",
+                    alias,
+                    req.completion_window,
+                    allowed_windows.join(", ")
+                ),
+            });
+        }
+    }
+
     let windows = vec![(req.completion_window.clone(), parse_window_to_seconds(&req.completion_window))];
     let states = vec!["pending".to_string(), "claimed".to_string(), "processing".to_string()];
 
-    let model_throughputs = get_model_throughputs(&state, &model_aliases).await?;
+    let model_throughputs = batch_model_info.throughputs;
     let model_ids_by_alias = get_model_ids_by_aliases(&state, &model_aliases).await?;
 
     // Determine request_source from authentication method
@@ -280,6 +313,7 @@ pub async fn create_batch<P: PoolProvider>(
         &windows,
         &states,
         &model_aliases,
+        state.config.batches.relaxation_factor(&req.completion_window),
     )
     .await?;
 
@@ -366,9 +400,7 @@ async fn get_model_ids_by_aliases<P: PoolProvider>(state: &AppState<P>, model_al
 /// Phase 2 — create_batch   (fusillade, ms – seconds depending on batch size)
 ///   └─ single atomic tx: INSERT batches → INSERT requests → UPDATE totals → COMMIT
 ///
-/// Phase 3 — Release   (~1 ms)
 ///   └─ UPDATE reservations SET released_at = now()
-/// ```
 ///
 /// ## Advisory lock scope
 ///
@@ -413,6 +445,7 @@ async fn reserve_capacity_for_batch<P: PoolProvider>(
     windows: &[(String, i64)],
     states: &[String],
     model_filter: &[String],
+    relaxation_factor: f32,
 ) -> Result<Vec<Uuid>> {
     use crate::db::handlers::BatchCapacityReservations;
 
@@ -473,6 +506,7 @@ async fn reserve_capacity_for_batch<P: PoolProvider>(
         model_throughputs,
         state.config.batches.default_throughput,
         completion_window,
+        relaxation_factor,
     );
 
     if !capacity_result.has_capacity {
@@ -542,22 +576,6 @@ async fn release_capacity_reservations<P: PoolProvider>(state: &AppState<P>, res
         })
 }
 
-/// Get throughput values for the given model aliases from the database
-async fn get_model_throughputs<P: PoolProvider>(state: &AppState<P>, model_aliases: &[String]) -> Result<HashMap<String, f32>> {
-    use crate::db::handlers::deployments::Deployments;
-
-    let mut conn = state.db.read().acquire().await.map_err(|e| Error::Internal {
-        operation: format!("get db connection: {}", e),
-    })?;
-
-    Deployments::new(&mut conn)
-        .get_throughputs_by_aliases(model_aliases)
-        .await
-        .map_err(|e| Error::Internal {
-            operation: format!("get model throughputs: {}", e),
-        })
-}
-
 #[utoipa::path(
     get,
     path = "/batches/{batch_id}",
@@ -614,7 +632,6 @@ pub async fn get_batch<P: PoolProvider>(
 #[utoipa::path(
     get,
     path = "/batches/{batch_id}/analytics",
-    tag = "batches",
     summary = "Get batch analytics",
     description = "Retrieve aggregated metrics for a batch including token usage, costs, and latency statistics.
 
@@ -2216,6 +2233,7 @@ mod tests {
             &windows,
             &states,
             &model_filter,
+            1.0,
         )
         .await
         .unwrap();
@@ -2277,6 +2295,7 @@ mod tests {
             &windows,
             &states,
             &model_filter,
+            1.0,
         )
         .await
         .unwrap_err();
@@ -2498,5 +2517,234 @@ mod tests {
         resp.assert_status(StatusCode::BAD_REQUEST);
         let error_text = resp.text();
         assert!(error_text.contains("Unsupported completion_window"));
+    }
+
+    /// Test that relaxation factor of 0.0 blocks all batches for that window
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_create_batch_blocked_by_zero_relaxation_factor(pool: PgPool) {
+        let mut config = create_test_config();
+        config.batches.allowed_completion_windows = vec!["24h".to_string()];
+        config.batches.window_relaxation_factors = std::collections::HashMap::from([("24h".to_string(), 0.0)]);
+
+        let (app, _bg_services) = create_test_app_with_config(pool.clone(), config, false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}"#;
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test.jsonl");
+        let multipart = axum_test::multipart::MultipartForm::new()
+            .add_part("file", file_part)
+            .add_part("purpose", axum_test::multipart::Part::text("batch"));
+        let upload_resp = app
+            .post("/ai/v1/files")
+            .multipart(multipart)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        upload_resp.assert_status(StatusCode::CREATED);
+        let file: serde_json::Value = upload_resp.json();
+        let file_id = file["id"].as_str().unwrap();
+
+        let create_req = CreateBatchRequest {
+            input_file_id: file_id.to_string(),
+            endpoint: "/v1/chat/completions".to_string(),
+            completion_window: "24h".to_string(),
+            metadata: None,
+        };
+
+        let resp = app
+            .post("/ai/v1/batches")
+            .json(&create_req)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+
+        // factor=0.0 means effective capacity=0, any request must be rejected
+        resp.assert_status(StatusCode::TOO_MANY_REQUESTS);
+        let error_text = resp.text();
+        assert!(error_text.contains("completion window"), "Error should mention completion window");
+        assert!(error_text.contains("gpt-4"), "Error should name the overloaded model");
+    }
+
+    /// Test that relaxation factor > 1.0 allows accepting more requests than strict capacity
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_reserve_capacity_relaxation_factor_expands_acceptance(pool: PgPool) {
+        let mut config = create_test_config();
+        // Set a very low throughput so strict capacity is tiny
+        config.batches.default_throughput = 0.001; // 0.001 req/s = 3.6 requests per hour
+        config.batches.allowed_completion_windows = vec!["1h".to_string(), "24h".to_string()];
+        // 2× relaxation on 1h: effective capacity = 3.6 * 2 = 7.2 → floor to 7
+        config.batches.window_relaxation_factors = std::collections::HashMap::from([("1h".to_string(), 2.0)]);
+
+        let state = create_test_app_state_with_fusillade(pool.clone(), config).await;
+
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let endpoint_id = create_test_endpoint(&pool, &format!("test-{}", Uuid::new_v4()), user.id).await;
+        let alias = format!("alias-{}", Uuid::new_v4());
+        let model_id = create_test_model(&pool, "model-a", &alias, endpoint_id, user.id).await;
+
+        // 5 requests — would fail at strict capacity (3) but pass with 2× relaxation (7)
+        let file_model_counts = HashMap::from([(alias.clone(), 5_i64)]);
+        let model_throughputs = HashMap::from([(alias.clone(), 0.001_f32)]);
+        let model_ids_by_alias = HashMap::from([(alias.clone(), model_id)]);
+        let windows = vec![("1h".to_string(), super::parse_window_to_seconds("1h"))];
+        let states = vec!["pending".to_string(), "claimed".to_string(), "processing".to_string()];
+        let model_filter = vec![alias.clone()];
+
+        // Without relaxation (strict): should be rejected
+        let strict_err = super::reserve_capacity_for_batch(
+            &state,
+            "1h",
+            &file_model_counts,
+            &model_throughputs,
+            &model_ids_by_alias,
+            &windows,
+            &states,
+            &model_filter,
+            1.0,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(strict_err, Error::TooManyRequests { .. }),
+            "Should be rejected at strict capacity"
+        );
+
+        // With relaxation factor 2.0: should be accepted
+        let reservation_ids = super::reserve_capacity_for_batch(
+            &state,
+            "1h",
+            &file_model_counts,
+            &model_throughputs,
+            &model_ids_by_alias,
+            &windows,
+            &states,
+            &model_filter,
+            2.0,
+        )
+        .await
+        .expect("Should be accepted with 2× relaxation factor");
+        assert_eq!(reservation_ids.len(), 1);
+
+        super::release_capacity_reservations(&state, &reservation_ids).await.unwrap();
+    }
+
+    /// Test that relaxation factors are window-specific — relaxing one window
+    /// does not affect another.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_reserve_capacity_relaxation_factor_is_window_specific(pool: PgPool) {
+        let mut config = create_test_config();
+        config.batches.default_throughput = 0.001; // 3.6 req/h strict
+        config.batches.allowed_completion_windows = vec!["1h".to_string(), "24h".to_string()];
+        // Only relax 24h — 1h stays strict
+        config.batches.window_relaxation_factors = std::collections::HashMap::from([("24h".to_string(), 10.0)]);
+
+        let state = create_test_app_state_with_fusillade(pool.clone(), config).await;
+
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let endpoint_id = create_test_endpoint(&pool, &format!("test-{}", Uuid::new_v4()), user.id).await;
+        let alias = format!("alias-{}", Uuid::new_v4());
+        let model_id = create_test_model(&pool, "model-a", &alias, endpoint_id, user.id).await;
+
+        let file_model_counts = HashMap::from([(alias.clone(), 5_i64)]);
+        let model_throughputs = HashMap::from([(alias.clone(), 0.001_f32)]);
+        let model_ids_by_alias = HashMap::from([(alias.clone(), model_id)]);
+        let states = vec!["pending".to_string(), "claimed".to_string(), "processing".to_string()];
+        let model_filter = vec![alias.clone()];
+
+        // 1h window — strict (factor defaults to 1.0), 5 > 3.6, rejected
+        let windows_1h = vec![("1h".to_string(), super::parse_window_to_seconds("1h"))];
+        let err = super::reserve_capacity_for_batch(
+            &state,
+            "1h",
+            &file_model_counts,
+            &model_throughputs,
+            &model_ids_by_alias,
+            &windows_1h,
+            &states,
+            &model_filter,
+            1.0,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, Error::TooManyRequests { .. }), "1h should be rejected — not relaxed");
+
+        // 24h window — factor=10.0, effective capacity = 86400 * 0.001 * 10 = 864, accepted
+        let windows_24h = vec![("24h".to_string(), super::parse_window_to_seconds("24h"))];
+        let reservation_ids = super::reserve_capacity_for_batch(
+            &state,
+            "24h",
+            &file_model_counts,
+            &model_throughputs,
+            &model_ids_by_alias,
+            &windows_24h,
+            &states,
+            &model_filter,
+            10.0,
+        )
+        .await
+        .expect("24h should be accepted with 10× relaxation");
+        assert_eq!(reservation_ids.len(), 1);
+
+        super::release_capacity_reservations(&state, &reservation_ids).await.unwrap();
+    }
+
+    /// Test that the relaxation_factor from config flows through the full API path
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_create_batch_relaxation_factor_from_config(pool: PgPool) {
+        let mut config = create_test_config();
+        // Throughput so low that even 1 request fails strict, but 2× relaxation passes
+        config.batches.default_throughput = 0.0001; // 0.36 req/h strict → floor 0
+        config.batches.allowed_completion_windows = vec!["24h".to_string()];
+        // 2× on 24h: 0.0001 * 86400 * 2 = 17.28 → 17 capacity — easily fits 1 request
+        config.batches.window_relaxation_factors = std::collections::HashMap::from([("24h".to_string(), 2.0)]);
+
+        let (app, _bg_services) = create_test_app_with_config(pool.clone(), config, false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}"#;
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test.jsonl");
+        let multipart = axum_test::multipart::MultipartForm::new()
+            .add_part("file", file_part)
+            .add_part("purpose", axum_test::multipart::Part::text("batch"));
+        let upload_resp = app
+            .post("/ai/v1/files")
+            .multipart(multipart)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        upload_resp.assert_status(StatusCode::CREATED);
+        let file: serde_json::Value = upload_resp.json();
+        let file_id = file["id"].as_str().unwrap();
+
+        let create_req = CreateBatchRequest {
+            input_file_id: file_id.to_string(),
+            endpoint: "/v1/chat/completions".to_string(),
+            completion_window: "24h".to_string(),
+            metadata: None,
+        };
+
+        let resp = app
+            .post("/ai/v1/batches")
+            .json(&create_req)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+
+        // Should be accepted because relaxation factor makes effective capacity > 0
+        resp.assert_status(StatusCode::CREATED);
     }
 }

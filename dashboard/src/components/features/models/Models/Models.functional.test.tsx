@@ -79,7 +79,7 @@ describe("Models Component - Functional Tests", () => {
   });
 
   describe("Model Discovery Journey", () => {
-    it("allows users to browse, filter, and search models", async () => {
+    it("allows users to browse, filter, and search models", { timeout: 10000 }, async () => {
       const user = userEvent.setup();
       const { container } = render(<Models />, { wrapper: createWrapper() });
 

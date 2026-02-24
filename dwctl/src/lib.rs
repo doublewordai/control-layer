@@ -472,6 +472,11 @@ pub async fn seed_database(sources: &[config::ModelSource], db: &PgPool) -> Resu
                             throughput: None,
                             tariffs: None,
                             provider_pricing: None,
+                            sanitize_responses: None,
+                            trusted: None,
+                            open_responses_adapter: None,
+                            traffic_routing_rules: None,
+                            allowed_batch_completion_windows: None,
                         }),
                     ))
                     .await
@@ -1193,8 +1198,8 @@ pub async fn build_router(
 
     // Add AI routes with appropriate nesting based on strict mode
     if strict_mode {
-        // Strict mode: nest onwards at /ai, nest batches at /ai/v1
-        router = router.nest("/ai", onwards_router);
+        // Strict mode: nest onwards at /ai/v1, nest batches at /ai/v1
+        router = router.nest("/ai/v1", onwards_router);
         if let Some(batches) = batches_routes {
             // Add fallback to batches router to return 404 for unknown routes
             // This prevents unknown /ai/v1/* requests from falling through to the

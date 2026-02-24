@@ -40,7 +40,8 @@
 //! [outlet]: https://github.com/doublewordai/outlet
 
 use crate::config::Config;
-use crate::request_logging::models::{AiRequest, AiResponse, ChatCompletionChunk, ParsedAIRequest};
+use crate::request_logging::models::{AiRequest, AiResponse, ChatCompletionChunk, ParsedAIRequest, ResponsesRequest};
+use async_openai::types::responses::ResponseStreamEvent;
 use outlet::{RequestData, ResponseData};
 use outlet_postgres::SerializationError;
 use serde_json::Value;
@@ -142,12 +143,15 @@ pub struct UsageMetrics {
 /// * `request_data` - The HTTP request data containing body and metadata
 ///
 /// # Returns
-/// * `Ok(AiRequest)` - Successfully parsed request as chat completion, completion, embeddings, or other
+/// * `Ok(ParsedAIRequest)` - Successfully parsed request as chat completion, completion,
+///   embeddings, responses, or other
 /// * `Err(SerializationError)` - Parse error with base64-encoded fallback data for storage
 ///
 /// # Behavior
 /// - Returns `AiRequest::Other(Value::Null)` for missing or empty bodies
 /// - On parse failure, returns error with base64-encoded body for safe PostgreSQL storage
+/// - For `/v1/responses` paths, uses path-based detection to avoid serde disambiguation
+///   issues with the embeddings variant (both use an `input` field).
 #[instrument(skip_all)]
 pub fn parse_ai_request(request_data: &RequestData) -> Result<ParsedAIRequest, SerializationError> {
     let headers = request_data
@@ -159,11 +163,10 @@ pub fn parse_ai_request(request_data: &RequestData) -> Result<ParsedAIRequest, S
     let bytes = match &request_data.body {
         Some(body) => body.as_ref(),
         None => {
-            return Ok({
-                ParsedAIRequest {
-                    headers,
-                    request: AiRequest::Other(Value::Null),
-                }
+            return Ok(ParsedAIRequest {
+                headers,
+                request: AiRequest::Other(Value::Null),
+                responses_request: None,
             });
         }
     };
@@ -171,16 +174,43 @@ pub fn parse_ai_request(request_data: &RequestData) -> Result<ParsedAIRequest, S
     let body_str = String::from_utf8_lossy(bytes);
 
     if body_str.trim().is_empty() {
-        return Ok({
-            ParsedAIRequest {
-                headers,
-                request: AiRequest::Other(Value::Null),
-            }
+        return Ok(ParsedAIRequest {
+            headers,
+            request: AiRequest::Other(Value::Null),
+            responses_request: None,
         });
     }
 
+    // Use path-based detection for /v1/responses to avoid serde disambiguation issues
+    // (both embeddings and responses requests have an `input` field).
+    let is_responses_path = request_data.uri.path().ends_with("/responses");
+    if is_responses_path {
+        return match serde_json::from_str::<Value>(&body_str) {
+            Ok(value) => {
+                let model = value.get("model").and_then(|v| v.as_str()).map(|s| s.to_string());
+                let stream = value.get("stream").and_then(|v| v.as_bool());
+                Ok(ParsedAIRequest {
+                    headers,
+                    request: AiRequest::Other(value),
+                    responses_request: Some(ResponsesRequest { model, stream }),
+                })
+            }
+            Err(e) => {
+                let base64_encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes);
+                Err(SerializationError {
+                    fallback_data: format!("base64:{base64_encoded}"),
+                    error: Box::new(e),
+                })
+            }
+        };
+    }
+
     match serde_json::from_str(&body_str) {
-        Ok(request) => Ok(ParsedAIRequest { headers, request }),
+        Ok(request) => Ok(ParsedAIRequest {
+            headers,
+            request,
+            responses_request: None,
+        }),
         Err(e) => {
             // Always base64 encode unparseable content to avoid PostgreSQL issues
             let base64_encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes);
@@ -227,11 +257,27 @@ pub fn parse_ai_response(request_data: &RequestData, response_data: &ResponseDat
 
     // Parse response based on request type
     let result = match parse_ai_request(request_data) {
-        Ok(parsed_request) => match parsed_request.request {
-            AiRequest::ChatCompletions(chat_req) if chat_req.stream.unwrap_or(false) => utils::parse_streaming_response(&body_str),
-            AiRequest::Completions(completion_req) if completion_req.stream.unwrap_or(false) => utils::parse_streaming_response(&body_str),
-            _ => utils::parse_non_streaming_response(&body_str),
-        },
+        Ok(parsed_request) => {
+            // /v1/responses has its own SSE event format distinct from chat completions.
+            if let Some(responses_req) = &parsed_request.responses_request {
+                if responses_req.stream.unwrap_or(false) {
+                    utils::parse_responses_streaming_response(&body_str)
+                } else {
+                    // Try the typed Response parser first. Fall back to the generic untagged
+                    // parser so that error bodies (4xx/5xx JSON) are captured as
+                    // AiResponse::Other rather than becoming a base64 SerializationError.
+                    utils::parse_responses_non_streaming_response(&body_str).or_else(|_| utils::parse_non_streaming_response(&body_str))
+                }
+            } else {
+                match parsed_request.request {
+                    AiRequest::ChatCompletions(chat_req) if chat_req.stream.unwrap_or(false) => utils::parse_streaming_response(&body_str),
+                    AiRequest::Completions(completion_req) if completion_req.stream.unwrap_or(false) => {
+                        utils::parse_streaming_response(&body_str)
+                    }
+                    _ => utils::parse_non_streaming_response(&body_str),
+                }
+            }
+        }
         _ => utils::parse_non_streaming_response(&body_str),
     };
 
@@ -270,22 +316,28 @@ impl UsageMetrics {
         // like Responses API's input_text/input_image), fall back to extracting the
         // "model" field from raw JSON.
         let request_model = match parse_ai_request(request_data) {
-            Ok(parsed_request) => match parsed_request.request {
-                AiRequest::ChatCompletions(req) => Some(req.model),
-                AiRequest::Completions(req) => Some(req.model),
-                AiRequest::Embeddings(req) => Some(req.model),
-                AiRequest::Other(ref value) => {
-                    let model = value.get("model").and_then(|v| v.as_str()).map(String::from);
-                    if model.is_some() {
-                        error!(
-                            uri = %request_data.uri,
-                            "Request body has a model field but failed typed deserialization — \
-                             likely uses unsupported content types"
-                        );
+            Ok(parsed_request) => {
+                if let Some(responses_req) = parsed_request.responses_request {
+                    responses_req.model
+                } else {
+                    match parsed_request.request {
+                        AiRequest::ChatCompletions(req) => Some(req.model),
+                        AiRequest::Completions(req) => Some(req.model),
+                        AiRequest::Embeddings(req) => Some(req.model),
+                        AiRequest::Other(ref value) => {
+                            let model = value.get("model").and_then(|v| v.as_str()).map(String::from);
+                            if model.is_some() {
+                                error!(
+                                    uri = %request_data.uri,
+                                    "Request body has a model field but failed typed deserialization — \
+                                     likely uses unsupported content types"
+                                );
+                            }
+                            model
+                        }
                     }
-                    model
                 }
-            },
+            }
             _ => None,
         };
 
@@ -451,6 +503,55 @@ impl From<&AiResponse> for TokenMetrics {
                     total_tokens: usage.total_tokens as i64,
                     response_type: "base64_embeddings".to_string(),
                     response_model: Some(response.model.clone()),
+                }
+            }
+            AiResponse::Responses(response) => {
+                if let Some(usage) = &response.usage {
+                    Self {
+                        prompt_tokens: usage.input_tokens as i64,
+                        completion_tokens: usage.output_tokens as i64,
+                        total_tokens: usage.total_tokens as i64,
+                        response_type: "response".to_string(),
+                        response_model: Some(response.model.clone()),
+                    }
+                } else {
+                    Self {
+                        prompt_tokens: 0,
+                        completion_tokens: 0,
+                        total_tokens: 0,
+                        response_type: "response".to_string(),
+                        response_model: Some(response.model.clone()),
+                    }
+                }
+            }
+            AiResponse::ResponsesStream(events) => {
+                // Usage is reported in the response.completed event.
+                let completed = events.iter().find_map(|e| {
+                    if let ResponseStreamEvent::ResponseCompleted(ev) = e {
+                        Some(&ev.response)
+                    } else {
+                        None
+                    }
+                });
+
+                let model = completed.map(|r| r.model.clone());
+
+                if let Some(usage) = completed.and_then(|r| r.usage.as_ref()) {
+                    Self {
+                        prompt_tokens: usage.input_tokens as i64,
+                        completion_tokens: usage.output_tokens as i64,
+                        total_tokens: usage.total_tokens as i64,
+                        response_type: "response_stream".to_string(),
+                        response_model: model,
+                    }
+                } else {
+                    Self {
+                        prompt_tokens: 0,
+                        completion_tokens: 0,
+                        total_tokens: 0,
+                        response_type: "response_stream".to_string(),
+                        response_model: model,
+                    }
                 }
             }
             AiResponse::Other(_) => Self {
@@ -1129,5 +1230,187 @@ mod tests {
         assert_eq!(metrics.completion_tokens, 0); // Base64 embeddings don't have completion tokens
         assert_eq!(metrics.total_tokens, 4);
         assert_eq!(metrics.response_type, "base64_embeddings");
+    }
+
+    // Minimal valid Response JSON (only non-Option fields filled in)
+    fn responses_api_body(usage: bool) -> String {
+        let usage_json = if usage {
+            r#","usage":{"input_tokens":15,"input_tokens_details":{"cached_tokens":0},"output_tokens":25,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":40}"#
+        } else {
+            ""
+        };
+        format!(
+            r#"{{"id":"resp_123","object":"response","created_at":1234567890,"model":"gpt-4o","status":"completed","output":[]{usage_json}}}"#
+        )
+    }
+
+    fn responses_request_data(stream: Option<bool>) -> RequestData {
+        let stream_field = match stream {
+            Some(true) => r#","stream":true"#,
+            Some(false) => r#","stream":false"#,
+            None => "",
+        };
+        let body = format!(r#"{{"model":"gpt-4o","input":"tell me a joke"{stream_field}}}"#);
+        RequestData {
+            correlation_id: 1,
+            timestamp: SystemTime::now(),
+            method: Method::POST,
+            uri: "/v1/responses".parse::<Uri>().unwrap(),
+            headers: HashMap::new(),
+            body: Some(Bytes::from(body)),
+        }
+    }
+
+    fn responses_response_data(body: String) -> ResponseData {
+        ResponseData {
+            correlation_id: 1,
+            timestamp: SystemTime::now(),
+            status: StatusCode::OK,
+            headers: HashMap::new(),
+            body: Some(Bytes::from(body)),
+            duration: Duration::from_millis(100),
+            duration_to_first_byte: Duration::from_millis(50),
+        }
+    }
+
+    #[test]
+    fn test_parse_ai_request_responses_path_not_classified_as_embeddings() {
+        // Both embeddings and responses requests have an `input` field.
+        // Path-based detection must prevent /v1/responses bodies being classified as Embeddings.
+        let result = parse_ai_request(&responses_request_data(None)).unwrap();
+
+        let rr = result.responses_request.expect("responses_request should be set");
+        assert_eq!(rr.model, Some("gpt-4o".to_string()));
+        assert_eq!(rr.stream, None);
+
+        match result.request {
+            AiRequest::Other(_) => {}
+            _ => panic!("expected AiRequest::Other for /v1/responses, not Embeddings or ChatCompletions"),
+        }
+    }
+
+    #[test]
+    fn test_parse_ai_request_responses_path_stream_flag() {
+        let result = parse_ai_request(&responses_request_data(Some(true))).unwrap();
+        let rr = result.responses_request.unwrap();
+        assert_eq!(rr.stream, Some(true));
+    }
+
+    #[test]
+    fn test_parse_ai_response_responses_non_streaming() {
+        let request_data = responses_request_data(None);
+        let response_data = responses_response_data(responses_api_body(true));
+
+        let result = parse_ai_response(&request_data, &response_data).unwrap();
+
+        match result {
+            AiResponse::Responses(resp) => {
+                assert_eq!(resp.model, "gpt-4o");
+                let usage = resp.usage.expect("usage should be present");
+                assert_eq!(usage.input_tokens, 15);
+                assert_eq!(usage.output_tokens, 25);
+                assert_eq!(usage.total_tokens, 40);
+            }
+            _ => panic!("expected AiResponse::Responses"),
+        }
+    }
+
+    #[test]
+    fn test_parse_ai_response_responses_error_body_falls_back_to_other() {
+        // 4xx/5xx error responses from the provider don't match the Response schema;
+        // they should be stored as AiResponse::Other rather than returning a SerializationError.
+        let request_data = responses_request_data(None);
+        let error_json = r#"{"error":{"message":"invalid request","type":"invalid_request_error","code":"model_not_found"}}"#;
+        let response_data = ResponseData {
+            correlation_id: 1,
+            timestamp: SystemTime::now(),
+            status: StatusCode::BAD_REQUEST,
+            headers: HashMap::new(),
+            body: Some(Bytes::from(error_json)),
+            duration: Duration::from_millis(100),
+            duration_to_first_byte: Duration::from_millis(50),
+        };
+
+        let result = parse_ai_response(&request_data, &response_data).unwrap();
+        match result {
+            AiResponse::Other(_) => {}
+            _ => panic!("expected AiResponse::Other for error body, got something else"),
+        }
+    }
+
+    #[test]
+    fn test_parse_ai_response_responses_streaming() {
+        let request_data = responses_request_data(Some(true));
+
+        // SSE body with a response.completed event carrying usage
+        let completed_data = responses_api_body(true);
+        let sse_body = format!(
+            "data: {{\"type\":\"response.output_text.delta\",\"sequence_number\":1,\"item_id\":\"item_1\",\"output_index\":0,\"content_index\":0,\"delta\":\"Hello\"}}\n\ndata: {{\"type\":\"response.completed\",\"sequence_number\":5,\"response\":{completed_data}}}\n\n"
+        );
+        let response_data = responses_response_data(sse_body);
+
+        let result = parse_ai_response(&request_data, &response_data).unwrap();
+
+        match result {
+            AiResponse::ResponsesStream(events) => {
+                assert!(!events.is_empty(), "should have parsed at least the completed event");
+                let has_completed = events
+                    .iter()
+                    .any(|e| matches!(e, async_openai::types::responses::ResponseStreamEvent::ResponseCompleted(_)));
+                assert!(has_completed, "should contain a ResponseCompleted event");
+            }
+            _ => panic!("expected AiResponse::ResponsesStream"),
+        }
+    }
+
+    #[test]
+    fn test_analytics_metrics_extract_responses_tokens() {
+        let instance_id = Uuid::new_v4();
+        let request_data = responses_request_data(None);
+        let response_data = responses_response_data(responses_api_body(true));
+
+        let parsed_response = parse_ai_response(&request_data, &response_data).unwrap();
+
+        let metrics = UsageMetrics::extract(
+            instance_id,
+            &request_data,
+            &response_data,
+            &parsed_response,
+            &crate::test::utils::create_test_config(),
+        );
+
+        assert_eq!(metrics.request_model, Some("gpt-4o".to_string()));
+        assert_eq!(metrics.response_model, Some("gpt-4o".to_string()));
+        assert_eq!(metrics.prompt_tokens, 15);
+        assert_eq!(metrics.completion_tokens, 25);
+        assert_eq!(metrics.total_tokens, 40);
+        assert_eq!(metrics.response_type, "response");
+    }
+
+    #[test]
+    fn test_analytics_metrics_extract_responses_streaming_tokens() {
+        let instance_id = Uuid::new_v4();
+        let request_data = responses_request_data(Some(true));
+
+        let completed_data = responses_api_body(true);
+        let sse_body = format!("data: {{\"type\":\"response.completed\",\"sequence_number\":5,\"response\":{completed_data}}}\n\n");
+        let response_data = responses_response_data(sse_body);
+
+        let parsed_response = parse_ai_response(&request_data, &response_data).unwrap();
+
+        let metrics = UsageMetrics::extract(
+            instance_id,
+            &request_data,
+            &response_data,
+            &parsed_response,
+            &crate::test::utils::create_test_config(),
+        );
+
+        assert_eq!(metrics.request_model, Some("gpt-4o".to_string()));
+        assert_eq!(metrics.response_model, Some("gpt-4o".to_string()));
+        assert_eq!(metrics.prompt_tokens, 15);
+        assert_eq!(metrics.completion_tokens, 25);
+        assert_eq!(metrics.total_tokens, 40);
+        assert_eq!(metrics.response_type, "response_stream");
     }
 }

@@ -5,8 +5,8 @@ use std::{collections::HashMap, num::NonZeroU32, sync::Arc};
 use metrics::histogram;
 use onwards::target::{
     Auth, ConcurrencyLimitParameters, ConfigFile, FallbackConfig as OnwardsFallbackConfig, KeyDefinition,
-    LoadBalanceStrategy as OnwardsLoadBalanceStrategy, PoolSpec, ProviderSpec, RateLimitParameters, TargetSpec, TargetSpecOrList, Targets,
-    WatchTargetsStream,
+    LoadBalanceStrategy as OnwardsLoadBalanceStrategy, OpenResponsesConfig, PoolSpec, ProviderSpec, RateLimitParameters, RoutingAction,
+    RoutingRule, TargetSpecOrList, Targets, WatchTargetsStream,
 };
 use sqlx::{PgPool, postgres::PgListener};
 use tokio::sync::{mpsc, watch};
@@ -56,6 +56,10 @@ struct OnwardsTarget {
     burst_size: Option<i32>,
     capacity: Option<i32>,
     sanitize_responses: bool,
+    trusted: bool,
+    open_responses_adapter: bool,
+    /// Traffic routing rules from the model_traffic_rules table
+    routing_rules: Vec<RoutingRule>,
 
     // Endpoint info
     endpoint_url: url::Url,
@@ -72,6 +76,7 @@ struct OnwardsTarget {
 struct OnwardsApiKey {
     id: ApiKeyId,
     secret: String,
+    purpose: String,
     requests_per_second: Option<f32>,
     burst_size: Option<i32>,
 }
@@ -409,6 +414,13 @@ struct OnwardsCompositeModel {
     fallback_max_attempts: Option<i32>,
     /// Whether to sanitize/filter sensitive data from model responses
     sanitize_responses: bool,
+    /// Whether to mark provider as trusted in strict mode
+    #[allow(dead_code)] // Stored in DB but composite-level trust is not yet propagated to onwards
+    trusted: bool,
+    /// Whether to enable the open_responses adapter at the pool level
+    open_responses_adapter: bool,
+    /// Traffic routing rules from the database
+    routing_rules: Vec<RoutingRule>,
     components: Vec<CompositeModelComponent>,
     // API keys that have access to this composite model
     api_keys: Vec<OnwardsApiKey>,
@@ -438,6 +450,8 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
             cm.fallback_with_replacement,
             cm.fallback_max_attempts,
             cm.sanitize_responses as composite_sanitize_responses,
+            cm.trusted as composite_trusted,
+            cm.open_responses_adapter as "composite_open_responses_adapter?",
             -- Component info
             dmc.deployed_model_id,
             dmc.weight,
@@ -448,6 +462,8 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
             dm.burst_size as deployment_burst_size,
             dm.capacity as deployment_capacity,
             dm.sanitize_responses as deployment_sanitize_responses,
+            dm.trusted as deployment_trusted,
+            dm.open_responses_adapter as "deployment_open_responses_adapter?",
             -- Endpoint info
             ie.url as "endpoint_url!",
             ie.api_key as endpoint_api_key,
@@ -490,6 +506,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
             cm.id as composite_model_id,
             ak.id as api_key_id,
             ak.secret as api_key_secret,
+            ak.purpose as api_key_purpose,
             ak.requests_per_second,
             ak.burst_size
         FROM deployed_models cm
@@ -497,6 +514,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
             SELECT DISTINCT
                 ak.id,
                 ak.secret,
+                ak.purpose,
                 ak.requests_per_second,
                 ak.burst_size
             FROM api_keys ak
@@ -577,6 +595,9 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                 fallback_with_replacement: row.fallback_with_replacement.unwrap_or(false),
                 fallback_max_attempts: row.fallback_max_attempts,
                 sanitize_responses: row.composite_sanitize_responses,
+                trusted: row.composite_trusted,
+                open_responses_adapter: row.composite_open_responses_adapter.unwrap_or(true),
+                routing_rules: Vec::new(), // Populated from separate query below
                 components: Vec::new(),
                 api_keys: Vec::new(),
             }
@@ -591,6 +612,9 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                 burst_size: row.deployment_burst_size,
                 capacity: row.deployment_capacity,
                 sanitize_responses: row.deployment_sanitize_responses,
+                trusted: row.deployment_trusted,
+                open_responses_adapter: row.deployment_open_responses_adapter.unwrap_or(true),
+                routing_rules: Vec::new(), // Components don't have their own routing rules
                 endpoint_url,
                 endpoint_api_key: row.endpoint_api_key.clone(),
                 auth_header_name: row.auth_header_name.clone(),
@@ -608,6 +632,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                 composite.api_keys.push(OnwardsApiKey {
                     id: row.api_key_id,
                     secret: row.api_key_secret,
+                    purpose: row.api_key_purpose.clone(),
                     requests_per_second: row.requests_per_second,
                     burst_size: row.burst_size,
                 });
@@ -647,12 +672,15 @@ fn convert_composite_to_target_spec(
             _ => None,
         };
 
+        let labels = HashMap::from([("purpose".to_string(), api_key.purpose.clone())]);
+
         key_definitions.insert(
             api_key.id.to_string(),
             KeyDefinition {
                 key: api_key.secret.clone(),
                 rate_limit,
                 concurrency_limit: None,
+                labels,
             },
         );
     }
@@ -741,8 +769,8 @@ fn convert_composite_to_target_spec(
 
             {
                 debug!(
-                    "  Provider '{}' ({}): weight={}, sanitize_response={}",
-                    target.alias, target.model_name, component.weight, composite.sanitize_responses
+                    "  Provider '{}' ({}): weight={}, sanitize_response={}, trusted={}",
+                    target.alias, target.model_name, component.weight, composite.sanitize_responses, target.trusted
                 );
                 ProviderSpec {
                     url: target.endpoint_url.clone(),
@@ -765,7 +793,13 @@ fn convert_composite_to_target_spec(
                     // For composite models, use the composite model's sanitize_responses setting
                     // This ensures the virtual model's toggle controls all providers
                     sanitize_response: composite.sanitize_responses,
+                    open_responses: Some(OpenResponsesConfig {
+                        adapter: target.open_responses_adapter,
+                    }),
                     request_timeout_secs: None,
+                    // Each provider uses its own trusted setting from the database
+                    // This allows fine-grained control over which providers bypass error sanitization
+                    trusted: Some(target.trusted),
                 }
             }
         })
@@ -781,6 +815,8 @@ fn convert_composite_to_target_spec(
     );
 
     // Create PoolSpec with weighted providers
+    // Note: trusted is not set at the pool level for composite models
+    // Each provider uses its own trusted setting via ProviderSpec.trusted
     let pool_spec = PoolSpec {
         keys,
         rate_limit,
@@ -790,7 +826,11 @@ fn convert_composite_to_target_spec(
         providers,
         response_headers: None,
         sanitize_response: composite.sanitize_responses,
-        trusted: false,
+        trusted: false, // Pool-level trusted defaults to false; providers set their own
+        open_responses: Some(OpenResponsesConfig {
+            adapter: composite.open_responses_adapter,
+        }),
+        routing_rules: composite.routing_rules.clone(),
     };
 
     (composite.alias.clone(), TargetSpecOrList::Pool(pool_spec))
@@ -801,7 +841,7 @@ fn convert_composite_to_target_spec(
 fn convert_to_config_file(targets: Vec<OnwardsTarget>, composites: Vec<OnwardsCompositeModel>, strict_mode: bool) -> ConfigFile {
     let mut key_definitions = HashMap::new();
 
-    // Convert regular deployed models (wrapped in TargetSpecOrList::Single)
+    // Convert regular deployed models (wrapped in TargetSpecOrList::Pool)
     let mut target_specs: HashMap<String, TargetSpecOrList> = targets
         .into_iter()
         .map(|target| {
@@ -819,12 +859,16 @@ fn convert_to_config_file(targets: Vec<OnwardsTarget>, composites: Vec<OnwardsCo
                     _ => None,
                 };
 
+                // Build labels from API key purpose
+                let labels = HashMap::from([("purpose".to_string(), api_key.purpose.clone())]);
+
                 key_definitions.insert(
                     api_key.id.to_string(),
                     KeyDefinition {
                         key: api_key.secret.clone(),
                         rate_limit,
                         concurrency_limit: None,
+                        labels,
                     },
                 );
             }
@@ -862,9 +906,9 @@ fn convert_to_config_file(targets: Vec<OnwardsTarget>, composites: Vec<OnwardsCo
                 max_concurrent_requests: capacity as usize,
             });
 
-            let target_spec = TargetSpec {
+            // Build provider spec from target
+            let provider = ProviderSpec {
                 url: target.endpoint_url.clone(),
-                keys,
                 onwards_key: target.endpoint_api_key.clone(),
                 onwards_model: Some(target.model_name.clone()),
                 rate_limit,
@@ -872,13 +916,31 @@ fn convert_to_config_file(targets: Vec<OnwardsTarget>, composites: Vec<OnwardsCo
                 upstream_auth_header_name,
                 upstream_auth_header_prefix,
                 response_headers: None,
-                weight: 1, // Default weight for single-provider targets
+                weight: 1,
                 sanitize_response: target.sanitize_responses,
+                open_responses: Some(OpenResponsesConfig {
+                    adapter: target.open_responses_adapter,
+                }),
                 request_timeout_secs: None,
-                trusted: false,
+                trusted: Some(target.trusted),
             };
 
-            (target.alias, TargetSpecOrList::Single(target_spec))
+            // Use PoolSpec so routing_rules are carried through
+            let pool_spec = PoolSpec {
+                keys,
+                rate_limit: None,
+                concurrency_limit: None,
+                fallback: None,
+                strategy: OnwardsLoadBalanceStrategy::default(),
+                providers: vec![provider],
+                response_headers: None,
+                open_responses: None,
+                sanitize_response: target.sanitize_responses,
+                trusted: false,
+                routing_rules: target.routing_rules,
+            };
+
+            (target.alias, TargetSpecOrList::Pool(pool_spec))
         })
         .collect();
 
@@ -951,6 +1013,8 @@ pub async fn load_targets_from_db(db: &PgPool, escalation_models: &[String], str
             dm.burst_size as deployment_burst_size,
             dm.capacity,
             dm.sanitize_responses,
+            dm.trusted,
+            dm.open_responses_adapter,
             ie.id as endpoint_id,
             ie.url as "endpoint_url!",
             ie.api_key as endpoint_api_key,
@@ -958,6 +1022,7 @@ pub async fn load_targets_from_db(db: &PgPool, escalation_models: &[String], str
             ie.auth_header_prefix,
             ak.id as "api_key_id?",
             ak.secret as "api_key_secret?",
+            ak.purpose as "api_key_purpose?",
             ak.requests_per_second as api_key_requests_per_second,
             ak.burst_size as api_key_burst_size
         FROM deployed_models dm
@@ -966,6 +1031,7 @@ pub async fn load_targets_from_db(db: &PgPool, escalation_models: &[String], str
             SELECT DISTINCT
                 ak.id,
                 ak.secret,
+                ak.purpose,
                 ak.requests_per_second,
                 ak.burst_size
             FROM api_keys ak
@@ -1027,35 +1093,92 @@ pub async fn load_targets_from_db(db: &PgPool, escalation_models: &[String], str
     let mut targets_map: HashMap<DeploymentId, OnwardsTarget> = HashMap::new();
     for row in rows {
         let deployment_id = row.deployment_id;
-        let target = targets_map.entry(deployment_id).or_insert_with(|| OnwardsTarget {
-            model_name: row.model_name.clone(),
-            alias: row.alias.clone(),
-            requests_per_second: row.deployment_requests_per_second,
-            burst_size: row.deployment_burst_size,
-            capacity: row.capacity,
-            sanitize_responses: row.sanitize_responses,
-            endpoint_url: url::Url::parse(&row.endpoint_url).expect("Invalid URL in database"),
-            endpoint_api_key: row.endpoint_api_key.clone(),
-            auth_header_name: row.auth_header_name.clone(),
-            auth_header_prefix: row.auth_header_prefix.clone(),
-            api_keys: Vec::new(),
+        let target = targets_map.entry(deployment_id).or_insert_with(|| {
+            OnwardsTarget {
+                model_name: row.model_name.clone(),
+                alias: row.alias.clone(),
+                requests_per_second: row.deployment_requests_per_second,
+                burst_size: row.deployment_burst_size,
+                capacity: row.capacity,
+                sanitize_responses: row.sanitize_responses,
+                trusted: row.trusted,
+                open_responses_adapter: row.open_responses_adapter.unwrap_or(true),
+                routing_rules: Vec::new(), // Populated from separate query below
+                endpoint_url: url::Url::parse(&row.endpoint_url).expect("Invalid URL in database"),
+                endpoint_api_key: row.endpoint_api_key.clone(),
+                auth_header_name: row.auth_header_name.clone(),
+                auth_header_prefix: row.auth_header_prefix.clone(),
+                api_keys: Vec::new(),
+            }
         });
 
-        if let (Some(api_key_id), Some(api_key_secret)) = (row.api_key_id, row.api_key_secret) {
+        if let (Some(api_key_id), Some(api_key_secret), Some(api_key_purpose)) = (row.api_key_id, row.api_key_secret, row.api_key_purpose) {
             target.api_keys.push(OnwardsApiKey {
                 id: api_key_id,
                 secret: api_key_secret,
+                purpose: api_key_purpose,
                 requests_per_second: row.api_key_requests_per_second,
                 burst_size: row.api_key_burst_size,
             });
         }
     }
 
-    let targets: Vec<_> = targets_map.into_values().collect();
-    debug!("Loaded {} deployed models", targets.len());
+    debug!("Loaded {} deployed models", targets_map.len());
 
     // Load composite models (pass escalation_models to grant batch API keys access)
     let composites = load_composite_models_from_db(db, escalation_models).await?;
+
+    // Load traffic routing rules for all non-deleted models (regular + composite)
+    let traffic_rule_rows = sqlx::query!(
+        r#"
+        SELECT mtr.deployed_model_id, mtr.api_key_purpose, mtr.action,
+               dm.alias as "redirect_target_alias?"
+        FROM model_traffic_rules mtr
+        LEFT JOIN deployed_models dm ON dm.id = mtr.redirect_target_id
+        WHERE mtr.deployed_model_id IN (
+            SELECT id FROM deployed_models WHERE deleted = FALSE
+        )
+        ORDER BY mtr.deployed_model_id, mtr.api_key_purpose
+        "#
+    )
+    .fetch_all(db)
+    .await?;
+
+    // Build a map of deployment_id → routing rules
+    let mut routing_rules_map: HashMap<DeploymentId, Vec<RoutingRule>> = HashMap::new();
+    for rule_row in traffic_rule_rows {
+        let routing_rule = RoutingRule {
+            match_labels: HashMap::from([("purpose".to_string(), rule_row.api_key_purpose)]),
+            action: match rule_row.action.as_str() {
+                "deny" => RoutingAction::Deny,
+                "redirect" => RoutingAction::Redirect {
+                    target: rule_row.redirect_target_alias.unwrap_or_default(),
+                },
+                _ => continue,
+            },
+        };
+        routing_rules_map.entry(rule_row.deployed_model_id).or_default().push(routing_rule);
+    }
+
+    // Attach routing rules to regular targets
+    for (deployment_id, target) in &mut targets_map {
+        if let Some(rules) = routing_rules_map.remove(deployment_id) {
+            target.routing_rules = rules;
+        }
+    }
+
+    let targets: Vec<_> = targets_map.into_values().collect();
+
+    // Attach routing rules to composite models
+    let composites: Vec<_> = composites
+        .into_iter()
+        .map(|mut c| {
+            if let Some(rules) = routing_rules_map.remove(&c.id) {
+                c.routing_rules = rules;
+            }
+            c
+        })
+        .collect();
 
     // Convert to ConfigFile format
     let config = convert_to_config_file(targets, composites, strict_mode);
@@ -1098,523 +1221,4 @@ async fn update_daemon_capacity_limits(db: &PgPool, limits: &Arc<dashmap::DashMa
 }
 
 #[cfg(test)]
-mod tests {
-    use std::{str::FromStr, time::Duration};
-
-    use onwards::target::TargetSpecOrList;
-    use tokio::{sync::mpsc, time::timeout};
-    use tokio_util::sync::CancellationToken;
-
-    use crate::sync::onwards_config::{OnwardsTarget, SyncConfig, convert_to_config_file, parse_notify_payload};
-
-    // Helper function to create a test target
-    fn create_test_target(model_name: &str, alias: &str, endpoint_url: &str) -> OnwardsTarget {
-        OnwardsTarget {
-            model_name: model_name.to_string(),
-            alias: alias.to_string(),
-            requests_per_second: None,
-            burst_size: None,
-            capacity: None,
-            sanitize_responses: true,
-            endpoint_url: url::Url::parse(endpoint_url).unwrap(),
-            endpoint_api_key: None,
-            auth_header_name: "Authorization".to_string(),
-            auth_header_prefix: "Bearer ".to_string(),
-            api_keys: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn test_convert_to_config_file() {
-        // Create test targets
-        let target1 = create_test_target("gpt-4", "gpt4-alias", "https://api.openai.com");
-        let target2 = create_test_target("claude-3", "claude-alias", "https://api.anthropic.com");
-
-        let targets = vec![target1, target2];
-        let config = convert_to_config_file(targets, vec![], false);
-
-        // Verify the config
-        assert_eq!(config.targets.len(), 2);
-
-        // Check model1 (using alias as key)
-        let target1 = &config.targets["gpt4-alias"];
-        if let TargetSpecOrList::Single(spec) = target1 {
-            assert_eq!(spec.url.as_str(), "https://api.openai.com/");
-            assert_eq!(spec.onwards_model, Some("gpt-4".to_string()));
-            // Since we provided empty key data, targets should have no keys configured
-            assert!(spec.keys.is_none() || spec.keys.as_ref().unwrap().is_empty());
-        } else {
-            panic!("Expected Single target spec");
-        }
-
-        // Check model2 (using alias as key)
-        let target2 = &config.targets["claude-alias"];
-        if let TargetSpecOrList::Single(spec) = target2 {
-            assert_eq!(spec.url.as_str(), "https://api.anthropic.com/");
-            assert_eq!(spec.onwards_model, Some("claude-3".to_string()));
-            assert!(spec.keys.is_none() || spec.keys.as_ref().unwrap().is_empty());
-        } else {
-            panic!("Expected Single target spec");
-        }
-    }
-
-    #[test]
-    fn test_convert_to_config_file_with_single_target() {
-        // Create a single test target
-        let target = create_test_target("valid-model", "valid-alias", "https://api.valid.com");
-
-        let targets = vec![target];
-        let config = convert_to_config_file(targets, vec![], false);
-
-        // Should have exactly one target
-        assert_eq!(config.targets.len(), 1);
-        assert!(config.targets.contains_key("valid-alias"));
-    }
-
-    #[test]
-    fn test_parse_notify_payload() {
-        // Test valid payload
-        let now_micros = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_micros() as i64;
-        let payload = format!("api_keys:{}", now_micros);
-        let result = parse_notify_payload(&payload);
-        assert!(result.is_some());
-        let (table_name, lag) = result.unwrap();
-        assert_eq!(table_name, "api_keys");
-        // Lag should be very small (< 100ms) since we just created the timestamp
-        assert!(lag.as_millis() < 100, "Lag should be < 100ms, got {:?}", lag);
-
-        // Test payload from 1 second ago
-        let old_micros = now_micros - 1_000_000; // 1 second ago
-        let old_payload = format!("deployed_models:{}", old_micros);
-        let result = parse_notify_payload(&old_payload);
-        assert!(result.is_some());
-        let (table_name, lag) = result.unwrap();
-        assert_eq!(table_name, "deployed_models");
-        // Lag should be around 1 second
-        assert!(
-            lag.as_millis() >= 1000 && lag.as_millis() < 1100,
-            "Lag should be ~1s, got {:?}",
-            lag
-        );
-
-        // Test invalid payloads
-        assert!(parse_notify_payload("").is_none());
-        assert!(parse_notify_payload("no_colon").is_none());
-        assert!(parse_notify_payload("table:not_a_number").is_none());
-        assert!(parse_notify_payload("too:many:colons").is_none());
-    }
-
-    #[sqlx::test]
-    /// Test that tariff changes trigger onwards config reload via Postgres NOTIFY
-    async fn test_onwards_config_reloads_on_tariff_change(pool: sqlx::PgPool) {
-        use crate::Role;
-        use crate::db::handlers::{Deployments, InferenceEndpoints, Repository, Tariffs};
-        use crate::db::models::{
-            deployments::DeploymentCreateDBRequest, inference_endpoints::InferenceEndpointCreateDBRequest, tariffs::TariffCreateDBRequest,
-        };
-        use rust_decimal::Decimal;
-        use sqlx::postgres::PgListener;
-
-        // Create test user
-        let test_user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
-
-        // Set up a listener to verify notifications are sent
-        let mut listener = PgListener::connect_with(&pool).await.unwrap();
-        listener.listen("auth_config_changed").await.unwrap();
-
-        // Create test endpoint
-        let mut endpoint_tx = pool.begin().await.unwrap();
-        let mut endpoints_repo = InferenceEndpoints::new(&mut endpoint_tx);
-        let endpoint = endpoints_repo
-            .create(&InferenceEndpointCreateDBRequest {
-                created_by: test_user.id,
-                name: "test-endpoint".to_string(),
-                description: None,
-                url: url::Url::from_str("https://api.test.com").unwrap(),
-                api_key: None,
-                model_filter: None,
-                auth_header_name: Some("Authorization".to_string()),
-                auth_header_prefix: Some("Bearer ".to_string()),
-            })
-            .await
-            .unwrap();
-        endpoint_tx.commit().await.unwrap();
-
-        // Create test deployment
-        let mut deployment_tx = pool.begin().await.unwrap();
-        let mut deployments_repo = Deployments::new(&mut deployment_tx);
-        let deployment = deployments_repo
-            .create(&DeploymentCreateDBRequest {
-                created_by: test_user.id,
-                model_name: "test-model".to_string(),
-                alias: "test-alias".to_string(),
-                description: None,
-                model_type: None,
-                capabilities: None,
-                hosted_on: Some(endpoint.id),
-                requests_per_second: None,
-                burst_size: None,
-                capacity: None,
-                batch_capacity: None,
-                throughput: None,
-                provider_pricing: None,
-                // Composite model fields (regular model = not composite)
-                is_composite: false,
-                lb_strategy: None,
-                fallback_enabled: None,
-                fallback_on_rate_limit: None,
-                fallback_on_status: None,
-                fallback_with_replacement: None,
-                fallback_max_attempts: None,
-                sanitize_responses: true,
-            })
-            .await
-            .unwrap();
-        deployment_tx.commit().await.unwrap();
-
-        // Drain any pending notifications from setup
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        while timeout(Duration::from_millis(10), listener.try_recv()).await.is_ok() {
-            // Drain
-        }
-
-        // Now create a tariff - this should trigger a notification
-        let mut tariff_tx = pool.begin().await.unwrap();
-        let mut tariffs_repo = Tariffs::new(&mut tariff_tx);
-        tariffs_repo
-            .create(&TariffCreateDBRequest {
-                deployed_model_id: deployment.id,
-                name: "default".to_string(),
-                input_price_per_token: Decimal::new(1, 6),  // $0.000001
-                output_price_per_token: Decimal::new(2, 6), // $0.000002
-                api_key_purpose: None,
-                completion_window: None,
-                valid_from: None,
-            })
-            .await
-            .unwrap();
-        tariff_tx.commit().await.unwrap();
-
-        // Wait for notification
-        let notification = timeout(Duration::from_secs(2), listener.recv())
-            .await
-            .expect("Timeout waiting for tariff change notification")
-            .expect("Failed to receive notification");
-
-        // Verify notification contains tariff table reference
-        assert!(
-            notification.payload().contains("model_tariffs"),
-            "Notification should reference model_tariffs table"
-        );
-    }
-
-    #[sqlx::test]
-    /// Test that batch API keys get automatic access to composite escalation targets
-    async fn test_batch_api_key_access_to_composite_escalation_target(pool: sqlx::PgPool) {
-        use std::str::FromStr;
-
-        use onwards::auth::ConstantTimeString;
-
-        use crate::Role;
-        use crate::db::handlers::{Deployments, InferenceEndpoints, Repository, api_keys::ApiKeys};
-        use crate::db::models::{
-            api_keys::{ApiKeyCreateDBRequest, ApiKeyPurpose},
-            deployments::{DeploymentCreateDBRequest, LoadBalancingStrategy},
-            inference_endpoints::InferenceEndpointCreateDBRequest,
-        };
-
-        // Create test user
-        let test_user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
-
-        // Grant credits to the user (required for API key access)
-        sqlx::query!(
-            r#"
-            INSERT INTO credits_transactions (user_id, amount, transaction_type, source_id, balance_after, description)
-            VALUES ($1, 1000000, 'admin_grant', 'test-grant', 1000000, 'Test credits for API key access')
-            "#,
-            test_user.id
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        // Create test endpoint
-        let mut endpoint_tx = pool.begin().await.unwrap();
-        let mut endpoints_repo = InferenceEndpoints::new(&mut endpoint_tx);
-        let endpoint = endpoints_repo
-            .create(&InferenceEndpointCreateDBRequest {
-                created_by: test_user.id,
-                name: "test-endpoint".to_string(),
-                description: None,
-                url: url::Url::from_str("https://api.test.com").unwrap(),
-                api_key: None,
-                model_filter: None,
-                auth_header_name: Some("Authorization".to_string()),
-                auth_header_prefix: Some("Bearer ".to_string()),
-            })
-            .await
-            .unwrap();
-        endpoint_tx.commit().await.unwrap();
-
-        // Create component model (regular deployment)
-        let mut component_tx = pool.begin().await.unwrap();
-        let mut deployments_repo = Deployments::new(&mut component_tx);
-        let component_model = deployments_repo
-            .create(&DeploymentCreateDBRequest {
-                created_by: test_user.id,
-                model_name: "gpt-4".to_string(),
-                alias: "gpt-4-component".to_string(),
-                description: None,
-                model_type: None,
-                capabilities: None,
-                hosted_on: Some(endpoint.id),
-                requests_per_second: None,
-                burst_size: None,
-                capacity: None,
-                batch_capacity: None,
-                throughput: None,
-                provider_pricing: None,
-                is_composite: false,
-                lb_strategy: None,
-                fallback_enabled: None,
-                fallback_on_rate_limit: None,
-                fallback_on_status: None,
-                fallback_with_replacement: None,
-                fallback_max_attempts: None,
-                sanitize_responses: true,
-            })
-            .await
-            .unwrap();
-        component_tx.commit().await.unwrap();
-
-        // Create composite model with escalation alias
-        let composite_alias = "escalation-composite".to_string();
-        let mut composite_tx = pool.begin().await.unwrap();
-        let mut deployments_repo = Deployments::new(&mut composite_tx);
-        let composite_model = deployments_repo
-            .create(&DeploymentCreateDBRequest {
-                created_by: test_user.id,
-                model_name: "composite-model".to_string(),
-                alias: composite_alias.clone(),
-                description: Some("Composite escalation target".to_string()),
-                model_type: None,
-                capabilities: None,
-                hosted_on: None, // Composite models have no direct endpoint
-                requests_per_second: None,
-                burst_size: None,
-                capacity: None,
-                batch_capacity: None,
-                throughput: None,
-                provider_pricing: None,
-                is_composite: true,
-                lb_strategy: Some(LoadBalancingStrategy::WeightedRandom),
-                fallback_enabled: Some(true),
-                fallback_on_rate_limit: Some(true),
-                fallback_on_status: Some(vec![429, 500, 502, 503, 504]),
-                fallback_with_replacement: None,
-                fallback_max_attempts: None,
-                sanitize_responses: true,
-            })
-            .await
-            .unwrap();
-        composite_tx.commit().await.unwrap();
-
-        // Link component to composite model
-        sqlx::query!(
-            r#"
-            INSERT INTO deployed_model_components (composite_model_id, deployed_model_id, weight, sort_order, enabled)
-            VALUES ($1, $2, 100, 0, TRUE)
-            "#,
-            composite_model.id,
-            component_model.id,
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        // Create batch-purpose API key
-        let mut api_key_tx = pool.begin().await.unwrap();
-        let mut api_keys_repo = ApiKeys::new(&mut api_key_tx);
-        let batch_api_key = api_keys_repo
-            .create(&ApiKeyCreateDBRequest {
-                user_id: test_user.id,
-                name: "batch-key".to_string(),
-                description: None,
-                purpose: ApiKeyPurpose::Batch,
-                requests_per_second: None,
-                burst_size: None,
-            })
-            .await
-            .unwrap();
-        api_key_tx.commit().await.unwrap();
-
-        // Load targets with composite alias in escalation_models
-        let escalation_models = vec![composite_alias.clone()];
-        let targets = super::load_targets_from_db(&pool, &escalation_models, false).await.unwrap();
-
-        // Find the composite model in targets (DashMap)
-        let composite_target = targets.targets.get(&composite_alias).expect("Composite model should be in targets");
-
-        // Access the ProviderPool from the DashMap entry
-        let pool_spec = composite_target.value();
-
-        // Verify batch API key has access
-        // Keys are stored as ConstantTimeString in onwards
-        let batch_key_ct = ConstantTimeString::from(batch_api_key.secret.clone());
-        let keys = pool_spec.keys().expect("Composite model should have keys");
-        let has_batch_key = keys.iter().any(|k| k == &batch_key_ct);
-
-        assert!(has_batch_key, "Batch API key should have access to composite escalation target");
-    }
-
-    /// Regression test: onwards_config should reconnect after connection loss
-    /// and successfully resume receiving notifications.
-    #[sqlx::test]
-    #[test_log::test]
-    async fn test_onwards_config_reconnects_after_connection_loss(pool: sqlx::PgPool) {
-        // Start the onwards config sync with status channel
-        let (sync, _initial_targets, _stream) = super::OnwardsConfigSync::new(pool.clone())
-            .await
-            .expect("Failed to create OnwardsConfigSync");
-
-        let (status_tx, mut status_rx) = mpsc::channel(10);
-        let config = SyncConfig {
-            status_tx: Some(status_tx),
-            fallback_interval_milliseconds: 10000,
-        };
-        let shutdown_token = CancellationToken::new();
-        let mut sync_handle = tokio::spawn({
-            let shutdown = shutdown_token.clone();
-            async move { sync.start(config, shutdown).await }
-        });
-
-        // Wait for initial connection
-        println!("Waiting for Connecting status...");
-        assert_eq!(status_rx.recv().await, Some(super::SyncStatus::Connecting));
-        println!("Waiting for Connected status...");
-        assert_eq!(status_rx.recv().await, Some(super::SyncStatus::Connected));
-        println!("Initial connection established");
-
-        // Kill the LISTEN connection to simulate network interruption
-        // First, get the PIDs of LISTEN connections
-        let pids: Vec<i32> = sqlx::query_scalar(
-            "SELECT pid FROM pg_stat_activity
-             WHERE query LIKE '%LISTEN%auth_config_changed%'
-             AND pid != pg_backend_pid()",
-        )
-        .fetch_all(&pool)
-        .await
-        .expect("Failed to find LISTEN connections");
-
-        assert!(!pids.is_empty(), "Should have found at least one LISTEN connection");
-        println!("Found {} LISTEN connections to kill: {:?}", pids.len(), pids);
-
-        // Now kill them one by one
-        for pid in &pids {
-            let _: bool = sqlx::query_scalar("SELECT pg_terminate_backend($1)")
-                .bind(pid)
-                .fetch_one(&pool)
-                .await
-                .expect("Failed to terminate backend");
-        }
-        println!("Killed LISTEN connections");
-
-        // Wait for reconnection status events
-        println!("Waiting for Disconnected status...");
-        // Add a timeout in case the Disconnected status never arrives
-        let status = timeout(Duration::from_secs(2), status_rx.recv())
-            .await
-            .expect("Timeout waiting for Disconnected status - the dead connection wasn't detected");
-        assert_eq!(
-            status,
-            Some(super::SyncStatus::Disconnected),
-            "Should receive Disconnected after kill"
-        );
-
-        println!("Waiting for Reconnecting status...");
-        let status = status_rx.recv().await;
-        assert_eq!(status, Some(super::SyncStatus::Reconnecting), "Should receive Reconnecting");
-
-        // Wait up to 7 seconds for successful reconnection (5s delay + 2s buffer)
-        let reconnected = timeout(Duration::from_secs(7), async {
-            loop {
-                match status_rx.recv().await {
-                    Some(super::SyncStatus::Connected) => return true,
-                    Some(status) => println!("Received status: {:?}", status),
-                    None => return false,
-                }
-            }
-        })
-        .await;
-
-        assert!(
-            reconnected.is_ok(),
-            "Should reconnect after connection loss (BUG: current code calls listen() on broken connection)"
-        );
-
-        // Verify task is still running
-        let result = timeout(Duration::from_millis(100), &mut sync_handle).await;
-        assert!(result.is_err(), "Task should still be running after reconnection");
-        sync_handle.abort();
-    }
-
-    #[sqlx::test]
-    #[test_log::test]
-    /// Test that fallback sync triggers periodic reloads even without LISTEN/NOTIFY activity
-    async fn test_fallback_sync_triggers_without_notifications(pool: sqlx::PgPool) {
-        use tokio::sync::mpsc;
-        use tokio_util::sync::CancellationToken;
-
-        // Create the sync service
-        let (sync, _initial_targets, _stream) = super::OnwardsConfigSync::new(pool.clone())
-            .await
-            .expect("Failed to create OnwardsConfigSync");
-
-        // Create sync config with 200ms fallback interval for fast testing
-        let (status_tx, mut status_rx) = mpsc::channel(10);
-        let config = SyncConfig {
-            status_tx: Some(status_tx),
-            fallback_interval_milliseconds: 20,
-        };
-
-        let shutdown_token = CancellationToken::new();
-        let mut sync_handle = tokio::spawn({
-            let token = shutdown_token.clone();
-            async move { sync.start(config, token).await }
-        });
-
-        // Wait for initial connection
-        println!("Waiting for Connecting status...");
-        assert_eq!(status_rx.recv().await, Some(super::SyncStatus::Connecting));
-        println!("Waiting for Connected status...");
-        assert_eq!(status_rx.recv().await, Some(super::SyncStatus::Connected));
-        println!("Initial connection established");
-
-        // Poll task health to ensure fallback sync doesn't crash
-        // Use interval to poll every 100ms for 500ms total (at least 2 fallback syncs at 200ms each)
-        println!("Polling task health while waiting for fallback sync...");
-        let mut poll_interval = tokio::time::interval(Duration::from_millis(100));
-        poll_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-        for i in 0..5 {
-            poll_interval.tick().await;
-
-            // Check task is still running (timeout ensures we don't block if it finished)
-            let result = timeout(Duration::from_millis(10), &mut sync_handle).await;
-            assert!(
-                result.is_err(),
-                "Task should still be running at poll {} (proves fallback timer doesn't crash)",
-                i
-            );
-        }
-
-        println!("✅ Fallback sync working: task remained healthy through 5 health polls over 500ms");
-
-        // Cleanup
-        shutdown_token.cancel();
-        let _ = timeout(Duration::from_secs(1), sync_handle).await;
-    }
-}
+mod tests;

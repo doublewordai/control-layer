@@ -3125,7 +3125,7 @@ mod tests {
             limit: 0,
             field_name: None,
         };
-        let _stream_read = multer::Error::StreamReadFailed(Box::new(std::io::Error::new(std::io::ErrorKind::Other, "test")));
+        let _stream_read = multer::Error::StreamReadFailed(Box::new(std::io::Error::other("test")));
     }
 
     /// Compile-time test: Ensure axum's LengthLimitError exists.
