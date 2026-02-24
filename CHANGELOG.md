@@ -1,5 +1,14 @@
 # Changelog
 
+## [8.7.0](https://github.com/doublewordai/control-layer/compare/v8.6.0...v8.7.0) (2026-02-24)
+
+
+### Features
+
+* add trusted provider flag for strict mode response sanitization ([#724](https://github.com/doublewordai/control-layer/issues/724)) ([1fb3703](https://github.com/doublewordai/control-layer/commit/1fb3703139d587220154ab56e5e237173a31eb12))
+* **billing:** add token usage extraction for OpenAI Responses API ([#753](https://github.com/doublewordai/control-layer/issues/753)) ([2258d24](https://github.com/doublewordai/control-layer/commit/2258d24b98efb63f1b9876a58a6affa0e4dc6889))
+* edit throughput in UI ([#722](https://github.com/doublewordai/control-layer/issues/722)) ([60fd5ec](https://github.com/doublewordai/control-layer/commit/60fd5ec498db4698f7a15b2f2bc5291e8c404862))
+
 ## [8.6.0](https://github.com/doublewordai/control-layer/compare/v8.5.0...v8.6.0) (2026-02-23)
 
 
