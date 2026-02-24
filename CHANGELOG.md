@@ -1,5 +1,17 @@
 # Changelog
 
+## [8.9.0](https://github.com/doublewordai/control-layer/compare/v8.8.1...v8.9.0) (2026-02-24)
+
+
+### Features
+
+* User usage dashboard ([#729](https://github.com/doublewordai/control-layer/issues/729)) ([34ca712](https://github.com/doublewordai/control-layer/commit/34ca712fdf750cc529bc9ede9842af0abca276cf))
+
+
+### Bug Fixes
+
+* Logging cleanup ([#764](https://github.com/doublewordai/control-layer/issues/764)) ([3a44a05](https://github.com/doublewordai/control-layer/commit/3a44a057354a5ef2e037d03158bd524ec35d75b1))
+
 ## [8.8.1](https://github.com/doublewordai/control-layer/compare/v8.8.0...v8.8.1) (2026-02-24)
 
 
