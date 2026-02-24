@@ -21,6 +21,7 @@ import {
   useProbes,
   useModelComponents,
   useDaemons,
+  useConfig,
 } from "../../../../api/control-layer";
 import { useAuthorization } from "../../../../utils";
 import {
@@ -120,10 +121,13 @@ const ModelInfo: React.FC = () => {
     model_type: "" as "CHAT" | "EMBEDDINGS" | "",
     capabilities: [] as string[],
     sanitize_responses: false,
+    trusted: false,
+    open_responses_adapter: true,
     requests_per_second: null as number | null,
     burst_size: null as number | null,
     capacity: null as number | null,
     batch_capacity: null as number | null,
+    throughput: null as number | null,
   });
   const [settingsError, setSettingsError] = useState<string | null>(null);
   const [showApiExamples, setShowApiExamples] = useState(false);
@@ -147,6 +151,10 @@ const ModelInfo: React.FC = () => {
   });
 
   const updateModelMutation = useUpdateModel();
+
+  // Get config to check for strict mode
+  const { data: config } = useConfig();
+  const strictModeEnabled = config?.onwards?.strict_mode ?? false;
 
   // Build include parameter based on permissions
   const includeParam = useMemo(() => {
@@ -209,10 +217,13 @@ const ModelInfo: React.FC = () => {
         model_type: effectiveType as "CHAT" | "EMBEDDINGS",
         capabilities: model.capabilities || [],
         sanitize_responses: model.sanitize_responses ?? false,
+        trusted: model.trusted ?? false,
+        open_responses_adapter: model.open_responses_adapter ?? true,
         requests_per_second: model.requests_per_second || null,
         burst_size: model.burst_size || null,
         capacity: model.capacity || null,
         batch_capacity: model.batch_capacity || null,
+        throughput: model.throughput || null,
       });
       aliasForm.reset({
         alias: model.alias,
@@ -240,12 +251,15 @@ const ModelInfo: React.FC = () => {
               : (updateData.model_type as "CHAT" | "EMBEDDINGS"),
           capabilities: updateData.capabilities,
           sanitize_responses: updateData.sanitize_responses,
+          trusted: updateData.trusted,
+          open_responses_adapter: updateData.open_responses_adapter,
           // Always include rate limiting and capacity fields to handle clearing properly
           // Send null as the actual value when clearing (not undefined)
           requests_per_second: updateData.requests_per_second,
           burst_size: updateData.burst_size,
           capacity: updateData.capacity,
           batch_capacity: updateData.batch_capacity,
+          throughput: updateData.throughput,
         },
       });
       setIsEditingModelDetails(false);
@@ -268,10 +282,13 @@ const ModelInfo: React.FC = () => {
         model_type: effectiveType as "CHAT" | "EMBEDDINGS",
         capabilities: model.capabilities || [],
         sanitize_responses: model.sanitize_responses ?? false,
+        trusted: model.trusted ?? false,
+        open_responses_adapter: model.open_responses_adapter ?? true,
         requests_per_second: model.requests_per_second || null,
         burst_size: model.burst_size || null,
         capacity: model.capacity || null,
         batch_capacity: model.batch_capacity || null,
+        throughput: model.throughput || null,
       });
     }
     setIsEditingModelDetails(false);
@@ -737,32 +754,104 @@ const ModelInfo: React.FC = () => {
                             </p>
                           </InfoTip>
                         </div>
-                        <div className="flex items-center space-x-2">
-                          <input
-                            type="checkbox"
-                            id="sanitize-responses"
-                            checked={updateData.sanitize_responses ?? false}
-                            onChange={(e) => {
-                              setUpdateData((prev) => ({
-                                ...prev,
-                                sanitize_responses: e.target.checked,
-                              }));
-                            }}
-                            className="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
-                          />
-                          <label
-                            htmlFor="sanitize-responses"
-                            className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70 flex items-center gap-1"
-                          >
-                            Sanitize Responses
-                            <InfoTip>
-                              <p className="text-sm text-muted-foreground">
-                                Filter out third-party provider fields from
-                                OpenAI compatible responses to ensure clean,
-                                standardized API responses.
-                              </p>
-                            </InfoTip>
-                          </label>
+
+                        <div className="space-y-2">
+                          {/* Show sanitize_responses when strict mode is OFF */}
+                          {!strictModeEnabled && (
+                            <div className="flex items-center space-x-2">
+                              <input
+                                type="checkbox"
+                                id="sanitize-responses"
+                                checked={updateData.sanitize_responses ?? false}
+                                onChange={(e) => {
+                                  setUpdateData((prev) => ({
+                                    ...prev,
+                                    sanitize_responses: e.target.checked,
+                                  }));
+                                }}
+                                className="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                              />
+                              <label
+                                htmlFor="sanitize-responses"
+                                className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70 flex items-center gap-1"
+                              >
+                                Sanitize Responses
+                                <InfoTip>
+                                  <p className="text-sm text-muted-foreground">
+                                    Filter out third-party provider fields from
+                                    OpenAI compatible responses to ensure clean,
+                                    standardized API responses.
+                                  </p>
+                                </InfoTip>
+                              </label>
+                            </div>
+                          )}
+
+                          {/* Show trusted and responses adapter for standard models when strict mode is ON */}
+                          {!model.is_composite && strictModeEnabled && (
+                            <>
+                              <div className="flex items-center space-x-2">
+                                <input
+                                  type="checkbox"
+                                  id="trusted-provider"
+                                  checked={updateData.trusted ?? false}
+                                  onChange={(e) => {
+                                    setUpdateData((prev) => ({
+                                      ...prev,
+                                      trusted: e.target.checked,
+                                    }));
+                                  }}
+                                  className="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                                />
+                                <label
+                                  htmlFor="trusted-provider"
+                                  className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70 flex items-center gap-1"
+                                >
+                                  Trusted Provider
+                                  <InfoTip>
+                                    <p className="text-sm text-muted-foreground">
+                                      Mark this provider as trusted in strict
+                                      mode. Trusted providers bypass error
+                                      sanitization, allowing full error details
+                                      to be returned. Non-trusted providers have
+                                      sensitive error information removed.
+                                    </p>
+                                  </InfoTip>
+                                </label>
+                              </div>
+                              <div className="flex items-center space-x-2">
+                                <input
+                                  type="checkbox"
+                                  id="open-responses-adapter"
+                                  checked={
+                                    updateData.open_responses_adapter ?? true
+                                  }
+                                  onChange={(e) => {
+                                    setUpdateData((prev) => ({
+                                      ...prev,
+                                      open_responses_adapter: e.target.checked,
+                                    }));
+                                  }}
+                                  className="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                                />
+                                <label
+                                  htmlFor="open-responses-adapter"
+                                  className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70 flex items-center gap-1"
+                                >
+                                  Responses API Adapter
+                                  <InfoTip>
+                                    <p className="text-sm text-muted-foreground">
+                                      Enable the adapter that converts OpenAI
+                                      Responses API requests (/v1/responses) to
+                                      Chat Completions (/v1/chat/completions)
+                                      for providers that don&apos;t natively
+                                      support the Responses API.
+                                    </p>
+                                  </InfoTip>
+                                </label>
+                              </div>
+                            </>
+                          )}
                         </div>
                       </div>
 
@@ -776,7 +865,8 @@ const ModelInfo: React.FC = () => {
                             <p className="text-sm text-muted-foreground">
                               Set system-wide rate limits for this model.
                               These apply to all users and override individual
-                              API key limits.
+                              API key limits. Leave fields blank for no
+                              limits/defaults.
                             </p>
                           </InfoTip>
                         </div>
@@ -891,6 +981,19 @@ const ModelInfo: React.FC = () => {
                                   daemons.
                                 </p>
                               </InfoTip>
+                              {runningDaemonCount > 0 && (
+                                <span className="text-xs text-gray-500">
+                                  ({runningDaemonCount}{" "}
+                                  {runningDaemonCount === 1
+                                    ? "daemon"
+                                    : "daemons"}{" "}
+                                  running
+                                  {updateData.batch_capacity
+                                    ? ` · ${(updateData.batch_capacity * runningDaemonCount).toLocaleString()} total capacity`
+                                    : ""}
+                                  )
+                                </span>
+                              )}
                             </label>
                             <Input
                               type="number"
@@ -914,24 +1017,46 @@ const ModelInfo: React.FC = () => {
                                   : "None"
                               }
                             />
-                            {runningDaemonCount > 0 && (
-                              <p className="text-xs text-gray-500 mt-1">
-                                {runningDaemonCount}{" "}
-                                {runningDaemonCount === 1
-                                  ? "daemon"
-                                  : "daemons"}{" "}
-                                running
-                                {updateData.batch_capacity
-                                  ? ` · ${(updateData.batch_capacity * runningDaemonCount).toLocaleString()} total capacity`
-                                  : ""}
-                              </p>
-                            )}
+                          </div>
+                          <div>
+                            <label className="text-sm text-gray-600 mb-2 flex items-center gap-1">
+                              Throughput
+                              <InfoTip>
+                                <p className="text-sm text-muted-foreground">
+                                  Model throughput in requests per second,
+                                  used for batch SLA capacity calculations.
+                                  Defaults to 100 req/s if not set.
+                                </p>
+                              </InfoTip>
+                            </label>
+                            <Input
+                              type="number"
+                              min="1"
+                              max="1000"
+                              step="1"
+                              value={updateData.throughput || ""}
+                              onChange={(e) =>
+                                setUpdateData((prev) => ({
+                                  ...prev,
+                                  throughput:
+                                    e.target.value === ""
+                                      ? null
+                                      : Number(e.target.value),
+                                }))
+                              }
+                              placeholder={
+                                updateData.throughput !== null
+                                  ? updateData.throughput?.toString() || "None"
+                                  : "None"
+                              }
+                            />
                           </div>
                         </div>
                         {(updateData.requests_per_second ||
                           updateData.burst_size ||
                           updateData.capacity ||
-                          updateData.batch_capacity) && (
+                          updateData.batch_capacity ||
+                          updateData.throughput) && (
                           <div className="mt-3">
                             <Button
                               type="button"
@@ -944,6 +1069,7 @@ const ModelInfo: React.FC = () => {
                                   burst_size: null,
                                   capacity: null,
                                   batch_capacity: null,
+                                  throughput: null,
                                 }))
                               }
                               className="text-xs"
@@ -952,9 +1078,6 @@ const ModelInfo: React.FC = () => {
                             </Button>
                           </div>
                         )}
-                        <p className="text-xs text-gray-500 mt-2">
-                          Leave fields blank for no limits.
-                        </p>
                         {updateData.burst_size &&
                           !updateData.requests_per_second && (
                             <div className="mt-2 p-2 bg-yellow-50 border border-yellow-200 rounded-md">
@@ -1249,7 +1372,8 @@ const ModelInfo: React.FC = () => {
                         (model.requests_per_second !== undefined ||
                           model.burst_size !== undefined ||
                           model.capacity !== undefined ||
-                          model.batch_capacity !== undefined) && (
+                          model.batch_capacity !== undefined ||
+                          model.throughput !== undefined) && (
                           <div className="border-t pt-6">
                             <div className="flex items-center gap-1 mb-1">
                               <p className="text-sm text-gray-600">
@@ -1326,21 +1450,38 @@ const ModelInfo: React.FC = () => {
                                       running daemons.
                                     </p>
                                   </InfoTip>
+                                  {runningDaemonCount > 0 && (
+                                    <span className="text-xs text-gray-500">
+                                      ({runningDaemonCount}{" "}
+                                      {runningDaemonCount === 1
+                                        ? "daemon"
+                                        : "daemons"}{" "}
+                                      running)
+                                    </span>
+                                  )}
                                 </p>
                                 <p className="font-medium">
                                   {model.batch_capacity
                                     ? `${model.batch_capacity.toLocaleString()} per daemon`
                                     : "No limit"}
-                                  {model.batch_capacity &&
-                                    runningDaemonCount > 0 && (
-                                      <span className="text-xs text-gray-500 font-normal ml-1">
-                                        · {runningDaemonCount}{" "}
-                                        {runningDaemonCount === 1
-                                          ? "daemon"
-                                          : "daemons"}{" "}
-                                        running
-                                      </span>
-                                    )}
+                                </p>
+                              </div>
+                              <div>
+                                <p className="text-xs text-gray-500 mb-1 flex items-center gap-1">
+                                  Throughput
+                                  <InfoTip>
+                                    <p className="text-sm text-muted-foreground">
+                                      Model throughput in requests per second,
+                                      used for batch SLA capacity
+                                      calculations. Defaults to 100 req/s if
+                                      not set.
+                                    </p>
+                                  </InfoTip>
+                                </p>
+                                <p className="font-medium">
+                                  {model.throughput
+                                    ? `${model.throughput} req/s`
+                                    : "100 req/s (default)"}
                                 </p>
                               </div>
                             </div>

@@ -1,11 +1,13 @@
 //! Database repository for model deployments.
 
+use crate::db::models::api_keys::ApiKeyPurpose;
 use crate::db::{
     errors::{DbError, Result},
     handlers::repository::Repository,
     models::deployments::{
         DeploymentComponentCreateDBRequest, DeploymentComponentDBResponse, DeploymentCreateDBRequest, DeploymentDBResponse,
         DeploymentUpdateDBRequest, LoadBalancingStrategy, ModelStatus, ModelType, ProviderPricing, ProviderPricingFields,
+        TrafficRuleAction, TrafficRuleDBRow,
     },
 };
 use crate::types::{DeploymentId, InferenceEndpointId, UserId, abbrev_uuid};
@@ -14,7 +16,17 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sqlx::PgConnection;
 use sqlx::{FromRow, query_builder::QueryBuilder};
+use std::collections::HashMap;
 use tracing::instrument;
+
+/// Per-model batch info: throughputs and allowed completion windows.
+#[derive(Debug, Default)]
+pub struct BatchModelInfo {
+    /// alias → throughput (only models with throughput set)
+    pub throughputs: HashMap<String, f32>,
+    /// alias → allowed windows (only models with explicit restrictions; absent = all allowed)
+    pub allowed_windows: HashMap<String, Vec<String>>,
+}
 
 /// Filter options for listing deployments
 #[derive(Debug, Clone)]
@@ -133,6 +145,10 @@ struct DeployedModel {
     pub fallback_with_replacement: Option<bool>,
     pub fallback_max_attempts: Option<i32>,
     pub sanitize_responses: bool,
+    pub trusted: bool,
+    pub open_responses_adapter: Option<bool>,
+    // Traffic routing
+    pub allowed_batch_completion_windows: Option<Vec<String>>,
 }
 
 pub struct Deployments<'c> {
@@ -185,6 +201,9 @@ impl From<(Option<ModelType>, DeployedModel)> for DeploymentDBResponse {
             fallback_with_replacement: m.fallback_with_replacement.unwrap_or(false),
             fallback_max_attempts: m.fallback_max_attempts,
             sanitize_responses: m.sanitize_responses,
+            trusted: m.trusted,
+            open_responses_adapter: m.open_responses_adapter.unwrap_or(true),
+            allowed_batch_completion_windows: m.allowed_batch_completion_windows,
         }
     }
 }
@@ -233,9 +252,9 @@ impl<'c> Repository for Deployments<'c> {
                 downstream_hourly_rate, downstream_input_token_cost_ratio,
                 is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status,
                 fallback_with_replacement, fallback_max_attempts,
-                sanitize_responses
+                sanitize_responses, trusted, open_responses_adapter, allowed_batch_completion_windows
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30)
             RETURNING *
             "#,
             request.model_name.trim(),
@@ -264,7 +283,10 @@ impl<'c> Repository for Deployments<'c> {
             request.fallback_on_status.as_ref().map(|s| s.as_slice()),
             request.fallback_with_replacement,
             request.fallback_max_attempts,
-            request.sanitize_responses
+            request.sanitize_responses,
+            request.trusted,
+            Some(request.open_responses_adapter),
+            request.allowed_batch_completion_windows.as_ref().map(|w| w.as_slice())
         )
         .fetch_one(&mut *self.db)
         .await?;
@@ -283,7 +305,7 @@ impl<'c> Repository for Deployments<'c> {
     async fn get_by_id(&mut self, id: Self::Id) -> Result<Option<Self::Response>> {
         let model = sqlx::query_as!(
             DeployedModel,
-            "SELECT id, model_name, alias, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_with_replacement, fallback_max_attempts, sanitize_responses FROM deployed_models WHERE id = $1",
+            "SELECT id, model_name, alias, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_with_replacement, fallback_max_attempts, sanitize_responses, trusted, open_responses_adapter, allowed_batch_completion_windows FROM deployed_models WHERE id = $1",
             id
         )
             .fetch_optional(&mut *self.db)
@@ -308,7 +330,7 @@ impl<'c> Repository for Deployments<'c> {
 
         let deployments = sqlx::query_as!(
             DeployedModel,
-            "SELECT id, model_name, alias, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_with_replacement, fallback_max_attempts, sanitize_responses FROM deployed_models WHERE id = ANY($1)",
+            "SELECT id, model_name, alias, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_with_replacement, fallback_max_attempts, sanitize_responses, trusted, open_responses_adapter, allowed_batch_completion_windows FROM deployed_models WHERE id = ANY($1)",
             ids.as_slice()
         )
             .fetch_all(&mut *self.db)
@@ -468,6 +490,14 @@ impl<'c> Repository for Deployments<'c> {
                 WHEN $40 THEN $41
                 ELSE fallback_max_attempts
             END,
+            trusted = COALESCE($42, trusted),
+            open_responses_adapter = COALESCE($43, open_responses_adapter),
+
+            -- Batch completion windows
+            allowed_batch_completion_windows = CASE
+                WHEN $44 THEN $45
+                ELSE allowed_batch_completion_windows
+            END,
 
             updated_at = NOW()
         WHERE id = $1
@@ -522,6 +552,11 @@ impl<'c> Repository for Deployments<'c> {
             request.fallback_with_replacement,                                       // $39
             request.fallback_max_attempts.is_some() as bool,                         // $40
             request.fallback_max_attempts.as_ref().and_then(|inner| inner.as_ref()), // $41
+            request.trusted,                                                         // $42
+            request.open_responses_adapter,                                          // $43
+            // Batch completion windows
+            request.allowed_batch_completion_windows.is_some() as bool, // $44
+            request.allowed_batch_completion_windows.as_ref().and_then(|inner| inner.as_deref()) as Option<&[String]>, // $45
         )
         .fetch_one(&mut *self.db)
         .await?;
@@ -776,6 +811,8 @@ impl<'c> Deployments<'c> {
                 dm.model_name,
                 dm.description as model_description,
                 dm.type as model_type,
+                dm.trusted as model_trusted,
+                dm.open_responses_adapter as "model_open_responses_adapter?",
                 dm.hosted_on as endpoint_id,
                 e.name as "endpoint_name?"
             FROM inserted
@@ -805,6 +842,8 @@ impl<'c> Deployments<'c> {
             model_type: result.model_type,
             endpoint_id: result.endpoint_id,
             endpoint_name: result.endpoint_name,
+            model_trusted: result.model_trusted,
+            model_open_responses_adapter: result.model_open_responses_adapter.unwrap_or(true),
         })
     }
 
@@ -839,6 +878,8 @@ impl<'c> Deployments<'c> {
                 dm.model_name,
                 dm.description as model_description,
                 dm.type as model_type,
+                dm.trusted as model_trusted,
+                dm.open_responses_adapter as "model_open_responses_adapter?",
                 dm.hosted_on as endpoint_id,
                 e.name as "endpoint_name?"
             FROM deployed_model_components dmc
@@ -868,6 +909,8 @@ impl<'c> Deployments<'c> {
                 model_type: r.model_type,
                 endpoint_id: r.endpoint_id,
                 endpoint_name: r.endpoint_name,
+                model_trusted: r.model_trusted,
+                model_open_responses_adapter: r.model_open_responses_adapter.unwrap_or(true),
             })
             .collect())
     }
@@ -896,6 +939,8 @@ impl<'c> Deployments<'c> {
                 dm.model_name,
                 dm.description as model_description,
                 dm.type as model_type,
+                dm.trusted as model_trusted,
+                dm.open_responses_adapter as "model_open_responses_adapter?",
                 dm.hosted_on as endpoint_id,
                 e.name as "endpoint_name?"
             FROM deployed_model_components dmc
@@ -926,6 +971,8 @@ impl<'c> Deployments<'c> {
                 model_type: r.model_type,
                 endpoint_id: r.endpoint_id,
                 endpoint_name: r.endpoint_name,
+                model_trusted: r.model_trusted,
+                model_open_responses_adapter: r.model_open_responses_adapter.unwrap_or(true),
             });
         }
 
@@ -996,6 +1043,8 @@ impl<'c> Deployments<'c> {
                 dm.model_name,
                 dm.description as model_description,
                 dm.type as model_type,
+                dm.trusted as model_trusted,
+                dm.open_responses_adapter as "model_open_responses_adapter?",
                 dm.hosted_on as endpoint_id,
                 e.name as "endpoint_name?"
             FROM updated
@@ -1025,31 +1074,166 @@ impl<'c> Deployments<'c> {
             model_type: r.model_type,
             endpoint_id: r.endpoint_id,
             endpoint_name: r.endpoint_name,
+            model_trusted: r.model_trusted,
+            model_open_responses_adapter: r.model_open_responses_adapter.unwrap_or(true),
         }))
     }
 
     /// Get throughput values for the given model aliases
     /// Returns a map of alias -> throughput for models that have throughput configured
+    /// Get batch-relevant model info (throughput + allowed completion windows) in a single query.
     #[instrument(skip(self, aliases), fields(count = aliases.len()), err)]
-    pub async fn get_throughputs_by_aliases(&mut self, aliases: &[String]) -> Result<std::collections::HashMap<String, f32>> {
+    pub async fn get_batch_model_info(&mut self, aliases: &[String]) -> Result<BatchModelInfo> {
         if aliases.is_empty() {
-            return Ok(std::collections::HashMap::new());
+            return Ok(BatchModelInfo::default());
         }
 
         let rows = sqlx::query!(
             r#"
-            SELECT alias, throughput
+            SELECT alias, throughput, allowed_batch_completion_windows
             FROM deployed_models
             WHERE alias = ANY($1)
               AND deleted = false
-              AND throughput IS NOT NULL
             "#,
             aliases
         )
         .fetch_all(&mut *self.db)
         .await?;
 
-        Ok(rows.into_iter().filter_map(|r| r.throughput.map(|t| (r.alias, t))).collect())
+        let mut info = BatchModelInfo::default();
+        for row in rows {
+            if let Some(t) = row.throughput {
+                info.throughputs.insert(row.alias.clone(), t);
+            }
+            if let Some(w) = row.allowed_batch_completion_windows {
+                info.allowed_windows.insert(row.alias, w);
+            }
+        }
+        Ok(info)
+    }
+
+    /// Resolve a model alias to its deployment ID. Returns None if not found or deleted.
+    #[instrument(skip(self), fields(alias = %alias), err)]
+    pub async fn resolve_alias_to_id(&mut self, alias: &str) -> Result<Option<DeploymentId>> {
+        let id = sqlx::query_scalar!(
+            r#"
+            SELECT id FROM deployed_models WHERE alias = $1 AND deleted = false
+            "#,
+            alias
+        )
+        .fetch_optional(&mut *self.db)
+        .await?;
+
+        Ok(id)
+    }
+
+    /// Set traffic routing rules for a model (replace-all pattern).
+    #[instrument(skip(self, rules), fields(deployment_id = %abbrev_uuid(&deployed_model_id), count = rules.len()), err)]
+    pub async fn set_traffic_rules(&mut self, deployed_model_id: DeploymentId, rules: &[(ApiKeyPurpose, TrafficRuleAction)]) -> Result<()> {
+        // Delete existing rules
+        sqlx::query!("DELETE FROM model_traffic_rules WHERE deployed_model_id = $1", deployed_model_id)
+            .execute(&mut *self.db)
+            .await?;
+
+        // Insert new rules
+        for (purpose, action) in rules {
+            let purpose_str = serde_json::to_value(purpose)
+                .ok()
+                .and_then(|v| v.as_str().map(String::from))
+                .unwrap_or_default();
+            let (action_str, redirect_target_id) = match action {
+                TrafficRuleAction::Deny => ("deny", None),
+                TrafficRuleAction::Redirect(target_id) => ("redirect", Some(*target_id)),
+            };
+
+            sqlx::query!(
+                r#"
+                INSERT INTO model_traffic_rules (deployed_model_id, api_key_purpose, action, redirect_target_id)
+                VALUES ($1, $2, $3, $4)
+                "#,
+                deployed_model_id,
+                purpose_str,
+                action_str,
+                redirect_target_id,
+            )
+            .execute(&mut *self.db)
+            .await?;
+        }
+
+        Ok(())
+    }
+
+    /// Get traffic routing rules for a single model.
+    #[instrument(skip(self), fields(deployment_id = %abbrev_uuid(&deployed_model_id)), err)]
+    pub async fn get_traffic_rules(&mut self, deployed_model_id: DeploymentId) -> Result<Vec<TrafficRuleDBRow>> {
+        let rows = sqlx::query!(
+            r#"
+            SELECT mtr.id, mtr.deployed_model_id, mtr.api_key_purpose, mtr.action,
+                   mtr.redirect_target_id, dm.alias as "redirect_target_alias?",
+                   mtr.created_at
+            FROM model_traffic_rules mtr
+            LEFT JOIN deployed_models dm ON dm.id = mtr.redirect_target_id
+            WHERE mtr.deployed_model_id = $1
+            ORDER BY mtr.api_key_purpose
+            "#,
+            deployed_model_id
+        )
+        .fetch_all(&mut *self.db)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| TrafficRuleDBRow {
+                id: r.id,
+                deployed_model_id: r.deployed_model_id,
+                api_key_purpose: r.api_key_purpose,
+                action: r.action,
+                redirect_target_id: r.redirect_target_id,
+                redirect_target_alias: r.redirect_target_alias,
+                created_at: r.created_at,
+            })
+            .collect())
+    }
+
+    /// Get traffic routing rules for multiple models in bulk.
+    #[instrument(skip(self, deployment_ids), fields(count = deployment_ids.len()), err)]
+    pub async fn get_traffic_rules_bulk(
+        &mut self,
+        deployment_ids: &[DeploymentId],
+    ) -> Result<HashMap<DeploymentId, Vec<TrafficRuleDBRow>>> {
+        if deployment_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let rows = sqlx::query!(
+            r#"
+            SELECT mtr.id, mtr.deployed_model_id, mtr.api_key_purpose, mtr.action,
+                   mtr.redirect_target_id, dm.alias as "redirect_target_alias?",
+                   mtr.created_at
+            FROM model_traffic_rules mtr
+            LEFT JOIN deployed_models dm ON dm.id = mtr.redirect_target_id
+            WHERE mtr.deployed_model_id = ANY($1)
+            ORDER BY mtr.deployed_model_id, mtr.api_key_purpose
+            "#,
+            deployment_ids
+        )
+        .fetch_all(&mut *self.db)
+        .await?;
+
+        let mut map: HashMap<DeploymentId, Vec<TrafficRuleDBRow>> = HashMap::new();
+        for r in rows {
+            map.entry(r.deployed_model_id).or_default().push(TrafficRuleDBRow {
+                id: r.id,
+                deployed_model_id: r.deployed_model_id,
+                api_key_purpose: r.api_key_purpose,
+                action: r.action,
+                redirect_target_id: r.redirect_target_id,
+                redirect_target_alias: r.redirect_target_alias,
+                created_at: r.created_at,
+            });
+        }
+
+        Ok(map)
     }
 
     /// Get model UUIDs keyed by alias for the given aliases.
@@ -2801,5 +2985,694 @@ mod tests {
         let filter = DeploymentFilter::new(0, 10).with_groups(vec![group1.id, group2.id]);
         let count = repo.count(&filter).await.unwrap();
         assert_eq!(count, 2);
+    }
+
+    // ===== Traffic Routing Rules Tests =====
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_resolve_alias_to_id(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: base_url.clone(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
+        }];
+        crate::seed_database(&sources, &pool).await.unwrap();
+
+        let user = create_test_user(&pool).await;
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        let model;
+        {
+            let mut tx = pool.begin().await.unwrap();
+            {
+                let mut repo = Deployments::new(tx.acquire().await.unwrap());
+                let model_create = DeploymentCreateDBRequest::builder()
+                    .created_by(user.id)
+                    .model_name("resolve-test".to_string())
+                    .alias("resolve-alias".to_string())
+                    .hosted_on(test_endpoint_id)
+                    .build();
+                model = repo.create(&model_create).await.unwrap();
+            }
+            tx.commit().await.unwrap();
+        }
+
+        // Resolve existing alias → returns ID
+        {
+            let mut tx = pool.begin().await.unwrap();
+            let mut repo = Deployments::new(tx.acquire().await.unwrap());
+            let resolved = repo.resolve_alias_to_id("resolve-alias").await.unwrap();
+            assert_eq!(resolved, Some(model.id));
+            tx.commit().await.unwrap();
+        }
+
+        // Resolve nonexistent alias → returns None
+        {
+            let mut tx = pool.begin().await.unwrap();
+            let mut repo = Deployments::new(tx.acquire().await.unwrap());
+            let resolved = repo.resolve_alias_to_id("does-not-exist").await.unwrap();
+            assert_eq!(resolved, None);
+            tx.commit().await.unwrap();
+        }
+
+        // Soft-delete the model and resolve again → returns None
+        {
+            let mut tx = pool.begin().await.unwrap();
+            {
+                let mut repo = Deployments::new(tx.acquire().await.unwrap());
+                let update = DeploymentUpdateDBRequest::builder().deleted(true).build();
+                repo.update(model.id, &update).await.unwrap();
+            }
+            tx.commit().await.unwrap();
+        }
+        {
+            let mut tx = pool.begin().await.unwrap();
+            let mut repo = Deployments::new(tx.acquire().await.unwrap());
+            let resolved = repo.resolve_alias_to_id("resolve-alias").await.unwrap();
+            assert_eq!(resolved, None);
+            tx.commit().await.unwrap();
+        }
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_set_and_get_traffic_rules(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: base_url.clone(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
+        }];
+        crate::seed_database(&sources, &pool).await.unwrap();
+
+        let user = create_test_user(&pool).await;
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        // Create source and redirect target models
+        let (source, target);
+        {
+            let mut tx = pool.begin().await.unwrap();
+            {
+                let mut repo = Deployments::new(tx.acquire().await.unwrap());
+                source = repo
+                    .create(
+                        &DeploymentCreateDBRequest::builder()
+                            .created_by(user.id)
+                            .model_name("source-model".to_string())
+                            .alias("source-alias".to_string())
+                            .hosted_on(test_endpoint_id)
+                            .build(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            {
+                let mut repo = Deployments::new(tx.acquire().await.unwrap());
+                target = repo
+                    .create(
+                        &DeploymentCreateDBRequest::builder()
+                            .created_by(user.id)
+                            .model_name("target-model".to_string())
+                            .alias("target-alias".to_string())
+                            .hosted_on(test_endpoint_id)
+                            .build(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            tx.commit().await.unwrap();
+        }
+
+        // Set a deny rule and a redirect rule
+        {
+            let mut tx = pool.begin().await.unwrap();
+            {
+                let mut repo = Deployments::new(tx.acquire().await.unwrap());
+                let rules = vec![
+                    (ApiKeyPurpose::Batch, TrafficRuleAction::Deny),
+                    (ApiKeyPurpose::Realtime, TrafficRuleAction::Redirect(target.id)),
+                ];
+                repo.set_traffic_rules(source.id, &rules).await.unwrap();
+            }
+            tx.commit().await.unwrap();
+        }
+
+        // Get rules back and verify
+        {
+            let mut tx = pool.begin().await.unwrap();
+            let mut repo = Deployments::new(tx.acquire().await.unwrap());
+            let rules = repo.get_traffic_rules(source.id).await.unwrap();
+            assert_eq!(rules.len(), 2);
+
+            // Rules are ordered by api_key_purpose
+            let batch_rule = rules.iter().find(|r| r.api_key_purpose == "batch").unwrap();
+            assert_eq!(batch_rule.action, "deny");
+            assert_eq!(batch_rule.redirect_target_id, None);
+            assert_eq!(batch_rule.redirect_target_alias, None);
+
+            let realtime_rule = rules.iter().find(|r| r.api_key_purpose == "realtime").unwrap();
+            assert_eq!(realtime_rule.action, "redirect");
+            assert_eq!(realtime_rule.redirect_target_id, Some(target.id));
+            assert_eq!(realtime_rule.redirect_target_alias.as_deref(), Some("target-alias"));
+
+            tx.commit().await.unwrap();
+        }
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_set_traffic_rules_replaces_existing(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: base_url.clone(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
+        }];
+        crate::seed_database(&sources, &pool).await.unwrap();
+
+        let user = create_test_user(&pool).await;
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        let (model, target);
+        {
+            let mut tx = pool.begin().await.unwrap();
+            {
+                let mut repo = Deployments::new(tx.acquire().await.unwrap());
+                model = repo
+                    .create(
+                        &DeploymentCreateDBRequest::builder()
+                            .created_by(user.id)
+                            .model_name("replace-model".to_string())
+                            .alias("replace-alias".to_string())
+                            .hosted_on(test_endpoint_id)
+                            .build(),
+                    )
+                    .await
+                    .unwrap();
+                target = repo
+                    .create(
+                        &DeploymentCreateDBRequest::builder()
+                            .created_by(user.id)
+                            .model_name("replace-target".to_string())
+                            .alias("replace-target-alias".to_string())
+                            .hosted_on(test_endpoint_id)
+                            .build(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            tx.commit().await.unwrap();
+        }
+
+        // Set initial rules
+        {
+            let mut tx = pool.begin().await.unwrap();
+            {
+                let mut repo = Deployments::new(tx.acquire().await.unwrap());
+                repo.set_traffic_rules(model.id, &[(ApiKeyPurpose::Batch, TrafficRuleAction::Deny)])
+                    .await
+                    .unwrap();
+            }
+            tx.commit().await.unwrap();
+        }
+
+        // Replace with different rules
+        {
+            let mut tx = pool.begin().await.unwrap();
+            {
+                let mut repo = Deployments::new(tx.acquire().await.unwrap());
+                repo.set_traffic_rules(model.id, &[(ApiKeyPurpose::Realtime, TrafficRuleAction::Redirect(target.id))])
+                    .await
+                    .unwrap();
+            }
+            tx.commit().await.unwrap();
+        }
+
+        // Verify old rules are gone, new rules are present
+        {
+            let mut tx = pool.begin().await.unwrap();
+            let mut repo = Deployments::new(tx.acquire().await.unwrap());
+            let rules = repo.get_traffic_rules(model.id).await.unwrap();
+            assert_eq!(rules.len(), 1);
+            assert_eq!(rules[0].api_key_purpose, "realtime");
+            assert_eq!(rules[0].action, "redirect");
+            tx.commit().await.unwrap();
+        }
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_set_traffic_rules_empty_clears(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: base_url.clone(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
+        }];
+        crate::seed_database(&sources, &pool).await.unwrap();
+
+        let user = create_test_user(&pool).await;
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        let model;
+        {
+            let mut tx = pool.begin().await.unwrap();
+            {
+                let mut repo = Deployments::new(tx.acquire().await.unwrap());
+                model = repo
+                    .create(
+                        &DeploymentCreateDBRequest::builder()
+                            .created_by(user.id)
+                            .model_name("clear-model".to_string())
+                            .alias("clear-alias".to_string())
+                            .hosted_on(test_endpoint_id)
+                            .build(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            tx.commit().await.unwrap();
+        }
+
+        // Set rules
+        {
+            let mut tx = pool.begin().await.unwrap();
+            {
+                let mut repo = Deployments::new(tx.acquire().await.unwrap());
+                repo.set_traffic_rules(model.id, &[(ApiKeyPurpose::Batch, TrafficRuleAction::Deny)])
+                    .await
+                    .unwrap();
+            }
+            tx.commit().await.unwrap();
+        }
+
+        // Clear rules by passing empty vec
+        {
+            let mut tx = pool.begin().await.unwrap();
+            {
+                let mut repo = Deployments::new(tx.acquire().await.unwrap());
+                repo.set_traffic_rules(model.id, &[]).await.unwrap();
+            }
+            tx.commit().await.unwrap();
+        }
+
+        // Verify cleared
+        {
+            let mut tx = pool.begin().await.unwrap();
+            let mut repo = Deployments::new(tx.acquire().await.unwrap());
+            let rules = repo.get_traffic_rules(model.id).await.unwrap();
+            assert!(rules.is_empty());
+            tx.commit().await.unwrap();
+        }
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_get_traffic_rules_empty(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: base_url.clone(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
+        }];
+        crate::seed_database(&sources, &pool).await.unwrap();
+
+        let user = create_test_user(&pool).await;
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        let model;
+        {
+            let mut tx = pool.begin().await.unwrap();
+            {
+                let mut repo = Deployments::new(tx.acquire().await.unwrap());
+                model = repo
+                    .create(
+                        &DeploymentCreateDBRequest::builder()
+                            .created_by(user.id)
+                            .model_name("empty-rules-model".to_string())
+                            .alias("empty-rules-alias".to_string())
+                            .hosted_on(test_endpoint_id)
+                            .build(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            tx.commit().await.unwrap();
+        }
+
+        // Get rules for model with none set → empty vec
+        {
+            let mut tx = pool.begin().await.unwrap();
+            let mut repo = Deployments::new(tx.acquire().await.unwrap());
+            let rules = repo.get_traffic_rules(model.id).await.unwrap();
+            assert!(rules.is_empty());
+            tx.commit().await.unwrap();
+        }
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_get_traffic_rules_bulk(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: base_url.clone(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
+        }];
+        crate::seed_database(&sources, &pool).await.unwrap();
+
+        let user = create_test_user(&pool).await;
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        let (model_a, model_b, model_c);
+        {
+            let mut tx = pool.begin().await.unwrap();
+            {
+                let mut repo = Deployments::new(tx.acquire().await.unwrap());
+                model_a = repo
+                    .create(
+                        &DeploymentCreateDBRequest::builder()
+                            .created_by(user.id)
+                            .model_name("bulk-a".to_string())
+                            .alias("bulk-alias-a".to_string())
+                            .hosted_on(test_endpoint_id)
+                            .build(),
+                    )
+                    .await
+                    .unwrap();
+                model_b = repo
+                    .create(
+                        &DeploymentCreateDBRequest::builder()
+                            .created_by(user.id)
+                            .model_name("bulk-b".to_string())
+                            .alias("bulk-alias-b".to_string())
+                            .hosted_on(test_endpoint_id)
+                            .build(),
+                    )
+                    .await
+                    .unwrap();
+                model_c = repo
+                    .create(
+                        &DeploymentCreateDBRequest::builder()
+                            .created_by(user.id)
+                            .model_name("bulk-c".to_string())
+                            .alias("bulk-alias-c".to_string())
+                            .hosted_on(test_endpoint_id)
+                            .build(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            tx.commit().await.unwrap();
+        }
+
+        // Set rules on model_a and model_b only
+        {
+            let mut tx = pool.begin().await.unwrap();
+            {
+                let mut repo = Deployments::new(tx.acquire().await.unwrap());
+                repo.set_traffic_rules(model_a.id, &[(ApiKeyPurpose::Batch, TrafficRuleAction::Deny)])
+                    .await
+                    .unwrap();
+                repo.set_traffic_rules(model_b.id, &[(ApiKeyPurpose::Realtime, TrafficRuleAction::Redirect(model_c.id))])
+                    .await
+                    .unwrap();
+            }
+            tx.commit().await.unwrap();
+        }
+
+        // Bulk fetch for all three
+        {
+            let mut tx = pool.begin().await.unwrap();
+            let mut repo = Deployments::new(tx.acquire().await.unwrap());
+            let map = repo.get_traffic_rules_bulk(&[model_a.id, model_b.id, model_c.id]).await.unwrap();
+
+            // model_a has 1 rule
+            let a_rules = map.get(&model_a.id).unwrap();
+            assert_eq!(a_rules.len(), 1);
+            assert_eq!(a_rules[0].api_key_purpose, "batch");
+            assert_eq!(a_rules[0].action, "deny");
+
+            // model_b has 1 rule
+            let b_rules = map.get(&model_b.id).unwrap();
+            assert_eq!(b_rules.len(), 1);
+            assert_eq!(b_rules[0].api_key_purpose, "realtime");
+            assert_eq!(b_rules[0].action, "redirect");
+
+            // model_c has no rules (absent key)
+            assert!(map.get(&model_c.id).is_none());
+
+            tx.commit().await.unwrap();
+        }
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_get_traffic_rules_bulk_empty_ids(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: base_url.clone(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
+        }];
+        crate::seed_database(&sources, &pool).await.unwrap();
+
+        let mut tx = pool.begin().await.unwrap();
+        let mut repo = Deployments::new(tx.acquire().await.unwrap());
+        let map = repo.get_traffic_rules_bulk(&[]).await.unwrap();
+        assert!(map.is_empty());
+        tx.commit().await.unwrap();
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_cascade_delete_source_model(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: base_url.clone(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
+        }];
+        crate::seed_database(&sources, &pool).await.unwrap();
+
+        let user = create_test_user(&pool).await;
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        let model;
+        {
+            let mut tx = pool.begin().await.unwrap();
+            {
+                let mut repo = Deployments::new(tx.acquire().await.unwrap());
+                model = repo
+                    .create(
+                        &DeploymentCreateDBRequest::builder()
+                            .created_by(user.id)
+                            .model_name("cascade-src".to_string())
+                            .alias("cascade-src-alias".to_string())
+                            .hosted_on(test_endpoint_id)
+                            .build(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            tx.commit().await.unwrap();
+        }
+
+        // Set a deny rule
+        {
+            let mut tx = pool.begin().await.unwrap();
+            {
+                let mut repo = Deployments::new(tx.acquire().await.unwrap());
+                repo.set_traffic_rules(model.id, &[(ApiKeyPurpose::Batch, TrafficRuleAction::Deny)])
+                    .await
+                    .unwrap();
+            }
+            tx.commit().await.unwrap();
+        }
+
+        // Verify rule exists
+        {
+            let mut tx = pool.begin().await.unwrap();
+            let mut repo = Deployments::new(tx.acquire().await.unwrap());
+            let rules = repo.get_traffic_rules(model.id).await.unwrap();
+            assert_eq!(rules.len(), 1);
+            tx.commit().await.unwrap();
+        }
+
+        // Hard-delete the source model
+        {
+            let mut tx = pool.begin().await.unwrap();
+            {
+                let mut repo = Deployments::new(tx.acquire().await.unwrap());
+                repo.delete(model.id).await.unwrap();
+            }
+            tx.commit().await.unwrap();
+        }
+
+        // Rules should be gone (CASCADE)
+        // Query directly since the model no longer exists
+        let count: i64 = sqlx::query_scalar!(
+            "SELECT COUNT(*) as \"count!\" FROM model_traffic_rules WHERE deployed_model_id = $1",
+            model.id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_cascade_delete_redirect_target(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: base_url.clone(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
+        }];
+        crate::seed_database(&sources, &pool).await.unwrap();
+
+        let user = create_test_user(&pool).await;
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        let (model_a, model_b);
+        {
+            let mut tx = pool.begin().await.unwrap();
+            {
+                let mut repo = Deployments::new(tx.acquire().await.unwrap());
+                model_a = repo
+                    .create(
+                        &DeploymentCreateDBRequest::builder()
+                            .created_by(user.id)
+                            .model_name("cascade-a".to_string())
+                            .alias("cascade-alias-a".to_string())
+                            .hosted_on(test_endpoint_id)
+                            .build(),
+                    )
+                    .await
+                    .unwrap();
+                model_b = repo
+                    .create(
+                        &DeploymentCreateDBRequest::builder()
+                            .created_by(user.id)
+                            .model_name("cascade-b".to_string())
+                            .alias("cascade-alias-b".to_string())
+                            .hosted_on(test_endpoint_id)
+                            .build(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            tx.commit().await.unwrap();
+        }
+
+        // model_a redirects to model_b
+        {
+            let mut tx = pool.begin().await.unwrap();
+            {
+                let mut repo = Deployments::new(tx.acquire().await.unwrap());
+                repo.set_traffic_rules(model_a.id, &[(ApiKeyPurpose::Realtime, TrafficRuleAction::Redirect(model_b.id))])
+                    .await
+                    .unwrap();
+            }
+            tx.commit().await.unwrap();
+        }
+
+        // Delete model_b (the redirect target)
+        {
+            let mut tx = pool.begin().await.unwrap();
+            {
+                let mut repo = Deployments::new(tx.acquire().await.unwrap());
+                repo.delete(model_b.id).await.unwrap();
+            }
+            tx.commit().await.unwrap();
+        }
+
+        // model_a's redirect rule should be gone (CASCADE on redirect_target_id)
+        {
+            let mut tx = pool.begin().await.unwrap();
+            let mut repo = Deployments::new(tx.acquire().await.unwrap());
+            let rules = repo.get_traffic_rules(model_a.id).await.unwrap();
+            assert!(rules.is_empty());
+            tx.commit().await.unwrap();
+        }
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_unique_purpose_per_model(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: base_url.clone(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
+        }];
+        crate::seed_database(&sources, &pool).await.unwrap();
+
+        let user = create_test_user(&pool).await;
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        let model;
+        {
+            let mut tx = pool.begin().await.unwrap();
+            {
+                let mut repo = Deployments::new(tx.acquire().await.unwrap());
+                model = repo
+                    .create(
+                        &DeploymentCreateDBRequest::builder()
+                            .created_by(user.id)
+                            .model_name("unique-model".to_string())
+                            .alias("unique-alias".to_string())
+                            .hosted_on(test_endpoint_id)
+                            .build(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            tx.commit().await.unwrap();
+        }
+
+        // Insert first rule directly via SQL
+        sqlx::query!(
+            "INSERT INTO model_traffic_rules (deployed_model_id, api_key_purpose, action) VALUES ($1, 'batch', 'deny')",
+            model.id
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Try inserting a second rule with the same purpose → unique constraint violation
+        let result = sqlx::query!(
+            "INSERT INTO model_traffic_rules (deployed_model_id, api_key_purpose, action) VALUES ($1, 'batch', 'deny')",
+            model.id
+        )
+        .execute(&pool)
+        .await;
+
+        assert!(result.is_err());
+        let err_str = format!("{}", result.unwrap_err());
+        assert!(err_str.contains("unique_purpose_per_model") || err_str.contains("duplicate key"));
     }
 }
