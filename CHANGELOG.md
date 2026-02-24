@@ -1,5 +1,19 @@
 # Changelog
 
+## [8.8.0](https://github.com/doublewordai/control-layer/compare/v8.7.1...v8.8.0) (2026-02-24)
+
+
+### Features
+
+* **dashboard:** add traffic routing rules and batch window UI ([#763](https://github.com/doublewordai/control-layer/issues/763)) ([adcfc96](https://github.com/doublewordai/control-layer/commit/adcfc960e43eacbc079cc366b8efafbd1be0a908))
+* **deployments:** filter batch tariffs by allowed completion windows ([#759](https://github.com/doublewordai/control-layer/issues/759)) ([3190e81](https://github.com/doublewordai/control-layer/commit/3190e81f90f274576cd13200564324c7eeb9fe01))
+* per completion window, acceptance relaxation factors ([#742](https://github.com/doublewordai/control-layer/issues/742)) ([15e5021](https://github.com/doublewordai/control-layer/commit/15e5021aa1ae08d923438c0623f953ebc667dc9f))
+
+
+### Bug Fixes
+
+* use fallback serialisation to extract model name where possible if deserialisation into standard openai type fails. ([#757](https://github.com/doublewordai/control-layer/issues/757)) ([e535e73](https://github.com/doublewordai/control-layer/commit/e535e732c1e7a784cae69996046e21b57846664e))
+
 ## [8.7.1](https://github.com/doublewordai/control-layer/compare/v8.7.0...v8.7.1) (2026-02-24)
 
 
