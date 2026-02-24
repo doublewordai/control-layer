@@ -227,7 +227,7 @@ async fn create_sample_files_for_new_user<P: PoolProvider>(state: &AppState<P>, 
     )
     .await?;
 
-    tracing::info!(
+    tracing::debug!(
         user_id = %user_id,
         file_count = created_files.len(),
         "Created sample files for new user"
