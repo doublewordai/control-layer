@@ -251,6 +251,11 @@ impl<'a> DeployedModelEnricher<'a> {
                 model_response = model_response.mask_response_config();
             }
 
+            // Filter batch tariffs for disabled completion windows (non-pricing users)
+            if !self.can_read_pricing {
+                model_response = model_response.filter_disabled_batch_tariffs();
+            }
+
             enriched_models.push(model_response);
         }
 
@@ -416,7 +421,10 @@ impl<'a> DeployedModelEnricher<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{api::models::deployments::ModelMetrics, db::models::groups::GroupDBResponse};
+    use crate::{
+        api::models::deployments::ModelMetrics,
+        db::models::{api_keys::ApiKeyPurpose, groups::GroupDBResponse},
+    };
     use chrono::Utc;
     use std::collections::HashMap;
     use uuid::Uuid;
@@ -724,5 +732,128 @@ mod tests {
 
         // Tariffs not requested, should remain None
         assert!(result.tariffs.is_none());
+    }
+
+    fn create_test_tariff(purpose: Option<ApiKeyPurpose>, window: Option<&str>) -> crate::api::models::tariffs::TariffResponse {
+        use rust_decimal::Decimal;
+        use std::str::FromStr;
+
+        crate::api::models::tariffs::TariffResponse {
+            id: Uuid::new_v4(),
+            deployed_model_id: Uuid::new_v4(),
+            name: format!("Tariff {:?} {:?}", purpose, window.unwrap_or("none")),
+            input_price_per_token: Decimal::from_str("0.001").unwrap(),
+            output_price_per_token: Decimal::from_str("0.002").unwrap(),
+            api_key_purpose: purpose,
+            completion_window: window.map(String::from),
+            valid_from: Utc::now(),
+            valid_until: None,
+            is_active: true,
+        }
+    }
+
+    #[test]
+    fn test_filter_disabled_batch_tariffs_with_allowed_windows() {
+        let mut model = create_test_model();
+        model.allowed_batch_completion_windows = Some(vec!["24h".to_string()]);
+        model.tariffs = Some(vec![
+            create_test_tariff(Some(ApiKeyPurpose::Batch), Some("24h")),
+            create_test_tariff(Some(ApiKeyPurpose::Batch), Some("1h")),
+            create_test_tariff(Some(ApiKeyPurpose::Realtime), None),
+        ]);
+
+        let result = model.filter_disabled_batch_tariffs();
+
+        let tariffs = result.tariffs.unwrap();
+        assert_eq!(tariffs.len(), 2);
+        // 24h batch tariff remains
+        assert_eq!(tariffs[0].api_key_purpose, Some(ApiKeyPurpose::Batch));
+        assert_eq!(tariffs[0].completion_window.as_deref(), Some("24h"));
+        // Realtime tariff unaffected
+        assert_eq!(tariffs[1].api_key_purpose, Some(ApiKeyPurpose::Realtime));
+    }
+
+    #[test]
+    fn test_filter_disabled_batch_tariffs_none_allowed() {
+        let mut model = create_test_model();
+        model.allowed_batch_completion_windows = None;
+        model.tariffs = Some(vec![
+            create_test_tariff(Some(ApiKeyPurpose::Batch), Some("24h")),
+            create_test_tariff(Some(ApiKeyPurpose::Batch), Some("1h")),
+        ]);
+
+        let result = model.filter_disabled_batch_tariffs();
+
+        // All tariffs pass through when allowed_batch_completion_windows is None
+        assert_eq!(result.tariffs.unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_filter_disabled_batch_tariffs_empty_allowed() {
+        let mut model = create_test_model();
+        model.allowed_batch_completion_windows = Some(vec![]);
+        model.tariffs = Some(vec![
+            create_test_tariff(Some(ApiKeyPurpose::Batch), Some("24h")),
+            create_test_tariff(Some(ApiKeyPurpose::Batch), Some("1h")),
+            create_test_tariff(Some(ApiKeyPurpose::Realtime), None),
+        ]);
+
+        let result = model.filter_disabled_batch_tariffs();
+
+        // Empty allowed list means no batch windows allowed — all batch tariffs removed, realtime kept
+        let tariffs = result.tariffs.unwrap();
+        assert_eq!(tariffs.len(), 1);
+        assert_eq!(tariffs[0].api_key_purpose, Some(ApiKeyPurpose::Realtime));
+    }
+
+    #[test]
+    fn test_filter_disabled_batch_tariffs_generic_fallback_kept() {
+        let mut model = create_test_model();
+        model.allowed_batch_completion_windows = Some(vec!["24h".to_string()]);
+        model.tariffs = Some(vec![
+            create_test_tariff(Some(ApiKeyPurpose::Batch), Some("24h")),
+            create_test_tariff(Some(ApiKeyPurpose::Batch), None), // generic fallback
+            create_test_tariff(Some(ApiKeyPurpose::Batch), Some("1h")),
+        ]);
+
+        let result = model.filter_disabled_batch_tariffs();
+
+        // Generic batch tariff (no window) kept as billing fallback, 1h filtered out
+        let tariffs = result.tariffs.unwrap();
+        assert_eq!(tariffs.len(), 2);
+        assert_eq!(tariffs[0].completion_window.as_deref(), Some("24h"));
+        assert_eq!(tariffs[1].completion_window, None);
+    }
+
+    #[test]
+    fn test_filter_disabled_batch_tariffs_generic_fallback_removed_when_empty() {
+        let mut model = create_test_model();
+        model.allowed_batch_completion_windows = Some(vec![]);
+        model.tariffs = Some(vec![
+            create_test_tariff(Some(ApiKeyPurpose::Batch), None), // generic fallback
+            create_test_tariff(Some(ApiKeyPurpose::Realtime), None),
+        ]);
+
+        let result = model.filter_disabled_batch_tariffs();
+
+        // Empty allowed = no batch at all, generic fallback removed too
+        let tariffs = result.tariffs.unwrap();
+        assert_eq!(tariffs.len(), 1);
+        assert_eq!(tariffs[0].api_key_purpose, Some(ApiKeyPurpose::Realtime));
+    }
+
+    #[test]
+    fn test_filter_disabled_batch_tariffs_realtime_unaffected() {
+        let mut model = create_test_model();
+        model.allowed_batch_completion_windows = Some(vec!["24h".to_string()]);
+        model.tariffs = Some(vec![
+            create_test_tariff(Some(ApiKeyPurpose::Realtime), None),
+            create_test_tariff(None, None),
+        ]);
+
+        let result = model.filter_disabled_batch_tariffs();
+
+        // Non-batch tariffs always pass through
+        assert_eq!(result.tariffs.unwrap().len(), 2);
     }
 }

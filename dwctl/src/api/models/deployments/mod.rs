@@ -4,6 +4,7 @@ pub mod enrichment;
 
 use super::pagination::Pagination;
 use crate::api::models::groups::GroupResponse;
+use crate::db::models::api_keys::ApiKeyPurpose;
 use crate::db::models::deployments::{
     DeploymentDBResponse, FallbackConfig, LoadBalancingStrategy, ModelType, ProviderPricing, ProviderPricingUpdate, TrafficRuleDBRow,
 };
@@ -528,6 +529,24 @@ impl DeployedModelResponse {
         self.sanitize_responses = None;
         self.trusted = None;
         self.open_responses_adapter = None;
+        self
+    }
+
+    /// Filter out batch tariffs for completion windows that aren't in allowed_batch_completion_windows.
+    /// - `None` → all tariffs pass through (global defaults apply).
+    /// - `Some([])` → no batch windows allowed, all batch tariffs removed.
+    /// - `Some(["24h", ...])` → keep batch tariffs whose window is in the list, plus generic
+    ///   batch tariffs (no window) since they serve as billing fallbacks for allowed windows.
+    pub fn filter_disabled_batch_tariffs(mut self) -> Self {
+        if let Some(ref allowed) = self.allowed_batch_completion_windows
+            && let Some(ref mut tariffs) = self.tariffs
+        {
+            tariffs.retain(|t| match (&t.api_key_purpose, &t.completion_window) {
+                (Some(ApiKeyPurpose::Batch), Some(window)) => allowed.contains(window),
+                (Some(ApiKeyPurpose::Batch), None) => !allowed.is_empty(), // Generic fallback kept when batch is allowed
+                _ => true,                                                 // Non-batch tariffs always pass through
+            });
+        }
         self
     }
 
