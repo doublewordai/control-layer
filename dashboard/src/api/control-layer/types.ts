@@ -65,6 +65,15 @@ export type Role =
 export type ApiKeyPurpose = "platform" | "realtime" | "batch" | "playground";
 export type TariffApiKeyPurpose = "realtime" | "batch" | "playground";
 
+export type TrafficRoutingAction =
+  | { type: "deny" }
+  | { type: "redirect"; target: string };
+
+export interface TrafficRoutingRule {
+  api_key_purpose: ApiKeyPurpose;
+  action: TrafficRoutingAction;
+}
+
 // Batch completion window types
 export type BatchCompletionWindow = "24h" | "1h";
 
@@ -157,6 +166,8 @@ export interface Model {
   fallback?: FallbackConfig | null;
   components?: ModelComponent[]; // only present when include=components
   sanitize_responses?: boolean | null; // only present for virtual models
+  traffic_routing_rules?: TrafficRoutingRule[] | null;
+  allowed_batch_completion_windows?: string[] | null;
 }
 
 // Model creation types - discriminated union with "type" field
@@ -172,6 +183,8 @@ export interface StandardModelCreate {
   burst_size?: number;
   capacity?: number;
   batch_capacity?: number;
+  traffic_routing_rules?: TrafficRoutingRule[];
+  allowed_batch_completion_windows?: string[];
 }
 
 // Virtual model creation - routes requests across multiple hosted models
@@ -194,6 +207,8 @@ export interface VirtualModelCreate {
   fallback_with_replacement?: boolean;
   fallback_max_attempts?: number | null;
   sanitize_responses?: boolean;
+  traffic_routing_rules?: TrafficRoutingRule[];
+  allowed_batch_completion_windows?: string[];
 }
 
 // Backwards compatibility alias
@@ -375,6 +390,8 @@ export interface ModelUpdateRequest {
   fallback_with_replacement?: boolean | null;
   fallback_max_attempts?: number | null;
   sanitize_responses?: boolean | null;
+  traffic_routing_rules?: TrafficRoutingRule[] | null;
+  allowed_batch_completion_windows?: string[] | null;
 }
 
 // Endpoint-specific types
