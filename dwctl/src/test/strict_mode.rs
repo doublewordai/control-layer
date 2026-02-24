@@ -117,7 +117,7 @@ async fn test_strict_mode_allows_models_endpoint(pool: PgPool) {
     // Poll until onwards picks up the API key via LISTEN/NOTIFY
     // First verify initial state (key not yet available)
     let initial_response = server
-        .get("/ai/models")
+        .get("/ai/v1/models")
         .add_header("Authorization", &format!("Bearer {}", api_key))
         .await;
     let initial_status = initial_response.status_code();
@@ -127,7 +127,7 @@ async fn test_strict_mode_allows_models_endpoint(pool: PgPool) {
     let mut synced = initial_status == 200;
     while !synced && start.elapsed() < std::time::Duration::from_secs(3) {
         let check_response = server
-            .get("/ai/models")
+            .get("/ai/v1/models")
             .add_header("Authorization", &format!("Bearer {}", api_key))
             .await;
         synced = check_response.status_code() == 200;
@@ -137,8 +137,9 @@ async fn test_strict_mode_allows_models_endpoint(pool: PgPool) {
     }
     assert!(synced, "API key should be synced to onwards within 3 seconds");
 
-    // Test both /models and /v1/models endpoints
-    for endpoint in &["/ai/models", "/ai/v1/models"] {
+    // Test /ai/v1/models endpoint
+    {
+        let endpoint = "/ai/v1/models";
         let response = server
             .get(endpoint)
             .add_header("Authorization", &format!("Bearer {}", api_key))
@@ -164,7 +165,7 @@ async fn test_strict_mode_allows_chat_completions(pool: PgPool) {
     let mock_server = wiremock::MockServer::start().await;
 
     wiremock::Mock::given(wiremock::matchers::method("POST"))
-        .and(wiremock::matchers::path("/v1/chat/completions"))
+        .and(wiremock::matchers::path("/chat/completions"))
         .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "id": "chatcmpl-strict-test",
             "object": "chat.completion",
@@ -293,7 +294,7 @@ async fn test_strict_mode_allows_chat_completions(pool: PgPool) {
     let mut model_available = false;
     while !model_available && start.elapsed() < std::time::Duration::from_secs(3) {
         let check_response = server
-            .get("/ai/models")
+            .get("/ai/v1/models")
             .add_header("Authorization", &format!("Bearer {}", api_key))
             .await;
 
@@ -349,7 +350,7 @@ async fn test_strict_mode_allows_embeddings(pool: PgPool) {
     let mock_server = wiremock::MockServer::start().await;
 
     wiremock::Mock::given(wiremock::matchers::method("POST"))
-        .and(wiremock::matchers::path("/v1/embeddings"))
+        .and(wiremock::matchers::path("/embeddings"))
         .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "object": "list",
             "data": [{
@@ -460,7 +461,7 @@ async fn test_strict_mode_allows_embeddings(pool: PgPool) {
     let mut model_available = false;
     while !model_available && start.elapsed() < std::time::Duration::from_secs(3) {
         let check_response = server
-            .get("/ai/models")
+            .get("/ai/v1/models")
             .add_header("Authorization", &format!("Bearer {}", api_key))
             .await;
 
@@ -568,7 +569,7 @@ async fn test_strict_mode_allows_responses(pool: PgPool) {
     let mock_server = wiremock::MockServer::start().await;
 
     wiremock::Mock::given(wiremock::matchers::method("POST"))
-        .and(wiremock::matchers::path("/v1/responses"))
+        .and(wiremock::matchers::path("/responses"))
         .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "id": "resp-strict-test",
             "object": "response",
@@ -709,7 +710,7 @@ async fn test_strict_mode_allows_responses(pool: PgPool) {
     let mut model_available = false;
     while !model_available && start.elapsed() < std::time::Duration::from_secs(3) {
         let check_response = server
-            .get("/ai/models")
+            .get("/ai/v1/models")
             .add_header("Authorization", &format!("Bearer {}", api_key))
             .await;
 
@@ -755,7 +756,7 @@ async fn test_strict_mode_sanitizes_provider_errors(pool: PgPool) {
 
     // Mock provider returns error with sensitive internal details
     wiremock::Mock::given(wiremock::matchers::method("POST"))
-        .and(wiremock::matchers::path("/v1/chat/completions"))
+        .and(wiremock::matchers::path("/chat/completions"))
         .respond_with(wiremock::ResponseTemplate::new(500).set_body_json(serde_json::json!({
             "error": {
                 "message": "Internal server error: database connection failed at 10.0.0.5:5432",
@@ -856,7 +857,7 @@ async fn test_strict_mode_sanitizes_provider_errors(pool: PgPool) {
     let mut model_available = false;
     while !model_available && start.elapsed() < std::time::Duration::from_secs(3) {
         let check_response = server
-            .get("/ai/models")
+            .get("/ai/v1/models")
             .add_header("Authorization", &format!("Bearer {}", api_key))
             .await;
 
@@ -931,7 +932,7 @@ async fn test_strict_mode_trusted_flag_bypasses_sanitization(pool: PgPool) {
     });
 
     wiremock::Mock::given(wiremock::matchers::method("POST"))
-        .and(wiremock::matchers::path("/v1/chat/completions"))
+        .and(wiremock::matchers::path("/chat/completions"))
         .respond_with(wiremock::ResponseTemplate::new(429).set_body_json(error_response.clone()))
         .mount(&mock_server)
         .await;
@@ -1021,7 +1022,7 @@ async fn test_strict_mode_trusted_flag_bypasses_sanitization(pool: PgPool) {
     let mut model_available = false;
     while !model_available && start.elapsed() < std::time::Duration::from_secs(3) {
         let check_response = server
-            .get("/ai/models")
+            .get("/ai/v1/models")
             .add_header("Authorization", &format!("Bearer {}", api_key))
             .await;
 
@@ -1114,7 +1115,7 @@ async fn test_strict_mode_handles_various_provider_errors(pool: PgPool) {
 
         // Mock GET /v1/models to return empty list (prevent auto-sync conflicts)
         wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/v1/models"))
+            .and(wiremock::matchers::path("/models"))
             .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "data": [],
                 "object": "list"
@@ -1124,7 +1125,7 @@ async fn test_strict_mode_handles_various_provider_errors(pool: PgPool) {
 
         // Setup mock for this test case
         wiremock::Mock::given(wiremock::matchers::method("POST"))
-            .and(wiremock::matchers::path("/v1/chat/completions"))
+            .and(wiremock::matchers::path("/chat/completions"))
             .respond_with(wiremock::ResponseTemplate::new(status_code).set_body_string(response_body.to_string()))
             .mount(&mock_server)
             .await;
@@ -1222,7 +1223,7 @@ async fn test_strict_mode_handles_various_provider_errors(pool: PgPool) {
         let mut model_available = false;
         while !model_available && start.elapsed() < std::time::Duration::from_secs(3) {
             let check_response = server
-                .get("/ai/models")
+                .get("/ai/v1/models")
                 .add_header("Authorization", &format!("Bearer {}", api_key))
                 .await;
 

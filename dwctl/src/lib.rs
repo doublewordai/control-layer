@@ -1198,8 +1198,8 @@ pub async fn build_router(
 
     // Add AI routes with appropriate nesting based on strict mode
     if strict_mode {
-        // Strict mode: nest onwards at /ai, nest batches at /ai/v1
-        router = router.nest("/ai", onwards_router);
+        // Strict mode: nest onwards at /ai/v1, nest batches at /ai/v1
+        router = router.nest("/ai/v1", onwards_router);
         if let Some(batches) = batches_routes {
             // Add fallback to batches router to return 404 for unknown routes
             // This prevents unknown /ai/v1/* requests from falling through to the
