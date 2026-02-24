@@ -13,6 +13,8 @@ pub struct BatchConfigResponse {
     pub enabled: bool,
     /// Available completion windows (e.g., "24h", "1h").
     pub allowed_completion_windows: Vec<String>,
+    /// Allowed endpoint URL paths (e.g., "/v1/chat/completions", "/v1/responses").
+    pub allowed_url_paths: Vec<String>,
 }
 
 /// Onwards AI proxy configuration
@@ -72,6 +74,7 @@ pub async fn get_config(State(state): State<AppState>, _user: CurrentUser) -> im
         Some(BatchConfigResponse {
             enabled: state.config.batches.enabled,
             allowed_completion_windows: state.config.batches.allowed_completion_windows.clone(),
+            allowed_url_paths: state.config.batches.allowed_url_paths.clone(),
         })
     } else {
         None
@@ -157,5 +160,13 @@ mod tests {
 
         // Default config should have "24h" completion window
         assert!(slas.iter().any(|v| v.as_str() == Some("24h")));
+
+        let url_paths = batches
+            .get("allowed_url_paths")
+            .and_then(|v| v.as_array())
+            .expect("allowed_url_paths should be an array");
+
+        // Default config should include /v1/chat/completions
+        assert!(url_paths.iter().any(|v| v.as_str() == Some("/v1/chat/completions")));
     }
 }

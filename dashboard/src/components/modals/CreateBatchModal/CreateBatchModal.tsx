@@ -34,6 +34,7 @@ import {
   useConfig,
   useFileCostEstimate,
 } from "../../../api/control-layer/hooks";
+import { dwctlApi } from "../../../api/control-layer/client";
 import { useDebounce } from "../../../hooks/useDebounce";
 import { toast } from "sonner";
 import type { FileObject } from "../../features/batches/types";
@@ -93,6 +94,7 @@ export function CreateBatchModal({
     [config?.batches?.allowed_completion_windows],
   );
 
+
   // Fetch available files for combobox (only input files with purpose "batch")
   // Only fetch when modal is open to avoid unnecessary queries on page load
   const { data: filesResponse } = useFiles({
@@ -126,6 +128,51 @@ export function CreateBatchModal({
       setCompletionWindow(availableWindows[0]);
     }
   }, [availableWindows, completionWindow]);
+
+  // Detect endpoint from a JSONL text string (reads first request's url field)
+  const detectEndpointFromJsonl = useCallback((text: string): string => {
+    for (const line of text.split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      try {
+        const parsed = JSON.parse(trimmed) as { url?: string };
+        if (parsed.url) return parsed.url;
+      } catch {
+        // skip malformed lines
+      }
+    }
+    return "/v1/chat/completions";
+  }, []);
+
+  // When a local file is chosen for upload, parse it client-side to detect the endpoint
+  useEffect(() => {
+    if (!fileToUpload) return;
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const text = e.target?.result;
+      if (typeof text === "string") {
+        setEndpoint(detectEndpointFromJsonl(text));
+      }
+    };
+    reader.readAsText(fileToUpload);
+  }, [fileToUpload, detectEndpointFromJsonl]);
+
+  // When an existing file is selected from the list, fetch its content to detect the endpoint
+  useEffect(() => {
+    if (!selectedFileId) return;
+    let cancelled = false;
+    dwctlApi.files
+      .getFileContent(selectedFileId, { limit: 1 })
+      .then(({ content }) => {
+        if (!cancelled) setEndpoint(detectEndpointFromJsonl(content));
+      })
+      .catch(() => {
+        // Fall back to default if content fetch fails
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedFileId, detectEndpointFromJsonl]);
 
   // Update selected file when preselected file changes
   useEffect(() => {
