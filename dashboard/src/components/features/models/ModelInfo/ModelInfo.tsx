@@ -23,6 +23,10 @@ import {
   useDaemons,
   useConfig,
 } from "../../../../api/control-layer";
+import type {
+  ApiKeyPurpose,
+  TrafficRoutingRule,
+} from "../../../../api/control-layer";
 import { useAuthorization } from "../../../../utils";
 import {
   ApiExamples,
@@ -44,6 +48,7 @@ import { Button } from "../../../ui/button";
 import { Input } from "../../../ui/input";
 import { Textarea } from "../../../ui/textarea";
 import { InfoTip } from "../../../ui/info-tip";
+import { Checkbox } from "../../../ui/checkbox";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "../../../ui/tabs";
 import {
   Select,
@@ -71,6 +76,12 @@ const aliasFormSchema = z.object({
     .min(1, "Alias is required")
     .max(100, "Alias must be 100 characters or less"),
 });
+
+const TRAFFIC_PURPOSE_OPTIONS: ApiKeyPurpose[] = [
+  "realtime",
+  "batch",
+  "playground",
+];
 
 const ModelInfo: React.FC = () => {
   const { modelId } = useParams<{ modelId: string }>();
@@ -128,6 +139,8 @@ const ModelInfo: React.FC = () => {
     capacity: null as number | null,
     batch_capacity: null as number | null,
     throughput: null as number | null,
+    allowed_batch_completion_windows: [] as string[],
+    traffic_routing_rules: [] as TrafficRoutingRule[],
   });
   const [settingsError, setSettingsError] = useState<string | null>(null);
   const [showApiExamples, setShowApiExamples] = useState(false);
@@ -151,9 +164,13 @@ const ModelInfo: React.FC = () => {
   });
 
   const updateModelMutation = useUpdateModel();
+  const { data: config } = useConfig();
+  const availableCompletionWindows = useMemo(
+    () => config?.batches?.allowed_completion_windows ?? ["24h"],
+    [config?.batches?.allowed_completion_windows],
+  );
 
   // Get config to check for strict mode
-  const { data: config } = useConfig();
   const strictModeEnabled = config?.onwards?.strict_mode ?? false;
 
   // Build include parameter based on permissions
@@ -224,6 +241,9 @@ const ModelInfo: React.FC = () => {
         capacity: model.capacity || null,
         batch_capacity: model.batch_capacity || null,
         throughput: model.throughput || null,
+        allowed_batch_completion_windows:
+          model.allowed_batch_completion_windows || [],
+        traffic_routing_rules: model.traffic_routing_rules || [],
       });
       aliasForm.reset({
         alias: model.alias,
@@ -238,6 +258,29 @@ const ModelInfo: React.FC = () => {
   const handleSave = async () => {
     if (!model) return;
     setSettingsError(null);
+
+    const normalizedTrafficRules = updateData.traffic_routing_rules.map((rule) => {
+      if (rule.action.type === "redirect") {
+        return {
+          ...rule,
+          action: {
+            type: "redirect" as const,
+            target: rule.action.target.trim(),
+          },
+        };
+      }
+      return rule;
+    });
+
+    if (
+      normalizedTrafficRules.some(
+        (rule) =>
+          rule.action.type === "redirect" && rule.action.target.length === 0,
+      )
+    ) {
+      setSettingsError("Redirect rules must include a target model alias");
+      return;
+    }
 
     try {
       await updateModelMutation.mutateAsync({
@@ -260,6 +303,9 @@ const ModelInfo: React.FC = () => {
           capacity: updateData.capacity,
           batch_capacity: updateData.batch_capacity,
           throughput: updateData.throughput,
+          allowed_batch_completion_windows:
+            updateData.allowed_batch_completion_windows,
+          traffic_routing_rules: normalizedTrafficRules,
         },
       });
       setIsEditingModelDetails(false);
@@ -289,6 +335,9 @@ const ModelInfo: React.FC = () => {
         capacity: model.capacity || null,
         batch_capacity: model.batch_capacity || null,
         throughput: model.throughput || null,
+        allowed_batch_completion_windows:
+          model.allowed_batch_completion_windows || [],
+        traffic_routing_rules: model.traffic_routing_rules || [],
       });
     }
     setIsEditingModelDetails(false);
@@ -855,6 +904,272 @@ const ModelInfo: React.FC = () => {
                         </div>
                       </div>
 
+                      {/* Batch Completion Windows Section */}
+                      <div className="border-t pt-4">
+                        <div className="flex items-center gap-1 mb-3">
+                          <label className="text-sm text-gray-600 font-medium">
+                            Batch Completion Windows
+                          </label>
+                          <InfoTip>
+                            <p className="text-sm text-muted-foreground">
+                              All globally configured windows are allowed by
+                              default. Uncheck to restrict specific windows for
+                              this model.
+                            </p>
+                          </InfoTip>
+                        </div>
+                        <div className="space-y-2">
+                          {availableCompletionWindows.map((window) => {
+                            const usingDefaults =
+                              updateData.allowed_batch_completion_windows
+                                .length === 0;
+                            const isChecked =
+                              usingDefaults ||
+                              updateData.allowed_batch_completion_windows.includes(
+                                window,
+                              );
+                            return (
+                              <label
+                                key={window}
+                                className="flex items-center gap-2 text-sm"
+                              >
+                                <Checkbox
+                                  checked={isChecked}
+                                  onCheckedChange={(checked) =>
+                                    setUpdateData((prev) => {
+                                      const wasUsingDefaults =
+                                        prev.allowed_batch_completion_windows
+                                          .length === 0;
+                                      let next: string[];
+                                      if (checked) {
+                                        // Re-checking: add back
+                                        next = [
+                                          ...prev.allowed_batch_completion_windows,
+                                          window,
+                                        ];
+                                      } else if (wasUsingDefaults) {
+                                        // First uncheck from defaults: populate with all except this one
+                                        next =
+                                          availableCompletionWindows.filter(
+                                            (w) => w !== window,
+                                          );
+                                      } else {
+                                        // Already restricted: remove this one
+                                        next =
+                                          prev.allowed_batch_completion_windows.filter(
+                                            (w) => w !== window,
+                                          );
+                                      }
+                                      // If all are checked again, clear back to defaults
+                                      const allChecked =
+                                        availableCompletionWindows.every((w) =>
+                                          next.includes(w),
+                                        );
+                                      return {
+                                        ...prev,
+                                        allowed_batch_completion_windows:
+                                          allChecked ? [] : next,
+                                      };
+                                    })
+                                  }
+                                />
+                                <span className="font-mono text-xs">
+                                  {window}
+                                </span>
+                              </label>
+                            );
+                          })}
+                        </div>
+                        {updateData.allowed_batch_completion_windows.length >
+                          0 && (
+                          <Button
+                            type="button"
+                            variant="outline"
+                            size="sm"
+                            className="mt-3 text-xs"
+                            onClick={() =>
+                              setUpdateData((prev) => ({
+                                ...prev,
+                                allowed_batch_completion_windows: [],
+                              }))
+                            }
+                          >
+                            Allow All
+                          </Button>
+                        )}
+                      </div>
+
+                      {/* Traffic Routing Rules Section */}
+                      <div className="border-t pt-4">
+                        <div className="flex items-center gap-1 mb-3">
+                          <label className="text-sm text-gray-600 font-medium">
+                            Traffic Routing Rules
+                          </label>
+                          <InfoTip>
+                            <p className="text-sm text-muted-foreground">
+                              Match API key purpose and either deny traffic or
+                              transparently redirect to another model alias.
+                            </p>
+                          </InfoTip>
+                        </div>
+                        <div className="space-y-2">
+                          {updateData.traffic_routing_rules.length > 0 && (
+                            <div className="hidden md:grid md:grid-cols-12 gap-2 text-xs text-muted-foreground">
+                              <span className="md:col-span-3">Purpose</span>
+                              <span className="md:col-span-3">Action</span>
+                              <span className="md:col-span-5">Target</span>
+                            </div>
+                          )}
+                          {updateData.traffic_routing_rules.map((rule, index) => (
+                            <div
+                              key={index}
+                              className="grid grid-cols-1 md:grid-cols-12 gap-2 items-start"
+                            >
+                              <div className="md:col-span-3">
+                                <Select
+                                  value={rule.api_key_purpose}
+                                  onValueChange={(value) =>
+                                    setUpdateData((prev) => ({
+                                      ...prev,
+                                      traffic_routing_rules:
+                                        prev.traffic_routing_rules.map((r, i) =>
+                                          i === index
+                                            ? {
+                                                ...r,
+                                                api_key_purpose:
+                                                  value as ApiKeyPurpose,
+                                              }
+                                            : r,
+                                        ),
+                                    }))
+                                  }
+                                >
+                                  <SelectTrigger>
+                                    <SelectValue />
+                                  </SelectTrigger>
+                                  <SelectContent>
+                                    {TRAFFIC_PURPOSE_OPTIONS.map((purpose) => (
+                                      <SelectItem key={purpose} value={purpose}>
+                                        {purpose}
+                                      </SelectItem>
+                                    ))}
+                                  </SelectContent>
+                                </Select>
+                              </div>
+                              <div className="md:col-span-3">
+                                <Select
+                                  value={rule.action.type}
+                                  onValueChange={(value) =>
+                                    setUpdateData((prev) => ({
+                                      ...prev,
+                                      traffic_routing_rules:
+                                        prev.traffic_routing_rules.map((r, i) => {
+                                          if (i !== index) return r;
+                                          if (value === "redirect") {
+                                            return {
+                                              ...r,
+                                              action: {
+                                                type: "redirect",
+                                                target:
+                                                  r.action.type === "redirect"
+                                                    ? r.action.target
+                                                    : "",
+                                              },
+                                            };
+                                          }
+                                          return {
+                                            ...r,
+                                            action: { type: "deny" },
+                                          };
+                                        }),
+                                    }))
+                                  }
+                                >
+                                  <SelectTrigger>
+                                    <SelectValue />
+                                  </SelectTrigger>
+                                  <SelectContent>
+                                    <SelectItem value="deny">Deny</SelectItem>
+                                    <SelectItem value="redirect">
+                                      Redirect
+                                    </SelectItem>
+                                  </SelectContent>
+                                </Select>
+                              </div>
+                              <div className="md:col-span-5">
+                                {rule.action.type === "redirect" ? (
+                                  <Input
+                                    value={rule.action.target}
+                                    onChange={(e) =>
+                                      setUpdateData((prev) => ({
+                                        ...prev,
+                                        traffic_routing_rules:
+                                          prev.traffic_routing_rules.map((r, i) =>
+                                            i === index
+                                              ? {
+                                                  ...r,
+                                                  action: {
+                                                    type: "redirect",
+                                                    target: e.target.value,
+                                                  },
+                                                }
+                                              : r,
+                                          ),
+                                      }))
+                                    }
+                                    placeholder="target model alias"
+                                    className="font-mono text-xs"
+                                  />
+                                ) : (
+                                  <p className="text-xs text-muted-foreground h-10 flex items-center">
+                                    Return 403 Forbidden
+                                  </p>
+                                )}
+                              </div>
+                              <div className="md:col-span-1 flex justify-end">
+                                <Button
+                                  type="button"
+                                  variant="outline"
+                                  size="sm"
+                                  className="h-9 w-9 p-0"
+                                  onClick={() =>
+                                    setUpdateData((prev) => ({
+                                      ...prev,
+                                      traffic_routing_rules:
+                                        prev.traffic_routing_rules.filter(
+                                          (_, i) => i !== index,
+                                        ),
+                                    }))
+                                  }
+                                >
+                                  <X className="h-4 w-4" />
+                                </Button>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          className="mt-3"
+                          onClick={() =>
+                            setUpdateData((prev) => ({
+                              ...prev,
+                              traffic_routing_rules: [
+                                ...prev.traffic_routing_rules,
+                                {
+                                  api_key_purpose: "realtime",
+                                  action: { type: "deny" },
+                                },
+                              ],
+                            }))
+                          }
+                        >
+                          Add Rule
+                        </Button>
+                      </div>
+
                       {/* Rate Limiting Section */}
                       <div className="border-t pt-4">
                         <div className="flex items-center gap-1 mb-3">
@@ -1276,6 +1591,81 @@ const ModelInfo: React.FC = () => {
                             </div>
                           </div>
                         )}
+
+                      {/* Batch Configuration Display */}
+                      {canManageGroups && (
+                        <div className="border-t pt-6 space-y-4">
+                          <div>
+                            <div className="flex items-center gap-1 mb-1">
+                              <p className="text-sm text-gray-600">
+                                Batch Completion Windows
+                              </p>
+                              <InfoTip>
+                                <p className="text-sm text-muted-foreground">
+                                  Allowed batch completion windows for this model.
+                                  Empty means global defaults from config.
+                                </p>
+                              </InfoTip>
+                            </div>
+                            {model.allowed_batch_completion_windows &&
+                            model.allowed_batch_completion_windows.length > 0 ? (
+                              <div className="flex flex-wrap gap-2">
+                                {model.allowed_batch_completion_windows.map((window) => (
+                                  <Badge key={window} variant="outline" className="font-mono">
+                                    {window}
+                                  </Badge>
+                                ))}
+                              </div>
+                            ) : (
+                              <p className="text-sm text-muted-foreground">
+                                Global defaults ({availableCompletionWindows.join(", ")})
+                              </p>
+                            )}
+                          </div>
+                          <div>
+                            <div className="flex items-center gap-1 mb-1">
+                              <p className="text-sm text-gray-600">
+                                Traffic Routing Rules
+                              </p>
+                              <InfoTip>
+                                <p className="text-sm text-muted-foreground">
+                                  Purpose-specific deny or redirect behavior.
+                                </p>
+                              </InfoTip>
+                            </div>
+                            {model.traffic_routing_rules &&
+                            model.traffic_routing_rules.length > 0 ? (
+                              <div className="space-y-2">
+                                {model.traffic_routing_rules.map((rule, index) => (
+                                  <div
+                                    key={index}
+                                    className="flex items-center justify-between rounded-md border bg-muted px-3 py-2"
+                                  >
+                                    <div className="flex items-center gap-2 text-sm">
+                                      <Badge variant="outline">{rule.api_key_purpose}</Badge>
+                                      <span className="text-muted-foreground">→</span>
+                                      {rule.action.type === "deny" ? (
+                                        <span className="font-medium">deny</span>
+                                      ) : (
+                                        <span className="font-medium">
+                                          redirect to
+                                          <span className="ml-1 font-mono text-xs">
+                                            {rule.action.target}
+                                          </span>
+                                        </span>
+                                      )}
+                                    </div>
+                                  </div>
+                                ))}
+                              </div>
+                            ) : (
+                              <p className="text-sm text-muted-foreground">
+                                No routing rules configured.
+                              </p>
+                            )}
+                          </div>
+                        </div>
+                      )}
 
                       {/* Pricing Display - visible to all users when billing is enabled */}
                       {
