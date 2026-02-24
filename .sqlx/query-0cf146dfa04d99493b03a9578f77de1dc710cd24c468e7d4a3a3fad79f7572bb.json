@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                INSERT INTO model_traffic_rules (deployed_model_id, api_key_purpose, action, redirect_target_id)\n                VALUES ($1, $2, $3, $4)\n                ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Varchar",
+        "Varchar",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "0cf146dfa04d99493b03a9578f77de1dc710cd24c468e7d4a3a3fad79f7572bb"
+}

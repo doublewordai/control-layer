@@ -124,7 +124,7 @@ describe("EditEndpointModal", () => {
     });
   });
 
-  it("shows API key field when endpoint requires API key", () => {
+  it("shows API key field with hint when endpoint requires API key", () => {
     render(
       <EditEndpointModal
         isOpen={true}
@@ -142,7 +142,7 @@ describe("EditEndpointModal", () => {
     expect(screen.getByPlaceholderText("sk-...")).toBeInTheDocument();
   });
 
-  it("does not show API key field when endpoint does not require API key", () => {
+  it("shows API key field without hint when endpoint does not require API key", () => {
     const endpointWithoutApiKey = { ...mockEndpoint, requires_api_key: false };
 
     render(
@@ -155,8 +155,11 @@ describe("EditEndpointModal", () => {
       { wrapper: createWrapper() },
     );
 
-    expect(screen.queryByText(/API Key/)).not.toBeInTheDocument();
-    expect(screen.queryByPlaceholderText("sk-...")).not.toBeInTheDocument();
+    expect(screen.getByText(/API Key/)).toBeInTheDocument();
+    expect(screen.getByPlaceholderText("sk-...")).toBeInTheDocument();
+    expect(
+      screen.queryByText("Leave empty to keep existing key"),
+    ).not.toBeInTheDocument();
   });
 
   it("closes modal when cancel is clicked", () => {

@@ -4,19 +4,24 @@ use axum::{Json, extract::State, response::IntoResponse};
 use serde::Serialize;
 use utoipa::ToSchema;
 
-use crate::{
-    AppState,
-    api::models::{completion_window::format_completion_window, users::CurrentUser},
-};
+use crate::{AppState, api::models::users::CurrentUser};
 
 /// Batch processing configuration
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct BatchConfigResponse {
     /// Whether batch processing is enabled on this instance
     pub enabled: bool,
-    /// Available priority options in display format: "Standard (24h)", "High (1h)".
-    /// Frontend should display these values as-is in dropdowns.
+    /// Available completion windows (e.g., "24h", "1h").
     pub allowed_completion_windows: Vec<String>,
+    /// Allowed endpoint URL paths (e.g., "/v1/chat/completions", "/v1/responses").
+    pub allowed_url_paths: Vec<String>,
+}
+
+/// Onwards AI proxy configuration
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct OnwardsConfigResponse {
+    /// Whether strict mode is enabled (uses trusted flag, otherwise uses sanitize_responses)
+    pub strict_mode: bool,
 }
 
 /// Instance configuration and capabilities
@@ -39,6 +44,8 @@ pub struct ConfigResponse {
     /// If not set, the frontend should use relative paths (same-origin requests)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ai_api_base_url: Option<String>,
+    /// Onwards AI proxy configuration
+    pub onwards: OnwardsConfigResponse,
 }
 
 #[utoipa::path(
@@ -64,18 +71,10 @@ pub async fn get_config(State(state): State<AppState>, _user: CurrentUser) -> im
     let metadata = &state.config.metadata;
 
     let batches_config = if state.config.batches.enabled {
-        // Format internal completion windows for display in UI
-        let allowed_completion_windows = state
-            .config
-            .batches
-            .allowed_completion_windows
-            .iter()
-            .map(|w| format_completion_window(w))
-            .collect();
-
         Some(BatchConfigResponse {
             enabled: state.config.batches.enabled,
-            allowed_completion_windows,
+            allowed_completion_windows: state.config.batches.allowed_completion_windows.clone(),
+            allowed_url_paths: state.config.batches.allowed_url_paths.clone(),
         })
     } else {
         None
@@ -90,6 +89,9 @@ pub async fn get_config(State(state): State<AppState>, _user: CurrentUser) -> im
         docs_jsonl_url: metadata.docs_jsonl_url.clone(),
         batches: batches_config,
         ai_api_base_url: metadata.ai_api_base_url.clone(),
+        onwards: OnwardsConfigResponse {
+            strict_mode: state.config.onwards.strict_mode,
+        },
     };
 
     Json(response)
@@ -156,7 +158,15 @@ mod tests {
             .and_then(|v| v.as_array())
             .expect("allowed_completion_windows should be an array");
 
-        // Default config should have formatted "Standard (24h)" priority (converted from "24h")
-        assert!(slas.iter().any(|v| v.as_str() == Some("Standard (24h)")));
+        // Default config should have "24h" completion window
+        assert!(slas.iter().any(|v| v.as_str() == Some("24h")));
+
+        let url_paths = batches
+            .get("allowed_url_paths")
+            .and_then(|v| v.as_array())
+            .expect("allowed_url_paths should be an array");
+
+        // Default config should include /v1/chat/completions
+        assert!(url_paths.iter().any(|v| v.as_str() == Some("/v1/chat/completions")));
     }
 }

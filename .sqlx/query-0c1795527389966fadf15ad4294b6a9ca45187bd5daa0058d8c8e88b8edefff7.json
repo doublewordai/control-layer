@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT\n                dmc.id,\n                dmc.composite_model_id,\n                dmc.deployed_model_id,\n                dmc.weight,\n                dmc.enabled,\n                dmc.sort_order,\n                dmc.created_at,\n                dm.alias as model_alias,\n                dm.model_name,\n                dm.description as model_description,\n                dm.type as model_type,\n                dm.hosted_on as endpoint_id,\n                e.name as \"endpoint_name?\"\n            FROM deployed_model_components dmc\n            JOIN deployed_models dm ON dm.id = dmc.deployed_model_id\n            LEFT JOIN inference_endpoints e ON e.id = dm.hosted_on\n            WHERE dmc.composite_model_id = ANY($1)\n            ORDER BY dmc.composite_model_id, dmc.sort_order ASC, dmc.weight DESC, dmc.created_at ASC\n            ",
+  "query": "\n            SELECT\n                dmc.id,\n                dmc.composite_model_id,\n                dmc.deployed_model_id,\n                dmc.weight,\n                dmc.enabled,\n                dmc.sort_order,\n                dmc.created_at,\n                dm.alias as model_alias,\n                dm.model_name,\n                dm.description as model_description,\n                dm.type as model_type,\n                dm.trusted as model_trusted,\n                dm.open_responses_adapter as \"model_open_responses_adapter?\",\n                dm.hosted_on as endpoint_id,\n                e.name as \"endpoint_name?\"\n            FROM deployed_model_components dmc\n            JOIN deployed_models dm ON dm.id = dmc.deployed_model_id\n            LEFT JOIN inference_endpoints e ON e.id = dm.hosted_on\n            WHERE dmc.composite_model_id = $1\n            ORDER BY dmc.sort_order ASC, dmc.weight DESC, dmc.created_at ASC\n            ",
   "describe": {
     "columns": [
       {
@@ -60,18 +60,28 @@
       },
       {
         "ordinal": 11,
+        "name": "model_trusted",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 12,
+        "name": "model_open_responses_adapter?",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 13,
         "name": "endpoint_id",
         "type_info": "Uuid"
       },
       {
-        "ordinal": 12,
+        "ordinal": 14,
         "name": "endpoint_name?",
         "type_info": "Varchar"
       }
     ],
     "parameters": {
       "Left": [
-        "UuidArray"
+        "Uuid"
       ]
     },
     "nullable": [
@@ -86,9 +96,11 @@
       false,
       true,
       true,
+      false,
+      true,
       true,
       false
     ]
   },
-  "hash": "8230ec9a6f43a6c793e4bb86fb7da028e87f875b132e3c8b6e31c80c7e0f6ae1"
+  "hash": "0c1795527389966fadf15ad4294b6a9ca45187bd5daa0058d8c8e88b8edefff7"
 }

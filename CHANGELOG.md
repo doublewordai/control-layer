@@ -1,5 +1,81 @@
 # Changelog
 
+## [8.7.1](https://github.com/doublewordai/control-layer/compare/v8.7.0...v8.7.1) (2026-02-24)
+
+
+### Bug Fixes
+
+* if statement in release ([#760](https://github.com/doublewordai/control-layer/issues/760)) ([00b5f16](https://github.com/doublewordai/control-layer/commit/00b5f163d0970652757589681bfd904f224057eb))
+
+## [8.7.0](https://github.com/doublewordai/control-layer/compare/v8.6.0...v8.7.0) (2026-02-24)
+
+
+### Features
+
+* add trusted provider flag for strict mode response sanitization ([#724](https://github.com/doublewordai/control-layer/issues/724)) ([1fb3703](https://github.com/doublewordai/control-layer/commit/1fb3703139d587220154ab56e5e237173a31eb12))
+* **billing:** add token usage extraction for OpenAI Responses API ([#753](https://github.com/doublewordai/control-layer/issues/753)) ([2258d24](https://github.com/doublewordai/control-layer/commit/2258d24b98efb63f1b9876a58a6affa0e4dc6889))
+* edit throughput in UI ([#722](https://github.com/doublewordai/control-layer/issues/722)) ([60fd5ec](https://github.com/doublewordai/control-layer/commit/60fd5ec498db4698f7a15b2f2bc5291e8c404862))
+
+## [8.6.0](https://github.com/doublewordai/control-layer/compare/v8.5.0...v8.6.0) (2026-02-23)
+
+
+### Features
+
+* per-model traffic routing rules and batch window control ([#743](https://github.com/doublewordai/control-layer/issues/743)) ([7163e75](https://github.com/doublewordai/control-layer/commit/7163e751a7d366929fe57e8f4a4692519c3c7c71))
+
+
+### Bug Fixes
+
+* **dev:** extra commas in just check ([#750](https://github.com/doublewordai/control-layer/issues/750)) ([12fdf56](https://github.com/doublewordai/control-layer/commit/12fdf56d56eb0108b64e02c39af7f220e79c403a))
+
+## [8.5.0](https://github.com/doublewordai/control-layer/compare/v8.4.1...v8.5.0) (2026-02-23)
+
+
+### Features
+
+* race condition guard on batch creation ([#723](https://github.com/doublewordai/control-layer/issues/723)) ([34d5340](https://github.com/doublewordai/control-layer/commit/34d5340e2c5afaed63df3c7d80911f7d0050ffdf))
+
+## [8.4.1](https://github.com/doublewordai/control-layer/compare/v8.4.0...v8.4.1) (2026-02-20)
+
+
+### Bug Fixes
+
+* Parameterise email templates to repair crate publishing ([#719](https://github.com/doublewordai/control-layer/issues/719)) ([4939b12](https://github.com/doublewordai/control-layer/commit/4939b12d0d68e740ff5c646d0ba1c913629c57c0))
+
+## [8.4.0](https://github.com/doublewordai/control-layer/compare/v8.3.0...v8.4.0) (2026-02-20)
+
+
+### Features
+
+* **playground:** stream reasoning tokens into collapsible thinking block ([#744](https://github.com/doublewordai/control-layer/issues/744)) ([943b9b2](https://github.com/doublewordai/control-layer/commit/943b9b2b6fdc2c1be41d095b6a658de6977d4b10))
+
+## [8.3.0](https://github.com/doublewordai/control-layer/compare/v8.2.0...v8.3.0) (2026-02-19)
+
+
+### Features
+
+* UI tweaks got merged onto a lost branch ([#740](https://github.com/doublewordai/control-layer/issues/740)) ([1c7445b](https://github.com/doublewordai/control-layer/commit/1c7445be50cddf23bc5ee7fb9950944e4f9bc1e3))
+
+## [8.2.0](https://github.com/doublewordai/control-layer/compare/v8.1.0...v8.2.0) (2026-02-19)
+
+
+### Features
+
+* persist models page filters across navigations ([#733](https://github.com/doublewordai/control-layer/issues/733)) ([dd7cc9d](https://github.com/doublewordai/control-layer/commit/dd7cc9df24dbb5cfaa744f770767c407e1711e12))
+
+## [8.1.0](https://github.com/doublewordai/control-layer/compare/v8.0.1...v8.1.0) (2026-02-19)
+
+
+### Features
+
+* make demo mode data more realistic ([#731](https://github.com/doublewordai/control-layer/issues/731)) ([17aa9bf](https://github.com/doublewordai/control-layer/commit/17aa9bf874b1c5251fc6e164d60f9a351fcfc01d))
+
+
+### Bug Fixes
+
+* advance to step 2 when manually configuring models in edit endpoint modal ([#728](https://github.com/doublewordai/control-layer/issues/728)) ([fdcf360](https://github.com/doublewordai/control-layer/commit/fdcf36051948ea61b478d5ec741824a23b461d90))
+* omit Secure attribute from cookies when cookie_secure is false ([#730](https://github.com/doublewordai/control-layer/issues/730)) ([e6f936e](https://github.com/doublewordai/control-layer/commit/e6f936ee0ccd2e62edcfca636668bd85d0cf4631))
+
 ## [8.0.1](https://github.com/doublewordai/control-layer/compare/v8.0.0...v8.0.1) (2026-02-18)
 
 

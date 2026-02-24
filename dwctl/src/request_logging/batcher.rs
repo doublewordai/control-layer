@@ -397,6 +397,17 @@ where
                 (None, "unauthenticated".to_string(), None)
             };
 
+            if raw.request_model.is_none() && (raw.completion_tokens > 0 || raw.prompt_tokens > 0) {
+                error!(
+                    correlation_id = raw.correlation_id,
+                    response_model = ?raw.response_model,
+                    completion_tokens = raw.completion_tokens,
+                    prompt_tokens = raw.prompt_tokens,
+                    uri = %raw.uri,
+                    "request_model is None but response has token usage — record will not be billed"
+                );
+            }
+
             let (provider_name, input_price, output_price) = if let Some(ref model_alias) = raw.request_model {
                 if let Some(model_info) = model_map.get(model_alias) {
                     // Use batch_created_at for pricing if available (for batch requests)
@@ -1460,6 +1471,9 @@ mod integration_tests {
                 fallback_with_replacement: None,
                 fallback_max_attempts: None,
                 sanitize_responses: true,
+                trusted: false,
+                open_responses_adapter: true,
+                allowed_batch_completion_windows: None,
             })
             .await
             .unwrap();

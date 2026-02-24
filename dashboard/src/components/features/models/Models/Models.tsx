@@ -32,15 +32,23 @@ import {
 import { Label } from "../../../ui/label";
 import { Switch } from "../../../ui/switch";
 import { ModelsContent } from "./ModelsContent";
-import { SupportRequestModal, CreateVirtualModelModal } from "../../../modals";
+import { CreateVirtualModelModal } from "../../../modals";
 import { useEndpoints, useGroups } from "@/api/control-layer/hooks";
 import { useDebounce } from "@/hooks/useDebounce";
 import { useServerPagination } from "@/hooks/useServerPagination";
+import {
+  usePersistedFilter,
+  clearPersistedFilters,
+} from "@/hooks/usePersistedFilter";
+
+const EMPTY_GROUPS: string[] = [];
+const MODEL_TYPES = ["all", "virtual", "hosted"] as const;
+type ModelType = (typeof MODEL_TYPES)[number];
+const FILTER_PARAM_NAMES = ["endpoint", "groups", "type", "accessible"];
 
 const Models: React.FC = () => {
   const [searchParams, setSearchParams] = useSearchParams();
   const { hasPermission } = useAuthorization();
-  const [isSupportModalOpen, setIsSupportModalOpen] = useState(false);
   const [isCreateVirtualModalOpen, setIsCreateVirtualModalOpen] =
     useState(false);
   const canManageGroups = hasPermission("manage-groups");
@@ -49,16 +57,19 @@ const Models: React.FC = () => {
   const showPricing = true;
   const canManageModels = hasPermission("manage-models");
 
-  const [filterProvider, setFilterProvider] = useState("all");
-  const [filterGroups, setFilterGroups] = useState<string[]>([]);
-  const [filterModelType, setFilterModelType] = useState<
-    "all" | "virtual" | "hosted"
-  >("all");
+  const [filterProvider, setFilterProvider] = usePersistedFilter("endpoint", "all");
+  const [filterGroups, setFilterGroups] = usePersistedFilter("groups", EMPTY_GROUPS);
+  const [rawModelType, setFilterModelType] = usePersistedFilter("type", "all");
+  const filterModelType: ModelType = (MODEL_TYPES as readonly string[]).includes(rawModelType)
+    ? (rawModelType as ModelType)
+    : "all";
+  const [accessibleOnly, setAccessibleOnly] = usePersistedFilter("accessible", "false");
+  const showAccessibleOnly = accessibleOnly === "true";
+
   const [searchQuery, setSearchQuery] = useState(
     searchParams.get("search") || "",
   );
   const debouncedSearch = useDebounce(searchQuery, 300);
-  const [showAccessibleOnly, setShowAccessibleOnly] = useState(false);
 
   // Use pagination hook for URL-based pagination state
   const pagination = useServerPagination({ defaultPageSize: 12 });
@@ -107,15 +118,19 @@ const Models: React.FC = () => {
   const isStatusMode = viewMode === "status";
 
   const handleTabChange = (value: string) => {
-    setSearchParams({ view: value }, { replace: true });
+    setSearchParams(
+      (prev) => {
+        const next = new URLSearchParams(prev);
+        next.set("view", value);
+        return next;
+      },
+      { replace: true },
+    );
   };
 
   const handleClearFilters = () => {
     setSearchQuery("");
-    setFilterProvider("all");
-    setFilterGroups([]);
-    setFilterModelType("all");
-    setShowAccessibleOnly(false);
+    clearPersistedFilters(setSearchParams, FILTER_PARAM_NAMES);
   };
 
   return (
@@ -123,19 +138,11 @@ const Models: React.FC = () => {
       <Tabs value={viewMode} onValueChange={handleTabChange}>
         {/* Header */}
         <div className="mb-6">
-          <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4">
-            <div className="flex items-baseline gap-3">
-              <h1 className="text-2xl md:text-3xl font-bold text-doubleword-neutral-900">
-                Models
-              </h1>
-              <button
-                onClick={() => setIsSupportModalOpen(true)}
-                className="text-sm text-blue-600 hover:text-blue-700"
-              >
-                Request a model
-              </button>
-            </div>
-            <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2 sm:gap-3">
+          <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
+            <h1 className="text-2xl md:text-3xl font-bold text-doubleword-neutral-900">
+              Models
+            </h1>
+            <div className="flex flex-col md:flex-row items-stretch md:items-center gap-2 md:gap-3">
               {/* Search - most frequently used */}
               <div className="relative">
                 <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 text-gray-400 w-4 h-4 z-10 pointer-events-none" />
@@ -144,27 +151,27 @@ const Models: React.FC = () => {
                   placeholder="Search models..."
                   value={searchQuery}
                   onChange={(e) => setSearchQuery(e.target.value)}
-                  className="pl-10 w-40 sm:w-48 md:w-64"
+                  className="pl-10 w-full md:w-48 lg:w-64"
                   aria-label="Search models"
                 />
               </div>
 
               {/* View mode tabs - only for platform managers */}
               {canManageGroups && (
-                <TabsList className="w-full sm:w-auto">
+                <TabsList className="w-full md:w-auto">
                   <TabsTrigger
                     value="grid"
-                    className="flex items-center gap-2 flex-1 sm:flex-initial"
+                    className="flex items-center gap-2 flex-1 md:flex-initial"
                   >
                     <LayoutGrid className="h-4 w-4" />
-                    <span className="hidden sm:inline">Grid</span>
+                    <span className="hidden md:inline">Grid</span>
                   </TabsTrigger>
                   <TabsTrigger
                     value="status"
-                    className="flex items-center gap-2 flex-1 sm:flex-initial"
+                    className="flex items-center gap-2 flex-1 md:flex-initial"
                   >
                     <Activity className="h-4 w-4" />
-                    <span className="hidden sm:inline">Status</span>
+                    <span className="hidden md:inline">Status</span>
                   </TabsTrigger>
                 </TabsList>
               )}
@@ -180,7 +187,7 @@ const Models: React.FC = () => {
                       aria-label="Filter models"
                     >
                       <SlidersHorizontal className="h-4 w-4" />
-                      <span className="hidden sm:inline">Filter</span>
+                      <span className="hidden md:inline">Filter</span>
                       <ChevronDown className="h-3 w-3 opacity-50" />
                       {(filterProvider !== "all" ||
                         filterGroups.length > 0 ||
@@ -348,7 +355,9 @@ const Models: React.FC = () => {
                           <Switch
                             id="access-toggle"
                             checked={showAccessibleOnly}
-                            onCheckedChange={setShowAccessibleOnly}
+                            onCheckedChange={(checked) =>
+                              setAccessibleOnly(checked ? "true" : "false")
+                            }
                             aria-label="Show only my accessible models"
                           />
                         </div>
@@ -368,7 +377,7 @@ const Models: React.FC = () => {
                       aria-label="Model actions"
                     >
                       <MoreHorizontal className="h-4 w-4" />
-                      <span className="hidden sm:inline ml-1.5">Actions</span>
+                      <span className="hidden md:inline ml-1.5">Actions</span>
                     </Button>
                   </DropdownMenuTrigger>
                   <DropdownMenuContent align="end">
@@ -403,12 +412,6 @@ const Models: React.FC = () => {
           onClearFilters={handleClearFilters}
         />
       </Tabs>
-
-      <SupportRequestModal
-        isOpen={isSupportModalOpen}
-        onClose={() => setIsSupportModalOpen(false)}
-        defaultSubject="Model/Feature Request"
-      />
 
       <CreateVirtualModelModal
         isOpen={isCreateVirtualModalOpen}

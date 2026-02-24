@@ -214,6 +214,7 @@ export function AppLayout({ children }: { children: React.ReactNode }) {
   const { data: config, isLoading: configLoading } = useConfig();
   const { isFeatureEnabled } = useSettings();
   const isDemoMode = isFeatureEnabled("demo");
+  const [isSupportModalOpen, setIsSupportModalOpen] = useState(false);
 
   // Fetch balance and transactions
   const { data: balance = 0 } = useUserBalance(user?.id || "");
@@ -276,7 +277,15 @@ export function AppLayout({ children }: { children: React.ReactNode }) {
                   <div className="hidden md:block w-px h-4 bg-border"></div>
                 </>
               )}
+              <button
+                onClick={() => setIsSupportModalOpen(true)}
+                className="hidden md:block text-muted-foreground hover:text-primary transition-colors font-medium"
+              >
+                Request a model
+              </button>
               {config?.docs_url && (
+                <>
+                  <div className="hidden md:block w-px h-4 bg-border"></div>
                 <a
                   href={config.docs_url}
                   target="_blank"
@@ -287,12 +296,19 @@ export function AppLayout({ children }: { children: React.ReactNode }) {
                   <span className="sm:hidden">Docs</span>
                   <ExternalLink className="w-3 h-3" />
                 </a>
+                </>
               )}
             </div>
           </header>
           <main className="flex-1">{children}</main>
         </SidebarInset>
       </div>
+
+      <SupportRequestModal
+        isOpen={isSupportModalOpen}
+        onClose={() => setIsSupportModalOpen(false)}
+        defaultSubject="Model/Feature Request"
+      />
     </SidebarProvider>
   );
 }

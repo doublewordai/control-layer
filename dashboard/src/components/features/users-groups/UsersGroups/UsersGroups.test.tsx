@@ -59,7 +59,7 @@ describe("UsersGroups Component", () => {
       // Check that user data from mock is displayed
       expect(within(container).getByText("Sarah Chen")).toBeInTheDocument();
       expect(
-        within(container).getByText("sarah.chen@doubleword.ai"),
+        within(container).getByText("sarah.chen@acme.com"),
       ).toBeInTheDocument();
     });
   });
@@ -241,7 +241,7 @@ describe("UsersGroups Component", () => {
         ).toBeInTheDocument();
         // Verify form fields with injected user data
         expect(screen.getByDisplayValue("Sarah Chen")).toBeInTheDocument(); // Display name (injected data)
-        expect(screen.getByText("sarah.chen")).toBeInTheDocument(); // Username (injected data)
+        expect(screen.getByText("github|109540503")).toBeInTheDocument(); // Username (injected data)
         // Verify form structure by labels
         expect(screen.getByLabelText("Display Name")).toBeInTheDocument();
         expect(screen.getByLabelText("Avatar URL")).toBeInTheDocument();
@@ -294,7 +294,7 @@ describe("UsersGroups Component", () => {
         // Verify injected user data is shown in confirmation
         expect(screen.getAllByText("Sarah Chen").length).toBeGreaterThan(0); // User name (injected data)
         expect(
-          screen.getAllByText("sarah.chen@doubleword.ai").length,
+          screen.getAllByText("sarah.chen@acme.com").length,
         ).toBeGreaterThan(0); // Email (injected data)
         // Verify delete action is available
         expect(

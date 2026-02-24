@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM model_traffic_rules WHERE deployed_model_id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "f6d2914545bcaf8b1e75c821f35ad0f7d4d8e6400465531faf27494945738f8a"
+}

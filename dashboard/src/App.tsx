@@ -1,5 +1,5 @@
 import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
-import { useEffect, lazy, Suspense } from "react";
+import { Component, useEffect, lazy, Suspense, type ReactNode } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ReactQueryDevtools } from "@tanstack/react-query-devtools";
 import { Toaster } from "./components/ui/sonner";
@@ -16,6 +16,52 @@ import { SettingsProvider, useSettings } from "./contexts";
 import { AuthProvider, useAuth } from "./contexts/auth";
 import { useAuthorization } from "./utils";
 import { useRegistrationInfo } from "./api/control-layer/hooks";
+
+// Error boundary to catch and display React render errors
+class ErrorBoundary extends Component<
+  { children: ReactNode },
+  { error: Error | null }
+> {
+  state = { error: null as Error | null };
+  static getDerivedStateFromError(error: Error) {
+    return { error };
+  }
+  componentDidCatch(error: Error, info: React.ErrorInfo) {
+    console.error("React ErrorBoundary caught:", error, info.componentStack);
+  }
+  render() {
+    if (this.state.error) {
+      const showDetails = import.meta.env.DEV;
+      return (
+        <div style={{ padding: 32, fontFamily: "monospace" }}>
+          <h2 style={{ color: "red" }}>Something went wrong</h2>
+          {showDetails ? (
+            <>
+              <pre style={{ whiteSpace: "pre-wrap", fontSize: 14 }}>
+                {this.state.error.message}
+              </pre>
+              <pre style={{ whiteSpace: "pre-wrap", fontSize: 12, color: "#666" }}>
+                {this.state.error.stack}
+              </pre>
+            </>
+          ) : (
+            <p>An unexpected error occurred. Please try reloading the page.</p>
+          )}
+          <button
+            onClick={() => {
+              localStorage.removeItem("demo-mode-state");
+              window.location.reload();
+            }}
+            style={{ marginTop: 16, padding: "8px 16px" }}
+          >
+            Clear demo state & reload
+          </button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
 
 // Lazy load route components
 const ApiKeys = lazy(() =>
@@ -445,15 +491,17 @@ function AppRoutes() {
 
 function App() {
   return (
-    <QueryClientProvider client={queryClient}>
-      <SettingsProvider>
-        <AuthProvider>
-          <AppRoutes />
-        </AuthProvider>
-      </SettingsProvider>
-      {import.meta.env.DEV && <ReactQueryDevtools initialIsOpen={false} />}
-      <Toaster />
-    </QueryClientProvider>
+    <ErrorBoundary>
+      <QueryClientProvider client={queryClient}>
+        <SettingsProvider>
+          <AuthProvider>
+            <AppRoutes />
+          </AuthProvider>
+        </SettingsProvider>
+        {import.meta.env.DEV && <ReactQueryDevtools initialIsOpen={false} />}
+        <Toaster />
+      </QueryClientProvider>
+    </ErrorBoundary>
   );
 }
 

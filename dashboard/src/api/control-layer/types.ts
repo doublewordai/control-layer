@@ -33,6 +33,8 @@ export interface ComponentModelSummary {
   description?: string;
   model_type?: ModelType;
   endpoint?: ComponentEndpointSummary;
+  trusted?: boolean;
+  open_responses_adapter?: boolean;
 }
 
 export interface ModelComponent {
@@ -65,9 +67,8 @@ export type Role =
 export type ApiKeyPurpose = "platform" | "realtime" | "batch" | "playground";
 export type TariffApiKeyPurpose = "realtime" | "batch" | "playground";
 
-// Batch priority types
-// API returns formatted priority labels: "Standard (24h)" or "High (1h)"
-export type BatchPriority = "Standard (24h)" | "High (1h)";
+// Batch completion window types
+export type BatchCompletionWindow = "24h" | "1h";
 
 // Config/Metadata types
 export interface ConfigResponse {
@@ -79,10 +80,16 @@ export interface ConfigResponse {
   docs_url: string;
   batches?: {
     enabled: boolean;
-    allowed_completion_windows: string[]; // Formatted priority labels like ["Standard (24h)", "High (1h)"]
+    allowed_completion_windows: string[]; // Raw completion windows like ["24h", "1h"]
+    allowed_url_paths: string[]; // Allowed endpoint paths like ["/v1/chat/completions", "/v1/responses"]
   };
   /** Base URL for AI API endpoints (files, batches, daemons). If not set, use relative paths. */
   ai_api_base_url?: string;
+  /** Onwards AI proxy configuration */
+  onwards: {
+    /** Whether strict mode is enabled (uses trusted flag for providers) */
+    strict_mode: boolean;
+  };
 }
 
 // Model metrics time series point
@@ -121,7 +128,7 @@ export interface ModelTariff {
   valid_from: string; // ISO 8601 timestamp
   valid_until?: string | null; // ISO 8601 timestamp, null means currently active
   api_key_purpose?: TariffApiKeyPurpose | null;
-  completion_window?: string | null; // Priority name: "Standard (24h)", "High (1h)" (API returns priority names)
+  completion_window?: string | null; // Completion window like "24h", "1h"
   is_active: boolean;
 }
 
@@ -147,6 +154,7 @@ export interface Model {
   burst_size?: number | null; // Global rate limiting: burst capacity
   capacity?: number | null; // Maximum concurrent requests allowed
   batch_capacity?: number | null; // Maximum concurrent batch requests allowed
+  throughput?: number | null; // Throughput in requests/second for batch SLA capacity calculations
   groups?: Group[]; // array of group IDs - only present when include=groups
   metrics?: ModelMetrics; // only present when include=metrics
   status?: ModelProbeStatus; // only present when include=status
@@ -158,6 +166,8 @@ export interface Model {
   fallback?: FallbackConfig | null;
   components?: ModelComponent[]; // only present when include=components
   sanitize_responses?: boolean | null; // only present for virtual models
+  trusted?: boolean; // Mark provider as trusted in strict mode (bypasses error sanitization)
+  open_responses_adapter?: boolean; // Enable adapter that converts /v1/responses to /v1/chat/completions
 }
 
 // Model creation types - discriminated union with "type" field
@@ -173,6 +183,9 @@ export interface StandardModelCreate {
   burst_size?: number;
   capacity?: number;
   batch_capacity?: number;
+  throughput?: number;
+  trusted?: boolean;
+  open_responses_adapter?: boolean;
 }
 
 // Virtual model creation - routes requests across multiple hosted models
@@ -188,6 +201,7 @@ export interface VirtualModelCreate {
   burst_size?: number;
   capacity?: number;
   batch_capacity?: number;
+  throughput?: number;
   lb_strategy?: LoadBalancingStrategy;
   fallback_enabled?: boolean;
   fallback_on_rate_limit?: boolean;
@@ -367,6 +381,7 @@ export interface ModelUpdateRequest {
   burst_size?: number | null;
   capacity?: number | null;
   batch_capacity?: number | null;
+  throughput?: number | null;
   tariffs?: TariffDefinition[];
   // Composite model fields
   lb_strategy?: LoadBalancingStrategy | null;
@@ -376,6 +391,8 @@ export interface ModelUpdateRequest {
   fallback_with_replacement?: boolean | null;
   fallback_max_attempts?: number | null;
   sanitize_responses?: boolean | null;
+  trusted?: boolean | null;
+  open_responses_adapter?: boolean | null;
 }
 
 // Endpoint-specific types
@@ -809,7 +826,7 @@ export interface Transaction {
   created_at: string; // ISO 8601 timestamp
   /** Request origin: "api" (direct API), "frontend" (playground), or "fusillade" (batch) */
   request_origin?: string;
-  /** Batch priority: "High (1h)", "Standard (24h)", or empty string for non-batch */
+  /** Batch completion window: "1h", "24h", or empty string for non-batch */
   batch_sla?: string;
   /** Number of requests in this batch (only present for batch transactions) */
   batch_request_count?: number;
@@ -1018,7 +1035,7 @@ export interface Batch {
   endpoint: string;
   errors?: BatchErrors | null;
   input_file_id: string;
-  completion_window: string; // Priority like "Standard (24h)", "High (1h)"
+  completion_window: string; // Completion window like "24h", "1h"
   status: BatchStatus;
   output_file_id?: string | null;
   error_file_id?: string | null;
@@ -1049,7 +1066,7 @@ export interface BatchListResponse {
 export interface BatchCreateRequest {
   input_file_id: string;
   endpoint: string;
-  completion_window: string; // Priority like "Standard (24h)", "High (1h)"
+  completion_window: string; // Completion window like "24h", "1h"
   metadata?: Record<string, string>;
   output_expires_after?: {
     anchor: "created_at";

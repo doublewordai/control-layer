@@ -106,7 +106,7 @@ describe("CreateBatchModal", () => {
     vi.mocked(hooks.useConfig).mockReturnValue({
       data: {
         batches: {
-          allowed_completion_windows: ["Standard (24h)"],
+          allowed_completion_windows: ["24h"],
         },
       },
       isLoading: false,
@@ -218,7 +218,7 @@ describe("CreateBatchModal", () => {
         expect(mutateAsync).toHaveBeenCalledWith({
           input_file_id: "file-123",
           endpoint: "/v1/chat/completions",
-          completion_window: "Standard (24h)",
+          completion_window: "24h",
           metadata: {
             batch_description: "Test batch",
           },
@@ -363,7 +363,7 @@ describe("CreateBatchModal", () => {
         expect(mutateAsync).toHaveBeenCalledWith({
           input_file_id: "file-123",
           endpoint: "/v1/chat/completions",
-          completion_window: "Standard (24h)",
+          completion_window: "24h",
           metadata: {
             batch_description: "Test batch description",
           },
@@ -517,7 +517,7 @@ describe("CreateBatchModal", () => {
         expect(mutateAsync).toHaveBeenCalledWith({
           input_file_id: "file-123",
           endpoint: "/v1/chat/completions",
-          completion_window: "Standard (24h)",
+          completion_window: "24h",
           metadata: undefined,
         });
       });
