@@ -4,6 +4,7 @@ pub mod enrichment;
 
 use super::pagination::Pagination;
 use crate::api::models::groups::GroupResponse;
+use crate::db::models::api_keys::ApiKeyPurpose;
 use crate::db::models::deployments::{
     DeploymentDBResponse, FallbackConfig, LoadBalancingStrategy, ModelType, ProviderPricing, ProviderPricingUpdate, TrafficRuleDBRow,
 };
@@ -528,6 +529,24 @@ impl DeployedModelResponse {
         self.sanitize_responses = None;
         self.trusted = None;
         self.open_responses_adapter = None;
+        self
+    }
+
+    /// Filter out batch tariffs for completion windows that aren't in allowed_batch_completion_windows.
+    /// When allowed_batch_completion_windows is None or empty, all tariffs pass through (global defaults).
+    pub fn filter_disabled_batch_tariffs(mut self) -> Self {
+        if let Some(ref allowed) = self.allowed_batch_completion_windows
+            && !allowed.is_empty()
+            && let Some(ref mut tariffs) = self.tariffs
+        {
+            tariffs.retain(|t| {
+                // Only filter batch tariffs with a completion_window
+                match (&t.api_key_purpose, &t.completion_window) {
+                    (Some(ApiKeyPurpose::Batch), Some(window)) => allowed.contains(window),
+                    _ => true, // Non-batch tariffs, or batch without window, pass through
+                }
+            });
+        }
         self
     }
 
