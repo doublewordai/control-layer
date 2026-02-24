@@ -93,6 +93,12 @@ pub struct RawAnalyticsRecord {
     pub batch_created_at: Option<DateTime<Utc>>,
     /// The request_source from batch metadata
     pub batch_request_source: String,
+
+    // === Trace context ===
+    /// The OTel trace ID from the originating request, if available.
+    /// Included in batcher log events so errors can be correlated back to
+    /// request traces in Loki/Tempo.
+    pub trace_id: Option<String>,
 }
 
 /// Enriched data resolved during batch processing
@@ -263,11 +269,17 @@ where
         async {
             let start = std::time::Instant::now();
 
+            // Collect trace IDs for log correlation with Loki/Tempo
+            let trace_ids: Vec<&str> = buffer
+                .iter()
+                .filter_map(|r| r.trace_id.as_deref())
+                .collect();
+
             // Phase 1: Batch enrich (no retry - enrichment failures are usually data issues)
             let enriched = match self.enrich_batch(buffer).await {
                 Ok(enriched) => enriched,
                 Err(e) => {
-                    error!(error = %e, batch_size = batch_size, "Failed to enrich analytics batch");
+                    error!(error = %e, batch_size = batch_size, ?trace_ids, "Failed to enrich analytics batch");
                     counter!("dwctl_analytics_batch_errors_total", "phase" => "enrich").increment(1);
                     buffer.clear();
                     return;
@@ -280,7 +292,7 @@ where
                 match self.write_batch_transactional(&enriched).await {
                     Ok(()) => {
                         if attempt > 0 {
-                            debug!(attempt = attempt, batch_size = batch_size, "Batch write succeeded after retry");
+                            debug!(attempt = attempt, batch_size = batch_size, ?trace_ids, "Batch write succeeded after retry");
                             counter!("dwctl_analytics_batch_retries_total", "outcome" => "success").increment(1);
                         }
                         last_error = None;
@@ -296,6 +308,7 @@ where
                                 max_retries = self.max_retries,
                                 delay_ms = delay.as_millis() as u64,
                                 batch_size = batch_size,
+                                ?trace_ids,
                                 "Batch write failed, retrying"
                             );
                             counter!("dwctl_analytics_batch_retries_total", "outcome" => "retry").increment(1);
@@ -310,6 +323,7 @@ where
                     error = %e,
                     batch_size = batch_size,
                     attempts = self.max_retries + 1,
+                    ?trace_ids,
                     "Failed to write analytics batch after all retries, dropping batch"
                 );
                 counter!("dwctl_analytics_batch_errors_total", "phase" => "write").increment(1);
@@ -339,6 +353,7 @@ where
             debug!(
                 batch_size = batch_size,
                 duration_ms = duration.as_millis() as u64,
+                ?trace_ids,
                 "Flushed analytics batch"
             );
 
@@ -353,6 +368,7 @@ where
     /// Performs two batch queries:
     /// 1. Token → (user_id, purpose) lookup
     /// 2. Model alias → (model_id, provider, tariffs) lookup
+    #[tracing::instrument(skip_all)]
     async fn enrich_batch(&self, buffer: &[RawAnalyticsRecord]) -> Result<Vec<EnrichedRecord>, sqlx::Error> {
         // Collect unique bearer tokens
         let tokens: Vec<&str> = buffer
@@ -444,6 +460,7 @@ where
     }
 
     /// Batch lookup user info by bearer tokens.
+    #[tracing::instrument(skip_all)]
     async fn batch_lookup_users(&self, tokens: &[&str]) -> Result<HashMap<String, (Uuid, ApiKeyPurpose)>, sqlx::Error> {
         let tokens_vec: Vec<String> = tokens.iter().map(|s| s.to_string()).collect();
 
@@ -479,6 +496,7 @@ where
     ///
     /// Fetches ALL tariffs (including expired ones) to support historical pricing
     /// for batch requests that may have been created in the past.
+    #[tracing::instrument(skip_all)]
     async fn batch_lookup_models_with_tariffs(&self, aliases: &[&str]) -> Result<HashMap<String, ModelInfo>, sqlx::Error> {
         let aliases_vec: Vec<String> = aliases.iter().map(|s| s.to_string()).collect();
 
@@ -601,6 +619,7 @@ where
     }
 
     /// Write enriched records to the database in a single transaction.
+    #[tracing::instrument(skip_all)]
     async fn write_batch_transactional(&self, records: &[EnrichedRecord]) -> Result<(), sqlx::Error> {
         let mut tx = self.pool.begin().await?;
 
@@ -1067,6 +1086,7 @@ mod tests {
             batch_completion_window: None,
             batch_created_at: None,
             batch_request_source: "".to_string(),
+            trace_id: None,
         };
 
         assert_eq!(record.correlation_id, 123);
@@ -1588,6 +1608,7 @@ mod integration_tests {
             batch_completion_window: None,
             batch_created_at: None,
             batch_request_source: String::new(),
+            trace_id: None,
         }
     }
 

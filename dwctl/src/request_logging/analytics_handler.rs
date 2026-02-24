@@ -52,7 +52,9 @@ use crate::request_logging::utils::{extract_header_as_string, extract_header_as_
 use metrics::counter;
 use outlet::{RequestData, RequestHandler, ResponseData};
 use serde_json::Value;
+use opentelemetry::trace::TraceContextExt;
 use tracing::{Instrument, info_span, warn};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 use uuid::Uuid;
 
 /// A request handler that sends analytics data to a background batcher.
@@ -171,6 +173,10 @@ impl RequestHandler for AnalyticsHandler {
                 batch_completion_window,
                 batch_created_at,
                 batch_request_source,
+                trace_id: {
+                    let sc = tracing::Span::current().context().span().span_context().clone();
+                    sc.is_valid().then(|| sc.trace_id().to_string())
+                },
             };
 
             // Send to batcher (non-blocking, just puts in channel)
