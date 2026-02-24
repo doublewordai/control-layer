@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.8.1](https://github.com/doublewordai/control-layer/compare/v8.8.0...v8.8.1) (2026-02-24)
+
+
+### Bug Fixes
+
+* align strict mode mount point with non-strict mode ([#767](https://github.com/doublewordai/control-layer/issues/767)) ([c8d8b6a](https://github.com/doublewordai/control-layer/commit/c8d8b6aa0db93636e778e33bf5168eba9ddef9eb))
+
 ## [8.8.0](https://github.com/doublewordai/control-layer/compare/v8.7.1...v8.8.0) (2026-02-24)
 
 
