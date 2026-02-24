@@ -48,12 +48,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 /// Returns the tracer provider if OTLP export was successfully enabled. The caller should
 /// store this and call `provider.shutdown()` before application exit to flush pending spans.
 pub fn init_telemetry(enable_otel_export: bool) -> anyhow::Result<Option<SdkTracerProvider>> {
-    // Start with RUST_LOG or default to "info", then suppress noisy crates that
-    // spam DEBUG logs (OTLP batch timer, hyper connection pool, HTTP/2 frames).
-    // User-specified directives come first so our suppressions override them for
-    // these specific crates; remove the suffix here if you need to debug them.
-    let base = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
-    let env_filter = EnvFilter::new(format!("{base},opentelemetry_sdk=warn,hyper_util=warn,h2=warn,reqwest=warn"));
+    let env_filter = EnvFilter::new(std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()));
 
     if enable_otel_export {
         let (tracer, provider) = create_otlp_tracer()?;
