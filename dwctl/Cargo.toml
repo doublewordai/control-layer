@@ -84,7 +84,7 @@ metrics = "0.24"
 metrics-exporter-prometheus = "0.18"
 outlet = "0.5.2"
 outlet-postgres = "0.4.6"
-async-openai = { version = "0.32.0", default-features = false, features = [
+async-openai = { version = "0.33.0", default-features = false, features = [
   "chat-completion-types",
   "completion-types",
   "embedding-types",
