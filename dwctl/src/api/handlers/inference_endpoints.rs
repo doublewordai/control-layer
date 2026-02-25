@@ -192,7 +192,7 @@ pub async fn update_inference_endpoint<P: PoolProvider>(
         let mut deployments_repo = Deployments::new(&mut tx);
         match update_endpoint_aliases(endpoint.clone(), &mut deployments_repo, &alias_mapping).await {
             Ok(sync_result) => {
-                tracing::info!(
+                tracing::debug!(
                     "Updated aliases for endpoint {}: {} changes made",
                     endpoint.id,
                     sync_result.changes_made
@@ -240,7 +240,7 @@ pub async fn update_inference_endpoint<P: PoolProvider>(
         // Perform background sync after successful update
         match endpoint_sync::synchronize_endpoint(endpoint.id, state.db.write().clone()).await {
             Ok(sync_result) => {
-                tracing::info!(
+                tracing::debug!(
                     "Auto-sync after endpoint {} update: {} changes made",
                     endpoint.id,
                     sync_result.changes_made
@@ -314,7 +314,7 @@ pub async fn validate_inference_endpoint<P: PoolProvider>(
         }
     };
 
-    tracing::info!(
+    tracing::debug!(
         "Validating endpoint: url={}, has_api_key={}, auth_header_name={:?}, auth_header_prefix={:?}",
         url,
         api_key.is_some(),
@@ -397,7 +397,7 @@ pub async fn create_inference_endpoint<P: PoolProvider>(
             if model_names.is_empty() {
                 tracing::warn!("skip_fetch is true but model_filter is empty for endpoint {}", endpoint.id);
             }
-            tracing::info!("Using static model list for endpoint {}: {:?}", endpoint.id, model_names);
+            tracing::debug!("Using static model list for endpoint {}: {:?}", endpoint.id, model_names);
             let fetcher = StaticModelsFetcher::new(model_names);
             sync_endpoint_models_with_aliases(endpoint.clone(), &mut deployments_repo, fetcher, &create_request.alias_mapping).await
         } else {
@@ -408,7 +408,7 @@ pub async fn create_inference_endpoint<P: PoolProvider>(
 
         match sync_result {
             Ok(result) => {
-                tracing::info!("Sync succeeded: {:?}", result);
+                tracing::debug!("Sync succeeded: {:?}", result);
             }
             Err(sync_error) => {
                 tracing::error!("Sync failed with error: {:?}", sync_error);
@@ -429,7 +429,7 @@ pub async fn create_inference_endpoint<P: PoolProvider>(
             }
         }
     } else {
-        tracing::info!("Skipped sync during endpoint {} creation (sync=false)", endpoint.id);
+        tracing::debug!("Skipped sync during endpoint {} creation (sync=false)", endpoint.id);
     }
 
     tx.commit().await.map_err(|e| Error::Database(e.into()))?;
@@ -568,7 +568,7 @@ pub async fn synchronize_endpoint<P: PoolProvider>(
     // Perform synchronization
     let response = endpoint_sync::synchronize_endpoint(id, state.db.write().clone()).await?;
 
-    tracing::info!("Successfully synchronized endpoint {} with {} changes", id, response.changes_made);
+    tracing::debug!("Successfully synchronized endpoint {} with {} changes", id, response.changes_made);
     Ok(Json(response))
 }
 

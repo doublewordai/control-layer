@@ -248,6 +248,17 @@ batches:
     # - "12h"  # Uncomment to allow 12 hour 
     # - "48h"  # Uncomment to allow 48 hour
 
+  # Per-window relaxation factors for capacity acceptance.
+  # A multiplier on the model's computed capacity for that window.
+  #   1.0 (default) = strict, only accept what current throughput supports
+  #   1.5           = accept up to 50% more (rely on autoscaling for headroom)
+  #   0.0           = block all new batches for this window
+  # Keys must be present in allowed_completion_windows.
+  # Windows not listed here default to 1.0.
+  window_relaxation_factors:
+    "1h": 1.0    # strict — no over-acceptance for high priority window
+    "24h": 1.25   # 25% over-acceptance — time to provision more capacity
+
   # Allowed OpenAI-compatible URL paths for batch requests.
   # This is used by both /files upload validation and /batches endpoint validation.
   allowed_url_paths:

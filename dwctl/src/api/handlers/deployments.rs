@@ -87,6 +87,8 @@ fn db_component_to_response(c: DeploymentComponentDBResponse) -> ModelComponentR
                 id,
                 name: c.endpoint_name.unwrap_or_default(),
             }),
+            trusted: c.model_trusted,
+            open_responses_adapter: c.model_open_responses_adapter,
         },
     }
 }

@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT MAX(id) FROM http_analytics\n        WHERE id > $1 AND user_id IS NOT NULL AND model IS NOT NULL AND fusillade_batch_id IS NOT NULL\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "max",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "57921714bdbf1c442b5210a2da8bbcee9bd8e3138261b34083c532621667d1f9"
+}

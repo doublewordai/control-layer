@@ -140,7 +140,7 @@ impl WebhookDispatcher {
         }
 
         counter!("dwctl_webhook_deliveries_claimed_total").increment(deliveries.len() as u64);
-        tracing::info!(count = deliveries.len(), "Claimed deliveries for sending");
+        tracing::debug!(count = deliveries.len(), "Claimed deliveries for sending");
 
         for delivery in deliveries {
             // Webhook missing from LEFT JOIN. With CASCADE delete this is
@@ -244,7 +244,7 @@ impl WebhookDispatcher {
                     if let Err(e) = repo.reset_failures(result.webhook_id).await {
                         tracing::warn!(error = %e, webhook_id = %result.webhook_id, "Failed to reset webhook failures");
                     }
-                    tracing::info!(
+                    tracing::debug!(
                         webhook_id = %result.webhook_id,
                         delivery_id = %result.delivery_id,
                         status = status_code,
@@ -292,7 +292,7 @@ impl WebhookDispatcher {
         }
 
         if drained > 0 {
-            tracing::info!(count = drained, "Drained webhook send results");
+            tracing::debug!(count = drained, "Drained webhook send results");
         } else {
             tracing::debug!("No send results to drain");
         }

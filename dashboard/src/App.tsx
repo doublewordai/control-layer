@@ -127,6 +127,11 @@ const System = lazy(() =>
     default: m.System,
   })),
 );
+const Usage = lazy(() =>
+  import("./components/features/usage").then((m) => ({
+    default: m.Usage,
+  })),
+);
 
 // Loading component for lazy-loaded routes
 function RouteLoader() {
@@ -438,6 +443,18 @@ function AppRoutes() {
               <ProtectedRoute path="/api-keys">
                 <Suspense fallback={<RouteLoader />}>
                   <ApiKeys />
+                </Suspense>
+              </ProtectedRoute>
+            </AppLayout>
+          }
+        />
+        <Route
+          path="/usage"
+          element={
+            <AppLayout>
+              <ProtectedRoute path="/usage">
+                <Suspense fallback={<RouteLoader />}>
+                  <Usage />
                 </Suspense>
               </ProtectedRoute>
             </AppLayout>

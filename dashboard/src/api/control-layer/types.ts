@@ -33,6 +33,8 @@ export interface ComponentModelSummary {
   description?: string;
   model_type?: ModelType;
   endpoint?: ComponentEndpointSummary;
+  trusted?: boolean;
+  open_responses_adapter?: boolean;
 }
 
 export interface ModelComponent {
@@ -65,6 +67,15 @@ export type Role =
 export type ApiKeyPurpose = "platform" | "realtime" | "batch" | "playground";
 export type TariffApiKeyPurpose = "realtime" | "batch" | "playground";
 
+export type TrafficRoutingAction =
+  | { type: "deny" }
+  | { type: "redirect"; target: string };
+
+export interface TrafficRoutingRule {
+  api_key_purpose: ApiKeyPurpose;
+  action: TrafficRoutingAction;
+}
+
 // Batch completion window types
 export type BatchCompletionWindow = "24h" | "1h";
 
@@ -79,9 +90,15 @@ export interface ConfigResponse {
   batches?: {
     enabled: boolean;
     allowed_completion_windows: string[]; // Raw completion windows like ["24h", "1h"]
+    allowed_url_paths: string[]; // Allowed endpoint paths like ["/v1/chat/completions", "/v1/responses"]
   };
   /** Base URL for AI API endpoints (files, batches, daemons). If not set, use relative paths. */
   ai_api_base_url?: string;
+  /** Onwards AI proxy configuration */
+  onwards: {
+    /** Whether strict mode is enabled (uses trusted flag for providers) */
+    strict_mode: boolean;
+  };
 }
 
 // Model metrics time series point
@@ -158,6 +175,10 @@ export interface Model {
   fallback?: FallbackConfig | null;
   components?: ModelComponent[]; // only present when include=components
   sanitize_responses?: boolean | null; // only present for virtual models
+  trusted?: boolean; // Mark provider as trusted in strict mode (bypasses error sanitization)
+  open_responses_adapter?: boolean; // Enable adapter that converts /v1/responses to /v1/chat/completions
+  traffic_routing_rules?: TrafficRoutingRule[] | null;
+  allowed_batch_completion_windows?: string[] | null;
 }
 
 // Model creation types - discriminated union with "type" field
@@ -174,6 +195,10 @@ export interface StandardModelCreate {
   capacity?: number;
   batch_capacity?: number;
   throughput?: number;
+  trusted?: boolean;
+  open_responses_adapter?: boolean;
+  traffic_routing_rules?: TrafficRoutingRule[];
+  allowed_batch_completion_windows?: string[];
 }
 
 // Virtual model creation - routes requests across multiple hosted models
@@ -197,6 +222,8 @@ export interface VirtualModelCreate {
   fallback_with_replacement?: boolean;
   fallback_max_attempts?: number | null;
   sanitize_responses?: boolean;
+  traffic_routing_rules?: TrafficRoutingRule[];
+  allowed_batch_completion_windows?: string[];
 }
 
 // Backwards compatibility alias
@@ -379,6 +406,10 @@ export interface ModelUpdateRequest {
   fallback_with_replacement?: boolean | null;
   fallback_max_attempts?: number | null;
   sanitize_responses?: boolean | null;
+  trusted?: boolean | null;
+  open_responses_adapter?: boolean | null;
+  traffic_routing_rules?: TrafficRoutingRule[] | null;
+  allowed_batch_completion_windows?: string[] | null;
 }
 
 // Endpoint-specific types
@@ -720,6 +751,26 @@ export interface ModelUserUsageResponse {
   total_tokens: number;
   total_cost?: number;
   users: UserUsage[];
+}
+
+// User batch usage types
+export interface ModelBreakdownEntry {
+  model: string;
+  input_tokens: number;
+  output_tokens: number;
+  cost: string;
+  request_count: number;
+}
+
+export interface UserBatchUsageResponse {
+  total_input_tokens: number;
+  total_output_tokens: number;
+  total_request_count: number;
+  total_batch_count: number;
+  avg_requests_per_batch: number;
+  total_cost: string;
+  estimated_realtime_cost: string;
+  by_model: ModelBreakdownEntry[];
 }
 
 // Authentication types

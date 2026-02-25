@@ -472,6 +472,9 @@ pub async fn seed_database(sources: &[config::ModelSource], db: &PgPool) -> Resu
                             throughput: None,
                             tariffs: None,
                             provider_pricing: None,
+                            sanitize_responses: None,
+                            trusted: None,
+                            open_responses_adapter: None,
                             traffic_routing_rules: None,
                             allowed_batch_completion_windows: None,
                         }),
@@ -1095,6 +1098,7 @@ pub async fn build_router(
         .route("/requests", get(api::handlers::requests::list_requests))
         .route("/requests/aggregate", get(api::handlers::requests::aggregate_requests))
         .route("/requests/aggregate-by-user", get(api::handlers::requests::aggregate_by_user))
+        .route("/usage", get(api::handlers::requests::get_usage))
         // Probes management
         .route("/probes", get(api::handlers::probes::list_probes))
         .route("/probes", post(api::handlers::probes::create_probe))
@@ -1195,8 +1199,8 @@ pub async fn build_router(
 
     // Add AI routes with appropriate nesting based on strict mode
     if strict_mode {
-        // Strict mode: nest onwards at /ai, nest batches at /ai/v1
-        router = router.nest("/ai", onwards_router);
+        // Strict mode: nest onwards at /ai/v1, nest batches at /ai/v1
+        router = router.nest("/ai/v1", onwards_router);
         if let Some(batches) = batches_routes {
             // Add fallback to batches router to return 404 for unknown routes
             // This prevents unknown /ai/v1/* requests from falling through to the
@@ -1364,6 +1368,7 @@ pub async fn build_router(
                 span.set_attribute("url.query", request.uri().query().unwrap_or("").to_string());
                 span
             })
+            .on_request(tower_http::trace::DefaultOnRequest::new().level(tracing::Level::TRACE))
             .on_response(|response: &http::Response<_>, latency: std::time::Duration, span: &tracing::Span| {
                 let status = response.status().as_u16();
                 span.set_attribute("http.response.status_code", i64::from(status));

@@ -29,6 +29,8 @@ pub enum ApiAiResponse {
     ChatCompletionsStream(serde_json::Value),
     Completions(serde_json::Value),
     Embeddings(serde_json::Value),
+    Responses(serde_json::Value),
+    ResponsesStream(serde_json::Value),
     Other(serde_json::Value),
 }
 
@@ -53,6 +55,8 @@ impl From<&AiResponse> for ApiAiResponse {
             AiResponse::Completions(resp) => ApiAiResponse::Completions(serde_json::to_value(resp).unwrap_or_default()),
             AiResponse::Embeddings(resp) => ApiAiResponse::Embeddings(serde_json::to_value(resp).unwrap_or_default()),
             AiResponse::Base64Embeddings(resp) => ApiAiResponse::Embeddings(serde_json::to_value(resp).unwrap_or_default()),
+            AiResponse::Responses(resp) => ApiAiResponse::Responses(serde_json::to_value(resp).unwrap_or_default()),
+            AiResponse::ResponsesStream(events) => ApiAiResponse::ResponsesStream(serde_json::to_value(events).unwrap_or_default()),
             AiResponse::Other(val) => ApiAiResponse::Other(val.clone()),
         }
     }
@@ -262,6 +266,17 @@ impl Default for ListRequestsQuery {
     }
 }
 
+/// Query parameters for the usage endpoint (date filtering)
+#[derive(Debug, Deserialize, ToSchema, IntoParams)]
+pub struct UsageDateQuery {
+    /// Start of the date range (inclusive). When provided, queries http_analytics directly.
+    pub start_date: Option<DateTime<Utc>>,
+    /// End of the date range (inclusive). When provided, queries http_analytics directly.
+    pub end_date: Option<DateTime<Utc>>,
+    /// When true, bypasses the server-side cache and forces fresh aggregation.
+    pub refresh: Option<bool>,
+}
+
 // ===== AGGREGATE/ANALYTICS RESPONSE TYPES =====
 
 /// Status code breakdown for analytics
@@ -329,4 +344,28 @@ pub struct RequestsAggregateResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub models: Option<Vec<ModelUsage>>,
     pub time_series: Vec<TimeSeriesPoint>,
+}
+
+/// Per-model breakdown entry for user batch usage
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ModelBreakdownEntry {
+    pub model: String,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cost: String,
+    pub request_count: i64,
+}
+
+/// User batch usage response with overall metrics and per-model breakdown
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct UserBatchUsageResponse {
+    pub total_input_tokens: i64,
+    pub total_output_tokens: i64,
+    pub total_request_count: i64,
+    pub total_batch_count: i64,
+    pub avg_requests_per_batch: f64,
+    pub total_cost: String,
+    /// Estimated cost if all tokens were charged at realtime tariff rates.
+    pub estimated_realtime_cost: String,
+    pub by_model: Vec<ModelBreakdownEntry>,
 }

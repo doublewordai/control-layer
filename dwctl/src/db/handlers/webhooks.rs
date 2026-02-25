@@ -558,7 +558,7 @@ mod tests {
         assert_eq!(d.status, "failed");
         assert_eq!(d.attempt_count, 1);
         let delay = (d.next_attempt_at - Utc::now()).num_seconds();
-        assert!(delay >= 3 && delay <= 7, "expected ~5s delay, got {}s", delay);
+        assert!((3..=7).contains(&delay), "expected ~5s delay, got {}s", delay);
 
         // Time travel and fail again: attempt 1 → 2: next retry in ~5 minutes
         time_travel_delivery(&pool, delivery.id).await;
@@ -566,7 +566,7 @@ mod tests {
         let d = get_delivery(&pool, delivery.id).await;
         assert_eq!(d.attempt_count, 2);
         let delay = (d.next_attempt_at - Utc::now()).num_seconds();
-        assert!(delay >= 280 && delay <= 320, "expected ~300s delay, got {}s", delay);
+        assert!((280..=320).contains(&delay), "expected ~300s delay, got {}s", delay);
     }
 
     #[sqlx::test]
