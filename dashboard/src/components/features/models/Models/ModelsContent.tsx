@@ -12,6 +12,8 @@ import {
   BarChart3,
   ArrowUpDown,
   Info,
+  ArrowDownToLine,
+  ArrowUpToLine,
   GitMerge,
   Copy,
   Check,
@@ -640,7 +642,7 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                                 const realtimeDenied = isRealtimeDenied(model);
                                 const batchDenied = isBatchDenied(model);
                                 const realtimeTariff = model.tariffs?.find(
-                                  (t) => t.api_key_purpose === null,
+                                  (t) => t.api_key_purpose === "realtime" || t.api_key_purpose === null,
                                 );
 
                                 // Determine which batch windows this model supports:
@@ -697,7 +699,7 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                                     {tiers.map((tier, index) => (
                                       <React.Fragment key={tier.key}>
                                         {index > 0 && (
-                                          <span className="mx-0.5 text-gray-300">·</span>
+                                          <span className="mx-1">•</span>
                                         )}
                                         <HoverCard openDelay={200} closeDelay={100}>
                                           <HoverCardTrigger asChild>
@@ -714,9 +716,25 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                                               }`} />
                                               <span className="hidden sm:inline">{tier.label}</span>
                                               {!tier.denied && (tier.inputPrice || tier.outputPrice) && (
-                                                <span className="hidden sm:inline tabular-nums text-gray-500 ml-0.5">
-                                                  {formatTariffPrice(tier.inputPrice)}/{formatTariffPrice(tier.outputPrice)}
-                                                </span>
+                                                <>
+                                                  <span className="hidden sm:inline">:</span>
+                                                  <span className="hidden sm:flex items-center gap-1">
+                                                    <span className="flex items-center gap-0.5">
+                                                      <ArrowUpToLine className="h-2.5 w-2.5 text-gray-500 shrink-0" />
+                                                      <span className="whitespace-nowrap tabular-nums">
+                                                        {formatTariffPrice(tier.inputPrice)}
+                                                      </span>
+                                                      <span className="text-[8px] text-gray-400">/M</span>
+                                                    </span>
+                                                    <span className="flex items-center gap-0.5">
+                                                      <ArrowDownToLine className="h-2.5 w-2.5 text-gray-500 shrink-0" />
+                                                      <span className="whitespace-nowrap tabular-nums">
+                                                        {formatTariffPrice(tier.outputPrice)}
+                                                      </span>
+                                                      <span className="text-[8px] text-gray-400">/M</span>
+                                                    </span>
+                                                  </span>
+                                                </>
                                               )}
                                             </button>
                                           </HoverCardTrigger>
