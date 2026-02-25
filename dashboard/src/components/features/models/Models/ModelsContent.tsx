@@ -713,6 +713,11 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                                                 tier.denied ? "text-gray-400" : "text-gray-500"
                                               }`} />
                                               <span className="hidden sm:inline">{tier.label}</span>
+                                              {!tier.denied && (tier.inputPrice || tier.outputPrice) && (
+                                                <span className="hidden sm:inline tabular-nums text-gray-500 ml-0.5">
+                                                  {formatTariffPrice(tier.inputPrice)}/{formatTariffPrice(tier.outputPrice)}
+                                                </span>
+                                              )}
                                             </button>
                                           </HoverCardTrigger>
                                           <HoverCardContent className="w-52" sideOffset={5}>
