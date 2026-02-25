@@ -59,6 +59,7 @@ import {
 } from "../../../ui/tooltip";
 import { StatusRow } from "./StatusRow";
 import { Markdown } from "../../../ui/markdown";
+import { isBatchDenied, isPlaygroundDenied } from "../../../../utils/modelAccess";
 
 const COMPLETION_WINDOWS: Record<
   string,
@@ -636,10 +637,11 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                           {showPricing && (
                             <>
                               {(() => {
-                                const batchTariffs =
-                                  model.tariffs?.filter(
-                                    (t) => t.api_key_purpose === "batch",
-                                  ) || [];
+                                const batchTariffs = isBatchDenied(model)
+                                  ? []
+                                  : model.tariffs?.filter(
+                                      (t) => t.api_key_purpose === "batch",
+                                    ) || [];
 
                                 return (
                                   <>
@@ -1002,29 +1004,38 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                   </div>
 
                   <div className="border-t">
-                    <div className="grid grid-cols-2 divide-x">
-                      <button
-                        className="flex items-center justify-center gap-1.5 py-3.5 text-sm font-medium text-gray-600 hover:bg-gray-50 hover:text-gray-700 transition-colors rounded-bl-lg"
-                        onClick={() => {
-                          setApiExamplesModel(model);
-                          setShowApiExamples(true);
-                        }}
-                      >
-                        <Code className="h-4 w-4 text-blue-500" />
-                        <span>API</span>
-                      </button>
-                      <button
-                        className="flex items-center justify-center gap-1.5 py-3.5 text-sm font-medium text-gray-600 hover:bg-gray-50 hover:text-gray-700 transition-colors rounded-br-lg group"
-                        onClick={() => {
-                          navigate(
-                            `/playground?model=${encodeURIComponent(model.alias)}&from=${encodeURIComponent("/models")}`,
-                          );
-                        }}
-                      >
-                        <ArrowRight className="h-4 w-4 text-purple-500 group-hover:translate-x-0.5 transition-transform" />
-                        <span>Playground</span>
-                      </button>
-                    </div>
+                    {(() => {
+                      const playgroundAvailable = !isPlaygroundDenied(model);
+                      return (
+                        <div
+                          className={`grid ${playgroundAvailable ? "grid-cols-2 divide-x" : "grid-cols-1"}`}
+                        >
+                          <button
+                            className={`flex items-center justify-center gap-1.5 py-3.5 text-sm font-medium text-gray-600 hover:bg-gray-50 hover:text-gray-700 transition-colors rounded-bl-lg ${!playgroundAvailable ? "rounded-br-lg" : ""}`}
+                            onClick={() => {
+                              setApiExamplesModel(model);
+                              setShowApiExamples(true);
+                            }}
+                          >
+                            <Code className="h-4 w-4 text-blue-500" />
+                            <span>API</span>
+                          </button>
+                          {playgroundAvailable && (
+                            <button
+                              className="flex items-center justify-center gap-1.5 py-3.5 text-sm font-medium text-gray-600 hover:bg-gray-50 hover:text-gray-700 transition-colors rounded-br-lg group"
+                              onClick={() => {
+                                navigate(
+                                  `/playground?model=${encodeURIComponent(model.alias)}&from=${encodeURIComponent("/models")}`,
+                                );
+                              }}
+                            >
+                              <ArrowRight className="h-4 w-4 text-purple-500 group-hover:translate-x-0.5 transition-transform" />
+                              <span>Playground</span>
+                            </button>
+                          )}
+                        </div>
+                      );
+                    })()}
                   </div>
                 </Card>
               );
