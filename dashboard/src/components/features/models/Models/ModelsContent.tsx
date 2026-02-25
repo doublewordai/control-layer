@@ -13,8 +13,6 @@ import {
   ArrowUpDown,
   Info,
   DollarSign,
-  ArrowDownToLine,
-  ArrowUpToLine,
   GitMerge,
   Copy,
   Check,
@@ -51,6 +49,7 @@ import {
   formatNumber,
   formatLatency,
   formatRelativeTime,
+  formatTariffPrice,
 } from "../../../../utils/formatters";
 import { Skeleton } from "../../../ui/skeleton";
 import {
@@ -632,164 +631,108 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                           )
                         )}
 
-                        {/* ROW 3: Tariffs */}
+                        {/* ROW 3: Access tiers */}
                         <CardDescription className="flex items-center flex-wrap gap-1.5 min-w-0">
-                          {/* Show pricing for users with pricing permissions */}
                           {showPricing && (
                             <>
                               {(() => {
                                 const realtimeDenied = isRealtimeDenied(model);
-                                const batchTariffs = isBatchDenied(model)
+                                const batchDenied = isBatchDenied(model);
+                                const realtimeTariff = model.tariffs?.find(
+                                  (t) => t.api_key_purpose === null,
+                                );
+                                const batchTariffs = batchDenied
                                   ? []
                                   : model.tariffs?.filter(
                                       (t) => t.api_key_purpose === "batch",
                                     ) || [];
 
+                                const tiers: {
+                                  key: string;
+                                  label: string;
+                                  icon: typeof Clock;
+                                  denied: boolean;
+                                  deniedMessage: string;
+                                  description: string;
+                                  inputPrice?: string | null;
+                                  outputPrice?: string | null;
+                                }[] = [
+                                  {
+                                    key: "realtime",
+                                    label: "Realtime",
+                                    icon: Radio,
+                                    denied: realtimeDenied,
+                                    deniedMessage: "Synchronous API access is unavailable for this model",
+                                    description: "Synchronous API access",
+                                    inputPrice: realtimeTariff?.input_price_per_token,
+                                    outputPrice: realtimeTariff?.output_price_per_token,
+                                  },
+                                  ...batchTariffs.map((t) => {
+                                    const cw = t.completion_window
+                                      ? COMPLETION_WINDOWS[t.completion_window]
+                                      : null;
+                                    return {
+                                      key: t.id,
+                                      label: cw?.label ?? t.completion_window ?? "Batch",
+                                      icon: cw?.icon ?? Clock,
+                                      denied: false,
+                                      deniedMessage: "",
+                                      description: `${t.completion_window ?? ""} completion window`,
+                                      inputPrice: t.input_price_per_token,
+                                      outputPrice: t.output_price_per_token,
+                                    };
+                                  }),
+                                ];
+
                                 return (
                                   <>
-                                    <span className={`flex items-center gap-0.5 shrink-0 ${realtimeDenied ? "line-through text-gray-400" : ""}`}>
-                                      <Radio className={`h-2.5 w-2.5 shrink-0 ${realtimeDenied ? "text-gray-400" : "text-gray-500"}`} />
-                                      <span className="hidden sm:inline">Realtime</span>
-                                    </span>
-                                    {batchTariffs.map((batchTariff) => (
-                                      <React.Fragment key={batchTariff.id}>
-                                        <span className="mx-1">•</span>
-                                        <HoverCard
-                                          openDelay={200}
-                                          closeDelay={100}
-                                        >
+                                    {tiers.map((tier, index) => (
+                                      <React.Fragment key={tier.key}>
+                                        {index > 0 && (
+                                          <span className="mx-0.5 text-gray-300">·</span>
+                                        )}
+                                        <HoverCard openDelay={200} closeDelay={100}>
                                           <HoverCardTrigger asChild>
                                             <button
-                                              className="flex items-center gap-0.5 shrink-0 hover:opacity-70 transition-opacity"
-                                              onClick={(e) =>
-                                                e.stopPropagation()
-                                              }
+                                              className={`flex items-center gap-0.5 shrink-0 transition-opacity ${
+                                                tier.denied
+                                                  ? "line-through text-gray-400"
+                                                  : "hover:opacity-70"
+                                              }`}
+                                              onClick={(e) => e.stopPropagation()}
                                             >
-                                              {(() => {
-                                                const cw = batchTariff.completion_window
-                                                  ? COMPLETION_WINDOWS[batchTariff.completion_window]
-                                                  : null;
-                                                const Icon = cw?.icon;
-                                                return (
-                                                  <>
-                                                    {Icon && <Icon className="h-2.5 w-2.5 text-gray-500 shrink-0" />}
-                                                    <span className="hidden sm:inline">{cw?.label ?? batchTariff.completion_window ?? "Batch"}</span>
-                                                  </>
-                                                );
-                                              })()}
-                                              :
-                                              {!batchTariff.input_price_per_token &&
-                                              !batchTariff.output_price_per_token ? (
-                                                <span className="flex items-center gap-0.5 text-green-700">
-                                                  <div className="relative h-2.5 w-2.5">
-                                                    <DollarSign className="h-2.5 w-2.5" />
-                                                    <div className="absolute inset-0 flex items-center justify-center">
-                                                      <div className="w-5 h-px bg-green-700 rotate-[-50deg]" />
-                                                    </div>
-                                                  </div>
-                                                  <span>Free</span>
-                                                </span>
-                                              ) : (
-                                                <span className="flex items-center gap-1">
-                                                  <span className="flex items-center gap-0.5">
-                                                    <ArrowUpToLine className="h-2.5 w-2.5 text-gray-500 shrink-0" />
-                                                    <span className="whitespace-nowrap tabular-nums">
-                                                      {batchTariff.input_price_per_token
-                                                        ? (() => {
-                                                            const price =
-                                                              Number(
-                                                                batchTariff.input_price_per_token,
-                                                              ) * 1000000;
-                                                            return `$${price % 1 === 0 ? price.toFixed(0) : price.toFixed(2)}`;
-                                                          })()
-                                                        : "$0"}
-                                                    </span>
-                                                    <span className="text-[8px] text-gray-400">
-                                                      /M
-                                                    </span>
-                                                  </span>
-                                                  <span className="flex items-center gap-0.5">
-                                                    <ArrowDownToLine className="h-2.5 w-2.5 text-gray-500 shrink-0" />
-                                                    <span className="whitespace-nowrap tabular-nums">
-                                                      {batchTariff.output_price_per_token
-                                                        ? (() => {
-                                                            const price =
-                                                              Number(
-                                                                batchTariff.output_price_per_token,
-                                                              ) * 1000000;
-                                                            return `$${price % 1 === 0 ? price.toFixed(0) : price.toFixed(2)}`;
-                                                          })()
-                                                        : "$0"}
-                                                    </span>
-                                                    <span className="text-[8px] text-gray-400">
-                                                      /M
-                                                    </span>
-                                                  </span>
-                                                </span>
-                                              )}
-                                              <span className="sr-only">
-                                                View {batchTariff.name} pricing
-                                                details
-                                              </span>
+                                              <tier.icon className={`h-2.5 w-2.5 shrink-0 ${
+                                                tier.denied ? "text-gray-400" : "text-gray-500"
+                                              }`} />
+                                              <span className="hidden sm:inline">{tier.label}</span>
                                             </button>
                                           </HoverCardTrigger>
-                                          <HoverCardContent
-                                            className="w-48"
-                                            sideOffset={5}
-                                          >
-                                            <p className="font-medium text-sm mb-1">
-                                              {COMPLETION_WINDOWS[batchTariff.completion_window ?? ""]?.label ?? batchTariff.completion_window}{" "}
-                                              priority
-                                            </p>
-                                            <p className="text-xs text-muted-foreground mb-2">
-                                              {batchTariff.completion_window ?? ""}{" "}
-                                              completion window
-                                            </p>
-                                            {!batchTariff.input_price_per_token &&
-                                            !batchTariff.output_price_per_token ? (
-                                              <div className="text-sm">
-                                                <p className="font-medium text-green-700">
-                                                  Free
-                                                </p>
-                                                <p className="text-xs text-muted-foreground mt-1">
-                                                  No charge for calls to this
-                                                  model
-                                                </p>
-                                              </div>
+                                          <HoverCardContent className="w-52" sideOffset={5}>
+                                            {tier.denied ? (
+                                              <p className="text-xs text-muted-foreground">
+                                                {tier.deniedMessage}
+                                              </p>
                                             ) : (
-                                              <div className="space-y-1 text-xs">
-                                                <p className="text-muted-foreground">
-                                                  Pricing per million tokens:
-                                                </p>
-                                                <p>
-                                                  <span className="font-medium">
-                                                    Input:
-                                                  </span>{" "}
-                                                  {batchTariff.input_price_per_token
-                                                    ? (() => {
-                                                        const price =
-                                                          Number(
-                                                            batchTariff.input_price_per_token,
-                                                          ) * 1000000;
-                                                        return `$${price % 1 === 0 ? price.toFixed(0) : price.toFixed(2)}`;
-                                                      })()
-                                                    : "$0"}
-                                                </p>
-                                                <p>
-                                                  <span className="font-medium">
-                                                    Output:
-                                                  </span>{" "}
-                                                  {batchTariff.output_price_per_token
-                                                    ? (() => {
-                                                        const price =
-                                                          Number(
-                                                            batchTariff.output_price_per_token,
-                                                          ) * 1000000;
-                                                        return `$${price % 1 === 0 ? price.toFixed(0) : price.toFixed(2)}`;
-                                                      })()
-                                                    : "$0"}
-                                                </p>
-                                              </div>
+                                              <>
+                                                <p className="font-medium text-sm mb-0.5">{tier.label}</p>
+                                                <p className="text-xs text-muted-foreground mb-2">{tier.description}</p>
+                                                {!tier.inputPrice && !tier.outputPrice ? (
+                                                  <p className="text-xs text-muted-foreground">
+                                                    Free — no charge for this tier
+                                                  </p>
+                                                ) : (
+                                                  <div className="space-y-0.5 text-xs">
+                                                    <p>
+                                                      <span className="text-muted-foreground">Input:</span>{" "}
+                                                      <span className="font-medium tabular-nums">{formatTariffPrice(tier.inputPrice)}/M</span>
+                                                    </p>
+                                                    <p>
+                                                      <span className="text-muted-foreground">Output:</span>{" "}
+                                                      <span className="font-medium tabular-nums">{formatTariffPrice(tier.outputPrice)}/M</span>
+                                                    </p>
+                                                  </div>
+                                                )}
+                                              </>
                                             )}
                                           </HoverCardContent>
                                         </HoverCard>
@@ -797,6 +740,7 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                                     ))}
 
                                     {batchTariffs.length === 0 &&
+                                      !batchDenied &&
                                       canManageModels && (
                                         <button
                                           className="flex items-center gap-1 text-xs text-gray-600 hover:text-gray-900 transition-colors"
