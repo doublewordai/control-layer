@@ -74,6 +74,10 @@ fn to_batch_response_with_email(batch: fusillade::Batch, creator_email: Option<&
         if batch.completed_at.is_some() {
             // Output files written, batch is truly completed
             "completed"
+        } else if batch.failed_at.is_some() {
+            // Batch was marked as failed but not all requests failed (e.g. requests
+            // were retried and completed after the batch was already finalized as failed)
+            "failed"
         } else {
             // Requests done but still writing output files
             "finalizing"
