@@ -2,16 +2,14 @@ import type { Model } from "../api/control-layer/types";
 
 /**
  * Returns true if the model has a traffic routing rule that denies
- * the "playground" or "realtime" API key purpose. Either denial
- * means the playground will not work for this model.
+ * the "playground" API key purpose. Only a deny on "playground"
+ * blocks the playground — "realtime" is a separate purpose.
  */
 export function isPlaygroundDenied(model: Model): boolean {
   return (
     model.traffic_routing_rules?.some(
       (rule) =>
-        rule.action.type === "deny" &&
-        (rule.api_key_purpose === "playground" ||
-          rule.api_key_purpose === "realtime"),
+        rule.action.type === "deny" && rule.api_key_purpose === "playground",
     ) ?? false
   );
 }

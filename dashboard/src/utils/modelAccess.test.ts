@@ -37,7 +37,7 @@ describe("isPlaygroundDenied", () => {
     ).toBe(true);
   });
 
-  it("returns true when realtime purpose is denied", () => {
+  it("returns false when only realtime purpose is denied (separate from playground)", () => {
     expect(
       isPlaygroundDenied({
         ...baseModel,
@@ -45,7 +45,7 @@ describe("isPlaygroundDenied", () => {
           { api_key_purpose: "realtime", action: { type: "deny" } },
         ],
       }),
-    ).toBe(true);
+    ).toBe(false);
   });
 
   it("returns false when batch purpose is denied (not playground-related)", () => {
