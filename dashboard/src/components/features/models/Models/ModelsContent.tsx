@@ -12,7 +12,6 @@ import {
   BarChart3,
   ArrowUpDown,
   Info,
-  DollarSign,
   GitMerge,
   Copy,
   Check,
@@ -22,13 +21,13 @@ import {
 import {
   useModels,
   useModelsMetrics,
+  useConfig,
   type Model,
   type ModelsInclude,
   useProbes,
 } from "../../../../api/control-layer";
 import { AccessManagementModal } from "../../../modals";
 import { ApiExamples } from "../../../modals";
-import { UpdateModelPricingModal } from "../../../modals";
 import { TablePagination } from "../../../ui/table-pagination";
 import {
   Card,
@@ -155,16 +154,18 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
   canViewAnalytics,
   canViewEndpoints,
   showPricing,
-  canManageModels,
   onClearFilters,
 }) => {
   const navigate = useNavigate();
+  const { data: config } = useConfig();
+  const globalBatchWindows = useMemo(
+    () => config?.batches?.allowed_completion_windows ?? ["24h"],
+    [config?.batches?.allowed_completion_windows],
+  );
   const [showAccessModal, setShowAccessModal] = useState(false);
   const [accessModel, setAccessModel] = useState<Model | null>(null);
   const [showApiExamples, setShowApiExamples] = useState(false);
   const [apiExamplesModel, setApiExamplesModel] = useState<Model | null>(null);
-  const [showPricingModal, setShowPricingModal] = useState(false);
-  const [pricingModel, setPricingModel] = useState<Model | null>(null);
 
   const includeParam = useMemo(() => {
     const parts: string[] = ["status", "components"];
@@ -641,11 +642,19 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                                 const realtimeTariff = model.tariffs?.find(
                                   (t) => t.api_key_purpose === null,
                                 );
-                                const batchTariffs = batchDenied
+
+                                // Determine which batch windows this model supports:
+                                // per-model override > global config defaults
+                                const availableWindows = batchDenied
                                   ? []
-                                  : model.tariffs?.filter(
-                                      (t) => t.api_key_purpose === "batch",
-                                    ) || [];
+                                  : model.allowed_batch_completion_windows ?? globalBatchWindows;
+
+                                // Build batch tariff lookup for pricing
+                                const batchTariffsByWindow = new Map(
+                                  (model.tariffs ?? [])
+                                    .filter((t) => t.api_key_purpose === "batch" && t.completion_window)
+                                    .map((t) => [t.completion_window!, t]),
+                                );
 
                                 const tiers: {
                                   key: string;
@@ -667,19 +676,18 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                                     inputPrice: realtimeTariff?.input_price_per_token,
                                     outputPrice: realtimeTariff?.output_price_per_token,
                                   },
-                                  ...batchTariffs.map((t) => {
-                                    const cw = t.completion_window
-                                      ? COMPLETION_WINDOWS[t.completion_window]
-                                      : null;
+                                  ...availableWindows.map((window) => {
+                                    const cw = COMPLETION_WINDOWS[window];
+                                    const tariff = batchTariffsByWindow.get(window);
                                     return {
-                                      key: t.id,
-                                      label: cw?.label ?? t.completion_window ?? "Batch",
+                                      key: `batch-${window}`,
+                                      label: cw?.label ?? window,
                                       icon: cw?.icon ?? Clock,
                                       denied: false,
                                       deniedMessage: "",
-                                      description: `${t.completion_window ?? ""} completion window`,
-                                      inputPrice: t.input_price_per_token,
-                                      outputPrice: t.output_price_per_token,
+                                      description: `${window} completion window`,
+                                      inputPrice: tariff?.input_price_per_token ?? null,
+                                      outputPrice: tariff?.output_price_per_token ?? null,
                                     };
                                   }),
                                 ];
@@ -739,22 +747,6 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                                       </React.Fragment>
                                     ))}
 
-                                    {batchTariffs.length === 0 &&
-                                      !batchDenied &&
-                                      canManageModels && (
-                                        <button
-                                          className="flex items-center gap-1 text-xs text-gray-600 hover:text-gray-900 transition-colors"
-                                          onClick={(e) => {
-                                            e.stopPropagation();
-                                            setPricingModel(model);
-                                            setShowPricingModal(true);
-                                          }}
-                                          title="Set pricing tariffs"
-                                        >
-                                          <DollarSign className="h-3 w-3" />
-                                          <span>Set pricing</span>
-                                        </button>
-                                      )}
                                   </>
                                 );
                               })()}
@@ -1020,17 +1012,6 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
         model={apiExamplesModel}
       />
 
-      {showPricing && pricingModel && (
-        <UpdateModelPricingModal
-          isOpen={showPricingModal}
-          modelId={pricingModel.id}
-          modelName={pricingModel.alias}
-          onClose={() => {
-            setShowPricingModal(false);
-            setPricingModel(null);
-          }}
-        />
-      )}
     </>
   );
 };
