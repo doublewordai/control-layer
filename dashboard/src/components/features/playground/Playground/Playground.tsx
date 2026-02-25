@@ -84,9 +84,10 @@ const Playground: React.FC = () => {
   });
   const urlModels = useMemo(() => urlModelsData?.data ?? [], [urlModelsData]);
 
-  // Fetch first accessible chat model as default (only when no URL model specified)
+  // Fetch accessible models as default candidates (only when no URL model specified).
+  // We fetch more than 1 so we can skip playground-denied models.
   const { data: defaultModelsData } = useModels({
-    limit: 1,
+    limit: 10,
     accessible: true,
   });
   const defaultModels = useMemo(
