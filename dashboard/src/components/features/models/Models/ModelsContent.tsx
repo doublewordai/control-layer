@@ -17,6 +17,8 @@ import {
   Check,
   Zap,
   Radio,
+  ArrowUpToLine,
+  ArrowDownToLine,
 } from "lucide-react";
 import {
   useModels,
@@ -62,10 +64,10 @@ import { isBatchDenied, isPlaygroundDenied, isRealtimeDenied } from "../../../..
 
 const COMPLETION_WINDOWS: Record<
   string,
-  { label: string; icon: typeof Clock }
+  { label: string; icon: typeof Clock; sort: number }
 > = {
-  "24h": { label: "Standard", icon: Clock },
-  "1h": { label: "High", icon: Zap },
+  "1h": { label: "High", icon: Zap, sort: 0 },
+  "24h": { label: "Standard", icon: Clock, sort: 1 },
 };
 
 const CopyableModelName: React.FC<{
@@ -360,7 +362,7 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                 <Card
                   key={model.id}
                   role="listitem"
-                  className="hover:shadow-md transition-shadow rounded-lg p-0 gap-0 overflow-hidden flex flex-col"
+                  className="@container hover:shadow-md transition-shadow rounded-lg p-0 gap-0 overflow-hidden flex flex-col"
                 >
                   <div
                     className="cursor-pointer hover:bg-gray-50 transition-colors group grow flex flex-col min-w-0"
@@ -645,9 +647,12 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
 
                                 // Determine which batch windows this model supports:
                                 // per-model override > global config defaults
-                                const availableWindows = batchDenied
+                                const availableWindows = (batchDenied
                                   ? []
-                                  : model.allowed_batch_completion_windows ?? globalBatchWindows;
+                                  : model.allowed_batch_completion_windows ?? globalBatchWindows
+                                ).toSorted((a, b) =>
+                                  (COMPLETION_WINDOWS[a]?.sort ?? 99) - (COMPLETION_WINDOWS[b]?.sort ?? 99)
+                                );
 
                                 // Build batch tariff lookup for pricing
                                 const batchTariffsByWindow = new Map(
@@ -712,10 +717,23 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                                               <tier.icon className={`h-2.5 w-2.5 shrink-0 ${
                                                 tier.denied ? "text-gray-400" : "text-gray-500"
                                               }`} />
-                                              <span className="hidden sm:inline">{tier.label}</span>
+                                              <span>{tier.label}</span>
                                               {!tier.denied && (tier.inputPrice || tier.outputPrice) && (
-                                                <span className="hidden sm:inline whitespace-nowrap tabular-nums ml-0.5">
-                                                  {formatTariffPrice(tier.inputPrice)}/{formatTariffPrice(tier.outputPrice)}
+                                                <span className="hidden @min-[680px]:inline-flex items-center gap-1 ml-0.5">
+                                                  <span className="flex items-center gap-0.5">
+                                                    <ArrowUpToLine className="h-2.5 w-2.5 text-gray-500 shrink-0" />
+                                                    <span className="whitespace-nowrap tabular-nums">
+                                                      {formatTariffPrice(tier.inputPrice)}
+                                                    </span>
+                                                    <span className="text-[8px] text-gray-400">/M</span>
+                                                  </span>
+                                                  <span className="flex items-center gap-0.5">
+                                                    <ArrowDownToLine className="h-2.5 w-2.5 text-gray-500 shrink-0" />
+                                                    <span className="whitespace-nowrap tabular-nums">
+                                                      {formatTariffPrice(tier.outputPrice)}
+                                                    </span>
+                                                    <span className="text-[8px] text-gray-400">/M</span>
+                                                  </span>
                                                 </span>
                                               )}
                                             </button>
