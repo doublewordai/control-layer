@@ -714,7 +714,7 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                                               }`} />
                                               <span className="hidden sm:inline">{tier.label}</span>
                                               {!tier.denied && (tier.inputPrice || tier.outputPrice) && (
-                                                <span className="hidden sm:inline tabular-nums text-gray-500 ml-0.5">
+                                                <span className="hidden sm:inline whitespace-nowrap tabular-nums ml-0.5">
                                                   {formatTariffPrice(tier.inputPrice)}/{formatTariffPrice(tier.outputPrice)}
                                                 </span>
                                               )}
