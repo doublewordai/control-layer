@@ -7,6 +7,10 @@
 host: "0.0.0.0"
 port: 3001
 
+# OpenTelemetry OTLP export for distributed tracing
+# Configure via OTEL_* env vars (endpoint, protocol, headers, service name)
+enable_otel_export: true
+
 # Base URL where the dashboard is accessible
 # Used for password reset links, payment redirect URLs, and batch notification emails
 dashboard_url: "http://localhost:5173"
@@ -97,7 +101,7 @@ database:
   #   #   max_connections: 3
 
 # Admin user email - will be created on first startup
-admin_email: "test@doubleword.ai"
+admin_email: "josh.cowan@doubleword.ai"
 # TODO: Change this in production!
 admin_password: "hunter2"
 
@@ -202,7 +206,8 @@ auth:
 # Email configuration for password resets and notifications
 email:
   # Email transport - either 'file' (for development) or 'smtp' (for production)
-  type: file
+  type: smtp
+  templates_dir: "/home/josh/internal/files/email_templates/"
   path: "./emails" # Directory for file-based email (when type=file)
   # For SMTP (production), use:
   # type: smtp
@@ -211,6 +216,15 @@ email:
   # username: "noreply@example.com"
   # password: "your-smtp-password"
   # use_tls: true
+  host: "smtp.gmail.com"
+  port: 587
+  use_tls: true
+  username: "batches@notifications.doubleword.ai"
+  password: "olha kofg phvj jmvp"
+  from_email: "batches@notifications.doubleword.ai"
+  from_name: "Doubleword Batch Notifications"
+  reply_to: "support@doubleword.ai"
+
 # Credits configuration
 credits:
   # Initial credits given to standard users when they are created
@@ -364,6 +378,10 @@ background_services:
     #   gpt-4:  # Original model
     #     escalation_model: o1-preview  # Route to this model when near expiry
     #     escalation_threshold_seconds: 900  # Default: 900 (15 minutes before expiry)
+
+    # Priority injected as a top-level "priority" field into batch request bodies.
+    # Lower number = higher priority. Omit to not inject any priority.
+    # request_priority: 0
 
   # Batch completion notifications (emails + webhooks)
   # notifications:
