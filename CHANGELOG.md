@@ -1,5 +1,18 @@
 # Changelog
 
+## [8.10.0](https://github.com/doublewordai/control-layer/compare/v8.9.0...v8.10.0) (2026-02-25)
+
+
+### Features
+
+* **dashboard:** use searchable combobox for redirect target ([#770](https://github.com/doublewordai/control-layer/issues/770)) ([0b3abb9](https://github.com/doublewordai/control-layer/commit/0b3abb9a1431e0525d6dd6e81936bdfc36dd9b18))
+
+
+### Bug Fixes
+
+* allow decimal throughput input ([#773](https://github.com/doublewordai/control-layer/issues/773)) ([109ddb9](https://github.com/doublewordai/control-layer/commit/109ddb9cedc209ea88e6c38ec80a1c87dc5eb7e4))
+* Bump onwards 0.18.0 ([#774](https://github.com/doublewordai/control-layer/issues/774)) ([1894bdb](https://github.com/doublewordai/control-layer/commit/1894bdbcb55fa44a36d3241fcd32d344f69da130))
+
 ## [8.9.0](https://github.com/doublewordai/control-layer/compare/v8.8.1...v8.9.0) (2026-02-24)
 
 
