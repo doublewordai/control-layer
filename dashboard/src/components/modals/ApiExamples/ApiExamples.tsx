@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useState, useMemo } from "react";
 import {
   Copy,
   Code,
@@ -13,6 +13,7 @@ import { toast } from "sonner";
 import { useCreateApiKey, useConfig } from "../../../api/control-layer";
 import { type ModelType } from "../../../utils/modelType";
 import type { Model } from "../../../api/control-layer";
+import { isBatchDenied, isRealtimeDenied } from "../../../utils/modelAccess";
 import {
   Dialog,
   DialogContent,
@@ -71,6 +72,20 @@ const ApiExamplesModal: React.FC<ApiExamplesModalProps> = ({
   const [showInfoTooltip, setShowInfoTooltip] = useState(false);
 
   const { data: config } = useConfig();
+
+  const availableWindows = useMemo(() => {
+    if (!model || isBatchDenied(model)) return [];
+    return model.allowed_batch_completion_windows ??
+      config?.batches?.allowed_completion_windows ?? ["24h"];
+  }, [model, config?.batches?.allowed_completion_windows]);
+
+  const hasHigh = availableWindows.includes("1h");
+  const hasStandard = availableWindows.includes("24h");
+
+  // Effective window: respect selection when both available, otherwise use what's available
+  const effectiveWindow: CompletionWindow =
+    hasHigh && hasStandard ? completionWindow :
+    hasHigh ? "high" : "standard";
 
   const createApiKeyMutation = useCreateApiKey();
 
@@ -149,7 +164,7 @@ const ApiExamplesModal: React.FC<ApiExamplesModalProps> = ({
     const batchEndpoint = isEmbeddingsModel
       ? "/v1/embeddings"
       : "/v1/chat/completions";
-    const windowValue = completionWindowValues[completionWindow];
+    const windowValue = completionWindowValues[effectiveWindow];
     if (language === "python") {
       return `from openai import OpenAI
 
@@ -521,13 +536,15 @@ chatCompletion();`;
                   >
                     Batch
                   </ToggleGroupItem>
-                  <ToggleGroupItem
-                    value="realtime"
-                    aria-label="Realtime API usage"
-                    className="px-5 py-1.5"
-                  >
-                    Realtime
-                  </ToggleGroupItem>
+                  {model && !isRealtimeDenied(model) && (
+                    <ToggleGroupItem
+                      value="realtime"
+                      aria-label="Realtime API usage"
+                      className="px-5 py-1.5"
+                    >
+                      Realtime
+                    </ToggleGroupItem>
+                  )}
                 </ToggleGroup>
                 {exampleType === "batch" && (
                   <div className="mt-4 space-y-3">
@@ -638,7 +655,7 @@ chatCompletion();`;
                   </div>
                 </div>
                 <div className="flex items-center gap-2">
-                  {exampleType === "batch" && (
+                  {exampleType === "batch" && hasHigh && hasStandard && (
                     <label className="flex items-center gap-1.5 text-xs text-gray-500 cursor-pointer">
                       <Switch
                         checked={completionWindow === "high"}
