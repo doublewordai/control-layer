@@ -12,8 +12,6 @@ import {
   BarChart3,
   ArrowUpDown,
   Info,
-  ArrowDownToLine,
-  ArrowUpToLine,
   GitMerge,
   Copy,
   Check,
@@ -716,17 +714,8 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                                               }`} />
                                               <span className="hidden sm:inline">{tier.label}</span>
                                               {!tier.denied && (tier.inputPrice || tier.outputPrice) && (
-                                                <span className="hidden sm:inline-flex flex-col text-[10px] leading-tight ml-0.5">
-                                                  <span className="flex items-center gap-0.5 tabular-nums">
-                                                    <ArrowUpToLine className="h-2 w-2 text-gray-400 shrink-0" />
-                                                    {formatTariffPrice(tier.inputPrice)}
-                                                    <span className="text-[8px] text-gray-400">/M</span>
-                                                  </span>
-                                                  <span className="flex items-center gap-0.5 tabular-nums">
-                                                    <ArrowDownToLine className="h-2 w-2 text-gray-400 shrink-0" />
-                                                    {formatTariffPrice(tier.outputPrice)}
-                                                    <span className="text-[8px] text-gray-400">/M</span>
-                                                  </span>
+                                                <span className="hidden sm:inline tabular-nums text-gray-500 ml-0.5">
+                                                  {formatTariffPrice(tier.inputPrice)}/{formatTariffPrice(tier.outputPrice)}
                                                 </span>
                                               )}
                                             </button>
