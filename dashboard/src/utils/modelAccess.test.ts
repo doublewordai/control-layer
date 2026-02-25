@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { isPlaygroundDenied, isBatchDenied } from "./modelAccess";
+import { isPlaygroundDenied, isBatchDenied, isRealtimeDenied } from "./modelAccess";
 import type { Model } from "../api/control-layer/types";
 
 const baseModel: Model = {
@@ -119,6 +119,48 @@ describe("isBatchDenied", () => {
   it("returns false when only playground is denied", () => {
     expect(
       isBatchDenied({
+        ...baseModel,
+        traffic_routing_rules: [
+          { api_key_purpose: "playground", action: { type: "deny" } },
+        ],
+      }),
+    ).toBe(false);
+  });
+});
+
+describe("isRealtimeDenied", () => {
+  it("returns false when traffic_routing_rules is undefined", () => {
+    expect(isRealtimeDenied(baseModel)).toBe(false);
+  });
+
+  it("returns true when realtime purpose is denied", () => {
+    expect(
+      isRealtimeDenied({
+        ...baseModel,
+        traffic_routing_rules: [
+          { api_key_purpose: "realtime", action: { type: "deny" } },
+        ],
+      }),
+    ).toBe(true);
+  });
+
+  it("returns false when realtime purpose is redirected", () => {
+    expect(
+      isRealtimeDenied({
+        ...baseModel,
+        traffic_routing_rules: [
+          {
+            api_key_purpose: "realtime",
+            action: { type: "redirect", target: "other-model" },
+          },
+        ],
+      }),
+    ).toBe(false);
+  });
+
+  it("returns false when only playground is denied", () => {
+    expect(
+      isRealtimeDenied({
         ...baseModel,
         traffic_routing_rules: [
           { api_key_purpose: "playground", action: { type: "deny" } },

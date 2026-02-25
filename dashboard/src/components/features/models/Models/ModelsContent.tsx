@@ -19,6 +19,7 @@ import {
   Copy,
   Check,
   Zap,
+  Radio,
 } from "lucide-react";
 import {
   useModels,
@@ -59,7 +60,7 @@ import {
 } from "../../../ui/tooltip";
 import { StatusRow } from "./StatusRow";
 import { Markdown } from "../../../ui/markdown";
-import { isBatchDenied, isPlaygroundDenied } from "../../../../utils/modelAccess";
+import { isBatchDenied, isPlaygroundDenied, isRealtimeDenied } from "../../../../utils/modelAccess";
 
 const COMPLETION_WINDOWS: Record<
   string,
@@ -637,6 +638,7 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                           {showPricing && (
                             <>
                               {(() => {
+                                const realtimeDenied = isRealtimeDenied(model);
                                 const batchTariffs = isBatchDenied(model)
                                   ? []
                                   : model.tariffs?.filter(
@@ -645,11 +647,13 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
 
                                 return (
                                   <>
-                                    {batchTariffs.map((batchTariff, index) => (
+                                    <span className={`flex items-center gap-0.5 shrink-0 ${realtimeDenied ? "line-through text-gray-400" : ""}`}>
+                                      <Radio className={`h-2.5 w-2.5 shrink-0 ${realtimeDenied ? "text-gray-400" : "text-gray-500"}`} />
+                                      <span className="hidden sm:inline">Realtime</span>
+                                    </span>
+                                    {batchTariffs.map((batchTariff) => (
                                       <React.Fragment key={batchTariff.id}>
-                                        {index > 0 && (
-                                          <span className="mx-1">•</span>
-                                        )}
+                                        <span className="mx-1">•</span>
                                         <HoverCard
                                           openDelay={200}
                                           closeDelay={100}
