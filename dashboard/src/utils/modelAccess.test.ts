@@ -2,11 +2,10 @@ import { describe, it, expect } from "vitest";
 import { isPlaygroundDenied, isBatchDenied, isRealtimeDenied } from "./modelAccess";
 import type { Model } from "../api/control-layer/types";
 
-const baseModel: Model = {
+const baseModel = {
   id: "test-id",
   alias: "test-model",
   model_name: "test",
-  has_payment_provider_id: false,
 } as Model;
 
 describe("isPlaygroundDenied", () => {
