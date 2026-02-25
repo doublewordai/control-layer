@@ -63,6 +63,7 @@ import { zodResolver } from "@hookform/resolvers/zod";
 import * as z from "zod";
 import { Sparkline } from "../../../ui/sparkline";
 import { Markdown } from "../../../ui/markdown";
+import { ModelCombobox } from "../../../ui/model-combobox";
 import {
   Popover,
   PopoverContent,
@@ -1101,9 +1102,13 @@ const ModelInfo: React.FC = () => {
                               </div>
                               <div className="md:col-span-5">
                                 {rule.action.type === "redirect" ? (
-                                  <Input
-                                    value={rule.action.target}
-                                    onChange={(e) =>
+                                  <ModelCombobox
+                                    value={
+                                      rule.action.target
+                                        ? ({ id: "", alias: rule.action.target } as any)
+                                        : null
+                                    }
+                                    onValueChange={(model) =>
                                       setUpdateData((prev) => ({
                                         ...prev,
                                         traffic_routing_rules:
@@ -1113,15 +1118,18 @@ const ModelInfo: React.FC = () => {
                                                   ...r,
                                                   action: {
                                                     type: "redirect",
-                                                    target: e.target.value,
+                                                    target: model.alias,
                                                   },
                                                 }
                                               : r,
                                           ),
                                       }))
                                     }
-                                    placeholder="target model alias"
-                                    className="font-mono text-xs"
+                                    placeholder="Select target model..."
+                                    className="w-full font-mono text-xs"
+                                    filterFn={(model) =>
+                                      model.id !== modelId
+                                    }
                                   />
                                 ) : (
                                   <p className="text-xs text-muted-foreground h-10 flex items-center">
