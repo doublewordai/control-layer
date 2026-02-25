@@ -716,25 +716,18 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                                               }`} />
                                               <span className="hidden sm:inline">{tier.label}</span>
                                               {!tier.denied && (tier.inputPrice || tier.outputPrice) && (
-                                                <>
-                                                  <span className="hidden sm:inline">:</span>
-                                                  <span className="hidden sm:flex items-center gap-1">
-                                                    <span className="flex items-center gap-0.5">
-                                                      <ArrowUpToLine className="h-2.5 w-2.5 text-gray-500 shrink-0" />
-                                                      <span className="whitespace-nowrap tabular-nums">
-                                                        {formatTariffPrice(tier.inputPrice)}
-                                                      </span>
-                                                      <span className="text-[8px] text-gray-400">/M</span>
-                                                    </span>
-                                                    <span className="flex items-center gap-0.5">
-                                                      <ArrowDownToLine className="h-2.5 w-2.5 text-gray-500 shrink-0" />
-                                                      <span className="whitespace-nowrap tabular-nums">
-                                                        {formatTariffPrice(tier.outputPrice)}
-                                                      </span>
-                                                      <span className="text-[8px] text-gray-400">/M</span>
-                                                    </span>
+                                                <span className="hidden sm:inline-flex flex-col text-[10px] leading-tight ml-0.5">
+                                                  <span className="flex items-center gap-0.5 tabular-nums">
+                                                    <ArrowUpToLine className="h-2 w-2 text-gray-400 shrink-0" />
+                                                    {formatTariffPrice(tier.inputPrice)}
+                                                    <span className="text-[8px] text-gray-400">/M</span>
                                                   </span>
-                                                </>
+                                                  <span className="flex items-center gap-0.5 tabular-nums">
+                                                    <ArrowDownToLine className="h-2 w-2 text-gray-400 shrink-0" />
+                                                    {formatTariffPrice(tier.outputPrice)}
+                                                    <span className="text-[8px] text-gray-400">/M</span>
+                                                  </span>
+                                                </span>
                                               )}
                                             </button>
                                           </HoverCardTrigger>
