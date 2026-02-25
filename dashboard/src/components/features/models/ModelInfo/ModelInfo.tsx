@@ -946,9 +946,9 @@ const ModelInfo: React.FC = () => {
                             </label>
                             <Input
                               type="number"
-                              min="1"
+                              min="0.01"
                               max="1000"
-                              step="1"
+                              step="any"
                               value={updateData.throughput || ""}
                               onChange={(e) =>
                                 setUpdateData((prev) => ({
