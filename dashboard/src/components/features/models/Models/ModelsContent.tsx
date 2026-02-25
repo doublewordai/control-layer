@@ -647,10 +647,10 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
 
                                 // Determine which batch windows this model supports:
                                 // per-model override > global config defaults
-                                const availableWindows = (batchDenied
+                                const availableWindows = [...(batchDenied
                                   ? []
                                   : model.allowed_batch_completion_windows ?? globalBatchWindows
-                                ).toSorted((a, b) =>
+                                )].sort((a: string, b: string) =>
                                   (COMPLETION_WINDOWS[a]?.sort ?? 99) - (COMPLETION_WINDOWS[b]?.sort ?? 99)
                                 );
 
@@ -681,7 +681,7 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                                     inputPrice: realtimeTariff?.input_price_per_token,
                                     outputPrice: realtimeTariff?.output_price_per_token,
                                   },
-                                  ...availableWindows.map((window) => {
+                                  ...availableWindows.map((window: string) => {
                                     const cw = COMPLETION_WINDOWS[window];
                                     const tariff = batchTariffsByWindow.get(window);
                                     return {
