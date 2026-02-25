@@ -120,7 +120,6 @@ impl OpenAIBatchRequest {
     /// * `endpoint` - The target endpoint (e.g., "http://localhost:8080/ai")
     /// * `api_key` - The API key to inject for request execution
     /// * `accessible_models` - Set of model aliases the user can access
-    #[tracing::instrument(skip(self, api_key, accessible_models), fields(custom_id = %self.custom_id, method = %self.method, url = %self.url))]
     fn to_internal(
         &self,
         endpoint: &str,
@@ -184,7 +183,6 @@ impl OpenAIBatchRequest {
     }
 
     /// Transform internal format to OpenAI format
-    #[tracing::instrument(skip(internal), fields(custom_id = ?internal.custom_id, method = %internal.method, path = %internal.path))]
     fn from_internal(internal: &fusillade::RequestTemplateInput) -> Result<Self> {
         // Parse body string to JSON
         let body: serde_json::Value = serde_json::from_str(&internal.body).map_err(|e| Error::Internal {
