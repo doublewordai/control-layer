@@ -365,6 +365,10 @@ background_services:
     #     escalation_model: o1-preview  # Route to this model when near expiry
     #     escalation_threshold_seconds: 900  # Default: 900 (15 minutes before expiry)
 
+    # Priority injected as a top-level "priority" field into batch request bodies.
+    # Lower number = higher priority. Omit to not inject any priority.
+    # request_priority: 0
+
   # Batch completion notifications (emails + webhooks)
   # notifications:
   #   poll_interval: 30s                # How often to poll for completed batches

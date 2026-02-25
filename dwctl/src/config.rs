@@ -1071,6 +1071,10 @@ pub struct DaemonConfig {
     /// Note: Batch API keys automatically have access to escalation models in the routing cache.
     pub model_escalations: HashMap<String, fusillade::ModelEscalationConfig>,
 
+    /// Priority injected as a top-level `"priority"` field into batch request bodies.
+    /// Lower number = higher priority. If `None`, no priority field is added.
+    pub request_priority: Option<i64>,
+
     /// Batch table column names to include as request headers.
     /// These values are sent as `x-fusillade-batch-{column}` headers with each request.
     /// Example: ["id", "created_by", "endpoint"] produces headers like:
@@ -1125,6 +1129,7 @@ impl Default for DaemonConfig {
             processing_timeout_ms: 600000,
             batch_metadata_fields: default_batch_metadata_fields_dwctl(),
             model_escalations: HashMap::new(),
+            request_priority: None,
             purge_interval_ms: 600_000,
             purge_batch_size: 1000,
             purge_throttle_ms: 100,
@@ -1147,6 +1152,7 @@ impl DaemonConfig {
             default_model_concurrency: self.default_model_concurrency,
             model_concurrency_limits: model_capacity_limits.unwrap_or_else(|| std::sync::Arc::new(dashmap::DashMap::new())),
             model_escalations: Arc::new(DashMap::from_iter(self.model_escalations.clone())),
+            request_priority: self.request_priority,
             claim_interval_ms: self.claim_interval_ms,
             max_retries: self.max_retries,
             stop_before_deadline_ms: self.stop_before_deadline_ms,
