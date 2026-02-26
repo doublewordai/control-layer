@@ -134,6 +134,7 @@ const ModelInfo: React.FC = () => {
     capabilities: [] as string[],
     sanitize_responses: false,
     trusted: false,
+    supports_priority: false,
     open_responses_adapter: true,
     requests_per_second: null as number | null,
     burst_size: null as number | null,
@@ -236,6 +237,7 @@ const ModelInfo: React.FC = () => {
         capabilities: model.capabilities || [],
         sanitize_responses: model.sanitize_responses ?? false,
         trusted: model.trusted ?? false,
+        supports_priority: model.supports_priority ?? false,
         open_responses_adapter: model.open_responses_adapter ?? true,
         requests_per_second: model.requests_per_second || null,
         burst_size: model.burst_size || null,
@@ -296,6 +298,7 @@ const ModelInfo: React.FC = () => {
           capabilities: updateData.capabilities,
           sanitize_responses: updateData.sanitize_responses,
           trusted: updateData.trusted,
+          supports_priority: updateData.supports_priority,
           open_responses_adapter: updateData.open_responses_adapter,
           // Always include rate limiting and capacity fields to handle clearing properly
           // Send null as the actual value when clearing (not undefined)
@@ -330,6 +333,7 @@ const ModelInfo: React.FC = () => {
         capabilities: model.capabilities || [],
         sanitize_responses: model.sanitize_responses ?? false,
         trusted: model.trusted ?? false,
+        supports_priority: model.supports_priority ?? false,
         open_responses_adapter: model.open_responses_adapter ?? true,
         requests_per_second: model.requests_per_second || null,
         burst_size: model.burst_size || null,
@@ -869,6 +873,42 @@ const ModelInfo: React.FC = () => {
                                   </InfoTip>
                                 </label>
                               </div>
+                            </>
+                          )}
+                          {!model.is_composite && (
+                            <>
+                              <div className="flex items-center space-x-2">
+                                <input
+                                  type="checkbox"
+                                  id="supports-priority"
+                                  checked={updateData.supports_priority ?? false}
+                                  onChange={(e) => {
+                                    setUpdateData((prev) => ({
+                                      ...prev,
+                                      supports_priority: e.target.checked,
+                                    }));
+                                  }}
+                                  className="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                                />
+                                <label
+                                  htmlFor="supports-priority"
+                                  className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70 flex items-center gap-1"
+                                >
+                                  Supports Priority
+                                  <InfoTip>
+                                    <p className="text-sm text-muted-foreground">
+                                      Whether this provider supports the priority
+                                      request parameter. When disabled, the priority
+                                      field is stripped from request bodies before
+                                      forwarding.
+                                    </p>
+                                  </InfoTip>
+                                </label>
+                              </div>
+                            </>
+                          )}
+                          {!model.is_composite && strictModeEnabled && (
+                            <>
                               <div className="flex items-center space-x-2">
                                 <input
                                   type="checkbox"

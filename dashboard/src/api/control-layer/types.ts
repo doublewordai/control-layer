@@ -34,6 +34,7 @@ export interface ComponentModelSummary {
   model_type?: ModelType;
   endpoint?: ComponentEndpointSummary;
   trusted?: boolean;
+  supports_priority?: boolean;
   open_responses_adapter?: boolean;
 }
 
@@ -176,6 +177,7 @@ export interface Model {
   components?: ModelComponent[]; // only present when include=components
   sanitize_responses?: boolean | null; // only present for virtual models
   trusted?: boolean; // Mark provider as trusted in strict mode (bypasses error sanitization)
+  supports_priority?: boolean; // Whether this provider supports the priority request parameter
   open_responses_adapter?: boolean; // Enable adapter that converts /v1/responses to /v1/chat/completions
   traffic_routing_rules?: TrafficRoutingRule[] | null;
   allowed_batch_completion_windows?: string[] | null;
@@ -196,6 +198,7 @@ export interface StandardModelCreate {
   batch_capacity?: number;
   throughput?: number;
   trusted?: boolean;
+  supports_priority?: boolean;
   open_responses_adapter?: boolean;
   traffic_routing_rules?: TrafficRoutingRule[];
   allowed_batch_completion_windows?: string[];
@@ -407,6 +410,7 @@ export interface ModelUpdateRequest {
   fallback_max_attempts?: number | null;
   sanitize_responses?: boolean | null;
   trusted?: boolean | null;
+  supports_priority?: boolean | null;
   open_responses_adapter?: boolean | null;
   traffic_routing_rules?: TrafficRoutingRule[] | null;
   allowed_batch_completion_windows?: string[] | null;

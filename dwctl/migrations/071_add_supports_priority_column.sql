@@ -1,0 +1,1 @@
+ALTER TABLE deployed_models ADD COLUMN supports_priority BOOLEAN NOT NULL DEFAULT FALSE;

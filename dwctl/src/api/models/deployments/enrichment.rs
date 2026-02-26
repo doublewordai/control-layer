@@ -412,6 +412,7 @@ impl<'a> DeployedModelEnricher<'a> {
                     name: c.endpoint_name.unwrap_or_default(),
                 }),
                 trusted: c.model_trusted,
+                supports_priority: c.model_supports_priority,
                 open_responses_adapter: c.model_open_responses_adapter,
             },
         }

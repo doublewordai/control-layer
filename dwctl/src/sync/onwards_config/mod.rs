@@ -57,6 +57,7 @@ struct OnwardsTarget {
     capacity: Option<i32>,
     sanitize_responses: bool,
     trusted: bool,
+    supports_priority: bool,
     open_responses_adapter: bool,
     /// Traffic routing rules from the model_traffic_rules table
     routing_rules: Vec<RoutingRule>,
@@ -463,6 +464,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
             dm.capacity as deployment_capacity,
             dm.sanitize_responses as deployment_sanitize_responses,
             dm.trusted as deployment_trusted,
+            dm.supports_priority as deployment_supports_priority,
             dm.open_responses_adapter as "deployment_open_responses_adapter?",
             -- Endpoint info
             ie.url as "endpoint_url!",
@@ -613,6 +615,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                 capacity: row.deployment_capacity,
                 sanitize_responses: row.deployment_sanitize_responses,
                 trusted: row.deployment_trusted,
+                supports_priority: row.deployment_supports_priority,
                 open_responses_adapter: row.deployment_open_responses_adapter.unwrap_or(true),
                 routing_rules: Vec::new(), // Components don't have their own routing rules
                 endpoint_url,
@@ -800,6 +803,7 @@ fn convert_composite_to_target_spec(
                     // Each provider uses its own trusted setting from the database
                     // This allows fine-grained control over which providers bypass error sanitization
                     trusted: Some(target.trusted),
+                    supports_priority: target.supports_priority,
                 }
             }
         })
@@ -923,6 +927,7 @@ fn convert_to_config_file(targets: Vec<OnwardsTarget>, composites: Vec<OnwardsCo
                 }),
                 request_timeout_secs: None,
                 trusted: Some(target.trusted),
+                supports_priority: target.supports_priority,
             };
 
             // Use PoolSpec so routing_rules are carried through
@@ -1014,6 +1019,7 @@ pub async fn load_targets_from_db(db: &PgPool, escalation_models: &[String], str
             dm.capacity,
             dm.sanitize_responses,
             dm.trusted,
+            dm.supports_priority,
             dm.open_responses_adapter,
             ie.id as endpoint_id,
             ie.url as "endpoint_url!",
@@ -1102,6 +1108,7 @@ pub async fn load_targets_from_db(db: &PgPool, escalation_models: &[String], str
                 capacity: row.capacity,
                 sanitize_responses: row.sanitize_responses,
                 trusted: row.trusted,
+                supports_priority: row.supports_priority,
                 open_responses_adapter: row.open_responses_adapter.unwrap_or(true),
                 routing_rules: Vec::new(), // Populated from separate query below
                 endpoint_url: url::Url::parse(&row.endpoint_url).expect("Invalid URL in database"),

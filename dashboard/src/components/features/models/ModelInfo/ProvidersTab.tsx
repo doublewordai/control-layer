@@ -16,6 +16,7 @@ import {
   ShieldOff,
   Zap,
   ZapOff,
+  ListOrdered,
 } from "lucide-react";
 import {
   DndContext,
@@ -102,6 +103,7 @@ const ProviderRow: React.FC<{
   onRemove: () => void;
   onToggle: () => void;
   onToggleTrusted?: () => void;
+  onTogglePriority?: () => void;
   onToggleAdapter?: () => void;
   canManage: boolean;
   isUpdating: boolean;
@@ -122,6 +124,7 @@ const ProviderRow: React.FC<{
   onRemove,
   onToggle,
   onToggleTrusted,
+  onTogglePriority,
   onToggleAdapter,
   canManage,
   isUpdating,
@@ -273,6 +276,26 @@ const ProviderRow: React.FC<{
                   </TooltipContent>
                 </Tooltip>
               )}
+              {onTogglePriority && (
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      onClick={onTogglePriority}
+                      disabled={isUpdating}
+                      className="h-8 w-8"
+                    >
+                      <ListOrdered className={`h-4 w-4 ${component.model.supports_priority ? "text-purple-600" : "text-gray-400"}`} />
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent side="top">
+                    {component.model.supports_priority
+                      ? "Supports priority — priority param forwarded"
+                      : "No priority support — priority param stripped"}
+                  </TooltipContent>
+                </Tooltip>
+              )}
               {strictModeEnabled && onToggleAdapter && (
                 <Tooltip>
                   <TooltipTrigger asChild>
@@ -352,6 +375,7 @@ const SortableProviderRow: React.FC<{
   onRemove: () => void;
   onToggle: () => void;
   onToggleTrusted?: () => void;
+  onTogglePriority?: () => void;
   onToggleAdapter?: () => void;
   canManage: boolean;
   isUpdating: boolean;
@@ -1089,6 +1113,13 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
     });
   };
 
+  const handleTogglePriority = async (component: ModelComponent) => {
+    await updateModelMutation.mutateAsync({
+      id: component.model.id,
+      data: { supports_priority: !component.model.supports_priority },
+    });
+  };
+
   const handleToggleAdapter = async (component: ModelComponent) => {
     await updateModelMutation.mutateAsync({
       id: component.model.id,
@@ -1374,6 +1405,7 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
                         onRemove={() => setRemovingComponent(component)}
                         onToggle={() => handleToggle(component)}
                         onToggleTrusted={() => handleToggleTrusted(component)}
+                        onTogglePriority={() => handleTogglePriority(component)}
                         onToggleAdapter={() => handleToggleAdapter(component)}
                         canManage={canManage}
                         isUpdating={

@@ -362,6 +362,7 @@ pub struct DeploymentComponentDBResponse {
     pub endpoint_id: Option<InferenceEndpointId>,
     pub endpoint_name: Option<String>,
     pub model_trusted: bool,
+    pub model_supports_priority: bool,
     pub model_open_responses_adapter: bool,
 }
 
@@ -401,6 +402,9 @@ pub struct DeploymentCreateDBRequest {
     /// Whether to mark provider as trusted in strict mode (bypasses sanitization)
     #[builder(default = false)]
     pub trusted: bool,
+    /// Whether this provider supports the `priority` request parameter
+    #[builder(default = false)]
+    pub supports_priority: bool,
     /// Whether to enable the open_responses adapter (converts /v1/responses to /v1/chat/completions)
     #[builder(default = true)]
     pub open_responses_adapter: bool,
@@ -429,6 +433,7 @@ impl DeploymentCreateDBRequest {
                 .is_composite(false)
                 .sanitize_responses(standard.sanitize_responses.unwrap_or(false))
                 .trusted(standard.trusted.unwrap_or(false))
+                .supports_priority(standard.supports_priority.unwrap_or(false))
                 .open_responses_adapter(standard.open_responses_adapter.unwrap_or(true))
                 .maybe_allowed_batch_completion_windows(standard.allowed_batch_completion_windows)
                 .build(),
@@ -453,6 +458,7 @@ impl DeploymentCreateDBRequest {
                 .maybe_fallback_max_attempts(composite.fallback_max_attempts)
                 .sanitize_responses(composite.sanitize_responses)
                 .trusted(composite.trusted.unwrap_or(false))
+                .supports_priority(composite.supports_priority.unwrap_or(false))
                 .open_responses_adapter(composite.open_responses_adapter.unwrap_or(true))
                 .maybe_allowed_batch_completion_windows(composite.allowed_batch_completion_windows)
                 .build(),
@@ -489,6 +495,8 @@ pub struct DeploymentUpdateDBRequest {
     pub sanitize_responses: Option<bool>,
     /// Whether to mark provider as trusted in strict mode (bypasses sanitization)
     pub trusted: Option<bool>,
+    /// Whether this provider supports the `priority` request parameter
+    pub supports_priority: Option<bool>,
     /// Whether to enable the open_responses adapter (converts /v1/responses to /v1/chat/completions)
     pub open_responses_adapter: Option<bool>,
     /// Per-model allowed batch completion windows (None = no change, Some(None) = clear, Some(windows) = set)
@@ -516,6 +524,7 @@ impl From<DeployedModelUpdate> for DeploymentUpdateDBRequest {
             .maybe_fallback_max_attempts(update.fallback_max_attempts)
             .maybe_sanitize_responses(update.sanitize_responses)
             .maybe_trusted(update.trusted)
+            .maybe_supports_priority(update.supports_priority)
             .maybe_open_responses_adapter(update.open_responses_adapter)
             .maybe_allowed_batch_completion_windows(update.allowed_batch_completion_windows)
             .build()
@@ -580,6 +589,8 @@ pub struct DeploymentDBResponse {
     pub sanitize_responses: bool,
     /// Whether to mark provider as trusted in strict mode (bypasses sanitization)
     pub trusted: bool,
+    /// Whether this provider supports the `priority` request parameter
+    pub supports_priority: bool,
     /// Whether the open_responses adapter is enabled (converts /v1/responses to /v1/chat/completions)
     pub open_responses_adapter: bool,
     /// Per-model allowed batch completion windows (overrides global config when set)
