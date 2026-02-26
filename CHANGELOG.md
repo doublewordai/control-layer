@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.10.1](https://github.com/doublewordai/control-layer/compare/v8.10.0...v8.10.1) (2026-02-26)
+
+
+### Bug Fixes
+
+* dont mark as finalising if the batch is marked failed ([#775](https://github.com/doublewordai/control-layer/issues/775)) ([1beb646](https://github.com/doublewordai/control-layer/commit/1beb646096d9e3324b5f6c284cf4d6e7a670d5f3))
+
 ## [8.10.0](https://github.com/doublewordai/control-layer/compare/v8.9.0...v8.10.0) (2026-02-25)
 
 
