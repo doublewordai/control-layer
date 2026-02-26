@@ -1498,7 +1498,7 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
- "outlet 0.6.0",
+ "outlet",
  "outlet-postgres",
  "paste",
  "postgresql_embedded",
@@ -3301,30 +3301,6 @@ dependencies = [
 
 [[package]]
 name = "outlet"
-version = "0.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5d484da44ecf98edcf2664301db1a2109baf78f108727997f590b5485bad22d7"
-dependencies = [
- "anyhow",
- "axum",
- "bytes",
- "futures",
- "http-body-util",
- "metrics",
- "opentelemetry",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tower",
- "tower-http",
- "tracing",
- "tracing-opentelemetry",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "outlet"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cbce3e5e96355b32b60f5490d75d53889c8446480eca3a16320030c8f3af703b"
@@ -3349,16 +3325,16 @@ dependencies = [
 
 [[package]]
 name = "outlet-postgres"
-version = "0.4.6"
+version = "0.4.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6aeba5c8d488448cf2258e1fa09e0f6b54ad14db1fefb442cac6bb2c6d28a4e3"
+checksum = "8d8da161fb668ed72a6d1081b52a7315c6e0e707967315bfcac2bd2ff5b46fab"
 dependencies = [
  "base64",
  "bytes",
  "chrono",
  "http",
  "metrics",
- "outlet 0.5.2",
+ "outlet",
  "serde",
  "serde_json",
  "sqlx",

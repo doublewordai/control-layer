@@ -83,7 +83,7 @@ axum-prometheus = "0.10"
 metrics = "0.24"
 metrics-exporter-prometheus = "0.18"
 outlet = "0.6.0"
-outlet-postgres = "0.4.6"
+outlet-postgres = "0.4.7"
 async-openai = { version = "0.33.0", default-features = false, features = [
   "chat-completion-types",
   "completion-types",
