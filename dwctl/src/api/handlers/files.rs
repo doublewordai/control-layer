@@ -155,20 +155,8 @@ impl OpenAIBatchRequest {
             });
         }
 
-        // Strip 'priority' key from body if present (users shouldn't control priority)
-        let mut sanitized_body = self.body.clone();
-        if sanitized_body.is_object()
-            && let Some(obj) = sanitized_body.as_object_mut()
-            && obj.remove("priority").is_some()
-        {
-            tracing::debug!(
-                custom_id = %self.custom_id,
-                "Stripped 'priority' field from request body"
-            );
-        }
-
-        // Serialize sanitized body back to string
-        let body = serde_json::to_string(&sanitized_body).map_err(|e| Error::BadRequest {
+        // Serialize body to string (priority stripping is handled by onwards)
+        let body = serde_json::to_string(&self.body).map_err(|e| Error::BadRequest {
             message: format!("Invalid JSON body: {}", e),
         })?;
 
