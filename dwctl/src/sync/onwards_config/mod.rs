@@ -975,6 +975,8 @@ fn convert_to_config_file(targets: Vec<OnwardsTarget>, composites: Vec<OnwardsCo
         auth,
         strict_mode,
         http_pool: None,
+        priority_routing: true,
+        batch_header: Some("x-fusillade-batch-id".to_string()),
     }
 }
 
