@@ -149,6 +149,7 @@ async fn try_proxy_header_auth<P: sqlx_pool_router::PoolProvider + Clone + Send 
         Err(e) => return Some(Err(DbError::from(e).into())),
     };
     let mut user_repo = Users::new(&mut tx);
+    let mut should_create_sample_files = false;
 
     // Get or create user with group sync (only if auto_create is enabled)
     let user_result = if config.auth.proxy_header.auto_create_users {
@@ -157,8 +158,9 @@ async fn try_proxy_header_auth<P: sqlx_pool_router::PoolProvider + Clone + Send 
             .await
         {
             Ok((user, was_created)) => {
-                // Grant initial credits and create sample files for newly created users
+                // Grant initial credits for newly created users
                 if was_created {
+                    should_create_sample_files = true;
                     let initial_credits = config.credits.initial_credits_for_standard_users;
                     if initial_credits > rust_decimal::Decimal::ZERO && user.roles.contains(&Role::StandardUser) {
                         use crate::db::handlers::credits::Credits;
@@ -174,17 +176,6 @@ async fn try_proxy_header_auth<P: sqlx_pool_router::PoolProvider + Clone + Send 
                         if let Err(e) = credits_repo.create_transaction(&request).await {
                             return Some(Err(Error::Database(e)));
                         }
-                    }
-
-                    // Create sample files for new user (non-blocking, failures are logged)
-                    if config.sample_files.enabled && config.batches.enabled {
-                        let state_clone = state.clone();
-                        let user_id = user.id;
-                        tokio::spawn(async move {
-                            if let Err(e) = crate::api::handlers::auth::create_sample_files_for_new_user(&state_clone, user_id).await {
-                                tracing::warn!(user_id = %user_id, error = %e, "Failed to create sample files for new user");
-                            }
-                        });
                     }
                 }
 
@@ -231,6 +222,20 @@ async fn try_proxy_header_auth<P: sqlx_pool_router::PoolProvider + Clone + Send 
         Ok(_) => {}
         Err(e) => return Some(Err(DbError::from(e).into())),
     }
+
+    // Create sample files after commit so the user and API keys are persisted
+    if should_create_sample_files && config.sample_files.enabled && config.batches.enabled {
+        if let Some(ref user) = user_result {
+            let state_clone = state.clone();
+            let user_id = user.id;
+            tokio::spawn(async move {
+                if let Err(e) = crate::api::handlers::auth::create_sample_files_for_new_user(&state_clone, user_id).await {
+                    tracing::warn!(user_id = %user_id, error = %e, "Failed to create sample files for new user");
+                }
+            });
+        }
+    }
+
     user_result.map(Ok)
 }
 
