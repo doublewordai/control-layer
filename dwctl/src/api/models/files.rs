@@ -23,6 +23,10 @@ pub struct ListFilesQuery {
 
     /// Search query to filter files by filename (case-insensitive substring match)
     pub search: Option<String>,
+
+    /// If true, only return files uploaded by the current user (even if the user has ReadAll permission)
+    #[serde(default)]
+    pub own: bool,
 }
 
 fn default_order() -> String {
