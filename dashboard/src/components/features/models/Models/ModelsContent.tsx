@@ -12,24 +12,24 @@ import {
   BarChart3,
   ArrowUpDown,
   Info,
-  DollarSign,
-  ArrowDownToLine,
-  ArrowUpToLine,
   GitMerge,
   Copy,
   Check,
   Zap,
+  Radio,
+  ArrowUpToLine,
+  ArrowDownToLine,
 } from "lucide-react";
 import {
   useModels,
   useModelsMetrics,
+  useConfig,
   type Model,
   type ModelsInclude,
   useProbes,
 } from "../../../../api/control-layer";
 import { AccessManagementModal } from "../../../modals";
 import { ApiExamples } from "../../../modals";
-import { UpdateModelPricingModal } from "../../../modals";
 import { TablePagination } from "../../../ui/table-pagination";
 import {
   Card,
@@ -50,6 +50,7 @@ import {
   formatNumber,
   formatLatency,
   formatRelativeTime,
+  formatTariffPrice,
 } from "../../../../utils/formatters";
 import { Skeleton } from "../../../ui/skeleton";
 import {
@@ -59,13 +60,14 @@ import {
 } from "../../../ui/tooltip";
 import { StatusRow } from "./StatusRow";
 import { Markdown } from "../../../ui/markdown";
+import { isBatchDenied, isPlaygroundDenied, isRealtimeDenied } from "../../../../utils/modelAccess";
 
 const COMPLETION_WINDOWS: Record<
   string,
-  { label: string; icon: typeof Clock }
+  { label: string; icon: typeof Clock; sort: number }
 > = {
-  "24h": { label: "Standard", icon: Clock },
-  "1h": { label: "High", icon: Zap },
+  "1h": { label: "High", icon: Zap, sort: 0 },
+  "24h": { label: "Standard", icon: Clock, sort: 1 },
 };
 
 const CopyableModelName: React.FC<{
@@ -154,16 +156,18 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
   canViewAnalytics,
   canViewEndpoints,
   showPricing,
-  canManageModels,
   onClearFilters,
 }) => {
   const navigate = useNavigate();
+  const { data: config } = useConfig();
+  const globalBatchWindows = useMemo(
+    () => config?.batches?.allowed_completion_windows ?? ["24h"],
+    [config?.batches?.allowed_completion_windows],
+  );
   const [showAccessModal, setShowAccessModal] = useState(false);
   const [accessModel, setAccessModel] = useState<Model | null>(null);
   const [showApiExamples, setShowApiExamples] = useState(false);
   const [apiExamplesModel, setApiExamplesModel] = useState<Model | null>(null);
-  const [showPricingModal, setShowPricingModal] = useState(false);
-  const [pricingModel, setPricingModel] = useState<Model | null>(null);
 
   const includeParam = useMemo(() => {
     const parts: string[] = ["status", "components"];
@@ -358,7 +362,7 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                 <Card
                   key={model.id}
                   role="listitem"
-                  className="hover:shadow-md transition-shadow rounded-lg p-0 gap-0 overflow-hidden flex flex-col"
+                  className="@container hover:shadow-md transition-shadow rounded-lg p-0 gap-0 overflow-hidden flex flex-col"
                 >
                   <div
                     className="cursor-pointer hover:bg-gray-50 transition-colors group grow flex flex-col min-w-0"
@@ -630,181 +634,142 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                           )
                         )}
 
-                        {/* ROW 3: Tariffs */}
+                        {/* ROW 3: Access tiers */}
                         <CardDescription className="flex items-center flex-wrap gap-1.5 min-w-0">
-                          {/* Show pricing for users with pricing permissions */}
                           {showPricing && (
                             <>
                               {(() => {
-                                const batchTariffs =
-                                  model.tariffs?.filter(
-                                    (t) => t.api_key_purpose === "batch",
-                                  ) || [];
+                                const realtimeDenied = isRealtimeDenied(model);
+                                const batchDenied = isBatchDenied(model);
+                                const realtimeTariff = model.tariffs?.find(
+                                  (t) => t.api_key_purpose === "realtime" || t.api_key_purpose === null,
+                                );
+
+                                // Determine which batch windows this model supports:
+                                // per-model override > global config defaults
+                                const availableWindows = [...(batchDenied
+                                  ? []
+                                  : model.allowed_batch_completion_windows ?? globalBatchWindows
+                                )].sort((a: string, b: string) =>
+                                  (COMPLETION_WINDOWS[a]?.sort ?? 99) - (COMPLETION_WINDOWS[b]?.sort ?? 99)
+                                );
+
+                                // Build batch tariff lookup for pricing
+                                const batchTariffsByWindow = new Map(
+                                  (model.tariffs ?? [])
+                                    .filter((t) => t.api_key_purpose === "batch" && t.completion_window)
+                                    .map((t) => [t.completion_window!, t]),
+                                );
+
+                                const tiers: {
+                                  key: string;
+                                  label: string;
+                                  icon: typeof Clock;
+                                  denied: boolean;
+                                  deniedMessage: string;
+                                  description: string;
+                                  inputPrice?: string | null;
+                                  outputPrice?: string | null;
+                                }[] = [
+                                  {
+                                    key: "realtime",
+                                    label: "Realtime",
+                                    icon: Radio,
+                                    denied: realtimeDenied,
+                                    deniedMessage: "Synchronous API access is unavailable for this model",
+                                    description: "Synchronous API access",
+                                    inputPrice: realtimeTariff?.input_price_per_token,
+                                    outputPrice: realtimeTariff?.output_price_per_token,
+                                  },
+                                  ...availableWindows.map((window: string) => {
+                                    const cw = COMPLETION_WINDOWS[window];
+                                    const tariff = batchTariffsByWindow.get(window);
+                                    return {
+                                      key: `batch-${window}`,
+                                      label: cw?.label ?? window,
+                                      icon: cw?.icon ?? Clock,
+                                      denied: false,
+                                      deniedMessage: "",
+                                      description: `${window} completion window`,
+                                      inputPrice: tariff?.input_price_per_token ?? null,
+                                      outputPrice: tariff?.output_price_per_token ?? null,
+                                    };
+                                  }),
+                                ];
 
                                 return (
                                   <>
-                                    {batchTariffs.map((batchTariff, index) => (
-                                      <React.Fragment key={batchTariff.id}>
+                                    {tiers.map((tier, index) => (
+                                      <React.Fragment key={tier.key}>
                                         {index > 0 && (
                                           <span className="mx-1">•</span>
                                         )}
-                                        <HoverCard
-                                          openDelay={200}
-                                          closeDelay={100}
-                                        >
+                                        <HoverCard openDelay={200} closeDelay={100}>
                                           <HoverCardTrigger asChild>
                                             <button
-                                              className="flex items-center gap-0.5 shrink-0 hover:opacity-70 transition-opacity"
-                                              onClick={(e) =>
-                                                e.stopPropagation()
-                                              }
+                                              className={`flex items-center gap-0.5 shrink-0 transition-opacity ${
+                                                tier.denied
+                                                  ? "line-through text-gray-400"
+                                                  : "hover:opacity-70"
+                                              }`}
+                                              onClick={(e) => e.stopPropagation()}
                                             >
-                                              {(() => {
-                                                const cw = batchTariff.completion_window
-                                                  ? COMPLETION_WINDOWS[batchTariff.completion_window]
-                                                  : null;
-                                                const Icon = cw?.icon;
-                                                return (
-                                                  <>
-                                                    {Icon && <Icon className="h-2.5 w-2.5 text-gray-500 shrink-0" />}
-                                                    <span className="hidden sm:inline">{cw?.label ?? batchTariff.completion_window ?? "Batch"}</span>
-                                                  </>
-                                                );
-                                              })()}
-                                              :
-                                              {!batchTariff.input_price_per_token &&
-                                              !batchTariff.output_price_per_token ? (
-                                                <span className="flex items-center gap-0.5 text-green-700">
-                                                  <div className="relative h-2.5 w-2.5">
-                                                    <DollarSign className="h-2.5 w-2.5" />
-                                                    <div className="absolute inset-0 flex items-center justify-center">
-                                                      <div className="w-5 h-px bg-green-700 rotate-[-50deg]" />
-                                                    </div>
-                                                  </div>
-                                                  <span>Free</span>
-                                                </span>
-                                              ) : (
-                                                <span className="flex items-center gap-1">
+                                              <tier.icon className={`h-2.5 w-2.5 shrink-0 ${
+                                                tier.denied ? "text-gray-400" : "text-gray-500"
+                                              }`} />
+                                              <span>{tier.label}</span>
+                                              {!tier.denied && (tier.inputPrice || tier.outputPrice) && (
+                                                <span className="hidden @min-[680px]:inline-flex items-center gap-1 ml-0.5">
                                                   <span className="flex items-center gap-0.5">
                                                     <ArrowUpToLine className="h-2.5 w-2.5 text-gray-500 shrink-0" />
                                                     <span className="whitespace-nowrap tabular-nums">
-                                                      {batchTariff.input_price_per_token
-                                                        ? (() => {
-                                                            const price =
-                                                              Number(
-                                                                batchTariff.input_price_per_token,
-                                                              ) * 1000000;
-                                                            return `$${price % 1 === 0 ? price.toFixed(0) : price.toFixed(2)}`;
-                                                          })()
-                                                        : "$0"}
+                                                      {formatTariffPrice(tier.inputPrice)}
                                                     </span>
-                                                    <span className="text-[8px] text-gray-400">
-                                                      /M
-                                                    </span>
+                                                    <span className="text-[8px] text-gray-400">/M</span>
                                                   </span>
                                                   <span className="flex items-center gap-0.5">
                                                     <ArrowDownToLine className="h-2.5 w-2.5 text-gray-500 shrink-0" />
                                                     <span className="whitespace-nowrap tabular-nums">
-                                                      {batchTariff.output_price_per_token
-                                                        ? (() => {
-                                                            const price =
-                                                              Number(
-                                                                batchTariff.output_price_per_token,
-                                                              ) * 1000000;
-                                                            return `$${price % 1 === 0 ? price.toFixed(0) : price.toFixed(2)}`;
-                                                          })()
-                                                        : "$0"}
+                                                      {formatTariffPrice(tier.outputPrice)}
                                                     </span>
-                                                    <span className="text-[8px] text-gray-400">
-                                                      /M
-                                                    </span>
+                                                    <span className="text-[8px] text-gray-400">/M</span>
                                                   </span>
                                                 </span>
                                               )}
-                                              <span className="sr-only">
-                                                View {batchTariff.name} pricing
-                                                details
-                                              </span>
                                             </button>
                                           </HoverCardTrigger>
-                                          <HoverCardContent
-                                            className="w-48"
-                                            sideOffset={5}
-                                          >
-                                            <p className="font-medium text-sm mb-1">
-                                              {COMPLETION_WINDOWS[batchTariff.completion_window ?? ""]?.label ?? batchTariff.completion_window}{" "}
-                                              priority
-                                            </p>
-                                            <p className="text-xs text-muted-foreground mb-2">
-                                              {batchTariff.completion_window ?? ""}{" "}
-                                              completion window
-                                            </p>
-                                            {!batchTariff.input_price_per_token &&
-                                            !batchTariff.output_price_per_token ? (
-                                              <div className="text-sm">
-                                                <p className="font-medium text-green-700">
-                                                  Free
-                                                </p>
-                                                <p className="text-xs text-muted-foreground mt-1">
-                                                  No charge for calls to this
-                                                  model
-                                                </p>
-                                              </div>
+                                          <HoverCardContent className="w-52" sideOffset={5}>
+                                            {tier.denied ? (
+                                              <p className="text-xs text-muted-foreground">
+                                                {tier.deniedMessage}
+                                              </p>
                                             ) : (
-                                              <div className="space-y-1 text-xs">
-                                                <p className="text-muted-foreground">
-                                                  Pricing per million tokens:
-                                                </p>
-                                                <p>
-                                                  <span className="font-medium">
-                                                    Input:
-                                                  </span>{" "}
-                                                  {batchTariff.input_price_per_token
-                                                    ? (() => {
-                                                        const price =
-                                                          Number(
-                                                            batchTariff.input_price_per_token,
-                                                          ) * 1000000;
-                                                        return `$${price % 1 === 0 ? price.toFixed(0) : price.toFixed(2)}`;
-                                                      })()
-                                                    : "$0"}
-                                                </p>
-                                                <p>
-                                                  <span className="font-medium">
-                                                    Output:
-                                                  </span>{" "}
-                                                  {batchTariff.output_price_per_token
-                                                    ? (() => {
-                                                        const price =
-                                                          Number(
-                                                            batchTariff.output_price_per_token,
-                                                          ) * 1000000;
-                                                        return `$${price % 1 === 0 ? price.toFixed(0) : price.toFixed(2)}`;
-                                                      })()
-                                                    : "$0"}
-                                                </p>
-                                              </div>
+                                              <>
+                                                <p className="font-medium text-sm mb-0.5">{tier.label}</p>
+                                                <p className="text-xs text-muted-foreground mb-2">{tier.description}</p>
+                                                {!tier.inputPrice && !tier.outputPrice ? (
+                                                  <p className="text-xs text-muted-foreground">
+                                                    Free — no charge for this tier
+                                                  </p>
+                                                ) : (
+                                                  <div className="space-y-0.5 text-xs">
+                                                    <p>
+                                                      <span className="text-muted-foreground">Input:</span>{" "}
+                                                      <span className="font-medium tabular-nums">{formatTariffPrice(tier.inputPrice)}/M</span>
+                                                    </p>
+                                                    <p>
+                                                      <span className="text-muted-foreground">Output:</span>{" "}
+                                                      <span className="font-medium tabular-nums">{formatTariffPrice(tier.outputPrice)}/M</span>
+                                                    </p>
+                                                  </div>
+                                                )}
+                                              </>
                                             )}
                                           </HoverCardContent>
                                         </HoverCard>
                                       </React.Fragment>
                                     ))}
 
-                                    {batchTariffs.length === 0 &&
-                                      canManageModels && (
-                                        <button
-                                          className="flex items-center gap-1 text-xs text-gray-600 hover:text-gray-900 transition-colors"
-                                          onClick={(e) => {
-                                            e.stopPropagation();
-                                            setPricingModel(model);
-                                            setShowPricingModal(true);
-                                          }}
-                                          title="Set pricing tariffs"
-                                        >
-                                          <DollarSign className="h-3 w-3" />
-                                          <span>Set pricing</span>
-                                        </button>
-                                      )}
                                   </>
                                 );
                               })()}
@@ -1002,29 +967,38 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                   </div>
 
                   <div className="border-t">
-                    <div className="grid grid-cols-2 divide-x">
-                      <button
-                        className="flex items-center justify-center gap-1.5 py-3.5 text-sm font-medium text-gray-600 hover:bg-gray-50 hover:text-gray-700 transition-colors rounded-bl-lg"
-                        onClick={() => {
-                          setApiExamplesModel(model);
-                          setShowApiExamples(true);
-                        }}
-                      >
-                        <Code className="h-4 w-4 text-blue-500" />
-                        <span>API</span>
-                      </button>
-                      <button
-                        className="flex items-center justify-center gap-1.5 py-3.5 text-sm font-medium text-gray-600 hover:bg-gray-50 hover:text-gray-700 transition-colors rounded-br-lg group"
-                        onClick={() => {
-                          navigate(
-                            `/playground?model=${encodeURIComponent(model.alias)}&from=${encodeURIComponent("/models")}`,
-                          );
-                        }}
-                      >
-                        <ArrowRight className="h-4 w-4 text-purple-500 group-hover:translate-x-0.5 transition-transform" />
-                        <span>Playground</span>
-                      </button>
-                    </div>
+                    {(() => {
+                      const playgroundAvailable = !isPlaygroundDenied(model);
+                      return (
+                        <div
+                          className={`grid ${playgroundAvailable ? "grid-cols-2 divide-x" : "grid-cols-1"}`}
+                        >
+                          <button
+                            className={`flex items-center justify-center gap-1.5 py-3.5 text-sm font-medium text-gray-600 hover:bg-gray-50 hover:text-gray-700 transition-colors rounded-bl-lg ${!playgroundAvailable ? "rounded-br-lg" : ""}`}
+                            onClick={() => {
+                              setApiExamplesModel(model);
+                              setShowApiExamples(true);
+                            }}
+                          >
+                            <Code className="h-4 w-4 text-blue-500" />
+                            <span>API</span>
+                          </button>
+                          {playgroundAvailable && (
+                            <button
+                              className="flex items-center justify-center gap-1.5 py-3.5 text-sm font-medium text-gray-600 hover:bg-gray-50 hover:text-gray-700 transition-colors rounded-br-lg group"
+                              onClick={() => {
+                                navigate(
+                                  `/playground?model=${encodeURIComponent(model.alias)}&from=${encodeURIComponent("/models")}`,
+                                );
+                              }}
+                            >
+                              <ArrowRight className="h-4 w-4 text-purple-500 group-hover:translate-x-0.5 transition-transform" />
+                              <span>Playground</span>
+                            </button>
+                          )}
+                        </div>
+                      );
+                    })()}
                   </div>
                 </Card>
               );
@@ -1061,17 +1035,6 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
         model={apiExamplesModel}
       />
 
-      {showPricing && pricingModel && (
-        <UpdateModelPricingModal
-          isOpen={showPricingModal}
-          modelId={pricingModel.id}
-          modelName={pricingModel.alias}
-          onClose={() => {
-            setShowPricingModal(false);
-            setPricingModel(null);
-          }}
-        />
-      )}
     </>
   );
 };

@@ -27,7 +27,7 @@ import type {
   ApiKeyPurpose,
   TrafficRoutingRule,
 } from "../../../../api/control-layer";
-import { useAuthorization } from "../../../../utils";
+import { useAuthorization, isPlaygroundDenied } from "../../../../utils";
 import {
   ApiExamples,
   AccessManagementModal,
@@ -2063,18 +2063,20 @@ const ModelInfo: React.FC = () => {
                   <CardTitle>Quick Actions</CardTitle>
                 </CardHeader>
                 <CardContent className="px-6 pb-6 pt-0 space-y-3">
-                  <Button
-                    className="w-full justify-start"
-                    onClick={() => {
-                      const currentUrl = `/models/${model.id}${fromUrl ? `?from=${encodeURIComponent(fromUrl)}` : ""}`;
-                      navigate(
-                        `/playground?model=${encodeURIComponent(model.alias)}&from=${encodeURIComponent(currentUrl)}`,
-                      );
-                    }}
-                  >
-                    <Play className="mr-2 h-4 w-4" />
-                    Try in Playground
-                  </Button>
+                  {!isPlaygroundDenied(model) && (
+                    <Button
+                      className="w-full justify-start"
+                      onClick={() => {
+                        const currentUrl = `/models/${model.id}${fromUrl ? `?from=${encodeURIComponent(fromUrl)}` : ""}`;
+                        navigate(
+                          `/playground?model=${encodeURIComponent(model.alias)}&from=${encodeURIComponent(currentUrl)}`,
+                        );
+                      }}
+                    >
+                      <Play className="mr-2 h-4 w-4" />
+                      Try in Playground
+                    </Button>
+                  )}
                   {canViewAnalytics && (
                     <>
                       <Button
