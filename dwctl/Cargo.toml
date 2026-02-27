@@ -76,7 +76,7 @@ jsonwebtoken = "9.0"
 argon2 = "0.5"
 base64 = "0.22"
 bytes = "1.5"
-onwards = "0.18.0"
+onwards = "0.18.1"
 thiserror = "2.0.14"
 axum-prometheus = "0.10"
 # Metrics facade and exporter (same versions as axum-prometheus uses)
