@@ -28,7 +28,7 @@ impl Default for SampleFilesConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            requests_per_file: 2000,
+            requests_per_file: 100,
         }
     }
 }
