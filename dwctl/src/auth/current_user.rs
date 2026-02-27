@@ -224,16 +224,18 @@ async fn try_proxy_header_auth<P: sqlx_pool_router::PoolProvider + Clone + Send 
     }
 
     // Create sample files after commit so the user and API keys are persisted
-    if should_create_sample_files && config.sample_files.enabled && config.batches.enabled {
-        if let Some(ref user) = user_result {
-            let state_clone = state.clone();
-            let user_id = user.id;
-            tokio::spawn(async move {
-                if let Err(e) = crate::api::handlers::auth::create_sample_files_for_new_user(&state_clone, user_id).await {
-                    tracing::warn!(user_id = %user_id, error = %e, "Failed to create sample files for new user");
-                }
-            });
-        }
+    if should_create_sample_files
+        && config.sample_files.enabled
+        && config.batches.enabled
+        && let Some(ref user) = user_result
+    {
+        let state_clone = state.clone();
+        let user_id = user.id;
+        tokio::spawn(async move {
+            if let Err(e) = crate::api::handlers::auth::create_sample_files_for_new_user(&state_clone, user_id).await {
+                tracing::warn!(user_id = %user_id, error = %e, "Failed to create sample files for new user");
+            }
+        });
     }
 
     user_result.map(Ok)
