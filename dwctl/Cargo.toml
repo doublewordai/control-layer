@@ -140,7 +140,7 @@ hmac = "0.12.1"
 sha2 = "0.10.9"
 
 [dev-dependencies]
-axum-test = { version = "18.4.1" }
+axum-test = { version = "19.0.0" }
 sqlx = { version = "0.8", features = [
   "postgres",
   "runtime-tokio-rustls",
