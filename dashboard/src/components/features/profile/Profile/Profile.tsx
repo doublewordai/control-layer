@@ -934,6 +934,7 @@ export const Profile: React.FC = () => {
                     <div className="flex items-center gap-1">
                       <span className="text-xs text-gray-500">$</span>
                       <Input
+                        key={currentUser.low_balance_threshold}
                         type="number"
                         min="0.01"
                         step="0.50"
