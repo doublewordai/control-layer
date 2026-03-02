@@ -989,12 +989,7 @@ mod tests {
         // Topup: add credits and refresh checkpoint so balance > threshold
         let mut conn = pool.acquire().await.unwrap();
         let mut credits = Credits::new(&mut conn);
-        let grant = CreditTransactionCreateDBRequest::admin_grant(
-            user_id,
-            user_id,
-            Decimal::from_str("10.00").unwrap(),
-            None,
-        );
+        let grant = CreditTransactionCreateDBRequest::admin_grant(user_id, user_id, Decimal::from_str("10.00").unwrap(), None);
         credits.create_transaction(&grant).await.unwrap();
         credits.refresh_checkpoint(user_id).await.unwrap();
         drop(conn);
@@ -1054,12 +1049,7 @@ mod tests {
         // 5. Topup $50 → balance $51 (above threshold)
         let mut conn = pool.acquire().await.unwrap();
         let mut credits = Credits::new(&mut conn);
-        let grant = CreditTransactionCreateDBRequest::admin_grant(
-            user_id,
-            user_id,
-            Decimal::from_str("50.00").unwrap(),
-            None,
-        );
+        let grant = CreditTransactionCreateDBRequest::admin_grant(user_id, user_id, Decimal::from_str("50.00").unwrap(), None);
         credits.create_transaction(&grant).await.unwrap();
         credits.refresh_checkpoint(user_id).await.unwrap();
         drop(conn);
