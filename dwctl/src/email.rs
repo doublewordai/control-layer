@@ -304,7 +304,7 @@ impl EmailService {
         env.add_template("email", &self.templates.low_balance)?;
 
         let base = self.base_url.trim_end_matches('/');
-        let dashboard_link = format!("{base}/credits");
+        let dashboard_link = format!("{base}/cost-management");
         let profile_link = format!("{base}/profile");
 
         env.get_template("email")?.render(context! {
