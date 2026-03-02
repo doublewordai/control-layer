@@ -14,6 +14,7 @@ struct EmailTemplates {
     password_reset: String,
     batch_complete: String,
     first_batch: String,
+    low_balance: String,
 }
 
 impl EmailTemplates {
@@ -22,6 +23,7 @@ impl EmailTemplates {
             password_reset: include_str!("../default_templates/password_reset.html").to_string(),
             batch_complete: include_str!("../default_templates/batch_complete.html").to_string(),
             first_batch: include_str!("../default_templates/first_batch.html").to_string(),
+            low_balance: include_str!("../default_templates/low_balance.html").to_string(),
         }
     }
 
@@ -37,6 +39,7 @@ impl EmailTemplates {
             password_reset: load("password_reset.html")?,
             batch_complete: load("batch_complete.html")?,
             first_batch: load("first_batch.html")?,
+            low_balance: load("low_balance.html")?,
         })
     }
 }
@@ -279,6 +282,38 @@ impl EmailService {
         env.get_template("email")?.render(context! {
             to_name,
             reset_link,
+        })
+    }
+
+    pub async fn send_low_balance_email(
+        &self,
+        to_email: &str,
+        to_name: Option<&str>,
+        balance: &rust_decimal::Decimal,
+    ) -> Result<(), Error> {
+        let subject = "Your balance is running low";
+        let name = to_name.unwrap_or("User");
+        let body = self.render_low_balance_body(name, balance).map_err(|e| Error::Internal {
+            operation: format!("render email template: {e}"),
+        })?;
+        self.send_email(to_email, to_name, subject, &body).await
+    }
+
+    fn render_low_balance_body(&self, to_name: &str, balance: &rust_decimal::Decimal) -> Result<String, minijinja::Error> {
+        let mut env = Environment::new();
+        env.add_template("email", &self.templates.low_balance)?;
+
+        let base = self.base_url.trim_end_matches('/');
+        let dashboard_link = format!("{base}/credits");
+        let profile_link = format!("{base}/profile");
+
+        env.get_template("email")?.render(context! {
+            to_name,
+            balance => format!("{:.2}", balance),
+            dashboard_link,
+            profile_link,
+            from_name => &self.from_name,
+            reply_to => self.reply_to.as_deref().unwrap_or(&self.from_email),
         })
     }
 }

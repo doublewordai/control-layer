@@ -276,6 +276,36 @@ export const Profile: React.FC = () => {
     }
   };
 
+  const handleLowBalanceToggle = async (enabled: boolean) => {
+    if (!currentUser) return;
+    try {
+      await updateUserMutation.mutateAsync({
+        id: currentUser.id,
+        data: {
+          low_balance_threshold: enabled ? 2.0 : null,
+        },
+      });
+      await refetchUser();
+    } catch {
+      // Revert will happen via refetchUser
+    }
+  };
+
+  const handleLowBalanceThresholdChange = async (value: string) => {
+    if (!currentUser) return;
+    const num = parseFloat(value);
+    if (isNaN(num) || num <= 0) return;
+    try {
+      await updateUserMutation.mutateAsync({
+        id: currentUser.id,
+        data: { low_balance_threshold: num },
+      });
+      await refetchUser();
+    } catch {
+      // Revert will happen via refetchUser
+    }
+  };
+
   // Webhook handlers
   const openCreateWebhookDialog = () => {
     setEditingWebhook(null);
@@ -847,7 +877,12 @@ export const Profile: React.FC = () => {
                 Notifications
               </h4>
 
-              {/* Email Notifications Toggle */}
+              {/* Email Section */}
+              <h5 className="text-sm font-medium text-gray-500 uppercase tracking-wide mb-3">
+                Email
+              </h5>
+
+              {/* Batch Notifications Toggle */}
               <div className="flex items-center justify-between pb-4 border-b border-gray-200">
                 <div className="flex items-center gap-3">
                   <div className="p-2 bg-gray-100 rounded-lg">
@@ -858,7 +893,7 @@ export const Profile: React.FC = () => {
                       htmlFor="emailNotifications"
                       className="text-sm font-medium text-gray-900"
                     >
-                      Email Notifications
+                      Batch Notifications
                     </Label>
                     <p className="text-xs text-gray-500 mt-0.5">
                       Receive email when a batch completes or fails
@@ -876,18 +911,64 @@ export const Profile: React.FC = () => {
                 </div>
               </div>
 
+              {/* Low Balance Alerts Toggle */}
+              <div className="flex items-center justify-between py-4 border-b border-gray-200">
+                <div className="flex items-center gap-3">
+                  <div className="p-2 bg-gray-100 rounded-lg">
+                    <AlertTriangle className="w-4 h-4 text-gray-600" />
+                  </div>
+                  <div>
+                    <Label
+                      htmlFor="lowBalanceNotifications"
+                      className="text-sm font-medium text-gray-900"
+                    >
+                      Low Balance Alerts
+                    </Label>
+                    <p className="text-xs text-gray-500 mt-0.5">
+                      Receive email when your balance drops below the specified threshold
+                    </p>
+                  </div>
+                </div>
+                <div className="flex items-center gap-2 shrink-0">
+                  {currentUser?.low_balance_threshold != null && (
+                    <div className="flex items-center gap-1">
+                      <span className="text-xs text-gray-500">$</span>
+                      <Input
+                        type="number"
+                        min="0.01"
+                        step="0.50"
+                        className="w-20 h-7 text-xs [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none"
+                        defaultValue={currentUser.low_balance_threshold}
+                        onBlur={(e) =>
+                          handleLowBalanceThresholdChange(e.target.value)
+                        }
+                        disabled={updateUserMutation.isPending}
+                        aria-label="Low balance threshold"
+                      />
+                    </div>
+                  )}
+                  <Switch
+                    id="lowBalanceNotifications"
+                    checked={currentUser?.low_balance_threshold != null}
+                    onCheckedChange={handleLowBalanceToggle}
+                    disabled={updateUserMutation.isPending}
+                    aria-label="Low balance notifications"
+                  />
+                </div>
+              </div>
+
               {/* Webhooks Section */}
-              <div className="pt-4">
+              <h5 className="text-sm font-medium text-gray-500 uppercase tracking-wide mt-6 mb-3">
+                Webhooks
+              </h5>
+              <div>
                 <div className="flex items-center justify-between mb-3">
                   <div className="flex items-center gap-3">
                     <div className="p-2 bg-gray-100 rounded-lg">
                       <Globe className="w-4 h-4 text-gray-600" />
                     </div>
                     <div>
-                      <h5 className="text-sm font-medium text-gray-900">
-                        Webhooks
-                      </h5>
-                      <p className="text-xs text-gray-500 mt-0.5">
+                      <p className="text-xs text-gray-500">
                         Receive HTTP callbacks when events occur
                       </p>
                     </div>
@@ -1149,7 +1230,7 @@ export const Profile: React.FC = () => {
                           <HoverCardContent
                             side="left"
                             align="start"
-                            className="w-72"
+                            className="w-[22rem]"
                           >
                             <p className="text-xs font-medium text-gray-700 mb-1">
                               Example payload

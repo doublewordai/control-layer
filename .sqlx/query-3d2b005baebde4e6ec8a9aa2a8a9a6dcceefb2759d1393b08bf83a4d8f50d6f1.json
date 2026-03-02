@@ -1,0 +1,38 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            WITH clear_recovered AS (\n                UPDATE users u\n                SET low_balance_notification_sent = false\n                FROM user_balance_checkpoints c\n                WHERE u.id = c.user_id\n                  AND u.low_balance_notification_sent = true\n                  AND u.low_balance_threshold IS NOT NULL\n                  AND c.balance >= u.low_balance_threshold\n            )\n            SELECT u.id, u.email, u.username, u.display_name\n            FROM users u\n            JOIN user_balance_checkpoints c ON u.id = c.user_id\n            WHERE u.id != '00000000-0000-0000-0000-000000000000'\n              AND u.is_deleted = false\n              AND u.low_balance_notification_sent = false\n              AND u.low_balance_threshold IS NOT NULL\n              AND c.balance < u.low_balance_threshold\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "email",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "username",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "display_name",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "3d2b005baebde4e6ec8a9aa2a8a9a6dcceefb2759d1393b08bf83a4d8f50d6f1"
+}

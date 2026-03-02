@@ -14,7 +14,8 @@
     "credit_balance": 4250.00,
     "is_admin": true,
     "has_payment_provider_id": true,
-    "batch_notifications_enabled": true
+    "batch_notifications_enabled": true,
+    "low_balance_threshold": 2.0
   },
   {
     "id": "550e8400-e29b-41d4-a716-446655440002",
@@ -31,7 +32,8 @@
     "credit_balance": 1520.75,
     "is_admin": false,
     "has_payment_provider_id": true,
-    "batch_notifications_enabled": true
+    "batch_notifications_enabled": true,
+    "low_balance_threshold": 2.0
   },
   {
     "id": "550e8400-e29b-41d4-a716-446655440003",
@@ -48,7 +50,8 @@
     "credit_balance": 250.00,
     "is_admin": false,
     "has_payment_provider_id": false,
-    "batch_notifications_enabled": false
+    "batch_notifications_enabled": false,
+    "low_balance_threshold": null
   },
   {
     "id": "550e8400-e29b-41d4-a716-446655440004",
@@ -65,7 +68,8 @@
     "credit_balance": 3180.50,
     "is_admin": false,
     "has_payment_provider_id": true,
-    "batch_notifications_enabled": true
+    "batch_notifications_enabled": true,
+    "low_balance_threshold": 2.0
   },
   {
     "id": "550e8400-e29b-41d4-a716-446655440005",
@@ -82,7 +86,8 @@
     "credit_balance": 8750.25,
     "is_admin": false,
     "has_payment_provider_id": true,
-    "batch_notifications_enabled": true
+    "batch_notifications_enabled": true,
+    "low_balance_threshold": 2.0
   },
   {
     "id": "550e8400-e29b-41d4-a716-446655440006",
@@ -99,7 +104,8 @@
     "credit_balance": 0.00,
     "is_admin": false,
     "has_payment_provider_id": false,
-    "batch_notifications_enabled": false
+    "batch_notifications_enabled": false,
+    "low_balance_threshold": null
   },
   {
     "id": "550e8400-e29b-41d4-a716-446655440007",
@@ -116,7 +122,8 @@
     "credit_balance": 620.00,
     "is_admin": false,
     "has_payment_provider_id": true,
-    "batch_notifications_enabled": true
+    "batch_notifications_enabled": true,
+    "low_balance_threshold": 2.0
   },
   {
     "id": "550e8400-e29b-41d4-a716-446655440008",
@@ -133,7 +140,8 @@
     "credit_balance": 12400.00,
     "is_admin": false,
     "has_payment_provider_id": true,
-    "batch_notifications_enabled": true
+    "batch_notifications_enabled": true,
+    "low_balance_threshold": 2.0
   },
   {
     "id": "550e8400-e29b-41d4-a716-446655440009",
@@ -150,7 +158,8 @@
     "credit_balance": 45.50,
     "is_admin": false,
     "has_payment_provider_id": false,
-    "batch_notifications_enabled": false
+    "batch_notifications_enabled": false,
+    "low_balance_threshold": null
   },
   {
     "id": "550e8400-e29b-41d4-a716-446655440010",
@@ -167,7 +176,8 @@
     "credit_balance": 5200.00,
     "is_admin": false,
     "has_payment_provider_id": true,
-    "batch_notifications_enabled": true
+    "batch_notifications_enabled": true,
+    "low_balance_threshold": 2.0
   },
   {
     "id": "550e8400-e29b-41d4-a716-446655440011",
@@ -184,7 +194,8 @@
     "credit_balance": 980.00,
     "is_admin": false,
     "has_payment_provider_id": true,
-    "batch_notifications_enabled": false
+    "batch_notifications_enabled": false,
+    "low_balance_threshold": null
   },
   {
     "id": "550e8400-e29b-41d4-a716-446655440012",
@@ -201,7 +212,8 @@
     "credit_balance": 0.00,
     "is_admin": false,
     "has_payment_provider_id": false,
-    "batch_notifications_enabled": false
+    "batch_notifications_enabled": false,
+    "low_balance_threshold": null
   },
   {
     "id": "550e8400-e29b-41d4-a716-446655440013",
@@ -218,7 +230,8 @@
     "credit_balance": 7300.00,
     "is_admin": false,
     "has_payment_provider_id": true,
-    "batch_notifications_enabled": true
+    "batch_notifications_enabled": true,
+    "low_balance_threshold": 2.0
   },
   {
     "id": "550e8400-e29b-41d4-a716-446655440014",
@@ -235,7 +248,8 @@
     "credit_balance": 150.00,
     "is_admin": false,
     "has_payment_provider_id": false,
-    "batch_notifications_enabled": false
+    "batch_notifications_enabled": false,
+    "low_balance_threshold": null
   },
   {
     "id": "550e8400-e29b-41d4-a716-446655440015",
@@ -252,6 +266,7 @@
     "credit_balance": 2100.00,
     "is_admin": false,
     "has_payment_provider_id": true,
-    "batch_notifications_enabled": true
+    "batch_notifications_enabled": true,
+    "low_balance_threshold": 2.0
   }
 ]

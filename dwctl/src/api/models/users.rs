@@ -6,6 +6,7 @@ use crate::db::models::users::UserDBResponse;
 use crate::types::UserId;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_with::rust::double_option;
 use utoipa::{IntoParams, ToSchema};
 
 /// User role determining access permissions and capabilities.
@@ -60,6 +61,11 @@ pub struct UserUpdate {
     pub roles: Option<Vec<Role>>,
     /// Whether to receive email notifications when batches complete (null to keep unchanged)
     pub batch_notifications_enabled: Option<bool>,
+    /// Low balance notification threshold in dollars. Set to a number to enable
+    /// (e.g. 2.0 means notify when balance drops below $2), set to null to disable.
+    /// Omit entirely to leave unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
+    pub low_balance_threshold: Option<Option<f32>>,
 }
 
 /// Full user details returned by the API.
@@ -108,6 +114,8 @@ pub struct UserResponse {
     pub has_payment_provider_id: bool,
     /// Whether the user receives email notifications when batches complete
     pub batch_notifications_enabled: bool,
+    /// Low balance notification threshold in dollars. Null means notifications are disabled.
+    pub low_balance_threshold: Option<f32>,
 }
 
 /// Query parameters for listing users
@@ -175,6 +183,7 @@ impl From<UserDBResponse> for UserResponse {
             credit_balance: None, // By default, credit balances are not included
             has_payment_provider_id: db.payment_provider_id.is_some(),
             batch_notifications_enabled: db.batch_notifications_enabled,
+            low_balance_threshold: db.low_balance_threshold,
         }
     }
 }

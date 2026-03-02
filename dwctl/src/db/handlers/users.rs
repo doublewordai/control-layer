@@ -37,6 +37,15 @@ impl UserFilter {
     }
 }
 
+/// Minimal user info for low-balance notifications.
+#[derive(Debug, Clone)]
+pub struct LowBalanceUser {
+    pub id: UserId,
+    pub email: String,
+    pub username: String,
+    pub display_name: Option<String>,
+}
+
 // Database entity model
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 struct User {
@@ -57,6 +66,8 @@ struct User {
     pub is_internal: bool,
     pub batch_notifications_enabled: bool,
     pub first_batch_email_sent: bool,
+    pub low_balance_notification_sent: bool,
+    pub low_balance_threshold: Option<f32>,
 }
 
 pub struct Users<'c> {
@@ -81,6 +92,8 @@ impl From<(Vec<Role>, User)> for UserDBResponse {
             payment_provider_id: user.payment_provider_id,
             batch_notifications_enabled: user.batch_notifications_enabled,
             first_batch_email_sent: user.first_batch_email_sent,
+            low_balance_notification_sent: user.low_balance_notification_sent,
+            low_balance_threshold: user.low_balance_threshold,
         }
     }
 }
@@ -167,11 +180,13 @@ impl<'c> Repository for Users<'c> {
                 u.is_internal,
                 u.batch_notifications_enabled,
                 u.first_batch_email_sent,
+                u.low_balance_notification_sent,
+                u.low_balance_threshold,
                 ARRAY_AGG(ur.role) FILTER (WHERE ur.role IS NOT NULL) as "roles: Vec<Role>"
             FROM users u
             LEFT JOIN user_roles ur ON ur.user_id = u.id
             WHERE u.id = $1 AND u.id != '00000000-0000-0000-0000-000000000000' AND u.is_deleted = false
-            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id, u.is_deleted, u.is_internal, u.batch_notifications_enabled, u.first_batch_email_sent
+            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id, u.is_deleted, u.is_internal, u.batch_notifications_enabled, u.first_batch_email_sent, u.low_balance_notification_sent, u.low_balance_threshold
             "#,
             id
         )
@@ -197,6 +212,8 @@ impl<'c> Repository for Users<'c> {
                 is_internal: row.is_internal,
                 batch_notifications_enabled: row.batch_notifications_enabled,
                 first_batch_email_sent: row.first_batch_email_sent,
+                low_balance_notification_sent: row.low_balance_notification_sent,
+                low_balance_threshold: row.low_balance_threshold,
             };
 
             let roles = row.roles.unwrap_or_default();
@@ -234,11 +251,13 @@ impl<'c> Repository for Users<'c> {
                 u.is_internal,
                 u.batch_notifications_enabled,
                 u.first_batch_email_sent,
+                u.low_balance_notification_sent,
+                u.low_balance_threshold,
                 ARRAY_AGG(ur.role) FILTER (WHERE ur.role IS NOT NULL) as "roles: Vec<Role>"
             FROM users u
             LEFT JOIN user_roles ur ON ur.user_id = u.id
             WHERE u.id = ANY($1) AND u.id != '00000000-0000-0000-0000-000000000000' AND u.is_deleted = false
-            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id, u.is_deleted, u.is_internal, u.batch_notifications_enabled, u.first_batch_email_sent
+            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id, u.is_deleted, u.is_internal, u.batch_notifications_enabled, u.first_batch_email_sent, u.low_balance_notification_sent, u.low_balance_threshold
             "#,
             ids.as_slice()
         )
@@ -266,6 +285,8 @@ impl<'c> Repository for Users<'c> {
                 is_internal: row.is_internal,
                 batch_notifications_enabled: row.batch_notifications_enabled,
                 first_batch_email_sent: row.first_batch_email_sent,
+                low_balance_notification_sent: row.low_balance_notification_sent,
+                low_balance_threshold: row.low_balance_threshold,
             };
 
             let roles = row.roles.unwrap_or_default();
@@ -366,6 +387,14 @@ impl<'c> Repository for Users<'c> {
                 avatar_url = COALESCE($3, avatar_url),
                 password_hash = COALESCE($4, password_hash),
                 batch_notifications_enabled = COALESCE($5, batch_notifications_enabled),
+                low_balance_threshold = CASE
+                    WHEN $6::boolean THEN $7
+                    ELSE low_balance_threshold
+                END,
+                low_balance_notification_sent = CASE
+                    WHEN $6::boolean THEN false
+                    ELSE low_balance_notification_sent
+                END,
                 updated_at = NOW()
             WHERE id = $1
             RETURNING *
@@ -375,6 +404,8 @@ impl<'c> Repository for Users<'c> {
                 request.avatar_url,
                 request.password_hash,
                 request.batch_notifications_enabled,
+                request.low_balance_threshold.is_some() as bool,
+                request.low_balance_threshold.flatten(),
             )
             .fetch_optional(&mut *tx)
             .await?
@@ -651,6 +682,58 @@ impl<'c> Users<'c> {
         Ok(())
     }
 
+    /// Get users whose balance is below their configured threshold and haven't been notified yet.
+    ///
+    /// Uses the checkpoint+delta CTE to calculate balance efficiently.
+    /// Only includes users with low_balance_threshold set (non-NULL = opted in).
+    /// Clear recovered notification flags and return users needing low-balance notifications.
+    ///
+    /// In a single query:
+    /// 1. Computes balance for all users with a threshold set
+    /// 2. Clears `low_balance_notification_sent` for users whose balance recovered above threshold
+    /// 3. Returns users whose balance is below threshold and haven't been notified yet
+    #[instrument(skip(self), err)]
+    pub async fn poll_low_balance_users(&mut self) -> Result<Vec<LowBalanceUser>> {
+        // Clear recovered users and fetch low-balance users in one round-trip.
+        // Uses the cached checkpoint balance (not the full delta recalculation) — good enough
+        // for notification thresholds and avoids expensive per-tick aggregation.
+        let rows = sqlx::query_as!(
+            LowBalanceUser,
+            r#"
+            WITH clear_recovered AS (
+                UPDATE users u
+                SET low_balance_notification_sent = false
+                FROM user_balance_checkpoints c
+                WHERE u.id = c.user_id
+                  AND u.low_balance_notification_sent = true
+                  AND u.low_balance_threshold IS NOT NULL
+                  AND c.balance >= u.low_balance_threshold
+            )
+            SELECT u.id, u.email, u.username, u.display_name
+            FROM users u
+            JOIN user_balance_checkpoints c ON u.id = c.user_id
+            WHERE u.id != '00000000-0000-0000-0000-000000000000'
+              AND u.is_deleted = false
+              AND u.low_balance_notification_sent = false
+              AND u.low_balance_threshold IS NOT NULL
+              AND c.balance < u.low_balance_threshold
+            "#,
+        )
+        .fetch_all(&mut *self.db)
+        .await?;
+
+        Ok(rows)
+    }
+
+    /// Mark that low-balance notifications have been sent for the given users.
+    #[instrument(skip(self, user_ids), fields(count = user_ids.len()), err)]
+    pub async fn mark_low_balance_notification_sent(&mut self, user_ids: &[UserId]) -> Result<()> {
+        sqlx::query!("UPDATE users SET low_balance_notification_sent = true WHERE id = ANY($1)", user_ids)
+            .execute(&mut *self.db)
+            .await?;
+        Ok(())
+    }
+
     /// Set the payment provider ID for a user if it's not already set
     /// Returns true if the ID was updated, false if the user already had one or user not found
     #[instrument(skip(self), err)]
@@ -762,6 +845,7 @@ mod tests {
             roles: Some(vec![Role::RequestViewer]), // Intentionally omitting StandardUser
             password_hash: None,
             batch_notifications_enabled: None,
+            low_balance_threshold: None,
         };
 
         let updated_user = repo.update(created_user.id, &update_request).await.unwrap();
@@ -779,6 +863,7 @@ mod tests {
             roles: Some(vec![]), // Empty roles
             password_hash: None,
             batch_notifications_enabled: None,
+            low_balance_threshold: None,
         };
 
         let updated_user = repo.update(created_user.id, &update_request).await.unwrap();
