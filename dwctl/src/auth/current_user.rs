@@ -87,12 +87,13 @@ async fn try_jwt_session_auth(
 /// - None: No proxy header present
 /// - Some(Ok(user)): Valid proxy header found and user authenticated
 /// - Some(Err(error)): Proxy header present but user lookup/creation failed
-#[instrument(skip(parts, config, db), level = "TRACE")]
-async fn try_proxy_header_auth(
+#[instrument(skip(parts, state), level = "TRACE")]
+async fn try_proxy_header_auth<P: sqlx_pool_router::PoolProvider + Clone + Send + Sync + 'static>(
     parts: &axum::http::request::Parts,
-    config: &crate::config::Config,
-    db: &PgPool,
+    state: &crate::AppState<P>,
 ) -> Option<Result<CurrentUser>> {
+    let config = &state.config;
+    let db: &PgPool = state.db.write();
     tracing::trace!("Trying proxy header auth, config: {:?}", config.auth.proxy_header);
     // Extract external_user_id from header_name (required)
     let external_user_id = parts
@@ -148,6 +149,7 @@ async fn try_proxy_header_auth(
         Err(e) => return Some(Err(DbError::from(e).into())),
     };
     let mut user_repo = Users::new(&mut tx);
+    let mut should_create_sample_files = false;
 
     // Get or create user with group sync (only if auto_create is enabled)
     let user_result = if config.auth.proxy_header.auto_create_users {
@@ -156,8 +158,9 @@ async fn try_proxy_header_auth(
             .await
         {
             Ok((user, was_created)) => {
-                // Grant initial credits to newly created standard users if configured
+                // Grant initial credits for newly created users
                 if was_created {
+                    should_create_sample_files = true;
                     let initial_credits = config.credits.initial_credits_for_standard_users;
                     if initial_credits > rust_decimal::Decimal::ZERO && user.roles.contains(&Role::StandardUser) {
                         use crate::db::handlers::credits::Credits;
@@ -219,6 +222,22 @@ async fn try_proxy_header_auth(
         Ok(_) => {}
         Err(e) => return Some(Err(DbError::from(e).into())),
     }
+
+    // Create sample files after commit so the user and API keys are persisted
+    if should_create_sample_files
+        && config.sample_files.enabled
+        && config.batches.enabled
+        && let Some(ref user) = user_result
+    {
+        let state_clone = state.clone();
+        let user_id = user.id;
+        tokio::spawn(async move {
+            if let Err(e) = crate::api::handlers::auth::create_sample_files_for_new_user(&state_clone, user_id).await {
+                tracing::warn!(user_id = %user_id, error = %e, "Failed to create sample files for new user");
+            }
+        });
+    }
+
     user_result.map(Ok)
 }
 
@@ -417,7 +436,7 @@ impl<P: sqlx_pool_router::PoolProvider + Clone + Send + Sync> FromRequestParts<c
 
         // Fall back to proxy header authentication
         if state.config.auth.proxy_header.enabled {
-            match try_proxy_header_auth(parts, &state.config, state.db.write()).await {
+            match try_proxy_header_auth(parts, state).await {
                 Some(Ok(user)) => {
                     debug!("Authentication successful via proxy header");
                     trace!("Authenticated user: {}", user.id);

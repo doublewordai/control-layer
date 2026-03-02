@@ -915,8 +915,8 @@ pub async fn list_files<P: PoolProvider>(
 
     // Build filter based on permissions
     let filter = fusillade::FileFilter {
-        // Filter by ownership if user can't read all files
-        uploaded_by: if !can_read_all_files {
+        // Filter by ownership if user can't read all files, or if explicitly requested
+        uploaded_by: if !can_read_all_files || query.own {
             Some(current_user.id.to_string())
         } else {
             None

@@ -101,6 +101,7 @@ export function CreateBatchModal({
     purpose: "batch",
     limit: 20,
     search: debouncedFileSearch.trim() || undefined,
+    own: true,
     enabled: isOpen,
   });
 
