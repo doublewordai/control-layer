@@ -985,6 +985,7 @@ export interface FilesListQuery {
   order?: "asc" | "desc";
   purpose?: string;
   search?: string;
+  own?: boolean;
 }
 
 export interface ModelCostBreakdown {

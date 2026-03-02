@@ -1262,6 +1262,7 @@ const filesApi = {
     if (options?.order) params.set("order", options.order);
     if (options?.purpose) params.set("purpose", options.purpose);
     if (options?.search) params.set("search", options.search);
+    if (options?.own) params.set("own", "true");
 
     const response = await fetchAiApi(
       `/ai/v1/files${params.toString() ? "?" + params.toString() : ""}`,
