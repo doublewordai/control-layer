@@ -192,7 +192,7 @@ pub async fn register<P: PoolProvider>(
 /// This function is called asynchronously after user registration to avoid
 /// blocking the registration response. Failures are logged but don't affect
 /// the user creation.
-async fn create_sample_files_for_new_user<P: PoolProvider>(state: &AppState<P>, user_id: Uuid) -> Result<(), Error> {
+pub async fn create_sample_files_for_new_user<P: PoolProvider>(state: &AppState<P>, user_id: Uuid) -> Result<(), Error> {
     use crate::db::handlers::deployments::DeploymentFilter;
     use crate::sample_files;
 
