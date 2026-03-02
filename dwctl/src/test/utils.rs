@@ -360,6 +360,7 @@ pub async fn get_system_user(pool: &mut PgConnection) -> UserResponse {
         credit_balance: None,
         has_payment_provider_id: false,
         batch_notifications_enabled: false,
+        low_balance_threshold: None,
     }
 }
 
