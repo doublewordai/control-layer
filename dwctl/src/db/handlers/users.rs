@@ -900,7 +900,7 @@ mod tests {
             repo.update(user.id, &update).await.unwrap();
         }
 
-        // Grant credits and refresh checkpoint so poll_low_balance_users can see it
+        // Grant credits and refresh checkpoint
         let amount = Decimal::from_str(balance).unwrap();
         if amount > Decimal::ZERO {
             drop(conn);
@@ -916,196 +916,65 @@ mod tests {
 
     #[sqlx::test]
     #[test_log::test]
-    async fn test_poll_low_balance_skips_users_without_threshold(pool: PgPool) {
-        // User with no threshold set should never appear
+    async fn test_users_with_threshold_skips_users_without_threshold(pool: PgPool) {
         create_user_with_balance(&pool, "1.00", None).await;
 
         let mut conn = pool.acquire().await.unwrap();
         let mut users = Users::new(&mut conn);
-        let low = users.poll_low_balance_users().await.unwrap();
-        assert!(low.is_empty());
+        let result = users.users_with_low_balance_threshold().await.unwrap();
+        assert!(result.is_empty());
     }
 
     #[sqlx::test]
     #[test_log::test]
-    async fn test_poll_low_balance_returns_user_below_threshold(pool: PgPool) {
+    async fn test_users_with_threshold_returns_user_with_checkpoint(pool: PgPool) {
         let user_id = create_user_with_balance(&pool, "1.50", Some(2.0)).await;
 
         let mut conn = pool.acquire().await.unwrap();
         let mut users = Users::new(&mut conn);
-        let low = users.poll_low_balance_users().await.unwrap();
-        assert_eq!(low.len(), 1);
-        assert_eq!(low[0].id, user_id);
+        let result = users.users_with_low_balance_threshold().await.unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].id, user_id);
+        assert_eq!(result[0].low_balance_threshold, Decimal::from_str("2.0").unwrap());
+        assert!(!result[0].low_balance_notification_sent);
+        assert_eq!(result[0].checkpoint_balance, Some(Decimal::from_str("1.50").unwrap()));
     }
 
     #[sqlx::test]
     #[test_log::test]
-    async fn test_poll_low_balance_skips_user_above_threshold(pool: PgPool) {
-        create_user_with_balance(&pool, "10.00", Some(2.0)).await;
+    async fn test_users_with_threshold_returns_user_without_checkpoint(pool: PgPool) {
+        // Create user with threshold but no credits (so no checkpoint)
+        let user_id = create_user_with_balance(&pool, "0", Some(2.0)).await;
 
         let mut conn = pool.acquire().await.unwrap();
         let mut users = Users::new(&mut conn);
-        let low = users.poll_low_balance_users().await.unwrap();
-        assert!(low.is_empty());
+        let result = users.users_with_low_balance_threshold().await.unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].id, user_id);
+        assert!(result[0].checkpoint_balance.is_none());
     }
 
     #[sqlx::test]
     #[test_log::test]
-    async fn test_poll_low_balance_skips_already_notified(pool: PgPool) {
+    async fn test_mark_and_clear_low_balance_notification(pool: PgPool) {
         let user_id = create_user_with_balance(&pool, "1.00", Some(2.0)).await;
 
         let mut conn = pool.acquire().await.unwrap();
         let mut users = Users::new(&mut conn);
 
-        // First poll: user appears
-        let low = users.poll_low_balance_users().await.unwrap();
-        assert_eq!(low.len(), 1);
+        // Initially not notified
+        let result = users.users_with_low_balance_threshold().await.unwrap();
+        assert!(!result[0].low_balance_notification_sent);
 
-        // Mark as notified
+        // Mark notified
         users.mark_low_balance_notification_sent(&[user_id]).await.unwrap();
+        let result = users.users_with_low_balance_threshold().await.unwrap();
+        assert!(result[0].low_balance_notification_sent);
 
-        // Second poll: user should not appear
-        let low = users.poll_low_balance_users().await.unwrap();
-        assert!(low.is_empty());
-    }
-
-    #[sqlx::test]
-    #[test_log::test]
-    async fn test_poll_low_balance_clears_flag_after_topup(pool: PgPool) {
-        let user_id = create_user_with_balance(&pool, "1.00", Some(2.0)).await;
-
-        // Poll and mark notified
-        let mut conn = pool.acquire().await.unwrap();
-        let mut users = Users::new(&mut conn);
-        let low = users.poll_low_balance_users().await.unwrap();
-        assert_eq!(low.len(), 1);
-        users.mark_low_balance_notification_sent(&[user_id]).await.unwrap();
-        drop(conn);
-
-        // Topup: add credits and refresh checkpoint so balance > threshold
-        let mut conn = pool.acquire().await.unwrap();
-        let mut credits = Credits::new(&mut conn);
-        let grant = CreditTransactionCreateDBRequest::admin_grant(user_id, user_id, Decimal::from_str("10.00").unwrap(), None);
-        credits.create_transaction(&grant).await.unwrap();
-        credits.refresh_checkpoint(user_id).await.unwrap();
-        drop(conn);
-
-        // Poll again: the clear_recovered CTE should reset the flag,
-        // and the user should NOT appear (balance is now above threshold)
-        let mut conn = pool.acquire().await.unwrap();
-        let mut users = Users::new(&mut conn);
-        let low = users.poll_low_balance_users().await.unwrap();
-        assert!(low.is_empty());
-
-        // Verify flag was actually cleared
-        let user = users.get_by_id(user_id).await.unwrap().unwrap();
-        assert!(!user.low_balance_notification_sent);
-    }
-
-    #[sqlx::test]
-    #[test_log::test]
-    async fn test_poll_low_balance_full_cycle(pool: PgPool) {
-        // 1. Create user with $100, threshold $2
-        let user_id = create_user_with_balance(&pool, "100.00", Some(2.0)).await;
-
-        let mut conn = pool.acquire().await.unwrap();
-        let mut users = Users::new(&mut conn);
-        let low = users.poll_low_balance_users().await.unwrap();
-        assert!(low.is_empty(), "User above threshold should not appear");
-        drop(conn);
-
-        // 2. Deduct $99 → balance $1 (below threshold)
-        let mut conn = pool.acquire().await.unwrap();
-        let mut credits = Credits::new(&mut conn);
-        let deduct = CreditTransactionCreateDBRequest {
-            user_id,
-            transaction_type: crate::db::models::credits::CreditTransactionType::AdminRemoval,
-            amount: Decimal::from_str("99.00").unwrap(),
-            source_id: Uuid::new_v4().to_string(),
-            description: None,
-            fusillade_batch_id: None,
-        };
-        credits.create_transaction(&deduct).await.unwrap();
-        credits.refresh_checkpoint(user_id).await.unwrap();
-        drop(conn);
-
-        // 3. Poll: user should appear
-        let mut conn = pool.acquire().await.unwrap();
-        let mut users = Users::new(&mut conn);
-        let low = users.poll_low_balance_users().await.unwrap();
-        assert_eq!(low.len(), 1, "User below threshold should appear");
-        assert_eq!(low[0].id, user_id);
-
-        // 4. Mark notified
-        users.mark_low_balance_notification_sent(&[user_id]).await.unwrap();
-        let low = users.poll_low_balance_users().await.unwrap();
-        assert!(low.is_empty(), "Notified user should not appear again");
-        drop(conn);
-
-        // 5. Topup $50 → balance $51 (above threshold)
-        let mut conn = pool.acquire().await.unwrap();
-        let mut credits = Credits::new(&mut conn);
-        let grant = CreditTransactionCreateDBRequest::admin_grant(user_id, user_id, Decimal::from_str("50.00").unwrap(), None);
-        credits.create_transaction(&grant).await.unwrap();
-        credits.refresh_checkpoint(user_id).await.unwrap();
-        drop(conn);
-
-        // 6. Poll: clear_recovered CTE resets the flag, user above threshold → not returned
-        let mut conn = pool.acquire().await.unwrap();
-        let mut users = Users::new(&mut conn);
-        let low = users.poll_low_balance_users().await.unwrap();
-        assert!(low.is_empty(), "Topped-up user should not appear");
-        drop(conn);
-
-        // 7. Deduct $50 → balance $1 again (below threshold)
-        let mut conn = pool.acquire().await.unwrap();
-        let mut credits = Credits::new(&mut conn);
-        let deduct2 = CreditTransactionCreateDBRequest {
-            user_id,
-            transaction_type: crate::db::models::credits::CreditTransactionType::AdminRemoval,
-            amount: Decimal::from_str("50.00").unwrap(),
-            source_id: Uuid::new_v4().to_string(),
-            description: None,
-            fusillade_batch_id: None,
-        };
-        credits.create_transaction(&deduct2).await.unwrap();
-        credits.refresh_checkpoint(user_id).await.unwrap();
-        drop(conn);
-
-        // 8. Poll: user should appear again (flag was cleared by step 6)
-        let mut conn = pool.acquire().await.unwrap();
-        let mut users = Users::new(&mut conn);
-        let low = users.poll_low_balance_users().await.unwrap();
-        assert_eq!(low.len(), 1, "User should be notifiable again after recovery + re-drop");
-        assert_eq!(low[0].id, user_id);
-    }
-
-    #[sqlx::test]
-    #[test_log::test]
-    async fn test_poll_low_balance_negative_balance(pool: PgPool) {
-        // User with negative balance should still be returned
-        let user_id = create_user_with_balance(&pool, "5.00", Some(2.0)).await;
-
-        // Deduct more than the balance
-        let mut conn = pool.acquire().await.unwrap();
-        let mut credits = Credits::new(&mut conn);
-        let deduct = CreditTransactionCreateDBRequest {
-            user_id,
-            transaction_type: crate::db::models::credits::CreditTransactionType::AdminRemoval,
-            amount: Decimal::from_str("10.00").unwrap(),
-            source_id: Uuid::new_v4().to_string(),
-            description: None,
-            fusillade_batch_id: None,
-        };
-        credits.create_transaction(&deduct).await.unwrap();
-        credits.refresh_checkpoint(user_id).await.unwrap();
-        drop(conn);
-
-        let mut conn = pool.acquire().await.unwrap();
-        let mut users = Users::new(&mut conn);
-        let low = users.poll_low_balance_users().await.unwrap();
-        assert_eq!(low.len(), 1);
-        assert_eq!(low[0].id, user_id);
+        // Clear
+        users.clear_low_balance_notification_sent(&[user_id]).await.unwrap();
+        let result = users.users_with_low_balance_threshold().await.unwrap();
+        assert!(!result[0].low_balance_notification_sent);
     }
 
     #[sqlx::test]
@@ -1116,9 +985,7 @@ mod tests {
         let mut conn = pool.acquire().await.unwrap();
         let mut users = Users::new(&mut conn);
 
-        // Trigger notification
-        let low = users.poll_low_balance_users().await.unwrap();
-        assert_eq!(low.len(), 1);
+        // Mark notified
         users.mark_low_balance_notification_sent(&[user_id]).await.unwrap();
 
         // Update threshold — should reset the flag so user can be re-notified at new level
@@ -1134,8 +1001,8 @@ mod tests {
         assert!(!updated.low_balance_notification_sent);
         assert_eq!(updated.low_balance_threshold, Some(5.0));
 
-        // Poll again: user should appear at new threshold
-        let low = users.poll_low_balance_users().await.unwrap();
-        assert_eq!(low.len(), 1);
+        let result = users.users_with_low_balance_threshold().await.unwrap();
+        assert_eq!(result[0].low_balance_threshold, Decimal::from_str("5.0").unwrap());
+        assert!(!result[0].low_balance_notification_sent);
     }
 }
