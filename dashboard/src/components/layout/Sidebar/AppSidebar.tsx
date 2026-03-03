@@ -59,6 +59,7 @@ interface NavItem {
   label: string;
   featureFlag?: keyof FeatureFlags;
   demoOnly?: boolean;
+  hidden?: boolean;
 }
 
 export function AppSidebar() {
@@ -67,10 +68,17 @@ export function AppSidebar() {
   const { canAccessRoute } = useAuthorization();
   const { logout } = useAuth();
   const { isFeatureEnabled } = useSettings();
+  const { data: config } = useConfig();
   const [isSupportModalOpen, setIsSupportModalOpen] = useState(false);
 
   const allNavItems: NavItem[] = [
-    { path: "/batches", icon: Box, label: "Batches", demoOnly: false },
+    {
+      path: "/batches",
+      icon: Box,
+      label: "Batches",
+      demoOnly: false,
+      hidden: config !== undefined && !config.batches,
+    },
     { path: "/models", icon: Layers, label: "Models" },
     { path: "/endpoints", icon: Server, label: "Endpoints" },
     { path: "/playground", icon: Play, label: "Playground" },
@@ -82,6 +90,10 @@ export function AppSidebar() {
   ];
 
   const navItems = allNavItems.filter((item) => {
+    // Hide items explicitly marked as hidden (e.g. batches when disabled server-side)
+    if (item.hidden) {
+      return false;
+    }
     // Check feature flag if specified
     if (item.featureFlag && !isFeatureEnabled(item.featureFlag)) {
       return false;
