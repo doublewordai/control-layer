@@ -291,7 +291,7 @@ impl<'c> Repository for Deployments<'c> {
             request.trusted,
             Some(request.open_responses_adapter),
             request.allowed_batch_completion_windows.as_ref().map(|w| w.as_slice()),
-            request.metadata.as_ref().map(|m| serde_json::to_value(m).unwrap_or_default()).unwrap_or_default() as serde_json::Value
+            request.metadata.as_ref().map(|m| serde_json::to_value(m).unwrap_or_else(|_| serde_json::json!({}))).unwrap_or_else(|| serde_json::json!({})) as serde_json::Value
         )
         .fetch_one(&mut *self.db)
         .await?;
@@ -573,8 +573,8 @@ impl<'c> Repository for Deployments<'c> {
             request
                 .metadata
                 .as_ref()
-                .map(|m| serde_json::to_value(m).unwrap_or_default())
-                .unwrap_or_default() as serde_json::Value, // $47
+                .map(|m| serde_json::to_value(m).unwrap_or_else(|_| serde_json::json!({})))
+                .unwrap_or_else(|| serde_json::json!({})) as serde_json::Value, // $47
         )
         .fetch_one(&mut *self.db)
         .await?;

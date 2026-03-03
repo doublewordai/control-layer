@@ -478,7 +478,10 @@ impl From<DeploymentDBResponse> for DeployedModelResponse {
             open_responses_adapter: Some(db.open_responses_adapter),
             traffic_routing_rules: None, // Populated via enrichment (with_traffic_rules)
             allowed_batch_completion_windows: db.allowed_batch_completion_windows,
-            metadata: serde_json::from_value(db.metadata).ok(),
+            metadata: serde_json::from_value::<ModelCatalogMetadata>(db.metadata)
+                .inspect_err(|e| tracing::warn!(error = %e, "failed to deserialize model metadata"))
+                .ok()
+                .filter(|m| *m != ModelCatalogMetadata::default()),
         }
     }
 }

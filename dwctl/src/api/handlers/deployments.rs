@@ -45,16 +45,16 @@ fn validate_metadata(metadata: &ModelCatalogMetadata) -> Result<()> {
             ),
         });
     }
-    if let Some(serde_json::Value::Object(map)) = &metadata.extra {
-        if map.len() > MODEL_CATALOG_METADATA_MAX_EXTRA_KEYS {
-            return Err(Error::BadRequest {
-                message: format!(
-                    "metadata.extra has too many keys ({}, limit is {})",
-                    map.len(),
-                    MODEL_CATALOG_METADATA_MAX_EXTRA_KEYS
-                ),
-            });
-        }
+    if let Some(serde_json::Value::Object(map)) = &metadata.extra
+        && map.len() > MODEL_CATALOG_METADATA_MAX_EXTRA_KEYS
+    {
+        return Err(Error::BadRequest {
+            message: format!(
+                "metadata.extra has too many keys ({}, limit is {})",
+                map.len(),
+                MODEL_CATALOG_METADATA_MAX_EXTRA_KEYS
+            ),
+        });
     }
     Ok(())
 }
