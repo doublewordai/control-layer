@@ -77,7 +77,7 @@ export function AppSidebar() {
       icon: Box,
       label: "Batches",
       demoOnly: false,
-      hidden: config !== undefined && !config.batches,
+      hidden: config !== undefined && !config.batches?.enabled,
     },
     { path: "/models", icon: Layers, label: "Models" },
     { path: "/endpoints", icon: Server, label: "Endpoints" },
