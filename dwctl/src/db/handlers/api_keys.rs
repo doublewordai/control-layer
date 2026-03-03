@@ -768,6 +768,7 @@ mod tests {
                 skip: 0,
                 limit: 100,
                 user_id: Some(user.id),
+                created_by: None,
             })
             .await
             .unwrap();
@@ -2065,6 +2066,7 @@ mod tests {
                 skip: 0,
                 limit: 2,
                 user_id: Some(user.id),
+                created_by: None,
             })
             .await
             .unwrap();
@@ -2076,6 +2078,7 @@ mod tests {
                 skip: 2,
                 limit: 2,
                 user_id: Some(user.id),
+                created_by: None,
             })
             .await
             .unwrap();
@@ -2087,6 +2090,7 @@ mod tests {
                 skip: 4,
                 limit: 2,
                 user_id: Some(user.id),
+                created_by: None,
             })
             .await
             .unwrap();
@@ -2098,6 +2102,7 @@ mod tests {
                 skip: 10,
                 limit: 2,
                 user_id: Some(user.id),
+                created_by: None,
             })
             .await
             .unwrap();
@@ -2116,6 +2121,7 @@ mod tests {
                 skip: 0,
                 limit: 10,
                 user_id: Some(user.id),
+                created_by: None,
             })
             .await
             .unwrap();
@@ -2203,6 +2209,7 @@ mod tests {
                 skip: 0,
                 limit: 10,
                 user_id: Some(user1.id),
+                created_by: None,
             })
             .await
             .unwrap();
@@ -2215,6 +2222,7 @@ mod tests {
                 skip: 0,
                 limit: 10,
                 user_id: None,
+                created_by: None,
             })
             .await
             .unwrap();
@@ -3836,6 +3844,7 @@ mod tests {
 
         let filter = ApiKeyFilter {
             user_id: Some(user.id),
+            created_by: None,
             skip: 0,
             limit: 100,
         };

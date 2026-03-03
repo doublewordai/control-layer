@@ -993,7 +993,6 @@ mod tests {
                 prompt_tokens_details: None,
                 completion_tokens_details: None,
             }),
-            system_fingerprint: None,
             service_tier: None,
         };
 
@@ -1058,7 +1057,6 @@ mod tests {
                 prompt_tokens_details: None,
                 completion_tokens_details: None,
             }),
-            system_fingerprint: None,
             service_tier: None,
         };
 
@@ -1164,7 +1162,6 @@ mod tests {
                 prompt_tokens_details: None,
                 completion_tokens_details: None,
             }),
-            system_fingerprint: None,
         };
 
         let parsed_response = AiResponse::Completions(completions_response);
