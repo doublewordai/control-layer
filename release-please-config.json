@@ -2,11 +2,11 @@
   "packages": {
     "dwctl": {
       "release-type": "rust",
-      "changelog-path": "../CHANGELOG.md",
+      "changelog-path": "/CHANGELOG.md",
       "extra-files": [
         {
           "type": "json",
-          "path": "../dashboard/package.json",
+          "path": "/dashboard/package.json",
           "jsonpath": "$.version"
         }
       ]
