@@ -46,6 +46,8 @@ pub struct LowBalanceUser {
     pub display_name: Option<String>,
     pub low_balance_threshold: rust_decimal::Decimal,
     pub low_balance_notification_sent: bool,
+    /// Cached checkpoint balance, if one exists.
+    pub checkpoint_balance: Option<rust_decimal::Decimal>,
 }
 
 // Database entity model
@@ -692,8 +694,10 @@ impl<'c> Users<'c> {
             r#"
             SELECT u.id, u.email, u.username, u.display_name,
                    u.low_balance_threshold as "low_balance_threshold!: rust_decimal::Decimal",
-                   u.low_balance_notification_sent
+                   u.low_balance_notification_sent,
+                   c.balance as "checkpoint_balance?"
             FROM users u
+            LEFT JOIN user_balance_checkpoints c ON c.user_id = u.id
             WHERE u.id != '00000000-0000-0000-0000-000000000000'
               AND u.is_deleted = false
               AND u.low_balance_threshold IS NOT NULL
