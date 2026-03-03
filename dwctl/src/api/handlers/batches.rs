@@ -205,7 +205,7 @@ pub async fn create_batch<P: PoolProvider>(
 
     // Reject batches from users with negative credit balance
     {
-        let mut conn = state.db.read().acquire().await.map_err(|e| Error::Internal {
+        let mut conn = state.db.write().acquire().await.map_err(|e| Error::Internal {
             operation: format!("get db connection for credit check: {}", e),
         })?;
         let balance = Credits::new(&mut conn)
