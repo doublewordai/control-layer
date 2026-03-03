@@ -21,9 +21,9 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::config::NotificationsConfig;
-use crate::db::handlers::Webhooks;
 use crate::db::handlers::repository::Repository;
 use crate::db::handlers::users::{LowBalanceUser, Users};
+use crate::db::handlers::{Credits, Webhooks};
 use crate::db::models::webhooks::WebhookDeliveryCreateDBRequest;
 use crate::email::EmailService;
 use crate::webhooks::WebhookDispatcher;
@@ -195,19 +195,57 @@ pub async fn run_notification_poller(
             }
         }
 
-        // === Step 4: Clear recovered flags + find low-balance users, then send emails ===
+        // === Step 4: Low-balance notifications ===
         if let Some(ref email_service) = email_service {
-            let low_balance_users = {
+            // 1. Get users with thresholds
+            let candidates = {
                 let mut users = Users::new(&mut conn);
-                users.poll_low_balance_users().await.unwrap_or_else(|e| {
-                    tracing::warn!(error = %e, "Failed to poll low-balance users");
+                users.users_with_low_balance_threshold().await.unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "Failed to fetch low-balance threshold users");
                     vec![]
                 })
             };
 
-            if !low_balance_users.is_empty() {
-                tracing::info!(count = low_balance_users.len(), "Found users with low balance");
-                send_low_balance_notifications(email_service, &low_balance_users, &mut conn).await;
+            if !candidates.is_empty() {
+                // 2. Compute real balances and refresh checkpoints (Some(1) = always)
+                let user_ids: Vec<Uuid> = candidates.iter().map(|u| u.id).collect();
+                let balances = {
+                    let mut credits = Credits::new(&mut conn);
+                    credits.get_users_balances_bulk(&user_ids, Some(1)).await.unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, "Failed to compute balances for low-balance users");
+                        Default::default()
+                    })
+                };
+
+                // 3. Send notifications for users below threshold who haven't been notified
+                let to_notify: Vec<_> = candidates
+                    .iter()
+                    .filter(|u| {
+                        !u.low_balance_notification_sent && balances.get(&u.id).map(|b| *b < u.low_balance_threshold).unwrap_or(false)
+                    })
+                    .collect();
+
+                if !to_notify.is_empty() {
+                    tracing::info!(count = to_notify.len(), "Found users with low balance");
+                    send_low_balance_notifications(email_service, &to_notify, &balances, &mut conn).await;
+                }
+
+                // 4. Clear recovered flags (after emails sent so we don't lose state on failure)
+                let recovered: Vec<Uuid> = candidates
+                    .iter()
+                    .filter(|u| {
+                        u.low_balance_notification_sent && balances.get(&u.id).map(|b| *b >= u.low_balance_threshold).unwrap_or(false)
+                    })
+                    .map(|u| u.id)
+                    .collect();
+
+                if !recovered.is_empty() {
+                    let mut users = Users::new(&mut conn);
+                    let _ = users
+                        .clear_low_balance_notification_sent(&recovered)
+                        .await
+                        .inspect_err(|e| tracing::warn!(error = %e, "Failed to clear recovered low-balance flags"));
+                }
             }
         }
 
@@ -347,15 +385,17 @@ async fn send_email_notifications(
 /// Send low-balance notification emails to the given users.
 async fn send_low_balance_notifications(
     email_service: &EmailService,
-    users: &[LowBalanceUser],
+    users: &[&LowBalanceUser],
+    balances: &std::collections::HashMap<Uuid, rust_decimal::Decimal>,
     conn: &mut sqlx::pool::PoolConnection<sqlx::Postgres>,
 ) {
     let mut sent_ids = Vec::new();
 
     for user in users {
+        let Some(balance) = balances.get(&user.id) else { continue };
         let name = user.display_name.as_deref().unwrap_or(&user.username);
 
-        if let Err(e) = email_service.send_low_balance_email(&user.email, Some(name), &user.balance).await {
+        if let Err(e) = email_service.send_low_balance_email(&user.email, Some(name), balance).await {
             tracing::warn!(
                 user_id = %user.id,
                 email = %user.email,
@@ -365,7 +405,7 @@ async fn send_low_balance_notifications(
             continue;
         }
 
-        tracing::info!(user_id = %user.id, email = %user.email, balance = %user.balance, "Sent low-balance notification");
+        tracing::info!(user_id = %user.id, email = %user.email, balance = %balance, "Sent low-balance notification");
         sent_ids.push(user.id);
     }
 

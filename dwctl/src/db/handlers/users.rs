@@ -37,14 +37,15 @@ impl UserFilter {
     }
 }
 
-/// Minimal user info for low-balance notifications.
+/// User with a low-balance threshold configured.
 #[derive(Debug, Clone)]
 pub struct LowBalanceUser {
     pub id: UserId,
     pub email: String,
     pub username: String,
     pub display_name: Option<String>,
-    pub balance: rust_decimal::Decimal,
+    pub low_balance_threshold: rust_decimal::Decimal,
+    pub low_balance_notification_sent: bool,
 }
 
 // Database entity model
@@ -683,41 +684,19 @@ impl<'c> Users<'c> {
         Ok(())
     }
 
-    /// Get users whose balance is below their configured threshold and haven't been notified yet.
-    ///
-    /// Uses the checkpoint+delta CTE to calculate balance efficiently.
-    /// Only includes users with low_balance_threshold set (non-NULL = opted in).
-    /// Clear recovered notification flags and return users needing low-balance notifications.
-    ///
-    /// In a single query:
-    /// 1. Computes balance for all users with a threshold set
-    /// 2. Clears `low_balance_notification_sent` for users whose balance recovered above threshold
-    /// 3. Returns users whose balance is below threshold and haven't been notified yet
+    /// Return all users who have a low-balance threshold configured.
     #[instrument(skip(self), err)]
-    pub async fn poll_low_balance_users(&mut self) -> Result<Vec<LowBalanceUser>> {
-        // Clear recovered users and fetch low-balance users in one round-trip.
-        // Uses the cached checkpoint balance (not the full delta recalculation) — good enough
-        // for notification thresholds and avoids expensive per-tick aggregation.
+    pub async fn users_with_low_balance_threshold(&mut self) -> Result<Vec<LowBalanceUser>> {
         let rows = sqlx::query_as!(
             LowBalanceUser,
             r#"
-            WITH clear_recovered AS (
-                UPDATE users u
-                SET low_balance_notification_sent = false
-                FROM user_balance_checkpoints c
-                WHERE u.id = c.user_id
-                  AND u.low_balance_notification_sent = true
-                  AND u.low_balance_threshold IS NOT NULL
-                  AND c.balance >= u.low_balance_threshold
-            )
-            SELECT u.id, u.email, u.username, u.display_name, c.balance
+            SELECT u.id, u.email, u.username, u.display_name,
+                   u.low_balance_threshold as "low_balance_threshold!: rust_decimal::Decimal",
+                   u.low_balance_notification_sent
             FROM users u
-            JOIN user_balance_checkpoints c ON u.id = c.user_id
             WHERE u.id != '00000000-0000-0000-0000-000000000000'
               AND u.is_deleted = false
-              AND u.low_balance_notification_sent = false
               AND u.low_balance_threshold IS NOT NULL
-              AND c.balance < u.low_balance_threshold
             "#,
         )
         .fetch_all(&mut *self.db)
@@ -732,6 +711,18 @@ impl<'c> Users<'c> {
         sqlx::query!("UPDATE users SET low_balance_notification_sent = true WHERE id = ANY($1)", user_ids)
             .execute(&mut *self.db)
             .await?;
+        Ok(())
+    }
+
+    /// Clear the low-balance notification flag for users who have recovered.
+    #[instrument(skip(self, user_ids), fields(count = user_ids.len()), err)]
+    pub async fn clear_low_balance_notification_sent(&mut self, user_ids: &[UserId]) -> Result<()> {
+        sqlx::query!(
+            "UPDATE users SET low_balance_notification_sent = false WHERE id = ANY($1)",
+            user_ids
+        )
+        .execute(&mut *self.db)
+        .await?;
         Ok(())
     }
 
