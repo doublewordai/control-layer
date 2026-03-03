@@ -162,7 +162,7 @@ pub struct CurrentUser {
     pub payment_provider_id: Option<String>,
     /// Organizations the user belongs to
     pub organizations: Vec<UserOrganizationContext>,
-    /// Active organization ID (from cookie)
+    /// Active organization ID (from X-Organization-Id header)
     #[schema(value_type = Option<String>, format = "uuid")]
     pub active_organization: Option<UserId>,
 }

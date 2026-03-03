@@ -21,7 +21,7 @@ use sqlx_pool_router::PoolProvider;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
-    response::{IntoResponse, Json, Response},
+    response::Json,
 };
 
 const VALID_ROLES: [&str; 3] = ["owner", "admin", "member"];
@@ -31,6 +31,29 @@ fn validate_role(role: &str) -> Result<()> {
         return Err(Error::BadRequest {
             message: format!("Invalid role '{}'. Must be one of: owner, admin, member", role),
         });
+    }
+    Ok(())
+}
+
+/// Check that the caller has sufficient privilege to assign the given role.
+/// Only owners (or platform managers) can assign the `owner` role.
+async fn check_role_assignment_privilege(
+    current_user: &CurrentUser,
+    org_id: UserId,
+    target_role: &str,
+    is_platform_manager: bool,
+    pool_conn: &mut sqlx::pool::PoolConnection<sqlx::Postgres>,
+) -> Result<()> {
+    if target_role == "owner" && !is_platform_manager {
+        let mut repo = Organizations::new(pool_conn);
+        let caller_role = repo.get_user_org_role(current_user.id, org_id).await?;
+        if caller_role.as_deref() != Some("owner") {
+            return Err(Error::InsufficientPermissions {
+                required: Permission::Allow(Resource::Organizations, Operation::UpdateOwn),
+                action: Operation::UpdateOwn,
+                resource: "Only owners can assign the owner role".to_string(),
+            });
+        }
     }
     Ok(())
 }
@@ -458,6 +481,9 @@ pub async fn add_member<P: PoolProvider>(
     let role = data.role.as_deref().unwrap_or("member");
     validate_role(role)?;
 
+    // Only owners (or platform managers) can assign the owner role
+    check_role_assignment_privilege(&current_user, id, role, can_all, &mut pool_conn).await?;
+
     let mut repo = Organizations::new(&mut pool_conn);
     let membership = repo.add_member(id, data.user_id, role).await?;
 
@@ -526,7 +552,24 @@ pub async fn update_member_role<P: PoolProvider>(
 
     validate_role(&data.role)?;
 
+    // Only owners (or platform managers) can assign the owner role
+    check_role_assignment_privilege(&current_user, id, &data.role, can_all, &mut pool_conn).await?;
+
+    // Prevent demoting the last owner
     let mut repo = Organizations::new(&mut pool_conn);
+    if data.role != "owner" {
+        let current_role = repo.get_user_org_role(user_id, id).await?;
+        if current_role.as_deref() == Some("owner") {
+            let members = repo.list_members(id).await?;
+            let owner_count = members.iter().filter(|m| m.role == "owner").count();
+            if owner_count <= 1 {
+                return Err(Error::BadRequest {
+                    message: "Cannot demote the last owner. Assign another owner first.".to_string(),
+                });
+            }
+        }
+    }
+
     let membership = repo.update_member_role(id, user_id, &data.role).await?;
 
     // Fetch user details for response
@@ -588,6 +631,21 @@ pub async fn remove_member<P: PoolProvider>(
     }
 
     let mut repo = Organizations::new(&mut pool_conn);
+
+    // Check if we're removing the last owner
+    let target_role = repo.get_user_org_role(user_id, id).await?;
+    if let Some(ref role) = target_role {
+        if role == "owner" {
+            let members = repo.list_members(id).await?;
+            let owner_count = members.iter().filter(|m| m.role == "owner").count();
+            if owner_count <= 1 {
+                return Err(Error::BadRequest {
+                    message: "Cannot remove the last owner of an organization. Transfer ownership first.".to_string(),
+                });
+            }
+        }
+    }
+
     let removed = repo.remove_member(id, user_id).await?;
     if !removed {
         return Err(Error::NotFound {
@@ -666,15 +724,20 @@ pub async fn list_user_organizations<P: PoolProvider>(
     Ok(Json(summaries))
 }
 
-/// Set or clear the active organization context via HttpOnly cookie
+/// Validate and confirm an active organization context.
+///
+/// The client sends `X-Organization-Id` header on subsequent requests.
+/// This endpoint validates membership and returns the confirmed org ID.
+/// The dashboard stores the org ID in localStorage and includes it as a header.
+/// CLI tools pass it as a flag or environment variable.
 #[utoipa::path(
     post,
     path = "/session/organization",
     tag = "organizations",
     summary = "Set active organization",
-    description = "Set or clear the active organization context. Sets an HttpOnly cookie.",
+    description = "Validate organization membership. The client should store the returned organization_id and send it as the X-Organization-Id header on subsequent requests.",
     responses(
-        (status = 200, description = "Organization context updated", body = SetActiveOrganizationResponse),
+        (status = 200, description = "Organization context validated", body = SetActiveOrganizationResponse),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden"),
     ),
@@ -689,37 +752,343 @@ pub async fn set_active_organization<P: PoolProvider>(
     State(state): State<AppState<P>>,
     current_user: CurrentUser,
     Json(data): Json<SetActiveOrganizationRequest>,
-) -> Result<Response> {
+) -> Result<Json<SetActiveOrganizationResponse>> {
     // If organization_id is provided, verify membership
     if let Some(org_id) = data.organization_id {
         let mut pool_conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
-        let can_org = can_manage_org_resource(&current_user, org_id, &mut pool_conn).await?;
-        if !can_org {
-            // Also allow regular members (not just owner/admin)
-            let mut repo = Organizations::new(&mut pool_conn);
-            let role = repo.get_user_org_role(current_user.id, org_id).await?;
-            if role.is_none() {
-                return Err(Error::InsufficientPermissions {
-                    required: Permission::Allow(Resource::Organizations, Operation::ReadOwn),
-                    action: Operation::ReadOwn,
-                    resource: format!("Organization {org_id}"),
-                });
-            }
+        let mut repo = Organizations::new(&mut pool_conn);
+        let role = repo.get_user_org_role(current_user.id, org_id).await?;
+        if role.is_none() {
+            return Err(Error::InsufficientPermissions {
+                required: Permission::Allow(Resource::Organizations, Operation::ReadOwn),
+                action: Operation::ReadOwn,
+                resource: format!("Organization {org_id}"),
+            });
         }
     }
 
-    let cookie = match data.organization_id {
-        Some(org_id) => format!(
-            "dw-organization-id={}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}",
-            org_id,
-            30 * 24 * 3600 // 30 days
-        ),
-        None => "dw-organization-id=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0".to_string(),
-    };
-
-    let body = SetActiveOrganizationResponse {
+    Ok(Json(SetActiveOrganizationResponse {
         active_organization_id: data.organization_id,
-    };
+    }))
+}
 
-    Ok(([(axum::http::header::SET_COOKIE, cookie)], Json(body)).into_response())
+#[cfg(test)]
+mod tests {
+    use crate::api::models::users::Role;
+    use crate::test::utils::{
+        add_auth_headers, create_test_admin_user, create_test_app, create_test_user,
+    };
+    use serde_json::json;
+    use sqlx::PgPool;
+
+    // ── Last-owner guard ─────────────────────────────────────────────────
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_cannot_remove_last_owner(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let admin_headers = add_auth_headers(&admin);
+
+        let owner = create_test_user(&pool, Role::StandardUser).await;
+        let owner_headers = add_auth_headers(&owner);
+
+        // Owner creates an org
+        let resp = server
+            .post("/admin/api/v1/organizations")
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .json(&json!({ "name": "test-org-last-owner", "email": "org@example.com" }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::CREATED);
+        let org_id = resp.json::<serde_json::Value>()["id"].as_str().unwrap().to_string();
+
+        // Try to remove the only owner (via platform admin) — should fail
+        let resp = server
+            .delete(&format!("/admin/api/v1/organizations/{org_id}/members/{}", owner.id))
+            .add_header(&admin_headers[0].0, &admin_headers[0].1)
+            .add_header(&admin_headers[1].0, &admin_headers[1].1)
+            .await;
+        resp.assert_status(axum::http::StatusCode::BAD_REQUEST);
+        let body = resp.json::<serde_json::Value>();
+        assert!(body["message"].as_str().unwrap().contains("last owner"));
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_can_remove_owner_when_another_exists(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let admin_headers = add_auth_headers(&admin);
+
+        let owner1 = create_test_user(&pool, Role::StandardUser).await;
+        let owner1_headers = add_auth_headers(&owner1);
+        let owner2 = create_test_user(&pool, Role::StandardUser).await;
+
+        // Owner1 creates an org
+        let resp = server
+            .post("/admin/api/v1/organizations")
+            .add_header(&owner1_headers[0].0, &owner1_headers[0].1)
+            .add_header(&owner1_headers[1].0, &owner1_headers[1].1)
+            .json(&json!({ "name": "test-org-two-owners", "email": "org@example.com" }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::CREATED);
+        let org_id = resp.json::<serde_json::Value>()["id"].as_str().unwrap().to_string();
+
+        // Admin adds owner2 as owner
+        let resp = server
+            .post(&format!("/admin/api/v1/organizations/{org_id}/members"))
+            .add_header(&admin_headers[0].0, &admin_headers[0].1)
+            .add_header(&admin_headers[1].0, &admin_headers[1].1)
+            .json(&json!({ "user_id": owner2.id, "role": "owner" }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::CREATED);
+
+        // Now removing owner1 should succeed (owner2 still exists)
+        let resp = server
+            .delete(&format!("/admin/api/v1/organizations/{org_id}/members/{}", owner1.id))
+            .add_header(&admin_headers[0].0, &admin_headers[0].1)
+            .add_header(&admin_headers[1].0, &admin_headers[1].1)
+            .await;
+        resp.assert_status(axum::http::StatusCode::NO_CONTENT);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_cannot_demote_last_owner(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let admin_headers = add_auth_headers(&admin);
+
+        let owner = create_test_user(&pool, Role::StandardUser).await;
+        let owner_headers = add_auth_headers(&owner);
+
+        // Owner creates an org
+        let resp = server
+            .post("/admin/api/v1/organizations")
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .json(&json!({ "name": "test-org-demote", "email": "org@example.com" }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::CREATED);
+        let org_id = resp.json::<serde_json::Value>()["id"].as_str().unwrap().to_string();
+
+        // Try to demote the only owner to member — should fail
+        let resp = server
+            .patch(&format!("/admin/api/v1/organizations/{org_id}/members/{}", owner.id))
+            .add_header(&admin_headers[0].0, &admin_headers[0].1)
+            .add_header(&admin_headers[1].0, &admin_headers[1].1)
+            .json(&json!({ "role": "member" }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::BAD_REQUEST);
+        let body = resp.json::<serde_json::Value>();
+        assert!(body["message"].as_str().unwrap().contains("last owner"));
+    }
+
+    // ── Privilege escalation prevention ──────────────────────────────────
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_admin_cannot_assign_owner_role(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+
+        let owner = create_test_user(&pool, Role::StandardUser).await;
+        let owner_headers = add_auth_headers(&owner);
+        let org_admin = create_test_user(&pool, Role::StandardUser).await;
+        let org_admin_headers = add_auth_headers(&org_admin);
+        let member = create_test_user(&pool, Role::StandardUser).await;
+
+        // Owner creates an org
+        let resp = server
+            .post("/admin/api/v1/organizations")
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .json(&json!({ "name": "test-org-priv-esc", "email": "org@example.com" }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::CREATED);
+        let org_id = resp.json::<serde_json::Value>()["id"].as_str().unwrap().to_string();
+
+        // Owner adds org_admin as admin
+        let resp = server
+            .post(&format!("/admin/api/v1/organizations/{org_id}/members"))
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .json(&json!({ "user_id": org_admin.id, "role": "admin" }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::CREATED);
+
+        // Owner adds member
+        let resp = server
+            .post(&format!("/admin/api/v1/organizations/{org_id}/members"))
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .json(&json!({ "user_id": member.id, "role": "member" }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::CREATED);
+
+        // Org admin tries to promote member to owner — should fail
+        let resp = server
+            .patch(&format!("/admin/api/v1/organizations/{org_id}/members/{}", member.id))
+            .add_header(&org_admin_headers[0].0, &org_admin_headers[0].1)
+            .add_header(&org_admin_headers[1].0, &org_admin_headers[1].1)
+            .json(&json!({ "role": "owner" }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::FORBIDDEN);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_admin_cannot_add_member_as_owner(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+
+        let owner = create_test_user(&pool, Role::StandardUser).await;
+        let owner_headers = add_auth_headers(&owner);
+        let org_admin = create_test_user(&pool, Role::StandardUser).await;
+        let org_admin_headers = add_auth_headers(&org_admin);
+        let new_user = create_test_user(&pool, Role::StandardUser).await;
+
+        // Owner creates an org
+        let resp = server
+            .post("/admin/api/v1/organizations")
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .json(&json!({ "name": "test-org-add-owner", "email": "org@example.com" }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::CREATED);
+        let org_id = resp.json::<serde_json::Value>()["id"].as_str().unwrap().to_string();
+
+        // Owner adds org_admin as admin
+        let resp = server
+            .post(&format!("/admin/api/v1/organizations/{org_id}/members"))
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .json(&json!({ "user_id": org_admin.id, "role": "admin" }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::CREATED);
+
+        // Org admin tries to add new_user as owner — should fail
+        let resp = server
+            .post(&format!("/admin/api/v1/organizations/{org_id}/members"))
+            .add_header(&org_admin_headers[0].0, &org_admin_headers[0].1)
+            .add_header(&org_admin_headers[1].0, &org_admin_headers[1].1)
+            .json(&json!({ "user_id": new_user.id, "role": "owner" }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::FORBIDDEN);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_owner_can_assign_owner_role(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+
+        let owner = create_test_user(&pool, Role::StandardUser).await;
+        let owner_headers = add_auth_headers(&owner);
+        let new_user = create_test_user(&pool, Role::StandardUser).await;
+
+        // Owner creates an org
+        let resp = server
+            .post("/admin/api/v1/organizations")
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .json(&json!({ "name": "test-org-owner-assign", "email": "org@example.com" }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::CREATED);
+        let org_id = resp.json::<serde_json::Value>()["id"].as_str().unwrap().to_string();
+
+        // Owner adds new_user as owner — should succeed
+        let resp = server
+            .post(&format!("/admin/api/v1/organizations/{org_id}/members"))
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .json(&json!({ "user_id": new_user.id, "role": "owner" }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::CREATED);
+        let body = resp.json::<serde_json::Value>();
+        assert_eq!(body["role"].as_str().unwrap(), "owner");
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_platform_manager_can_assign_owner_role(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+
+        let pm = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let pm_headers = add_auth_headers(&pm);
+        let owner = create_test_user(&pool, Role::StandardUser).await;
+        let owner_headers = add_auth_headers(&owner);
+        let new_user = create_test_user(&pool, Role::StandardUser).await;
+
+        // Owner creates an org
+        let resp = server
+            .post("/admin/api/v1/organizations")
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .json(&json!({ "name": "test-org-pm-assign", "email": "org@example.com" }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::CREATED);
+        let org_id = resp.json::<serde_json::Value>()["id"].as_str().unwrap().to_string();
+
+        // Platform manager adds new_user as owner — should succeed
+        let resp = server
+            .post(&format!("/admin/api/v1/organizations/{org_id}/members"))
+            .add_header(&pm_headers[0].0, &pm_headers[0].1)
+            .add_header(&pm_headers[1].0, &pm_headers[1].1)
+            .json(&json!({ "user_id": new_user.id, "role": "owner" }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::CREATED);
+        let body = resp.json::<serde_json::Value>();
+        assert_eq!(body["role"].as_str().unwrap(), "owner");
+    }
+
+    // ── Validation endpoint ──────────────────────────────────────────────
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_set_active_organization_validates_membership(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+
+        let owner = create_test_user(&pool, Role::StandardUser).await;
+        let owner_headers = add_auth_headers(&owner);
+        let non_member = create_test_user(&pool, Role::StandardUser).await;
+        let non_member_headers = add_auth_headers(&non_member);
+
+        // Owner creates an org
+        let resp = server
+            .post("/admin/api/v1/organizations")
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .json(&json!({ "name": "test-org-session", "email": "org@example.com" }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::CREATED);
+        let org_id = resp.json::<serde_json::Value>()["id"].as_str().unwrap().to_string();
+
+        // Owner can set active org
+        let resp = server
+            .post("/admin/api/v1/session/organization")
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .json(&json!({ "organization_id": org_id }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::OK);
+        let body = resp.json::<serde_json::Value>();
+        assert_eq!(body["active_organization_id"].as_str().unwrap(), org_id);
+
+        // Non-member cannot set active org
+        let resp = server
+            .post("/admin/api/v1/session/organization")
+            .add_header(&non_member_headers[0].0, &non_member_headers[0].1)
+            .add_header(&non_member_headers[1].0, &non_member_headers[1].1)
+            .json(&json!({ "organization_id": org_id }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::FORBIDDEN);
+
+        // Clearing active org always succeeds
+        let resp = server
+            .post("/admin/api/v1/session/organization")
+            .add_header(&non_member_headers[0].0, &non_member_headers[0].1)
+            .add_header(&non_member_headers[1].0, &non_member_headers[1].1)
+            .json(&json!({ "organization_id": null }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::OK);
+    }
 }

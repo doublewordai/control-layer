@@ -388,8 +388,13 @@ impl FromRequestParts<AppState> for HasApiKey {
     }
 }
 
+/// The HTTP header name used to specify the active organization context.
+/// Clients (browser via localStorage, CLI via flag) send this header to indicate
+/// which organization the request should operate in.
+pub const ORGANIZATION_HEADER: &str = "x-organization-id";
+
 /// Populate organization context on an authenticated user.
-/// Reads the `dw-organization-id` cookie and queries the user's org memberships.
+/// Reads the `X-Organization-Id` header and queries the user's org memberships.
 async fn populate_org_context(user: &mut CurrentUser, parts: &Parts, db: &PgPool) {
     // Query all organizations the user belongs to
     let mut conn = match db.acquire().await {
@@ -440,26 +445,19 @@ async fn populate_org_context(user: &mut CurrentUser, parts: &Parts, db: &PgPool
         }
     }
 
-    // Read dw-organization-id cookie for active organization
-    if let Some(cookie_header) = parts.headers.get(axum::http::header::COOKIE)
-        && let Ok(cookie_str) = cookie_header.to_str()
+    // Read X-Organization-Id header for active organization
+    if let Some(header_value) = parts.headers.get(ORGANIZATION_HEADER)
+        && let Ok(value_str) = header_value.to_str()
+        && let Ok(org_id) = value_str.parse::<uuid::Uuid>()
     {
-        for cookie in cookie_str.split(';') {
-            let cookie = cookie.trim();
-            if let Some((name, value)) = cookie.split_once('=')
-                && name == "dw-organization-id"
-                && let Ok(org_id) = value.parse::<uuid::Uuid>()
-            {
-                // Verify the user is a member of this organization
-                if user.organizations.iter().any(|o| o.id == org_id) {
-                    user.active_organization = Some(org_id);
-                } else {
-                    tracing::debug!(
-                        org_id = %org_id,
-                        "Active organization cookie references org user is not a member of"
-                    );
-                }
-            }
+        // Verify the user is a member of this organization
+        if user.organizations.iter().any(|o| o.id == org_id) {
+            user.active_organization = Some(org_id);
+        } else {
+            tracing::debug!(
+                org_id = %org_id,
+                "X-Organization-Id header references org user is not a member of"
+            );
         }
     }
 }
@@ -1357,5 +1355,150 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(transactions.len(), 1, "Should still have exactly one transaction");
+    }
+
+    // ── X-Organization-Id header tests ───────────────────────────────────
+
+    #[sqlx::test]
+    async fn test_org_context_from_header(pool: PgPool) {
+        use crate::db::handlers::Organizations;
+        use crate::db::models::organizations::OrganizationCreateDBRequest;
+
+        let config = create_test_config();
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
+
+        // Create a user
+        let test_user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+        let external_user_id = test_user.external_user_id.as_ref().unwrap();
+
+        // Create an org with this user as owner
+        let mut conn = pool.acquire().await.unwrap();
+        let mut orgs = Organizations::new(&mut conn);
+        let org = orgs
+            .create(&OrganizationCreateDBRequest {
+                name: "test-org-header".to_string(),
+                email: "org@example.com".to_string(),
+                display_name: Some("Test Org".to_string()),
+                avatar_url: None,
+                created_by: test_user.id,
+            })
+            .await
+            .unwrap();
+        drop(conn);
+
+        // Request with X-Organization-Id header set to the org
+        let request = axum::http::Request::builder()
+            .uri("http://localhost/test")
+            .header("x-doubleword-user", external_user_id)
+            .header("x-doubleword-email", &test_user.email)
+            .header(super::ORGANIZATION_HEADER, org.id.to_string())
+            .body(())
+            .unwrap();
+        let (mut parts, _body) = request.into_parts();
+
+        let result = CurrentUser::from_request_parts(&mut parts, &state).await;
+        assert!(result.is_ok());
+
+        let current_user = result.unwrap();
+        assert_eq!(current_user.active_organization, Some(org.id));
+        assert!(!current_user.organizations.is_empty());
+        assert!(current_user.organizations.iter().any(|o| o.id == org.id));
+    }
+
+    #[sqlx::test]
+    async fn test_org_context_invalid_org_id_ignored(pool: PgPool) {
+        let config = create_test_config();
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
+
+        let test_user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+        let external_user_id = test_user.external_user_id.as_ref().unwrap();
+
+        // Request with X-Organization-Id header set to a random UUID (not a member)
+        let fake_org_id = uuid::Uuid::new_v4();
+        let request = axum::http::Request::builder()
+            .uri("http://localhost/test")
+            .header("x-doubleword-user", external_user_id)
+            .header("x-doubleword-email", &test_user.email)
+            .header(super::ORGANIZATION_HEADER, fake_org_id.to_string())
+            .body(())
+            .unwrap();
+        let (mut parts, _body) = request.into_parts();
+
+        let result = CurrentUser::from_request_parts(&mut parts, &state).await;
+        assert!(result.is_ok());
+
+        let current_user = result.unwrap();
+        // active_organization should be None because user is not a member
+        assert_eq!(current_user.active_organization, None);
+    }
+
+    #[sqlx::test]
+    async fn test_org_context_no_header_means_personal(pool: PgPool) {
+        use crate::db::handlers::Organizations;
+        use crate::db::models::organizations::OrganizationCreateDBRequest;
+
+        let config = create_test_config();
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
+
+        let test_user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+        let external_user_id = test_user.external_user_id.as_ref().unwrap();
+
+        // Create an org (user is a member)
+        let mut conn = pool.acquire().await.unwrap();
+        let mut orgs = Organizations::new(&mut conn);
+        orgs.create(&OrganizationCreateDBRequest {
+            name: "test-org-no-header".to_string(),
+            email: "org@example.com".to_string(),
+            display_name: None,
+            avatar_url: None,
+            created_by: test_user.id,
+        })
+        .await
+        .unwrap();
+        drop(conn);
+
+        // Request WITHOUT X-Organization-Id header
+        let request = axum::http::Request::builder()
+            .uri("http://localhost/test")
+            .header("x-doubleword-user", external_user_id)
+            .header("x-doubleword-email", &test_user.email)
+            .body(())
+            .unwrap();
+        let (mut parts, _body) = request.into_parts();
+
+        let result = CurrentUser::from_request_parts(&mut parts, &state).await;
+        assert!(result.is_ok());
+
+        let current_user = result.unwrap();
+        // active_organization should be None (personal context)
+        assert_eq!(current_user.active_organization, None);
+        // But organizations list should still contain the org
+        assert_eq!(current_user.organizations.len(), 1);
+    }
+
+    #[sqlx::test]
+    async fn test_org_context_malformed_header_ignored(pool: PgPool) {
+        let config = create_test_config();
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
+
+        let test_user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+        let external_user_id = test_user.external_user_id.as_ref().unwrap();
+
+        // Request with malformed X-Organization-Id header (not a UUID)
+        let request = axum::http::Request::builder()
+            .uri("http://localhost/test")
+            .header("x-doubleword-user", external_user_id)
+            .header("x-doubleword-email", &test_user.email)
+            .header(super::ORGANIZATION_HEADER, "not-a-uuid")
+            .body(())
+            .unwrap();
+        let (mut parts, _body) = request.into_parts();
+
+        let result = CurrentUser::from_request_parts(&mut parts, &state).await;
+        assert!(result.is_ok());
+
+        let current_user = result.unwrap();
+        // Should silently ignore the malformed header
+        assert_eq!(current_user.active_organization, None);
     }
 }

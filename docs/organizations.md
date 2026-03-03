@@ -233,6 +233,12 @@ Endpoints following the existing pattern (generic over `PoolProvider`, utoipa do
 
 "Own" operations verify the current user is a member (or owner/admin) of the target org.
 
+**Security guards on membership mutations:**
+
+1. **Last-owner guard** (`remove_member`, `update_member_role`): Before removing an owner or demoting an owner to another role, check that at least one other owner exists. Prevents leaving an org in an ownerless state.
+
+2. **Privilege escalation prevention** (`add_member`, `update_member_role`): Only owners (or platform managers) can assign the `owner` role. Org admins can assign `admin` or `member` but cannot promote themselves or others to `owner`. This is enforced by `check_role_assignment_privilege()`.
+
 ### 3c. Org-Aware Permission Checks for User Sub-Resources
 
 **Problem:** Existing handlers for `/users/{user_id}/api-keys`, `/users/{user_id}/webhooks`, etc. check `can_*_own_resource(current_user, target_user_id)` which requires `current_user.id == target_user_id`. When Alice manages Acme Corp's API keys, `Alice.id != AcmeCorp.id`, so the check fails.
@@ -306,7 +312,7 @@ Add organization routes in `build_router()`, after the groups section:
 .route("/organizations/{id}/members/{user_id}", delete(api::handlers::organizations::remove_member))
 // User's organizations (sub-resource on users)
 .route("/users/{user_id}/organizations", get(api::handlers::organizations::list_user_organizations))
-// Organization session context (sets HttpOnly cookie)
+// Organization session context (validates membership; client sends X-Organization-Id header)
 .route("/session/organization", post(api::handlers::organizations::set_active_organization))
 ```
 
@@ -436,65 +442,48 @@ WHERE user_id = $1 AND purpose = $2 AND created_by = $3 AND hidden = true
 | `auth/middleware.rs:61` (playground proxy) | `(current_user.id, Playground)` | `(target_user_id, Playground, current_user.id)` — target is org or self |
 | `api/handlers/auth.rs:204` (fusillade auth) | `(user_id, Batch)` | `(user_id, Batch, user_id)` — fusillade auth is always for the key's owner |
 
-**Organization context resolution via cookie:**
+**Organization context resolution via HTTP header:**
 
-The org context is conveyed via an HttpOnly cookie (`dw-organization-id`), set by a dedicated backend endpoint. This avoids modifying the OpenAI-compatible file upload API and requires zero changes to the dashboard's fetch calls (`credentials: "include"` already sends all cookies).
+The org context is conveyed via an `X-Organization-Id` HTTP header, sent by the client on each request. The dashboard stores the active org ID in `localStorage` and includes the header via a fetch wrapper. CLI tools and curl pass it directly as a header. This approach works uniformly across browsers, CLIs, and programmatic clients.
 
-**New endpoint — `POST /admin/api/v1/session/organization`:**
+**Note:** API-key-authenticated requests (OpenAI SDK, curl with Bearer token) do NOT need this header. The API key's `user_id` already determines the org/individual context. The `X-Organization-Id` header is only relevant for session-authenticated requests (JWT cookie, proxy headers).
+
+**Validation endpoint — `POST /admin/api/v1/session/organization`:**
 
 ```rust
-/// Set or clear the active organization context.
+/// Validate organization membership and return confirmed org ID.
+/// The client stores the returned ID and sends it as X-Organization-Id header.
 /// Body: { "organization_id": "<uuid>" } or { "organization_id": null }
-pub async fn set_active_organization(...) -> Result<Response> {
+pub async fn set_active_organization(...) -> Result<Json<SetActiveOrganizationResponse>> {
     // If organization_id is provided, verify membership
     if let Some(org_id) = request.organization_id {
-        let can_org = can_manage_org_resource(&current_user, org_id, &mut conn).await?;
-        if !can_org { return Err(Error::InsufficientPermissions { ... }); }
+        let role = repo.get_user_org_role(current_user.id, org_id).await?;
+        if role.is_none() { return Err(Error::InsufficientPermissions { ... }); }
     }
 
-    // Set or clear cookie
-    let cookie = match request.organization_id {
-        Some(org_id) => format!(
-            "dw-organization-id={}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}",
-            org_id, 30 * 24 * 3600  // 30 days
-        ),
-        None => "dw-organization-id=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0".to_string(),
-    };
-
-    Ok(Response::builder()
-        .header("Set-Cookie", cookie)
-        .body(json!({ "active_organization_id": request.organization_id })))
+    Ok(Json(SetActiveOrganizationResponse {
+        active_organization_id: request.organization_id,
+    }))
 }
 ```
 
 Route: `.route("/session/organization", post(api::handlers::organizations::set_active_organization))`
 
-**Reading the cookie — `CurrentUser` extraction:**
+**Reading the header — `CurrentUser` extraction:**
 
-During auth extraction in `current_user.rs`, after resolving the user, read the `dw-organization-id` cookie and populate `CurrentUser.active_organization`:
+During auth extraction in `current_user.rs`, after resolving the user, read the `X-Organization-Id` header and populate `CurrentUser.active_organization`:
 
 ```rust
 // In current_user.rs, after user is resolved:
-let active_organization: Option<UserId> = req.headers()
-    .get_all("cookie")
-    .iter()
-    .filter_map(|v| v.to_str().ok())
-    .flat_map(|s| s.split(';'))
-    .find_map(|c| {
-        let c = c.trim();
-        c.strip_prefix("dw-organization-id=")
-            .and_then(|v| v.parse::<UserId>().ok())
-    });
-
-// Verify membership (only if cookie is present)
-if let Some(org_id) = active_organization {
-    let mut repo = Organizations::new(&mut conn);
-    if repo.get_user_org_role(current_user.id, org_id).await?.is_none() {
-        active_organization = None; // Silently clear invalid org context
+if let Some(header_value) = parts.headers.get("x-organization-id")
+    && let Ok(value_str) = header_value.to_str()
+    && let Ok(org_id) = value_str.parse::<UserId>()
+{
+    // Verify the user is a member of this organization
+    if user.organizations.iter().any(|o| o.id == org_id) {
+        user.active_organization = Some(org_id);
     }
 }
-
-current_user.active_organization = active_organization;
 ```
 
 **Handlers read from `CurrentUser` (no header parsing):**
@@ -508,13 +497,13 @@ let api_key = api_keys_repo
     .await?;
 ```
 
-**Why a cookie:**
-- HttpOnly + server-set — can't be tampered with from JavaScript
-- `credentials: "include"` already sends all cookies — zero dashboard fetch changes
-- No changes to OpenAI-compatible API body or headers
-- Persists across page refreshes (unlike React context alone)
-- Works for both native JWT auth and proxy/SSO auth identically
-- For API key users (programmatic): no cookie needed — their key already has `user_id = org_id`
+**Why an HTTP header (not a cookie):**
+- Works with CLIs and curl — no cookie jar needed, just pass `-H "X-Organization-Id: <uuid>"`
+- Works with any HTTP client (SDKs, scripts, CI pipelines)
+- Stateless — no server-side session state, no cookie management
+- Dashboard uses `localStorage` for persistence across page refreshes
+- Dashboard's fetch wrapper adds the header automatically
+- For API key users (programmatic): no header needed — their key already has `user_id = org_id`
 
 **Hidden key pre-creation for org members:**
 
@@ -596,8 +585,8 @@ These are the critical systems that work unchanged because an org is a user:
 ### 7b. API Client (`api/control-layer/client.ts`)
 
 - Add `organizations` namespace with all CRUD + membership methods
-- Add `setActiveOrganization(orgId)` / `clearActiveOrganization()` methods that call `POST /session/organization`
-- No per-request header changes needed — the `dw-organization-id` cookie is sent automatically via `credentials: "include"`
+- Add `setActiveOrganization(orgId)` / `clearActiveOrganization()` methods that call `POST /session/organization` and store the org ID in `localStorage`
+- Add a fetch wrapper that reads `activeOrganizationId` from `localStorage` and includes `X-Organization-Id` header on all requests when set
 
 ### 7c. Query Keys & Hooks (`keys.ts`, `hooks.ts`)
 
@@ -608,10 +597,11 @@ These are the critical systems that work unchanged because an org is a user:
 ### 7d. Context Switcher (new component)
 
 - Dropdown in the header/sidebar showing: "Personal" + list of orgs from `currentUser.organizations`
-- Selecting an org calls `POST /session/organization` which sets the `dw-organization-id` HttpOnly cookie server-side
+- Selecting an org calls `POST /session/organization` to validate membership, then stores the org ID in `localStorage`
 - React context stores `activeOrganizationId` for UI state (which pages to show, which user ID to query with)
+- The API client's fetch wrapper reads `activeOrganizationId` from `localStorage` and includes `X-Organization-Id` header on all requests
 - When an org is active, pages that show user-scoped data (API keys, credits, webhooks, usage) query with the org's user ID instead of the current user's ID
-- Hidden-key endpoints (file upload, playground) automatically use the correct org context via the cookie — no per-request changes needed
+- Hidden-key endpoints (file upload, playground) automatically use the correct org context via the header — the `CurrentUser` extractor populates `active_organization` from the header
 - Existing sub-resource endpoints already work: `GET /users/{org_id}/api-keys` returns the org's keys, provided the permission check passes (see Phase 3c)
 
 ### 7e. Organization Management Page (new feature component)
@@ -693,8 +683,8 @@ Add an organization/personal context toggle in the expandable profile dropdown a
 - Above the existing menu items (Profile, Billing, Support, Logout) in the `DropdownMenuContent`, add an org switcher section
 - Shows "Personal" (always) plus each org from `currentUser.organizations`
 - Active context indicated with a checkmark or highlight
-- Selecting an org calls `POST /session/organization` (sets cookie) and updates React context
-- Selecting "Personal" calls the same endpoint with `null` (clears cookie)
+- Selecting an org calls `POST /session/organization` (validates membership), stores org ID in `localStorage`, and updates React context
+- Selecting "Personal" calls the same endpoint with `null` and clears `localStorage`
 
 ```tsx
 // In AppSidebar.tsx DropdownMenuContent:
@@ -721,7 +711,8 @@ Add an organization/personal context toggle in the expandable profile dropdown a
 **State management:**
 
 - `OrganizationContext` React context provides `activeOrganizationId` and `setActiveOrganization()`
-- `setActiveOrganization()` calls the backend cookie endpoint, then updates local state + invalidates relevant queries
+- `setActiveOrganization()` calls the backend validation endpoint, stores org ID in `localStorage`, updates React context, and invalidates relevant queries
+- The API client's fetch wrapper reads from `localStorage` and adds `X-Organization-Id` header to all requests
 - Balance display in the header (`AppLayout`) switches to org balance when org is active
 
 ---
@@ -759,7 +750,7 @@ Add an organization/personal context toggle in the expandable profile dropdown a
 | `dwctl/src/api/handlers/mod.rs` | Register `organizations` module |
 | `dwctl/src/api/models/mod.rs` | Register `organizations` module |
 | `dwctl/src/auth/permissions.rs` | Add `Organizations` resource, permission rules, `can_manage_org_resource` helper |
-| `dwctl/src/auth/current_user.rs` | Populate `organizations` on `CurrentUser` during extraction; read `dw-organization-id` cookie into `active_organization` field |
+| `dwctl/src/auth/current_user.rs` | Populate `organizations` on `CurrentUser` during extraction; read `X-Organization-Id` header into `active_organization` field |
 | `dwctl/src/types.rs` | Add `Organizations` to `Resource` enum |
 | `dwctl/src/lib.rs` | Add organization routes |
 | `dwctl/src/request_logging/analytics_handler.rs` | Populate `api_key_id` in http_analytics |
@@ -767,7 +758,7 @@ Add an organization/personal context toggle in the expandable profile dropdown a
 | `dwctl/src/db/models/credits.rs` | Add `performed_by` and `api_key_id` to `CreditTransactionCreateDBRequest` |
 | `dwctl/src/sync/onwards_config/mod.rs` | Add `AND ak.is_deleted = false` to API key queries in `load_targets_from_db` |
 | `dashboard/src/api/control-layer/types.ts` | Add org types, `user_type`, `created_by` on API keys |
-| `dashboard/src/api/control-layer/client.ts` | Add org API methods; add `setActiveOrganization` / `clearActiveOrganization` (cookie-based) |
+| `dashboard/src/api/control-layer/client.ts` | Add org API methods; add `setActiveOrganization` / `clearActiveOrganization` (localStorage + `X-Organization-Id` header) |
 | `dashboard/src/api/control-layer/keys.ts` | Add org query keys |
 | `dashboard/src/api/control-layer/hooks.ts` | Add org hooks |
 
@@ -777,7 +768,7 @@ Each PR is non-breaking — existing functionality is preserved at every step.
 
 | PR | Repo | Scope | Key changes |
 |----|------|-------|-------------|
-| **1** | control-layer | Migration + all Rust backend | `072_add_organizations.sql` + all Phases 2–4: organization models/handlers/API, permissions, routes, CurrentUser changes, API key soft-delete + created_by + hidden key updates, attribution (api_key_id + performed_by), org permission checks on existing handlers, cookie-based session endpoint, onwards sync filter |
+| **1** | control-layer | Migration + all Rust backend | `072_add_organizations.sql` + all Phases 2–4: organization models/handlers/API, permissions, routes, CurrentUser changes, API key soft-delete + created_by + hidden key updates, attribution (api_key_id + performed_by), org permission checks on existing handlers, header-based org context + validation endpoint, onwards sync filter |
 | **2** | control-layer | Dashboard | TS types, API client, hooks, query keys. AppSidebar org toggle (7h), org management page (7e), batch status sorting COR-88 (7f) |
 | **3** | fusillade | Schema + release | Migration: api_key_id on batches + files. Pass-through in creation. Release new version to crates.io |
 | **4** | control-layer | Org-scoped batch/file filtering | Bump fusillade version, pass api_key_id from file upload handler to fusillade, org-scoped batch/file member filtering in dashboard (7g) |
@@ -810,12 +801,14 @@ Each PR is non-breaking — existing functionality is preserved at every step.
    - Delete an org API key, verify it's soft-deleted (`is_deleted = true`, not removed)
    - Verify deleted key no longer routes in onwards (no inference access)
    - Verify `credits_transactions` referencing the deleted key still resolves (JOIN works)
-   - Upload a batch file in org context (set cookie via `POST /session/organization`), verify `files.api_key_id` and `batches.api_key_id` populated
+   - Upload a batch file in org context (send `X-Organization-Id` header), verify `files.api_key_id` and `batches.api_key_id` populated
    - Verify batch file uses org's hidden batch key (not user's personal one)
    - Filter batches by member via `api_keys.created_by` JOIN — verify correct attribution
+   - Verify removing the last owner is rejected
+   - Verify an admin cannot assign the `owner` role (only owners can)
 8. **Lint**: `just lint rust && just lint ts`
 9. **Dashboard**: `cd dashboard && npm run dev`:
-   - Verify org toggle in sidebar profile dropdown — switching sets cookie and updates UI context
+   - Verify org toggle in sidebar profile dropdown — switching stores org ID in localStorage and adds `X-Organization-Id` header
    - Verify balance in header switches to org balance when org is active
    - Verify batches page shows in-progress batches above completed (COR-88)
    - Verify batches page shows member filter when in org context
