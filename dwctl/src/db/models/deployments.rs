@@ -226,12 +226,21 @@ impl ModelType {
     }
 }
 
+/// Maximum serialized size of ModelCatalogMetadata in bytes (16 KB).
+pub const MODEL_CATALOG_METADATA_MAX_BYTES: usize = 16_384;
+/// Maximum number of keys allowed in the `extra` object.
+pub const MODEL_CATALOG_METADATA_MAX_EXTRA_KEYS: usize = 50;
+
 /// Catalog-style metadata for display purposes (stored as JSONB).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema, PartialEq)]
 pub struct ModelCatalogMetadata {
-    /// Relative intelligence tier: "flagship", "mid", "lite"
+    /// Provider name (e.g. "OpenAI", "Anthropic")
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub intelligence_tier: Option<String>,
+    pub provider: Option<String>,
+
+    /// Intelligence index score (e.g. from Artificial Analysis)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub intelligence_index: Option<f64>,
 
     /// Context window size in tokens
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -241,13 +250,18 @@ pub struct ModelCatalogMetadata {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub released_at: Option<NaiveDate>,
 
-    /// Provider name (e.g. "OpenAI", "Anthropic")
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub provider: Option<String>,
-
     /// Quantization type (e.g. "fp16", "int8")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quantization: Option<String>,
+
+    /// Attribution source for this metadata (e.g. "artificial_analysis")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attribution: Option<String>,
+
+    /// Arbitrary display-only data (benchmark scores, tags, etc.)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<Object>)]
+    pub extra: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]

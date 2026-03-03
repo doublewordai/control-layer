@@ -3,7 +3,9 @@
 use sqlx_pool_router::PoolProvider;
 
 use crate::api::models::deployments::{TrafficRoutingAction, TrafficRoutingRule};
-use crate::db::models::deployments::TrafficRuleAction;
+use crate::db::models::deployments::{
+    MODEL_CATALOG_METADATA_MAX_BYTES, MODEL_CATALOG_METADATA_MAX_EXTRA_KEYS, ModelCatalogMetadata, TrafficRuleAction,
+};
 use crate::db::models::tariffs::TariffCreateDBRequest;
 use crate::{
     AppState,
@@ -31,6 +33,31 @@ use axum::{
     response::Json,
 };
 use sqlx::Acquire;
+
+/// Validate that model catalog metadata is within size and key count limits.
+fn validate_metadata(metadata: &ModelCatalogMetadata) -> Result<()> {
+    let size = serde_json::to_vec(metadata).map(|v| v.len()).unwrap_or(0);
+    if size > MODEL_CATALOG_METADATA_MAX_BYTES {
+        return Err(Error::BadRequest {
+            message: format!(
+                "metadata exceeds maximum size ({} bytes, limit is {} bytes)",
+                size, MODEL_CATALOG_METADATA_MAX_BYTES
+            ),
+        });
+    }
+    if let Some(serde_json::Value::Object(map)) = &metadata.extra {
+        if map.len() > MODEL_CATALOG_METADATA_MAX_EXTRA_KEYS {
+            return Err(Error::BadRequest {
+                message: format!(
+                    "metadata.extra has too many keys ({}, limit is {})",
+                    map.len(),
+                    MODEL_CATALOG_METADATA_MAX_EXTRA_KEYS
+                ),
+            });
+        }
+    }
+    Ok(())
+}
 
 /// Resolve API traffic routing rules to DB-layer actions (alias strings → UUIDs).
 /// Validates no self-redirects, no empty targets, and that redirect targets exist.
@@ -404,6 +431,15 @@ pub async fn create_deployed_model<P: PoolProvider>(
         }
     }
 
+    // Validate metadata size
+    let metadata = match &create {
+        DeployedModelCreate::Standard(s) => &s.metadata,
+        DeployedModelCreate::Composite(c) => &c.metadata,
+    };
+    if let Some(m) = metadata {
+        validate_metadata(m)?;
+    }
+
     let mut tx = state.db.write().begin().await.map_err(|e| Error::Database(e.into()))?;
 
     // Validate endpoint exists (only for standard models)
@@ -524,6 +560,11 @@ pub async fn update_deployed_model<P: PoolProvider>(
                 });
             }
         }
+    }
+
+    // Validate metadata size
+    if let Some(m) = &update.metadata {
+        validate_metadata(m)?;
     }
 
     let mut tx = state.db.write().begin().await.map_err(|e| Error::Database(e.into()))?;
