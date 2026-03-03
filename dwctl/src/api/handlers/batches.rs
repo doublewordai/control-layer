@@ -2816,11 +2816,12 @@ mod tests {
             metadata: None,
         };
 
+        let auth = add_auth_headers(&user);
         let resp = app
             .post("/ai/v1/batches")
             .json(&create_req)
-            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
-            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
             .await;
 
         resp.assert_status(StatusCode::PAYMENT_REQUIRED);
