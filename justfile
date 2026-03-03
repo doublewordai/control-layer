@@ -632,7 +632,10 @@ ci target *args="":
             echo "🦀 Running Rust CI pipeline..."
 
             echo "📋 Checking Cargo.lock sync..."
-            cargo metadata --locked > /dev/null
+            if ! cargo metadata --locked --format-version 1 > /dev/null 2>&1; then
+                echo "❌ Cargo.lock is out of date. Run 'cargo update' and commit the updated Cargo.lock."
+                exit 1
+            fi
 
             # Setup databases using db-setup target
             just db-setup
