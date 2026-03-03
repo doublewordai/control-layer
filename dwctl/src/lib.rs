@@ -1730,7 +1730,7 @@ async fn setup_background_services(
             let daemon_request_manager = request_manager.clone();
             let daemon_pool = pool.clone();
             let daemon_shutdown = shutdown_token.clone();
-            background_tasks.spawn("batch-notifications", async move {
+            background_tasks.spawn("batch-completion", async move {
                 notifications::run_notification_poller(
                     daemon_config.background_services.notifications.clone(),
                     daemon_config,

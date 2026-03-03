@@ -121,15 +121,13 @@ pub async fn run_notification_poller(
     dwctl_pool: PgPool,
     shutdown: CancellationToken,
 ) {
-    let notifications_enabled = config.enabled;
-
-    let mut dispatcher = if notifications_enabled && config.webhooks.enabled {
+    let mut dispatcher = if config.enabled && config.webhooks.enabled {
         Some(WebhookDispatcher::spawn(dwctl_pool.clone(), &config.webhooks, shutdown.clone()))
     } else {
         None
     };
 
-    let email_service = if notifications_enabled {
+    let email_service = if config.enabled {
         match EmailService::new(&app_config) {
             Ok(svc) => {
                 tracing::info!("Launched email service successfully");
@@ -146,7 +144,7 @@ pub async fn run_notification_poller(
 
     tracing::info!(
         poll_interval = ?config.poll_interval,
-        notifications = notifications_enabled,
+        notifications = config.enabled,
         webhooks = dispatcher.is_some(),
         email = email_service.is_some(),
         "Starting batch completion poller"
@@ -161,7 +159,7 @@ pub async fn run_notification_poller(
             }
         }
 
-        tracing::debug!("Notification poller tick");
+        tracing::debug!("Completion poller tick");
 
         // === Step 1: Poll fusillade for completed batches ===
         match request_manager.poll_completed_batches().await {
