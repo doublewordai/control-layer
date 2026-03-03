@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.12.0](https://github.com/doublewordai/control-layer/compare/v8.11.0...v8.12.0) (2026-03-03)
+
+
+### Features
+
+* Notify on low balance ([#786](https://github.com/doublewordai/control-layer/issues/786)) ([f77e436](https://github.com/doublewordai/control-layer/commit/f77e43694fd907238834630e5cfa28ab6083d68d))
+
 ## [8.11.0](https://github.com/doublewordai/control-layer/compare/v8.10.2...v8.11.0) (2026-03-03)
 
 
