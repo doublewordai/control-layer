@@ -693,7 +693,7 @@ impl<'c> Users<'c> {
             LowBalanceUser,
             r#"
             SELECT u.id, u.email, u.username, u.display_name,
-                   u.low_balance_threshold as "low_balance_threshold!: rust_decimal::Decimal",
+                   u.low_balance_threshold::decimal(20, 9) as "low_balance_threshold!",
                    u.low_balance_notification_sent,
                    c.balance as "checkpoint_balance?"
             FROM users u
