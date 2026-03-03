@@ -541,7 +541,7 @@ pub async fn update_member_role<P: PoolProvider>(
     let mut tx = state.db.write().begin().await.map_err(|e| Error::Database(e.into()))?;
 
     if !can_all {
-        let can_org = can_manage_org_resource(&current_user, id, &mut *tx).await?;
+        let can_org = can_manage_org_resource(&current_user, id, &mut tx).await?;
         if !can_org {
             return Err(Error::InsufficientPermissions {
                 required: Permission::Allow(Resource::Organizations, Operation::UpdateOwn),
@@ -554,10 +554,10 @@ pub async fn update_member_role<P: PoolProvider>(
     validate_role(&data.role)?;
 
     // Only owners (or platform managers) can assign the owner role
-    check_role_assignment_privilege(&current_user, id, &data.role, can_all, &mut *tx).await?;
+    check_role_assignment_privilege(&current_user, id, &data.role, can_all, &mut tx).await?;
 
     // Prevent demoting the last owner
-    let mut repo = Organizations::new(&mut *tx);
+    let mut repo = Organizations::new(&mut tx);
     if data.role != "owner" {
         let current_role = repo.get_user_org_role(user_id, id).await?;
         if current_role.as_deref() == Some("owner") {
@@ -574,7 +574,7 @@ pub async fn update_member_role<P: PoolProvider>(
     let membership = repo.update_member_role(id, user_id, &data.role).await?;
 
     // Fetch user details for response
-    let mut users_repo = Users::new(&mut *tx);
+    let mut users_repo = Users::new(&mut tx);
     let user = users_repo.get_by_id(user_id).await?.ok_or_else(|| Error::NotFound {
         resource: "User".to_string(),
         id: user_id.to_string(),
@@ -623,7 +623,7 @@ pub async fn remove_member<P: PoolProvider>(
     let mut tx = state.db.write().begin().await.map_err(|e| Error::Database(e.into()))?;
 
     if !can_all {
-        let can_org = can_manage_org_resource(&current_user, id, &mut *tx).await?;
+        let can_org = can_manage_org_resource(&current_user, id, &mut tx).await?;
         if !can_org {
             return Err(Error::InsufficientPermissions {
                 required: Permission::Allow(Resource::Organizations, Operation::UpdateOwn),
@@ -633,7 +633,7 @@ pub async fn remove_member<P: PoolProvider>(
         }
     }
 
-    let mut repo = Organizations::new(&mut *tx);
+    let mut repo = Organizations::new(&mut tx);
 
     // Check if we're removing the last owner
     let target_role = repo.get_user_org_role(user_id, id).await?;
