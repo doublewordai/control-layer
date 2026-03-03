@@ -1134,6 +1134,8 @@ mod tests {
                     source_id: "test".to_string(),
                     description: Some("Added credits".to_string()),
                     fusillade_batch_id: None,
+                    api_key_id: None,
+                    performed_by: None,
                 })
                 .await
                 .unwrap();
@@ -1150,6 +1152,7 @@ mod tests {
             purpose: ApiKeyPurpose::Realtime,
             requests_per_second: None,
             burst_size: None,
+            created_by: test_user_id,
         };
         let api_key = api_key_repo.create(&api_key_create).await.expect("Failed to create API key");
 

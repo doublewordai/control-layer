@@ -142,6 +142,15 @@ pub mod resource {
             Resource::Webhooks
         }
     }
+
+    #[derive(Default)]
+    pub struct Organizations;
+
+    impl From<Organizations> for Resource {
+        fn from(_: Organizations) -> Resource {
+            Resource::Organizations
+        }
+    }
 }
 
 pub mod operation {
@@ -316,6 +325,9 @@ pub fn role_has_permission(role: &Role, resource: Resource, operation: Operation
                     | (Resource::Webhooks, Operation::ReadOwn)    // Can read own webhooks
                     | (Resource::Webhooks, Operation::UpdateOwn)  // Can update own webhooks
                     | (Resource::Webhooks, Operation::DeleteOwn) // Can delete own webhooks
+                    | (Resource::Organizations, Operation::CreateOwn) // Can create own organizations
+                    | (Resource::Organizations, Operation::ReadOwn)   // Can read own organizations
+                    | (Resource::Organizations, Operation::UpdateOwn) // Can manage orgs they belong to
             )
         }
         Role::RequestViewer => {
@@ -392,6 +404,20 @@ generate_permission_helpers!(create, Operation::CreateAll, Operation::CreateOwn)
 generate_permission_helpers!(update, Operation::UpdateAll, Operation::UpdateOwn);
 generate_permission_helpers!(delete, Operation::DeleteAll, Operation::DeleteOwn);
 
+/// Check if the current user can manage resources belonging to an organization.
+/// Returns true if target_user_id is an org and current_user is an owner/admin of it.
+pub async fn can_manage_org_resource(
+    current_user: &CurrentUser,
+    target_user_id: UserId,
+    db: &mut sqlx::PgConnection,
+) -> std::result::Result<bool, crate::db::errors::DbError> {
+    let mut repo = crate::db::handlers::Organizations::new(db);
+    match repo.get_user_org_role(current_user.id, target_user_id).await? {
+        Some(role) if role == "owner" || role == "admin" => Ok(true),
+        _ => Ok(false),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -407,6 +433,8 @@ mod tests {
             display_name: None,
             avatar_url: None,
             payment_provider_id: None,
+            organizations: vec![],
+            active_organization: None,
         }
     }
 

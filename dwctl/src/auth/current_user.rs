@@ -76,6 +76,8 @@ async fn try_jwt_session_auth(
                 display_name: user.display_name,
                 avatar_url: user.avatar_url,
                 payment_provider_id: user.payment_provider_id,
+                organizations: vec![],
+                active_organization: None,
             }));
         }
     }
@@ -188,6 +190,8 @@ async fn try_proxy_header_auth<P: sqlx_pool_router::PoolProvider + Clone + Send 
                     display_name: user.display_name,
                     avatar_url: user.avatar_url,
                     payment_provider_id: user.payment_provider_id,
+                    organizations: vec![],
+                    active_organization: None,
                 })
             }
             Err(e) => return Some(Err(Error::Database(e))),
@@ -207,6 +211,8 @@ async fn try_proxy_header_auth<P: sqlx_pool_router::PoolProvider + Clone + Send 
                     display_name: user.display_name,
                     avatar_url: user.avatar_url,
                     payment_provider_id: user.payment_provider_id,
+                    organizations: vec![],
+                    active_organization: None,
                 })
             }
             Ok(None) => {
@@ -279,7 +285,7 @@ async fn try_api_key_auth(parts: &axum::http::request::Parts, db: &PgPool) -> Op
         SELECT ak.user_id, ak.purpose, u.username, u.email, u.is_admin, u.display_name, u.avatar_url, u.payment_provider_id
         FROM api_keys ak
         INNER JOIN users u ON ak.user_id = u.id
-        WHERE ak.secret = $1
+        WHERE ak.secret = $1 AND ak.is_deleted = false
         "#,
         api_key
     )
@@ -354,6 +360,8 @@ async fn try_api_key_auth(parts: &axum::http::request::Parts, db: &PgPool) -> Op
         display_name: api_key_data.display_name,
         avatar_url: api_key_data.avatar_url,
         payment_provider_id: api_key_data.payment_provider_id,
+        organizations: vec![],
+        active_organization: None,
     }))
 }
 
@@ -380,6 +388,82 @@ impl FromRequestParts<AppState> for HasApiKey {
     }
 }
 
+/// Populate organization context on an authenticated user.
+/// Reads the `dw-organization-id` cookie and queries the user's org memberships.
+async fn populate_org_context(user: &mut CurrentUser, parts: &Parts, db: &PgPool) {
+    // Query all organizations the user belongs to
+    let mut conn = match db.acquire().await {
+        Ok(conn) => conn,
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to acquire connection for org context");
+            return;
+        }
+    };
+
+    let mut org_repo = crate::db::handlers::Organizations::new(&mut conn);
+
+    // Get the user's organization memberships
+    match org_repo.list_user_organizations(user.id).await {
+        Ok(memberships) => {
+            user.organizations = memberships
+                .into_iter()
+                .map(|m| crate::api::models::users::UserOrganizationContext {
+                    id: m.organization_id,
+                    name: String::new(), // Will be populated below
+                    role: m.role,
+                })
+                .collect();
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to load user organizations");
+            return;
+        }
+    }
+
+    // Populate organization names by fetching org user records
+    if !user.organizations.is_empty() {
+        let org_ids: Vec<uuid::Uuid> = user.organizations.iter().map(|o| o.id).collect();
+        match sqlx::query!(r#"SELECT id, username FROM users WHERE id = ANY($1)"#, &org_ids)
+            .fetch_all(&mut *conn)
+            .await
+        {
+            Ok(rows) => {
+                for org in &mut user.organizations {
+                    if let Some(row) = rows.iter().find(|r| r.id == org.id) {
+                        org.name = row.username.clone();
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to load organization names");
+            }
+        }
+    }
+
+    // Read dw-organization-id cookie for active organization
+    if let Some(cookie_header) = parts.headers.get(axum::http::header::COOKIE)
+        && let Ok(cookie_str) = cookie_header.to_str()
+    {
+        for cookie in cookie_str.split(';') {
+            let cookie = cookie.trim();
+            if let Some((name, value)) = cookie.split_once('=')
+                && name == "dw-organization-id"
+                && let Ok(org_id) = value.parse::<uuid::Uuid>()
+            {
+                // Verify the user is a member of this organization
+                if user.organizations.iter().any(|o| o.id == org_id) {
+                    user.active_organization = Some(org_id);
+                } else {
+                    tracing::debug!(
+                        org_id = %org_id,
+                        "Active organization cookie references org user is not a member of"
+                    );
+                }
+            }
+        }
+    }
+}
+
 impl<P: sqlx_pool_router::PoolProvider + Clone + Send + Sync> FromRequestParts<crate::AppState<P>> for CurrentUser {
     type Rejection = Error;
 
@@ -400,9 +484,10 @@ impl<P: sqlx_pool_router::PoolProvider + Clone + Send + Sync> FromRequestParts<c
 
         // Try API key authentication first (most specific)
         match try_api_key_auth(parts, state.db.read()).await {
-            Some(Ok(user)) => {
+            Some(Ok(mut user)) => {
                 debug!("Authentication successful via API key");
                 trace!("Authenticated user: {}", user.id);
+                populate_org_context(&mut user, parts, state.db.read()).await;
                 return Ok(user);
             }
             Some(Err(e)) => {
@@ -418,9 +503,10 @@ impl<P: sqlx_pool_router::PoolProvider + Clone + Send + Sync> FromRequestParts<c
         // Native authentication (JWT sessions)
         if state.config.auth.native.enabled {
             match try_jwt_session_auth(parts, &state.config, state.db.read()).await {
-                Some(Ok(user)) => {
+                Some(Ok(mut user)) => {
                     debug!("Authentication successful via JWT session");
                     trace!("Authenticated user: {}", user.id);
+                    populate_org_context(&mut user, parts, state.db.read()).await;
                     return Ok(user);
                 }
                 Some(Err(e)) => {
@@ -437,9 +523,10 @@ impl<P: sqlx_pool_router::PoolProvider + Clone + Send + Sync> FromRequestParts<c
         // Fall back to proxy header authentication
         if state.config.auth.proxy_header.enabled {
             match try_proxy_header_auth(parts, state).await {
-                Some(Ok(user)) => {
+                Some(Ok(mut user)) => {
                     debug!("Authentication successful via proxy header");
                     trace!("Authenticated user: {}", user.id);
+                    populate_org_context(&mut user, parts, state.db.read()).await;
                     return Ok(user);
                 }
                 Some(Err(e)) => {
@@ -1009,6 +1096,8 @@ mod tests {
             display_name: None,
             avatar_url: None,
             payment_provider_id: None,
+            organizations: vec![],
+            active_organization: None,
         };
 
         let result = require_admin(admin_user);
@@ -1024,6 +1113,8 @@ mod tests {
             display_name: None,
             avatar_url: None,
             payment_provider_id: None,
+            organizations: vec![],
+            active_organization: None,
         };
 
         let result = require_admin(regular_user);
@@ -1052,6 +1143,8 @@ mod tests {
             display_name: user.display_name.clone(),
             avatar_url: user.avatar_url.clone(),
             payment_provider_id: None,
+            organizations: vec![],
+            active_organization: None,
         };
         let jwt_token = session::create_session_token(&current_user, &config).unwrap();
 
@@ -1118,6 +1211,8 @@ mod tests {
             display_name: user.display_name.clone(),
             avatar_url: user.avatar_url.clone(),
             payment_provider_id: None,
+            organizations: vec![],
+            active_organization: None,
         };
         let jwt_token = session::create_session_token(&current_user, &config).unwrap();
 

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            INSERT INTO api_keys (name, description, secret, purpose, user_id, requests_per_second, burst_size, hidden)\n            VALUES ($1, $2, $3, $4, $5, $6, $7, false)\n            RETURNING *\n            ",
+  "query": "SELECT id, name, description, secret, purpose, user_id, created_by, created_at, last_used, requests_per_second, burst_size, hidden, is_deleted FROM api_keys WHERE user_id = $1 AND hidden = false AND is_deleted = false ORDER BY created_at DESC LIMIT $2 OFFSET $3",
   "describe": {
     "columns": [
       {
@@ -25,55 +25,63 @@
       },
       {
         "ordinal": 4,
-        "name": "user_id",
-        "type_info": "Uuid"
-      },
-      {
-        "ordinal": 5,
-        "name": "created_at",
-        "type_info": "Timestamptz"
-      },
-      {
-        "ordinal": 6,
-        "name": "last_used",
-        "type_info": "Timestamptz"
-      },
-      {
-        "ordinal": 7,
-        "name": "requests_per_second",
-        "type_info": "Float4"
-      },
-      {
-        "ordinal": 8,
-        "name": "burst_size",
-        "type_info": "Int4"
-      },
-      {
-        "ordinal": 9,
         "name": "purpose",
         "type_info": "Varchar"
       },
       {
+        "ordinal": 5,
+        "name": "user_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 6,
+        "name": "created_by",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 7,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 8,
+        "name": "last_used",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 9,
+        "name": "requests_per_second",
+        "type_info": "Float4"
+      },
+      {
         "ordinal": 10,
+        "name": "burst_size",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 11,
         "name": "hidden",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 12,
+        "name": "is_deleted",
         "type_info": "Bool"
       }
     ],
     "parameters": {
       "Left": [
-        "Varchar",
-        "Text",
-        "Varchar",
-        "Varchar",
         "Uuid",
-        "Float4",
-        "Int4"
+        "Int8",
+        "Int8"
       ]
     },
     "nullable": [
       false,
       false,
       true,
+      false,
+      false,
       false,
       false,
       false,
@@ -84,5 +92,5 @@
       false
     ]
   },
-  "hash": "d659a08542c7edf1ead24adb8c5bb51a06dbbdd15efca43a42f9536896b16819"
+  "hash": "fe3163d141b10aaf4e1a0aaeb0afeb827eb9fb0dbec3f8cb5fd8cb77935a8144"
 }

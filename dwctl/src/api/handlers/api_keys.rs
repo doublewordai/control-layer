@@ -9,8 +9,8 @@ use crate::{
         users::CurrentUser,
     },
     auth::permissions::{
-        can_create_all_resources, can_create_own_resource, can_delete_all_resources, can_delete_own_resource, can_read_all_resources,
-        can_read_own_resource,
+        can_create_all_resources, can_create_own_resource, can_delete_all_resources, can_delete_own_resource, can_manage_org_resource,
+        can_read_all_resources, can_read_own_resource,
     },
     db::handlers::{Repository, api_keys::ApiKeyFilter, api_keys::ApiKeys},
     db::models::api_keys::ApiKeyCreateDBRequest,
@@ -84,14 +84,21 @@ pub async fn create_user_api_key<P: PoolProvider>(
 
             // Allow creation if user can create all API keys OR create their own API keys
             if !can_create_all_api_keys && !can_create_own_api_keys {
-                return Err(Error::InsufficientPermissions {
-                    required: Permission::Any(vec![
-                        Permission::Allow(Resource::ApiKeys, Operation::CreateAll),
-                        Permission::Allow(Resource::ApiKeys, Operation::CreateOwn),
-                    ]),
-                    action: Operation::CreateOwn,
-                    resource: format!("API keys for user {uuid}"),
-                });
+                // Check if user is an org admin/owner for the target user
+                let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+                let can_org = can_manage_org_resource(&current_user, uuid, &mut conn)
+                    .await
+                    .map_err(Error::Database)?;
+                if !can_org {
+                    return Err(Error::InsufficientPermissions {
+                        required: Permission::Any(vec![
+                            Permission::Allow(Resource::ApiKeys, Operation::CreateAll),
+                            Permission::Allow(Resource::ApiKeys, Operation::CreateOwn),
+                        ]),
+                        action: Operation::CreateOwn,
+                        resource: format!("API keys for user {uuid}"),
+                    });
+                }
             }
             uuid
         }
@@ -111,7 +118,7 @@ pub async fn create_user_api_key<P: PoolProvider>(
 
     let mut pool_conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut repo = ApiKeys::new(&mut pool_conn);
-    let db_request = ApiKeyCreateDBRequest::new(target_user_id, data);
+    let db_request = ApiKeyCreateDBRequest::new(target_user_id, current_user.id, data);
 
     let api_key = repo.create(&db_request).await?;
     Ok((StatusCode::CREATED, Json(ApiKeyResponse::from(api_key))))
@@ -167,14 +174,21 @@ pub async fn list_user_api_keys<P: PoolProvider>(
 
             // Allow access if user can read all API keys OR read their own API keys
             if !can_read_all_api_keys && !can_read_own_api_keys {
-                return Err(Error::InsufficientPermissions {
-                    required: Permission::Any(vec![
-                        Permission::Allow(Resource::ApiKeys, Operation::ReadAll),
-                        Permission::Allow(Resource::ApiKeys, Operation::ReadOwn),
-                    ]),
-                    action: Operation::ReadOwn,
-                    resource: format!("API keys for user {uuid}"),
-                });
+                // Check if user is an org admin/owner for the target user
+                let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+                let can_org = can_manage_org_resource(&current_user, uuid, &mut conn)
+                    .await
+                    .map_err(Error::Database)?;
+                if !can_org {
+                    return Err(Error::InsufficientPermissions {
+                        required: Permission::Any(vec![
+                            Permission::Allow(Resource::ApiKeys, Operation::ReadAll),
+                            Permission::Allow(Resource::ApiKeys, Operation::ReadOwn),
+                        ]),
+                        action: Operation::ReadOwn,
+                        resource: format!("API keys for user {uuid}"),
+                    });
+                }
             }
             uuid
         }
@@ -252,14 +266,21 @@ pub async fn get_user_api_key<P: PoolProvider>(
 
             // Allow access if user can read all API keys OR read their own API keys
             if !can_read_all_api_keys && !can_read_own_api_keys {
-                return Err(Error::InsufficientPermissions {
-                    required: Permission::Any(vec![
-                        Permission::Allow(Resource::ApiKeys, Operation::ReadAll),
-                        Permission::Allow(Resource::ApiKeys, Operation::ReadOwn),
-                    ]),
-                    action: Operation::ReadOwn,
-                    resource: format!("API keys for user {uuid}"),
-                });
+                // Check if user is an org admin/owner for the target user
+                let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+                let can_org = can_manage_org_resource(&current_user, uuid, &mut conn)
+                    .await
+                    .map_err(Error::Database)?;
+                if !can_org {
+                    return Err(Error::InsufficientPermissions {
+                        required: Permission::Any(vec![
+                            Permission::Allow(Resource::ApiKeys, Operation::ReadAll),
+                            Permission::Allow(Resource::ApiKeys, Operation::ReadOwn),
+                        ]),
+                        action: Operation::ReadOwn,
+                        resource: format!("API keys for user {uuid}"),
+                    });
+                }
             }
             uuid
         }
@@ -331,14 +352,21 @@ pub async fn delete_user_api_key<P: PoolProvider>(
 
             // Allow deletion if user can delete all API keys OR delete their own API keys
             if !can_delete_all_api_keys && !can_delete_own_api_keys {
-                return Err(Error::InsufficientPermissions {
-                    required: Permission::Any(vec![
-                        Permission::Allow(Resource::ApiKeys, Operation::DeleteAll),
-                        Permission::Allow(Resource::ApiKeys, Operation::DeleteOwn),
-                    ]),
-                    action: Operation::DeleteOwn,
-                    resource: format!("API keys for user {uuid}"),
-                });
+                // Check if user is an org admin/owner for the target user
+                let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+                let can_org = can_manage_org_resource(&current_user, uuid, &mut conn)
+                    .await
+                    .map_err(Error::Database)?;
+                if !can_org {
+                    return Err(Error::InsufficientPermissions {
+                        required: Permission::Any(vec![
+                            Permission::Allow(Resource::ApiKeys, Operation::DeleteAll),
+                            Permission::Allow(Resource::ApiKeys, Operation::DeleteOwn),
+                        ]),
+                        action: Operation::DeleteOwn,
+                        resource: format!("API keys for user {uuid}"),
+                    });
+                }
             }
             uuid
         }

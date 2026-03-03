@@ -28,6 +28,10 @@ pub struct CreditTransactionCreateDBRequest {
     pub description: Option<String>,
     /// Batch ID for fusillade batch requests (denormalized from http_analytics)
     pub fusillade_batch_id: Option<Uuid>,
+    /// The API key used for this transaction (for usage attribution)
+    pub api_key_id: Option<Uuid>,
+    /// The individual user who performed this action
+    pub performed_by: Option<UserId>,
 }
 
 impl CreditTransactionCreateDBRequest {
@@ -40,6 +44,8 @@ impl CreditTransactionCreateDBRequest {
             source_id: format!("{}_{}", grantor_id, uuid::Uuid::new_v4()),
             description,
             fusillade_batch_id: None,
+            api_key_id: None,
+            performed_by: Some(grantor_id),
         }
     }
 }
@@ -54,4 +60,8 @@ pub struct CreditTransactionDBResponse {
     pub source_id: String,
     pub description: Option<String>,
     pub created_at: DateTime<Utc>,
+    /// The API key used for this transaction
+    pub api_key_id: Option<Uuid>,
+    /// The individual user who performed this action
+    pub performed_by: Option<UserId>,
 }

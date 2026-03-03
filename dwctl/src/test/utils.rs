@@ -361,6 +361,8 @@ pub async fn get_system_user(pool: &mut PgConnection) -> UserResponse {
         has_payment_provider_id: false,
         batch_notifications_enabled: false,
         low_balance_threshold: None,
+        user_type: "individual".to_string(),
+        organizations: None,
     }
 }
 
@@ -377,6 +379,7 @@ pub async fn create_test_api_key_for_user(pool: &PgPool, user_id: UserId) -> Api
     let mut conn = pool.acquire().await.expect("Failed to acquire connection");
     let mut api_key_repo = ApiKeys::new(&mut conn);
     let request = ApiKeyCreateDBRequest::new(
+        user_id,
         user_id,
         ApiKeyCreate {
             name: format!("Test API Key {}", Uuid::new_v4().simple()),

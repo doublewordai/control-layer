@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT ak.user_id, ak.purpose, u.username, u.email, u.is_admin, u.display_name, u.avatar_url, u.payment_provider_id\n        FROM api_keys ak\n        INNER JOIN users u ON ak.user_id = u.id\n        WHERE ak.secret = $1\n        ",
+  "query": "\n        SELECT ak.user_id, ak.purpose, u.username, u.email, u.is_admin, u.display_name, u.avatar_url, u.payment_provider_id\n        FROM api_keys ak\n        INNER JOIN users u ON ak.user_id = u.id\n        WHERE ak.secret = $1 AND ak.is_deleted = false\n        ",
   "describe": {
     "columns": [
       {
@@ -60,5 +60,5 @@
       true
     ]
   },
-  "hash": "c29069a81edb900d37da11166829e5036b2922e721cf95c5922b548dea02ae51"
+  "hash": "cc8dd788a3e3e63ca9a83541c1c2087fb56c6d90c5c01642c992abf8728593d4"
 }

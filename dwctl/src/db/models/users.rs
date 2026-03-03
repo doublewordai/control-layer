@@ -81,4 +81,6 @@ pub struct UserDBResponse {
     pub low_balance_notification_sent: bool,
     /// Low balance notification threshold. NULL means notifications are disabled.
     pub low_balance_threshold: Option<f32>,
+    /// User type: 'individual' or 'organization'
+    pub user_type: String,
 }

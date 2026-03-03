@@ -117,6 +117,7 @@ pub enum Resource {
     Batches,
     Webhooks,
     System,
+    Organizations,
 }
 
 // Permission types for authorization

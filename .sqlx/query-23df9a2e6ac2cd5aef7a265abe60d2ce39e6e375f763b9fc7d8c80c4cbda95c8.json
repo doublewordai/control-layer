@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id, user_id, transaction_type as \"transaction_type: CreditTransactionType\",\n                amount, source_id, description, created_at, seq\n            FROM credits_transactions\n            WHERE id = $1\n            ",
+  "query": "\n            INSERT INTO credits_transactions (user_id, transaction_type, amount, source_id, description, fusillade_batch_id, api_key_id, performed_by)\n            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)\n            RETURNING id, user_id, transaction_type as \"transaction_type: CreditTransactionType\", amount, source_id,\n                      description, created_at, seq, api_key_id, performed_by\n            ",
   "describe": {
     "columns": [
       {
@@ -42,10 +42,27 @@
         "ordinal": 7,
         "name": "seq",
         "type_info": "Int8"
+      },
+      {
+        "ordinal": 8,
+        "name": "api_key_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 9,
+        "name": "performed_by",
+        "type_info": "Uuid"
       }
     ],
     "parameters": {
       "Left": [
+        "Uuid",
+        "Text",
+        "Numeric",
+        "Text",
+        "Text",
+        "Uuid",
+        "Uuid",
         "Uuid"
       ]
     },
@@ -57,8 +74,10 @@
       false,
       true,
       false,
-      false
+      false,
+      true,
+      true
     ]
   },
-  "hash": "49ba6ba94b0c58425b685ccd74c447cea60029568bbc041e08456f00568912ca"
+  "hash": "23df9a2e6ac2cd5aef7a265abe60d2ce39e6e375f763b9fc7d8c80c4cbda95c8"
 }

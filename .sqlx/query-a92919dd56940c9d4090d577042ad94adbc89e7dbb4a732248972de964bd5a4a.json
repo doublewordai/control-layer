@@ -97,6 +97,11 @@
         "ordinal": 18,
         "name": "low_balance_threshold",
         "type_info": "Float4"
+      },
+      {
+        "ordinal": 19,
+        "name": "user_type",
+        "type_info": "Varchar"
       }
     ],
     "parameters": {
@@ -129,7 +134,8 @@
       false,
       false,
       false,
-      true
+      true,
+      false
     ]
   },
   "hash": "a92919dd56940c9d4090d577042ad94adbc89e7dbb4a732248972de964bd5a4a"

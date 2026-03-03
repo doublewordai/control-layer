@@ -30,10 +30,12 @@ pub struct ApiKeyCreateDBRequest {
     pub purpose: ApiKeyPurpose,
     pub requests_per_second: Option<f32>,
     pub burst_size: Option<i32>,
+    /// The individual user who created this key
+    pub created_by: UserId,
 }
 
 impl ApiKeyCreateDBRequest {
-    pub fn new(user_id: UserId, create: ApiKeyCreate) -> Self {
+    pub fn new(user_id: UserId, created_by: UserId, create: ApiKeyCreate) -> Self {
         Self {
             user_id,
             name: create.name,
@@ -41,6 +43,7 @@ impl ApiKeyCreateDBRequest {
             purpose: create.purpose,
             requests_per_second: create.requests_per_second,
             burst_size: create.burst_size,
+            created_by,
         }
     }
 }
@@ -63,6 +66,7 @@ pub struct ApiKeyDBResponse {
     pub secret: String,
     pub purpose: ApiKeyPurpose,
     pub user_id: UserId,
+    pub created_by: UserId,
     pub created_at: DateTime<Utc>,
     pub last_used: Option<DateTime<Utc>>,
     pub model_access: Vec<DeploymentId>,

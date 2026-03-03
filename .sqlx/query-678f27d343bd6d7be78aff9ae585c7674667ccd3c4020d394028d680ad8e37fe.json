@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT COUNT(*) FROM api_keys WHERE user_id = $1 AND hidden = false",
+  "query": "SELECT COUNT(*) FROM api_keys WHERE user_id = $1 AND hidden = false AND is_deleted = false",
   "describe": {
     "columns": [
       {
@@ -18,5 +18,5 @@
       null
     ]
   },
-  "hash": "bb1bd341c6a1ad1918c9502c3276bec5d854cf3235d7df27d82f537a7c605f0f"
+  "hash": "678f27d343bd6d7be78aff9ae585c7674667ccd3c4020d394028d680ad8e37fe"
 }

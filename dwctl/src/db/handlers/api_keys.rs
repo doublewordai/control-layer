@@ -40,11 +40,13 @@ struct ApiKey {
     pub secret: String,
     pub purpose: String,
     pub user_id: UserId,
+    pub created_by: UserId,
     pub created_at: DateTime<Utc>,
     pub last_used: Option<DateTime<Utc>>,
     pub requests_per_second: Option<f32>,
     pub burst_size: Option<i32>,
     pub hidden: bool,
+    pub is_deleted: bool,
 }
 
 impl From<(Vec<DeploymentId>, ApiKey)> for ApiKeyDBResponse {
@@ -73,6 +75,7 @@ impl From<(Vec<DeploymentId>, ApiKey)> for ApiKeyDBResponse {
             secret: api_key.secret,
             purpose,
             user_id: api_key.user_id,
+            created_by: api_key.created_by,
             created_at: api_key.created_at,
             last_used: api_key.last_used,
             model_access,
@@ -110,8 +113,8 @@ impl<'c> Repository for ApiKeys<'c> {
         let api_key = sqlx::query_as!(
             ApiKey,
             r#"
-            INSERT INTO api_keys (name, description, secret, purpose, user_id, requests_per_second, burst_size, hidden)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, false)
+            INSERT INTO api_keys (name, description, secret, purpose, user_id, created_by, requests_per_second, burst_size, hidden)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, false)
             RETURNING *
             "#,
             request.name,
@@ -119,6 +122,7 @@ impl<'c> Repository for ApiKeys<'c> {
             secret,
             purpose_str,
             request.user_id,
+            request.created_by,
             request.requests_per_second,
             request.burst_size
         )
@@ -132,7 +136,7 @@ impl<'c> Repository for ApiKeys<'c> {
     async fn get_by_id(&mut self, id: Self::Id) -> Result<Option<Self::Response>> {
         let api_key = sqlx::query_as!(
             ApiKey,
-            "SELECT id, name, description, secret, purpose, user_id, created_at, last_used, requests_per_second, burst_size, hidden FROM api_keys WHERE id = $1",
+            "SELECT id, name, description, secret, purpose, user_id, created_by, created_at, last_used, requests_per_second, burst_size, hidden, is_deleted FROM api_keys WHERE id = $1 AND is_deleted = false",
             id
         )
             .fetch_optional(&mut *self.db)
@@ -148,7 +152,7 @@ impl<'c> Repository for ApiKeys<'c> {
     async fn get_bulk(&mut self, ids: Vec<Self::Id>) -> Result<HashMap<Self::Id, Self::Response>> {
         let api_keys = sqlx::query_as!(
             ApiKey,
-            "SELECT id, name, description, secret, purpose, user_id, created_at, last_used, requests_per_second, burst_size, hidden FROM api_keys WHERE id = ANY($1)",
+            "SELECT id, name, description, secret, purpose, user_id, created_by, created_at, last_used, requests_per_second, burst_size, hidden, is_deleted FROM api_keys WHERE id = ANY($1)",
             &ids
         )
             .fetch_all(&mut *self.db)
@@ -167,7 +171,7 @@ impl<'c> Repository for ApiKeys<'c> {
         let api_keys = if let Some(user_id) = filter.user_id {
             sqlx::query_as!(
                 ApiKey,
-                "SELECT id, name, description, secret, purpose, user_id, created_at, last_used, requests_per_second, burst_size, hidden FROM api_keys WHERE user_id = $1 AND hidden = false ORDER BY created_at DESC LIMIT $2 OFFSET $3",
+                "SELECT id, name, description, secret, purpose, user_id, created_by, created_at, last_used, requests_per_second, burst_size, hidden, is_deleted FROM api_keys WHERE user_id = $1 AND hidden = false AND is_deleted = false ORDER BY created_at DESC LIMIT $2 OFFSET $3",
                 user_id,
                 filter.limit,
                 filter.skip
@@ -177,7 +181,7 @@ impl<'c> Repository for ApiKeys<'c> {
         } else {
             sqlx::query_as!(
                 ApiKey,
-                "SELECT id, name, description, secret, purpose, user_id, created_at, last_used, requests_per_second, burst_size, hidden FROM api_keys WHERE hidden = false ORDER BY created_at DESC LIMIT $1 OFFSET $2",
+                "SELECT id, name, description, secret, purpose, user_id, created_by, created_at, last_used, requests_per_second, burst_size, hidden, is_deleted FROM api_keys WHERE hidden = false AND is_deleted = false ORDER BY created_at DESC LIMIT $1 OFFSET $2",
                 filter.limit,
                 filter.skip,
             )
@@ -196,7 +200,7 @@ impl<'c> Repository for ApiKeys<'c> {
 
     #[instrument(skip(self), fields(api_key_id = %abbrev_uuid(&id)), err)]
     async fn delete(&mut self, id: Self::Id) -> Result<bool> {
-        let result = sqlx::query!("DELETE FROM api_keys WHERE id = $1", id)
+        let result = sqlx::query!("UPDATE api_keys SET is_deleted = true WHERE id = $1 AND is_deleted = false", id)
             .execute(&mut *self.db)
             .await?;
 
@@ -250,11 +254,14 @@ impl<'c> ApiKeys<'c> {
     #[instrument(skip(self, filter), err)]
     pub async fn count(&mut self, filter: &ApiKeyFilter) -> Result<i64> {
         let count = if let Some(user_id) = filter.user_id {
-            sqlx::query_scalar!("SELECT COUNT(*) FROM api_keys WHERE user_id = $1 AND hidden = false", user_id)
-                .fetch_one(&mut *self.db)
-                .await?
+            sqlx::query_scalar!(
+                "SELECT COUNT(*) FROM api_keys WHERE user_id = $1 AND hidden = false AND is_deleted = false",
+                user_id
+            )
+            .fetch_one(&mut *self.db)
+            .await?
         } else {
-            sqlx::query_scalar!("SELECT COUNT(*) FROM api_keys WHERE hidden = false")
+            sqlx::query_scalar!("SELECT COUNT(*) FROM api_keys WHERE hidden = false AND is_deleted = false")
                 .fetch_one(&mut *self.db)
                 .await?
         };
@@ -279,6 +286,7 @@ impl<'c> ApiKeys<'c> {
             FROM api_keys ak
             JOIN users u ON ak.user_id = u.id
             WHERE ak.secret = $1
+            AND ak.is_deleted = false
             "#,
             secret
         )
@@ -300,7 +308,7 @@ impl<'c> ApiKeys<'c> {
     /// # Returns
     /// Returns the secret of the hidden API key
     #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
-    pub async fn get_or_create_hidden_key(&mut self, user_id: UserId, purpose: ApiKeyPurpose) -> Result<String> {
+    pub async fn get_or_create_hidden_key(&mut self, user_id: UserId, purpose: ApiKeyPurpose, created_by: UserId) -> Result<String> {
         // Convert purpose enum to string for database
         let purpose_str = match purpose {
             ApiKeyPurpose::Platform => "platform",
@@ -315,10 +323,13 @@ impl<'c> ApiKeys<'c> {
             SELECT secret
             FROM api_keys
             WHERE user_id = $1 AND purpose = $2 AND hidden = true
+            AND created_by = $3
+            AND is_deleted = false
             LIMIT 1
             "#,
             user_id,
-            purpose_str
+            purpose_str,
+            created_by
         )
         .fetch_optional(&mut *self.db)
         .await?;
@@ -330,7 +341,14 @@ impl<'c> ApiKeys<'c> {
 
         // No existing key found, create a new one
         let secret = generate_api_key();
-        let name = format!("Internal {} Key", purpose_str);
+        // Include created_by in name for per-member uniqueness within orgs.
+        // For individuals (created_by == user_id), this is cosmetic; for orgs,
+        // it avoids (user_id, name) unique constraint collisions.
+        let name = if user_id == created_by {
+            format!("Internal {} Key", purpose_str)
+        } else {
+            format!("Internal {} Key ({})", purpose_str, &created_by.to_string()[..8])
+        };
         let description = Some(format!(
             "Automatically managed internal API key for {} operations. Not visible to users.",
             purpose_str
@@ -340,14 +358,15 @@ impl<'c> ApiKeys<'c> {
 
         sqlx::query!(
             r#"
-            INSERT INTO api_keys (name, description, secret, purpose, user_id, hidden)
-            VALUES ($1, $2, $3, $4, $5, true)
+            INSERT INTO api_keys (name, description, secret, purpose, user_id, created_by, hidden)
+            VALUES ($1, $2, $3, $4, $5, $6, true)
             "#,
             name,
             description,
             secret,
             purpose_str,
-            user_id
+            user_id,
+            created_by
         )
         .execute(&mut *self.db)
         .await?;
@@ -399,11 +418,13 @@ impl<'c> ApiKeys<'c> {
                 ak.secret as "secret!",
                 ak.purpose as "purpose!",
                 ak.user_id as "user_id!",
+                ak.created_by as "created_by!",
                 ak.created_at as "created_at!",
                 ak.last_used,
                 ak.requests_per_second,
                 ak.burst_size,
-                ak.hidden as "hidden!"
+                ak.hidden as "hidden!",
+                ak.is_deleted as "is_deleted!"
             FROM api_keys ak
             WHERE ak.user_id = $2  -- System user has access to all deployments
 
@@ -416,11 +437,13 @@ impl<'c> ApiKeys<'c> {
                 ak.secret as "secret!",
                 ak.purpose as "purpose!",
                 ak.user_id as "user_id!",
+                ak.created_by as "created_by!",
                 ak.created_at as "created_at!",
                 ak.last_used,
                 ak.requests_per_second,
                 ak.burst_size,
-                ak.hidden as "hidden!"
+                ak.hidden as "hidden!",
+                ak.is_deleted as "is_deleted!"
             FROM api_keys ak
             INNER JOIN user_groups ug ON ak.user_id = ug.user_id
             INNER JOIN deployment_groups dg ON ug.group_id = dg.group_id
@@ -467,11 +490,13 @@ impl<'c> ApiKeys<'c> {
                 ak.secret as "secret!",
                 ak.purpose as "purpose!",
                 ak.user_id as "user_id!",
+                ak.created_by as "created_by!",
                 ak.created_at as "created_at!",
                 ak.last_used,
                 ak.requests_per_second,
                 ak.burst_size,
-                ak.hidden as "hidden!"
+                ak.hidden as "hidden!",
+                ak.is_deleted as "is_deleted!"
             FROM api_keys ak
             INNER JOIN deployment_groups dg ON dg.group_id = '00000000-0000-0000-0000-000000000000'
             INNER JOIN deployed_models dm ON dg.deployment_id = dm.id
@@ -674,6 +699,7 @@ mod tests {
                     purpose: ApiKeyPurpose::Realtime,
                     requests_per_second: None,
                     burst_size: None,
+                    created_by: userid,
                 };
 
                 api_key = api_repo.create(&api_key_create).await.unwrap();
@@ -714,6 +740,7 @@ mod tests {
                 purpose: ApiKeyPurpose::Realtime,
                 requests_per_second: None,
                 burst_size: None,
+                created_by: user.id,
             };
             let key2 = ApiKeyCreateDBRequest {
                 user_id: user.id,
@@ -722,6 +749,7 @@ mod tests {
                 purpose: ApiKeyPurpose::Realtime,
                 requests_per_second: None,
                 burst_size: None,
+                created_by: user.id,
             };
 
             api_repo.create(&key1).await.unwrap();
@@ -776,6 +804,7 @@ mod tests {
                 purpose: ApiKeyPurpose::Realtime,
                 requests_per_second: None,
                 burst_size: None,
+                created_by: user.id,
             };
             api_key = api_repo.create(&api_key_create).await.unwrap();
         }
@@ -819,6 +848,7 @@ mod tests {
                 purpose: ApiKeyPurpose::Realtime,
                 requests_per_second: None,
                 burst_size: None,
+                created_by: user.id,
             };
 
             // Test create via Repository trait
@@ -943,6 +973,7 @@ mod tests {
                 purpose: ApiKeyPurpose::Realtime,
                 requests_per_second: None,
                 burst_size: None,
+                created_by: user.id,
             };
             api_key = api_key_repo.create(&api_key_create).await.unwrap();
         }
@@ -961,6 +992,8 @@ mod tests {
                     transaction_type: CreditTransactionType::AdminGrant,
                     description: Some("Initial credit for testing".to_string()),
                     fusillade_batch_id: None,
+                    api_key_id: None,
+                    performed_by: None,
                 })
                 .await
                 .unwrap();
@@ -1072,6 +1105,7 @@ mod tests {
                 purpose: ApiKeyPurpose::Realtime,
                 requests_per_second: None,
                 burst_size: None,
+                created_by: user.id,
             };
             api_key = api_key_repo.create(&api_key_create).await.unwrap();
         }
@@ -1091,6 +1125,8 @@ mod tests {
                     transaction_type: CreditTransactionType::AdminGrant,
                     description: Some("Initial credit for testing".to_string()),
                     fusillade_batch_id: None,
+                    api_key_id: None,
+                    performed_by: None,
                 })
                 .await
                 .unwrap();
@@ -1215,6 +1251,7 @@ mod tests {
                 purpose: ApiKeyPurpose::Realtime,
                 requests_per_second: None,
                 burst_size: None,
+                created_by: user.id,
             };
             api_key = api_key_repo.create(&api_key_create).await.unwrap();
         }
@@ -1234,6 +1271,8 @@ mod tests {
                     transaction_type: CreditTransactionType::AdminGrant,
                     description: Some("Initial credit for testing".to_string()),
                     fusillade_batch_id: None,
+                    api_key_id: None,
+                    performed_by: None,
                 })
                 .await
                 .unwrap();
@@ -1384,6 +1423,7 @@ mod tests {
                 purpose: ApiKeyPurpose::Realtime,
                 requests_per_second: None,
                 burst_size: None,
+                created_by: user1.id,
             };
             api_key1 = api_key_repo.create(&api_key1_create).await.unwrap();
 
@@ -1394,6 +1434,7 @@ mod tests {
                 purpose: ApiKeyPurpose::Realtime,
                 requests_per_second: None,
                 burst_size: None,
+                created_by: user2.id,
             };
             api_key2 = api_key_repo.create(&api_key2_create).await.unwrap();
         }
@@ -1413,6 +1454,8 @@ mod tests {
                     transaction_type: CreditTransactionType::AdminGrant,
                     description: Some("Initial credit for testing".to_string()),
                     fusillade_batch_id: None,
+                    api_key_id: None,
+                    performed_by: None,
                 })
                 .await
                 .unwrap();
@@ -1424,6 +1467,8 @@ mod tests {
                     transaction_type: CreditTransactionType::AdminGrant,
                     description: Some("Initial credit for testing".to_string()),
                     fusillade_batch_id: None,
+                    api_key_id: None,
+                    performed_by: None,
                 })
                 .await
                 .unwrap();
@@ -1566,6 +1611,7 @@ mod tests {
                 purpose: ApiKeyPurpose::Realtime,
                 requests_per_second: None,
                 burst_size: None,
+                created_by: user.id,
             };
             api_key = api_key_repo.create(&api_key_create).await.unwrap();
         }
@@ -1585,6 +1631,8 @@ mod tests {
                     transaction_type: CreditTransactionType::AdminGrant,
                     description: Some("Initial credit for testing".to_string()),
                     fusillade_batch_id: None,
+                    api_key_id: None,
+                    performed_by: None,
                 })
                 .await
                 .unwrap();
@@ -1707,6 +1755,7 @@ mod tests {
                 purpose: ApiKeyPurpose::Realtime,
                 requests_per_second: None,
                 burst_size: None,
+                created_by: user.id,
             };
             api_key = api_key_repo.create(&api_key_create).await.unwrap();
         }
@@ -1724,6 +1773,8 @@ mod tests {
                     transaction_type: CreditTransactionType::AdminGrant,
                     description: Some("Initial credit for testing".to_string()),
                     fusillade_batch_id: None,
+                    api_key_id: None,
+                    performed_by: None,
                 })
                 .await
                 .unwrap();
@@ -1910,6 +1961,7 @@ mod tests {
                 purpose: ApiKeyPurpose::Realtime,
                 requests_per_second: None,
                 burst_size: None,
+                created_by: user.id,
             };
             api_key = api_key_repo.create(&api_key_create).await.unwrap();
         }
@@ -1929,6 +1981,8 @@ mod tests {
                     transaction_type: CreditTransactionType::AdminGrant,
                     description: Some("Initial credit for testing".to_string()),
                     fusillade_batch_id: None,
+                    api_key_id: None,
+                    performed_by: None,
                 })
                 .await
                 .unwrap();
@@ -1993,6 +2047,7 @@ mod tests {
                     purpose: ApiKeyPurpose::Realtime,
                     requests_per_second: None,
                     burst_size: None,
+                    created_by: user.id,
                 };
                 api_repo.create(&key_create).await.unwrap();
             }
@@ -2120,6 +2175,7 @@ mod tests {
                 purpose: ApiKeyPurpose::Realtime,
                 requests_per_second: None,
                 burst_size: None,
+                created_by: user1.id,
             };
             let key2 = ApiKeyCreateDBRequest {
                 user_id: user2.id,
@@ -2128,6 +2184,7 @@ mod tests {
                 purpose: ApiKeyPurpose::Realtime,
                 requests_per_second: None,
                 burst_size: None,
+                created_by: user2.id,
             };
 
             api_repo.create(&key1).await.unwrap();
@@ -2191,6 +2248,7 @@ mod tests {
             purpose: ApiKeyPurpose::Realtime,
             requests_per_second: None,
             burst_size: None,
+            created_by: user.id,
         };
         let key2_create = ApiKeyCreateDBRequest {
             user_id: user.id,
@@ -2199,6 +2257,7 @@ mod tests {
             purpose: ApiKeyPurpose::Realtime,
             requests_per_second: None,
             burst_size: None,
+            created_by: user.id,
         };
         let key3_create = ApiKeyCreateDBRequest {
             user_id: user.id,
@@ -2207,6 +2266,7 @@ mod tests {
             purpose: ApiKeyPurpose::Realtime,
             requests_per_second: None,
             burst_size: None,
+            created_by: user.id,
         };
 
         let mut api_conn = pool.acquire().await.unwrap();
@@ -2264,6 +2324,7 @@ mod tests {
             purpose: ApiKeyPurpose::Realtime,
             requests_per_second: None,
             burst_size: None,
+            created_by: user.id,
         };
 
         let mut api_conn = pool.acquire().await.unwrap();
@@ -2343,6 +2404,7 @@ mod tests {
             purpose: ApiKeyPurpose::Realtime,
             requests_per_second: None,
             burst_size: None,
+            created_by: user.id,
         };
         let mut api_conn = pool.acquire().await.unwrap();
         let mut api_repo = ApiKeys::new(&mut api_conn);
@@ -2431,6 +2493,7 @@ mod tests {
             purpose: ApiKeyPurpose::Realtime,
             requests_per_second: None,
             burst_size: None,
+            created_by: user.id,
         };
         let key2_create = ApiKeyCreateDBRequest {
             user_id: user.id,
@@ -2439,6 +2502,7 @@ mod tests {
             purpose: ApiKeyPurpose::Realtime,
             requests_per_second: None,
             burst_size: None,
+            created_by: user.id,
         };
 
         let mut api_repo = ApiKeys::new(&mut tx);
@@ -2499,6 +2563,7 @@ mod tests {
             purpose: ApiKeyPurpose::Realtime,
             requests_per_second: None,
             burst_size: None,
+            created_by: user1.id,
         };
         let key2_create = ApiKeyCreateDBRequest {
             user_id: user2.id,
@@ -2507,6 +2572,7 @@ mod tests {
             purpose: ApiKeyPurpose::Realtime,
             requests_per_second: None,
             burst_size: None,
+            created_by: user2.id,
         };
         let mut api_repo = ApiKeys::new(&mut tx);
 
@@ -2750,6 +2816,7 @@ mod tests {
                 user_id: user_with_credits.id,
                 requests_per_second: None,
                 burst_size: None,
+                created_by: user_with_credits.id,
                 purpose: ApiKeyPurpose::Realtime,
             })
             .await
@@ -2762,6 +2829,7 @@ mod tests {
                 user_id: user_without_credits.id,
                 requests_per_second: None,
                 burst_size: None,
+                created_by: user_without_credits.id,
                 purpose: ApiKeyPurpose::Realtime,
             })
             .await
@@ -2781,6 +2849,8 @@ mod tests {
                 source_id: uuid::Uuid::new_v4().to_string(), // Mimics Stripe payment ID
                 description: Some("Initial credits".to_string()),
                 fusillade_batch_id: None,
+                api_key_id: None,
+                performed_by: None,
             })
             .await
             .unwrap();
@@ -2794,6 +2864,8 @@ mod tests {
                 source_id: uuid::Uuid::new_v4().to_string(), // Mimics Stripe payment ID
                 description: Some("Initial credits".to_string()),
                 fusillade_batch_id: None,
+                api_key_id: None,
+                performed_by: None,
             })
             .await
             .unwrap();
@@ -2806,6 +2878,8 @@ mod tests {
                 source_id: uuid::Uuid::new_v4().to_string(), // Mimics request ID from http_analytics
                 description: Some("Used all credits".to_string()),
                 fusillade_batch_id: None,
+                api_key_id: None,
+                performed_by: None,
             })
             .await
             .unwrap();
@@ -2887,6 +2961,7 @@ mod tests {
                     description: None,
                     requests_per_second: None,
                     burst_size: None,
+                    created_by: platform_manager.id,
                     purpose: ApiKeyPurpose::Realtime,
                 })
                 .await
@@ -2920,6 +2995,8 @@ mod tests {
                     source_id: "test".to_string(),
                     description: Some("Platform Manager credits".to_string()),
                     fusillade_batch_id: None,
+                    api_key_id: None,
+                    performed_by: None,
                 })
                 .await
                 .unwrap();
@@ -2979,6 +3056,7 @@ mod tests {
                     description: None,
                     requests_per_second: None,
                     burst_size: None,
+                    created_by: user_no_transactions.id,
                     purpose: ApiKeyPurpose::Realtime,
                 })
                 .await
@@ -3041,6 +3119,7 @@ mod tests {
                     description: None,
                     requests_per_second: None,
                     burst_size: None,
+                    created_by: user_negative.id,
                     purpose: ApiKeyPurpose::Realtime,
                 })
                 .await
@@ -3059,6 +3138,8 @@ mod tests {
                     source_id: uuid::Uuid::new_v4().to_string(), // Mimics Stripe payment ID
                     description: Some("Initial credits".to_string()),
                     fusillade_batch_id: None,
+                    api_key_id: None,
+                    performed_by: None,
                 })
                 .await
                 .unwrap();
@@ -3071,6 +3152,8 @@ mod tests {
                     source_id: uuid::Uuid::new_v4().to_string(), // Mimics request ID from http_analytics
                     description: Some("Negative balance".to_string()),
                     fusillade_batch_id: None,
+                    api_key_id: None,
+                    performed_by: None,
                 })
                 .await
                 .unwrap();
@@ -3130,6 +3213,7 @@ mod tests {
                     description: None,
                     requests_per_second: None,
                     burst_size: None,
+                    created_by: user.id,
                     purpose: ApiKeyPurpose::Realtime,
                 })
                 .await
@@ -3162,6 +3246,8 @@ mod tests {
                     source_id: "test".to_string(),
                     description: Some("Added credits".to_string()),
                     fusillade_batch_id: None,
+                    api_key_id: None,
+                    performed_by: None,
                 })
                 .await
                 .unwrap();
@@ -3270,6 +3356,7 @@ mod tests {
                 user_id: user_no_credits.id,
                 requests_per_second: None,
                 burst_size: None,
+                created_by: user_no_credits.id,
                 purpose: ApiKeyPurpose::Realtime,
             })
             .await
@@ -3406,6 +3493,7 @@ mod tests {
                 user_id: user_no_credits.id,
                 requests_per_second: None,
                 burst_size: None,
+                created_by: user_no_credits.id,
                 purpose: ApiKeyPurpose::Realtime,
             })
             .await
@@ -3542,6 +3630,7 @@ mod tests {
                 user_id: user_no_credits.id,
                 requests_per_second: None,
                 burst_size: None,
+                created_by: user_no_credits.id,
                 purpose: ApiKeyPurpose::Realtime,
             })
             .await
@@ -3603,6 +3692,7 @@ mod tests {
                 purpose: ApiKeyPurpose::Realtime,
                 requests_per_second: None,
                 burst_size: None,
+                created_by: user.id,
             };
 
             api_key = api_repo.create(&api_key_create).await.unwrap();
@@ -3630,5 +3720,348 @@ mod tests {
 
         // Should return None
         assert_eq!(result, None);
+    }
+
+    // ── Soft-delete tests ─────────────────────────────────────────────────
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_delete_is_soft_delete(pool: PgPool) {
+        let mut tx = pool.begin().await.unwrap();
+        let user;
+        let api_key;
+        {
+            let mut user_repo = Users::new(tx.acquire().await.unwrap());
+            user = user_repo
+                .create(&UserCreateDBRequest::from(UserCreate {
+                    username: "softdel".to_string(),
+                    email: "softdel@example.com".to_string(),
+                    display_name: None,
+                    avatar_url: None,
+                    roles: vec![Role::StandardUser],
+                }))
+                .await
+                .unwrap();
+        }
+        {
+            let mut api_repo = ApiKeys::new(tx.acquire().await.unwrap());
+            api_key = api_repo
+                .create(&ApiKeyCreateDBRequest {
+                    user_id: user.id,
+                    name: "Soft Delete Key".to_string(),
+                    description: None,
+                    purpose: ApiKeyPurpose::Realtime,
+                    requests_per_second: None,
+                    burst_size: None,
+                    created_by: user.id,
+                })
+                .await
+                .unwrap();
+        }
+        tx.commit().await.unwrap();
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut api_repo = ApiKeys::new(&mut conn);
+
+        // Delete the key
+        let deleted = api_repo.delete(api_key.id).await.unwrap();
+        assert!(deleted);
+
+        // get_by_id should not find it
+        let found = api_repo.get_by_id(api_key.id).await.unwrap();
+        assert!(found.is_none());
+
+        // But the row should still exist in the database with is_deleted = true
+        let row = sqlx::query!(
+            "SELECT is_deleted FROM api_keys WHERE id = $1",
+            api_key.id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(row.is_deleted);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_soft_deleted_key_excluded_from_list(pool: PgPool) {
+        let mut tx = pool.begin().await.unwrap();
+        let user;
+        let api_key;
+        {
+            let mut user_repo = Users::new(tx.acquire().await.unwrap());
+            user = user_repo
+                .create(&UserCreateDBRequest::from(UserCreate {
+                    username: "listdel".to_string(),
+                    email: "listdel@example.com".to_string(),
+                    display_name: None,
+                    avatar_url: None,
+                    roles: vec![Role::StandardUser],
+                }))
+                .await
+                .unwrap();
+        }
+        {
+            let mut api_repo = ApiKeys::new(tx.acquire().await.unwrap());
+            api_key = api_repo
+                .create(&ApiKeyCreateDBRequest {
+                    user_id: user.id,
+                    name: "To Delete".to_string(),
+                    description: None,
+                    purpose: ApiKeyPurpose::Realtime,
+                    requests_per_second: None,
+                    burst_size: None,
+                    created_by: user.id,
+                })
+                .await
+                .unwrap();
+            // Create a second key that should still be visible
+            api_repo
+                .create(&ApiKeyCreateDBRequest {
+                    user_id: user.id,
+                    name: "Keep Me".to_string(),
+                    description: None,
+                    purpose: ApiKeyPurpose::Realtime,
+                    requests_per_second: None,
+                    burst_size: None,
+                    created_by: user.id,
+                })
+                .await
+                .unwrap();
+        }
+        tx.commit().await.unwrap();
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut api_repo = ApiKeys::new(&mut conn);
+
+        api_repo.delete(api_key.id).await.unwrap();
+
+        let filter = ApiKeyFilter { user_id: Some(user.id), skip: 0, limit: 100 };
+        let keys = api_repo.list(&filter).await.unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].name, "Keep Me");
+    }
+
+    // ── created_by tracking tests ─────────────────────────────────────────
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_created_by_stored_on_api_key(pool: PgPool) {
+        let mut tx = pool.begin().await.unwrap();
+        let owner;
+        let member;
+        {
+            let mut user_repo = Users::new(tx.acquire().await.unwrap());
+            owner = user_repo
+                .create(&UserCreateDBRequest::from(UserCreate {
+                    username: "orgowner".to_string(),
+                    email: "orgowner@example.com".to_string(),
+                    display_name: None,
+                    avatar_url: None,
+                    roles: vec![Role::StandardUser],
+                }))
+                .await
+                .unwrap();
+            member = user_repo
+                .create(&UserCreateDBRequest::from(UserCreate {
+                    username: "orgmember".to_string(),
+                    email: "orgmember@example.com".to_string(),
+                    display_name: None,
+                    avatar_url: None,
+                    roles: vec![Role::StandardUser],
+                }))
+                .await
+                .unwrap();
+        }
+        tx.commit().await.unwrap();
+
+        // Create a key where user_id != created_by (simulating org key created by member)
+        let mut conn = pool.acquire().await.unwrap();
+        let mut api_repo = ApiKeys::new(&mut conn);
+        let api_key = api_repo
+            .create(&ApiKeyCreateDBRequest {
+                user_id: owner.id,
+                name: "Org Key".to_string(),
+                description: None,
+                purpose: ApiKeyPurpose::Realtime,
+                requests_per_second: None,
+                burst_size: None,
+                created_by: member.id,
+            })
+            .await
+            .unwrap();
+
+        // Verify created_by is stored correctly via raw SQL
+        let row = sqlx::query!(
+            "SELECT created_by FROM api_keys WHERE id = $1",
+            api_key.id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.created_by, member.id);
+    }
+
+    // ── Per-member hidden key tests ───────────────────────────────────────
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_hidden_key_per_member_isolation(pool: PgPool) {
+        // Two members each get their own hidden key for the same org user
+        let mut tx = pool.begin().await.unwrap();
+        let org_user;
+        let member_a;
+        let member_b;
+        {
+            let mut user_repo = Users::new(tx.acquire().await.unwrap());
+            org_user = user_repo
+                .create(&UserCreateDBRequest::from(UserCreate {
+                    username: "org-acme".to_string(),
+                    email: "acme@example.com".to_string(),
+                    display_name: None,
+                    avatar_url: None,
+                    roles: vec![Role::StandardUser],
+                }))
+                .await
+                .unwrap();
+            member_a = user_repo
+                .create(&UserCreateDBRequest::from(UserCreate {
+                    username: "member-a".to_string(),
+                    email: "a@example.com".to_string(),
+                    display_name: None,
+                    avatar_url: None,
+                    roles: vec![Role::StandardUser],
+                }))
+                .await
+                .unwrap();
+            member_b = user_repo
+                .create(&UserCreateDBRequest::from(UserCreate {
+                    username: "member-b".to_string(),
+                    email: "b@example.com".to_string(),
+                    display_name: None,
+                    avatar_url: None,
+                    roles: vec![Role::StandardUser],
+                }))
+                .await
+                .unwrap();
+        }
+        tx.commit().await.unwrap();
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut api_repo = ApiKeys::new(&mut conn);
+
+        // Member A gets a hidden batch key for org
+        let secret_a = api_repo
+            .get_or_create_hidden_key(org_user.id, ApiKeyPurpose::Batch, member_a.id)
+            .await
+            .unwrap();
+
+        // Member B gets a different hidden batch key for the same org
+        let secret_b = api_repo
+            .get_or_create_hidden_key(org_user.id, ApiKeyPurpose::Batch, member_b.id)
+            .await
+            .unwrap();
+
+        // The two secrets should be different
+        assert_ne!(secret_a, secret_b);
+
+        // Calling again for the same member should return the same key (idempotent)
+        let secret_a_again = api_repo
+            .get_or_create_hidden_key(org_user.id, ApiKeyPurpose::Batch, member_a.id)
+            .await
+            .unwrap();
+        assert_eq!(secret_a, secret_a_again);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_hidden_key_individual_user_backward_compatible(pool: PgPool) {
+        // For individual users, created_by = user_id — should behave like before
+        let mut tx = pool.begin().await.unwrap();
+        let user;
+        {
+            let mut user_repo = Users::new(tx.acquire().await.unwrap());
+            user = user_repo
+                .create(&UserCreateDBRequest::from(UserCreate {
+                    username: "individual".to_string(),
+                    email: "individual@example.com".to_string(),
+                    display_name: None,
+                    avatar_url: None,
+                    roles: vec![Role::StandardUser],
+                }))
+                .await
+                .unwrap();
+        }
+        tx.commit().await.unwrap();
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut api_repo = ApiKeys::new(&mut conn);
+
+        let secret1 = api_repo
+            .get_or_create_hidden_key(user.id, ApiKeyPurpose::Batch, user.id)
+            .await
+            .unwrap();
+
+        // Same call returns same key
+        let secret2 = api_repo
+            .get_or_create_hidden_key(user.id, ApiKeyPurpose::Batch, user.id)
+            .await
+            .unwrap();
+        assert_eq!(secret1, secret2);
+
+        // Different purpose gives different key
+        let secret_playground = api_repo
+            .get_or_create_hidden_key(user.id, ApiKeyPurpose::Playground, user.id)
+            .await
+            .unwrap();
+        assert_ne!(secret1, secret_playground);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_soft_deleted_hidden_key_not_reused(pool: PgPool) {
+        let mut tx = pool.begin().await.unwrap();
+        let user;
+        {
+            let mut user_repo = Users::new(tx.acquire().await.unwrap());
+            user = user_repo
+                .create(&UserCreateDBRequest::from(UserCreate {
+                    username: "hiddendeluser".to_string(),
+                    email: "hiddendel@example.com".to_string(),
+                    display_name: None,
+                    avatar_url: None,
+                    roles: vec![Role::StandardUser],
+                }))
+                .await
+                .unwrap();
+        }
+        tx.commit().await.unwrap();
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut api_repo = ApiKeys::new(&mut conn);
+
+        // Create hidden key
+        let secret1 = api_repo
+            .get_or_create_hidden_key(user.id, ApiKeyPurpose::Batch, user.id)
+            .await
+            .unwrap();
+
+        // Soft-delete it
+        let key_id = sqlx::query_scalar!(
+            "SELECT id FROM api_keys WHERE secret = $1",
+            &secret1
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        api_repo.delete(key_id).await.unwrap();
+
+        // Getting hidden key again should create a new one
+        let secret2 = api_repo
+            .get_or_create_hidden_key(user.id, ApiKeyPurpose::Batch, user.id)
+            .await
+            .unwrap();
+        assert_ne!(secret1, secret2);
     }
 }

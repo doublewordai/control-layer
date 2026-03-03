@@ -1,0 +1,121 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE users SET\n                display_name = COALESCE($2, display_name),\n                avatar_url = COALESCE($3, avatar_url),\n                email = COALESCE($4, email),\n                updated_at = NOW()\n            WHERE id = $1 AND user_type = 'organization' AND is_deleted = false\n            RETURNING id, username, email, display_name, avatar_url, auth_source, created_at, updated_at,\n                      is_admin, password_hash, external_user_id, payment_provider_id,\n                      batch_notifications_enabled, first_batch_email_sent,\n                      low_balance_notification_sent, low_balance_threshold, user_type\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "username",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "email",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "display_name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 4,
+        "name": "avatar_url",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 5,
+        "name": "auth_source",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 6,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 7,
+        "name": "updated_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 8,
+        "name": "is_admin",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 9,
+        "name": "password_hash",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 10,
+        "name": "external_user_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 11,
+        "name": "payment_provider_id",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 12,
+        "name": "batch_notifications_enabled",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 13,
+        "name": "first_batch_email_sent",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 14,
+        "name": "low_balance_notification_sent",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 15,
+        "name": "low_balance_threshold",
+        "type_info": "Float4"
+      },
+      {
+        "ordinal": 16,
+        "name": "user_type",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Varchar",
+        "Varchar",
+        "Varchar"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      false,
+      false,
+      false,
+      true,
+      false
+    ]
+  },
+  "hash": "e8374837b648dac437790f6c9b3d707b7496fbdd60b587618bb9988fb66ed8ec"
+}

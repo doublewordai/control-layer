@@ -69,6 +69,7 @@ struct User {
     pub first_batch_email_sent: bool,
     pub low_balance_notification_sent: bool,
     pub low_balance_threshold: Option<f32>,
+    pub user_type: String,
 }
 
 pub struct Users<'c> {
@@ -95,6 +96,7 @@ impl From<(Vec<Role>, User)> for UserDBResponse {
             first_batch_email_sent: user.first_batch_email_sent,
             low_balance_notification_sent: user.low_balance_notification_sent,
             low_balance_threshold: user.low_balance_threshold,
+            user_type: user.user_type,
         }
     }
 }
@@ -151,8 +153,12 @@ impl<'c> Repository for Users<'c> {
         // These keys must exist before the user's first request to ensure immediate access
         // Realtime keys are NOT pre-created - users create them explicitly via API and can tolerate activation delay
         let mut api_keys_repo = ApiKeys::new(&mut tx);
-        api_keys_repo.get_or_create_hidden_key(user_id, ApiKeyPurpose::Batch).await?;
-        api_keys_repo.get_or_create_hidden_key(user_id, ApiKeyPurpose::Playground).await?;
+        api_keys_repo
+            .get_or_create_hidden_key(user_id, ApiKeyPurpose::Batch, user_id)
+            .await?;
+        api_keys_repo
+            .get_or_create_hidden_key(user_id, ApiKeyPurpose::Playground, user_id)
+            .await?;
 
         tx.commit().await?;
 
@@ -183,11 +189,12 @@ impl<'c> Repository for Users<'c> {
                 u.first_batch_email_sent,
                 u.low_balance_notification_sent,
                 u.low_balance_threshold,
+                u.user_type,
                 ARRAY_AGG(ur.role) FILTER (WHERE ur.role IS NOT NULL) as "roles: Vec<Role>"
             FROM users u
             LEFT JOIN user_roles ur ON ur.user_id = u.id
             WHERE u.id = $1 AND u.id != '00000000-0000-0000-0000-000000000000' AND u.is_deleted = false
-            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id, u.is_deleted, u.is_internal, u.batch_notifications_enabled, u.first_batch_email_sent, u.low_balance_notification_sent, u.low_balance_threshold
+            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id, u.is_deleted, u.is_internal, u.batch_notifications_enabled, u.first_batch_email_sent, u.low_balance_notification_sent, u.low_balance_threshold, u.user_type
             "#,
             id
         )
@@ -215,6 +222,7 @@ impl<'c> Repository for Users<'c> {
                 first_batch_email_sent: row.first_batch_email_sent,
                 low_balance_notification_sent: row.low_balance_notification_sent,
                 low_balance_threshold: row.low_balance_threshold,
+                user_type: row.user_type,
             };
 
             let roles = row.roles.unwrap_or_default();
@@ -254,11 +262,12 @@ impl<'c> Repository for Users<'c> {
                 u.first_batch_email_sent,
                 u.low_balance_notification_sent,
                 u.low_balance_threshold,
+                u.user_type,
                 ARRAY_AGG(ur.role) FILTER (WHERE ur.role IS NOT NULL) as "roles: Vec<Role>"
             FROM users u
             LEFT JOIN user_roles ur ON ur.user_id = u.id
             WHERE u.id = ANY($1) AND u.id != '00000000-0000-0000-0000-000000000000' AND u.is_deleted = false
-            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id, u.is_deleted, u.is_internal, u.batch_notifications_enabled, u.first_batch_email_sent, u.low_balance_notification_sent, u.low_balance_threshold
+            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id, u.is_deleted, u.is_internal, u.batch_notifications_enabled, u.first_batch_email_sent, u.low_balance_notification_sent, u.low_balance_threshold, u.user_type
             "#,
             ids.as_slice()
         )
@@ -288,6 +297,7 @@ impl<'c> Repository for Users<'c> {
                 first_batch_email_sent: row.first_batch_email_sent,
                 low_balance_notification_sent: row.low_balance_notification_sent,
                 low_balance_threshold: row.low_balance_threshold,
+                user_type: row.user_type,
             };
 
             let roles = row.roles.unwrap_or_default();
@@ -301,7 +311,9 @@ impl<'c> Repository for Users<'c> {
     async fn list(&mut self, filter: &Self::Filter) -> Result<Vec<Self::Response>> {
         use sqlx::QueryBuilder;
 
-        let mut query = QueryBuilder::new("SELECT * FROM users WHERE id != '00000000-0000-0000-0000-000000000000' AND is_deleted = false");
+        let mut query = QueryBuilder::new(
+            "SELECT * FROM users WHERE id != '00000000-0000-0000-0000-000000000000' AND is_deleted = false AND user_type = 'individual'",
+        );
 
         // Add search filter if specified (case-insensitive substring match on display_name, username, or email)
         if let Some(ref search) = filter.search {
@@ -456,8 +468,9 @@ impl<'c> Users<'c> {
     pub async fn count(&mut self, filter: &UserFilter) -> Result<i64> {
         use sqlx::QueryBuilder;
 
-        let mut query =
-            QueryBuilder::new("SELECT COUNT(*) FROM users WHERE id != '00000000-0000-0000-0000-000000000000' AND is_deleted = false");
+        let mut query = QueryBuilder::new(
+            "SELECT COUNT(*) FROM users WHERE id != '00000000-0000-0000-0000-000000000000' AND is_deleted = false AND user_type = 'individual'",
+        );
 
         // Add search filter if specified (case-insensitive substring match on display_name, username, or email)
         if let Some(ref search) = filter.search {
@@ -1029,6 +1042,8 @@ mod tests {
             source_id: Uuid::new_v4().to_string(),
             description: None,
             fusillade_batch_id: None,
+            api_key_id: None,
+            performed_by: None,
         };
         credits.create_transaction(&deduct).await.unwrap();
         credits.refresh_checkpoint(user_id).await.unwrap();
@@ -1072,6 +1087,8 @@ mod tests {
             source_id: Uuid::new_v4().to_string(),
             description: None,
             fusillade_batch_id: None,
+            api_key_id: None,
+            performed_by: None,
         };
         credits.create_transaction(&deduct2).await.unwrap();
         credits.refresh_checkpoint(user_id).await.unwrap();
@@ -1101,6 +1118,8 @@ mod tests {
             source_id: Uuid::new_v4().to_string(),
             description: None,
             fusillade_batch_id: None,
+            api_key_id: None,
+            performed_by: None,
         };
         credits.create_transaction(&deduct).await.unwrap();
         credits.refresh_checkpoint(user_id).await.unwrap();
@@ -1142,5 +1161,77 @@ mod tests {
         // Poll again: user should appear at new threshold
         let low = users.poll_low_balance_users().await.unwrap();
         assert_eq!(low.len(), 1);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_list_users_excludes_organizations(pool: PgPool) {
+        let mut conn = pool.acquire().await.unwrap();
+        let mut repo = Users::new(&mut conn);
+
+        // Create a regular user
+        let user_create = UserCreateDBRequest::from(UserCreate {
+            username: "individual".to_string(),
+            email: "individual@example.com".to_string(),
+            display_name: Some("Individual User".to_string()),
+            avatar_url: None,
+            roles: vec![Role::StandardUser],
+        });
+        repo.create(&user_create).await.unwrap();
+
+        // Create an organization user directly via SQL (since Users::create always creates individuals)
+        sqlx::query!(
+            "INSERT INTO users (id, username, email, auth_source, user_type) VALUES ($1, $2, $3, 'organization', 'organization')",
+            uuid::Uuid::new_v4(),
+            "acme-org",
+            "billing@acme.example.com",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // List should only return individual users (plus any seeded system user)
+        let filter = UserFilter::new(0, 100);
+        let users = repo.list(&filter).await.unwrap();
+
+        for u in &users {
+            assert_eq!(u.user_type, "individual", "Organization users should not appear in list");
+        }
+        assert!(users.iter().any(|u| u.username == "individual"));
+        assert!(!users.iter().any(|u| u.username == "acme-org"));
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_count_users_excludes_organizations(pool: PgPool) {
+        let mut conn = pool.acquire().await.unwrap();
+        let mut repo = Users::new(&mut conn);
+
+        let initial_count = repo.count(&UserFilter::new(0, 100)).await.unwrap();
+
+        // Create a regular user
+        repo.create(&UserCreateDBRequest::from(UserCreate {
+            username: "countuser".to_string(),
+            email: "countuser@example.com".to_string(),
+            display_name: None,
+            avatar_url: None,
+            roles: vec![Role::StandardUser],
+        }))
+        .await
+        .unwrap();
+
+        // Create an org user via raw SQL
+        sqlx::query!(
+            "INSERT INTO users (id, username, email, auth_source, user_type) VALUES ($1, $2, $3, 'organization', 'organization')",
+            uuid::Uuid::new_v4(),
+            "count-org",
+            "count-org@example.com",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let new_count = repo.count(&UserFilter::new(0, 100)).await.unwrap();
+        assert_eq!(new_count, initial_count + 1, "Count should increase by 1 (the individual), not 2");
     }
 }
