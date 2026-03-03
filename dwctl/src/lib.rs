@@ -477,6 +477,7 @@ pub async fn seed_database(sources: &[config::ModelSource], db: &PgPool) -> Resu
                             open_responses_adapter: None,
                             traffic_routing_rules: None,
                             allowed_batch_completion_windows: None,
+                            metadata: None,
                         }),
                     ))
                     .await

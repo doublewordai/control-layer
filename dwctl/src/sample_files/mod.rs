@@ -187,6 +187,7 @@ mod tests {
             trusted: false,
             open_responses_adapter: true,
             allowed_batch_completion_windows: None,
+            metadata: serde_json::Value::Object(serde_json::Map::new()),
         }
     }
 

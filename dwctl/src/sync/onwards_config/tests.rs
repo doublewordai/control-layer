@@ -455,6 +455,7 @@ async fn test_onwards_config_reloads_on_tariff_change(pool: sqlx::PgPool) {
             trusted: false,
             open_responses_adapter: true,
             allowed_batch_completion_windows: None,
+            metadata: None,
         })
         .await
         .unwrap();
@@ -570,6 +571,7 @@ async fn test_batch_api_key_access_to_composite_escalation_target(pool: sqlx::Pg
             fallback_with_replacement: None,
             fallback_max_attempts: None,
             allowed_batch_completion_windows: None,
+            metadata: None,
             sanitize_responses: true,
             trusted: false,
             open_responses_adapter: true,
@@ -605,6 +607,7 @@ async fn test_batch_api_key_access_to_composite_escalation_target(pool: sqlx::Pg
             fallback_with_replacement: None,
             allowed_batch_completion_windows: None,
             fallback_max_attempts: None,
+            metadata: None,
             sanitize_responses: true,
             trusted: false,
             open_responses_adapter: true,
