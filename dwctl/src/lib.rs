@@ -1721,8 +1721,11 @@ async fn setup_background_services(
             }
         }
 
-        // Start batch notification poller if enabled
-        if config.background_services.notifications.enabled {
+        // Always start the batch completion poller — it triggers lazy
+        // finalization of terminal batches (setting completed_at / failed_at).
+        // Notifications (emails, webhooks) are gated on config.enabled inside
+        // the poller itself.
+        {
             let daemon_config = config.clone();
             let daemon_request_manager = request_manager.clone();
             let daemon_pool = pool.clone();
@@ -1855,8 +1858,8 @@ async fn setup_background_services(
                             }
                         }
 
-                        // Start batch notification poller if enabled
-                        if config.background_services.notifications.enabled {
+                        // Always start the batch completion poller (see comment above)
+                        {
                             let daemon_config = config.clone();
                             let daemon_session_token = session_token.clone();
                             tokio::spawn(async move {
@@ -1869,7 +1872,7 @@ async fn setup_background_services(
                                 )
                                 .await;
                             });
-                            tracing::info!("Batch notification poller started on elected leader");
+                            tracing::info!("Batch completion poller started on elected leader");
                         }
 
                         Ok(())

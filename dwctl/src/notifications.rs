@@ -1,6 +1,8 @@
-//! Batch completion notification poller.
+//! Batch completion poller.
 //!
-//! Polls fusillade for completed/failed/cancelled batches and:
+//! Always runs to trigger lazy finalization of terminal batches (setting
+//! `completed_at` / `failed_at` timestamps via `poll_completed_batches`).
+//! When notifications are enabled (`config.enabled`), also:
 //! 1. Creates webhook delivery records for matching webhooks
 //! 2. Ticks the webhook dispatcher (claim → sign → send → process results)
 //! 3. Sends email notifications
@@ -119,28 +121,35 @@ pub async fn run_notification_poller(
     dwctl_pool: PgPool,
     shutdown: CancellationToken,
 ) {
-    let mut dispatcher = if config.webhooks.enabled {
+    let notifications_enabled = config.enabled;
+
+    let mut dispatcher = if notifications_enabled && config.webhooks.enabled {
         Some(WebhookDispatcher::spawn(dwctl_pool.clone(), &config.webhooks, shutdown.clone()))
     } else {
         None
     };
 
-    let email_service = match EmailService::new(&app_config) {
-        Ok(svc) => {
-            tracing::info!("Launched email service successfully");
-            Some(svc)
+    let email_service = if notifications_enabled {
+        match EmailService::new(&app_config) {
+            Ok(svc) => {
+                tracing::info!("Launched email service successfully");
+                Some(svc)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to create email service, email notifications disabled");
+                None
+            }
         }
-        Err(e) => {
-            tracing::warn!(error = %e, "Failed to create email service, email notifications disabled");
-            None
-        }
+    } else {
+        None
     };
 
     tracing::info!(
         poll_interval = ?config.poll_interval,
-        webhooks = config.webhooks.enabled,
+        notifications = notifications_enabled,
+        webhooks = dispatcher.is_some(),
         email = email_service.is_some(),
-        "Starting batch notification poller"
+        "Starting batch completion poller"
     );
 
     loop {
