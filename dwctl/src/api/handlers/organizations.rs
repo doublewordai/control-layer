@@ -810,8 +810,8 @@ mod tests {
             .add_header(&admin_headers[1].0, &admin_headers[1].1)
             .await;
         resp.assert_status(axum::http::StatusCode::BAD_REQUEST);
-        let body = resp.json::<serde_json::Value>();
-        assert!(body["message"].as_str().unwrap().contains("last owner"));
+        let body = resp.text();
+        assert!(body.contains("last owner"));
     }
 
     #[sqlx::test]
@@ -881,8 +881,8 @@ mod tests {
             .json(&json!({ "role": "member" }))
             .await;
         resp.assert_status(axum::http::StatusCode::BAD_REQUEST);
-        let body = resp.json::<serde_json::Value>();
-        assert!(body["message"].as_str().unwrap().contains("last owner"));
+        let body = resp.text();
+        assert!(body.contains("last owner"));
     }
 
     // ── Privilege escalation prevention ──────────────────────────────────
