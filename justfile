@@ -631,6 +631,9 @@ ci target *args="":
         rust)
             echo "🦀 Running Rust CI pipeline..."
 
+            echo "📋 Checking Cargo.lock sync..."
+            cargo metadata --locked > /dev/null
+
             # Setup databases using db-setup target
             just db-setup
 
