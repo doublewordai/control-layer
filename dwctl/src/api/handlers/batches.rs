@@ -203,8 +203,8 @@ pub async fn create_batch<P: PoolProvider>(
         });
     }
 
-    // Check credit balance if analytics/billing is enabled
-    if state.config.enable_analytics {
+    // Reject batches from users with negative credit balance
+    {
         let mut conn = state.db.read().acquire().await.map_err(|e| Error::Internal {
             operation: format!("get db connection for credit check: {}", e),
         })?;
