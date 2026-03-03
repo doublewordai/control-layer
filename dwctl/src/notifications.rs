@@ -343,29 +343,12 @@ async fn send_low_balance_notifications(
     users: &[LowBalanceUser],
     conn: &mut sqlx::pool::PoolConnection<sqlx::Postgres>,
 ) {
-    let user_ids: Vec<_> = users.iter().map(|u| u.id).collect();
-
-    // Bulk-fetch balances for email bodies
-    let balances = {
-        let mut credits = crate::db::handlers::Credits::new(&mut *conn);
-        match credits.get_users_balances_bulk(&user_ids, None).await {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!(error = %e, "Failed to fetch balances for low-balance emails");
-                return;
-            }
-        }
-    };
-
     let mut sent_ids = Vec::new();
 
     for user in users {
-        let Some(balance) = balances.get(&user.id) else {
-            continue;
-        };
         let name = user.display_name.as_deref().unwrap_or(&user.username);
 
-        if let Err(e) = email_service.send_low_balance_email(&user.email, Some(name), balance).await {
+        if let Err(e) = email_service.send_low_balance_email(&user.email, Some(name), &user.balance).await {
             tracing::warn!(
                 user_id = %user.id,
                 email = %user.email,
@@ -375,7 +358,7 @@ async fn send_low_balance_notifications(
             continue;
         }
 
-        tracing::info!(user_id = %user.id, email = %user.email, balance = %balance, "Sent low-balance notification");
+        tracing::info!(user_id = %user.id, email = %user.email, balance = %user.balance, "Sent low-balance notification");
         sent_ids.push(user.id);
     }
 

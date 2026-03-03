@@ -44,6 +44,7 @@ pub struct LowBalanceUser {
     pub email: String,
     pub username: String,
     pub display_name: Option<String>,
+    pub balance: rust_decimal::Decimal,
 }
 
 // Database entity model
@@ -709,7 +710,7 @@ impl<'c> Users<'c> {
                   AND u.low_balance_threshold IS NOT NULL
                   AND c.balance >= u.low_balance_threshold
             )
-            SELECT u.id, u.email, u.username, u.display_name
+            SELECT u.id, u.email, u.username, u.display_name, c.balance
             FROM users u
             JOIN user_balance_checkpoints c ON u.id = c.user_id
             WHERE u.id != '00000000-0000-0000-0000-000000000000'
