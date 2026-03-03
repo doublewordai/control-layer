@@ -429,9 +429,7 @@ mod tests {
     use crate::api::models::users::{Role, UserCreate};
     use crate::db::handlers::repository::Repository;
     use crate::db::handlers::users::Users;
-    use crate::db::models::organizations::{
-        OrganizationCreateDBRequest, OrganizationUpdateDBRequest,
-    };
+    use crate::db::models::organizations::{OrganizationCreateDBRequest, OrganizationUpdateDBRequest};
     use crate::db::models::users::UserCreateDBRequest;
     use sqlx::PgPool;
 
@@ -743,13 +741,10 @@ mod tests {
         orgs.delete(org.id).await.unwrap();
 
         // Verify scrubbed data via raw SQL
-        let row = sqlx::query!(
-            "SELECT username, email, display_name, is_deleted FROM users WHERE id = $1",
-            org.id
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let row = sqlx::query!("SELECT username, email, display_name, is_deleted FROM users WHERE id = $1", org.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
 
         assert!(row.is_deleted);
         assert!(row.display_name.is_none());

@@ -152,7 +152,7 @@ impl<'c> Repository for ApiKeys<'c> {
     async fn get_bulk(&mut self, ids: Vec<Self::Id>) -> Result<HashMap<Self::Id, Self::Response>> {
         let api_keys = sqlx::query_as!(
             ApiKey,
-            "SELECT id, name, description, secret, purpose, user_id, created_by, created_at, last_used, requests_per_second, burst_size, hidden, is_deleted FROM api_keys WHERE id = ANY($1)",
+            "SELECT id, name, description, secret, purpose, user_id, created_by, created_at, last_used, requests_per_second, burst_size, hidden, is_deleted FROM api_keys WHERE id = ANY($1) AND is_deleted = false",
             &ids
         )
             .fetch_all(&mut *self.db)
@@ -3772,13 +3772,10 @@ mod tests {
         assert!(found.is_none());
 
         // But the row should still exist in the database with is_deleted = true
-        let row = sqlx::query!(
-            "SELECT is_deleted FROM api_keys WHERE id = $1",
-            api_key.id
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let row = sqlx::query!("SELECT is_deleted FROM api_keys WHERE id = $1", api_key.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert!(row.is_deleted);
     }
 
@@ -3836,7 +3833,11 @@ mod tests {
 
         api_repo.delete(api_key.id).await.unwrap();
 
-        let filter = ApiKeyFilter { user_id: Some(user.id), skip: 0, limit: 100 };
+        let filter = ApiKeyFilter {
+            user_id: Some(user.id),
+            skip: 0,
+            limit: 100,
+        };
         let keys = api_repo.list(&filter).await.unwrap();
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].name, "Keep Me");
@@ -3892,13 +3893,10 @@ mod tests {
             .unwrap();
 
         // Verify created_by is stored correctly via raw SQL
-        let row = sqlx::query!(
-            "SELECT created_by FROM api_keys WHERE id = $1",
-            api_key.id
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let row = sqlx::query!("SELECT created_by FROM api_keys WHERE id = $1", api_key.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(row.created_by, member.id);
     }
 
@@ -4047,13 +4045,10 @@ mod tests {
             .unwrap();
 
         // Soft-delete it
-        let key_id = sqlx::query_scalar!(
-            "SELECT id FROM api_keys WHERE secret = $1",
-            &secret1
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let key_id = sqlx::query_scalar!("SELECT id FROM api_keys WHERE secret = $1", &secret1)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
 
         api_repo.delete(key_id).await.unwrap();
 
