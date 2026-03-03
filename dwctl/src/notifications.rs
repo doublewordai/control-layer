@@ -195,7 +195,7 @@ pub async fn run_notification_poller(
             }
         }
 
-        // === Step 5: Clear recovered flags + find low-balance users, then send emails ===
+        // === Step 4: Clear recovered flags + find low-balance users, then send emails ===
         if let Some(ref email_service) = email_service {
             let low_balance_users = {
                 let mut users = Users::new(&mut conn);
@@ -211,7 +211,7 @@ pub async fn run_notification_poller(
             }
         }
 
-        // === Step 6: Dispatch webhooks (claim → sign → send → process results) ===
+        // === Step 5: Dispatch webhooks (claim → sign → send → process results) ===
         if let Some(ref mut dispatcher) = dispatcher {
             dispatcher.tick().await;
         }
