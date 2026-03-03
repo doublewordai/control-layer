@@ -634,15 +634,15 @@ pub async fn remove_member<P: PoolProvider>(
 
     // Check if we're removing the last owner
     let target_role = repo.get_user_org_role(user_id, id).await?;
-    if let Some(ref role) = target_role {
-        if role == "owner" {
-            let members = repo.list_members(id).await?;
-            let owner_count = members.iter().filter(|m| m.role == "owner").count();
-            if owner_count <= 1 {
-                return Err(Error::BadRequest {
-                    message: "Cannot remove the last owner of an organization. Transfer ownership first.".to_string(),
-                });
-            }
+    if let Some(ref role) = target_role
+        && role == "owner"
+    {
+        let members = repo.list_members(id).await?;
+        let owner_count = members.iter().filter(|m| m.role == "owner").count();
+        if owner_count <= 1 {
+            return Err(Error::BadRequest {
+                message: "Cannot remove the last owner of an organization. Transfer ownership first.".to_string(),
+            });
         }
     }
 
@@ -775,9 +775,7 @@ pub async fn set_active_organization<P: PoolProvider>(
 #[cfg(test)]
 mod tests {
     use crate::api::models::users::Role;
-    use crate::test::utils::{
-        add_auth_headers, create_test_admin_user, create_test_app, create_test_user,
-    };
+    use crate::test::utils::{add_auth_headers, create_test_admin_user, create_test_app, create_test_user};
     use serde_json::json;
     use sqlx::PgPool;
 

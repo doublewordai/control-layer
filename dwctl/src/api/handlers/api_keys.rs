@@ -86,9 +86,7 @@ pub async fn create_user_api_key<P: PoolProvider>(
             if !can_create_all_api_keys && !can_create_own_api_keys {
                 // Check if user is any member of the target org
                 let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
-                let member = is_org_member(&current_user, uuid, &mut conn)
-                    .await
-                    .map_err(Error::Database)?;
+                let member = is_org_member(&current_user, uuid, &mut conn).await.map_err(Error::Database)?;
                 if !member {
                     return Err(Error::InsufficientPermissions {
                         required: Permission::Any(vec![
@@ -180,9 +178,7 @@ pub async fn list_user_api_keys<P: PoolProvider>(
             } else if !can_read_own_api_keys {
                 // Check if user is any member of the target org
                 let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
-                let member = is_org_member(&current_user, uuid, &mut conn)
-                    .await
-                    .map_err(Error::Database)?;
+                let member = is_org_member(&current_user, uuid, &mut conn).await.map_err(Error::Database)?;
                 if !member {
                     return Err(Error::InsufficientPermissions {
                         required: Permission::Any(vec![
@@ -277,9 +273,7 @@ pub async fn get_user_api_key<P: PoolProvider>(
             } else if !can_read_own_api_keys {
                 // Check if user is any member of the target org
                 let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
-                let member = is_org_member(&current_user, uuid, &mut conn)
-                    .await
-                    .map_err(Error::Database)?;
+                let member = is_org_member(&current_user, uuid, &mut conn).await.map_err(Error::Database)?;
                 if !member {
                     return Err(Error::InsufficientPermissions {
                         required: Permission::Any(vec![
@@ -367,9 +361,7 @@ pub async fn delete_user_api_key<P: PoolProvider>(
             } else if !can_delete_own_api_keys {
                 // Check if user is any member of the target org
                 let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
-                let member = is_org_member(&current_user, uuid, &mut conn)
-                    .await
-                    .map_err(Error::Database)?;
+                let member = is_org_member(&current_user, uuid, &mut conn).await.map_err(Error::Database)?;
                 if !member {
                     return Err(Error::InsufficientPermissions {
                         required: Permission::Any(vec![
@@ -1114,5 +1106,241 @@ mod tests {
         // ApiKeyInfoResponse doesn't have a key field - this is the security feature
         assert_eq!(retrieved_key.id, created_key.id);
         assert_eq!(retrieved_key.name, created_key.name);
+    }
+
+    // ── Organization API key tests ────────────────────────────────────────
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_org_member_can_create_api_key(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let alice = create_test_user(&pool, Role::StandardUser).await;
+        let bob = create_test_user(&pool, Role::StandardUser).await;
+        let org = create_test_org(&pool, alice.id).await;
+        add_org_member(&pool, org.id, bob.id, "member").await;
+
+        // Bob (member, not admin) creates a key for the org
+        let api_key_data = json!({
+            "name": "Bob Org Key",
+            "description": "Created by member",
+            "purpose": "realtime"
+        });
+
+        let response = app
+            .post(&format!("/admin/api/v1/users/{}/api-keys", org.id))
+            .add_header(&add_auth_headers(&bob)[0].0, &add_auth_headers(&bob)[0].1)
+            .add_header(&add_auth_headers(&bob)[1].0, &add_auth_headers(&bob)[1].1)
+            .json(&api_key_data)
+            .await;
+
+        response.assert_status(axum::http::StatusCode::CREATED);
+        let api_key: ApiKeyResponse = response.json();
+        assert_eq!(api_key.name, "Bob Org Key");
+        assert!(api_key.key.starts_with("sk-"));
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_non_member_cannot_create_org_api_key(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let alice = create_test_user(&pool, Role::StandardUser).await;
+        let outsider = create_test_user(&pool, Role::StandardUser).await;
+        let org = create_test_org(&pool, alice.id).await;
+
+        // Outsider (not a member) tries to create a key for the org
+        let api_key_data = json!({
+            "name": "Outsider Key",
+            "purpose": "realtime"
+        });
+
+        let response = app
+            .post(&format!("/admin/api/v1/users/{}/api-keys", org.id))
+            .add_header(&add_auth_headers(&outsider)[0].0, &add_auth_headers(&outsider)[0].1)
+            .add_header(&add_auth_headers(&outsider)[1].0, &add_auth_headers(&outsider)[1].1)
+            .json(&api_key_data)
+            .await;
+
+        response.assert_status_forbidden();
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_org_member_list_only_own_keys(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let alice = create_test_user(&pool, Role::StandardUser).await;
+        let bob = create_test_user(&pool, Role::StandardUser).await;
+        let org = create_test_org(&pool, alice.id).await;
+        add_org_member(&pool, org.id, bob.id, "member").await;
+
+        // Alice (owner) creates a key for the org
+        let response = app
+            .post(&format!("/admin/api/v1/users/{}/api-keys", org.id))
+            .add_header(&add_auth_headers(&alice)[0].0, &add_auth_headers(&alice)[0].1)
+            .add_header(&add_auth_headers(&alice)[1].0, &add_auth_headers(&alice)[1].1)
+            .json(&json!({"name": "Alice Key", "purpose": "realtime"}))
+            .await;
+        response.assert_status(axum::http::StatusCode::CREATED);
+
+        // Bob (member) creates a key for the org
+        let response = app
+            .post(&format!("/admin/api/v1/users/{}/api-keys", org.id))
+            .add_header(&add_auth_headers(&bob)[0].0, &add_auth_headers(&bob)[0].1)
+            .add_header(&add_auth_headers(&bob)[1].0, &add_auth_headers(&bob)[1].1)
+            .json(&json!({"name": "Bob Key", "purpose": "realtime"}))
+            .await;
+        response.assert_status(axum::http::StatusCode::CREATED);
+
+        // Alice lists org keys → should only see her own key
+        let response = app
+            .get(&format!("/admin/api/v1/users/{}/api-keys", org.id))
+            .add_header(&add_auth_headers(&alice)[0].0, &add_auth_headers(&alice)[0].1)
+            .add_header(&add_auth_headers(&alice)[1].0, &add_auth_headers(&alice)[1].1)
+            .await;
+        response.assert_status_ok();
+        let paginated: PaginatedResponse<ApiKeyInfoResponse> = response.json();
+        assert_eq!(paginated.data.len(), 1);
+        assert_eq!(paginated.data[0].name, "Alice Key");
+
+        // Bob lists org keys → should only see his own key
+        let response = app
+            .get(&format!("/admin/api/v1/users/{}/api-keys", org.id))
+            .add_header(&add_auth_headers(&bob)[0].0, &add_auth_headers(&bob)[0].1)
+            .add_header(&add_auth_headers(&bob)[1].0, &add_auth_headers(&bob)[1].1)
+            .await;
+        response.assert_status_ok();
+        let paginated: PaginatedResponse<ApiKeyInfoResponse> = response.json();
+        assert_eq!(paginated.data.len(), 1);
+        assert_eq!(paginated.data[0].name, "Bob Key");
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_org_member_cannot_get_other_members_key(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let alice = create_test_user(&pool, Role::StandardUser).await;
+        let bob = create_test_user(&pool, Role::StandardUser).await;
+        let org = create_test_org(&pool, alice.id).await;
+        add_org_member(&pool, org.id, bob.id, "member").await;
+
+        // Bob creates a key
+        let response = app
+            .post(&format!("/admin/api/v1/users/{}/api-keys", org.id))
+            .add_header(&add_auth_headers(&bob)[0].0, &add_auth_headers(&bob)[0].1)
+            .add_header(&add_auth_headers(&bob)[1].0, &add_auth_headers(&bob)[1].1)
+            .json(&json!({"name": "Bob Key", "purpose": "realtime"}))
+            .await;
+        response.assert_status(axum::http::StatusCode::CREATED);
+        let bob_key: ApiKeyResponse = response.json();
+
+        // Alice tries to get Bob's key by ID → should get 404
+        let response = app
+            .get(&format!("/admin/api/v1/users/{}/api-keys/{}", org.id, bob_key.id))
+            .add_header(&add_auth_headers(&alice)[0].0, &add_auth_headers(&alice)[0].1)
+            .add_header(&add_auth_headers(&alice)[1].0, &add_auth_headers(&alice)[1].1)
+            .await;
+        response.assert_status_not_found();
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_org_member_cannot_delete_other_members_key(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let alice = create_test_user(&pool, Role::StandardUser).await;
+        let bob = create_test_user(&pool, Role::StandardUser).await;
+        let org = create_test_org(&pool, alice.id).await;
+        add_org_member(&pool, org.id, bob.id, "member").await;
+
+        // Bob creates a key
+        let response = app
+            .post(&format!("/admin/api/v1/users/{}/api-keys", org.id))
+            .add_header(&add_auth_headers(&bob)[0].0, &add_auth_headers(&bob)[0].1)
+            .add_header(&add_auth_headers(&bob)[1].0, &add_auth_headers(&bob)[1].1)
+            .json(&json!({"name": "Bob Key", "purpose": "realtime"}))
+            .await;
+        response.assert_status(axum::http::StatusCode::CREATED);
+        let bob_key: ApiKeyResponse = response.json();
+
+        // Alice tries to delete Bob's key → should get 404
+        let response = app
+            .delete(&format!("/admin/api/v1/users/{}/api-keys/{}", org.id, bob_key.id))
+            .add_header(&add_auth_headers(&alice)[0].0, &add_auth_headers(&alice)[0].1)
+            .add_header(&add_auth_headers(&alice)[1].0, &add_auth_headers(&alice)[1].1)
+            .await;
+        response.assert_status_not_found();
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_org_member_can_delete_own_key(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let alice = create_test_user(&pool, Role::StandardUser).await;
+        let bob = create_test_user(&pool, Role::StandardUser).await;
+        let org = create_test_org(&pool, alice.id).await;
+        add_org_member(&pool, org.id, bob.id, "member").await;
+
+        // Bob creates a key
+        let response = app
+            .post(&format!("/admin/api/v1/users/{}/api-keys", org.id))
+            .add_header(&add_auth_headers(&bob)[0].0, &add_auth_headers(&bob)[0].1)
+            .add_header(&add_auth_headers(&bob)[1].0, &add_auth_headers(&bob)[1].1)
+            .json(&json!({"name": "Bob Key", "purpose": "realtime"}))
+            .await;
+        response.assert_status(axum::http::StatusCode::CREATED);
+        let bob_key: ApiKeyResponse = response.json();
+
+        // Bob deletes his own key → should succeed
+        let response = app
+            .delete(&format!("/admin/api/v1/users/{}/api-keys/{}", org.id, bob_key.id))
+            .add_header(&add_auth_headers(&bob)[0].0, &add_auth_headers(&bob)[0].1)
+            .add_header(&add_auth_headers(&bob)[1].0, &add_auth_headers(&bob)[1].1)
+            .await;
+        response.assert_status(axum::http::StatusCode::NO_CONTENT);
+
+        // Verify key is gone from Bob's list
+        let response = app
+            .get(&format!("/admin/api/v1/users/{}/api-keys", org.id))
+            .add_header(&add_auth_headers(&bob)[0].0, &add_auth_headers(&bob)[0].1)
+            .add_header(&add_auth_headers(&bob)[1].0, &add_auth_headers(&bob)[1].1)
+            .await;
+        response.assert_status_ok();
+        let paginated: PaginatedResponse<ApiKeyInfoResponse> = response.json();
+        assert_eq!(paginated.data.len(), 0);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_platform_manager_sees_all_org_keys(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let alice = create_test_user(&pool, Role::StandardUser).await;
+        let bob = create_test_user(&pool, Role::StandardUser).await;
+        let pm = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let org = create_test_org(&pool, alice.id).await;
+        add_org_member(&pool, org.id, bob.id, "member").await;
+
+        // Alice creates a key
+        app.post(&format!("/admin/api/v1/users/{}/api-keys", org.id))
+            .add_header(&add_auth_headers(&alice)[0].0, &add_auth_headers(&alice)[0].1)
+            .add_header(&add_auth_headers(&alice)[1].0, &add_auth_headers(&alice)[1].1)
+            .json(&json!({"name": "Alice Key", "purpose": "realtime"}))
+            .await
+            .assert_status(axum::http::StatusCode::CREATED);
+
+        // Bob creates a key
+        app.post(&format!("/admin/api/v1/users/{}/api-keys", org.id))
+            .add_header(&add_auth_headers(&bob)[0].0, &add_auth_headers(&bob)[0].1)
+            .add_header(&add_auth_headers(&bob)[1].0, &add_auth_headers(&bob)[1].1)
+            .json(&json!({"name": "Bob Key", "purpose": "realtime"}))
+            .await
+            .assert_status(axum::http::StatusCode::CREATED);
+
+        // PlatformManager lists org keys → should see all keys (bypasses created_by filter)
+        let response = app
+            .get(&format!("/admin/api/v1/users/{}/api-keys", org.id))
+            .add_header(&add_auth_headers(&pm)[0].0, &add_auth_headers(&pm)[0].1)
+            .add_header(&add_auth_headers(&pm)[1].0, &add_auth_headers(&pm)[1].1)
+            .await;
+        response.assert_status_ok();
+        let paginated: PaginatedResponse<ApiKeyInfoResponse> = response.json();
+        assert_eq!(paginated.data.len(), 2);
     }
 }

@@ -4069,4 +4069,240 @@ mod tests {
             .unwrap();
         assert_ne!(secret1, secret2);
     }
+
+    // ── created_by filter tests ───────────────────────────────────────────
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_list_filters_by_created_by(pool: PgPool) {
+        // Simulate org scenario: two members create keys for the same org user_id
+        let mut tx = pool.begin().await.unwrap();
+        let org_user;
+        let member_a;
+        let member_b;
+        {
+            let mut user_repo = Users::new(tx.acquire().await.unwrap());
+            org_user = user_repo
+                .create(&UserCreateDBRequest::from(UserCreate {
+                    username: "org".to_string(),
+                    email: "org@example.com".to_string(),
+                    display_name: None,
+                    avatar_url: None,
+                    roles: vec![Role::StandardUser],
+                }))
+                .await
+                .unwrap();
+            member_a = user_repo
+                .create(&UserCreateDBRequest::from(UserCreate {
+                    username: "member_a".to_string(),
+                    email: "a@example.com".to_string(),
+                    display_name: None,
+                    avatar_url: None,
+                    roles: vec![Role::StandardUser],
+                }))
+                .await
+                .unwrap();
+            member_b = user_repo
+                .create(&UserCreateDBRequest::from(UserCreate {
+                    username: "member_b".to_string(),
+                    email: "b@example.com".to_string(),
+                    display_name: None,
+                    avatar_url: None,
+                    roles: vec![Role::StandardUser],
+                }))
+                .await
+                .unwrap();
+        }
+        {
+            let mut api_repo = ApiKeys::new(tx.acquire().await.unwrap());
+            // Member A creates 2 keys for the org
+            api_repo
+                .create(&ApiKeyCreateDBRequest {
+                    user_id: org_user.id,
+                    name: "A-Key-1".to_string(),
+                    description: None,
+                    purpose: ApiKeyPurpose::Realtime,
+                    requests_per_second: None,
+                    burst_size: None,
+                    created_by: member_a.id,
+                })
+                .await
+                .unwrap();
+            api_repo
+                .create(&ApiKeyCreateDBRequest {
+                    user_id: org_user.id,
+                    name: "A-Key-2".to_string(),
+                    description: None,
+                    purpose: ApiKeyPurpose::Realtime,
+                    requests_per_second: None,
+                    burst_size: None,
+                    created_by: member_a.id,
+                })
+                .await
+                .unwrap();
+            // Member B creates 1 key for the org
+            api_repo
+                .create(&ApiKeyCreateDBRequest {
+                    user_id: org_user.id,
+                    name: "B-Key-1".to_string(),
+                    description: None,
+                    purpose: ApiKeyPurpose::Realtime,
+                    requests_per_second: None,
+                    burst_size: None,
+                    created_by: member_b.id,
+                })
+                .await
+                .unwrap();
+        }
+        tx.commit().await.unwrap();
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut api_repo = ApiKeys::new(&mut conn);
+
+        // Filter by created_by = member_a → should see 2 keys
+        let a_keys = api_repo
+            .list(&ApiKeyFilter {
+                skip: 0,
+                limit: 100,
+                user_id: Some(org_user.id),
+                created_by: Some(member_a.id),
+            })
+            .await
+            .unwrap();
+        assert_eq!(a_keys.len(), 2);
+        assert!(a_keys.iter().all(|k| k.name.starts_with("A-Key")));
+
+        // Filter by created_by = member_b → should see 1 key
+        let b_keys = api_repo
+            .list(&ApiKeyFilter {
+                skip: 0,
+                limit: 100,
+                user_id: Some(org_user.id),
+                created_by: Some(member_b.id),
+            })
+            .await
+            .unwrap();
+        assert_eq!(b_keys.len(), 1);
+        assert_eq!(b_keys[0].name, "B-Key-1");
+
+        // No created_by filter → should see all 3 keys
+        let all_keys = api_repo
+            .list(&ApiKeyFilter {
+                skip: 0,
+                limit: 100,
+                user_id: Some(org_user.id),
+                created_by: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(all_keys.len(), 3);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_count_filters_by_created_by(pool: PgPool) {
+        let mut tx = pool.begin().await.unwrap();
+        let org_user;
+        let member_a;
+        let member_b;
+        {
+            let mut user_repo = Users::new(tx.acquire().await.unwrap());
+            org_user = user_repo
+                .create(&UserCreateDBRequest::from(UserCreate {
+                    username: "org".to_string(),
+                    email: "org@example.com".to_string(),
+                    display_name: None,
+                    avatar_url: None,
+                    roles: vec![Role::StandardUser],
+                }))
+                .await
+                .unwrap();
+            member_a = user_repo
+                .create(&UserCreateDBRequest::from(UserCreate {
+                    username: "member_a".to_string(),
+                    email: "a@example.com".to_string(),
+                    display_name: None,
+                    avatar_url: None,
+                    roles: vec![Role::StandardUser],
+                }))
+                .await
+                .unwrap();
+            member_b = user_repo
+                .create(&UserCreateDBRequest::from(UserCreate {
+                    username: "member_b".to_string(),
+                    email: "b@example.com".to_string(),
+                    display_name: None,
+                    avatar_url: None,
+                    roles: vec![Role::StandardUser],
+                }))
+                .await
+                .unwrap();
+        }
+        {
+            let mut api_repo = ApiKeys::new(tx.acquire().await.unwrap());
+            for i in 0..3 {
+                api_repo
+                    .create(&ApiKeyCreateDBRequest {
+                        user_id: org_user.id,
+                        name: format!("A-Key-{i}"),
+                        description: None,
+                        purpose: ApiKeyPurpose::Realtime,
+                        requests_per_second: None,
+                        burst_size: None,
+                        created_by: member_a.id,
+                    })
+                    .await
+                    .unwrap();
+            }
+            api_repo
+                .create(&ApiKeyCreateDBRequest {
+                    user_id: org_user.id,
+                    name: "B-Key".to_string(),
+                    description: None,
+                    purpose: ApiKeyPurpose::Realtime,
+                    requests_per_second: None,
+                    burst_size: None,
+                    created_by: member_b.id,
+                })
+                .await
+                .unwrap();
+        }
+        tx.commit().await.unwrap();
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut api_repo = ApiKeys::new(&mut conn);
+
+        let a_count = api_repo
+            .count(&ApiKeyFilter {
+                skip: 0,
+                limit: 100,
+                user_id: Some(org_user.id),
+                created_by: Some(member_a.id),
+            })
+            .await
+            .unwrap();
+        assert_eq!(a_count, 3);
+
+        let b_count = api_repo
+            .count(&ApiKeyFilter {
+                skip: 0,
+                limit: 100,
+                user_id: Some(org_user.id),
+                created_by: Some(member_b.id),
+            })
+            .await
+            .unwrap();
+        assert_eq!(b_count, 1);
+
+        let total_count = api_repo
+            .count(&ApiKeyFilter {
+                skip: 0,
+                limit: 100,
+                user_id: Some(org_user.id),
+                created_by: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(total_count, 4);
+    }
 }
