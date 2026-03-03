@@ -156,7 +156,7 @@ pub async fn run_notification_poller(
         tokio::select! {
             _ = tokio::time::sleep(config.poll_interval) => {}
             _ = shutdown.cancelled() => {
-                tracing::info!("Batch notification poller shutting down");
+                tracing::info!("Batch completion poller shutting down");
                 return;
             }
         }
@@ -167,7 +167,7 @@ pub async fn run_notification_poller(
         match request_manager.poll_completed_batches().await {
             Ok(batches) => {
                 if !batches.is_empty() {
-                    tracing::info!(count = batches.len(), "Found batches needing notification");
+                    tracing::info!(count = batches.len(), "Found terminal batches to finalize");
 
                     let infos: Vec<_> = batches.iter().filter_map(BatchNotificationInfo::try_from_batch).collect();
 
