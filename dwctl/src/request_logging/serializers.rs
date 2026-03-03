@@ -980,6 +980,7 @@ mod tests {
         };
 
         // Response with usage data
+        #[allow(deprecated)]
         let chat_response = CreateChatCompletionResponse {
             id: "chatcmpl-123".to_string(),
             object: "chat.completion".to_string(),
@@ -993,6 +994,7 @@ mod tests {
                 prompt_tokens_details: None,
                 completion_tokens_details: None,
             }),
+            system_fingerprint: None,
             service_tier: None,
         };
 
@@ -1044,6 +1046,7 @@ mod tests {
         };
 
         // Streaming response with usage in the last chunk
+        #[allow(deprecated)]
         let stream_chunk = CreateChatCompletionStreamResponse {
             id: "chatcmpl-123".to_string(),
             object: "chat.completion.chunk".to_string(),
@@ -1057,6 +1060,7 @@ mod tests {
                 prompt_tokens_details: None,
                 completion_tokens_details: None,
             }),
+            system_fingerprint: None,
             service_tier: None,
         };
 
@@ -1149,6 +1153,7 @@ mod tests {
             duration_to_first_byte: Duration::from_millis(50),
         };
 
+        #[allow(deprecated)]
         let completions_response = CreateCompletionResponse {
             id: "cmpl-123".to_string(),
             object: "text_completion".to_string(),
@@ -1162,6 +1167,7 @@ mod tests {
                 prompt_tokens_details: None,
                 completion_tokens_details: None,
             }),
+            system_fingerprint: None,
         };
 
         let parsed_response = AiResponse::Completions(completions_response);
