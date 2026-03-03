@@ -221,6 +221,7 @@ credits:
 # Optional feature toggles
 enable_metrics: true # Enable Prometheus metrics endpoint
 enable_request_logging: true # Enable request/response logging to database
+enable_otel_export: true # Enable OpenTelemetry tracing export (requires OTEL env vars or Jaeger on :4318)
 # Note: Environment variables can override top level setting, as long as they're supplied with the DWCTL_ prefix:
 # DWCTL_PORT=8080
 #

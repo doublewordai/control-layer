@@ -1,0 +1,44 @@
+# Local observability stack for distributed tracing development.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.observability.yml up
+#
+# Then:
+#   1. Enable OTEL export in config.yaml:
+#        enable_otel_export: true
+#
+#   2. Set env vars (or use defaults):
+#        OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
+#        OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+#        OTEL_SERVICE_NAME=dwctl
+#
+#   3. View traces in Jaeger UI:
+#        http://localhost:16686
+#
+# If running dwctl outside of docker (cargo run), Jaeger's OTLP port is
+# exposed on localhost:4318 which matches the default in telemetry.rs.
+
+services:
+  jaeger:
+    image: jaegertracing/jaeger:2
+    ports:
+      # OTLP gRPC
+      - "4317:4317"
+      # OTLP HTTP (matches dwctl telemetry.rs default)
+      - "4318:4318"
+      # Jaeger UI
+      - "16686:16686"
+    environment:
+      # In-memory storage is fine for local dev
+      SPAN_STORAGE_TYPE: memory
+      # Increase trace retention for dev sessions
+      MEMORY_MAX_TRACES: 10000
+
+  # Override control-layer to enable OTEL export and point at Jaeger
+  control-layer:
+    environment:
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318
+      - OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+      - OTEL_SERVICE_NAME=dwctl
+    depends_on:
+      - jaeger
