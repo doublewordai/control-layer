@@ -21,13 +21,20 @@ pub struct ApiKeyFilter {
     pub skip: i64,
     pub limit: i64,
     pub user_id: Option<UserId>,
+    /// When set, only return keys created by this user (used for org-scoped visibility)
+    pub created_by: Option<UserId>,
 }
 
 impl ApiKeyFilter {
     // Currently only constructed in testing.
     #[cfg(test)]
     pub fn new(skip: i64, limit: i64, user_id: Option<UserId>) -> Self {
-        Self { skip, limit, user_id }
+        Self {
+            skip,
+            limit,
+            user_id,
+            created_by: None,
+        }
     }
 }
 
@@ -168,26 +175,22 @@ impl<'c> Repository for ApiKeys<'c> {
 
     #[instrument(skip(self, filter), fields(limit = filter.limit, skip = filter.skip), err)]
     async fn list(&mut self, filter: &Self::Filter) -> Result<Vec<Self::Response>> {
-        let api_keys = if let Some(user_id) = filter.user_id {
-            sqlx::query_as!(
-                ApiKey,
-                "SELECT id, name, description, secret, purpose, user_id, created_by, created_at, last_used, requests_per_second, burst_size, hidden, is_deleted FROM api_keys WHERE user_id = $1 AND hidden = false AND is_deleted = false ORDER BY created_at DESC LIMIT $2 OFFSET $3",
-                user_id,
-                filter.limit,
-                filter.skip
-            )
-            .fetch_all(&mut *self.db)
-            .await?
-        } else {
-            sqlx::query_as!(
-                ApiKey,
-                "SELECT id, name, description, secret, purpose, user_id, created_by, created_at, last_used, requests_per_second, burst_size, hidden, is_deleted FROM api_keys WHERE hidden = false AND is_deleted = false ORDER BY created_at DESC LIMIT $1 OFFSET $2",
-                filter.limit,
-                filter.skip,
-            )
-            .fetch_all(&mut *self.db)
-            .await?
-        };
+        let api_keys = sqlx::query_as!(
+            ApiKey,
+            r#"SELECT id, name, description, secret, purpose, user_id, created_by, created_at, last_used, requests_per_second, burst_size, hidden, is_deleted
+            FROM api_keys
+            WHERE hidden = false AND is_deleted = false
+              AND ($1::uuid IS NULL OR user_id = $1)
+              AND ($4::uuid IS NULL OR created_by = $4)
+            ORDER BY created_at DESC
+            LIMIT $2 OFFSET $3"#,
+            filter.user_id,
+            filter.limit,
+            filter.skip,
+            filter.created_by,
+        )
+        .fetch_all(&mut *self.db)
+        .await?;
 
         let mut responses = Vec::new();
         for key in api_keys {
@@ -253,18 +256,16 @@ impl<'c> ApiKeys<'c> {
     /// Count total API keys matching the filter
     #[instrument(skip(self, filter), err)]
     pub async fn count(&mut self, filter: &ApiKeyFilter) -> Result<i64> {
-        let count = if let Some(user_id) = filter.user_id {
-            sqlx::query_scalar!(
-                "SELECT COUNT(*) FROM api_keys WHERE user_id = $1 AND hidden = false AND is_deleted = false",
-                user_id
-            )
-            .fetch_one(&mut *self.db)
-            .await?
-        } else {
-            sqlx::query_scalar!("SELECT COUNT(*) FROM api_keys WHERE hidden = false AND is_deleted = false")
-                .fetch_one(&mut *self.db)
-                .await?
-        };
+        let count = sqlx::query_scalar!(
+            r#"SELECT COUNT(*) FROM api_keys
+            WHERE hidden = false AND is_deleted = false
+              AND ($1::uuid IS NULL OR user_id = $1)
+              AND ($2::uuid IS NULL OR created_by = $2)"#,
+            filter.user_id,
+            filter.created_by,
+        )
+        .fetch_one(&mut *self.db)
+        .await?;
 
         Ok(count.unwrap_or(0))
     }

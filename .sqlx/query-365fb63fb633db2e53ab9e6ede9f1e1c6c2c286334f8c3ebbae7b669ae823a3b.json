@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, name, description, secret, purpose, user_id, created_by, created_at, last_used, requests_per_second, burst_size, hidden, is_deleted FROM api_keys WHERE hidden = false AND is_deleted = false ORDER BY created_at DESC LIMIT $1 OFFSET $2",
+  "query": "SELECT id, name, description, secret, purpose, user_id, created_by, created_at, last_used, requests_per_second, burst_size, hidden, is_deleted\n            FROM api_keys\n            WHERE hidden = false AND is_deleted = false\n              AND ($1::uuid IS NULL OR user_id = $1)\n              AND ($4::uuid IS NULL OR created_by = $4)\n            ORDER BY created_at DESC\n            LIMIT $2 OFFSET $3",
   "describe": {
     "columns": [
       {
@@ -71,8 +71,10 @@
     ],
     "parameters": {
       "Left": [
+        "Uuid",
         "Int8",
-        "Int8"
+        "Int8",
+        "Uuid"
       ]
     },
     "nullable": [
@@ -91,5 +93,5 @@
       false
     ]
   },
-  "hash": "b52b9a083f8a780d572ce95124ac91a60d0a4d8f094233a6d5428f01e89a792e"
+  "hash": "365fb63fb633db2e53ab9e6ede9f1e1c6c2c286334f8c3ebbae7b669ae823a3b"
 }

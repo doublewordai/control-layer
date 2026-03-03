@@ -9,8 +9,8 @@ use crate::{
         users::CurrentUser,
     },
     auth::permissions::{
-        can_create_all_resources, can_create_own_resource, can_delete_all_resources, can_delete_own_resource, can_manage_org_resource,
-        can_read_all_resources, can_read_own_resource,
+        can_create_all_resources, can_create_own_resource, can_delete_all_resources, can_delete_own_resource, can_read_all_resources,
+        can_read_own_resource, is_org_member,
     },
     db::handlers::{Repository, api_keys::ApiKeyFilter, api_keys::ApiKeys},
     db::models::api_keys::ApiKeyCreateDBRequest,
@@ -84,12 +84,12 @@ pub async fn create_user_api_key<P: PoolProvider>(
 
             // Allow creation if user can create all API keys OR create their own API keys
             if !can_create_all_api_keys && !can_create_own_api_keys {
-                // Check if user is an org admin/owner for the target user
+                // Check if user is any member of the target org
                 let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
-                let can_org = can_manage_org_resource(&current_user, uuid, &mut conn)
+                let member = is_org_member(&current_user, uuid, &mut conn)
                     .await
                     .map_err(Error::Database)?;
-                if !can_org {
+                if !member {
                     return Err(Error::InsufficientPermissions {
                         required: Permission::Any(vec![
                             Permission::Allow(Resource::ApiKeys, Operation::CreateAll),
@@ -156,6 +156,9 @@ pub async fn list_user_api_keys<P: PoolProvider>(
     // Can't use RequiresPermission here because we need conditional logic for own vs other users
     current_user: CurrentUser,
 ) -> Result<Json<PaginatedResponse<ApiKeyInfoResponse>>> {
+    // PlatformManagers (ReadAll) see all keys unfiltered; everyone else is scoped to created_by
+    let mut skip_created_by_filter = false;
+
     let target_user_id = match user_id {
         UserIdOrCurrent::Current(_) => {
             // Even for /current, verify they have permission to read their own API keys
@@ -172,14 +175,15 @@ pub async fn list_user_api_keys<P: PoolProvider>(
             let can_read_all_api_keys = can_read_all_resources(&current_user, Resource::ApiKeys);
             let can_read_own_api_keys = can_read_own_resource(&current_user, Resource::ApiKeys, uuid);
 
-            // Allow access if user can read all API keys OR read their own API keys
-            if !can_read_all_api_keys && !can_read_own_api_keys {
-                // Check if user is an org admin/owner for the target user
+            if can_read_all_api_keys {
+                skip_created_by_filter = true;
+            } else if !can_read_own_api_keys {
+                // Check if user is any member of the target org
                 let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
-                let can_org = can_manage_org_resource(&current_user, uuid, &mut conn)
+                let member = is_org_member(&current_user, uuid, &mut conn)
                     .await
                     .map_err(Error::Database)?;
-                if !can_org {
+                if !member {
                     return Err(Error::InsufficientPermissions {
                         required: Permission::Any(vec![
                             Permission::Allow(Resource::ApiKeys, Operation::ReadAll),
@@ -202,10 +206,12 @@ pub async fn list_user_api_keys<P: PoolProvider>(
     let skip = query.pagination.skip();
     let limit = query.pagination.limit();
 
+    // Always scope to keys created by this user, unless they have ReadAll (PlatformManager)
     let filter = ApiKeyFilter {
         skip,
         limit,
         user_id: Some(target_user_id),
+        created_by: if skip_created_by_filter { None } else { Some(current_user.id) },
     };
 
     // Get total count and list of items
@@ -248,6 +254,8 @@ pub async fn get_user_api_key<P: PoolProvider>(
     // Can't use RequiresPermission here because we need conditional logic for own vs other users
     current_user: CurrentUser,
 ) -> Result<Json<ApiKeyInfoResponse>> {
+    let mut skip_created_by_filter = false;
+
     let target_user_id = match user_id {
         UserIdOrCurrent::Current(_) => {
             // Even for /current, verify they have permission to read their own API keys
@@ -264,14 +272,15 @@ pub async fn get_user_api_key<P: PoolProvider>(
             let can_read_all_api_keys = can_read_all_resources(&current_user, Resource::ApiKeys);
             let can_read_own_api_keys = can_read_own_resource(&current_user, Resource::ApiKeys, uuid);
 
-            // Allow access if user can read all API keys OR read their own API keys
-            if !can_read_all_api_keys && !can_read_own_api_keys {
-                // Check if user is an org admin/owner for the target user
+            if can_read_all_api_keys {
+                skip_created_by_filter = true;
+            } else if !can_read_own_api_keys {
+                // Check if user is any member of the target org
                 let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
-                let can_org = can_manage_org_resource(&current_user, uuid, &mut conn)
+                let member = is_org_member(&current_user, uuid, &mut conn)
                     .await
                     .map_err(Error::Database)?;
-                if !can_org {
+                if !member {
                     return Err(Error::InsufficientPermissions {
                         required: Permission::Any(vec![
                             Permission::Allow(Resource::ApiKeys, Operation::ReadAll),
@@ -290,11 +299,12 @@ pub async fn get_user_api_key<P: PoolProvider>(
     let mut pool_conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut repo = ApiKeys::new(&mut pool_conn);
 
-    // Get the specific API key and verify ownership
+    // Get the specific API key, verify ownership and created_by visibility
     let api_key = repo
         .get_by_id(api_key_id)
         .await?
         .filter(|key| key.user_id == target_user_id)
+        .filter(|key| skip_created_by_filter || key.created_by == current_user.id)
         .ok_or_else(|| Error::NotFound {
             resource: "API key".to_string(),
             id: api_key_id.to_string(),
@@ -334,6 +344,8 @@ pub async fn delete_user_api_key<P: PoolProvider>(
     // Can't use RequiresPermission here because we need conditional logic for own vs other users
     current_user: CurrentUser,
 ) -> Result<StatusCode> {
+    let mut skip_created_by_filter = false;
+
     let target_user_id = match user_id {
         UserIdOrCurrent::Current(_) => {
             // Even for /current, verify they have permission to delete their own API keys
@@ -350,14 +362,15 @@ pub async fn delete_user_api_key<P: PoolProvider>(
             let can_delete_all_api_keys = can_delete_all_resources(&current_user, Resource::ApiKeys);
             let can_delete_own_api_keys = can_delete_own_resource(&current_user, Resource::ApiKeys, uuid);
 
-            // Allow deletion if user can delete all API keys OR delete their own API keys
-            if !can_delete_all_api_keys && !can_delete_own_api_keys {
-                // Check if user is an org admin/owner for the target user
+            if can_delete_all_api_keys {
+                skip_created_by_filter = true;
+            } else if !can_delete_own_api_keys {
+                // Check if user is any member of the target org
                 let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
-                let can_org = can_manage_org_resource(&current_user, uuid, &mut conn)
+                let member = is_org_member(&current_user, uuid, &mut conn)
                     .await
                     .map_err(Error::Database)?;
-                if !can_org {
+                if !member {
                     return Err(Error::InsufficientPermissions {
                         required: Permission::Any(vec![
                             Permission::Allow(Resource::ApiKeys, Operation::DeleteAll),
@@ -375,10 +388,11 @@ pub async fn delete_user_api_key<P: PoolProvider>(
     let mut tx = state.db.write().begin().await.map_err(|e| Error::Database(e.into()))?;
     let mut repo = ApiKeys::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
 
-    // Check if the API key exists and belongs to the target user before deleting
+    // Check if the API key exists, belongs to the target user, and was created by current user
     repo.get_by_id(api_key_id)
         .await?
         .filter(|key| key.user_id == target_user_id)
+        .filter(|key| skip_created_by_filter || key.created_by == current_user.id)
         .ok_or_else(|| Error::NotFound {
             resource: "API key".to_string(),
             id: api_key_id.to_string(),

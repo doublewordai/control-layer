@@ -418,6 +418,20 @@ pub async fn can_manage_org_resource(
     }
 }
 
+/// Check if the current user is a member of the organization (any role).
+/// Returns true if target_user_id is an org and current_user has any membership role.
+pub async fn is_org_member(
+    current_user: &CurrentUser,
+    target_user_id: UserId,
+    db: &mut sqlx::PgConnection,
+) -> std::result::Result<bool, crate::db::errors::DbError> {
+    let mut repo = crate::db::handlers::Organizations::new(db);
+    Ok(repo
+        .get_user_org_role(current_user.id, target_user_id)
+        .await?
+        .is_some())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
