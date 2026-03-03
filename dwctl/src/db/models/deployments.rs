@@ -7,7 +7,7 @@
 use crate::api::models::deployments::{DeployedModelCreate, DeployedModelUpdate};
 use crate::types::{DeploymentId, InferenceEndpointId, UserId};
 use bon::Builder;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use serde_with::rust::double_option;
@@ -226,6 +226,30 @@ impl ModelType {
     }
 }
 
+/// Catalog-style metadata for display purposes (stored as JSONB).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema, PartialEq)]
+pub struct ModelCatalogMetadata {
+    /// Relative intelligence tier: "flagship", "mid", "lite"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub intelligence_tier: Option<String>,
+
+    /// Context window size in tokens
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<i64>,
+
+    /// When the model was released by its provider
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub released_at: Option<NaiveDate>,
+
+    /// Provider name (e.g. "OpenAI", "Anthropic")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+
+    /// Quantization type (e.g. "fp16", "int8")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quantization: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum ModelStatus {
@@ -406,6 +430,8 @@ pub struct DeploymentCreateDBRequest {
     pub open_responses_adapter: bool,
     /// Per-model allowed batch completion windows (overrides global config when set)
     pub allowed_batch_completion_windows: Option<Vec<String>>,
+    /// Catalog metadata for display purposes (stored as JSONB)
+    pub metadata: Option<ModelCatalogMetadata>,
 }
 
 impl DeploymentCreateDBRequest {
@@ -431,6 +457,7 @@ impl DeploymentCreateDBRequest {
                 .trusted(standard.trusted.unwrap_or(false))
                 .open_responses_adapter(standard.open_responses_adapter.unwrap_or(true))
                 .maybe_allowed_batch_completion_windows(standard.allowed_batch_completion_windows)
+                .maybe_metadata(standard.metadata)
                 .build(),
             DeployedModelCreate::Composite(composite) => Self::builder()
                 .created_by(created_by)
@@ -455,6 +482,7 @@ impl DeploymentCreateDBRequest {
                 .trusted(composite.trusted.unwrap_or(false))
                 .open_responses_adapter(composite.open_responses_adapter.unwrap_or(true))
                 .maybe_allowed_batch_completion_windows(composite.allowed_batch_completion_windows)
+                .maybe_metadata(composite.metadata)
                 .build(),
         }
     }
@@ -493,6 +521,8 @@ pub struct DeploymentUpdateDBRequest {
     pub open_responses_adapter: Option<bool>,
     /// Per-model allowed batch completion windows (None = no change, Some(None) = clear, Some(windows) = set)
     pub allowed_batch_completion_windows: Option<Option<Vec<String>>>,
+    /// Catalog metadata (None = no change, Some(metadata) = replace)
+    pub metadata: Option<ModelCatalogMetadata>,
 }
 
 impl From<DeployedModelUpdate> for DeploymentUpdateDBRequest {
@@ -518,6 +548,7 @@ impl From<DeployedModelUpdate> for DeploymentUpdateDBRequest {
             .maybe_trusted(update.trusted)
             .maybe_open_responses_adapter(update.open_responses_adapter)
             .maybe_allowed_batch_completion_windows(update.allowed_batch_completion_windows)
+            .maybe_metadata(update.metadata)
             .build()
     }
 }
@@ -584,6 +615,8 @@ pub struct DeploymentDBResponse {
     pub open_responses_adapter: bool,
     /// Per-model allowed batch completion windows (overrides global config when set)
     pub allowed_batch_completion_windows: Option<Vec<String>>,
+    /// Catalog metadata (JSONB)
+    pub metadata: serde_json::Value,
 }
 
 /// DB action for a traffic routing rule (used at the repository layer)
