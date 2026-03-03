@@ -42,6 +42,9 @@ pub struct UserUpdateDBRequest {
     pub roles: Option<Vec<Role>>,
     pub password_hash: Option<String>,
     pub batch_notifications_enabled: Option<bool>,
+    /// Low balance notification threshold.
+    /// `None` = don't change, `Some(None)` = disable, `Some(Some(val))` = set threshold.
+    pub low_balance_threshold: Option<Option<f32>>,
 }
 
 impl UserUpdateDBRequest {
@@ -52,6 +55,7 @@ impl UserUpdateDBRequest {
             roles: update.roles,
             password_hash: None, // Regular updates don't include password changes
             batch_notifications_enabled: update.batch_notifications_enabled,
+            low_balance_threshold: update.low_balance_threshold,
         }
     }
 }
@@ -74,4 +78,7 @@ pub struct UserDBResponse {
     pub payment_provider_id: Option<String>,
     pub batch_notifications_enabled: bool,
     pub first_batch_email_sent: bool,
+    pub low_balance_notification_sent: bool,
+    /// Low balance notification threshold. NULL means notifications are disabled.
+    pub low_balance_threshold: Option<f32>,
 }

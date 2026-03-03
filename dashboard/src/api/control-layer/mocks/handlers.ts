@@ -593,6 +593,7 @@ export const handlers = [
       external_user_id: crypto.randomUUID(),
       has_payment_provider_id: false,
       batch_notifications_enabled: false,
+      low_balance_threshold: 2.0,
     };
     return HttpResponse.json(newUser, { status: 201 });
   }),

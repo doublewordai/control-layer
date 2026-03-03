@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"></head>
+<body style="font-family: system-ui, sans-serif; max-width: 600px; margin: 40px auto; padding: 20px; color: #333;">
+    <p>Hi {{ to_name }},</p>
+
+    <p>Your Doubleword credits are running low.</p>
+
+    <p>To keep your workflows running smoothly, <a href="{{ dashboard_link }}">top up your account</a>.</p>
+
+    <p><strong>Why teams use Doubleword:</strong></p>
+    <ul style="padding-left: 20px; line-height: 1.8;">
+        <li>Save up to 75% on batch workloads</li>
+        <li>High and Standard Priority delivery (guaranteed SLAs — or you don't pay)</li>
+        <li>Pay per token — no hidden fees</li>
+        <li>OpenAI-compatible API</li>
+    </ul>
+
+    <p>If you've hit any friction or have feedback, just let us know — we're iterating quickly and it directly shapes what we prioritise next.</p>
+
+    <p style="font-size: 12px; color: #888; margin-top: 30px; border-top: 1px solid #eee; padding-top: 15px;">
+        You're receiving this because your balance dropped below your configured threshold.
+        You'll only receive this notification once until your balance is topped up.
+        <a href="{{ profile_link }}">Manage notification preferences</a>
+    </p>
+</body>
+</html>

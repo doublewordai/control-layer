@@ -285,6 +285,7 @@ export interface User {
   credit_balance?: number; // User's balance in dollars (backend field name is credit_balance)
   has_payment_provider_id: boolean; // Whether the user has a payment provider customer ID set
   batch_notifications_enabled: boolean; // Whether the user receives batch completion emails
+  low_balance_threshold: number | null; // Threshold for low balance notifications (null = disabled)
 }
 
 export interface ApiKey {
@@ -380,6 +381,7 @@ export interface UserUpdateRequest {
   avatar_url?: string;
   roles?: Role[];
   batch_notifications_enabled?: boolean;
+  low_balance_threshold?: number | null; // Set a threshold to enable, null to disable
 }
 
 export interface GroupUpdateRequest {

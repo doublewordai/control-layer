@@ -1080,6 +1080,7 @@ mod tests {
             roles: Some(vec![Role::StandardUser, Role::PlatformManager]),
             password_hash: None,
             batch_notifications_enabled: None,
+            low_balance_threshold: None,
         };
         users_repo.update(user.id, &update).await.unwrap();
 

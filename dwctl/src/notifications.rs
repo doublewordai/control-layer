@@ -23,7 +23,7 @@ use uuid::Uuid;
 use crate::config::NotificationsConfig;
 use crate::db::handlers::Webhooks;
 use crate::db::handlers::repository::Repository;
-use crate::db::handlers::users::Users;
+use crate::db::handlers::users::{LowBalanceUser, Users};
 use crate::db::models::webhooks::WebhookDeliveryCreateDBRequest;
 use crate::email::EmailService;
 use crate::webhooks::WebhookDispatcher;
@@ -161,6 +161,14 @@ pub async fn run_notification_poller(
 
         tracing::debug!("Completion poller tick");
 
+        let mut conn = match dwctl_pool.acquire().await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to acquire database connection for notification poller tick");
+                continue;
+            }
+        };
+
         // === Step 1: Poll fusillade for completed batches ===
         match request_manager.poll_completed_batches().await {
             Ok(batches) => {
@@ -171,14 +179,14 @@ pub async fn run_notification_poller(
 
                     // === Step 2: Create webhook delivery records ===
                     if dispatcher.is_some() {
-                        let _ = create_batch_deliveries(&dwctl_pool, &infos)
+                        let _ = create_batch_deliveries(&mut conn, &infos)
                             .await
                             .inspect_err(|e| tracing::warn!(error = %e, "Failed to create webhook delivery records"));
                     }
 
                     // === Step 3: Send email notifications ===
                     if let Some(ref email_service) = email_service {
-                        send_email_notifications(email_service, &infos, &dwctl_pool).await;
+                        send_email_notifications(email_service, &infos, &mut conn).await;
                     }
                 }
             }
@@ -187,7 +195,23 @@ pub async fn run_notification_poller(
             }
         }
 
-        // === Step 4: Dispatch webhooks (claim → sign → send → process results) ===
+        // === Step 4: Clear recovered flags + find low-balance users, then send emails ===
+        if let Some(ref email_service) = email_service {
+            let low_balance_users = {
+                let mut users = Users::new(&mut conn);
+                users.poll_low_balance_users().await.unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "Failed to poll low-balance users");
+                    vec![]
+                })
+            };
+
+            if !low_balance_users.is_empty() {
+                tracing::info!(count = low_balance_users.len(), "Found users with low balance");
+                send_low_balance_notifications(email_service, &low_balance_users, &mut conn).await;
+            }
+        }
+
+        // === Step 5: Dispatch webhooks (claim → sign → send → process results) ===
         if let Some(ref mut dispatcher) = dispatcher {
             dispatcher.tick().await;
         }
@@ -198,20 +222,21 @@ pub async fn run_notification_poller(
 ///
 /// Deliveries are created with `next_attempt_at = now()` so the dispatcher's
 /// claim mechanism picks them up immediately.
-async fn create_batch_deliveries(pool: &PgPool, infos: &[BatchNotificationInfo]) -> anyhow::Result<()> {
+async fn create_batch_deliveries(
+    conn: &mut sqlx::pool::PoolConnection<sqlx::Postgres>,
+    infos: &[BatchNotificationInfo],
+) -> anyhow::Result<()> {
     if infos.is_empty() {
         return Ok(());
     }
 
-    let mut conn = pool.acquire().await?;
-
     let user_ids: Vec<Uuid> = infos.iter().map(|i| i.user_id).collect::<HashSet<_>>().into_iter().collect();
     let webhooks_by_user = {
-        let mut repo = Webhooks::new(&mut conn);
+        let mut repo = Webhooks::new(&mut *conn);
         repo.get_enabled_webhooks_for_users(user_ids).await?
     };
 
-    let mut repo = Webhooks::new(&mut conn);
+    let mut repo = Webhooks::new(&mut *conn);
 
     for info in infos {
         let Some(webhooks) = webhooks_by_user.get(&info.user_id) else {
@@ -253,19 +278,15 @@ async fn create_batch_deliveries(pool: &PgPool, infos: &[BatchNotificationInfo])
 }
 
 /// Send email notifications for completed batches.
-async fn send_email_notifications(email_service: &EmailService, infos: &[BatchNotificationInfo], pool: &PgPool) {
+async fn send_email_notifications(
+    email_service: &EmailService,
+    infos: &[BatchNotificationInfo],
+    conn: &mut sqlx::pool::PoolConnection<sqlx::Postgres>,
+) {
     let user_ids: Vec<Uuid> = infos.iter().map(|i| i.user_id).collect::<HashSet<_>>().into_iter().collect();
 
-    let mut conn = match pool.acquire().await {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!(error = %e, "Failed to acquire database connection");
-            return;
-        }
-    };
-
     let users_by_id = {
-        let mut users = Users::new(&mut conn);
+        let mut users = Users::new(&mut *conn);
         match users.get_bulk(user_ids).await {
             Ok(u) => u,
             Err(e) => {
@@ -311,7 +332,7 @@ async fn send_email_notifications(email_service: &EmailService, infos: &[BatchNo
         );
 
         if is_first_batch {
-            let mut users = Users::new(&mut conn);
+            let mut users = Users::new(&mut *conn);
             if let Err(e) = users.mark_first_batch_email_sent(info.user_id).await {
                 tracing::warn!(
                     user_id = %info.user_id,
@@ -319,6 +340,40 @@ async fn send_email_notifications(email_service: &EmailService, infos: &[BatchNo
                     "Failed to mark first batch email as sent"
                 );
             }
+        }
+    }
+}
+
+/// Send low-balance notification emails to the given users.
+async fn send_low_balance_notifications(
+    email_service: &EmailService,
+    users: &[LowBalanceUser],
+    conn: &mut sqlx::pool::PoolConnection<sqlx::Postgres>,
+) {
+    let mut sent_ids = Vec::new();
+
+    for user in users {
+        let name = user.display_name.as_deref().unwrap_or(&user.username);
+
+        if let Err(e) = email_service.send_low_balance_email(&user.email, Some(name), &user.balance).await {
+            tracing::warn!(
+                user_id = %user.id,
+                email = %user.email,
+                error = %e,
+                "Failed to send low-balance notification email"
+            );
+            continue;
+        }
+
+        tracing::info!(user_id = %user.id, email = %user.email, balance = %user.balance, "Sent low-balance notification");
+        sent_ids.push(user.id);
+    }
+
+    // Bulk-mark all successfully sent notifications
+    if !sent_ids.is_empty() {
+        let mut users_repo = Users::new(&mut *conn);
+        if let Err(e) = users_repo.mark_low_balance_notification_sent(&sent_ids).await {
+            tracing::warn!(error = %e, "Failed to mark low-balance notifications as sent");
         }
     }
 }

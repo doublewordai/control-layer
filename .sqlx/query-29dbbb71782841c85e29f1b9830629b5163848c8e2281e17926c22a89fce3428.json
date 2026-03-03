@@ -87,6 +87,16 @@
         "ordinal": 16,
         "name": "first_batch_email_sent",
         "type_info": "Bool"
+      },
+      {
+        "ordinal": 17,
+        "name": "low_balance_notification_sent",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 18,
+        "name": "low_balance_threshold",
+        "type_info": "Float4"
       }
     ],
     "parameters": {
@@ -111,7 +121,9 @@
       false,
       false,
       false,
-      false
+      false,
+      false,
+      true
     ]
   },
   "hash": "29dbbb71782841c85e29f1b9830629b5163848c8e2281e17926c22a89fce3428"

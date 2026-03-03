@@ -37,6 +37,16 @@ impl UserFilter {
     }
 }
 
+/// Minimal user info for low-balance notifications.
+#[derive(Debug, Clone)]
+pub struct LowBalanceUser {
+    pub id: UserId,
+    pub email: String,
+    pub username: String,
+    pub display_name: Option<String>,
+    pub balance: rust_decimal::Decimal,
+}
+
 // Database entity model
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 struct User {
@@ -57,6 +67,8 @@ struct User {
     pub is_internal: bool,
     pub batch_notifications_enabled: bool,
     pub first_batch_email_sent: bool,
+    pub low_balance_notification_sent: bool,
+    pub low_balance_threshold: Option<f32>,
 }
 
 pub struct Users<'c> {
@@ -81,6 +93,8 @@ impl From<(Vec<Role>, User)> for UserDBResponse {
             payment_provider_id: user.payment_provider_id,
             batch_notifications_enabled: user.batch_notifications_enabled,
             first_batch_email_sent: user.first_batch_email_sent,
+            low_balance_notification_sent: user.low_balance_notification_sent,
+            low_balance_threshold: user.low_balance_threshold,
         }
     }
 }
@@ -167,11 +181,13 @@ impl<'c> Repository for Users<'c> {
                 u.is_internal,
                 u.batch_notifications_enabled,
                 u.first_batch_email_sent,
+                u.low_balance_notification_sent,
+                u.low_balance_threshold,
                 ARRAY_AGG(ur.role) FILTER (WHERE ur.role IS NOT NULL) as "roles: Vec<Role>"
             FROM users u
             LEFT JOIN user_roles ur ON ur.user_id = u.id
             WHERE u.id = $1 AND u.id != '00000000-0000-0000-0000-000000000000' AND u.is_deleted = false
-            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id, u.is_deleted, u.is_internal, u.batch_notifications_enabled, u.first_batch_email_sent
+            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id, u.is_deleted, u.is_internal, u.batch_notifications_enabled, u.first_batch_email_sent, u.low_balance_notification_sent, u.low_balance_threshold
             "#,
             id
         )
@@ -197,6 +213,8 @@ impl<'c> Repository for Users<'c> {
                 is_internal: row.is_internal,
                 batch_notifications_enabled: row.batch_notifications_enabled,
                 first_batch_email_sent: row.first_batch_email_sent,
+                low_balance_notification_sent: row.low_balance_notification_sent,
+                low_balance_threshold: row.low_balance_threshold,
             };
 
             let roles = row.roles.unwrap_or_default();
@@ -234,11 +252,13 @@ impl<'c> Repository for Users<'c> {
                 u.is_internal,
                 u.batch_notifications_enabled,
                 u.first_batch_email_sent,
+                u.low_balance_notification_sent,
+                u.low_balance_threshold,
                 ARRAY_AGG(ur.role) FILTER (WHERE ur.role IS NOT NULL) as "roles: Vec<Role>"
             FROM users u
             LEFT JOIN user_roles ur ON ur.user_id = u.id
             WHERE u.id = ANY($1) AND u.id != '00000000-0000-0000-0000-000000000000' AND u.is_deleted = false
-            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id, u.is_deleted, u.is_internal, u.batch_notifications_enabled, u.first_batch_email_sent
+            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id, u.is_deleted, u.is_internal, u.batch_notifications_enabled, u.first_batch_email_sent, u.low_balance_notification_sent, u.low_balance_threshold
             "#,
             ids.as_slice()
         )
@@ -266,6 +286,8 @@ impl<'c> Repository for Users<'c> {
                 is_internal: row.is_internal,
                 batch_notifications_enabled: row.batch_notifications_enabled,
                 first_batch_email_sent: row.first_batch_email_sent,
+                low_balance_notification_sent: row.low_balance_notification_sent,
+                low_balance_threshold: row.low_balance_threshold,
             };
 
             let roles = row.roles.unwrap_or_default();
@@ -366,6 +388,14 @@ impl<'c> Repository for Users<'c> {
                 avatar_url = COALESCE($3, avatar_url),
                 password_hash = COALESCE($4, password_hash),
                 batch_notifications_enabled = COALESCE($5, batch_notifications_enabled),
+                low_balance_threshold = CASE
+                    WHEN $6::boolean THEN $7
+                    ELSE low_balance_threshold
+                END,
+                low_balance_notification_sent = CASE
+                    WHEN $6::boolean THEN false
+                    ELSE low_balance_notification_sent
+                END,
                 updated_at = NOW()
             WHERE id = $1
             RETURNING *
@@ -375,6 +405,8 @@ impl<'c> Repository for Users<'c> {
                 request.avatar_url,
                 request.password_hash,
                 request.batch_notifications_enabled,
+                request.low_balance_threshold.is_some() as bool,
+                request.low_balance_threshold.flatten(),
             )
             .fetch_optional(&mut *tx)
             .await?
@@ -651,6 +683,58 @@ impl<'c> Users<'c> {
         Ok(())
     }
 
+    /// Get users whose balance is below their configured threshold and haven't been notified yet.
+    ///
+    /// Uses the checkpoint+delta CTE to calculate balance efficiently.
+    /// Only includes users with low_balance_threshold set (non-NULL = opted in).
+    /// Clear recovered notification flags and return users needing low-balance notifications.
+    ///
+    /// In a single query:
+    /// 1. Computes balance for all users with a threshold set
+    /// 2. Clears `low_balance_notification_sent` for users whose balance recovered above threshold
+    /// 3. Returns users whose balance is below threshold and haven't been notified yet
+    #[instrument(skip(self), err)]
+    pub async fn poll_low_balance_users(&mut self) -> Result<Vec<LowBalanceUser>> {
+        // Clear recovered users and fetch low-balance users in one round-trip.
+        // Uses the cached checkpoint balance (not the full delta recalculation) — good enough
+        // for notification thresholds and avoids expensive per-tick aggregation.
+        let rows = sqlx::query_as!(
+            LowBalanceUser,
+            r#"
+            WITH clear_recovered AS (
+                UPDATE users u
+                SET low_balance_notification_sent = false
+                FROM user_balance_checkpoints c
+                WHERE u.id = c.user_id
+                  AND u.low_balance_notification_sent = true
+                  AND u.low_balance_threshold IS NOT NULL
+                  AND c.balance >= u.low_balance_threshold
+            )
+            SELECT u.id, u.email, u.username, u.display_name, c.balance
+            FROM users u
+            JOIN user_balance_checkpoints c ON u.id = c.user_id
+            WHERE u.id != '00000000-0000-0000-0000-000000000000'
+              AND u.is_deleted = false
+              AND u.low_balance_notification_sent = false
+              AND u.low_balance_threshold IS NOT NULL
+              AND c.balance < u.low_balance_threshold
+            "#,
+        )
+        .fetch_all(&mut *self.db)
+        .await?;
+
+        Ok(rows)
+    }
+
+    /// Mark that low-balance notifications have been sent for the given users.
+    #[instrument(skip(self, user_ids), fields(count = user_ids.len()), err)]
+    pub async fn mark_low_balance_notification_sent(&mut self, user_ids: &[UserId]) -> Result<()> {
+        sqlx::query!("UPDATE users SET low_balance_notification_sent = true WHERE id = ANY($1)", user_ids)
+            .execute(&mut *self.db)
+            .await?;
+        Ok(())
+    }
+
     /// Set the payment provider ID for a user if it's not already set
     /// Returns true if the ID was updated, false if the user already had one or user not found
     #[instrument(skip(self), err)]
@@ -673,7 +757,11 @@ mod tests {
     use super::super::repository::Repository;
     use super::*;
     use crate::api::models::users::{Role, UserCreate};
+    use crate::db::handlers::credits::Credits;
+    use crate::db::models::credits::CreditTransactionCreateDBRequest;
+    use rust_decimal::Decimal;
     use sqlx::PgPool;
+    use std::str::FromStr;
 
     #[sqlx::test]
     #[test_log::test]
@@ -762,6 +850,7 @@ mod tests {
             roles: Some(vec![Role::RequestViewer]), // Intentionally omitting StandardUser
             password_hash: None,
             batch_notifications_enabled: None,
+            low_balance_threshold: None,
         };
 
         let updated_user = repo.update(created_user.id, &update_request).await.unwrap();
@@ -779,6 +868,7 @@ mod tests {
             roles: Some(vec![]), // Empty roles
             password_hash: None,
             batch_notifications_enabled: None,
+            low_balance_threshold: None,
         };
 
         let updated_user = repo.update(created_user.id, &update_request).await.unwrap();
@@ -786,5 +876,271 @@ mod tests {
         // StandardUser should still be present
         assert_eq!(updated_user.roles.len(), 1);
         assert!(updated_user.roles.contains(&Role::StandardUser)); // Should be automatically added
+    }
+
+    /// Helper: create a user, set their threshold, grant credits, and refresh checkpoint.
+    async fn create_user_with_balance(pool: &PgPool, balance: &str, threshold: Option<f32>) -> UserId {
+        let mut conn = pool.acquire().await.unwrap();
+        let mut repo = Users::new(&mut conn);
+
+        let user_create = UserCreateDBRequest::from(UserCreate {
+            username: format!("lowbal_{}", Uuid::new_v4().simple()),
+            email: format!("lowbal_{}@example.com", Uuid::new_v4().simple()),
+            display_name: Some("Low Balance Test".to_string()),
+            avatar_url: None,
+            roles: vec![Role::StandardUser],
+        });
+        let user = repo.create(&user_create).await.unwrap();
+
+        // Set threshold if provided
+        if threshold.is_some() {
+            let update = UserUpdateDBRequest {
+                display_name: None,
+                avatar_url: None,
+                roles: None,
+                password_hash: None,
+                batch_notifications_enabled: None,
+                low_balance_threshold: Some(threshold),
+            };
+            repo.update(user.id, &update).await.unwrap();
+        }
+
+        // Grant credits and refresh checkpoint so poll_low_balance_users can see it
+        let amount = Decimal::from_str(balance).unwrap();
+        if amount > Decimal::ZERO {
+            drop(conn);
+            let mut conn = pool.acquire().await.unwrap();
+            let mut credits = Credits::new(&mut conn);
+            let grant = CreditTransactionCreateDBRequest::admin_grant(user.id, user.id, amount, None);
+            credits.create_transaction(&grant).await.unwrap();
+            credits.refresh_checkpoint(user.id).await.unwrap();
+        }
+
+        user.id
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_poll_low_balance_skips_users_without_threshold(pool: PgPool) {
+        // User with no threshold set should never appear
+        create_user_with_balance(&pool, "1.00", None).await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut users = Users::new(&mut conn);
+        let low = users.poll_low_balance_users().await.unwrap();
+        assert!(low.is_empty());
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_poll_low_balance_returns_user_below_threshold(pool: PgPool) {
+        let user_id = create_user_with_balance(&pool, "1.50", Some(2.0)).await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut users = Users::new(&mut conn);
+        let low = users.poll_low_balance_users().await.unwrap();
+        assert_eq!(low.len(), 1);
+        assert_eq!(low[0].id, user_id);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_poll_low_balance_skips_user_above_threshold(pool: PgPool) {
+        create_user_with_balance(&pool, "10.00", Some(2.0)).await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut users = Users::new(&mut conn);
+        let low = users.poll_low_balance_users().await.unwrap();
+        assert!(low.is_empty());
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_poll_low_balance_skips_already_notified(pool: PgPool) {
+        let user_id = create_user_with_balance(&pool, "1.00", Some(2.0)).await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut users = Users::new(&mut conn);
+
+        // First poll: user appears
+        let low = users.poll_low_balance_users().await.unwrap();
+        assert_eq!(low.len(), 1);
+
+        // Mark as notified
+        users.mark_low_balance_notification_sent(&[user_id]).await.unwrap();
+
+        // Second poll: user should not appear
+        let low = users.poll_low_balance_users().await.unwrap();
+        assert!(low.is_empty());
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_poll_low_balance_clears_flag_after_topup(pool: PgPool) {
+        let user_id = create_user_with_balance(&pool, "1.00", Some(2.0)).await;
+
+        // Poll and mark notified
+        let mut conn = pool.acquire().await.unwrap();
+        let mut users = Users::new(&mut conn);
+        let low = users.poll_low_balance_users().await.unwrap();
+        assert_eq!(low.len(), 1);
+        users.mark_low_balance_notification_sent(&[user_id]).await.unwrap();
+        drop(conn);
+
+        // Topup: add credits and refresh checkpoint so balance > threshold
+        let mut conn = pool.acquire().await.unwrap();
+        let mut credits = Credits::new(&mut conn);
+        let grant = CreditTransactionCreateDBRequest::admin_grant(user_id, user_id, Decimal::from_str("10.00").unwrap(), None);
+        credits.create_transaction(&grant).await.unwrap();
+        credits.refresh_checkpoint(user_id).await.unwrap();
+        drop(conn);
+
+        // Poll again: the clear_recovered CTE should reset the flag,
+        // and the user should NOT appear (balance is now above threshold)
+        let mut conn = pool.acquire().await.unwrap();
+        let mut users = Users::new(&mut conn);
+        let low = users.poll_low_balance_users().await.unwrap();
+        assert!(low.is_empty());
+
+        // Verify flag was actually cleared
+        let user = users.get_by_id(user_id).await.unwrap().unwrap();
+        assert!(!user.low_balance_notification_sent);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_poll_low_balance_full_cycle(pool: PgPool) {
+        // 1. Create user with $100, threshold $2
+        let user_id = create_user_with_balance(&pool, "100.00", Some(2.0)).await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut users = Users::new(&mut conn);
+        let low = users.poll_low_balance_users().await.unwrap();
+        assert!(low.is_empty(), "User above threshold should not appear");
+        drop(conn);
+
+        // 2. Deduct $99 → balance $1 (below threshold)
+        let mut conn = pool.acquire().await.unwrap();
+        let mut credits = Credits::new(&mut conn);
+        let deduct = CreditTransactionCreateDBRequest {
+            user_id,
+            transaction_type: crate::db::models::credits::CreditTransactionType::AdminRemoval,
+            amount: Decimal::from_str("99.00").unwrap(),
+            source_id: Uuid::new_v4().to_string(),
+            description: None,
+            fusillade_batch_id: None,
+        };
+        credits.create_transaction(&deduct).await.unwrap();
+        credits.refresh_checkpoint(user_id).await.unwrap();
+        drop(conn);
+
+        // 3. Poll: user should appear
+        let mut conn = pool.acquire().await.unwrap();
+        let mut users = Users::new(&mut conn);
+        let low = users.poll_low_balance_users().await.unwrap();
+        assert_eq!(low.len(), 1, "User below threshold should appear");
+        assert_eq!(low[0].id, user_id);
+
+        // 4. Mark notified
+        users.mark_low_balance_notification_sent(&[user_id]).await.unwrap();
+        let low = users.poll_low_balance_users().await.unwrap();
+        assert!(low.is_empty(), "Notified user should not appear again");
+        drop(conn);
+
+        // 5. Topup $50 → balance $51 (above threshold)
+        let mut conn = pool.acquire().await.unwrap();
+        let mut credits = Credits::new(&mut conn);
+        let grant = CreditTransactionCreateDBRequest::admin_grant(user_id, user_id, Decimal::from_str("50.00").unwrap(), None);
+        credits.create_transaction(&grant).await.unwrap();
+        credits.refresh_checkpoint(user_id).await.unwrap();
+        drop(conn);
+
+        // 6. Poll: clear_recovered CTE resets the flag, user above threshold → not returned
+        let mut conn = pool.acquire().await.unwrap();
+        let mut users = Users::new(&mut conn);
+        let low = users.poll_low_balance_users().await.unwrap();
+        assert!(low.is_empty(), "Topped-up user should not appear");
+        drop(conn);
+
+        // 7. Deduct $50 → balance $1 again (below threshold)
+        let mut conn = pool.acquire().await.unwrap();
+        let mut credits = Credits::new(&mut conn);
+        let deduct2 = CreditTransactionCreateDBRequest {
+            user_id,
+            transaction_type: crate::db::models::credits::CreditTransactionType::AdminRemoval,
+            amount: Decimal::from_str("50.00").unwrap(),
+            source_id: Uuid::new_v4().to_string(),
+            description: None,
+            fusillade_batch_id: None,
+        };
+        credits.create_transaction(&deduct2).await.unwrap();
+        credits.refresh_checkpoint(user_id).await.unwrap();
+        drop(conn);
+
+        // 8. Poll: user should appear again (flag was cleared by step 6)
+        let mut conn = pool.acquire().await.unwrap();
+        let mut users = Users::new(&mut conn);
+        let low = users.poll_low_balance_users().await.unwrap();
+        assert_eq!(low.len(), 1, "User should be notifiable again after recovery + re-drop");
+        assert_eq!(low[0].id, user_id);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_poll_low_balance_negative_balance(pool: PgPool) {
+        // User with negative balance should still be returned
+        let user_id = create_user_with_balance(&pool, "5.00", Some(2.0)).await;
+
+        // Deduct more than the balance
+        let mut conn = pool.acquire().await.unwrap();
+        let mut credits = Credits::new(&mut conn);
+        let deduct = CreditTransactionCreateDBRequest {
+            user_id,
+            transaction_type: crate::db::models::credits::CreditTransactionType::AdminRemoval,
+            amount: Decimal::from_str("10.00").unwrap(),
+            source_id: Uuid::new_v4().to_string(),
+            description: None,
+            fusillade_batch_id: None,
+        };
+        credits.create_transaction(&deduct).await.unwrap();
+        credits.refresh_checkpoint(user_id).await.unwrap();
+        drop(conn);
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut users = Users::new(&mut conn);
+        let low = users.poll_low_balance_users().await.unwrap();
+        assert_eq!(low.len(), 1);
+        assert_eq!(low[0].id, user_id);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_update_low_balance_threshold_resets_flag(pool: PgPool) {
+        let user_id = create_user_with_balance(&pool, "1.00", Some(2.0)).await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut users = Users::new(&mut conn);
+
+        // Trigger notification
+        let low = users.poll_low_balance_users().await.unwrap();
+        assert_eq!(low.len(), 1);
+        users.mark_low_balance_notification_sent(&[user_id]).await.unwrap();
+
+        // Update threshold — should reset the flag so user can be re-notified at new level
+        let update = UserUpdateDBRequest {
+            display_name: None,
+            avatar_url: None,
+            roles: None,
+            password_hash: None,
+            batch_notifications_enabled: None,
+            low_balance_threshold: Some(Some(5.0)),
+        };
+        let updated = users.update(user_id, &update).await.unwrap();
+        assert!(!updated.low_balance_notification_sent);
+        assert_eq!(updated.low_balance_threshold, Some(5.0));
+
+        // Poll again: user should appear at new threshold
+        let low = users.poll_low_balance_users().await.unwrap();
+        assert_eq!(low.len(), 1);
     }
 }

@@ -170,9 +170,7 @@ describe("Email Notifications", () => {
     const { container } = await renderAndWaitForProfile();
 
     expect(within(container).getByText("Notifications")).toBeInTheDocument();
-    expect(
-      within(container).getByText("Email Notifications"),
-    ).toBeInTheDocument();
+    expect(within(container).getByText("Email")).toBeInTheDocument();
     expect(
       within(container).getByText(
         /Receive email when a batch completes or fails/,
