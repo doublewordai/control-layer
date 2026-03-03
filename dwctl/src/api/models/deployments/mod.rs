@@ -6,7 +6,8 @@ use super::pagination::Pagination;
 use crate::api::models::groups::GroupResponse;
 use crate::db::models::api_keys::ApiKeyPurpose;
 use crate::db::models::deployments::{
-    DeploymentDBResponse, FallbackConfig, LoadBalancingStrategy, ModelType, ProviderPricing, ProviderPricingUpdate, TrafficRuleDBRow,
+    DeploymentDBResponse, FallbackConfig, LoadBalancingStrategy, ModelCatalogMetadata, ModelType, ProviderPricing, ProviderPricingUpdate,
+    TrafficRuleDBRow,
 };
 use crate::types::{DeploymentId, InferenceEndpointId, UserId};
 use chrono::{DateTime, Utc};
@@ -176,6 +177,9 @@ pub struct StandardModelCreate {
     /// Example: ["24h"] to only allow 24-hour batches on an expensive model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_batch_completion_windows: Option<Vec<String>>,
+    /// Catalog metadata for display purposes
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<ModelCatalogMetadata>,
 }
 
 /// Data for creating a composite model (routes across multiple providers)
@@ -238,6 +242,9 @@ pub struct CompositeModelCreate {
     /// Example: ["24h"] to only allow 24-hour batches on an expensive model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_batch_completion_windows: Option<Vec<String>>,
+    /// Catalog metadata for display purposes
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<ModelCatalogMetadata>,
 }
 
 fn default_true() -> bool {
@@ -310,6 +317,9 @@ pub struct DeployedModelUpdate {
     /// Per-model allowed batch completion windows (null = no change, Some(None) = clear, Some(windows) = set)
     #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
     pub allowed_batch_completion_windows: Option<Option<Vec<String>>>,
+    /// Catalog metadata (null = no change, Some(metadata) = replace)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<ModelCatalogMetadata>,
 }
 
 /// A request to update a specific model (i.e. bundle a `DeployedModelUpdate` with a model id).
@@ -416,6 +426,9 @@ pub struct DeployedModelResponse {
     /// Per-model allowed batch completion windows (overrides global config)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allowed_batch_completion_windows: Option<Vec<String>>,
+    /// Catalog metadata for display purposes
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<ModelCatalogMetadata>,
 }
 
 impl From<DeploymentDBResponse> for DeployedModelResponse {
@@ -465,6 +478,10 @@ impl From<DeploymentDBResponse> for DeployedModelResponse {
             open_responses_adapter: Some(db.open_responses_adapter),
             traffic_routing_rules: None, // Populated via enrichment (with_traffic_rules)
             allowed_batch_completion_windows: db.allowed_batch_completion_windows,
+            metadata: serde_json::from_value::<ModelCatalogMetadata>(db.metadata)
+                .inspect_err(|e| tracing::warn!(error = %e, "failed to deserialize model metadata"))
+                .ok()
+                .filter(|m| *m != ModelCatalogMetadata::default()),
         }
     }
 }

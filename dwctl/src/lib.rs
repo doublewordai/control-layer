@@ -477,6 +477,7 @@ pub async fn seed_database(sources: &[config::ModelSource], db: &PgPool) -> Resu
                             open_responses_adapter: None,
                             traffic_routing_rules: None,
                             allowed_batch_completion_windows: None,
+                            metadata: None,
                         }),
                     ))
                     .await
@@ -1721,13 +1722,16 @@ async fn setup_background_services(
             }
         }
 
-        // Start batch notification poller if enabled
-        if config.background_services.notifications.enabled {
+        // Always start the batch completion poller — it triggers lazy
+        // finalization of terminal batches (setting completed_at / failed_at).
+        // Notifications (emails, webhooks) are gated on config.enabled inside
+        // the poller itself.
+        {
             let daemon_config = config.clone();
             let daemon_request_manager = request_manager.clone();
             let daemon_pool = pool.clone();
             let daemon_shutdown = shutdown_token.clone();
-            background_tasks.spawn("batch-notifications", async move {
+            background_tasks.spawn("batch-completion", async move {
                 notifications::run_notification_poller(
                     daemon_config.background_services.notifications.clone(),
                     daemon_config,
@@ -1855,8 +1859,8 @@ async fn setup_background_services(
                             }
                         }
 
-                        // Start batch notification poller if enabled
-                        if config.background_services.notifications.enabled {
+                        // Always start the batch completion poller (see comment above)
+                        {
                             let daemon_config = config.clone();
                             let daemon_session_token = session_token.clone();
                             tokio::spawn(async move {
@@ -1869,7 +1873,7 @@ async fn setup_background_services(
                                 )
                                 .await;
                             });
-                            tracing::info!("Batch notification poller started on elected leader");
+                            tracing::info!("Batch completion poller started on elected leader");
                         }
 
                         Ok(())

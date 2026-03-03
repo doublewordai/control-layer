@@ -365,6 +365,7 @@ mod tests {
                 open_responses_adapter: true,
 
                 allowed_batch_completion_windows: None,
+                metadata: None,
             })
             .await
             .unwrap();
@@ -491,6 +492,7 @@ mod tests {
                 open_responses_adapter: true,
 
                 allowed_batch_completion_windows: None,
+                metadata: None,
             })
             .await
             .unwrap();
@@ -526,6 +528,7 @@ mod tests {
                 open_responses_adapter: true,
 
                 allowed_batch_completion_windows: None,
+                metadata: None,
             })
             .await
             .unwrap();
@@ -620,6 +623,7 @@ mod tests {
             trusted: false,
             open_responses_adapter: true,
             allowed_batch_completion_windows: None,
+            metadata: None,
         })
         .await
         .unwrap();
@@ -711,6 +715,7 @@ mod tests {
                 open_responses_adapter: true,
 
                 allowed_batch_completion_windows: None,
+                metadata: None,
             })
             .await
             .unwrap();
@@ -848,6 +853,7 @@ mod tests {
                 open_responses_adapter: true,
 
                 allowed_batch_completion_windows: None,
+                metadata: None,
             })
             .await
             .unwrap();
@@ -883,6 +889,7 @@ mod tests {
                 open_responses_adapter: true,
 
                 allowed_batch_completion_windows: None,
+                metadata: None,
             })
             .await
             .unwrap();
@@ -1009,6 +1016,7 @@ mod tests {
                 open_responses_adapter: true,
 
                 allowed_batch_completion_windows: None,
+                metadata: None,
             })
             .await
             .unwrap();
@@ -1128,6 +1136,7 @@ mod tests {
                 open_responses_adapter: true,
 
                 allowed_batch_completion_windows: None,
+                metadata: None,
             })
             .await
             .unwrap();

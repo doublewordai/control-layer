@@ -1,5 +1,19 @@
 # Changelog
 
+## [8.11.0](https://github.com/doublewordai/control-layer/compare/v8.10.2...v8.11.0) (2026-03-03)
+
+
+### Features
+
+* add model catalog metadata (JSONB) ([#790](https://github.com/doublewordai/control-layer/issues/790)) ([8a7c2f3](https://github.com/doublewordai/control-layer/commit/8a7c2f3b9c53f5af245af6831bd431b01e9b14d4))
+
+
+### Bug Fixes
+
+* always run batch completion poller for finalization ([#788](https://github.com/doublewordai/control-layer/issues/788)) ([1129bf5](https://github.com/doublewordai/control-layer/commit/1129bf56077c5073a441dff88fd139fd8053424e))
+* give sample files to oauth users ([#782](https://github.com/doublewordai/control-layer/issues/782)) ([fcbc342](https://github.com/doublewordai/control-layer/commit/fcbc342f57bb1a3ad74e5139ab69887ffca5b8d1))
+* set system API key purpose to platform for admin API access ([#778](https://github.com/doublewordai/control-layer/issues/778)) ([acf36c6](https://github.com/doublewordai/control-layer/commit/acf36c6ef9224b957f348d73336035df1d83df22))
+
 ## [8.10.2](https://github.com/doublewordai/control-layer/compare/v8.10.1...v8.10.2) (2026-02-27)
 
 
