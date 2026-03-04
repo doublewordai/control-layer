@@ -12,7 +12,7 @@ import {
   PasswordResetRequestForm,
   PasswordResetForm,
 } from "./components/auth";
-import { SettingsProvider, useSettings } from "./contexts";
+import { SettingsProvider, useSettings, OrganizationProvider } from "./contexts";
 import { AuthProvider, useAuth } from "./contexts/auth";
 import { useAuthorization } from "./utils";
 import { useRegistrationInfo } from "./api/control-layer/hooks";
@@ -130,6 +130,21 @@ const System = lazy(() =>
 const Usage = lazy(() =>
   import("./components/features/usage").then((m) => ({
     default: m.Usage,
+  })),
+);
+const Organizations = lazy(() =>
+  import("./components/features/organizations").then((m) => ({
+    default: m.Organizations,
+  })),
+);
+const OrganizationDetail = lazy(() =>
+  import("./components/features/organizations").then((m) => ({
+    default: m.OrganizationDetail,
+  })),
+);
+const AcceptInvite = lazy(() =>
+  import("./components/features/organizations").then((m) => ({
+    default: m.AcceptInvite,
   })),
 );
 
@@ -313,6 +328,16 @@ function AppRoutes() {
           }
         />
 
+        {/* Invite acceptance (handles its own auth state) */}
+        <Route
+          path="/accept-invite"
+          element={
+            <Suspense fallback={<div className="flex items-center justify-center h-screen"><div className="animate-spin rounded-full h-12 w-12 border-b-2 border-doubleword-accent-blue"></div></div>}>
+              <AcceptInvite />
+            </Suspense>
+          }
+        />
+
         {/* Protected app routes with layout */}
         <Route path="/" element={<RootRedirect />} />
         <Route
@@ -423,6 +448,30 @@ function AppRoutes() {
             </AppLayout>
           }
         />
+        <Route
+          path="/organizations"
+          element={
+            <AppLayout>
+              <ProtectedRoute path="/organizations">
+                <Suspense fallback={<RouteLoader />}>
+                  <Organizations />
+                </Suspense>
+              </ProtectedRoute>
+            </AppLayout>
+          }
+        />
+        <Route
+          path="/organizations/:organizationId"
+          element={
+            <AppLayout>
+              <ProtectedRoute path="/organizations/:organizationId">
+                <Suspense fallback={<RouteLoader />}>
+                  <OrganizationDetail />
+                </Suspense>
+              </ProtectedRoute>
+            </AppLayout>
+          }
+        />
         <Route path="/settings" element={<Navigate to="/system" replace />} />
         <Route
           path="/profile"
@@ -495,7 +544,9 @@ function App() {
       <QueryClientProvider client={queryClient}>
         <SettingsProvider>
           <AuthProvider>
-            <AppRoutes />
+            <OrganizationProvider>
+              <AppRoutes />
+            </OrganizationProvider>
           </AuthProvider>
         </SettingsProvider>
         {import.meta.env.DEV && <ReactQueryDevtools initialIsOpen={false} />}

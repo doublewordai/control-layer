@@ -9,6 +9,7 @@ export type PagePermission =
   | "analytics"
   | "cost-management"
   | "users-groups"
+  | "organizations"
   | "api-keys"
   | "settings"
   | "profile"
@@ -26,6 +27,7 @@ const ROLE_PERMISSIONS: Record<Role, PagePermission[]> = {
     "analytics",
     "cost-management",
     "users-groups",
+    "organizations",
     "api-keys",
     "settings",
     "profile",
@@ -40,6 +42,7 @@ const ROLE_PERMISSIONS: Record<Role, PagePermission[]> = {
     "playground",
     "cost-management",
     "profile",
+    "organizations",
     "usage",
   ],
   RequestViewer: [
@@ -77,6 +80,7 @@ export const ROUTE_PERMISSIONS: Record<string, PagePermission> = {
   "/profile": "profile",
   "/batches": "batches",
   "/usage": "usage",
+  "/organizations": "organizations",
 };
 
 /**

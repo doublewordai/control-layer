@@ -67,6 +67,16 @@ import type {
   WebhookCreateRequest,
   WebhookUpdateRequest,
   UserBatchUsageResponse,
+  Organization,
+  OrganizationMember,
+  OrganizationCreateRequest,
+  OrganizationUpdateRequest,
+  OrganizationsQuery,
+  InviteMemberRequest,
+  InviteMemberResponse,
+  InviteDetailsResponse,
+  UpdateMemberRoleRequest,
+  SetActiveOrganizationResponse,
 } from "./types";
 import { ApiError } from "./errors";
 
@@ -1605,6 +1615,231 @@ const usageApi = {
   },
 };
 
+// ===== Organization context header =====
+
+/**
+ * Get active organization ID from localStorage.
+ * Used by the fetch wrapper to include X-Organization-Id header.
+ */
+export function getActiveOrganizationId(): string | null {
+  return localStorage.getItem("activeOrganizationId");
+}
+
+const organizationsApi = {
+  async list(
+    options?: OrganizationsQuery,
+  ): Promise<PaginatedResponse<Organization>> {
+    const params = new URLSearchParams();
+    if (options?.skip !== undefined) params.set("skip", String(options.skip));
+    if (options?.limit !== undefined)
+      params.set("limit", String(options.limit));
+    if (options?.search) params.set("search", options.search);
+    if (options?.include) params.set("include", options.include);
+
+    const url = `/admin/api/v1/organizations${params.toString() ? "?" + params.toString() : ""}`;
+    const response = await fetch(url);
+    if (!response.ok) {
+      throw new Error(`Failed to fetch organizations: ${response.status}`);
+    }
+    return response.json();
+  },
+
+  async get(id: string): Promise<Organization> {
+    const response = await fetch(`/admin/api/v1/organizations/${id}`);
+    if (!response.ok) {
+      throw new Error(`Failed to fetch organization: ${response.status}`);
+    }
+    return response.json();
+  },
+
+  async create(data: OrganizationCreateRequest): Promise<Organization> {
+    const response = await fetch("/admin/api/v1/organizations", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data),
+    });
+    if (!response.ok) {
+      const error = await response.text();
+      throw new ApiError(
+        response.status,
+        `Failed to create organization: ${error}`,
+      );
+    }
+    return response.json();
+  },
+
+  async update(
+    id: string,
+    data: OrganizationUpdateRequest,
+  ): Promise<Organization> {
+    const response = await fetch(`/admin/api/v1/organizations/${id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data),
+    });
+    if (!response.ok) {
+      const error = await response.text();
+      throw new ApiError(
+        response.status,
+        `Failed to update organization: ${error}`,
+      );
+    }
+    return response.json();
+  },
+
+  async delete(id: string): Promise<void> {
+    const response = await fetch(`/admin/api/v1/organizations/${id}`, {
+      method: "DELETE",
+    });
+    if (!response.ok) {
+      throw new Error(`Failed to delete organization: ${response.status}`);
+    }
+  },
+
+  async listMembers(orgId: string): Promise<OrganizationMember[]> {
+    const response = await fetch(
+      `/admin/api/v1/organizations/${orgId}/members`,
+    );
+    if (!response.ok) {
+      throw new Error(`Failed to fetch members: ${response.status}`);
+    }
+    return response.json();
+  },
+
+  async inviteMember(
+    orgId: string,
+    data: InviteMemberRequest,
+  ): Promise<InviteMemberResponse> {
+    const response = await fetch(
+      `/admin/api/v1/organizations/${orgId}/invites`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(data),
+      },
+    );
+    if (!response.ok) {
+      const error = await response.text();
+      throw new ApiError(response.status, `Failed to invite member: ${error}`);
+    }
+    return response.json();
+  },
+
+  async cancelInvite(orgId: string, inviteId: string): Promise<void> {
+    const response = await fetch(
+      `/admin/api/v1/organizations/${orgId}/invites/${inviteId}`,
+      {
+        method: "DELETE",
+      },
+    );
+    if (!response.ok) {
+      const error = await response.text();
+      throw new ApiError(response.status, `Failed to cancel invite: ${error}`);
+    }
+  },
+
+  async getInviteDetails(token: string): Promise<InviteDetailsResponse> {
+    const response = await fetch(
+      `/admin/api/v1/organizations/invites/${token}`,
+    );
+    if (!response.ok) {
+      const error = await response.text();
+      throw new ApiError(
+        response.status,
+        `Failed to get invite details: ${error}`,
+      );
+    }
+    return response.json();
+  },
+
+  async acceptInvite(token: string): Promise<OrganizationMember> {
+    const response = await fetch(
+      `/admin/api/v1/organizations/invites/${token}/accept`,
+      {
+        method: "POST",
+      },
+    );
+    if (!response.ok) {
+      const error = await response.text();
+      throw new ApiError(response.status, `Failed to accept invite: ${error}`);
+    }
+    return response.json();
+  },
+
+  async declineInvite(token: string): Promise<void> {
+    const response = await fetch(
+      `/admin/api/v1/organizations/invites/${token}/decline`,
+      {
+        method: "POST",
+      },
+    );
+    if (!response.ok) {
+      const error = await response.text();
+      throw new ApiError(
+        response.status,
+        `Failed to decline invite: ${error}`,
+      );
+    }
+  },
+
+  async updateMemberRole(
+    orgId: string,
+    userId: string,
+    data: UpdateMemberRoleRequest,
+  ): Promise<OrganizationMember> {
+    const response = await fetch(
+      `/admin/api/v1/organizations/${orgId}/members/${userId}`,
+      {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(data),
+      },
+    );
+    if (!response.ok) {
+      const error = await response.text();
+      throw new ApiError(
+        response.status,
+        `Failed to update member role: ${error}`,
+      );
+    }
+    return response.json();
+  },
+
+  async removeMember(orgId: string, userId: string): Promise<void> {
+    const response = await fetch(
+      `/admin/api/v1/organizations/${orgId}/members/${userId}`,
+      {
+        method: "DELETE",
+      },
+    );
+    if (!response.ok) {
+      const error = await response.text();
+      throw new ApiError(
+        response.status,
+        `Failed to remove member: ${error}`,
+      );
+    }
+  },
+
+  async setActive(
+    organizationId: string | null,
+  ): Promise<SetActiveOrganizationResponse> {
+    const response = await fetch("/admin/api/v1/session/organization", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ organization_id: organizationId }),
+    });
+    if (!response.ok) {
+      const error = await response.text();
+      throw new ApiError(
+        response.status,
+        `Failed to set active organization: ${error}`,
+      );
+    }
+    return response.json();
+  },
+};
+
 // Main nested API object
 export const dwctlApi = {
   users: userApi,
@@ -1622,4 +1857,5 @@ export const dwctlApi = {
   batches: batchesApi,
   daemons: daemonsApi,
   usage: usageApi,
+  organizations: organizationsApi,
 };

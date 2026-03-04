@@ -58,12 +58,62 @@ impl OrganizationResponse {
 /// Organization member details
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct OrganizationMemberResponse {
-    /// The member's user details
-    pub user: UserResponse,
+    /// Membership row ID
+    #[schema(value_type = String, format = "uuid")]
+    pub id: uuid::Uuid,
+    /// The member's user details (None for pending invites where user hasn't signed up)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user: Option<UserResponse>,
     /// Role in the organization: 'owner', 'admin', or 'member'
     pub role: String,
+    /// Membership status: 'active' or 'pending'
+    pub status: String,
     /// When the membership was created
     pub created_at: DateTime<Utc>,
+    /// Email address for pending invites
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub invite_email: Option<String>,
+}
+
+/// Request body for inviting a member by email
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct InviteMemberRequest {
+    /// Email address to invite
+    #[schema(example = "newuser@example.com")]
+    pub email: String,
+    /// Role to assign: 'owner', 'admin', or 'member' (defaults to 'member')
+    pub role: Option<String>,
+}
+
+/// Response after creating an invite
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct InviteMemberResponse {
+    /// Membership row ID
+    #[schema(value_type = String, format = "uuid")]
+    pub id: uuid::Uuid,
+    /// Invited email address
+    pub email: String,
+    /// Assigned role
+    pub role: String,
+    /// Invite status (always 'pending')
+    pub status: String,
+    /// When the invite was created
+    pub created_at: DateTime<Utc>,
+    /// When the invite expires
+    pub expires_at: DateTime<Utc>,
+}
+
+/// Details about a pending invite (returned when looking up by token)
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct InviteDetailsResponse {
+    /// Name of the organization
+    pub org_name: String,
+    /// Role being offered
+    pub role: String,
+    /// Display name of the person who sent the invite
+    pub inviter_name: Option<String>,
+    /// When the invite expires
+    pub expires_at: DateTime<Utc>,
 }
 
 /// Request body for adding a member to an organization
