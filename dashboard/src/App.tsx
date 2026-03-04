@@ -132,11 +132,6 @@ const Usage = lazy(() =>
     default: m.Usage,
   })),
 );
-const Organizations = lazy(() =>
-  import("./components/features/organizations").then((m) => ({
-    default: m.Organizations,
-  })),
-);
 const OrganizationDetail = lazy(() =>
   import("./components/features/organizations").then((m) => ({
     default: m.OrganizationDetail,
@@ -450,15 +445,7 @@ function AppRoutes() {
         />
         <Route
           path="/organizations"
-          element={
-            <AppLayout>
-              <ProtectedRoute path="/organizations">
-                <Suspense fallback={<RouteLoader />}>
-                  <Organizations />
-                </Suspense>
-              </ProtectedRoute>
-            </AppLayout>
-          }
+          element={<Navigate to="/users-groups?tab=orgs" replace />}
         />
         <Route
           path="/organizations/:organizationId"

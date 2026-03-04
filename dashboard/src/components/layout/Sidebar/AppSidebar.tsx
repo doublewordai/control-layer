@@ -81,8 +81,7 @@ export function AppSidebar() {
     { path: "/endpoints", icon: Server, label: "Endpoints" },
     { path: "/playground", icon: Play, label: "Playground" },
     { path: "/analytics", icon: BarChart3, label: "Analytics" },
-    { path: "/users-groups", icon: Users, label: "Users & Groups" },
-    { path: "/organizations", icon: Building, label: "Organizations" },
+    { path: "/users-groups", icon: Users, label: "Users, Orgs & Groups" },
     { path: "/api-keys", icon: Key, label: "API Keys" },
     { path: "/usage", icon: Activity, label: "Usage" },
     { path: "/system", icon: Settings, label: "System" },
@@ -250,7 +249,8 @@ export function AppLayout({ children }: { children: React.ReactNode }) {
   const { user } = useAuth();
   const { data: config, isLoading: configLoading } = useConfig();
   const { isFeatureEnabled } = useSettings();
-  const { activeOrganizationId } = useOrganizationContext();
+  const { activeOrganizationId, activeOrganization } =
+    useOrganizationContext();
   const isDemoMode = isFeatureEnabled("demo");
   const [isSupportModalOpen, setIsSupportModalOpen] = useState(false);
 
@@ -276,7 +276,15 @@ export function AppLayout({ children }: { children: React.ReactNode }) {
         <AppSidebar />
         <SidebarInset className="flex flex-col flex-1">
           <header className="flex h-16 items-center justify-between border-b px-4 md:px-6">
-            <SidebarTrigger />
+            <div className="flex items-center gap-2">
+              <SidebarTrigger />
+              {activeOrganization && (
+                <div className="flex items-center gap-2 rounded-md bg-muted px-3 py-1.5 text-sm">
+                  <Building className="h-3.5 w-3.5 text-muted-foreground" />
+                  <span className="font-medium">{activeOrganization.name}</span>
+                </div>
+              )}
+            </div>
             <div className="flex items-center gap-3 md:gap-6 text-sm text-muted-foreground">
               {!configLoading && config && (
                 <>

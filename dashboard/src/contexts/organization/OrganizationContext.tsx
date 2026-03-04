@@ -43,7 +43,8 @@ export function OrganizationProvider({ children }: { children: ReactNode }) {
       }
       setActiveOrgId(orgId);
 
-      // Invalidate queries that are scoped to user context
+      // Invalidate queries that are scoped to user/org context
+      queryClient.invalidateQueries({ queryKey: queryKeys.models.all });
       queryClient.invalidateQueries({ queryKey: queryKeys.apiKeys.all });
       queryClient.invalidateQueries({ queryKey: queryKeys.batches.all });
       queryClient.invalidateQueries({ queryKey: queryKeys.files.all });

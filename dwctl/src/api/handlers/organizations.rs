@@ -12,19 +12,20 @@ use crate::{
         users::{CurrentUser, UserResponse},
     },
     auth::permissions::{can_manage_org_resource, can_read_all_resources, can_read_own_resource},
-    db::handlers::{Organizations, Repository, Users, organizations::OrganizationFilter},
+    db::handlers::{Credits, Organizations, Repository, Users, organizations::OrganizationFilter},
     db::models::organizations::{OrganizationCreateDBRequest, OrganizationUpdateDBRequest},
     email::EmailService,
     errors::{Error, Result},
     types::{Operation, Permission, Resource, UserId, UserIdOrCurrent},
 };
 use chrono::Duration;
+use rust_decimal::prelude::ToPrimitive;
 use sha2::{Digest, Sha256};
 use sqlx_pool_router::PoolProvider;
 
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{StatusCode, header, HeaderMap},
     response::Json,
 };
 
@@ -271,7 +272,16 @@ pub async fn get_organization<P: PoolProvider>(
     let mut org_repo = Organizations::new(&mut pool_conn);
     let members = org_repo.list_members(id).await?;
 
-    let response = OrganizationResponse::from_user(UserResponse::from(org)).with_member_count(members.len() as i64);
+    let mut response = OrganizationResponse::from_user(UserResponse::from(org)).with_member_count(members.len() as i64);
+
+    // Include credit balance if the user has permission to view billing data
+    let can_view_billing = crate::auth::permissions::has_permission(&current_user, Resource::Credits, Operation::ReadAll)
+        || crate::auth::permissions::has_permission(&current_user, Resource::Credits, Operation::ReadOwn);
+    if can_view_billing {
+        let mut credits_repo = Credits::new(&mut pool_conn);
+        let balance = credits_repo.get_user_balance(id).await?.to_f64().unwrap_or(0.0);
+        response.user = response.user.with_credit_balance(balance);
+    }
 
     Ok(Json(response))
 }
@@ -765,16 +775,14 @@ pub async fn list_user_organizations<P: PoolProvider>(
 
 /// Validate and confirm an active organization context.
 ///
-/// The client sends `X-Organization-Id` header on subsequent requests.
-/// This endpoint validates membership and returns the confirmed org ID.
-/// The dashboard stores the org ID in localStorage and includes it as a header.
-/// CLI tools pass it as a flag or environment variable.
+/// Sets a `dw_active_org` cookie so the browser sends it automatically with all
+/// subsequent requests.  CLI tools can still use the `X-Organization-Id` header.
 #[utoipa::path(
     post,
     path = "/session/organization",
     tag = "organizations",
     summary = "Set active organization",
-    description = "Validate organization membership. The client should store the returned organization_id and send it as the X-Organization-Id header on subsequent requests.",
+    description = "Validate organization membership and set a cookie for the active organization context.",
     responses(
         (status = 200, description = "Organization context validated", body = SetActiveOrganizationResponse),
         (status = 401, description = "Unauthorized"),
@@ -791,7 +799,7 @@ pub async fn set_active_organization<P: PoolProvider>(
     State(state): State<AppState<P>>,
     current_user: CurrentUser,
     Json(data): Json<SetActiveOrganizationRequest>,
-) -> Result<Json<SetActiveOrganizationResponse>> {
+) -> Result<(HeaderMap, Json<SetActiveOrganizationResponse>)> {
     // If organization_id is provided, verify membership
     if let Some(org_id) = data.organization_id {
         let mut pool_conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
@@ -806,9 +814,29 @@ pub async fn set_active_organization<P: PoolProvider>(
         }
     }
 
-    Ok(Json(SetActiveOrganizationResponse {
+    // Build the dw_active_org cookie using the same security settings as the session cookie
+    let session_config = &state.config.auth.native.session;
+    let secure = if session_config.cookie_secure { "; Secure" } else { "" };
+    let cookie = if let Some(org_id) = data.organization_id {
+        // Set cookie with long max-age (30 days) — cleared explicitly when switching back
+        format!(
+            "dw_active_org={}; Path=/; HttpOnly{}; SameSite={}; Max-Age={}",
+            org_id, secure, session_config.cookie_same_site, 30 * 24 * 60 * 60
+        )
+    } else {
+        // Clear cookie
+        format!(
+            "dw_active_org=; Path=/; HttpOnly{}; SameSite={}; Max-Age=0",
+            secure, session_config.cookie_same_site
+        )
+    };
+
+    let mut headers = HeaderMap::new();
+    headers.insert(header::SET_COOKIE, cookie.parse().unwrap());
+
+    Ok((headers, Json(SetActiveOrganizationResponse {
         active_organization_id: data.organization_id,
-    }))
+    })))
 }
 
 /// Invite a user to an organization by email

@@ -445,19 +445,38 @@ async fn populate_org_context(user: &mut CurrentUser, parts: &Parts, db: &PgPool
         }
     }
 
-    // Read X-Organization-Id header for active organization
-    if let Some(header_value) = parts.headers.get(ORGANIZATION_HEADER)
-        && let Ok(value_str) = header_value.to_str()
-        && let Ok(org_id) = value_str.parse::<uuid::Uuid>()
-    {
-        // Verify the user is a member of this organization
-        if user.organizations.iter().any(|o| o.id == org_id) {
-            user.active_organization = Some(org_id);
-        } else {
-            tracing::debug!(
-                org_id = %org_id,
-                "X-Organization-Id header references org user is not a member of"
-            );
+    // Read active organization from dw_active_org cookie, falling back to X-Organization-Id header.
+    // The cookie is set by POST /session/organization and sent automatically by the browser.
+    // The header is used by CLI tools and API clients without access to an API key (likely none).
+    let org_id_str = parts
+        .headers
+        .get_all("cookie")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|s| s.split(';'))
+        .find_map(|cookie| {
+            let cookie = cookie.trim();
+            cookie.strip_prefix("dw_active_org=").filter(|v| !v.is_empty())
+        })
+        .map(String::from)
+        .or_else(|| {
+            parts
+                .headers
+                .get(ORGANIZATION_HEADER)
+                .and_then(|v| v.to_str().ok())
+                .map(String::from)
+        });
+
+    if let Some(ref value) = org_id_str {
+        if let Ok(org_id) = value.parse::<uuid::Uuid>() {
+            if user.organizations.iter().any(|o| o.id == org_id) {
+                user.active_organization = Some(org_id);
+            } else {
+                tracing::debug!(
+                    org_id = %org_id,
+                    "Active organization references org user is not a member of"
+                );
+            }
         }
     }
 }

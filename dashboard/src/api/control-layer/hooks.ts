@@ -1424,8 +1424,10 @@ export function useCreateOrganization() {
         queryKey: queryKeys.organizations.all,
       });
       // Refresh current user to update their organizations list
+      // Use raw prefix key so it matches both ["users","byId","current",undefined]
+      // and ["users","byId","current","organizations"]
       queryClient.invalidateQueries({
-        queryKey: queryKeys.users.byId("current"),
+        queryKey: ["users", "byId", "current"],
       });
     },
   });
@@ -1462,7 +1464,7 @@ export function useDeleteOrganization() {
         queryKey: queryKeys.organizations.all,
       });
       queryClient.invalidateQueries({
-        queryKey: queryKeys.users.byId("current"),
+        queryKey: ["users", "byId", "current"],
       });
     },
   });

@@ -80,7 +80,6 @@ export const ROUTE_PERMISSIONS: Record<string, PagePermission> = {
   "/profile": "profile",
   "/batches": "batches",
   "/usage": "usage",
-  "/organizations": "organizations",
 };
 
 /**

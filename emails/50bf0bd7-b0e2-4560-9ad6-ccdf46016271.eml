@@ -1,0 +1,27 @@
+From: "Control Layer" <noreply@example.com>
+To: seb@doubleword.ai
+Subject: You've been invited to join ACME Corp
+Content-Type: text/html; charset=utf-8
+Content-Transfer-Encoding: quoted-printable
+Date: Wed, 04 Mar 2026 13:50:30 +0000
+
+<!DOCTYPE html>
+<html>
+<head><meta charset=3D"utf-8"></head>
+<body style=3D"font-family: system-ui, sans-serif; max-width: 600px; margin=
+: 40px auto; padding: 20px; color: #333;">
+    <h2>You're invited to join ACME Corp</h2>
+    <p>Hello,</p>
+    <p>test@doubleword.ai has invited you to join <strong>ACME Corp</strong=
+> as a <strong>member</strong>.</p>
+    <p style=3D"margin: 30px 0;">
+        <a href=3D"http://localhost:5173/invites/qEn9GSTBXVngdpA3OmUB9I6b47=
+1laxVjq_KcuauARk8" style=3D"background-color: #333; color: #fff; padding: 1=
+2px 24px; text-decoration: none; border-radius: 4px;">Accept invite</a>
+    </p>
+    <p style=3D"font-size: 13px; color: #666; word-break: break-all;">http:=
+//localhost:5173/invites/qEn9GSTBXVngdpA3OmUB9I6b471laxVjq_KcuauARk8</p>
+    <p style=3D"font-size: 13px; color: #888;">This invite expires in 7 day=
+s. If you did not expect this invitation, you can ignore this email.</p>
+</body>
+</html>
