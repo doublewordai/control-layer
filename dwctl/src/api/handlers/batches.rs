@@ -203,6 +203,11 @@ pub async fn create_batch<P: PoolProvider>(
         });
     }
 
+    // Parse file ID
+    let file_id = Uuid::parse_str(&req.input_file_id).map_err(|_| Error::BadRequest {
+        message: "Invalid input_file_id format".to_string(),
+    })?;
+
     // Reject batches from users with negative credit balance
     {
         let mut conn = state.db.write().acquire().await.map_err(|e| Error::Internal {
@@ -221,11 +226,6 @@ pub async fn create_batch<P: PoolProvider>(
             });
         }
     }
-
-    // Parse file ID
-    let file_id = Uuid::parse_str(&req.input_file_id).map_err(|_| Error::BadRequest {
-        message: "Invalid input_file_id format".to_string(),
-    })?;
 
     // Verify file exists and user has access
     // Use primary pool to avoid read-after-write consistency issues with replicas
