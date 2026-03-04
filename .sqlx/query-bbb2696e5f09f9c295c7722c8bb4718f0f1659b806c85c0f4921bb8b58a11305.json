@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT u.id, u.email, u.username, u.display_name,\n                   u.low_balance_threshold as \"low_balance_threshold!: rust_decimal::Decimal\",\n                   u.low_balance_notification_sent,\n                   c.balance as \"checkpoint_balance?\"\n            FROM users u\n            LEFT JOIN user_balance_checkpoints c ON c.user_id = u.id\n            WHERE u.id != '00000000-0000-0000-0000-000000000000'\n              AND u.is_deleted = false\n              AND u.low_balance_threshold IS NOT NULL\n            ",
+  "query": "\n            SELECT u.id, u.email, u.username, u.display_name,\n                   u.low_balance_threshold::decimal(20, 9) as \"low_balance_threshold!\",\n                   u.low_balance_notification_sent,\n                   c.balance as \"checkpoint_balance?\"\n            FROM users u\n            LEFT JOIN user_balance_checkpoints c ON c.user_id = u.id\n            WHERE u.id != '00000000-0000-0000-0000-000000000000'\n              AND u.is_deleted = false\n              AND u.low_balance_threshold IS NOT NULL\n            ",
   "describe": {
     "columns": [
       {
@@ -25,8 +25,8 @@
       },
       {
         "ordinal": 4,
-        "name": "low_balance_threshold!: rust_decimal::Decimal",
-        "type_info": "Float4"
+        "name": "low_balance_threshold!",
+        "type_info": "Numeric"
       },
       {
         "ordinal": 5,
@@ -47,10 +47,10 @@
       false,
       false,
       true,
-      true,
+      null,
       false,
       true
     ]
   },
-  "hash": "169dcc48d7901783a54af95ceeaf41ec199b9c722013bfe826537995cc801dfe"
+  "hash": "bbb2696e5f09f9c295c7722c8bb4718f0f1659b806c85c0f4921bb8b58a11305"
 }
