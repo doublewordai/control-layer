@@ -71,7 +71,7 @@ export function AppSidebar() {
   const { canAccessRoute } = useAuthorization();
   const { logout } = useAuth();
   const { isFeatureEnabled } = useSettings();
-  const { activeOrganizationId, setActiveOrganization } =
+  const { activeOrganizationId, isOrgContext, setActiveOrganization } =
     useOrganizationContext();
   const [isSupportModalOpen, setIsSupportModalOpen] = useState(false);
 
@@ -82,6 +82,9 @@ export function AppSidebar() {
     { path: "/playground", icon: Play, label: "Playground" },
     { path: "/analytics", icon: BarChart3, label: "Analytics" },
     { path: "/users-groups", icon: Users, label: "Users, Orgs & Groups" },
+    ...(isOrgContext
+      ? [{ path: "/organization", icon: Building, label: "Organization" }]
+      : []),
     { path: "/api-keys", icon: Key, label: "API Keys" },
     { path: "/usage", icon: Activity, label: "Usage" },
     { path: "/system", icon: Settings, label: "System" },

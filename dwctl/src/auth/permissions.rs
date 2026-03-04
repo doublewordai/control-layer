@@ -325,7 +325,6 @@ pub fn role_has_permission(role: &Role, resource: Resource, operation: Operation
                     | (Resource::Webhooks, Operation::ReadOwn)    // Can read own webhooks
                     | (Resource::Webhooks, Operation::UpdateOwn)  // Can update own webhooks
                     | (Resource::Webhooks, Operation::DeleteOwn) // Can delete own webhooks
-                    | (Resource::Organizations, Operation::CreateOwn) // Can create own organizations
                     | (Resource::Organizations, Operation::ReadOwn)   // Can read own organizations
                     | (Resource::Organizations, Operation::UpdateOwn) // Can manage orgs they belong to
             )

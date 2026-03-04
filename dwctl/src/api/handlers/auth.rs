@@ -366,7 +366,11 @@ pub async fn logout<P: PoolProvider>(State(state): State<AppState<P>>) -> Result
         message: "Logout successful".to_string(),
     };
 
-    Ok(LogoutResponse { auth_response, cookie, extra_cookies: vec![org_cookie] })
+    Ok(LogoutResponse {
+        auth_response,
+        cookie,
+        extra_cookies: vec![org_cookie],
+    })
 }
 
 /// Request password reset (send email)

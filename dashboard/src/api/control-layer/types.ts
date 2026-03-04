@@ -1319,6 +1319,7 @@ export interface OrganizationCreateRequest {
   name: string;
   email: string;
   display_name?: string;
+  owner_id?: string;
 }
 
 export interface OrganizationUpdateRequest {

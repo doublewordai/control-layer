@@ -1124,9 +1124,18 @@ pub async fn build_router(
             "/organizations/{id}/invites/{invite_id}",
             delete(api::handlers::organizations::cancel_invite),
         )
-        .route("/organizations/invites/{token}", get(api::handlers::organizations::get_invite_details))
-        .route("/organizations/invites/{token}/accept", post(api::handlers::organizations::accept_invite))
-        .route("/organizations/invites/{token}/decline", post(api::handlers::organizations::decline_invite))
+        .route(
+            "/organizations/invites/{token}",
+            get(api::handlers::organizations::get_invite_details),
+        )
+        .route(
+            "/organizations/invites/{token}/accept",
+            post(api::handlers::organizations::accept_invite),
+        )
+        .route(
+            "/organizations/invites/{token}/decline",
+            post(api::handlers::organizations::decline_invite),
+        )
         // User's organizations (sub-resource on users)
         .route(
             "/users/{user_id}/organizations",

@@ -467,16 +467,16 @@ async fn populate_org_context(user: &mut CurrentUser, parts: &Parts, db: &PgPool
                 .map(String::from)
         });
 
-    if let Some(ref value) = org_id_str {
-        if let Ok(org_id) = value.parse::<uuid::Uuid>() {
-            if user.organizations.iter().any(|o| o.id == org_id) {
-                user.active_organization = Some(org_id);
-            } else {
-                tracing::debug!(
-                    org_id = %org_id,
-                    "Active organization references org user is not a member of"
-                );
-            }
+    if let Some(ref value) = org_id_str
+        && let Ok(org_id) = value.parse::<uuid::Uuid>()
+    {
+        if user.organizations.iter().any(|o| o.id == org_id) {
+            user.active_organization = Some(org_id);
+        } else {
+            tracing::debug!(
+                org_id = %org_id,
+                "Active organization references org user is not a member of"
+            );
         }
     }
 }

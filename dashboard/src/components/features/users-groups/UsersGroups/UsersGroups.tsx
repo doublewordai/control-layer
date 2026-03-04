@@ -792,6 +792,7 @@ const UsersGroups: React.FC = () => {
       <CreateOrganizationModal
         isOpen={showCreateOrgModal}
         onClose={() => setShowCreateOrgModal(false)}
+        isPlatformManager={isPlatformManager}
       />
       <EditOrganizationModal
         isOpen={!!editingOrg}

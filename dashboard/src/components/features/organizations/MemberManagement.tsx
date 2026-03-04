@@ -30,9 +30,10 @@ import { toast } from "sonner";
 
 interface MemberManagementProps {
   organizationId: string;
+  readOnly?: boolean;
 }
 
-export function MemberManagement({ organizationId }: MemberManagementProps) {
+export function MemberManagement({ organizationId, readOnly = false }: MemberManagementProps) {
   const { data: members = [], isLoading } =
     useOrganizationMembers(organizationId);
   const inviteMember = useInviteMember();
@@ -131,14 +132,16 @@ export function MemberManagement({ organizationId }: MemberManagementProps) {
         <h3 className="text-lg font-semibold">
           Members ({activeMembers.length})
         </h3>
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={() => setShowAddForm(!showAddForm)}
-        >
-          <UserPlus className="h-4 w-4 mr-2" />
-          Invite Member
-        </Button>
+        {!readOnly && (
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => setShowAddForm(!showAddForm)}
+          >
+            <UserPlus className="h-4 w-4 mr-2" />
+            Invite Member
+          </Button>
+        )}
       </div>
 
       {showAddForm && (
@@ -207,28 +210,36 @@ export function MemberManagement({ organizationId }: MemberManagementProps) {
                 </div>
               </div>
               <div className="flex items-center gap-2">
-                <Select
-                  value={member.role}
-                  onValueChange={(v) =>
-                    handleRoleChange(member.user!.id, v as OrgMemberRole)
-                  }
-                >
-                  <SelectTrigger className="w-28 h-8 text-xs">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="member">Member</SelectItem>
-                    <SelectItem value="admin">Admin</SelectItem>
-                    <SelectItem value="owner">Owner</SelectItem>
-                  </SelectContent>
-                </Select>
-                <button
-                  onClick={() => setMemberToRemove(member)}
-                  className="h-8 w-8 p-0 rounded text-red-600 hover:text-red-700 hover:bg-red-50 transition-all flex items-center justify-center"
-                  title="Remove member"
-                >
-                  <Trash2 className="h-4 w-4" />
-                </button>
+                {readOnly ? (
+                  <span className="text-xs text-muted-foreground capitalize px-2 py-1 bg-muted rounded">
+                    {member.role}
+                  </span>
+                ) : (
+                  <>
+                    <Select
+                      value={member.role}
+                      onValueChange={(v) =>
+                        handleRoleChange(member.user!.id, v as OrgMemberRole)
+                      }
+                    >
+                      <SelectTrigger className="w-28 h-8 text-xs">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="member">Member</SelectItem>
+                        <SelectItem value="admin">Admin</SelectItem>
+                        <SelectItem value="owner">Owner</SelectItem>
+                      </SelectContent>
+                    </Select>
+                    <button
+                      onClick={() => setMemberToRemove(member)}
+                      className="h-8 w-8 p-0 rounded text-red-600 hover:text-red-700 hover:bg-red-50 transition-all flex items-center justify-center"
+                      title="Remove member"
+                    >
+                      <Trash2 className="h-4 w-4" />
+                    </button>
+                  </>
+                )}
               </div>
             </div>
           ),
@@ -269,14 +280,16 @@ export function MemberManagement({ organizationId }: MemberManagementProps) {
                   <span className="text-xs text-muted-foreground capitalize">
                     {member.role}
                   </span>
-                  <button
-                    onClick={() => handleCancelInvite(member)}
-                    className="h-8 w-8 p-0 rounded text-red-600 hover:text-red-700 hover:bg-red-50 transition-all flex items-center justify-center"
-                    title="Cancel invite"
-                    disabled={cancelInvite.isPending}
-                  >
-                    <X className="h-4 w-4" />
-                  </button>
+                  {!readOnly && (
+                    <button
+                      onClick={() => handleCancelInvite(member)}
+                      className="h-8 w-8 p-0 rounded text-red-600 hover:text-red-700 hover:bg-red-50 transition-all flex items-center justify-center"
+                      title="Cancel invite"
+                      disabled={cancelInvite.isPending}
+                    >
+                      <X className="h-4 w-4" />
+                    </button>
+                  )}
                 </div>
               </div>
             ))}

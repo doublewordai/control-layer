@@ -137,6 +137,11 @@ const OrganizationDetail = lazy(() =>
     default: m.OrganizationDetail,
   })),
 );
+const MyOrganization = lazy(() =>
+  import("./components/features/organizations").then((m) => ({
+    default: m.MyOrganization,
+  })),
+);
 const AcceptInvite = lazy(() =>
   import("./components/features/organizations").then((m) => ({
     default: m.AcceptInvite,
@@ -438,6 +443,18 @@ function AppRoutes() {
               <ProtectedRoute path="/users-groups">
                 <Suspense fallback={<RouteLoader />}>
                   <UsersGroups />
+                </Suspense>
+              </ProtectedRoute>
+            </AppLayout>
+          }
+        />
+        <Route
+          path="/organization"
+          element={
+            <AppLayout>
+              <ProtectedRoute path="/organization">
+                <Suspense fallback={<RouteLoader />}>
+                  <MyOrganization />
                 </Suspense>
               </ProtectedRoute>
             </AppLayout>

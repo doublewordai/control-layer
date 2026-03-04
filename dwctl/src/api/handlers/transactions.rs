@@ -121,10 +121,11 @@ pub async fn get_transaction<P: PoolProvider>(
     let transaction = match transaction {
         Some(tx) => {
             if !has_read_all && tx.user_id != current_user.id {
-                let can_org = permissions::can_manage_org_resource(&current_user, tx.user_id, &mut pool_conn)
+                // Allow any org member to view org transactions (not just owner/admin)
+                let is_member = permissions::is_org_member(&current_user, tx.user_id, &mut pool_conn)
                     .await
                     .map_err(Error::Database)?;
-                if !can_org {
+                if !is_member {
                     return Err(Error::NotFound {
                         resource: "Transaction".to_string(),
                         id: transaction_id.to_string(),
@@ -195,11 +196,12 @@ pub async fn list_transactions<P: PoolProvider>(
         (_, Some(requested_user_id)) => {
             // If requesting specific user's transactions
             if !has_read_all && requested_user_id != current_user.id {
+                // Allow any org member to view org transactions (not just owner/admin)
                 let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
-                let can_org = permissions::can_manage_org_resource(&current_user, requested_user_id, &mut conn)
+                let is_member = permissions::is_org_member(&current_user, requested_user_id, &mut conn)
                     .await
                     .map_err(Error::Database)?;
-                if !can_org {
+                if !is_member {
                     return Err(Error::InsufficientPermissions {
                         required: Permission::Allow(Resource::Credits, Operation::ReadAll),
                         action: Operation::ReadAll,

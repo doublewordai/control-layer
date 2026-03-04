@@ -11,6 +11,7 @@ use crate::api::models::files::{
     FileContentQuery, FileCostEstimate, FileCostEstimateQuery, FileDeleteResponse, FileListResponse, FileResponse, ListFilesQuery,
     ListObject, ObjectType, Purpose,
 };
+use crate::api::models::users::CurrentUser;
 use crate::auth::permissions::{RequiresPermission, can_read_all_resources, operation, resource};
 
 use crate::AppState;
@@ -46,6 +47,23 @@ use uuid::Uuid;
 // axum's multipart wraps multer, and checking error variants is more robust than string matching.
 use crate::limits::MULTIPART_OVERHEAD;
 use axum::extract::rejection::LengthLimitError;
+
+/// Check if the current user "owns" a resource, considering org context.
+/// Returns true if the resource owner matches the user's ID or their active organization.
+fn is_file_owner(current_user: &CurrentUser, uploaded_by: Option<&str>) -> bool {
+    let user_id = current_user.id.to_string();
+    if uploaded_by == Some(user_id.as_str()) {
+        return true;
+    }
+    if let Some(org_id) = current_user.active_organization {
+        let org_id_str = org_id.to_string();
+        if uploaded_by == Some(org_id_str.as_str()) {
+            return true;
+        }
+    }
+    false
+}
+
 /// OpenAI Batch API request format
 /// See: https://platform.openai.com/docs/api-reference/batch
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -772,10 +790,11 @@ pub async fn upload_file<P: PoolProvider>(
         max_request_body_size: state.config.limits.requests.max_body_size,
         buffer_size: state.config.batches.files.upload_buffer_size,
     };
-    let uploaded_by = Some(current_user.id.to_string());
+    // When in org context, attribute file ownership to the org (not the individual user)
+    let target_user_id = current_user.active_organization.unwrap_or(current_user.id);
+    let uploaded_by = Some(target_user_id.to_string());
 
     // Get or create user-specific hidden batch API key for batch request execution
-    let target_user_id = current_user.active_organization.unwrap_or(current_user.id);
     let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut api_keys_repo = ApiKeys::new(&mut conn);
     let user_api_key = api_keys_repo
@@ -789,7 +808,7 @@ pub async fn upload_file<P: PoolProvider>(
     // Query models accessible to the user for validation during file parsing
     let mut deployments_repo = Deployments::new(&mut conn);
     let filter = DeploymentFilter::new(0, i64::MAX)
-        .with_accessible_to(current_user.id)
+        .with_accessible_to(target_user_id)
         .with_statuses(vec![ModelStatus::Active])
         .with_deleted(false);
     let accessible_deployments = deployments_repo.list(&filter).await.map_err(Error::Database)?;
@@ -917,8 +936,10 @@ pub async fn list_files<P: PoolProvider>(
     // Build filter based on permissions
     let filter = fusillade::FileFilter {
         // Filter by ownership if user can't read all files, or if explicitly requested
+        // In org context, show files owned by the org instead of the individual user
         uploaded_by: if !can_read_all_files || query.own {
-            Some(current_user.id.to_string())
+            let target_user_id = current_user.active_organization.unwrap_or(current_user.id);
+            Some(target_user_id.to_string())
         } else {
             None
         },
@@ -1013,15 +1034,12 @@ pub async fn get_file<P: PoolProvider>(
             id: file_id_str.clone(),
         })?;
 
-    // Check ownership: users without ReadAll permission can only see their own files
-    if !can_read_all_files {
-        let user_id = current_user.id.to_string();
-        if file.uploaded_by.as_deref() != Some(user_id.as_str()) {
-            return Err(Error::NotFound {
-                resource: "File".to_string(),
-                id: file_id_str,
-            });
-        }
+    // Check ownership: users without ReadAll permission can only see their own files (or org files)
+    if !can_read_all_files && !is_file_owner(&current_user, file.uploaded_by.as_deref()) {
+        return Err(Error::NotFound {
+            resource: "File".to_string(),
+            id: file_id_str,
+        });
     }
 
     // Convert fusillade Purpose to API Purpose
@@ -1086,15 +1104,12 @@ pub async fn get_file_content<P: PoolProvider>(
             id: file_id_str.clone(),
         })?;
 
-    // Check ownership: users without ReadAll permission can only see their own files
-    if !can_read_all_files {
-        let user_id = current_user.id.to_string();
-        if file.uploaded_by.as_deref() != Some(user_id.as_str()) {
-            return Err(Error::NotFound {
-                resource: "File".to_string(),
-                id: file_id_str,
-            });
-        }
+    // Check ownership: users without ReadAll permission can only see their own files (or org files)
+    if !can_read_all_files && !is_file_owner(&current_user, file.uploaded_by.as_deref()) {
+        return Err(Error::NotFound {
+            resource: "File".to_string(),
+            id: file_id_str,
+        });
     }
 
     // For BatchOutput and BatchError files, check if the batch is still running
@@ -1297,15 +1312,12 @@ pub async fn delete_file<P: PoolProvider>(
             id: file_id_str.clone(),
         })?;
 
-    // Check ownership: users without DeleteAll permission can only delete their own files
-    if !can_delete_all_files {
-        let user_id = current_user.id.to_string();
-        if file.uploaded_by.as_deref() != Some(user_id.as_str()) {
-            return Err(Error::NotFound {
-                resource: "File".to_string(),
-                id: file_id_str.clone(),
-            });
-        }
+    // Check ownership: users without DeleteAll permission can only delete their own files (or org files)
+    if !can_delete_all_files && !is_file_owner(&current_user, file.uploaded_by.as_deref()) {
+        return Err(Error::NotFound {
+            resource: "File".to_string(),
+            id: file_id_str.clone(),
+        });
     }
 
     // Perform the deletion (hard delete - cascades to batches and requests)
@@ -1368,15 +1380,12 @@ pub async fn get_file_cost_estimate<P: PoolProvider>(
             id: file_id_str.clone(),
         })?;
 
-    // Check ownership: users without ReadAll permission can only see their own files
-    if !can_read_all_files {
-        let user_id = current_user.id.to_string();
-        if file.uploaded_by.as_deref() != Some(user_id.as_str()) {
-            return Err(Error::NotFound {
-                resource: "File".to_string(),
-                id: file_id_str,
-            });
-        }
+    // Check ownership: users without ReadAll permission can only see their own files (or org files)
+    if !can_read_all_files && !is_file_owner(&current_user, file.uploaded_by.as_deref()) {
+        return Err(Error::NotFound {
+            resource: "File".to_string(),
+            id: file_id_str,
+        });
     }
 
     // Get aggregated template statistics first to know which models are in the file

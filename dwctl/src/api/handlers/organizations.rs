@@ -4,9 +4,9 @@ use crate::{
     AppState,
     api::models::{
         organizations::{
-            AddMemberRequest, InviteDetailsResponse, InviteMemberRequest, InviteMemberResponse,
-            ListOrganizationsQuery, OrganizationCreate, OrganizationMemberResponse, OrganizationResponse,
-            OrganizationUpdate, SetActiveOrganizationRequest, SetActiveOrganizationResponse, UpdateMemberRoleRequest,
+            AddMemberRequest, InviteDetailsResponse, InviteMemberRequest, InviteMemberResponse, ListOrganizationsQuery, OrganizationCreate,
+            OrganizationMemberResponse, OrganizationResponse, OrganizationUpdate, SetActiveOrganizationRequest,
+            SetActiveOrganizationResponse, UpdateMemberRoleRequest,
         },
         pagination::PaginatedResponse,
         users::{CurrentUser, UserResponse},
@@ -25,7 +25,7 @@ use sqlx_pool_router::PoolProvider;
 
 use axum::{
     extract::{Path, Query, State},
-    http::{StatusCode, header, HeaderMap},
+    http::{HeaderMap, StatusCode, header},
     response::Json,
 };
 
@@ -97,10 +97,10 @@ pub async fn create_organization<P: PoolProvider>(
     current_user: CurrentUser,
     Json(data): Json<OrganizationCreate>,
 ) -> Result<(StatusCode, Json<OrganizationResponse>)> {
-    if !crate::auth::permissions::has_permission(&current_user, Resource::Organizations, Operation::CreateOwn) {
+    if !crate::auth::permissions::has_permission(&current_user, Resource::Organizations, Operation::CreateAll) {
         return Err(Error::InsufficientPermissions {
-            required: Permission::Allow(Resource::Organizations, Operation::CreateOwn),
-            action: Operation::CreateOwn,
+            required: Permission::Allow(Resource::Organizations, Operation::CreateAll),
+            action: Operation::CreateAll,
             resource: "Organizations".to_string(),
         });
     }
@@ -111,12 +111,14 @@ pub async fn create_organization<P: PoolProvider>(
         });
     }
 
+    let owner_id = data.owner_id.unwrap_or(current_user.id);
+
     let db_request = OrganizationCreateDBRequest {
         name: data.name,
         email: data.email,
         display_name: data.display_name,
         avatar_url: None,
-        created_by: current_user.id,
+        created_by: owner_id,
     };
 
     let mut pool_conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
@@ -821,7 +823,10 @@ pub async fn set_active_organization<P: PoolProvider>(
         // Set cookie with long max-age (30 days) — cleared explicitly when switching back
         format!(
             "dw_active_org={}; Path=/; HttpOnly{}; SameSite={}; Max-Age={}",
-            org_id, secure, session_config.cookie_same_site, 30 * 24 * 60 * 60
+            org_id,
+            secure,
+            session_config.cookie_same_site,
+            30 * 24 * 60 * 60
         )
     } else {
         // Clear cookie
@@ -834,9 +839,12 @@ pub async fn set_active_organization<P: PoolProvider>(
     let mut headers = HeaderMap::new();
     headers.insert(header::SET_COOKIE, cookie.parse().unwrap());
 
-    Ok((headers, Json(SetActiveOrganizationResponse {
-        active_organization_id: data.organization_id,
-    })))
+    Ok((
+        headers,
+        Json(SetActiveOrganizationResponse {
+            active_organization_id: data.organization_id,
+        }),
+    ))
 }
 
 /// Invite a user to an organization by email
@@ -917,9 +925,9 @@ pub async fn invite_member<P: PoolProvider>(
     // Check for existing pending invite for same email+org
     let mut org_repo = Organizations::new(&mut pool_conn);
     let members = org_repo.list_members(id).await?;
-    let has_pending = members.iter().any(|m| {
-        m.status == "pending" && m.invite_email.as_deref() == Some(email.as_str())
-    });
+    let has_pending = members
+        .iter()
+        .any(|m| m.status == "pending" && m.invite_email.as_deref() == Some(email.as_str()));
     if has_pending {
         return Err(Error::Conflict {
             message: "A pending invite already exists for this email address".to_string(),
@@ -1006,18 +1014,21 @@ pub async fn get_invite_details<P: PoolProvider>(
     let mut pool_conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut org_repo = Organizations::new(&mut pool_conn);
 
-    let invite = org_repo.find_invite_by_token_hash(&token_hash).await?.ok_or_else(|| Error::NotFound {
-        resource: "Invite".to_string(),
-        id: "invalid or expired token".to_string(),
-    })?;
+    let invite = org_repo
+        .find_invite_by_token_hash(&token_hash)
+        .await?
+        .ok_or_else(|| Error::NotFound {
+            resource: "Invite".to_string(),
+            id: "invalid or expired token".to_string(),
+        })?;
 
     // Check expiry
-    if let Some(expires_at) = invite.expires_at {
-        if expires_at < chrono::Utc::now() {
-            return Err(Error::BadRequest {
-                message: "This invite has expired".to_string(),
-            });
-        }
+    if let Some(expires_at) = invite.expires_at
+        && expires_at < chrono::Utc::now()
+    {
+        return Err(Error::BadRequest {
+            message: "This invite has expired".to_string(),
+        });
     }
 
     // Get org name
@@ -1077,27 +1088,30 @@ pub async fn accept_invite<P: PoolProvider>(
     let mut pool_conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut org_repo = Organizations::new(&mut pool_conn);
 
-    let invite = org_repo.find_invite_by_token_hash(&token_hash).await?.ok_or_else(|| Error::NotFound {
-        resource: "Invite".to_string(),
-        id: "invalid or expired token".to_string(),
-    })?;
+    let invite = org_repo
+        .find_invite_by_token_hash(&token_hash)
+        .await?
+        .ok_or_else(|| Error::NotFound {
+            resource: "Invite".to_string(),
+            id: "invalid or expired token".to_string(),
+        })?;
 
     // Check expiry
-    if let Some(expires_at) = invite.expires_at {
-        if expires_at < chrono::Utc::now() {
-            return Err(Error::BadRequest {
-                message: "This invite has expired".to_string(),
-            });
-        }
+    if let Some(expires_at) = invite.expires_at
+        && expires_at < chrono::Utc::now()
+    {
+        return Err(Error::BadRequest {
+            message: "This invite has expired".to_string(),
+        });
     }
 
     // Verify the current user's email matches the invite
-    if let Some(ref invite_email) = invite.invite_email {
-        if current_user.email.to_lowercase() != invite_email.to_lowercase() {
-            return Err(Error::BadRequest {
-                message: "Your email address does not match this invite".to_string(),
-            });
-        }
+    if let Some(ref invite_email) = invite.invite_email
+        && current_user.email.to_lowercase() != invite_email.to_lowercase()
+    {
+        return Err(Error::BadRequest {
+            message: "Your email address does not match this invite".to_string(),
+        });
     }
 
     org_repo.accept_invite(invite.id, current_user.id).await?;
@@ -1137,18 +1151,21 @@ pub async fn decline_invite<P: PoolProvider>(
     let mut pool_conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut org_repo = Organizations::new(&mut pool_conn);
 
-    let invite = org_repo.find_invite_by_token_hash(&token_hash).await?.ok_or_else(|| Error::NotFound {
-        resource: "Invite".to_string(),
-        id: "invalid or expired token".to_string(),
-    })?;
+    let invite = org_repo
+        .find_invite_by_token_hash(&token_hash)
+        .await?
+        .ok_or_else(|| Error::NotFound {
+            resource: "Invite".to_string(),
+            id: "invalid or expired token".to_string(),
+        })?;
 
     // Verify the current user's email matches the invite
-    if let Some(ref invite_email) = invite.invite_email {
-        if current_user.email.to_lowercase() != invite_email.to_lowercase() {
-            return Err(Error::BadRequest {
-                message: "Your email address does not match this invite".to_string(),
-            });
-        }
+    if let Some(ref invite_email) = invite.invite_email
+        && current_user.email.to_lowercase() != invite_email.to_lowercase()
+    {
+        return Err(Error::BadRequest {
+            message: "Your email address does not match this invite".to_string(),
+        });
     }
 
     // Delete the pending invite row
@@ -1230,14 +1247,13 @@ mod tests {
         let admin_headers = add_auth_headers(&admin);
 
         let owner = create_test_user(&pool, Role::StandardUser).await;
-        let owner_headers = add_auth_headers(&owner);
 
-        // Owner creates an org
+        // Platform manager creates an org with owner as the designated owner
         let resp = server
             .post("/admin/api/v1/organizations")
-            .add_header(&owner_headers[0].0, &owner_headers[0].1)
-            .add_header(&owner_headers[1].0, &owner_headers[1].1)
-            .json(&json!({ "name": "test-org-last-owner", "email": "org@example.com" }))
+            .add_header(&admin_headers[0].0, &admin_headers[0].1)
+            .add_header(&admin_headers[1].0, &admin_headers[1].1)
+            .json(&json!({ "name": "test-org-last-owner", "email": "org@example.com", "owner_id": owner.id }))
             .await;
         resp.assert_status(axum::http::StatusCode::CREATED);
         let org_id = resp.json::<serde_json::Value>()["id"].as_str().unwrap().to_string();
@@ -1261,15 +1277,14 @@ mod tests {
         let admin_headers = add_auth_headers(&admin);
 
         let owner1 = create_test_user(&pool, Role::StandardUser).await;
-        let owner1_headers = add_auth_headers(&owner1);
         let owner2 = create_test_user(&pool, Role::StandardUser).await;
 
-        // Owner1 creates an org
+        // Platform manager creates an org with owner1 as the designated owner
         let resp = server
             .post("/admin/api/v1/organizations")
-            .add_header(&owner1_headers[0].0, &owner1_headers[0].1)
-            .add_header(&owner1_headers[1].0, &owner1_headers[1].1)
-            .json(&json!({ "name": "test-org-two-owners", "email": "org@example.com" }))
+            .add_header(&admin_headers[0].0, &admin_headers[0].1)
+            .add_header(&admin_headers[1].0, &admin_headers[1].1)
+            .json(&json!({ "name": "test-org-two-owners", "email": "org@example.com", "owner_id": owner1.id }))
             .await;
         resp.assert_status(axum::http::StatusCode::CREATED);
         let org_id = resp.json::<serde_json::Value>()["id"].as_str().unwrap().to_string();
@@ -1300,14 +1315,13 @@ mod tests {
         let admin_headers = add_auth_headers(&admin);
 
         let owner = create_test_user(&pool, Role::StandardUser).await;
-        let owner_headers = add_auth_headers(&owner);
 
-        // Owner creates an org
+        // Platform manager creates an org with owner as the designated owner
         let resp = server
             .post("/admin/api/v1/organizations")
-            .add_header(&owner_headers[0].0, &owner_headers[0].1)
-            .add_header(&owner_headers[1].0, &owner_headers[1].1)
-            .json(&json!({ "name": "test-org-demote", "email": "org@example.com" }))
+            .add_header(&admin_headers[0].0, &admin_headers[0].1)
+            .add_header(&admin_headers[1].0, &admin_headers[1].1)
+            .json(&json!({ "name": "test-org-demote", "email": "org@example.com", "owner_id": owner.id }))
             .await;
         resp.assert_status(axum::http::StatusCode::CREATED);
         let org_id = resp.json::<serde_json::Value>()["id"].as_str().unwrap().to_string();
@@ -1330,37 +1344,38 @@ mod tests {
     #[test_log::test]
     async fn test_admin_cannot_assign_owner_role(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let pm = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let pm_headers = add_auth_headers(&pm);
 
         let owner = create_test_user(&pool, Role::StandardUser).await;
-        let owner_headers = add_auth_headers(&owner);
         let org_admin = create_test_user(&pool, Role::StandardUser).await;
         let org_admin_headers = add_auth_headers(&org_admin);
         let member = create_test_user(&pool, Role::StandardUser).await;
 
-        // Owner creates an org
+        // Platform manager creates an org with owner as the designated owner
         let resp = server
             .post("/admin/api/v1/organizations")
-            .add_header(&owner_headers[0].0, &owner_headers[0].1)
-            .add_header(&owner_headers[1].0, &owner_headers[1].1)
-            .json(&json!({ "name": "test-org-priv-esc", "email": "org@example.com" }))
+            .add_header(&pm_headers[0].0, &pm_headers[0].1)
+            .add_header(&pm_headers[1].0, &pm_headers[1].1)
+            .json(&json!({ "name": "test-org-priv-esc", "email": "org@example.com", "owner_id": owner.id }))
             .await;
         resp.assert_status(axum::http::StatusCode::CREATED);
         let org_id = resp.json::<serde_json::Value>()["id"].as_str().unwrap().to_string();
 
-        // Owner adds org_admin as admin
+        // Platform manager adds org_admin as admin
         let resp = server
             .post(&format!("/admin/api/v1/organizations/{org_id}/members"))
-            .add_header(&owner_headers[0].0, &owner_headers[0].1)
-            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .add_header(&pm_headers[0].0, &pm_headers[0].1)
+            .add_header(&pm_headers[1].0, &pm_headers[1].1)
             .json(&json!({ "user_id": org_admin.id, "role": "admin" }))
             .await;
         resp.assert_status(axum::http::StatusCode::CREATED);
 
-        // Owner adds member
+        // Platform manager adds member
         let resp = server
             .post(&format!("/admin/api/v1/organizations/{org_id}/members"))
-            .add_header(&owner_headers[0].0, &owner_headers[0].1)
-            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .add_header(&pm_headers[0].0, &pm_headers[0].1)
+            .add_header(&pm_headers[1].0, &pm_headers[1].1)
             .json(&json!({ "user_id": member.id, "role": "member" }))
             .await;
         resp.assert_status(axum::http::StatusCode::CREATED);
@@ -1379,28 +1394,29 @@ mod tests {
     #[test_log::test]
     async fn test_admin_cannot_add_member_as_owner(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let pm = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let pm_headers = add_auth_headers(&pm);
 
         let owner = create_test_user(&pool, Role::StandardUser).await;
-        let owner_headers = add_auth_headers(&owner);
         let org_admin = create_test_user(&pool, Role::StandardUser).await;
         let org_admin_headers = add_auth_headers(&org_admin);
         let new_user = create_test_user(&pool, Role::StandardUser).await;
 
-        // Owner creates an org
+        // Platform manager creates an org with owner as the designated owner
         let resp = server
             .post("/admin/api/v1/organizations")
-            .add_header(&owner_headers[0].0, &owner_headers[0].1)
-            .add_header(&owner_headers[1].0, &owner_headers[1].1)
-            .json(&json!({ "name": "test-org-add-owner", "email": "org@example.com" }))
+            .add_header(&pm_headers[0].0, &pm_headers[0].1)
+            .add_header(&pm_headers[1].0, &pm_headers[1].1)
+            .json(&json!({ "name": "test-org-add-owner", "email": "org@example.com", "owner_id": owner.id }))
             .await;
         resp.assert_status(axum::http::StatusCode::CREATED);
         let org_id = resp.json::<serde_json::Value>()["id"].as_str().unwrap().to_string();
 
-        // Owner adds org_admin as admin
+        // Platform manager adds org_admin as admin
         let resp = server
             .post(&format!("/admin/api/v1/organizations/{org_id}/members"))
-            .add_header(&owner_headers[0].0, &owner_headers[0].1)
-            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .add_header(&pm_headers[0].0, &pm_headers[0].1)
+            .add_header(&pm_headers[1].0, &pm_headers[1].1)
             .json(&json!({ "user_id": org_admin.id, "role": "admin" }))
             .await;
         resp.assert_status(axum::http::StatusCode::CREATED);
@@ -1419,17 +1435,19 @@ mod tests {
     #[test_log::test]
     async fn test_owner_can_assign_owner_role(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let pm = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let pm_headers = add_auth_headers(&pm);
 
         let owner = create_test_user(&pool, Role::StandardUser).await;
         let owner_headers = add_auth_headers(&owner);
         let new_user = create_test_user(&pool, Role::StandardUser).await;
 
-        // Owner creates an org
+        // Platform manager creates an org with owner as the designated owner
         let resp = server
             .post("/admin/api/v1/organizations")
-            .add_header(&owner_headers[0].0, &owner_headers[0].1)
-            .add_header(&owner_headers[1].0, &owner_headers[1].1)
-            .json(&json!({ "name": "test-org-owner-assign", "email": "org@example.com" }))
+            .add_header(&pm_headers[0].0, &pm_headers[0].1)
+            .add_header(&pm_headers[1].0, &pm_headers[1].1)
+            .json(&json!({ "name": "test-org-owner-assign", "email": "org@example.com", "owner_id": owner.id }))
             .await;
         resp.assert_status(axum::http::StatusCode::CREATED);
         let org_id = resp.json::<serde_json::Value>()["id"].as_str().unwrap().to_string();
@@ -1454,15 +1472,14 @@ mod tests {
         let pm = create_test_admin_user(&pool, Role::PlatformManager).await;
         let pm_headers = add_auth_headers(&pm);
         let owner = create_test_user(&pool, Role::StandardUser).await;
-        let owner_headers = add_auth_headers(&owner);
         let new_user = create_test_user(&pool, Role::StandardUser).await;
 
-        // Owner creates an org
+        // Platform manager creates an org with owner as the designated owner
         let resp = server
             .post("/admin/api/v1/organizations")
-            .add_header(&owner_headers[0].0, &owner_headers[0].1)
-            .add_header(&owner_headers[1].0, &owner_headers[1].1)
-            .json(&json!({ "name": "test-org-pm-assign", "email": "org@example.com" }))
+            .add_header(&pm_headers[0].0, &pm_headers[0].1)
+            .add_header(&pm_headers[1].0, &pm_headers[1].1)
+            .json(&json!({ "name": "test-org-pm-assign", "email": "org@example.com", "owner_id": owner.id }))
             .await;
         resp.assert_status(axum::http::StatusCode::CREATED);
         let org_id = resp.json::<serde_json::Value>()["id"].as_str().unwrap().to_string();
@@ -1485,18 +1502,20 @@ mod tests {
     #[test_log::test]
     async fn test_set_active_organization_validates_membership(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let pm = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let pm_headers = add_auth_headers(&pm);
 
         let owner = create_test_user(&pool, Role::StandardUser).await;
         let owner_headers = add_auth_headers(&owner);
         let non_member = create_test_user(&pool, Role::StandardUser).await;
         let non_member_headers = add_auth_headers(&non_member);
 
-        // Owner creates an org
+        // Platform manager creates an org with owner as the designated owner
         let resp = server
             .post("/admin/api/v1/organizations")
-            .add_header(&owner_headers[0].0, &owner_headers[0].1)
-            .add_header(&owner_headers[1].0, &owner_headers[1].1)
-            .json(&json!({ "name": "test-org-session", "email": "org@example.com" }))
+            .add_header(&pm_headers[0].0, &pm_headers[0].1)
+            .add_header(&pm_headers[1].0, &pm_headers[1].1)
+            .json(&json!({ "name": "test-org-session", "email": "org@example.com", "owner_id": owner.id }))
             .await;
         resp.assert_status(axum::http::StatusCode::CREATED);
         let org_id = resp.json::<serde_json::Value>()["id"].as_str().unwrap().to_string();

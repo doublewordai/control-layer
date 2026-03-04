@@ -423,6 +423,7 @@ impl<'c> Organizations<'c> {
     }
 
     /// Create a pending invite
+    #[allow(clippy::too_many_arguments)]
     #[instrument(skip(self, token_hash), fields(org_id = %abbrev_uuid(&org_id), invite_email = %invite_email), err)]
     pub async fn create_invite(
         &mut self,

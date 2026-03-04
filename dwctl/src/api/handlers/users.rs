@@ -201,16 +201,23 @@ pub async fn get_user<P: PoolProvider>(
             let can_read_all_users = can_read_all_resources(&current_user, Resource::Users);
             let can_read_own_user = can_read_own_resource(&current_user, Resource::Users, uuid);
 
-            // Allow access if user can read all users OR read their own user data
+            // Allow access if user can read all users, read their own user data,
+            // or is a member of the org (orgs are virtual users)
             if !can_read_all_users && !can_read_own_user {
-                return Err(Error::InsufficientPermissions {
-                    required: Permission::Any(vec![
-                        Permission::Allow(Resource::Users, Operation::ReadAll),
-                        Permission::Allow(Resource::Users, Operation::ReadOwn),
-                    ]),
-                    action: Operation::ReadAll,
-                    resource: format!("user data for user {uuid}"),
-                });
+                let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+                let is_member = permissions::is_org_member(&current_user, uuid, &mut conn)
+                    .await
+                    .map_err(Error::Database)?;
+                if !is_member {
+                    return Err(Error::InsufficientPermissions {
+                        required: Permission::Any(vec![
+                            Permission::Allow(Resource::Users, Operation::ReadAll),
+                            Permission::Allow(Resource::Users, Operation::ReadOwn),
+                        ]),
+                        action: Operation::ReadAll,
+                        resource: format!("user data for user {uuid}"),
+                    });
+                }
             }
             uuid
         }
@@ -248,7 +255,7 @@ pub async fn get_user<P: PoolProvider>(
         let mut org_repo = Organizations::new(&mut pool_conn);
         let memberships = org_repo.list_user_organizations(target_user_id).await?;
 
-        let org_ids: Vec<UserId> = memberships.iter().filter_map(|m| Some(m.organization_id)).collect();
+        let org_ids: Vec<UserId> = memberships.iter().map(|m| m.organization_id).collect();
         if !org_ids.is_empty() {
             let mut users_repo = Users::new(&mut pool_conn);
             let org_map = users_repo.get_bulk(org_ids).await?;
@@ -256,13 +263,13 @@ pub async fn get_user<P: PoolProvider>(
             let summaries: Vec<crate::api::models::organizations::OrganizationSummary> = memberships
                 .iter()
                 .filter_map(|m| {
-                    org_map.get(&m.organization_id).map(|org| {
-                        crate::api::models::organizations::OrganizationSummary {
+                    org_map
+                        .get(&m.organization_id)
+                        .map(|org| crate::api::models::organizations::OrganizationSummary {
                             id: m.organization_id,
                             name: org.display_name.clone().unwrap_or_else(|| org.username.clone()),
                             role: m.role.clone(),
-                        }
-                    })
+                        })
                 })
                 .collect();
 

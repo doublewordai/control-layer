@@ -20,6 +20,9 @@ pub struct OrganizationCreate {
     /// Human-readable display name
     #[schema(example = "Acme Corporation")]
     pub display_name: Option<String>,
+    /// User ID to assign as owner (platform managers only; defaults to current user)
+    #[schema(value_type = Option<String>, format = "uuid")]
+    pub owner_id: Option<UserId>,
 }
 
 /// Request body for updating an organization
