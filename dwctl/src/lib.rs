@@ -1123,7 +1123,7 @@ pub async fn build_router(
             "/users/{user_id}/organizations",
             get(api::handlers::organizations::list_user_organizations),
         )
-        // Organization session context (sets HttpOnly cookie)
+        // Organization session context (validates membership, client stores org ID for X-Organization-Id header)
         .route("/session/organization", post(api::handlers::organizations::set_active_organization))
         .route("/requests", get(api::handlers::requests::list_requests))
         .route("/requests/aggregate", get(api::handlers::requests::aggregate_requests))

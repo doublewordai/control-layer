@@ -61,7 +61,7 @@ pub(crate) async fn admin_ai_proxy<P: sqlx_pool_router::PoolProvider + Clone>(
     let user_api_key = api_keys_repo
         .get_or_create_hidden_key(target_user_id, ApiKeyPurpose::Playground, current_user.id)
         .await
-        .with_context(|| format!("Failed to get or create hidden playground API key for user {}", current_user.id))?;
+        .with_context(|| format!("Failed to get or create hidden playground API key for target user {} (current user {})", target_user_id, current_user.id))?;
 
     // Rewrite the path from /admin/api/v1/ai/* to /ai/*
     debug!("User has access to model: {}", model_name);

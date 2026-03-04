@@ -2,6 +2,8 @@
 -- Default 'individual' preserves all existing behavior.
 ALTER TABLE users
   ADD COLUMN user_type VARCHAR NOT NULL DEFAULT 'individual';
+ALTER TABLE users
+  ADD CONSTRAINT chk_user_type CHECK (user_type IN ('individual', 'organization'));
 
 -- Mapping: which users belong to which organizations.
 -- An organization is itself a row in the users table with user_type = 'organization'.
@@ -9,7 +11,7 @@ CREATE TABLE user_organizations (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     organization_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    role VARCHAR NOT NULL DEFAULT 'member',   -- 'owner' | 'admin' | 'member'
+    role VARCHAR NOT NULL DEFAULT 'member' CHECK (role IN ('owner', 'admin', 'member')),
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     UNIQUE (user_id, organization_id)
 );
@@ -17,9 +19,9 @@ CREATE TABLE user_organizations (
 CREATE INDEX idx_user_organizations_user_id ON user_organizations(user_id);
 CREATE INDEX idx_user_organizations_organization_id ON user_organizations(organization_id);
 
--- Enforce that organization_id always points to a user with user_type = 'organization'.
+-- Enforce that organization_id points to an 'organization' user and user_id points to an 'individual' user.
 -- CHECK constraints can't query other tables, so we use a trigger.
-CREATE OR REPLACE FUNCTION check_organization_type() RETURNS trigger AS $$
+CREATE OR REPLACE FUNCTION check_organization_membership_types() RETURNS trigger AS $$
 BEGIN
     IF NOT EXISTS (
         SELECT 1 FROM users WHERE id = NEW.organization_id AND user_type = 'organization'
@@ -27,13 +29,19 @@ BEGIN
         RAISE EXCEPTION 'organization_id must reference a user with user_type = ''organization'''
             USING ERRCODE = 'check_violation';
     END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM users WHERE id = NEW.user_id AND user_type = 'individual'
+    ) THEN
+        RAISE EXCEPTION 'user_id must reference a user with user_type = ''individual'''
+            USING ERRCODE = 'check_violation';
+    END IF;
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
 
-CREATE TRIGGER enforce_organization_type
+CREATE TRIGGER enforce_organization_membership_types
     BEFORE INSERT OR UPDATE ON user_organizations
-    FOR EACH ROW EXECUTE FUNCTION check_organization_type();
+    FOR EACH ROW EXECUTE FUNCTION check_organization_membership_types();
 
 -- Trigger NOTIFY so onwards picks up any future config changes involving org users
 CREATE TRIGGER user_organizations_notify

@@ -124,7 +124,7 @@ pub async fn create_user_api_key<P: PoolProvider>(
     // When a PlatformManager creates a key on behalf of another user, set created_by
     // to the target user so the key is visible to them. For org members creating keys
     // for their org, created_by stays as current_user.id so the member can see their
-    // own keys. All API key visibility is scoped by created_by — there is no bypass.
+    // own keys. PlatformManagers bypass the created_by filter in list/get/delete.
     let created_by = if pm_creating_for_other { target_user_id } else { current_user.id };
     let db_request = ApiKeyCreateDBRequest::new(target_user_id, created_by, data);
 

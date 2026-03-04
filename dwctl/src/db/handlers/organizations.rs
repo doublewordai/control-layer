@@ -967,7 +967,7 @@ mod tests {
         assert_eq!(role, None);
     }
 
-    // ── Trigger: enforce_organization_type ─────────────────────────────────
+    // ── Trigger: enforce_organization_membership_types ─────────────────────
 
     #[sqlx::test]
     #[test_log::test]
