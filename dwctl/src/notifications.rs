@@ -231,17 +231,13 @@ pub async fn run_notification_poller(
                 };
 
                 // Look up balance: prefer refreshed, fall back to checkpoint
-                let balance_for = |u: &LowBalanceUser| -> Option<rust_decimal::Decimal> {
-                    refreshed.get(&u.id).copied().or(u.checkpoint_balance)
-                };
+                let balance_for =
+                    |u: &LowBalanceUser| -> Option<rust_decimal::Decimal> { refreshed.get(&u.id).copied().or(u.checkpoint_balance) };
 
                 // 3. Send notifications for users below threshold who haven't been notified
                 let to_notify: Vec<_> = candidates
                     .iter()
-                    .filter(|u| {
-                        !u.low_balance_notification_sent
-                            && balance_for(u).map(|b| b < u.low_balance_threshold).unwrap_or(false)
-                    })
+                    .filter(|u| !u.low_balance_notification_sent && balance_for(u).map(|b| b < u.low_balance_threshold).unwrap_or(false))
                     .collect();
 
                 if !to_notify.is_empty() {
@@ -252,10 +248,7 @@ pub async fn run_notification_poller(
                 // 4. Clear recovered flags (after emails sent so we don't lose state on failure)
                 let recovered: Vec<Uuid> = candidates
                     .iter()
-                    .filter(|u| {
-                        u.low_balance_notification_sent
-                            && balance_for(u).map(|b| b >= u.low_balance_threshold).unwrap_or(false)
-                    })
+                    .filter(|u| u.low_balance_notification_sent && balance_for(u).map(|b| b >= u.low_balance_threshold).unwrap_or(false))
                     .map(|u| u.id)
                     .collect();
 
