@@ -162,4 +162,25 @@ pub trait PaymentProvider: Send + Sync {
     /// * `user` - The authenticated user requesting portal access
     /// * `return_url` - The complete URL to redirect to after the customer is done (e.g., "https://example.com/cost-management")
     async fn create_billing_portal_session(&self, user: &CurrentUser, return_url: &str) -> Result<String>;
+
+    /// Create a checkout session for auto top-up setup
+    ///
+    /// Checks if the user can set up auto top-up (e.g., has a saved payment method)
+    /// and creates a checkout session for it. Returns the checkout URL.
+    ///
+    /// # Arguments
+    /// * `user` - The authenticated user
+    /// * `cancel_url` - URL to redirect to if the user cancels
+    /// * `success_url` - URL to redirect to on success
+    async fn create_auto_topup_checkout_session(&self, user: &CurrentUser, cancel_url: &str, success_url: &str) -> Result<String>;
+
+    /// Validate and process an auto top-up checkout session
+    ///
+    /// Verifies that the checkout session completed successfully with the payment
+    /// provider (e.g., payment method was saved). Called after the user completes
+    /// the auto top-up checkout flow.
+    ///
+    /// Unlike `process_payment_session`, this does not create a credit transaction.
+    /// It only validates the session so the caller can safely enable auto top-up.
+    async fn process_auto_topup_session(&self, db_pool: &PgPool, session_id: &str) -> Result<String>;
 }

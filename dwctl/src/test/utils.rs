@@ -361,6 +361,9 @@ pub async fn get_system_user(pool: &mut PgConnection) -> UserResponse {
         has_payment_provider_id: false,
         batch_notifications_enabled: false,
         low_balance_threshold: None,
+        auto_topup_amount: None,
+        auto_topup_threshold: None,
+        has_auto_topup_payment_method: false,
     }
 }
 

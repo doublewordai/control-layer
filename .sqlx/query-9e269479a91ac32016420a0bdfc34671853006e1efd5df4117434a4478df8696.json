@@ -97,6 +97,11 @@
         "ordinal": 18,
         "name": "low_balance_threshold",
         "type_info": "Float4"
+      },
+      {
+        "ordinal": 19,
+        "name": "auto_topup_amount",
+        "type_info": "Float4"
       }
     ],
     "parameters": {
@@ -123,6 +128,7 @@
       false,
       false,
       false,
+      true,
       true
     ]
   },

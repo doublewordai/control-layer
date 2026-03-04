@@ -169,6 +169,26 @@ impl PaymentProvider for DummyProvider {
         Ok(())
     }
 
+    async fn create_auto_topup_checkout_session(
+        &self,
+        user: &CurrentUser,
+        _cancel_url: &str,
+        success_url: &str,
+    ) -> Result<String> {
+        // Dummy provider: always redirect to success URL (no real payment flow)
+        let session_id = format!("dummy_session_{}_{}", user.id, uuid::Uuid::new_v4());
+        let redirect_url = success_url.replace("{CHECKOUT_SESSION_ID}", &session_id);
+        Ok(redirect_url)
+    }
+
+    async fn process_auto_topup_session(&self, _db_pool: &PgPool, session_id: &str) -> Result<String> {
+        // For dummy provider, just validate the session format
+        if !session_id.starts_with("dummy_session_") {
+            return Err(PaymentError::InvalidData("Invalid dummy session ID format".to_string()));
+        }
+        Ok(format!("dummy_pm_{}", uuid::Uuid::new_v4()))
+    }
+
     async fn create_billing_portal_session(&self, user: &CurrentUser, return_url: &str) -> Result<String> {
         // Check if user has a payment provider ID (required for billing portal)
         let _customer_id = user.payment_provider_id.as_ref().ok_or(PaymentError::NoCustomerId)?;

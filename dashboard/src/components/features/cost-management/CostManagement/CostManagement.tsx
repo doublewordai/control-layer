@@ -12,6 +12,7 @@ import { toast } from "sonner";
 import { useSettings } from "@/contexts";
 import { TransactionHistory } from "@/components/features/cost-management/CostManagement/TransactionHistory.tsx";
 import { AddFundsModal } from "@/components/modals/AddCreditsModal/AddCreditsModal";
+import { AutoTopupModal } from "@/components/modals/AutoTopupModal/AutoTopupModal";
 import {
   Dialog,
   DialogContent,
@@ -32,9 +33,29 @@ export function CostManagement() {
   const [showSuccessModal, setShowSuccessModal] = useState(false);
   const [showCancelledModal, setShowCancelledModal] = useState(false);
   const [showAddFundsModal, setShowAddFundsModal] = useState(false);
+  const [showAutoTopupModal, setShowAutoTopupModal] = useState(false);
+  const [autoTopupId, setAutoTopupId] = useState<string | undefined>(undefined);
 
   // Check if we're filtering by a specific user
   const filterUserId = searchParams.get("user");
+
+  // Open auto top-up modal from URL param (e.g. linked from profile page or Stripe redirect)
+  const openAutoTopup = searchParams.get("autoTopup");
+  const autoTopupIdParam = searchParams.get("autoTopupId");
+  useEffect(() => {
+    if (openAutoTopup === "true") {
+      setAutoTopupId(autoTopupIdParam ?? undefined);
+      setShowAutoTopupModal(true);
+
+      // Clean autoTopupId from URL but preserve other params
+      if (autoTopupIdParam) {
+        const url = new URL(window.location.href);
+        url.searchParams.delete("autoTopupId");
+        url.searchParams.delete("autoTopup");
+        window.history.replaceState({}, "", url.pathname + url.search);
+      }
+    }
+  }, [openAutoTopup, autoTopupIdParam]);
 
   // Fetch current user and display user (the one we're viewing billing for)
   const { data: currentUser, refetch: refetchCurrentUser } = useUser("current");
@@ -204,6 +225,7 @@ export function CostManagement() {
         onGiftFunds: canManageFunds ? handleGiftFunds : undefined,
         // Only show "Billing Portal" if user has a customer ID
         onBillingPortal: hasCustomerId ? handleBillingPortal : undefined,
+        onManageAutoTopup: () => setShowAutoTopupModal(true),
       };
     } else {
       // Non-admin without customer ID: simple payment button
@@ -235,6 +257,21 @@ export function CostManagement() {
               onSuccess={handleAddFundsSuccess}
             />
           )}
+          <AutoTopupModal
+            isOpen={showAutoTopupModal}
+            onClose={() => {
+              setShowAutoTopupModal(false);
+              setAutoTopupId(undefined);
+            }}
+            autoTopupAmount={displayUser?.auto_topup_amount ?? null}
+            autoTopupThreshold={displayUser?.auto_topup_threshold ?? null}
+            userId={filterUserId || currentUser.id}
+            onSuccess={() => {
+              refetchCurrentUser();
+              refetchDisplayUser();
+            }}
+            autoTopupId={autoTopupId}
+          />
         </>
       )}
 

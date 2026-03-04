@@ -74,7 +74,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx_pool_router::PoolProvider;
 
-use crate::{AppState, api::models::users::CurrentUser, payment_providers};
+use crate::{
+    AppState,
+    api::models::users::CurrentUser,
+    db::{handlers::repository::Repository, handlers::users::Users, models::users::UserUpdateDBRequest},
+    payment_providers,
+};
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct PaymentQuery {
@@ -352,6 +357,187 @@ pub async fn create_billing_portal_session<P: PoolProvider>(
     // Return the portal URL as JSON for the frontend to navigate to
     Ok(Json(json!({
         "url": portal_url
+    }))
+    .into_response())
+}
+
+/// Create a checkout session for auto top-up setup
+///
+/// Creates a checkout session with the payment provider for setting up
+/// auto top-up. Returns the checkout URL for the frontend to redirect to.
+#[utoipa::path(
+    post,
+    path = "/auto-topup/checkout",
+    tag = "payments",
+    summary = "Create auto top-up checkout session",
+    description = "Creates a checkout session for auto top-up setup. The user must have a payment provider customer ID.",
+    responses(
+        (status = 200, description = "Checkout session created. Returns JSON with checkout URL.", body = inline(Object)),
+        (status = 400, description = "User does not have a payment provider customer ID"),
+        (status = 503, description = "No payment provider configured"),
+    ),
+    security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
+        ("X-Doubleword-User" = [])
+    )
+)]
+#[tracing::instrument(skip_all)]
+pub async fn create_auto_topup_checkout<P: PoolProvider>(
+    State(state): State<AppState<P>>,
+    user: CurrentUser,
+) -> Result<Response, StatusCode> {
+    let payment_config = match state.config.payment.clone() {
+        Some(config) => config,
+        None => {
+            tracing::warn!("Auto top-up checkout requested but no payment provider is configured");
+            let error_response = Json(json!({
+                "message": "Payment processing is currently unavailable. Please contact support."
+            }));
+            return Ok((StatusCode::SERVICE_UNAVAILABLE, error_response).into_response());
+        }
+    };
+
+    let origin = state.config.dashboard_url.clone();
+    let success_url = format!("{}/cost-management?autoTopupId={{CHECKOUT_SESSION_ID}}&autoTopup=true", origin);
+    let cancel_url = format!("{}/cost-management?autoTopup=true&autoTopupId=fail", origin);
+
+    let provider = payment_providers::create_provider(payment_config);
+
+    let checkout_url = provider
+        .create_auto_topup_checkout_session(&user, &cancel_url, &success_url)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to create auto top-up checkout session: {:?}", e);
+            StatusCode::from(e)
+        })?;
+
+    Ok(Json(json!({
+        "url": checkout_url
+    }))
+    .into_response())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ProcessAutoTopupRequest {
+    /// Balance threshold in dollars that triggers auto top-up.
+    pub threshold: f32,
+    /// Amount in dollars to top up when threshold is reached.
+    pub amount: f32,
+}
+
+/// Enable auto top-up for the current user
+///
+/// Validates the checkout session with the payment provider, then enables
+/// auto top-up at the specified threshold. Works like `PATCH /payments/{id}`
+/// but instead of creating a credit transaction, it enables auto top-up.
+#[utoipa::path(
+    put,
+    path = "/auto-topup/{id}",
+    tag = "payments",
+    summary = "Enable auto top-up",
+    description = "Validates a checkout session with the payment provider and enables auto top-up for the current user at the specified threshold and amount.",
+    params(
+        ("id" = String, Path, description = "Checkout session ID from the payment provider")
+    ),
+    request_body(content = inline(Object), description = "Auto top-up configuration"),
+    responses(
+        (status = 200, description = "Auto top-up enabled successfully"),
+        (status = 400, description = "Invalid session or threshold"),
+        (status = 402, description = "Session not completed yet"),
+        (status = 503, description = "No payment provider configured"),
+    ),
+    security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
+        ("X-Doubleword-User" = [])
+    )
+)]
+#[tracing::instrument(skip_all)]
+pub async fn process_auto_topup<P: PoolProvider>(
+    State(state): State<AppState<P>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    user: CurrentUser,
+    Json(body): Json<ProcessAutoTopupRequest>,
+) -> Result<Response, StatusCode> {
+    if body.threshold < 0.0 || body.amount <= 0.0 {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "message": "Threshold must be non-negative and amount must be positive"
+            })),
+        )
+            .into_response());
+    }
+
+    // Validate the session with the payment provider
+    let provider = match state.config.payment.clone() {
+        Some(payment_config) => payment_providers::create_provider(payment_config),
+        None => {
+            tracing::warn!("Auto top-up requested but no payment provider is configured");
+            return Ok((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "message": "Payment processing is currently unavailable. Please contact support."
+                })),
+            )
+                .into_response());
+        }
+    };
+
+    let payment_method_id = match provider.process_auto_topup_session(state.db.write(), &id).await {
+        Ok(pm_id) => pm_id,
+        Err(e) => match e {
+            payment_providers::PaymentError::PaymentNotCompleted => {
+                return Ok((
+                    StatusCode::PAYMENT_REQUIRED,
+                    Json(json!({
+                        "message": "Session is still processing. Please check back in a moment."
+                    })),
+                )
+                    .into_response());
+            }
+            _ => {
+                tracing::error!("Failed to validate auto top-up session: {:?}", e);
+                return Ok((
+                    StatusCode::from(e),
+                    Json(json!({
+                        "message": "Failed to validate session with payment provider."
+                    })),
+                )
+                    .into_response());
+            }
+        },
+    };
+
+    // Session validated - enable auto top-up
+    let update = UserUpdateDBRequest {
+        display_name: None,
+        avatar_url: None,
+        roles: None,
+        password_hash: None,
+        batch_notifications_enabled: None,
+        low_balance_threshold: None,
+        auto_topup_amount: Some(Some(body.amount)),
+        auto_topup_threshold: Some(Some(body.threshold)),
+        auto_topup_payment_id: Some(Some(payment_method_id)),
+    };
+
+    let mut conn = state.db.write().acquire().await.map_err(|e| {
+        tracing::error!("Failed to acquire database connection: {:?}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let mut users = Users::new(&mut conn);
+    users.update(user.id, &update).await.map_err(|e| {
+        tracing::error!("Failed to enable auto top-up: {:?}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    Ok(Json(json!({
+        "message": "Auto top-up enabled successfully",
+        "threshold": body.threshold,
+        "amount": body.amount
     }))
     .into_response())
 }

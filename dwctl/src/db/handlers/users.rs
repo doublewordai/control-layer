@@ -72,6 +72,9 @@ struct User {
     pub first_batch_email_sent: bool,
     pub low_balance_notification_sent: bool,
     pub low_balance_threshold: Option<f32>,
+    pub auto_topup_amount: Option<f32>,
+    pub auto_topup_threshold: Option<f32>,
+    pub auto_topup_payment_id: Option<String>,
 }
 
 pub struct Users<'c> {
@@ -98,6 +101,9 @@ impl From<(Vec<Role>, User)> for UserDBResponse {
             first_batch_email_sent: user.first_batch_email_sent,
             low_balance_notification_sent: user.low_balance_notification_sent,
             low_balance_threshold: user.low_balance_threshold,
+            auto_topup_amount: user.auto_topup_amount,
+            auto_topup_threshold: user.auto_topup_threshold,
+            auto_topup_payment_id: user.auto_topup_payment_id,
         }
     }
 }
@@ -186,11 +192,14 @@ impl<'c> Repository for Users<'c> {
                 u.first_batch_email_sent,
                 u.low_balance_notification_sent,
                 u.low_balance_threshold,
+                u.auto_topup_amount,
+                u.auto_topup_threshold,
+                u.auto_topup_payment_id,
                 ARRAY_AGG(ur.role) FILTER (WHERE ur.role IS NOT NULL) as "roles: Vec<Role>"
             FROM users u
             LEFT JOIN user_roles ur ON ur.user_id = u.id
             WHERE u.id = $1 AND u.id != '00000000-0000-0000-0000-000000000000' AND u.is_deleted = false
-            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id, u.is_deleted, u.is_internal, u.batch_notifications_enabled, u.first_batch_email_sent, u.low_balance_notification_sent, u.low_balance_threshold
+            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id, u.is_deleted, u.is_internal, u.batch_notifications_enabled, u.first_batch_email_sent, u.low_balance_notification_sent, u.low_balance_threshold, u.auto_topup_amount, u.auto_topup_threshold, u.auto_topup_payment_id
             "#,
             id
         )
@@ -218,6 +227,9 @@ impl<'c> Repository for Users<'c> {
                 first_batch_email_sent: row.first_batch_email_sent,
                 low_balance_notification_sent: row.low_balance_notification_sent,
                 low_balance_threshold: row.low_balance_threshold,
+                auto_topup_amount: row.auto_topup_amount,
+                auto_topup_threshold: row.auto_topup_threshold,
+                auto_topup_payment_id: row.auto_topup_payment_id,
             };
 
             let roles = row.roles.unwrap_or_default();
@@ -257,11 +269,14 @@ impl<'c> Repository for Users<'c> {
                 u.first_batch_email_sent,
                 u.low_balance_notification_sent,
                 u.low_balance_threshold,
+                u.auto_topup_amount,
+                u.auto_topup_threshold,
+                u.auto_topup_payment_id,
                 ARRAY_AGG(ur.role) FILTER (WHERE ur.role IS NOT NULL) as "roles: Vec<Role>"
             FROM users u
             LEFT JOIN user_roles ur ON ur.user_id = u.id
             WHERE u.id = ANY($1) AND u.id != '00000000-0000-0000-0000-000000000000' AND u.is_deleted = false
-            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id, u.is_deleted, u.is_internal, u.batch_notifications_enabled, u.first_batch_email_sent, u.low_balance_notification_sent, u.low_balance_threshold
+            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id, u.is_deleted, u.is_internal, u.batch_notifications_enabled, u.first_batch_email_sent, u.low_balance_notification_sent, u.low_balance_threshold, u.auto_topup_amount, u.auto_topup_threshold, u.auto_topup_payment_id
             "#,
             ids.as_slice()
         )
@@ -291,6 +306,9 @@ impl<'c> Repository for Users<'c> {
                 first_batch_email_sent: row.first_batch_email_sent,
                 low_balance_notification_sent: row.low_balance_notification_sent,
                 low_balance_threshold: row.low_balance_threshold,
+                auto_topup_amount: row.auto_topup_amount,
+                auto_topup_threshold: row.auto_topup_threshold,
+                auto_topup_payment_id: row.auto_topup_payment_id,
             };
 
             let roles = row.roles.unwrap_or_default();
@@ -399,6 +417,18 @@ impl<'c> Repository for Users<'c> {
                     WHEN $6::boolean THEN false
                     ELSE low_balance_notification_sent
                 END,
+                auto_topup_amount = CASE
+                    WHEN $8::boolean THEN $9
+                    ELSE auto_topup_amount
+                END,
+                auto_topup_threshold = CASE
+                    WHEN $10::boolean THEN $11
+                    ELSE auto_topup_threshold
+                END,
+                auto_topup_payment_id = CASE
+                    WHEN $12::boolean THEN $13
+                    ELSE auto_topup_payment_id
+                END,
                 updated_at = NOW()
             WHERE id = $1
             RETURNING *
@@ -410,6 +440,12 @@ impl<'c> Repository for Users<'c> {
                 request.batch_notifications_enabled,
                 request.low_balance_threshold.is_some() as bool,
                 request.low_balance_threshold.flatten(),
+                request.auto_topup_amount.is_some() as bool,
+                request.auto_topup_amount.flatten(),
+                request.auto_topup_threshold.is_some() as bool,
+                request.auto_topup_threshold.flatten(),
+                request.auto_topup_payment_id.is_some() as bool,
+                request.auto_topup_payment_id.clone().flatten(),
             )
             .fetch_optional(&mut *tx)
             .await?
@@ -846,6 +882,9 @@ mod tests {
             password_hash: None,
             batch_notifications_enabled: None,
             low_balance_threshold: None,
+            auto_topup_amount: None,
+            auto_topup_threshold: None,
+            auto_topup_payment_id: None,
         };
 
         let updated_user = repo.update(created_user.id, &update_request).await.unwrap();
@@ -864,6 +903,9 @@ mod tests {
             password_hash: None,
             batch_notifications_enabled: None,
             low_balance_threshold: None,
+            auto_topup_amount: None,
+            auto_topup_threshold: None,
+            auto_topup_payment_id: None,
         };
 
         let updated_user = repo.update(created_user.id, &update_request).await.unwrap();
@@ -896,6 +938,9 @@ mod tests {
                 password_hash: None,
                 batch_notifications_enabled: None,
                 low_balance_threshold: Some(threshold),
+                auto_topup_amount: None,
+                auto_topup_threshold: None,
+                auto_topup_payment_id: None,
             };
             repo.update(user.id, &update).await.unwrap();
         }
@@ -996,6 +1041,9 @@ mod tests {
             password_hash: None,
             batch_notifications_enabled: None,
             low_balance_threshold: Some(Some(5.0)),
+            auto_topup_amount: None,
+            auto_topup_threshold: None,
+            auto_topup_payment_id: None,
         };
         let updated = users.update(user_id, &update).await.unwrap();
         assert!(!updated.low_balance_notification_sent);

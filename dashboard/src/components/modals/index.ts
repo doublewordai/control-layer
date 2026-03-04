@@ -14,3 +14,4 @@ export * from "./GroupManagementModal";
 export * from "./UserGroupsModal";
 export * from "./UpdateModelPricingModal";
 export * from "./SupportRequestModal";
+export * from "./AutoTopupModal";

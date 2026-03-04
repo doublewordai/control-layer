@@ -1287,6 +1287,33 @@ export function useCreateBillingPortalSession() {
   });
 }
 
+export function useCreateAutoTopupCheckout() {
+  return useMutation({
+    mutationKey: ["payments", "auto-topup-checkout"],
+    mutationFn: () => dwctlApi.payments.autoTopupCheckout(),
+  });
+}
+
+export function useProcessAutoTopupSetup() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationKey: ["payments", "auto-topup-setup"],
+    mutationFn: ({
+      sessionId,
+      threshold,
+      amount,
+    }: {
+      sessionId: string;
+      threshold: number;
+      amount: number;
+    }) => dwctlApi.payments.processAutoTopupSetup(sessionId, threshold, amount),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.users.all });
+    },
+  });
+}
+
 // ===== DAEMONS HOOKS =====
 
 export function useDaemons(

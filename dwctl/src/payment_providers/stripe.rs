@@ -7,13 +7,19 @@ use std::collections::HashMap;
 use stripe::Client;
 use stripe_billing::billing_portal_session::CreateBillingPortalSession;
 use stripe_checkout::checkout_session::{
-    CreateCheckoutSessionCustomerUpdate, CreateCheckoutSessionCustomerUpdateAddress, CreateCheckoutSessionCustomerUpdateName,
-    CreateCheckoutSessionInvoiceCreation, CreateCheckoutSessionNameCollection, CreateCheckoutSessionNameCollectionBusiness,
-    CreateCheckoutSessionSavedPaymentMethodOptions, CreateCheckoutSessionSavedPaymentMethodOptionsPaymentMethodRemove,
-    CreateCheckoutSessionSavedPaymentMethodOptionsPaymentMethodSave,
+    CreateCheckoutSessionConsentCollection, CreateCheckoutSessionConsentCollectionPaymentMethodReuseAgreement,
+    CreateCheckoutSessionConsentCollectionPaymentMethodReuseAgreementPosition,
+    CreateCheckoutSessionConsentCollectionTermsOfService, CreateCheckoutSessionCustomText,
+    CreateCheckoutSessionCustomerUpdate, CreateCheckoutSessionCustomerUpdateAddress,
+    CreateCheckoutSessionCustomerUpdateName, CreateCheckoutSessionInvoiceCreation,
+    CreateCheckoutSessionNameCollection, CreateCheckoutSessionNameCollectionBusiness,
+    CreateCheckoutSessionPaymentMethodTypes, CreateCheckoutSessionSavedPaymentMethodOptions,
+    CreateCheckoutSessionSavedPaymentMethodOptionsPaymentMethodRemove,
+    CreateCheckoutSessionSavedPaymentMethodOptionsPaymentMethodSave, CreateCheckoutSessionSetupIntentData,
+    CustomTextPositionParam,
 };
 use stripe_checkout::{
-    CheckoutSessionId, CheckoutSessionMode, CheckoutSessionPaymentStatus, CheckoutSessionUiMode,
+    CheckoutSessionId, CheckoutSessionMode, CheckoutSessionPaymentStatus, CheckoutSessionStatus, CheckoutSessionUiMode,
     checkout_session::{
         CreateCheckoutSession, CreateCheckoutSessionAutomaticTax, CreateCheckoutSessionCustomerCreation, CreateCheckoutSessionLineItems,
         CreateCheckoutSessionTaxIdCollection, RetrieveCheckoutSession,
@@ -42,6 +48,78 @@ impl From<crate::config::StripeConfig> for StripeProvider {
     fn from(config: crate::config::StripeConfig) -> Self {
         let client = Client::new(&config.api_key);
         Self { config, client }
+    }
+}
+
+
+
+impl StripeProvider {
+    /// Charge a saved payment method off-session for auto top-up.
+    async fn charge_auto_topup(
+        &self,
+        amount_cents: i64,
+        customer_id: &str,
+        payment_method_id: &str,
+    ) -> Result<stripe_core::PaymentIntent> {
+        use stripe_core::payment_intent::{
+            CreatePaymentIntent, CreatePaymentIntentOffSession, AsyncWorkflowsParam,
+            AsyncWorkflowsInputsParam, AsyncWorkflowsInputsTaxParam,
+        };
+        use stripe_misc::tax_calculation::{CreateTaxCalculation, CreateTaxCalculationLineItems};
+        //todo: parent caller should be in notifications scheduler, and should retrieve the user's topup amount and pass it through here.
+        // todo: below somehow needs the tax code in it - its stored on the product but we only have the price currently.
+
+        // Calculate tax
+        let tax_calc = CreateTaxCalculation::new(
+            Currency::USD,
+            vec![CreateTaxCalculationLineItems::new(amount_cents)],
+        )
+        .customer(customer_id)
+        .send(&self.client)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to create tax calculation: {:?}", e);
+            PaymentError::ProviderApi(e.to_string())
+        })?;
+
+        let tax_calc_id = tax_calc.id.ok_or_else(|| {
+            PaymentError::ProviderApi("Tax calculation missing ID".to_string())
+        })?;
+
+        // Create PaymentIntent with tax calculation linked
+        CreatePaymentIntent::new(tax_calc.amount_total, Currency::USD)
+            .customer(customer_id)
+            .payment_method(payment_method_id)
+            .off_session(CreatePaymentIntentOffSession::Bool(true))
+            .confirm(true)
+            .description("Automatic credit top-up")
+            .statement_descriptor_suffix("AUTO-TOPUP")
+            .hooks(AsyncWorkflowsParam {
+                inputs: Some(AsyncWorkflowsInputsParam {
+                    tax: Some(AsyncWorkflowsInputsTaxParam::new(tax_calc_id.to_string())),
+                }),
+            })
+            .send(&self.client)
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to create auto top-up payment intent: {:?}", e);
+                PaymentError::ProviderApi(e.to_string())
+            })
+    }
+
+    async fn get_setup_session(&self, session_id: &str) -> Result<stripe_checkout::CheckoutSession> {
+        let session_id: CheckoutSessionId = session_id
+            .parse()
+            .map_err(|_| PaymentError::InvalidData("Invalid Stripe session ID".to_string()))?;
+
+        RetrieveCheckoutSession::new(session_id)
+            .expand(vec!["setup_intent".to_string(), "setup_intent.payment_method".to_string()])
+            .send(&self.client)
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to retrieve Stripe setup session: {:?}", e);
+                PaymentError::ProviderApi(e.to_string())
+            })
     }
 }
 
@@ -334,6 +412,115 @@ impl PaymentProvider for StripeProvider {
         self.process_payment_session(db_pool, session_id).await
     }
 
+    async fn create_auto_topup_checkout_session(&self, user: &CurrentUser, cancel_url: &str, success_url: &str) -> Result<String> {
+        // This should verify the user has a saved payment method and create
+        // a checkout session for auto top-up setup.
+        let _customer_id = user.payment_provider_id.as_ref().ok_or(PaymentError::NoCustomerId)?;
+
+        let mut checkout_params = CreateCheckoutSession::new()
+            .cancel_url(cancel_url)
+            .success_url(success_url)
+            .client_reference_id(user.id.to_string()) // This is who will purchase the credits
+            .mode(CheckoutSessionMode::Setup)
+            .ui_mode(CheckoutSessionUiMode::Hosted)
+            .tax_id_collection(CreateCheckoutSessionTaxIdCollection::new(true))
+            .name_collection(CreateCheckoutSessionNameCollection {
+                business: Some(CreateCheckoutSessionNameCollectionBusiness::new(true)),
+                individual: None,
+            })
+            .consent_collection(CreateCheckoutSessionConsentCollection {
+                terms_of_service: Some(CreateCheckoutSessionConsentCollectionTermsOfService::Required),
+                payment_method_reuse_agreement: Some(
+                    CreateCheckoutSessionConsentCollectionPaymentMethodReuseAgreement::new(
+                        CreateCheckoutSessionConsentCollectionPaymentMethodReuseAgreementPosition::Auto,
+                    ),
+                ),
+                promotions: None,
+            })
+            .custom_text(CreateCheckoutSessionCustomText {
+                terms_of_service_acceptance: self.config.auto_topup_terms_of_service_text.as_ref().map(|text| CustomTextPositionParam::new(text)),
+                submit: Some(CustomTextPositionParam::new("Set up auto top-up")),
+                after_submit: None,
+                shipping_address: None,
+            })
+            .payment_method_types(vec![
+                CreateCheckoutSessionPaymentMethodTypes::Card,
+                CreateCheckoutSessionPaymentMethodTypes::Link,
+                CreateCheckoutSessionPaymentMethodTypes::SepaDebit,
+            ])
+            .setup_intent_data(CreateCheckoutSessionSetupIntentData {
+                description: Some("Auto top-up setup".to_string()),
+                metadata: None,
+                on_behalf_of: None,
+            });
+
+
+        // Include existing customer ID if we have one
+        if let Some(existing_id) = &user.payment_provider_id {
+            // This is who is giving the credits
+            tracing::debug!("Using existing Stripe customer ID {} for user {}", existing_id, user.id);
+            checkout_params = checkout_params
+                .customer(existing_id.as_str())
+                .customer_update(CreateCheckoutSessionCustomerUpdate {
+                    address: Some(CreateCheckoutSessionCustomerUpdateAddress::Auto),
+                    name: Some(CreateCheckoutSessionCustomerUpdateName::Auto),
+                    shipping: None,
+                })
+        } else {
+            tracing::debug!("No customer ID found for user {}, Stripe will create one", user.id);
+            // Provide customer email for the new customer
+            checkout_params = checkout_params
+                .customer_email(&user.email)
+                .customer_creation(CreateCheckoutSessionCustomerCreation::Always);
+        }
+
+        // Create checkout session
+        let checkout_session = checkout_params.send(&self.client).await.map_err(|e| {
+            tracing::error!("Failed to create Stripe checkout session: {:?}", e);
+            PaymentError::ProviderApi(e.to_string())
+        })?;
+
+        tracing::debug!(
+        "Created checkout session {} for user {} ",
+        checkout_session.id,
+        user.id
+    );
+
+        // Return checkout URL for hosted checkout
+        checkout_session.url.ok_or_else(|| {
+            tracing::error!("Checkout session missing URL");
+            PaymentError::ProviderApi("Checkout session missing URL".to_string())
+        })
+    }
+
+
+    async fn process_auto_topup_session(&self, _db_pool: &PgPool, session_id: &str) -> Result<String> {
+        let session = self.get_setup_session(session_id).await?;
+
+        // Check if setup was completed
+        if session.status != Some(CheckoutSessionStatus::Complete) {
+            return Err(PaymentError::InvalidData("Setup was not completed".to_string()));
+        }
+
+        // Extract the expanded SetupIntent
+        let setup_intent = match session.setup_intent {
+            Some(stripe_types::Expandable::Object(si)) => *si,
+            _ => return Err(PaymentError::InvalidData("Setup intent not found or not expanded".to_string())),
+        };
+
+        // Check if the SetupIntent succeeded
+        if setup_intent.status.as_str() != "succeeded" {
+            return Err(PaymentError::InvalidData("Payment method setup failed".to_string()));
+        }
+
+        // Get the payment method ID
+        match setup_intent.payment_method {
+            Some(stripe_types::Expandable::Object(pm)) => Ok(pm.id.to_string()),
+            Some(stripe_types::Expandable::Id(id)) => Ok(id.to_string()),
+            None => Err(PaymentError::InvalidData("Payment method not found".to_string())),
+        }
+    }
+
     async fn create_billing_portal_session(&self, user: &CurrentUser, return_url: &str) -> Result<String> {
         // Fetch user's payment provider customer ID from user struct
         let customer_id_str = user.payment_provider_id.as_ref().ok_or(PaymentError::NoCustomerId)?;
@@ -381,6 +568,7 @@ mod tests {
             price_id: "price_fake".to_string(),
             webhook_secret: "whsec_fake".to_string(),
             enable_invoice_creation: false,
+            auto_topup_terms_of_service_text: None,
         };
         let provider = StripeProvider::from(config);
 
@@ -397,6 +585,7 @@ mod tests {
             price_id: "price_fake".to_string(),
             webhook_secret: "whsec_fake".to_string(),
             enable_invoice_creation: true,
+            auto_topup_terms_of_service_text: None,
         };
         let provider = StripeProvider::from(config);
 
@@ -429,6 +618,7 @@ mod tests {
             price_id: "price_fake".to_string(),
             webhook_secret: "whsec_fake".to_string(),
             enable_invoice_creation: false,
+            auto_topup_terms_of_service_text: None,
         };
         let provider = StripeProvider::from(config);
 

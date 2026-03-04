@@ -51,6 +51,7 @@ export type AddFundsConfig =
       onPurchaseFunds: () => void;
       onGiftFunds?: () => void;
       onBillingPortal?: () => void;
+      onManageAutoTopup?: () => void;
     }
   | undefined;
 
@@ -366,6 +367,13 @@ export function TransactionHistory({
                           onClick={addFundsConfig.onBillingPortal}
                         >
                           Billing Portal
+                        </DropdownMenuItem>
+                      )}
+                      {addFundsConfig.onManageAutoTopup && (
+                        <DropdownMenuItem
+                          onClick={addFundsConfig.onManageAutoTopup}
+                        >
+                          Auto Top-Up
                         </DropdownMenuItem>
                       )}
                     </DropdownMenuContent>

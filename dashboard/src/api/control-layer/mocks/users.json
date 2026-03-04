@@ -15,7 +15,9 @@
     "is_admin": true,
     "has_payment_provider_id": true,
     "batch_notifications_enabled": true,
-    "low_balance_threshold": 2.0
+    "low_balance_threshold": 2.0,
+    "auto_topup_amount": 50.0,
+    "auto_topup_threshold": 5.0
   },
   {
     "id": "550e8400-e29b-41d4-a716-446655440002",
@@ -33,7 +35,9 @@
     "is_admin": false,
     "has_payment_provider_id": true,
     "batch_notifications_enabled": true,
-    "low_balance_threshold": 2.0
+    "low_balance_threshold": 2.0,
+    "auto_topup_amount": null,
+    "auto_topup_threshold": null
   },
   {
     "id": "550e8400-e29b-41d4-a716-446655440003",
@@ -51,7 +55,9 @@
     "is_admin": false,
     "has_payment_provider_id": false,
     "batch_notifications_enabled": false,
-    "low_balance_threshold": null
+    "low_balance_threshold": null,
+    "auto_topup_amount": null,
+    "auto_topup_threshold": null
   },
   {
     "id": "550e8400-e29b-41d4-a716-446655440004",
@@ -69,7 +75,9 @@
     "is_admin": false,
     "has_payment_provider_id": true,
     "batch_notifications_enabled": true,
-    "low_balance_threshold": 2.0
+    "low_balance_threshold": 2.0,
+    "auto_topup_amount": null,
+    "auto_topup_threshold": null
   },
   {
     "id": "550e8400-e29b-41d4-a716-446655440005",
@@ -87,7 +95,9 @@
     "is_admin": false,
     "has_payment_provider_id": true,
     "batch_notifications_enabled": true,
-    "low_balance_threshold": 2.0
+    "low_balance_threshold": 2.0,
+    "auto_topup_amount": null,
+    "auto_topup_threshold": null
   },
   {
     "id": "550e8400-e29b-41d4-a716-446655440006",
@@ -105,7 +115,9 @@
     "is_admin": false,
     "has_payment_provider_id": false,
     "batch_notifications_enabled": false,
-    "low_balance_threshold": null
+    "low_balance_threshold": null,
+    "auto_topup_amount": null,
+    "auto_topup_threshold": null
   },
   {
     "id": "550e8400-e29b-41d4-a716-446655440007",
@@ -123,7 +135,9 @@
     "is_admin": false,
     "has_payment_provider_id": true,
     "batch_notifications_enabled": true,
-    "low_balance_threshold": 2.0
+    "low_balance_threshold": 2.0,
+    "auto_topup_amount": null,
+    "auto_topup_threshold": null
   },
   {
     "id": "550e8400-e29b-41d4-a716-446655440008",
@@ -141,7 +155,9 @@
     "is_admin": false,
     "has_payment_provider_id": true,
     "batch_notifications_enabled": true,
-    "low_balance_threshold": 2.0
+    "low_balance_threshold": 2.0,
+    "auto_topup_amount": null,
+    "auto_topup_threshold": null
   },
   {
     "id": "550e8400-e29b-41d4-a716-446655440009",
@@ -159,7 +175,9 @@
     "is_admin": false,
     "has_payment_provider_id": false,
     "batch_notifications_enabled": false,
-    "low_balance_threshold": null
+    "low_balance_threshold": null,
+    "auto_topup_amount": null,
+    "auto_topup_threshold": null
   },
   {
     "id": "550e8400-e29b-41d4-a716-446655440010",
@@ -177,7 +195,9 @@
     "is_admin": false,
     "has_payment_provider_id": true,
     "batch_notifications_enabled": true,
-    "low_balance_threshold": 2.0
+    "low_balance_threshold": 2.0,
+    "auto_topup_amount": null,
+    "auto_topup_threshold": null
   },
   {
     "id": "550e8400-e29b-41d4-a716-446655440011",
@@ -195,7 +215,9 @@
     "is_admin": false,
     "has_payment_provider_id": true,
     "batch_notifications_enabled": false,
-    "low_balance_threshold": null
+    "low_balance_threshold": null,
+    "auto_topup_amount": null,
+    "auto_topup_threshold": null
   },
   {
     "id": "550e8400-e29b-41d4-a716-446655440012",
@@ -213,7 +235,9 @@
     "is_admin": false,
     "has_payment_provider_id": false,
     "batch_notifications_enabled": false,
-    "low_balance_threshold": null
+    "low_balance_threshold": null,
+    "auto_topup_amount": null,
+    "auto_topup_threshold": null
   },
   {
     "id": "550e8400-e29b-41d4-a716-446655440013",
@@ -231,7 +255,9 @@
     "is_admin": false,
     "has_payment_provider_id": true,
     "batch_notifications_enabled": true,
-    "low_balance_threshold": 2.0
+    "low_balance_threshold": 2.0,
+    "auto_topup_amount": null,
+    "auto_topup_threshold": null
   },
   {
     "id": "550e8400-e29b-41d4-a716-446655440014",
@@ -249,7 +275,9 @@
     "is_admin": false,
     "has_payment_provider_id": false,
     "batch_notifications_enabled": false,
-    "low_balance_threshold": null
+    "low_balance_threshold": null,
+    "auto_topup_amount": null,
+    "auto_topup_threshold": null
   },
   {
     "id": "550e8400-e29b-41d4-a716-446655440015",
@@ -267,6 +295,8 @@
     "is_admin": false,
     "has_payment_provider_id": true,
     "batch_notifications_enabled": true,
-    "low_balance_threshold": 2.0
+    "low_balance_threshold": 2.0,
+    "auto_topup_amount": null,
+    "auto_topup_threshold": null
   }
 ]
