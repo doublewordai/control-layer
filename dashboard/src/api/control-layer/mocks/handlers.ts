@@ -22,6 +22,8 @@ import type {
   BatchCreateRequest,
   Transaction,
   AddFundsRequest,
+  Role,
+  ModelType,
 } from "../types";
 import usersDataRaw from "./users.json";
 import groupsDataRaw from "./groups.json";
@@ -167,7 +169,7 @@ function resolveComponents(modelId: string): import("../types").ModelComponent[]
         id: componentModel?.id ?? sc.componentModelId,
         alias: componentModel?.alias ?? "unknown",
         model_name: componentModel?.model_name ?? "unknown",
-        description: componentModel?.description,
+        description: componentModel?.description ?? undefined,
         model_type: componentModel?.model_type ?? undefined,
         endpoint: endpoint ? { id: endpoint.id, name: endpoint.name } : undefined,
         trusted: componentModel?.trusted,
@@ -827,7 +829,7 @@ export const handlers = [
     if (params.id === "current") {
       const persistedRoles = getCurrentUserRoles(demoState);
       if (persistedRoles) {
-        result = { ...result, roles: persistedRoles };
+        result = { ...result, roles: persistedRoles as Role[] };
       }
     }
 
@@ -1166,7 +1168,7 @@ export const handlers = [
             ...new Set(
               modelsData
                 .map((m) => m.model_type)
-                .filter((t): t is string => !!t),
+                .filter((t): t is ModelType => !!t),
             ),
           ].sort(),
         }
