@@ -309,7 +309,7 @@ function ModelRow({
           <div className="flex items-center gap-2">
             <span className="font-medium">{model.alias}</span>
             {isLatest && (
-              <span className="inline-flex items-center rounded-full bg-doubleword-purple/10 text-doubleword-purple px-2 py-0.5 text-[10px] font-semibold tracking-wide uppercase">
+              <span className="inline-flex items-center rounded-full bg-blue-100 text-blue-800 px-2 py-0.5 text-[10px] font-semibold tracking-wide uppercase">
                 New
               </span>
             )}
@@ -373,10 +373,10 @@ function ModelRow({
             ? formatReleaseDate(model.metadata.released_at)
             : "\u2014"}
         </TableCell>
-        <TableCell className="text-right">
+        <TableCell className="text-right pr-3 lg:pr-6">
           {playgroundAvailable && (
             <Button
-              variant="default"
+              variant="outline"
               size="sm"
               onClick={(e) => {
                 e.stopPropagation();
@@ -384,9 +384,9 @@ function ModelRow({
                   `/playground?model=${encodeURIComponent(model.alias)}`,
                 );
               }}
-              className="text-xs h-7 px-2.5 bg-doubleword-purple hover:bg-doubleword-purple/90 text-white"
+              className="text-xs h-7 px-2.5 border-blue-200 text-blue-700 hover:bg-blue-50 hover:text-blue-800"
             >
-              Try &rarr;
+              Try it &rarr;
             </Button>
           )}
         </TableCell>
