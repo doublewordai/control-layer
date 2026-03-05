@@ -344,7 +344,8 @@ export type ModelSortField =
   | "intelligence_index"
   | "released_at"
   | "context_window"
-  | "provider";
+  | "provider"
+  | "price_from";
 
 export type SortDirection = "asc" | "desc";
 
