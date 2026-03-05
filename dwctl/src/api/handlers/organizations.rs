@@ -960,7 +960,7 @@ pub async fn invite_member<P: PoolProvider>(
         .unwrap_or_else(|| inviter.as_ref().map(|u| u.username.clone()).unwrap_or_default());
 
     // Send invite email
-    let invite_link = format!("{}/invites/{}", state.config.dashboard_url.trim_end_matches('/'), token);
+    let invite_link = format!("{}/org-invite?token={}", state.config.dashboard_url.trim_end_matches('/'), token);
     let email_service = EmailService::new(&state.config)?;
     if let Err(e) = email_service
         .send_org_invite_email(&email, &org_name, &inviter_name, role, &invite_link)
