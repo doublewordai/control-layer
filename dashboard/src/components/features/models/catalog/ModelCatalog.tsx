@@ -78,6 +78,7 @@ const DEFAULT_SORT_DIRECTIONS: Record<ModelSortField, SortDirection> = {
   intelligence_index: "desc",
   released_at: "desc",
   context_window: "desc",
+  price_from: "asc",
   created_at: "desc",
 };
 
@@ -457,7 +458,9 @@ function SectionTable({
               <TableHead className="min-w-[130px]">
                 <SortButton field="intelligence_index" label="Intelligence" {...sortProps} />
               </TableHead>
-              <TableHead className="min-w-[110px]">Cost</TableHead>
+              <TableHead className="min-w-[110px]">
+                <SortButton field="price_from" label="Cost" {...sortProps} />
+              </TableHead>
               <TableHead className="min-w-[80px]">
                 <SortButton field="context_window" label="Context" {...sortProps} />
               </TableHead>
@@ -638,6 +641,8 @@ export const ModelCatalog: React.FC = () => {
           </h1>
           <div className="flex items-center gap-3">
             {canManageGroups && (
+              <div className="flex items-center gap-2">
+              <span className="text-sm text-muted-foreground">Group:</span>
               <Popover>
                 <PopoverTrigger asChild>
                   <button
@@ -727,6 +732,7 @@ export const ModelCatalog: React.FC = () => {
                   </div>
                 </PopoverContent>
               </Popover>
+              </div>
             )}
             <div className="relative">
               <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 text-gray-400 w-4 h-4 z-10 pointer-events-none" />
