@@ -5,9 +5,19 @@
 
 const STORAGE_KEY = "demo-mode-state";
 
+// Stored component entry (lightweight, references model IDs)
+export interface StoredComponent {
+  componentModelId: string;
+  weight: number;
+  enabled: boolean;
+  sort_order: number;
+}
+
 interface DemoState {
   modelsGroups: Record<string, string[]>; // modelId -> groupIds[]
   userGroups: Record<string, string[]>; // userId -> groupIds[]
+  currentUserRoles?: string[]; // persisted role overrides for the demo current user
+  modelComponents?: Record<string, StoredComponent[]>; // virtualModelId -> components
 }
 
 /**
@@ -99,6 +109,28 @@ export function removeModelFromGroup(
 }
 
 /**
+ * Update the current user's roles
+ */
+export function setCurrentUserRoles(
+  state: DemoState,
+  roles: string[],
+): DemoState {
+  const newState = {
+    ...state,
+    currentUserRoles: roles,
+  };
+  saveDemoState(newState);
+  return newState;
+}
+
+/**
+ * Get the current user's persisted role overrides (if any)
+ */
+export function getCurrentUserRoles(state: DemoState): string[] | undefined {
+  return state.currentUserRoles;
+}
+
+/**
  * Add a user to a group
  */
 export function addUserToGroup(
@@ -142,6 +174,97 @@ export function removeUserFromGroup(
     );
   }
 
+  saveDemoState(newState);
+  return newState;
+}
+
+/**
+ * Get components for a virtual model
+ */
+export function getModelComponents(
+  state: DemoState,
+  modelId: string,
+  initialComponents: Record<string, StoredComponent[]>,
+): StoredComponent[] {
+  const components = state.modelComponents ?? initialComponents;
+  return components[modelId] ?? [];
+}
+
+/**
+ * Add a component to a virtual model
+ */
+export function addModelComponent(
+  state: DemoState,
+  modelId: string,
+  component: StoredComponent,
+  initialComponents: Record<string, StoredComponent[]>,
+): DemoState {
+  const currentComponents = state.modelComponents ?? { ...initialComponents };
+  const existing = currentComponents[modelId] ?? [];
+
+  // Don't add duplicates
+  if (existing.some((c) => c.componentModelId === component.componentModelId)) {
+    return state;
+  }
+
+  const newState = {
+    ...state,
+    modelComponents: {
+      ...currentComponents,
+      [modelId]: [...existing, component],
+    },
+  };
+  saveDemoState(newState);
+  return newState;
+}
+
+/**
+ * Update a component in a virtual model
+ */
+export function updateModelComponent(
+  state: DemoState,
+  modelId: string,
+  componentModelId: string,
+  updates: Partial<Pick<StoredComponent, "weight" | "enabled" | "sort_order">>,
+  initialComponents: Record<string, StoredComponent[]>,
+): DemoState {
+  const currentComponents = state.modelComponents ?? { ...initialComponents };
+  const existing = currentComponents[modelId] ?? [];
+
+  const newState = {
+    ...state,
+    modelComponents: {
+      ...currentComponents,
+      [modelId]: existing.map((c) =>
+        c.componentModelId === componentModelId ? { ...c, ...updates } : c,
+      ),
+    },
+  };
+  saveDemoState(newState);
+  return newState;
+}
+
+/**
+ * Remove a component from a virtual model
+ */
+export function removeModelComponent(
+  state: DemoState,
+  modelId: string,
+  componentModelId: string,
+  initialComponents: Record<string, StoredComponent[]>,
+): DemoState {
+  const currentComponents = state.modelComponents ?? { ...initialComponents };
+  const existing = currentComponents[modelId] ?? [];
+
+  const newState = {
+    ...state,
+    modelComponents: {
+      ...currentComponents,
+      [modelId]: existing.filter(
+        (c) => c.componentModelId !== componentModelId,
+      ),
+    },
+  };
   saveDemoState(newState);
   return newState;
 }

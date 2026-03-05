@@ -1,6 +1,6 @@
 import React from "react";
 import { useProbeResults } from "@/api/control-layer/hooks";
-import { ProbeTimeline } from "../ModelInfo/ProbeTimeline";
+import { ProbeTimeline } from "./ProbeTimeline";
 import type { Model, Probe } from "@/api/control-layer/types";
 
 // StatusRow component for status page layout
