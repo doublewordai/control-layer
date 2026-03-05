@@ -2,7 +2,7 @@
 
 use sqlx_pool_router::PoolProvider;
 
-use crate::api::models::deployments::{TrafficRoutingAction, TrafficRoutingRule};
+use crate::api::models::deployments::{ModelFacets, ModelListResponse, TrafficRoutingAction, TrafficRoutingRule};
 use crate::db::models::deployments::{
     MODEL_CATALOG_METADATA_MAX_BYTES, MODEL_CATALOG_METADATA_MAX_EXTRA_KEYS, ModelCatalogMetadata, TrafficRuleAction,
 };
@@ -14,7 +14,6 @@ use crate::{
             ComponentEndpointSummary, ComponentModelSummary, DeployedModelCreate, DeployedModelResponse, DeployedModelUpdate,
             GetModelQuery, ListModelsQuery, ModelComponentResponse, enrichment::DeployedModelEnricher,
         },
-        pagination::PaginatedResponse,
         users::CurrentUser,
     },
     auth::permissions::{RequiresPermission, can_read_all_resources, has_permission, operation, resource},
@@ -138,7 +137,7 @@ fn db_component_to_response(c: DeploymentComponentDBResponse) -> ModelComponentR
         ("is_composite" = Option<bool>, Query, description = "Filter by composite/virtual model status (true = virtual models only, false = hosted models only)"),
     ),
     responses(
-        (status = 200, description = "Paginated list of deployed models", body = PaginatedResponse<DeployedModelResponse>),
+        (status = 200, description = "Paginated list of deployed models", body = ModelListResponse),
         (status = 401, description = "Unauthorized"),
         (status = 404, description = "Inference endpoint not found"),
         (status = 500, description = "Internal server error"),
@@ -155,7 +154,7 @@ pub async fn list_deployed_models<P: PoolProvider>(
     Query(query): Query<ListModelsQuery>,
     // Lots of conditional logic here, so no logic in extractor
     current_user: CurrentUser,
-) -> Result<Json<PaginatedResponse<DeployedModelResponse>>> {
+) -> Result<Json<ModelListResponse>> {
     let has_system_access = has_permission(&current_user, resource::Models.into(), operation::SystemAccess.into());
     let can_read_all_models = can_read_all_resources(&current_user, Resource::Models);
     let can_read_groups = can_read_all_resources(&current_user, Resource::Groups);
@@ -258,6 +257,26 @@ pub async fn list_deployed_models<P: PoolProvider>(
         filter = filter.with_composite(is_composite);
     }
 
+    // Apply provider filter if specified
+    if let Some(ref provider) = query.provider {
+        filter = filter.with_provider(provider.trim().to_string());
+    }
+
+    // Apply model_type filter if specified
+    if let Some(model_type) = query.model_type {
+        filter = filter.with_model_type(model_type);
+    }
+
+    // Apply capability filter if specified
+    if let Some(ref capability) = query.capability {
+        filter = filter.with_capability(capability.trim().to_string());
+    }
+
+    // Apply sort if specified
+    if let Some(sort_field) = query.sort {
+        filter = filter.with_sort(sort_field, query.sort_direction);
+    }
+
     // Parse include parameter
     let all_includes: Vec<&str> = query
         .include
@@ -348,7 +367,28 @@ pub async fn list_deployed_models<P: PoolProvider>(
 
     let response = enricher.enrich_many(models).await?;
 
-    Ok(Json(PaginatedResponse::new(response, total_count, skip, limit)))
+    // Fetch facets if requested
+    let include_facets = includes.contains(&"facets");
+    let facets = if include_facets {
+        let mut facets_conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+        let mut facets_repo = Deployments::new(&mut facets_conn);
+        let (providers, capabilities, model_types) = facets_repo.facets().await?;
+        Some(ModelFacets {
+            providers,
+            capabilities,
+            model_types,
+        })
+    } else {
+        None
+    };
+
+    Ok(Json(ModelListResponse {
+        data: response,
+        total_count,
+        skip,
+        limit,
+        facets,
+    }))
 }
 
 #[utoipa::path(

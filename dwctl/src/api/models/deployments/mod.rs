@@ -16,6 +16,59 @@ use serde_with::rust::double_option;
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
+/// Sort field for model listing
+#[derive(Debug, Clone, Copy, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelSortField {
+    /// Sort by creation date (default)
+    CreatedAt,
+    /// Sort alphabetically by alias
+    Alias,
+    /// Sort by intelligence index (from metadata)
+    IntelligenceIndex,
+    /// Sort by release date (from metadata)
+    ReleasedAt,
+    /// Sort by context window size (from metadata)
+    ContextWindow,
+    /// Sort alphabetically by provider name (from metadata)
+    Provider,
+}
+
+/// Sort direction
+#[derive(Debug, Clone, Copy, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SortDirection {
+    Asc,
+    Desc,
+}
+
+/// Facets: distinct values for filter dropdowns
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ModelFacets {
+    /// Distinct provider names across all active models
+    pub providers: Vec<String>,
+    /// Distinct capabilities across all active models
+    pub capabilities: Vec<String>,
+    /// Distinct model types across all active models
+    pub model_types: Vec<String>,
+}
+
+/// Response for model listing, extending PaginatedResponse with optional facets
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ModelListResponse {
+    /// The models for the current page
+    pub data: Vec<DeployedModelResponse>,
+    /// Total number of models matching the query (before pagination)
+    pub total_count: i64,
+    /// Number of items skipped
+    pub skip: i64,
+    /// Maximum items returned per page
+    pub limit: i64,
+    /// Filter facets (only included when include=facets)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub facets: Option<ModelFacets>,
+}
+
 /// Query parameters for listing deployed models
 #[derive(Debug, Deserialize, IntoParams, ToSchema)]
 pub struct ListModelsQuery {
@@ -29,7 +82,7 @@ pub struct ListModelsQuery {
     pub endpoint: Option<InferenceEndpointId>,
     /// Filter by group IDs (comma-separated UUIDs)
     pub group: Option<String>,
-    /// Include related data (comma-separated: "groups", "metrics", "status", "pricing", "endpoints")
+    /// Include related data (comma-separated: "groups", "metrics", "status", "pricing", "endpoints", "facets")
     pub include: Option<String>,
     /// Show deleted models when true, non-deleted when false, all when not specified (admin only for deleted=true)
     pub deleted: Option<bool>,
@@ -41,6 +94,16 @@ pub struct ListModelsQuery {
     pub search: Option<String>,
     /// Filter by composite/virtual model status (true = composite only, false = non-composite only)
     pub is_composite: Option<bool>,
+    /// Filter by provider name (case-insensitive exact match against metadata.provider)
+    pub provider: Option<String>,
+    /// Filter by model type (CHAT, EMBEDDINGS, RERANKER)
+    pub model_type: Option<ModelType>,
+    /// Filter by capability (returns models that have this capability)
+    pub capability: Option<String>,
+    /// Sort field (default: created_at)
+    pub sort: Option<ModelSortField>,
+    /// Sort direction (default depends on sort field)
+    pub sort_direction: Option<SortDirection>,
 }
 
 /// Query parameters for getting a single deployed model

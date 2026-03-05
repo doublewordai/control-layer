@@ -1,5 +1,6 @@
 //! Database repository for model deployments.
 
+use crate::api::models::deployments::{ModelSortField, SortDirection};
 use crate::db::models::api_keys::ApiKeyPurpose;
 use crate::db::{
     errors::{DbError, Result},
@@ -39,8 +40,13 @@ pub struct DeploymentFilter {
     pub accessible_to: Option<UserId>, // None = show all deployments, Some(user_id) = show only deployments accessible to that user
     pub group_ids: Option<Vec<crate::types::GroupId>>, // None = show all, Some(group_ids) = show only models in any of these groups
     pub aliases: Option<Vec<String>>,
-    pub search: Option<String>,     // Case-insensitive substring search on alias and model_name
-    pub is_composite: Option<bool>, // None = show all, Some(true) = composite only, Some(false) = non-composite only
+    pub search: Option<String>,                // Case-insensitive substring search on alias and model_name
+    pub is_composite: Option<bool>,            // None = show all, Some(true) = composite only, Some(false) = non-composite only
+    pub provider: Option<String>,              // Filter by metadata provider (case-insensitive exact match)
+    pub model_type: Option<ModelType>,         // Filter by model type column
+    pub capability: Option<String>,            // Filter to models that have this capability
+    pub sort_field: Option<ModelSortField>,    // Sort field (default: created_at)
+    pub sort_direction: Option<SortDirection>, // Sort direction (default depends on field)
 }
 
 impl DeploymentFilter {
@@ -55,7 +61,12 @@ impl DeploymentFilter {
             group_ids: None,     // Default: show all groups
             aliases: None,
             search: None,
-            is_composite: None, // Default: show all models
+            is_composite: None,   // Default: show all models
+            provider: None,       // Default: no provider filter
+            model_type: None,     // Default: no type filter
+            capability: None,     // Default: no capability filter
+            sort_field: None,     // Default: created_at
+            sort_direction: None, // Default: depends on field
         }
     }
 
@@ -96,6 +107,27 @@ impl DeploymentFilter {
 
     pub fn with_composite(mut self, is_composite: bool) -> Self {
         self.is_composite = Some(is_composite);
+        self
+    }
+
+    pub fn with_provider(mut self, provider: String) -> Self {
+        self.provider = Some(provider);
+        self
+    }
+
+    pub fn with_model_type(mut self, model_type: ModelType) -> Self {
+        self.model_type = Some(model_type);
+        self
+    }
+
+    pub fn with_capability(mut self, capability: String) -> Self {
+        self.capability = Some(capability);
+        self
+    }
+
+    pub fn with_sort(mut self, field: ModelSortField, direction: Option<SortDirection>) -> Self {
+        self.sort_field = Some(field);
+        self.sort_direction = direction;
         self
     }
 }
@@ -596,77 +628,30 @@ impl<'c> Repository for Deployments<'c> {
         let mut query =
             QueryBuilder::new("SELECT dm.* FROM deployed_models dm LEFT JOIN inference_endpoints ie ON dm.hosted_on = ie.id WHERE 1=1");
 
-        // Add endpoint filter if specified
-        if let Some(endpoint_id) = filter.endpoint_id {
-            query.push(" AND dm.hosted_on = ");
-            query.push_bind(endpoint_id);
-        }
+        Self::apply_filters(&mut query, filter);
 
-        // Add status filter if specified
-        if let Some(ref statuses) = filter.statuses {
-            let status_strings: Vec<String> = statuses.iter().map(|s| s.to_db_string().to_string()).collect();
-            query.push(" AND dm.status = ANY(");
-            query.push_bind(status_strings);
-            query.push(")");
-        }
-
-        // Add deleted filter if specified
-        if let Some(deleted) = filter.deleted {
-            query.push(" AND dm.deleted = ");
-            query.push_bind(deleted);
-        }
-
-        // Add aliases filter if specified
-        if let Some(ref aliases) = filter.aliases
-            && !aliases.is_empty()
-        {
-            query.push(" AND dm.alias = ANY(");
-            query.push_bind(aliases);
-            query.push(")");
-        }
-
-        // Add accessibility filter if specified
-        if let Some(user_id) = filter.accessible_to {
-            query.push(" AND dm.id IN (");
-            query.push("SELECT dg.deployment_id FROM deployment_groups dg WHERE dg.group_id IN (");
-            query.push("SELECT ug.group_id FROM user_groups ug WHERE ug.user_id = ");
-            query.push_bind(user_id);
-            query.push(" UNION SELECT '00000000-0000-0000-0000-000000000000'::uuid WHERE ");
-            query.push_bind(user_id);
-            query.push(" != '00000000-0000-0000-0000-000000000000'::uuid");
-            query.push("))");
-        }
-
-        // Add group filter if specified
-        if let Some(ref group_ids) = filter.group_ids
-            && !group_ids.is_empty()
-        {
-            query.push(" AND dm.id IN (");
-            query.push("SELECT dg.deployment_id FROM deployment_groups dg WHERE dg.group_id = ANY(");
-            query.push_bind(group_ids);
-            query.push("))");
-        }
-
-        // Add search filter if specified (case-insensitive substring match on alias, model_name, or endpoint name)
-        if let Some(ref search) = filter.search {
-            let search_pattern = format!("%{}%", search.to_lowercase());
-            query.push(" AND (LOWER(dm.alias) LIKE ");
-            query.push_bind(search_pattern.clone());
-            query.push(" OR LOWER(dm.model_name) LIKE ");
-            query.push_bind(search_pattern.clone());
-            query.push(" OR LOWER(ie.name) LIKE ");
-            query.push_bind(search_pattern);
-            query.push(")");
-        }
-
-        // Add is_composite filter if specified
-        if let Some(is_composite) = filter.is_composite {
-            query.push(" AND dm.is_composite = ");
-            query.push_bind(is_composite);
-        }
-
-        // Add ordering and pagination
-        query.push(" ORDER BY created_at DESC LIMIT ");
+        // Dynamic ordering
+        let (sort_expr, default_dir) = match filter.sort_field {
+            Some(ModelSortField::Alias) => ("dm.alias", "ASC"),
+            Some(ModelSortField::IntelligenceIndex) => ("(dm.metadata->>'intelligence_index')::float8", "DESC"),
+            Some(ModelSortField::ReleasedAt) => ("(dm.metadata->>'released_at')::date", "DESC"),
+            Some(ModelSortField::ContextWindow) => ("(dm.metadata->>'context_window')::bigint", "DESC"),
+            Some(ModelSortField::Provider) => ("dm.metadata->>'provider'", "ASC"),
+            Some(ModelSortField::CreatedAt) | None => ("dm.created_at", "DESC"),
+        };
+        let direction = match filter.sort_direction {
+            Some(SortDirection::Asc) => "ASC",
+            Some(SortDirection::Desc) => "DESC",
+            None => default_dir,
+        };
+        // NULLS LAST for metadata sorts so models without metadata sink to the bottom
+        let nulls_clause =
+            if filter.sort_field.is_some() && !matches!(filter.sort_field, Some(ModelSortField::CreatedAt) | Some(ModelSortField::Alias)) {
+                " NULLS LAST"
+            } else {
+                ""
+            };
+        query.push(format!(" ORDER BY {sort_expr} {direction}{nulls_clause} LIMIT "));
         query.push_bind(filter.limit);
         query.push(" OFFSET ");
         query.push_bind(filter.skip);
@@ -691,6 +676,112 @@ impl<'c> Repository for Deployments<'c> {
 impl<'c> Deployments<'c> {
     pub fn new(db: &'c mut PgConnection) -> Self {
         Self { db }
+    }
+
+    /// Apply shared filter clauses to a query builder (used by both list and count)
+    fn apply_filters<'a>(query: &mut QueryBuilder<'a, sqlx::Postgres>, filter: &'a DeploymentFilter) {
+        if let Some(endpoint_id) = filter.endpoint_id {
+            query.push(" AND dm.hosted_on = ");
+            query.push_bind(endpoint_id);
+        }
+
+        if let Some(ref statuses) = filter.statuses {
+            let status_strings: Vec<String> = statuses.iter().map(|s| s.to_db_string().to_string()).collect();
+            query.push(" AND dm.status = ANY(");
+            query.push_bind(status_strings);
+            query.push(")");
+        }
+
+        if let Some(deleted) = filter.deleted {
+            query.push(" AND dm.deleted = ");
+            query.push_bind(deleted);
+        }
+
+        if let Some(ref aliases) = filter.aliases
+            && !aliases.is_empty()
+        {
+            query.push(" AND dm.alias = ANY(");
+            query.push_bind(aliases);
+            query.push(")");
+        }
+
+        if let Some(user_id) = filter.accessible_to {
+            query.push(" AND dm.id IN (");
+            query.push("SELECT dg.deployment_id FROM deployment_groups dg WHERE dg.group_id IN (");
+            query.push("SELECT ug.group_id FROM user_groups ug WHERE ug.user_id = ");
+            query.push_bind(user_id);
+            query.push(" UNION SELECT '00000000-0000-0000-0000-000000000000'::uuid WHERE ");
+            query.push_bind(user_id);
+            query.push(" != '00000000-0000-0000-0000-000000000000'::uuid");
+            query.push("))");
+        }
+
+        if let Some(ref group_ids) = filter.group_ids
+            && !group_ids.is_empty()
+        {
+            query.push(" AND dm.id IN (");
+            query.push("SELECT dg.deployment_id FROM deployment_groups dg WHERE dg.group_id = ANY(");
+            query.push_bind(group_ids);
+            query.push("))");
+        }
+
+        if let Some(ref search) = filter.search {
+            let search_pattern = format!("%{}%", search.to_lowercase());
+            query.push(" AND (LOWER(dm.alias) LIKE ");
+            query.push_bind(search_pattern.clone());
+            query.push(" OR LOWER(dm.model_name) LIKE ");
+            query.push_bind(search_pattern.clone());
+            query.push(" OR LOWER(ie.name) LIKE ");
+            query.push_bind(search_pattern);
+            query.push(")");
+        }
+
+        if let Some(is_composite) = filter.is_composite {
+            query.push(" AND dm.is_composite = ");
+            query.push_bind(is_composite);
+        }
+
+        if let Some(ref provider) = filter.provider {
+            query.push(" AND LOWER(dm.metadata->>'provider') = LOWER(");
+            query.push_bind(provider.clone());
+            query.push(")");
+        }
+
+        if let Some(ref model_type) = filter.model_type {
+            let type_str = match model_type {
+                ModelType::Chat => "CHAT",
+                ModelType::Embeddings => "EMBEDDINGS",
+                ModelType::Reranker => "RERANKER",
+            };
+            query.push(" AND dm.type = ");
+            query.push_bind(type_str.to_string());
+        }
+
+        if let Some(ref capability) = filter.capability {
+            query.push(" AND ");
+            query.push_bind(capability.clone());
+            query.push(" = ANY(dm.capabilities)");
+        }
+    }
+
+    /// Get distinct facet values for filter dropdowns (always queries all active non-deleted models)
+    pub async fn facets(&mut self) -> Result<(Vec<String>, Vec<String>, Vec<String>)> {
+        let row = sqlx::query_as::<_, (Option<Vec<String>>, Option<Vec<String>>, Option<Vec<String>>)>(
+            r#"
+            SELECT
+                array_agg(DISTINCT metadata->>'provider' ORDER BY metadata->>'provider')
+                    FILTER (WHERE metadata->>'provider' IS NOT NULL),
+                (SELECT array_agg(DISTINCT cap ORDER BY cap) FROM deployed_models, unnest(capabilities) AS cap
+                    WHERE deleted = false AND status = 'active'),
+                array_agg(DISTINCT type ORDER BY type) FILTER (WHERE type IS NOT NULL)
+            FROM deployed_models
+            WHERE deleted = false AND status = 'active'
+            "#,
+        )
+        .fetch_one(&mut *self.db)
+        .await?;
+
+        Ok((row.0.unwrap_or_default(), row.1.unwrap_or_default(), row.2.unwrap_or_default()))
     }
 
     /// Check if a user has access to a deployment through group membership
@@ -732,74 +823,7 @@ impl<'c> Deployments<'c> {
         let mut query =
             QueryBuilder::new("SELECT COUNT(*) FROM deployed_models dm LEFT JOIN inference_endpoints ie ON dm.hosted_on = ie.id WHERE 1=1");
 
-        // Add endpoint filter if specified
-        if let Some(endpoint_id) = filter.endpoint_id {
-            query.push(" AND dm.hosted_on = ");
-            query.push_bind(endpoint_id);
-        }
-
-        // Add status filter if specified
-        if let Some(ref statuses) = filter.statuses {
-            let status_strings: Vec<String> = statuses.iter().map(|s| s.to_db_string().to_string()).collect();
-            query.push(" AND dm.status = ANY(");
-            query.push_bind(status_strings);
-            query.push(")");
-        }
-
-        // Add deleted filter if specified
-        if let Some(deleted) = filter.deleted {
-            query.push(" AND dm.deleted = ");
-            query.push_bind(deleted);
-        }
-
-        // Add aliases filter if specified
-        if let Some(ref aliases) = filter.aliases
-            && !aliases.is_empty()
-        {
-            query.push(" AND dm.alias = ANY(");
-            query.push_bind(aliases);
-            query.push(")");
-        }
-
-        // Add accessibility filter if specified
-        if let Some(user_id) = filter.accessible_to {
-            query.push(" AND dm.id IN (");
-            query.push("SELECT dg.deployment_id FROM deployment_groups dg WHERE dg.group_id IN (");
-            query.push("SELECT ug.group_id FROM user_groups ug WHERE ug.user_id = ");
-            query.push_bind(user_id);
-            query.push(" UNION SELECT '00000000-0000-0000-0000-000000000000'::uuid WHERE ");
-            query.push_bind(user_id);
-            query.push(" != '00000000-0000-0000-0000-000000000000'::uuid");
-            query.push("))");
-        }
-
-        // Add group filter if specified
-        if let Some(ref group_ids) = filter.group_ids
-            && !group_ids.is_empty()
-        {
-            query.push(" AND dm.id IN (");
-            query.push("SELECT dg.deployment_id FROM deployment_groups dg WHERE dg.group_id = ANY(");
-            query.push_bind(group_ids);
-            query.push("))");
-        }
-
-        // Add search filter if specified (case-insensitive substring match on alias, model_name, or endpoint name)
-        if let Some(ref search) = filter.search {
-            let search_pattern = format!("%{}%", search.to_lowercase());
-            query.push(" AND (LOWER(dm.alias) LIKE ");
-            query.push_bind(search_pattern.clone());
-            query.push(" OR LOWER(dm.model_name) LIKE ");
-            query.push_bind(search_pattern.clone());
-            query.push(" OR LOWER(ie.name) LIKE ");
-            query.push_bind(search_pattern);
-            query.push(")");
-        }
-
-        // Add is_composite filter if specified
-        if let Some(is_composite) = filter.is_composite {
-            query.push(" AND dm.is_composite = ");
-            query.push_bind(is_composite);
-        }
+        Self::apply_filters(&mut query, filter);
 
         let count: (i64,) = query.build_query_as().fetch_one(&mut *self.db).await?;
         Ok(count.0)
