@@ -52,7 +52,7 @@ use uuid::Uuid;
 #[tracing::instrument(skip_all)]
 pub async fn create_transaction<P: PoolProvider>(
     State(state): State<AppState<P>>,
-    perm: RequiresPermission<resource::Credits, operation::CreateAll>,
+    _perm: RequiresPermission<resource::Credits, operation::CreateAll>,
     Json(data): Json<CreditTransactionCreate>,
 ) -> Result<(StatusCode, Json<CreditTransactionResponse>)> {
     // Validate amount is positive
@@ -74,7 +74,6 @@ pub async fn create_transaction<P: PoolProvider>(
         description: data.description,
         fusillade_batch_id: None,
         api_key_id: None,
-        performed_by: Some(perm.current_user.id),
     };
 
     let transaction = repo.create_transaction(&db_request).await?;
@@ -1263,7 +1262,6 @@ mod tests {
             description: Some("Purchase".to_string()),
             fusillade_batch_id: None,
             api_key_id: None,
-            performed_by: None,
         };
         credits_repo
             .create_transaction(&purchase_request)
@@ -1303,7 +1301,6 @@ mod tests {
                 description: Some(format!("Batch 1 request {}", i)),
                 fusillade_batch_id: Some(batch_id_1),
                 api_key_id: None,
-                performed_by: None,
             };
             credits_repo
                 .create_transaction(&usage_request)
@@ -1340,7 +1337,6 @@ mod tests {
                 description: Some(format!("Batch 2 request {}", i)),
                 fusillade_batch_id: Some(batch_id_2),
                 api_key_id: None,
-                performed_by: None,
             };
             credits_repo
                 .create_transaction(&usage_request)
@@ -1376,7 +1372,6 @@ mod tests {
                 description: Some(format!("Individual request {}", i)),
                 fusillade_batch_id: None, // Not in a batch
                 api_key_id: None,
-                performed_by: None,
             };
             credits_repo
                 .create_transaction(&usage_request)
@@ -1512,7 +1507,6 @@ mod tests {
                     description: Some(format!("Batch {} request {}", batch_num, req_num)),
                     fusillade_batch_id: Some(batch_id),
                     api_key_id: None,
-                    performed_by: None,
                 };
                 credits_repo
                     .create_transaction(&usage_request)
@@ -1627,7 +1621,6 @@ mod tests {
                 description: Some(format!("Batch 1 request {}", i)),
                 fusillade_batch_id: Some(batch_id_1),
                 api_key_id: None,
-                performed_by: None,
             };
             credits_repo
                 .create_transaction(&usage_request)
@@ -1665,7 +1658,6 @@ mod tests {
                 description: Some(format!("Batch 2 request {}", i)),
                 fusillade_batch_id: Some(batch_id_2),
                 api_key_id: None,
-                performed_by: None,
             };
             credits_repo
                 .create_transaction(&usage_request)
@@ -1703,7 +1695,6 @@ mod tests {
                 description: Some(format!("Batch 3 request {}", i)),
                 fusillade_batch_id: Some(batch_id_3),
                 api_key_id: None,
-                performed_by: None,
             };
             credits_repo
                 .create_transaction(&usage_request)
@@ -1720,7 +1711,6 @@ mod tests {
             description: Some("Dummy payment (test)".to_string()),
             fusillade_batch_id: None,
             api_key_id: None,
-            performed_by: None,
         };
         credits_repo
             .create_transaction(&payment_request)

@@ -1,16 +1,16 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            INSERT INTO user_organizations (user_id, organization_id, role)\n            VALUES ($1, $2, $3)\n            RETURNING user_id, organization_id, role, created_at\n            ",
+  "query": "\n            SELECT uo.user_id as \"user_id!\", uo.organization_id as \"organization_id!\", uo.role, uo.created_at\n            FROM user_organizations uo\n            INNER JOIN users u ON u.id = uo.organization_id\n            WHERE uo.user_id = $1 AND u.is_deleted = false\n            ORDER BY uo.created_at ASC\n            ",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
-        "name": "user_id",
+        "name": "user_id!",
         "type_info": "Uuid"
       },
       {
         "ordinal": 1,
-        "name": "organization_id",
+        "name": "organization_id!",
         "type_info": "Uuid"
       },
       {
@@ -26,17 +26,15 @@
     ],
     "parameters": {
       "Left": [
-        "Uuid",
-        "Uuid",
-        "Varchar"
+        "Uuid"
       ]
     },
     "nullable": [
-      false,
+      true,
       false,
       false,
       false
     ]
   },
-  "hash": "b70f5420e3a8154df0c948e225d8bbc7ae1f580f8795c49e456fe27b3b6763ae"
+  "hash": "1c0348c8599834e9d386ee26a187c3eec7e631a565251c7c27ddda374fd965e9"
 }

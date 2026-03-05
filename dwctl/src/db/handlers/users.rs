@@ -1043,7 +1043,6 @@ mod tests {
             description: None,
             fusillade_batch_id: None,
             api_key_id: None,
-            performed_by: None,
         };
         credits.create_transaction(&deduct).await.unwrap();
         credits.refresh_checkpoint(user_id).await.unwrap();
@@ -1088,7 +1087,6 @@ mod tests {
             description: None,
             fusillade_batch_id: None,
             api_key_id: None,
-            performed_by: None,
         };
         credits.create_transaction(&deduct2).await.unwrap();
         credits.refresh_checkpoint(user_id).await.unwrap();
@@ -1119,7 +1117,6 @@ mod tests {
             description: None,
             fusillade_batch_id: None,
             api_key_id: None,
-            performed_by: None,
         };
         credits.create_transaction(&deduct).await.unwrap();
         credits.refresh_checkpoint(user_id).await.unwrap();

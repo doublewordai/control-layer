@@ -218,7 +218,6 @@ mod tests {
                 description: Some("Initial credits".to_string()),
                 fusillade_batch_id: None,
                 api_key_id: None,
-                performed_by: None,
             })
             .await
             .unwrap();
@@ -269,7 +268,6 @@ mod tests {
                 description: Some("Usage".to_string()),
                 fusillade_batch_id: None,
                 api_key_id: None,
-                performed_by: None,
             })
             .await
             .unwrap();
@@ -342,7 +340,6 @@ mod tests {
                 description: Some("Initial credits".to_string()),
                 fusillade_batch_id: None,
                 api_key_id: None,
-                performed_by: None,
             })
             .await
             .unwrap();

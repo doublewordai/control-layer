@@ -147,7 +147,6 @@ impl PaymentProvider for DummyProvider {
             description: Some(description),
             fusillade_batch_id: None,
             api_key_id: None,
-            performed_by: None,
         };
 
         let mut credits = Credits::new(&mut conn);

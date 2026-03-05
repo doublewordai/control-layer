@@ -295,7 +295,7 @@ impl<'c> Organizations<'c> {
             r#"
             INSERT INTO user_organizations (user_id, organization_id, role)
             VALUES ($1, $2, $3)
-            RETURNING user_id, organization_id, role, created_at
+            RETURNING user_id as "user_id!", organization_id as "organization_id!", role, created_at
             "#,
             user_id,
             org_id,
@@ -334,7 +334,7 @@ impl<'c> Organizations<'c> {
             r#"
             UPDATE user_organizations SET role = $3
             WHERE user_id = $1 AND organization_id = $2
-            RETURNING user_id, organization_id, role, created_at
+            RETURNING user_id as "user_id!", organization_id as "organization_id!", role, created_at
             "#,
             user_id,
             org_id,
@@ -358,7 +358,7 @@ impl<'c> Organizations<'c> {
         let rows = sqlx::query_as!(
             MemberRow,
             r#"
-            SELECT uo.user_id, uo.organization_id, uo.role, uo.created_at
+            SELECT uo.user_id as "user_id!", uo.organization_id as "organization_id!", uo.role, uo.created_at
             FROM user_organizations uo
             INNER JOIN users u ON u.id = uo.user_id
             WHERE uo.organization_id = $1 AND u.is_deleted = false
@@ -386,7 +386,7 @@ impl<'c> Organizations<'c> {
         let rows = sqlx::query_as!(
             MemberRow,
             r#"
-            SELECT uo.user_id, uo.organization_id, uo.role, uo.created_at
+            SELECT uo.user_id as "user_id!", uo.organization_id as "organization_id!", uo.role, uo.created_at
             FROM user_organizations uo
             INNER JOIN users u ON u.id = uo.organization_id
             WHERE uo.user_id = $1 AND u.is_deleted = false

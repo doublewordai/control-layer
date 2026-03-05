@@ -164,12 +164,14 @@ pub async fn list_user_api_keys<P: PoolProvider>(
     // Can't use RequiresPermission here because we need conditional logic for own vs other users
     current_user: CurrentUser,
 ) -> Result<Json<PaginatedResponse<ApiKeyInfoResponse>>> {
-    // PlatformManagers (ReadAll) see all keys for a user; everyone else is scoped to created_by
+    // PlatformManagers (ReadAll) see all keys for a user; everyone else is scoped to created_by.
+    // Note: /current is only used for personal (individual) keys. Org key operations always
+    // use /users/{org_uuid}/api-keys, so the Id(uuid) branch handles org isolation via created_by.
     let mut skip_created_by_filter = false;
 
     let target_user_id = match user_id {
         UserIdOrCurrent::Current(_) => {
-            // Even for /current, verify they have permission to read their own API keys
+            // Personal keys only — org interactions use Id(uuid) with the org's UUID.
             if !can_read_own_resource(&current_user, Resource::ApiKeys, current_user.id) {
                 return Err(Error::InsufficientPermissions {
                     required: Permission::Allow(Resource::ApiKeys, Operation::ReadOwn),
@@ -262,11 +264,12 @@ pub async fn get_user_api_key<P: PoolProvider>(
     // Can't use RequiresPermission here because we need conditional logic for own vs other users
     current_user: CurrentUser,
 ) -> Result<Json<ApiKeyInfoResponse>> {
+    // Note: /current is only used for personal keys. Org key operations use /users/{org_uuid}/api-keys.
     let mut skip_created_by_filter = false;
 
     let target_user_id = match user_id {
         UserIdOrCurrent::Current(_) => {
-            // Even for /current, verify they have permission to read their own API keys
+            // Personal keys only — org interactions use Id(uuid) with the org's UUID.
             if !can_read_own_resource(&current_user, Resource::ApiKeys, current_user.id) {
                 return Err(Error::InsufficientPermissions {
                     required: Permission::Allow(Resource::ApiKeys, Operation::ReadOwn),
@@ -350,11 +353,12 @@ pub async fn delete_user_api_key<P: PoolProvider>(
     // Can't use RequiresPermission here because we need conditional logic for own vs other users
     current_user: CurrentUser,
 ) -> Result<StatusCode> {
+    // Note: /current is only used for personal keys. Org key operations use /users/{org_uuid}/api-keys.
     let mut skip_created_by_filter = false;
 
     let target_user_id = match user_id {
         UserIdOrCurrent::Current(_) => {
-            // Even for /current, verify they have permission to delete their own API keys
+            // Personal keys only — org interactions use Id(uuid) with the org's UUID.
             if !can_delete_own_resource(&current_user, Resource::ApiKeys, current_user.id) {
                 return Err(Error::InsufficientPermissions {
                     required: Permission::Allow(Resource::ApiKeys, Operation::DeleteOwn),

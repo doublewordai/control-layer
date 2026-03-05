@@ -36,7 +36,6 @@ pub struct CreditTransaction {
     /// Sequence number for reliable ordering in checkpoint calculations.
     pub seq: i64,
     pub api_key_id: Option<Uuid>,
-    pub performed_by: Option<UserId>,
 }
 
 impl From<CreditTransaction> for CreditTransactionDBResponse {
@@ -50,7 +49,6 @@ impl From<CreditTransaction> for CreditTransactionDBResponse {
             source_id: tx.source_id,
             created_at: tx.created_at,
             api_key_id: tx.api_key_id,
-            performed_by: tx.performed_by,
         }
     }
 }
@@ -116,10 +114,10 @@ impl<'c> Credits<'c> {
         let transaction = sqlx::query_as!(
             CreditTransaction,
             r#"
-            INSERT INTO credits_transactions (user_id, transaction_type, amount, source_id, description, fusillade_batch_id, api_key_id, performed_by)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            INSERT INTO credits_transactions (user_id, transaction_type, amount, source_id, description, fusillade_batch_id, api_key_id)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
             RETURNING id, user_id, transaction_type as "transaction_type: CreditTransactionType", amount, source_id,
-                      description, created_at, seq, api_key_id, performed_by
+                      description, created_at, seq, api_key_id
             "#,
             request.user_id,
             &request.transaction_type as &CreditTransactionType,
@@ -127,8 +125,7 @@ impl<'c> Credits<'c> {
             request.source_id,
             request.description,
             request.fusillade_batch_id,
-            request.api_key_id,
-            request.performed_by
+            request.api_key_id
         )
         .fetch_one(&mut *self.db)
         .await?;
@@ -381,7 +378,7 @@ impl<'c> Credits<'c> {
         let transactions = sqlx::query_as!(
             CreditTransaction,
             r#"
-            SELECT id, user_id, transaction_type as "transaction_type: CreditTransactionType", amount, source_id, description, created_at, seq, api_key_id, performed_by
+            SELECT id, user_id, transaction_type as "transaction_type: CreditTransactionType", amount, source_id, description, created_at, seq, api_key_id
             FROM credits_transactions
             WHERE user_id = $1
               AND ($4::text IS NULL OR description ILIKE '%' || $4 || '%')
@@ -422,7 +419,7 @@ impl<'c> Credits<'c> {
         let transactions = sqlx::query_as!(
             CreditTransaction,
             r#"
-            SELECT id, user_id, transaction_type as "transaction_type: CreditTransactionType", amount, source_id, description, created_at, seq, api_key_id, performed_by
+            SELECT id, user_id, transaction_type as "transaction_type: CreditTransactionType", amount, source_id, description, created_at, seq, api_key_id
             FROM credits_transactions
             WHERE ($3::text IS NULL OR description ILIKE '%' || $3 || '%')
               AND ($4::text[] IS NULL OR transaction_type::text = ANY($4))
@@ -452,7 +449,7 @@ impl<'c> Credits<'c> {
             CreditTransaction,
             r#"
             SELECT id, user_id, transaction_type as "transaction_type: CreditTransactionType",
-                amount, source_id, description, created_at, seq, api_key_id, performed_by
+                amount, source_id, description, created_at, seq, api_key_id
             FROM credits_transactions
             WHERE id = $1
             "#,
@@ -944,7 +941,6 @@ impl<'c> Credits<'c> {
                 source_id,
                 created_at,
                 api_key_id: None,
-                performed_by: None,
             };
             results.push(TransactionWithCategory {
                 transaction,
@@ -1072,7 +1068,6 @@ mod tests {
             description: None,
             fusillade_batch_id: None,
             api_key_id: None,
-            performed_by: None,
         };
         credits.create_transaction(&request2).await.expect("Failed to create transaction");
 
@@ -1129,7 +1124,6 @@ mod tests {
             description: Some("Usage deduction".to_string()),
             fusillade_batch_id: None,
             api_key_id: None,
-            performed_by: None,
         };
 
         let transaction3 = credits
@@ -1409,7 +1403,6 @@ mod tests {
             description: Some("Purchase".to_string()),
             fusillade_batch_id: None,
             api_key_id: None,
-            performed_by: None,
         };
         let tx = credits.create_transaction(&request).await.expect("Failed to create Purchase");
         assert_eq!(tx.transaction_type, CreditTransactionType::Purchase);
@@ -1423,7 +1416,6 @@ mod tests {
             description: Some("Usage".to_string()),
             fusillade_batch_id: None,
             api_key_id: None,
-            performed_by: None,
         };
         let tx = credits.create_transaction(&request).await.expect("Failed to create Usage");
         assert_eq!(tx.transaction_type, CreditTransactionType::Usage);
@@ -1437,7 +1429,6 @@ mod tests {
             description: Some("Removal".to_string()),
             fusillade_batch_id: None,
             api_key_id: None,
-            performed_by: None,
         };
         let tx = credits.create_transaction(&request).await.expect("Failed to create AdminRemoval");
         assert_eq!(tx.transaction_type, CreditTransactionType::AdminRemoval);
@@ -1536,7 +1527,6 @@ mod tests {
                     description: Some(format!("Concurrent transaction {}", i)),
                     fusillade_batch_id: None,
                     api_key_id: None,
-                    performed_by: None,
                 };
 
                 credits.create_transaction(&request).await.expect("Failed to create transaction")
@@ -1615,7 +1605,6 @@ mod tests {
                 description: Some("Usage to go negative".to_string()),
                 fusillade_batch_id: None,
                 api_key_id: None,
-                performed_by: None,
             };
             credits.create_transaction(&usage).await.expect("Failed to use");
         }
@@ -1725,7 +1714,6 @@ mod tests {
             description: Some("Micro-transaction".to_string()),
             fusillade_batch_id: None,
             api_key_id: None,
-            performed_by: None,
         };
 
         let micro_transaction = credits
@@ -1999,7 +1987,6 @@ mod tests {
                     description: Some(format!("Batch transaction {}", i)),
                     fusillade_batch_id: Some(batch_id),
                     api_key_id: None,
-                    performed_by: None,
                 })
                 .await
                 .expect("Failed to create batch transaction");

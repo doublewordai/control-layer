@@ -1,16 +1,16 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT uo.user_id, uo.organization_id, uo.role, uo.created_at\n            FROM user_organizations uo\n            INNER JOIN users u ON u.id = uo.organization_id\n            WHERE uo.user_id = $1 AND u.is_deleted = false\n            ORDER BY uo.created_at ASC\n            ",
+  "query": "\n            SELECT uo.user_id as \"user_id!\", uo.organization_id as \"organization_id!\", uo.role, uo.created_at\n            FROM user_organizations uo\n            INNER JOIN users u ON u.id = uo.user_id\n            WHERE uo.organization_id = $1 AND u.is_deleted = false\n            ORDER BY uo.created_at ASC\n            ",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
-        "name": "user_id",
+        "name": "user_id!",
         "type_info": "Uuid"
       },
       {
         "ordinal": 1,
-        "name": "organization_id",
+        "name": "organization_id!",
         "type_info": "Uuid"
       },
       {
@@ -30,11 +30,11 @@
       ]
     },
     "nullable": [
-      false,
+      true,
       false,
       false,
       false
     ]
   },
-  "hash": "2069f2cb3b8c838f4c60804b2ca2c5df8c8c9da1b1956277400bc4399355b3fd"
+  "hash": "1afbc658905c40d79e08fa14a5de45558adaa786bbbb9365580cb699c73c93f7"
 }

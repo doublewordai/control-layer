@@ -1,16 +1,16 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            UPDATE user_organizations SET role = $3\n            WHERE user_id = $1 AND organization_id = $2\n            RETURNING user_id, organization_id, role, created_at\n            ",
+  "query": "\n            UPDATE user_organizations SET role = $3\n            WHERE user_id = $1 AND organization_id = $2\n            RETURNING user_id as \"user_id!\", organization_id as \"organization_id!\", role, created_at\n            ",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
-        "name": "user_id",
+        "name": "user_id!",
         "type_info": "Uuid"
       },
       {
         "ordinal": 1,
-        "name": "organization_id",
+        "name": "organization_id!",
         "type_info": "Uuid"
       },
       {
@@ -32,11 +32,11 @@
       ]
     },
     "nullable": [
-      false,
+      true,
       false,
       false,
       false
     ]
   },
-  "hash": "56afd2cea6d5cd12cf6eeb3e2439d87fc85b9ef07f85f3ac685a7da13ba8fa29"
+  "hash": "a9b435b3251e700f51ba7b8e7a58edb650db8e8e594b0a734ec8e7a41fb91c5d"
 }
