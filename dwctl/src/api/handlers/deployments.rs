@@ -367,12 +367,13 @@ pub async fn list_deployed_models<P: PoolProvider>(
 
     let response = enricher.enrich_many(models).await?;
 
-    // Fetch facets if requested
+    // Fetch facets if requested (reuse existing repo/connection to avoid
+    // acquiring a second read connection which could self-deadlock under pool
+    // saturation). The filter ensures facets respect the same access-control
+    // as the model list.
     let include_facets = includes.contains(&"facets");
     let facets = if include_facets {
-        let mut facets_conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
-        let mut facets_repo = Deployments::new(&mut facets_conn);
-        let (providers, capabilities, model_types) = facets_repo.facets().await?;
+        let (providers, capabilities, model_types) = repo.facets(&filter).await?;
         Some(ModelFacets {
             providers,
             capabilities,

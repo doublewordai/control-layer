@@ -664,6 +664,7 @@ impl<'c> Repository for Deployments<'c> {
                 let model_type = m.r#type.as_ref().and_then(|s| match s.as_str() {
                     "CHAT" => Some(ModelType::Chat),
                     "EMBEDDINGS" => Some(ModelType::Embeddings),
+                    "RERANKER" => Some(ModelType::Reranker),
                     _ => None,
                 });
 
@@ -764,22 +765,43 @@ impl<'c> Deployments<'c> {
         }
     }
 
-    /// Get distinct facet values for filter dropdowns (always queries all active non-deleted models)
-    pub async fn facets(&mut self) -> Result<(Vec<String>, Vec<String>, Vec<String>)> {
-        let row = sqlx::query_as::<_, (Option<Vec<String>>, Option<Vec<String>>, Option<Vec<String>>)>(
-            r#"
+    /// Get distinct facet values for filter dropdowns, respecting the same
+    /// access-control and visibility filters applied to the model list.
+    ///
+    /// Uses a CTE so the base set is filtered once, then facets are derived
+    /// from it — keeping the access-control logic in one place.
+    pub async fn facets(&mut self, filter: &DeploymentFilter) -> Result<(Vec<String>, Vec<String>, Vec<String>)> {
+        // Build a CTE that selects the filtered model set (ignoring pagination,
+        // sort, and search so facets reflect the full universe visible to this user).
+        let mut query = QueryBuilder::new(
+            "WITH visible AS (SELECT dm.* FROM deployed_models dm LEFT JOIN inference_endpoints ie ON dm.hosted_on = ie.id WHERE 1=1",
+        );
+
+        let facets_filter = DeploymentFilter {
+            skip: 0,
+            limit: i64::MAX,
+            search: None,
+            sort_field: None,
+            sort_direction: None,
+            ..filter.clone()
+        };
+        Self::apply_filters(&mut query, &facets_filter);
+
+        query.push(
+            r#")
             SELECT
                 array_agg(DISTINCT metadata->>'provider' ORDER BY metadata->>'provider')
                     FILTER (WHERE metadata->>'provider' IS NOT NULL),
-                (SELECT array_agg(DISTINCT cap ORDER BY cap) FROM deployed_models, unnest(capabilities) AS cap
-                    WHERE deleted = false AND status = 'active'),
+                (SELECT array_agg(DISTINCT cap ORDER BY cap)
+                    FROM visible, unnest(capabilities) AS cap),
                 array_agg(DISTINCT type ORDER BY type) FILTER (WHERE type IS NOT NULL)
-            FROM deployed_models
-            WHERE deleted = false AND status = 'active'
-            "#,
-        )
-        .fetch_one(&mut *self.db)
-        .await?;
+            FROM visible"#,
+        );
+
+        let row = query
+            .build_query_as::<(Option<Vec<String>>, Option<Vec<String>>, Option<Vec<String>>)>()
+            .fetch_one(&mut *self.db)
+            .await?;
 
         Ok((row.0.unwrap_or_default(), row.1.unwrap_or_default(), row.2.unwrap_or_default()))
     }
