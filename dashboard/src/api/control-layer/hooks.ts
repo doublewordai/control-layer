@@ -1532,7 +1532,7 @@ export function useAcceptInvite() {
         queryKey: queryKeys.organizations.all,
       });
       queryClient.invalidateQueries({
-        queryKey: queryKeys.users.byId("current"),
+        queryKey: ["users", "byId", "current"],
       });
     },
   });

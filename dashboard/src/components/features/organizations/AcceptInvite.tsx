@@ -47,10 +47,10 @@ export function AcceptInvite() {
           </p>
           <div className="flex flex-col gap-2 pt-2">
             <Button asChild>
-              <Link to="/login">Log In</Link>
+              <Link to={`/login?redirect=${encodeURIComponent(`/org-invite?token=${token}`)}`}>Log In</Link>
             </Button>
             <Button variant="outline" asChild>
-              <Link to="/register">Create Account</Link>
+              <Link to={`/register?redirect=${encodeURIComponent(`/org-invite?token=${token}`)}`}>Create Account</Link>
             </Button>
           </div>
         </div>

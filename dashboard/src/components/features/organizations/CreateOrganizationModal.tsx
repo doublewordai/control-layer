@@ -45,6 +45,7 @@ export function CreateOrganizationModal({
   const userOptions = users.map((user) => ({
     value: user.id,
     label: user.email,
+    description: user.display_name || undefined,
   }));
 
   const handleOwnerChange = (value: string) => {

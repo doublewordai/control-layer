@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Link } from "react-router-dom";
+import { Link, useSearchParams, useNavigate } from "react-router-dom";
 import { Eye, EyeOff } from "lucide-react";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
@@ -26,6 +26,8 @@ export function LoginForm() {
   const [showPassword, setShowPassword] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const { login } = useAuth();
+  const [searchParams] = useSearchParams();
+  const navigate = useNavigate();
   const { data: registrationInfo } = useRegistrationInfo();
   const { data: loginInfo, isLoading: isLoadingLoginInfo } = useLoginInfo();
 
@@ -35,6 +37,10 @@ export function LoginForm() {
 
     try {
       await login({ email, password });
+      const redirect = searchParams.get("redirect");
+      if (redirect) {
+        navigate(redirect);
+      }
       toast.success("Login successful!");
     } catch (error) {
       // Check for 401 authentication errors using ApiError
@@ -171,7 +177,7 @@ export function LoginForm() {
               <p className="text-sm text-center text-gray-600">
                 Don't have an account?{" "}
                 <Link
-                  to="/register"
+                  to={`/register${searchParams.get("redirect") ? `?redirect=${encodeURIComponent(searchParams.get("redirect")!)}` : ""}`}
                   className="font-medium text-doubleword-neutral-800 hover:text-doubleword-neutral-900 hover:underline"
                 >
                   Sign up

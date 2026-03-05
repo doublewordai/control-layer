@@ -492,7 +492,7 @@ impl<'c> Users<'c> {
     pub async fn get_user_by_email(&mut self, email: &str) -> Result<Option<UserDBResponse>> {
         let user = sqlx::query_as!(
             User,
-            "SELECT * FROM users WHERE email = $1 AND id != '00000000-0000-0000-0000-000000000000' AND is_deleted = false",
+            "SELECT * FROM users WHERE email = $1 AND id != '00000000-0000-0000-0000-000000000000' AND is_deleted = false AND user_type = 'individual'",
             email
         )
         .fetch_optional(&mut *self.db)
