@@ -113,13 +113,13 @@ pub async fn get_transaction<P: PoolProvider>(
     let mut repo = Credits::new(&mut pool_conn);
 
     // Check permissions: if not BillingManager and not admin, must be own transaction
-    let has_read_all = permissions::has_permission(&current_user, Resource::Credits, Operation::ReadAll);
+    let can_read_all = permissions::has_permission(&current_user, Resource::Credits, Operation::ReadAll);
 
     let transaction = repo.get_transaction_by_id(transaction_id).await?;
 
     let transaction = match transaction {
         Some(tx) => {
-            if !has_read_all && tx.user_id != current_user.id {
+            if !can_read_all && tx.user_id != current_user.id {
                 let can_org = permissions::can_manage_org_resource(&current_user, tx.user_id, &mut pool_conn)
                     .await
                     .map_err(Error::Database)?;
@@ -174,11 +174,11 @@ pub async fn list_transactions<P: PoolProvider>(
     let skip = query.pagination.skip();
     let limit = query.pagination.limit();
 
-    // Check if user has ReadAll permission
-    let has_read_all = permissions::has_permission(&current_user, Resource::Credits, Operation::ReadAll);
+    // Check permissions
+    let can_read_all = permissions::has_permission(&current_user, Resource::Credits, Operation::ReadAll);
 
     // Check if requesting all transactions
-    if query.all == Some(true) && !has_read_all {
+    if query.all == Some(true) && !can_read_all {
         return Err(Error::InsufficientPermissions {
             required: Permission::Allow(Resource::Credits, Operation::ReadAll),
             action: Operation::ReadAll,
@@ -193,7 +193,7 @@ pub async fn list_transactions<P: PoolProvider>(
         // user_id specified - filter to that user
         (_, Some(requested_user_id)) => {
             // If requesting specific user's transactions
-            if !has_read_all && requested_user_id != current_user.id {
+            if !can_read_all && requested_user_id != current_user.id {
                 let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
                 let can_org = permissions::can_manage_org_resource(&current_user, requested_user_id, &mut conn)
                     .await

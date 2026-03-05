@@ -24,11 +24,16 @@ pub struct UserFilter {
     pub skip: i64,
     pub limit: i64,
     pub search: Option<String>, // Case-insensitive substring search on display_name, username, and email
+    pub user_type: String,
 }
 
 impl UserFilter {
     pub fn new(skip: i64, limit: i64) -> Self {
-        Self { skip, limit, search: None }
+        Self { skip, limit, search: None, user_type: "individual".to_string() }
+    }
+
+    pub fn organizations(skip: i64, limit: i64) -> Self {
+        Self { skip, limit, search: None, user_type: "organization".to_string() }
     }
 
     pub fn with_search(mut self, search: String) -> Self {
@@ -312,8 +317,9 @@ impl<'c> Repository for Users<'c> {
         use sqlx::QueryBuilder;
 
         let mut query = QueryBuilder::new(
-            "SELECT * FROM users WHERE id != '00000000-0000-0000-0000-000000000000' AND is_deleted = false AND user_type = 'individual'",
+            "SELECT * FROM users WHERE id != '00000000-0000-0000-0000-000000000000' AND is_deleted = false AND user_type = ",
         );
+        query.push_bind(filter.user_type.clone());
 
         // Add search filter if specified (case-insensitive substring match on display_name, username, or email)
         if let Some(ref search) = filter.search {
@@ -469,8 +475,9 @@ impl<'c> Users<'c> {
         use sqlx::QueryBuilder;
 
         let mut query = QueryBuilder::new(
-            "SELECT COUNT(*) FROM users WHERE id != '00000000-0000-0000-0000-000000000000' AND is_deleted = false AND user_type = 'individual'",
+            "SELECT COUNT(*) FROM users WHERE id != '00000000-0000-0000-0000-000000000000' AND is_deleted = false AND user_type = ",
         );
+        query.push_bind(filter.user_type.clone());
 
         // Add search filter if specified (case-insensitive substring match on display_name, username, or email)
         if let Some(ref search) = filter.search {

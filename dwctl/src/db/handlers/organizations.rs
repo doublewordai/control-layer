@@ -1,7 +1,13 @@
 //! Database repository for organizations and memberships.
+//!
+//! Organizations are stored as rows in the `users` table with `user_type = 'organization'`.
+//! List/count operations delegate to [`Users`] with a `user_type` filter to avoid duplication.
+//! Only `user_organizations`-specific logic (membership CRUD) and org-specific mutations
+//! (create/update/delete with different column sets or safety guards) live here.
 
 use crate::db::{
     errors::{DbError, Result},
+    handlers::users::{UserFilter, Users},
     models::{
         organizations::{OrganizationCreateDBRequest, OrganizationMemberDBResponse, OrganizationUpdateDBRequest},
         users::UserDBResponse,
@@ -10,7 +16,7 @@ use crate::db::{
 use crate::types::{UserId, abbrev_uuid};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::{Acquire, FromRow, PgConnection, QueryBuilder};
+use sqlx::{Acquire, FromRow, PgConnection};
 use tracing::instrument;
 use uuid::Uuid;
 
@@ -30,6 +36,16 @@ impl OrganizationFilter {
     pub fn with_search(mut self, search: String) -> Self {
         self.search = Some(search);
         self
+    }
+
+    /// Convert to a [`UserFilter`] targeting organizations.
+    fn to_user_filter(&self) -> UserFilter {
+        let filter = UserFilter::organizations(self.skip, self.limit);
+        if let Some(ref search) = self.search {
+            filter.with_search(search.clone())
+        } else {
+            filter
+        }
     }
 }
 
@@ -111,103 +127,19 @@ impl<'c> Organizations<'c> {
         })
     }
 
-    /// List organizations with pagination and optional search
+    /// List organizations with pagination and optional search.
+    /// Delegates to [`Users::list`] with `user_type = 'organization'`.
     #[instrument(skip(self, filter), fields(limit = filter.limit, skip = filter.skip), err)]
     pub async fn list(&mut self, filter: &OrganizationFilter) -> Result<Vec<UserDBResponse>> {
-        use crate::api::models::users::Role;
-
-        let mut query = QueryBuilder::new("SELECT * FROM users WHERE user_type = 'organization' AND is_deleted = false");
-
-        if let Some(ref search) = filter.search {
-            let search_pattern = format!("%{}%", search.to_lowercase());
-            query.push(" AND (LOWER(COALESCE(display_name, '')) LIKE ");
-            query.push_bind(search_pattern.clone());
-            query.push(" OR LOWER(username) LIKE ");
-            query.push_bind(search_pattern.clone());
-            query.push(" OR LOWER(email) LIKE ");
-            query.push_bind(search_pattern);
-            query.push(")");
-        }
-
-        query.push(" ORDER BY created_at DESC LIMIT ");
-        query.push_bind(filter.limit);
-        query.push(" OFFSET ");
-        query.push_bind(filter.skip);
-
-        // We need to define a row struct since we're using QueryBuilder
-        #[derive(FromRow)]
-        struct OrgRow {
-            id: UserId,
-            username: String,
-            email: String,
-            display_name: Option<String>,
-            avatar_url: Option<String>,
-            auth_source: String,
-            created_at: DateTime<Utc>,
-            updated_at: DateTime<Utc>,
-            is_admin: bool,
-            password_hash: Option<String>,
-            external_user_id: Option<String>,
-            payment_provider_id: Option<String>,
-            batch_notifications_enabled: bool,
-            first_batch_email_sent: bool,
-            low_balance_notification_sent: bool,
-            low_balance_threshold: Option<f32>,
-            user_type: String,
-            // Columns that exist but we don't use in the response
-            #[allow(dead_code)]
-            is_deleted: bool,
-            #[allow(dead_code)]
-            is_internal: bool,
-            #[allow(dead_code)]
-            last_login: Option<DateTime<Utc>>,
-        }
-
-        let orgs: Vec<OrgRow> = query.build_query_as().fetch_all(&mut *self.db).await?;
-
-        Ok(orgs
-            .into_iter()
-            .map(|o| UserDBResponse {
-                id: o.id,
-                username: o.username,
-                email: o.email,
-                display_name: o.display_name,
-                avatar_url: o.avatar_url,
-                created_at: o.created_at,
-                updated_at: o.updated_at,
-                auth_source: o.auth_source,
-                is_admin: o.is_admin,
-                roles: vec![Role::StandardUser],
-                password_hash: o.password_hash,
-                external_user_id: o.external_user_id,
-                payment_provider_id: o.payment_provider_id,
-                batch_notifications_enabled: o.batch_notifications_enabled,
-                first_batch_email_sent: o.first_batch_email_sent,
-                low_balance_notification_sent: o.low_balance_notification_sent,
-                low_balance_threshold: o.low_balance_threshold,
-                user_type: o.user_type,
-            })
-            .collect())
+        use crate::db::handlers::repository::Repository;
+        Users::new(self.db).list(&filter.to_user_filter()).await
     }
 
-    /// Count organizations matching the filter
+    /// Count organizations matching the filter.
+    /// Delegates to [`Users::count`] with `user_type = 'organization'`.
     #[instrument(skip(self, filter), fields(search = filter.search), err)]
     pub async fn count(&mut self, filter: &OrganizationFilter) -> Result<i64> {
-        let mut query = QueryBuilder::new("SELECT COUNT(*) FROM users WHERE user_type = 'organization' AND is_deleted = false");
-
-        if let Some(ref search) = filter.search {
-            let search_pattern = format!("%{}%", search.to_lowercase());
-            query.push(" AND (LOWER(COALESCE(display_name, '')) LIKE ");
-            query.push_bind(search_pattern.clone());
-            query.push(" OR LOWER(username) LIKE ");
-            query.push_bind(search_pattern.clone());
-            query.push(" OR LOWER(email) LIKE ");
-            query.push_bind(search_pattern);
-            query.push(")");
-        }
-
-        let count: (i64,) = query.build_query_as().fetch_one(&mut *self.db).await?;
-        Ok(count.0)
+        Users::new(self.db).count(&filter.to_user_filter()).await
     }
 
     /// Update an organization's details

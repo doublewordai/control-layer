@@ -66,45 +66,33 @@ pub async fn create_user_api_key<P: PoolProvider>(
         });
     }
 
-    let mut pm_creating_for_other = false;
     let target_user_id = match user_id {
-        UserIdOrCurrent::Current(_) => {
-            // For /current, verify they have permission to create their own API keys
-            if !can_create_own_resource(&current_user, Resource::ApiKeys, current_user.id) {
-                return Err(Error::InsufficientPermissions {
-                    required: Permission::Allow(Resource::ApiKeys, Operation::CreateOwn),
-                    action: Operation::CreateOwn,
-                    resource: "API keys for current user".to_string(),
-                });
-            }
-            current_user.id
-        }
-        UserIdOrCurrent::Id(uuid) => {
-            let can_create_all_api_keys = can_create_all_resources(&current_user, Resource::ApiKeys);
-            let can_create_own_api_keys = can_create_own_resource(&current_user, Resource::ApiKeys, uuid);
-
-            // Allow creation if user can create all API keys OR create their own API keys
-            if !can_create_all_api_keys && !can_create_own_api_keys {
-                // Check if user is any member of the target org
-                let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
-                let member = is_org_member(&current_user, uuid, &mut conn).await.map_err(Error::Database)?;
-                if !member {
-                    return Err(Error::InsufficientPermissions {
-                        required: Permission::Any(vec![
-                            Permission::Allow(Resource::ApiKeys, Operation::CreateAll),
-                            Permission::Allow(Resource::ApiKeys, Operation::CreateOwn),
-                        ]),
-                        action: Operation::CreateOwn,
-                        resource: format!("API keys for user {uuid}"),
-                    });
-                }
-            }
-            // Track whether a PM is creating on behalf of another user.
-            // Org members reach here via is_org_member — they are NOT PMs creating on behalf.
-            pm_creating_for_other = can_create_all_api_keys && uuid != current_user.id;
-            uuid
-        }
+        UserIdOrCurrent::Current(_) => current_user.id,
+        UserIdOrCurrent::Id(uuid) => uuid,
     };
+
+    // Check permissions: CreateAll, CreateOwn, or org membership
+    let can_create_all = can_create_all_resources(&current_user, Resource::ApiKeys);
+    let can_create_own = can_create_own_resource(&current_user, Resource::ApiKeys, target_user_id);
+
+    if !can_create_all && !can_create_own {
+        let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+        let member = is_org_member(&current_user, target_user_id, &mut conn).await.map_err(Error::Database)?;
+        if !member {
+            return Err(Error::InsufficientPermissions {
+                required: Permission::Any(vec![
+                    Permission::Allow(Resource::ApiKeys, Operation::CreateAll),
+                    Permission::Allow(Resource::ApiKeys, Operation::CreateOwn),
+                ]),
+                action: Operation::CreateOwn,
+                resource: format!("API keys for user {target_user_id}"),
+            });
+        }
+    }
+
+    // Track whether a PM is creating on behalf of another user.
+    // Org members reach here via is_org_member — they are NOT PMs creating on behalf.
+    let pm_creating_for_other = can_create_all && target_user_id != current_user.id;
 
     // Validate purpose: restrict batch/playground to system use only (purpose defaults to Realtime via serde)
     match &data.purpose {
@@ -164,47 +152,32 @@ pub async fn list_user_api_keys<P: PoolProvider>(
     // Can't use RequiresPermission here because we need conditional logic for own vs other users
     current_user: CurrentUser,
 ) -> Result<Json<PaginatedResponse<ApiKeyInfoResponse>>> {
-    // PlatformManagers (ReadAll) see all keys for a user; everyone else is scoped to created_by.
-    // Note: /current is only used for personal (individual) keys. Org key operations always
-    // use /users/{org_uuid}/api-keys, so the Id(uuid) branch handles org isolation via created_by.
-    let mut skip_created_by_filter = false;
-
     let target_user_id = match user_id {
-        UserIdOrCurrent::Current(_) => {
-            // Personal keys only — org interactions use Id(uuid) with the org's UUID.
-            if !can_read_own_resource(&current_user, Resource::ApiKeys, current_user.id) {
-                return Err(Error::InsufficientPermissions {
-                    required: Permission::Allow(Resource::ApiKeys, Operation::ReadOwn),
-                    action: Operation::ReadOwn,
-                    resource: "API keys for current user".to_string(),
-                });
-            }
-            current_user.id
-        }
-        UserIdOrCurrent::Id(uuid) => {
-            let can_read_all_api_keys = can_read_all_resources(&current_user, Resource::ApiKeys);
-            let can_read_own_api_keys = can_read_own_resource(&current_user, Resource::ApiKeys, uuid);
-
-            if can_read_all_api_keys {
-                skip_created_by_filter = true;
-            } else if !can_read_own_api_keys {
-                // Check if user is any member of the target org
-                let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
-                let member = is_org_member(&current_user, uuid, &mut conn).await.map_err(Error::Database)?;
-                if !member {
-                    return Err(Error::InsufficientPermissions {
-                        required: Permission::Any(vec![
-                            Permission::Allow(Resource::ApiKeys, Operation::ReadAll),
-                            Permission::Allow(Resource::ApiKeys, Operation::ReadOwn),
-                        ]),
-                        action: Operation::ReadOwn,
-                        resource: format!("API keys for user {uuid}"),
-                    });
-                }
-            }
-            uuid
-        }
+        UserIdOrCurrent::Current(_) => current_user.id,
+        UserIdOrCurrent::Id(uuid) => uuid,
     };
+
+    // Check permissions: ReadAll, ReadOwn, or org membership
+    let can_read_all = can_read_all_resources(&current_user, Resource::ApiKeys);
+    let can_read_own = can_read_own_resource(&current_user, Resource::ApiKeys, target_user_id);
+
+    if !can_read_all && !can_read_own {
+        let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+        let member = is_org_member(&current_user, target_user_id, &mut conn).await.map_err(Error::Database)?;
+        if !member {
+            return Err(Error::InsufficientPermissions {
+                required: Permission::Any(vec![
+                    Permission::Allow(Resource::ApiKeys, Operation::ReadAll),
+                    Permission::Allow(Resource::ApiKeys, Operation::ReadOwn),
+                ]),
+                action: Operation::ReadOwn,
+                resource: format!("API keys for user {target_user_id}"),
+            });
+        }
+    }
+
+    // PlatformManagers (ReadAll) see all keys for a user; everyone else is scoped to created_by.
+    let skip_created_by_filter = can_read_all;
 
     // Use read replica for this read-only operation
     let mut pool_conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
@@ -264,45 +237,31 @@ pub async fn get_user_api_key<P: PoolProvider>(
     // Can't use RequiresPermission here because we need conditional logic for own vs other users
     current_user: CurrentUser,
 ) -> Result<Json<ApiKeyInfoResponse>> {
-    // Note: /current is only used for personal keys. Org key operations use /users/{org_uuid}/api-keys.
-    let mut skip_created_by_filter = false;
-
     let target_user_id = match user_id {
-        UserIdOrCurrent::Current(_) => {
-            // Personal keys only — org interactions use Id(uuid) with the org's UUID.
-            if !can_read_own_resource(&current_user, Resource::ApiKeys, current_user.id) {
-                return Err(Error::InsufficientPermissions {
-                    required: Permission::Allow(Resource::ApiKeys, Operation::ReadOwn),
-                    action: Operation::ReadOwn,
-                    resource: "API keys for current user".to_string(),
-                });
-            }
-            current_user.id
-        }
-        UserIdOrCurrent::Id(uuid) => {
-            let can_read_all_api_keys = can_read_all_resources(&current_user, Resource::ApiKeys);
-            let can_read_own_api_keys = can_read_own_resource(&current_user, Resource::ApiKeys, uuid);
-
-            if can_read_all_api_keys {
-                skip_created_by_filter = true;
-            } else if !can_read_own_api_keys {
-                // Check if user is any member of the target org
-                let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
-                let member = is_org_member(&current_user, uuid, &mut conn).await.map_err(Error::Database)?;
-                if !member {
-                    return Err(Error::InsufficientPermissions {
-                        required: Permission::Any(vec![
-                            Permission::Allow(Resource::ApiKeys, Operation::ReadAll),
-                            Permission::Allow(Resource::ApiKeys, Operation::ReadOwn),
-                        ]),
-                        action: Operation::ReadOwn,
-                        resource: format!("API keys for user {uuid}"),
-                    });
-                }
-            }
-            uuid
-        }
+        UserIdOrCurrent::Current(_) => current_user.id,
+        UserIdOrCurrent::Id(uuid) => uuid,
     };
+
+    // Check permissions: ReadAll, ReadOwn, or org membership
+    let can_read_all = can_read_all_resources(&current_user, Resource::ApiKeys);
+    let can_read_own = can_read_own_resource(&current_user, Resource::ApiKeys, target_user_id);
+
+    if !can_read_all && !can_read_own {
+        let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+        let member = is_org_member(&current_user, target_user_id, &mut conn).await.map_err(Error::Database)?;
+        if !member {
+            return Err(Error::InsufficientPermissions {
+                required: Permission::Any(vec![
+                    Permission::Allow(Resource::ApiKeys, Operation::ReadAll),
+                    Permission::Allow(Resource::ApiKeys, Operation::ReadOwn),
+                ]),
+                action: Operation::ReadOwn,
+                resource: format!("API keys for user {target_user_id}"),
+            });
+        }
+    }
+
+    let skip_created_by_filter = can_read_all;
 
     // Use read replica for this read-only operation
     let mut pool_conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
@@ -353,45 +312,31 @@ pub async fn delete_user_api_key<P: PoolProvider>(
     // Can't use RequiresPermission here because we need conditional logic for own vs other users
     current_user: CurrentUser,
 ) -> Result<StatusCode> {
-    // Note: /current is only used for personal keys. Org key operations use /users/{org_uuid}/api-keys.
-    let mut skip_created_by_filter = false;
-
     let target_user_id = match user_id {
-        UserIdOrCurrent::Current(_) => {
-            // Personal keys only — org interactions use Id(uuid) with the org's UUID.
-            if !can_delete_own_resource(&current_user, Resource::ApiKeys, current_user.id) {
-                return Err(Error::InsufficientPermissions {
-                    required: Permission::Allow(Resource::ApiKeys, Operation::DeleteOwn),
-                    action: Operation::DeleteOwn,
-                    resource: "API keys for current user".to_string(),
-                });
-            }
-            current_user.id
-        }
-        UserIdOrCurrent::Id(uuid) => {
-            let can_delete_all_api_keys = can_delete_all_resources(&current_user, Resource::ApiKeys);
-            let can_delete_own_api_keys = can_delete_own_resource(&current_user, Resource::ApiKeys, uuid);
-
-            if can_delete_all_api_keys {
-                skip_created_by_filter = true;
-            } else if !can_delete_own_api_keys {
-                // Check if user is any member of the target org
-                let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
-                let member = is_org_member(&current_user, uuid, &mut conn).await.map_err(Error::Database)?;
-                if !member {
-                    return Err(Error::InsufficientPermissions {
-                        required: Permission::Any(vec![
-                            Permission::Allow(Resource::ApiKeys, Operation::DeleteAll),
-                            Permission::Allow(Resource::ApiKeys, Operation::DeleteOwn),
-                        ]),
-                        action: Operation::DeleteOwn,
-                        resource: format!("API keys for user {uuid}"),
-                    });
-                }
-            }
-            uuid
-        }
+        UserIdOrCurrent::Current(_) => current_user.id,
+        UserIdOrCurrent::Id(uuid) => uuid,
     };
+
+    // Check permissions: DeleteAll, DeleteOwn, or org membership
+    let can_delete_all = can_delete_all_resources(&current_user, Resource::ApiKeys);
+    let can_delete_own = can_delete_own_resource(&current_user, Resource::ApiKeys, target_user_id);
+
+    if !can_delete_all && !can_delete_own {
+        let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+        let member = is_org_member(&current_user, target_user_id, &mut conn).await.map_err(Error::Database)?;
+        if !member {
+            return Err(Error::InsufficientPermissions {
+                required: Permission::Any(vec![
+                    Permission::Allow(Resource::ApiKeys, Operation::DeleteAll),
+                    Permission::Allow(Resource::ApiKeys, Operation::DeleteOwn),
+                ]),
+                action: Operation::DeleteOwn,
+                resource: format!("API keys for user {target_user_id}"),
+            });
+        }
+    }
+
+    let skip_created_by_filter = can_delete_all;
 
     let mut tx = state.db.write().begin().await.map_err(|e| Error::Database(e.into()))?;
     let mut repo = ApiKeys::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
