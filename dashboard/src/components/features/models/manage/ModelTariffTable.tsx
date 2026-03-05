@@ -3,7 +3,7 @@ import { Plus, Pencil, Trash2, Check, X } from "lucide-react";
 import { Button } from "@/components";
 import { Input } from "../../../ui/input";
 import { Label } from "../../../ui/label";
-import { formatTariffPrice } from "@/utils";
+import { formatTariffPrice, getTariffDisplayName } from "@/utils";
 import {
   Select,
   SelectContent,
@@ -412,9 +412,7 @@ export const ModelTariffTable: React.FC<ModelTariffTableProps> = ({
       <TableRow key={tariff._tempId}>
         <TableCell>
           {tariff.api_key_purpose
-            ? tariff.api_key_purpose === "batch" && tariff.completion_window
-              ? `Batch - ${tariff.completion_window}`
-              : API_KEY_PURPOSE_LABELS[tariff.api_key_purpose]
+            ? getTariffDisplayName(tariff.api_key_purpose, tariff.completion_window)
             : API_KEY_PURPOSE_LABELS.none}
         </TableCell>
         <TableCell>{tariff.name}</TableCell>

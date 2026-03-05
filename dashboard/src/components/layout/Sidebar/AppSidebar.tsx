@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { NavLink, Link, useNavigate } from "react-router-dom";
+import { NavLink, Link, useNavigate, useLocation } from "react-router-dom";
 import {
   Settings,
   Box,
@@ -12,6 +12,7 @@ import {
   ExternalLink,
   LogOut,
   ChevronUp,
+  ChevronRight,
   DollarSign,
   BarChart3,
   LifeBuoy,
@@ -40,12 +41,21 @@ import {
   SidebarGroupContent,
   SidebarHeader,
   SidebarMenu,
+  SidebarMenuAction,
   SidebarMenuButton,
   SidebarMenuItem,
+  SidebarMenuSub,
+  SidebarMenuSubButton,
+  SidebarMenuSubItem,
   SidebarProvider,
   SidebarInset,
   SidebarTrigger,
 } from "@/components/ui/sidebar";
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from "@/components/ui/collapsible";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
@@ -68,14 +78,17 @@ interface NavItem {
 
 export function AppSidebar() {
   const navigate = useNavigate();
+  const location = useLocation();
   const { data: currentUser, isLoading: loading } = useUser("current", { include: "organizations" });
-  const { canAccessRoute } = useAuthorization();
+  const { canAccessRoute, hasPermission } = useAuthorization();
   const { logout } = useAuth();
   const { isFeatureEnabled } = useSettings();
   const { activeOrganizationId, isOrgContext, setActiveOrganization } =
     useOrganizationContext();
   const { data: config } = useConfig();
   const [isSupportModalOpen, setIsSupportModalOpen] = useState(false);
+
+  const canManageModels = hasPermission("manage-models");
 
   const allNavItems: NavItem[] = [
     {
@@ -86,7 +99,13 @@ export function AppSidebar() {
       hidden: config !== undefined && !config.batches?.enabled,
     },
     { path: "/models", icon: Layers, label: "Models" },
-    { path: "/endpoints", icon: Server, label: "Endpoints" },
+    {
+      path: "/endpoints",
+      icon: Server,
+      label: "Endpoints",
+      // For platform managers, endpoints is nested under Models
+      hidden: canManageModels,
+    },
     { path: "/playground", icon: Play, label: "Playground" },
     { path: "/analytics", icon: BarChart3, label: "Analytics" },
     { path: "/users-groups", icon: Users, label: "User Access" },
@@ -131,25 +150,99 @@ export function AppSidebar() {
         <SidebarGroup>
           <SidebarGroupContent>
             <SidebarMenu>
-              {navItems.map((item) => (
-                <SidebarMenuItem key={item.path}>
-                  <NavLink to={item.path}>
-                    {({ isActive }) => (
-                      <SidebarMenuButton
-                        isActive={isActive}
-                        className={
-                          isActive
-                            ? "bg-sidebar-accent! text-sidebar-accent-foreground! hover:bg-sidebar-accent!"
-                            : "hover:bg-sidebar-border/50"
-                        }
-                      >
-                        <item.icon className="h-4 w-4" />
-                        <span>{item.label}</span>
-                      </SidebarMenuButton>
-                    )}
-                  </NavLink>
-                </SidebarMenuItem>
-              ))}
+              {navItems.map((item) => {
+                // Platform managers get collapsible Models section with sub-items
+                if (item.path === "/models" && canManageModels) {
+                  const isManageModelsActive =
+                    location.pathname === "/models/manage";
+                  const isEndpointsActive =
+                    location.pathname === "/endpoints";
+                  return (
+                    <Collapsible
+                      key="models"
+                      defaultOpen
+                      className="group/collapsible"
+                    >
+                      <SidebarMenuItem>
+                        <NavLink to="/models" end>
+                          {({ isActive }) => (
+                            <SidebarMenuButton
+                              isActive={isActive}
+                              className={
+                                isActive
+                                  ? "bg-sidebar-accent! text-sidebar-accent-foreground! hover:bg-sidebar-accent!"
+                                  : "hover:bg-sidebar-border/50"
+                              }
+                            >
+                              <Layers className="h-4 w-4" />
+                              <span>Models</span>
+                            </SidebarMenuButton>
+                          )}
+                        </NavLink>
+                        <CollapsibleTrigger asChild>
+                          <SidebarMenuAction className="data-[state=open]:rotate-90 transition-transform">
+                            <ChevronRight />
+                          </SidebarMenuAction>
+                        </CollapsibleTrigger>
+                        <CollapsibleContent>
+                          <SidebarMenuSub>
+                            <SidebarMenuSubItem>
+                              <SidebarMenuSubButton
+                                asChild
+                                isActive={isManageModelsActive}
+                                className={
+                                  isManageModelsActive
+                                    ? "bg-sidebar-accent! text-sidebar-accent-foreground!"
+                                    : "hover:bg-sidebar-border/50 hover:text-sidebar-foreground"
+                                }
+                              >
+                                <NavLink to="/models/manage">
+                                  Manage Models
+                                </NavLink>
+                              </SidebarMenuSubButton>
+                            </SidebarMenuSubItem>
+                            <SidebarMenuSubItem>
+                              <SidebarMenuSubButton
+                                asChild
+                                isActive={isEndpointsActive}
+                                className={
+                                  isEndpointsActive
+                                    ? "bg-sidebar-accent! text-sidebar-accent-foreground!"
+                                    : "hover:bg-sidebar-border/50 hover:text-sidebar-foreground"
+                                }
+                              >
+                                <NavLink to="/endpoints">
+                                  Manage Endpoints
+                                </NavLink>
+                              </SidebarMenuSubButton>
+                            </SidebarMenuSubItem>
+                          </SidebarMenuSub>
+                        </CollapsibleContent>
+                      </SidebarMenuItem>
+                    </Collapsible>
+                  );
+                }
+
+                return (
+                  <SidebarMenuItem key={item.path}>
+                    <NavLink to={item.path}>
+                      {({ isActive }) => (
+                        <SidebarMenuButton
+                          isActive={isActive}
+                          className={
+                            isActive
+                              ? "bg-sidebar-accent! text-sidebar-accent-foreground! hover:bg-sidebar-accent!"
+                              : "hover:bg-sidebar-border/50"
+                          }
+                        >
+                          <item.icon className="h-4 w-4" />
+                          <span>{item.label}</span>
+                        </SidebarMenuButton>
+                      )}
+                    </NavLink>
+                  </SidebarMenuItem>
+                );
+              })}
             </SidebarMenu>
           </SidebarGroupContent>
         </SidebarGroup>

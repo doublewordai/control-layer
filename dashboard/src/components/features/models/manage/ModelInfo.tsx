@@ -25,6 +25,7 @@ import {
 } from "../../../../api/control-layer";
 import type {
   ApiKeyPurpose,
+  ModelMetadata,
   TrafficRoutingRule,
 } from "../../../../api/control-layer";
 import { useAuthorization, isPlaygroundDenied } from "../../../../utils";
@@ -123,7 +124,7 @@ const ModelInfo: React.FC = () => {
     setActiveTab(value);
     const newParams = new URLSearchParams(searchParams);
     newParams.set("tab", value);
-    navigate(`/models/${modelId}?${newParams.toString()}`, { replace: true });
+    navigate(`/models/manage/${modelId}?${newParams.toString()}`, { replace: true });
   };
 
   // Settings form state
@@ -142,6 +143,7 @@ const ModelInfo: React.FC = () => {
     throughput: null as number | null,
     allowed_batch_completion_windows: null as string[] | null,
     traffic_routing_rules: [] as TrafficRoutingRule[],
+    metadata: null as ModelMetadata | null,
   });
   const [settingsError, setSettingsError] = useState<string | null>(null);
   const [showApiExamples, setShowApiExamples] = useState(false);
@@ -245,6 +247,7 @@ const ModelInfo: React.FC = () => {
         allowed_batch_completion_windows:
           model.allowed_batch_completion_windows ?? null,
         traffic_routing_rules: model.traffic_routing_rules || [],
+        metadata: model.metadata ?? null,
       });
       aliasForm.reset({
         alias: model.alias,
@@ -307,6 +310,7 @@ const ModelInfo: React.FC = () => {
           allowed_batch_completion_windows:
             updateData.allowed_batch_completion_windows,
           traffic_routing_rules: normalizedTrafficRules,
+          metadata: updateData.metadata,
         },
       });
       setIsEditingModelDetails(false);
@@ -339,6 +343,7 @@ const ModelInfo: React.FC = () => {
         allowed_batch_completion_windows:
           model.allowed_batch_completion_windows ?? null,
         traffic_routing_rules: model.traffic_routing_rules || [],
+        metadata: model.metadata ?? null,
       });
     }
     setIsEditingModelDetails(false);
@@ -397,7 +402,7 @@ const ModelInfo: React.FC = () => {
           <p className="text-red-600 font-semibold">Error: {error}</p>
           <Button
             variant="outline"
-            onClick={() => navigate(fromUrl || "/models")}
+            onClick={() => navigate(fromUrl || "/models/manage")}
             className="mt-4"
           >
             <ArrowLeft className="mr-2 h-4 w-4" />
@@ -415,7 +420,7 @@ const ModelInfo: React.FC = () => {
           <p className="text-gray-600 font-semibold">Model not found</p>
           <Button
             variant="outline"
-            onClick={() => navigate(fromUrl || "/models")}
+            onClick={() => navigate(fromUrl || "/models/manage")}
             className="mt-4"
           >
             <ArrowLeft className="mr-2 h-4 w-4" />
@@ -437,7 +442,7 @@ const ModelInfo: React.FC = () => {
         <div className="mb-6">
           <div className="flex items-center gap-4 mb-4">
             <button
-              onClick={() => navigate(fromUrl || "/models")}
+              onClick={() => navigate(fromUrl || "/models/manage")}
               className="p-2 text-gray-500 hover:bg-gray-100 rounded-lg transition-colors"
               aria-label={fromUrl ? "Go back" : "Back to Models"}
               title={fromUrl ? "Go back" : "Back to Models"}
@@ -751,45 +756,223 @@ const ModelInfo: React.FC = () => {
                             </label>
                           </div>
                           <div className="space-y-2">
-                            <div className="flex items-center space-x-2">
-                              <input
-                                type="checkbox"
-                                id="vision-capability"
-                                checked={
-                                  updateData.capabilities?.includes("vision") ??
-                                  false
-                                }
-                                onChange={(e) => {
-                                  const newCapabilities = e.target.checked
-                                    ? [
-                                        ...(updateData.capabilities || []),
-                                        "vision",
-                                      ]
-                                    : (updateData.capabilities || []).filter(
-                                        (c) => c !== "vision",
-                                      );
-                                  setUpdateData((prev) => ({
-                                    ...prev,
-                                    capabilities: newCapabilities,
-                                  }));
-                                }}
-                                className="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
-                              />
-                              <label
-                                htmlFor="vision-capability"
-                                className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70 flex items-center gap-1"
-                              >
-                                Vision
-                                <InfoTip>
-                                  <p className="text-sm text-muted-foreground">
-                                    Enables image upload in the playground.
-                                  </p>
-                                </InfoTip>
-                              </label>
-                            </div>
+                            {[
+                              { id: "vision", label: "Vision", tip: "Enables image upload in the playground." },
+                              { id: "reasoning", label: "Reasoning", tip: "Model supports extended reasoning / chain-of-thought." },
+                            ].map((cap) => (
+                              <div key={cap.id} className="flex items-center space-x-2">
+                                <input
+                                  type="checkbox"
+                                  id={`${cap.id}-capability`}
+                                  checked={
+                                    updateData.capabilities?.includes(cap.id) ??
+                                    false
+                                  }
+                                  onChange={(e) => {
+                                    const newCapabilities = e.target.checked
+                                      ? [
+                                          ...(updateData.capabilities || []),
+                                          cap.id,
+                                        ]
+                                      : (updateData.capabilities || []).filter(
+                                          (c) => c !== cap.id,
+                                        );
+                                    setUpdateData((prev) => ({
+                                      ...prev,
+                                      capabilities: newCapabilities,
+                                    }));
+                                  }}
+                                  className="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                                />
+                                <label
+                                  htmlFor={`${cap.id}-capability`}
+                                  className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70 flex items-center gap-1"
+                                >
+                                  {cap.label}
+                                  <InfoTip>
+                                    <p className="text-sm text-muted-foreground">
+                                      {cap.tip}
+                                    </p>
+                                  </InfoTip>
+                                </label>
+                              </div>
+                            ))}
                           </div>
                         </div>
                       )}
+
+                      {/* Catalog Metadata Section */}
+                      <div className="border-t pt-4">
+                        <div className="flex items-center gap-1 mb-3">
+                          <label className="text-sm text-gray-600 font-medium">
+                            Catalog Metadata
+                          </label>
+                          <InfoTip>
+                            <p className="text-sm text-muted-foreground">
+                              Display metadata shown in the model catalog.
+                              These fields are informational and do not affect
+                              model behavior.
+                            </p>
+                          </InfoTip>
+                        </div>
+                        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                          <div>
+                            <label className="text-sm text-gray-600 mb-2 block">
+                              Provider
+                            </label>
+                            <Input
+                              value={updateData.metadata?.provider ?? ""}
+                              onChange={(e) =>
+                                setUpdateData((prev) => ({
+                                  ...prev,
+                                  metadata: {
+                                    ...prev.metadata,
+                                    provider: e.target.value || undefined,
+                                  },
+                                }))
+                              }
+                              placeholder="e.g. OpenAI, Alibaba"
+                            />
+                          </div>
+                          <div>
+                            <label className="text-sm text-gray-600 mb-2 block">
+                              Context Window
+                            </label>
+                            <Input
+                              type="number"
+                              min="1"
+                              value={updateData.metadata?.context_window ?? ""}
+                              onChange={(e) =>
+                                setUpdateData((prev) => ({
+                                  ...prev,
+                                  metadata: {
+                                    ...prev.metadata,
+                                    context_window: e.target.value
+                                      ? parseInt(e.target.value)
+                                      : undefined,
+                                  },
+                                }))
+                              }
+                              placeholder="e.g. 131072"
+                            />
+                            <p className="text-xs text-gray-400 mt-1">
+                              Max tokens
+                            </p>
+                          </div>
+                          <div>
+                            <label className="text-sm text-gray-600 mb-2 block">
+                              Released
+                            </label>
+                            <Input
+                              type="date"
+                              value={updateData.metadata?.released_at ?? ""}
+                              onChange={(e) =>
+                                setUpdateData((prev) => ({
+                                  ...prev,
+                                  metadata: {
+                                    ...prev.metadata,
+                                    released_at: e.target.value || undefined,
+                                  },
+                                }))
+                              }
+                            />
+                          </div>
+                        </div>
+                        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mt-4">
+                          <div>
+                            <label className="text-sm text-gray-600 mb-2 block">
+                              Intelligence Index
+                            </label>
+                            <Input
+                              type="number"
+                              min="0"
+                              step="0.1"
+                              value={updateData.metadata?.intelligence_index ?? ""}
+                              onChange={(e) =>
+                                setUpdateData((prev) => ({
+                                  ...prev,
+                                  metadata: {
+                                    ...prev.metadata,
+                                    intelligence_index: e.target.value
+                                      ? parseFloat(e.target.value)
+                                      : undefined,
+                                  },
+                                }))
+                              }
+                              placeholder="e.g. 45.0"
+                            />
+                          </div>
+                          <div>
+                            <label className="text-sm text-gray-600 mb-2 block">
+                              Attribution
+                            </label>
+                            <Input
+                              value={updateData.metadata?.attribution ?? ""}
+                              onChange={(e) =>
+                                setUpdateData((prev) => ({
+                                  ...prev,
+                                  metadata: {
+                                    ...prev.metadata,
+                                    attribution: e.target.value || undefined,
+                                  },
+                                }))
+                              }
+                              placeholder="e.g. artificial_analysis"
+                            />
+                          </div>
+                        </div>
+                        <div className="mt-4">
+                          <label className="text-sm text-gray-600 mb-2 block">
+                            Summary
+                          </label>
+                          <Input
+                            value={
+                              (updateData.metadata?.extra as Record<string, unknown>)?.summary as string ?? ""
+                            }
+                            onChange={(e) =>
+                              setUpdateData((prev) => ({
+                                ...prev,
+                                metadata: {
+                                  ...prev.metadata,
+                                  extra: {
+                                    ...(prev.metadata?.extra ?? {}),
+                                    summary: e.target.value || undefined,
+                                  },
+                                },
+                              }))
+                            }
+                            placeholder="Short one-line description for the catalog"
+                          />
+                        </div>
+                        <div className="mt-4">
+                          <label className="text-sm text-gray-600 mb-2 block">
+                            Use Cases
+                          </label>
+                          <Input
+                            value={
+                              ((updateData.metadata?.extra as Record<string, unknown>)?.use_cases as string[] ?? []).join(", ")
+                            }
+                            onChange={(e) =>
+                              setUpdateData((prev) => ({
+                                ...prev,
+                                metadata: {
+                                  ...prev.metadata,
+                                  extra: {
+                                    ...(prev.metadata?.extra ?? {}),
+                                    use_cases: e.target.value
+                                      ? e.target.value.split(",").map((s) => s.trim()).filter(Boolean)
+                                      : undefined,
+                                  },
+                                },
+                              }))
+                            }
+                            placeholder="Comma-separated, e.g. Research, Coding, Analysis"
+                          />
+                          <p className="text-xs text-gray-400 mt-1">
+                            Comma-separated list
+                          </p>
+                        </div>
+                      </div>
 
                       {/* Response Configuration Section */}
                       <div className="border-t pt-4">
@@ -1564,59 +1747,134 @@ const ModelInfo: React.FC = () => {
                               </p>
                             </div>
                             <div className="space-y-3">
-                              <div className="flex items-center justify-between">
-                                <div className="flex items-center space-x-2">
-                                  <input
-                                    type="checkbox"
-                                    id="vision-capability-readonly"
-                                    checked={
-                                      model.capabilities?.includes("vision") ??
-                                      false
-                                    }
-                                    onChange={async (e) => {
-                                      const newCapabilities = e.target.checked
-                                        ? [
-                                            ...(model.capabilities || []),
-                                            "vision",
-                                          ]
-                                        : (model.capabilities || []).filter(
-                                            (c) => c !== "vision",
-                                          );
-
-                                      try {
-                                        await updateModelMutation.mutateAsync({
-                                          id: model.id,
-                                          data: {
-                                            capabilities: newCapabilities,
-                                          },
-                                        });
-                                      } catch (error) {
-                                        console.error(
-                                          "Failed to update capabilities:",
-                                          error,
-                                        );
+                              {[
+                                { id: "vision", label: "Vision", tip: "Enables image upload in the playground." },
+                                { id: "reasoning", label: "Reasoning", tip: "Model supports extended reasoning / chain-of-thought." },
+                              ].map((cap) => (
+                                <div key={cap.id} className="flex items-center justify-between">
+                                  <div className="flex items-center space-x-2">
+                                    <input
+                                      type="checkbox"
+                                      id={`${cap.id}-capability-readonly`}
+                                      checked={
+                                        model.capabilities?.includes(cap.id) ??
+                                        false
                                       }
-                                    }}
-                                    disabled={updateModelMutation.isPending}
-                                    className="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500 disabled:opacity-50"
-                                  />
-                                  <label
-                                    htmlFor="vision-capability-readonly"
-                                    className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70 flex items-center gap-1"
-                                  >
-                                    Vision
-                                    <InfoTip>
-                                      <p className="text-sm text-muted-foreground">
-                                        Enables image upload in the
-                                        playground.
-                                      </p>
-                                    </InfoTip>
-                                  </label>
+                                      onChange={async (e) => {
+                                        const newCapabilities = e.target.checked
+                                          ? [
+                                              ...(model.capabilities || []),
+                                              cap.id,
+                                            ]
+                                          : (model.capabilities || []).filter(
+                                              (c) => c !== cap.id,
+                                            );
+
+                                        try {
+                                          await updateModelMutation.mutateAsync({
+                                            id: model.id,
+                                            data: {
+                                              capabilities: newCapabilities,
+                                            },
+                                          });
+                                        } catch (error) {
+                                          console.error(
+                                            "Failed to update capabilities:",
+                                            error,
+                                          );
+                                        }
+                                      }}
+                                      disabled={updateModelMutation.isPending}
+                                      className="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500 disabled:opacity-50"
+                                    />
+                                    <label
+                                      htmlFor={`${cap.id}-capability-readonly`}
+                                      className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70 flex items-center gap-1"
+                                    >
+                                      {cap.label}
+                                      <InfoTip>
+                                        <p className="text-sm text-muted-foreground">
+                                          {cap.tip}
+                                        </p>
+                                      </InfoTip>
+                                    </label>
+                                  </div>
                                 </div>
-                              </div>
+                              ))}
                             </div>
                           </div>
                         )}
+
+                      {/* Catalog Metadata Display */}
+                      {model.metadata && (
+                        <div className="border-t pt-6">
+                          <div className="flex items-center gap-1 mb-3">
+                            <p className="text-sm text-gray-600 font-medium">
+                              Catalog Metadata
+                            </p>
+                          </div>
+                          <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                            {model.metadata.provider && (
+                              <div>
+                                <p className="text-xs text-gray-400 mb-1">Provider</p>
+                                <p className="text-sm font-medium">{model.metadata.provider}</p>
+                              </div>
+                            )}
+                            {model.metadata.context_window != null && (
+                              <div>
+                                <p className="text-xs text-gray-400 mb-1">Context Window</p>
+                                <p className="text-sm font-medium tabular-nums">
+                                  {model.metadata.context_window >= 1024
+                                    ? `${Math.round(model.metadata.context_window / 1024)}k tokens`
+                                    : `${model.metadata.context_window} tokens`}
+                                </p>
+                              </div>
+                            )}
+                            {model.metadata.intelligence_index != null && (
+                              <div>
+                                <p className="text-xs text-gray-400 mb-1">Intelligence Index</p>
+                                <p className="text-sm font-medium tabular-nums">{model.metadata.intelligence_index}</p>
+                              </div>
+                            )}
+                            {model.metadata.released_at && (
+                              <div>
+                                <p className="text-xs text-gray-400 mb-1">Released</p>
+                                <p className="text-sm font-medium">
+                                  {new Date(model.metadata.released_at + "T00:00:00").toLocaleDateString("en-US", {
+                                    month: "short",
+                                    day: "numeric",
+                                    year: "numeric",
+                                  })}
+                                </p>
+                              </div>
+                            )}
+                            {model.metadata.attribution && (
+                              <div>
+                                <p className="text-xs text-gray-400 mb-1">Attribution</p>
+                                <p className="text-sm font-medium">{model.metadata.attribution}</p>
+                              </div>
+                            )}
+                          </div>
+                          {model.metadata.extra?.summary && (
+                            <div className="mt-3">
+                              <p className="text-xs text-gray-400 mb-1">Summary</p>
+                              <p className="text-sm text-gray-700">{model.metadata.extra.summary}</p>
+                            </div>
+                          )}
+                          {model.metadata.extra?.use_cases && model.metadata.extra.use_cases.length > 0 && (
+                            <div className="mt-3">
+                              <p className="text-xs text-gray-400 mb-1">Use Cases</p>
+                              <div className="flex flex-wrap gap-1.5">
+                                {model.metadata.extra.use_cases.map((uc) => (
+                                  <Badge key={uc} variant="secondary" className="text-xs font-normal">
+                                    {uc}
+                                  </Badge>
+                                ))}
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      )}
 
                       {/* Batch Configuration Display */}
                       {canManageGroups && (

@@ -9,7 +9,7 @@ import {
   DialogFooter,
   DialogDescription,
 } from "../../ui/dialog";
-import { ModelTariffTable } from "../../features/models/ModelTariffTable";
+import { ModelTariffTable } from "../../features/models/manage/ModelTariffTable";
 import {
   useModel,
   useUpdateModel,
