@@ -32,6 +32,8 @@ pub enum ModelSortField {
     ContextWindow,
     /// Sort alphabetically by provider name (from metadata)
     Provider,
+    /// Sort by cheapest active tariff price (min input+output per token)
+    PriceFrom,
 }
 
 /// Sort direction
