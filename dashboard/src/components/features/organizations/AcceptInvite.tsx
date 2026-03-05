@@ -1,4 +1,4 @@
-import { useSearchParams, useNavigate, Link } from "react-router-dom";
+import { useSearchParams, useNavigate, Navigate, Link } from "react-router-dom";
 import { useAuth } from "@/contexts/auth";
 import {
   useInviteDetails,
@@ -19,7 +19,7 @@ export function AcceptInvite() {
     data: invite,
     isLoading: inviteLoading,
     error: inviteError,
-  } = useInviteDetails(token);
+  } = useInviteDetails(token, { enabled: isAuthenticated });
   const acceptInvite = useAcceptInvite();
   const declineInvite = useDeclineInvite();
 
@@ -32,29 +32,13 @@ export function AcceptInvite() {
     );
   }
 
-  // Not authenticated -- prompt to log in or register
+  // Not authenticated -- redirect to login with return path
   if (!isAuthenticated) {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-doubleword-background-secondary p-4">
-        <div className="w-full max-w-md border rounded-lg bg-white dark:bg-doubleword-background-dark p-6 shadow-sm space-y-4 text-center">
-          <div className="mx-auto h-12 w-12 rounded-full bg-muted flex items-center justify-center">
-            <Building className="h-6 w-6 text-muted-foreground" />
-          </div>
-          <h1 className="text-xl font-semibold">Organization Invite</h1>
-          <p className="text-sm text-muted-foreground">
-            You've been invited to join an organization. Please log in or create
-            an account to accept.
-          </p>
-          <div className="flex flex-col gap-2 pt-2">
-            <Button asChild>
-              <Link to={`/login?redirect=${encodeURIComponent(`/org-invite?token=${token}`)}`}>Log In</Link>
-            </Button>
-            <Button variant="outline" asChild>
-              <Link to={`/register?redirect=${encodeURIComponent(`/org-invite?token=${token}`)}`}>Create Account</Link>
-            </Button>
-          </div>
-        </div>
-      </div>
+      <Navigate
+        to={`/login?redirect=${encodeURIComponent(`/org-invite?token=${token}`)}`}
+        replace
+      />
     );
   }
 

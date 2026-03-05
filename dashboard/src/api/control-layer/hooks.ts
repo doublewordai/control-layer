@@ -1513,11 +1513,12 @@ export function useCancelInvite() {
   });
 }
 
-export function useInviteDetails(token: string) {
+export function useInviteDetails(token: string, options?: { enabled?: boolean }) {
+  const { enabled = true } = options || {};
   return useQuery({
     queryKey: ["organizations", "invite", token],
     queryFn: () => dwctlApi.organizations.getInviteDetails(token),
-    enabled: !!token,
+    enabled: !!token && enabled,
   });
 }
 
