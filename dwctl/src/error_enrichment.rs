@@ -103,7 +103,7 @@ pub async fn error_enrichment_middleware(State(pool): State<PgPool>, request: Re
 
         // If access is OK but we have a 403, check balance - if negative, it's a credits issue
         if let Ok(balance) = get_balance_of_api_key(pool.clone(), &key).await
-            && balance <= Decimal::ZERO
+            && balance < Decimal::ZERO
         {
             return Error::InsufficientCredits {
                 current_balance: balance,
