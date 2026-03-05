@@ -81,7 +81,7 @@ export function AppSidebar() {
     { path: "/endpoints", icon: Server, label: "Endpoints" },
     { path: "/playground", icon: Play, label: "Playground" },
     { path: "/analytics", icon: BarChart3, label: "Analytics" },
-    { path: "/users-groups", icon: Users, label: "Users, Orgs & Groups" },
+    { path: "/users-groups", icon: Users, label: "User Access" },
     ...(isOrgContext
       ? [{ path: "/organization", icon: Building, label: "Organization" }]
       : []),

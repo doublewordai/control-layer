@@ -44,25 +44,6 @@ import { TablePagination } from "@/components/ui/table-pagination";
 import { useServerPagination } from "@/hooks/useServerPagination";
 import { useAuthorization } from "../../../../utils";
 
-// Predefined color classes that Tailwind will include
-const GROUP_COLOR_CLASSES = [
-  "bg-blue-500",
-  "bg-purple-500",
-  "bg-green-500",
-  "bg-yellow-500",
-  "bg-red-500",
-  "bg-indigo-500",
-  "bg-teal-500",
-  "bg-orange-500",
-  "bg-pink-500",
-  "bg-cyan-500",
-];
-
-// Function to get a consistent color for a group
-const getGroupColor = (_groupId: string, index: number): string => {
-  // Use index to assign colors consistently
-  return GROUP_COLOR_CLASSES[index % GROUP_COLOR_CLASSES.length];
-};
 
 const UsersGroups: React.FC = () => {
   const [searchParams] = useSearchParams();
@@ -353,10 +334,10 @@ const UsersGroups: React.FC = () => {
       {/* Header */}
       <div className="mb-8">
         <h1 className="text-3xl font-bold text-doubleword-neutral-900">
-          Users, Orgs & Groups
+          User Access
         </h1>
         <p className="text-doubleword-neutral-600 mt-2">
-          Manage users, organizations, and group permissions
+          Manage users, organizations, and access groups
         </p>
       </div>
 
@@ -458,9 +439,9 @@ const UsersGroups: React.FC = () => {
 
       {/* Bulk action bar for groups */}
       {activeTab === "groups" && selectedGroups.size > 0 && (
-        <div className="bg-blue-50 border border-blue-200 rounded-lg p-3 mb-4 flex items-center justify-between">
+        <div className="bg-muted border rounded-lg p-3 mb-4 flex items-center justify-between">
           <div className="flex items-center gap-2">
-            <span className="text-sm font-medium text-blue-900">
+            <span className="text-sm font-medium text-foreground">
               {selectedGroups.size} group{selectedGroups.size !== 1 ? "s" : ""}{" "}
               selected
             </span>
@@ -515,9 +496,9 @@ const UsersGroups: React.FC = () => {
               </div>
             }
             actionBar={
-              <div className="bg-blue-50 border border-blue-200 rounded-lg p-3 mb-4 flex items-center justify-between">
+              <div className="bg-muted border rounded-lg p-3 mb-4 flex items-center justify-between">
                 <div className="flex items-center gap-2">
-                  <span className="text-sm font-medium text-blue-900">
+                  <span className="text-sm font-medium text-foreground">
                     {selectedUsers.length} user
                     {selectedUsers.length !== 1 ? "s" : ""} selected
                   </span>
@@ -581,16 +562,15 @@ const UsersGroups: React.FC = () => {
         {activeTab === "groups" && (
           /* Groups Grid */
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-            {groups.map((group, index) => {
-              const colorClass = getGroupColor(group.id, index);
+            {groups.map((group) => {
               const isSelected = selectedGroups.has(group.id);
               return (
                 <div
                   key={group.id}
-                  className={`bg-white rounded-xl shadow-sm border-2 p-6 hover:shadow-md transition-all cursor-pointer ${
+                  className={`bg-white dark:bg-doubleword-background-dark rounded-lg border p-6 transition-colors cursor-pointer ${
                     isSelected
-                      ? "border-blue-500 bg-blue-50 shadow-md"
-                      : "border-transparent hover:border-gray-200"
+                      ? "border-doubleword-primary bg-doubleword-primary/5"
+                      : "border-doubleword-neutral-200 dark:border-doubleword-neutral-700 hover:border-doubleword-neutral-300 dark:hover:border-doubleword-neutral-600"
                   }`}
                   onClick={(e) => {
                     // Only select if not clicking on the dropdown or its children
@@ -602,9 +582,9 @@ const UsersGroups: React.FC = () => {
                   <div className="flex items-start justify-between mb-4">
                     <div className="flex items-center gap-3">
                       <div
-                        className={`w-10 h-10 ${colorClass} rounded-lg flex items-center justify-center`}
+                        className="w-10 h-10 bg-doubleword-neutral-100 dark:bg-doubleword-neutral-800 rounded-lg flex items-center justify-center"
                       >
-                        <Users className="w-5 h-5 text-white" />
+                        <Users className="w-5 h-5 text-doubleword-neutral-500" />
                       </div>
                       <div className="min-w-0 flex-1">
                         <h3 className="font-semibold text-doubleword-neutral-900 truncate break-all">

@@ -35,37 +35,25 @@ export function MyOrganization() {
   return (
     <div className="p-6 space-y-6">
       <div>
-        <h1 className="text-3xl font-bold text-doubleword-neutral-900">
+        <h1 className="text-2xl font-bold tracking-tight">
           {org?.display_name || org?.username || activeOrganization.name}
         </h1>
-        {org?.email && (
-          <p className="text-doubleword-neutral-600 mt-1">{org.email}</p>
-        )}
-        {org?.display_name && org?.username && (
-          <p className="text-sm text-muted-foreground">
-            Slug: {org.username}
-          </p>
-        )}
-      </div>
-
-      <div className="grid grid-cols-3 gap-4">
-        <div className="border rounded-lg p-4">
-          <p className="text-sm text-muted-foreground">Members</p>
-          <p className="text-2xl font-bold">{org?.member_count ?? "—"}</p>
-        </div>
-        <div className="border rounded-lg p-4">
-          <p className="text-sm text-muted-foreground">Balance</p>
-          <p className="text-2xl font-bold">
-            {org?.credit_balance !== undefined
-              ? `$${org.credit_balance.toFixed(2)}`
-              : "—"}
-          </p>
-        </div>
-        <div className="border rounded-lg p-4">
-          <p className="text-sm text-muted-foreground">Created</p>
-          <p className="text-2xl font-bold">
-            {org ? new Date(org.created_at).toLocaleDateString() : "—"}
-          </p>
+        <div className="flex items-center gap-3 mt-1 text-sm text-muted-foreground flex-wrap">
+          {org?.email && <span>{org.email}</span>}
+          {org?.email && <span>·</span>}
+          <span>{org?.member_count ?? 0} members</span>
+          {org?.credit_balance !== undefined && (
+            <>
+              <span>·</span>
+              <span className="font-mono tabular-nums">${org.credit_balance.toFixed(2)}</span>
+            </>
+          )}
+          {org && (
+            <>
+              <span>·</span>
+              <span>Created {new Date(org.created_at).toLocaleDateString()}</span>
+            </>
+          )}
         </div>
       </div>
 

@@ -43,40 +43,26 @@ export function OrganizationDetail() {
 
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-2xl font-bold">
+          <h1 className="text-2xl font-bold tracking-tight">
             {org.display_name || org.username}
           </h1>
-          <p className="text-muted-foreground">{org.email}</p>
-          {org.display_name && (
-            <p className="text-sm text-muted-foreground">
-              Slug: {org.username}
-            </p>
-          )}
+          <div className="flex items-center gap-3 mt-1 text-sm text-muted-foreground flex-wrap">
+            <span>{org.email}</span>
+            <span>·</span>
+            <span>{org.member_count ?? 0} members</span>
+            {org.credit_balance !== undefined && (
+              <>
+                <span>·</span>
+                <span className="font-mono tabular-nums">${org.credit_balance.toFixed(2)}</span>
+              </>
+            )}
+            <span>·</span>
+            <span>Created {new Date(org.created_at).toLocaleDateString()}</span>
+          </div>
         </div>
         <Button variant="outline" onClick={() => setShowEditModal(true)}>
           Edit
         </Button>
-      </div>
-
-      <div className="grid grid-cols-3 gap-4">
-        <div className="border rounded-lg p-4">
-          <p className="text-sm text-muted-foreground">Members</p>
-          <p className="text-2xl font-bold">{org.member_count ?? "—"}</p>
-        </div>
-        <div className="border rounded-lg p-4">
-          <p className="text-sm text-muted-foreground">Balance</p>
-          <p className="text-2xl font-bold">
-            {org.credit_balance !== undefined
-              ? `$${org.credit_balance.toFixed(2)}`
-              : "—"}
-          </p>
-        </div>
-        <div className="border rounded-lg p-4">
-          <p className="text-sm text-muted-foreground">Created</p>
-          <p className="text-2xl font-bold">
-            {new Date(org.created_at).toLocaleDateString()}
-          </p>
-        </div>
       </div>
 
       <MemberManagement organizationId={organizationId!} />
