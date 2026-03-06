@@ -521,20 +521,21 @@ pub async fn process_auto_topup<P: PoolProvider>(
 
     // Verify session ownership: the session must belong to the authenticated user
     if let Some(ref session_user_id) = setup_result.user_id
-        && session_user_id != &user.id.to_string() {
-            tracing::warn!(
-                authenticated_user = %user.id,
-                session_user = %session_user_id,
-                "Auto top-up session ownership mismatch"
-            );
-            return Ok((
-                StatusCode::FORBIDDEN,
-                Json(json!({
-                    "message": "This session does not belong to your account."
-                })),
-            )
-                .into_response());
-        }
+        && session_user_id != &user.id.to_string()
+    {
+        tracing::warn!(
+            authenticated_user = %user.id,
+            session_user = %session_user_id,
+            "Auto top-up session ownership mismatch"
+        );
+        return Ok((
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "message": "This session does not belong to your account."
+            })),
+        )
+            .into_response());
+    }
 
     // Session validated - enable auto top-up
     let update = UserUpdateDBRequest {
