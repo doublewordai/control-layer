@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.15.0](https://github.com/doublewordai/control-layer/compare/v8.14.0...v8.15.0) (2026-03-06)
+
+
+### Features
+
+* auto top-up for credit balances ([#805](https://github.com/doublewordai/control-layer/issues/805)) ([957a1d5](https://github.com/doublewordai/control-layer/commit/957a1d53e6d3d53873e4e8db8270833846534bbd))
+
 ## [8.14.0](https://github.com/doublewordai/control-layer/compare/v8.13.0...v8.14.0) (2026-03-06)
 
 

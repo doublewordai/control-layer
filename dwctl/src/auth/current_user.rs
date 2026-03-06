@@ -1191,6 +1191,8 @@ mod tests {
             password_hash: None,
             batch_notifications_enabled: None,
             low_balance_threshold: None,
+            auto_topup_amount: None,
+            auto_topup_threshold: None,
         };
         users_repo.update(user.id, &update).await.unwrap();
 

@@ -1292,6 +1292,20 @@ export function useCreateBillingPortalSession() {
   });
 }
 
+export function useEnableAutoTopup() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationKey: ["payments", "auto-topup-enable"],
+    mutationFn: ({ threshold, amount }: { threshold: number; amount: number }) =>
+      dwctlApi.payments.enableAutoTopup(threshold, amount),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.users.all });
+    },
+  });
+}
+
+
 // ===== DAEMONS HOOKS =====
 
 export function useDaemons(

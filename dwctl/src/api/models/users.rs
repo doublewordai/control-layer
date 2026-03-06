@@ -66,6 +66,14 @@ pub struct UserUpdate {
     /// Omit entirely to leave unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
     pub low_balance_threshold: Option<Option<f32>>,
+    /// Auto top-up amount in dollars. Set to a number to enable automatic credit
+    /// replenishment, set to null to disable. Omit entirely to leave unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
+    pub auto_topup_amount: Option<Option<f32>>,
+    /// Auto top-up threshold in dollars. When balance drops below this amount,
+    /// auto top-up is triggered. Set to null to disable. Omit entirely to leave unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
+    pub auto_topup_threshold: Option<Option<f32>>,
 }
 
 /// Full user details returned by the API.
@@ -116,6 +124,12 @@ pub struct UserResponse {
     pub batch_notifications_enabled: bool,
     /// Low balance notification threshold in dollars. Null means notifications are disabled.
     pub low_balance_threshold: Option<f32>,
+    /// Auto top-up amount in dollars. Null means auto top-up is disabled.
+    pub auto_topup_amount: Option<f32>,
+    /// Auto top-up threshold in dollars. When balance drops below this, auto top-up triggers.
+    pub auto_topup_threshold: Option<f32>,
+    /// Whether the user has a payment method set up for auto top-up.
+    pub has_auto_topup_payment_method: bool,
     /// User type: 'individual' or 'organization'
     pub user_type: String,
     /// Organizations this user belongs to (only included if `include=organizations` is specified)
@@ -204,9 +218,12 @@ impl From<UserDBResponse> for UserResponse {
             last_login: None,     // UserDBResponse doesn't have last_login
             groups: None,         // By default, relationships are not included
             credit_balance: None, // By default, credit balances are not included
-            has_payment_provider_id: db.payment_provider_id.is_some(),
+            has_payment_provider_id: db.payment_provider_id.as_ref().is_some_and(|s| !s.is_empty()),
             batch_notifications_enabled: db.batch_notifications_enabled,
             low_balance_threshold: db.low_balance_threshold,
+            auto_topup_amount: db.auto_topup_amount,
+            auto_topup_threshold: db.auto_topup_threshold,
+            has_auto_topup_payment_method: db.payment_provider_id.as_ref().is_some_and(|s| !s.is_empty()),
             user_type: db.user_type,
             organizations: None,
             active_organization_id: None,

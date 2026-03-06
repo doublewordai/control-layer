@@ -1,0 +1,18 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"></head>
+<body style="font-family: system-ui, sans-serif; max-width: 600px; margin: 40px auto; padding: 20px; color: #333;">
+    <p>Hi {{ to_name }},</p>
+
+    <p>Your account has been automatically topped up with <strong>${{ amount }}</strong> because your balance dropped below your ${{ threshold }} threshold.</p>
+
+    <p>Your new balance is approximately <strong>${{ new_balance }}</strong>.</p>
+
+    <p>You can <a href="{{ dashboard_link }}">view your transaction history</a> or <a href="{{ profile_link }}">manage your auto top-up settings</a>.</p>
+
+    <p style="font-size: 12px; color: #888; margin-top: 30px; border-top: 1px solid #eee; padding-top: 15px;">
+        You're receiving this because you have auto top-up enabled on your account.
+        <a href="{{ profile_link }}">Manage notification preferences</a>
+    </p>
+</body>
+</html>

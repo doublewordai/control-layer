@@ -83,6 +83,15 @@ impl From<crate::db::errors::DbError> for PaymentError {
     }
 }
 
+/// Result of processing an auto top-up setup session
+#[derive(Debug, Clone)]
+pub struct AutoTopupSetupResult {
+    /// Payment provider customer ID (may be newly created)
+    pub customer_id: Option<String>,
+    /// The user ID that initiated this session (from `client_reference_id`)
+    pub user_id: Option<String>,
+}
+
 /// Represents a completed payment session
 #[derive(Debug, Clone)]
 pub struct PaymentSession {
@@ -162,4 +171,60 @@ pub trait PaymentProvider: Send + Sync {
     /// * `user` - The authenticated user requesting portal access
     /// * `return_url` - The complete URL to redirect to after the customer is done (e.g., "https://example.com/cost-management")
     async fn create_billing_portal_session(&self, user: &CurrentUser, return_url: &str) -> Result<String>;
+
+    /// Create a checkout session for auto top-up setup
+    ///
+    /// Creates a setup-mode checkout session to collect and save a payment method
+    /// for future off-session charges. Returns the checkout URL.
+    ///
+    /// # Arguments
+    /// * `user` - The authenticated user
+    /// * `cancel_url` - URL to redirect to if the user cancels
+    /// * `success_url` - URL to redirect to on success
+    async fn create_auto_topup_checkout_session(&self, user: &CurrentUser, cancel_url: &str, success_url: &str) -> Result<String>;
+
+    /// Validate and process an auto top-up checkout session
+    ///
+    /// Verifies that the checkout session completed successfully with the payment
+    /// provider (e.g., payment method was saved). Called after the user completes
+    /// the auto top-up checkout flow.
+    ///
+    /// Unlike `process_payment_session`, this does not create a credit transaction.
+    /// It only validates the session so the caller can safely enable auto top-up.
+    async fn process_auto_topup_session(&self, db_pool: &PgPool, session_id: &str) -> Result<AutoTopupSetupResult>;
+
+    /// Charge a saved payment method off-session for auto top-up.
+    ///
+    /// Creates a payment intent using the saved payment method and customer ID.
+    /// Returns the payment intent ID on success (logged for reconciliation; the caller
+    /// uses a deterministic `source_id` for the credit transaction, not this ID).
+    ///
+    /// # Arguments
+    /// * `amount_cents` - Amount to charge in cents
+    /// * `customer_id` - Payment provider customer ID
+    /// * `payment_method_id` - Saved payment method ID
+    /// * `idempotency_key` - Idempotency key to prevent duplicate charges (e.g. `auto_topup_{user_id}_{minute}`)
+    async fn charge_auto_topup(
+        &self,
+        amount_cents: i64,
+        customer_id: &str,
+        payment_method_id: &str,
+        idempotency_key: &str,
+    ) -> Result<String>;
+
+    /// Get the customer's default payment method from the payment provider.
+    ///
+    /// Returns `Some(payment_method_id)` if the customer has a default payment method,
+    /// or `None` if no default is set.
+    async fn get_default_payment_method(&self, customer_id: &str) -> Result<Option<String>>;
+
+    /// Check whether the customer has an address on file with the payment provider.
+    ///
+    /// Required for tax calculation — auto top-up must not be enabled without one.
+    async fn customer_has_address(&self, customer_id: &str) -> Result<bool>;
+
+    /// Create a new customer with the payment provider.
+    ///
+    /// Returns the provider's customer ID for the newly created customer.
+    async fn create_customer(&self, email: &str, name: Option<&str>) -> Result<String>;
 }

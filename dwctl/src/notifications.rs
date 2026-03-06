@@ -15,17 +15,21 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use fusillade::manager::postgres::PostgresRequestManager;
+use metrics::counter;
+use rust_decimal::prelude::ToPrimitive;
 use sqlx::PgPool;
 use sqlx_pool_router::DbPools;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::config::NotificationsConfig;
-use crate::db::handlers::Webhooks;
 use crate::db::handlers::repository::Repository;
-use crate::db::handlers::users::{LowBalanceUser, Users};
+use crate::db::handlers::users::{AutoTopupUser, LowBalanceUser, Users};
+use crate::db::handlers::{Credits, Webhooks};
+use crate::db::models::credits::{CreditTransactionCreateDBRequest, CreditTransactionType};
 use crate::db::models::webhooks::WebhookDeliveryCreateDBRequest;
 use crate::email::EmailService;
+use crate::payment_providers::{self, PaymentProvider};
 use crate::webhooks::WebhookDispatcher;
 use crate::webhooks::events::{WebhookEvent, WebhookEventType};
 
@@ -127,6 +131,9 @@ pub async fn run_notification_poller(
         None
     };
 
+    let payment_provider: Option<Box<dyn PaymentProvider>> =
+        app_config.payment.as_ref().map(|pc| payment_providers::create_provider(pc.clone()));
+
     let email_service = if config.enabled {
         match EmailService::new(&app_config) {
             Ok(svc) => {
@@ -195,23 +202,79 @@ pub async fn run_notification_poller(
             }
         }
 
-        // === Step 4: Clear recovered flags + find low-balance users, then send emails ===
+        // === Step 4: Low-balance notifications ===
         if let Some(ref email_service) = email_service {
-            let low_balance_users = {
+            // 1. Get users with thresholds
+            let candidates = {
                 let mut users = Users::new(&mut conn);
-                users.poll_low_balance_users().await.unwrap_or_else(|e| {
-                    tracing::warn!(error = %e, "Failed to poll low-balance users");
+                users.users_with_low_balance_threshold().await.unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "Failed to fetch low-balance threshold users");
                     vec![]
                 })
             };
 
-            if !low_balance_users.is_empty() {
-                tracing::info!(count = low_balance_users.len(), "Found users with low balance");
-                send_low_balance_notifications(email_service, &low_balance_users, &mut conn).await;
+            if !candidates.is_empty() {
+                // 2. Refresh checkpoints only for users near their threshold or missing one.
+                //    Users well above threshold use the cached checkpoint balance directly.
+                const REFRESH_MARGIN: rust_decimal::Decimal = rust_decimal::Decimal::from_parts(30, 0, 0, false, 0);
+
+                let needs_refresh: Vec<Uuid> = candidates
+                    .iter()
+                    .filter(|u| match u.checkpoint_balance {
+                        Some(b) => (b - u.low_balance_threshold) < REFRESH_MARGIN,
+                        None => true,
+                    })
+                    .map(|u| u.id)
+                    .collect();
+
+                let refreshed = if !needs_refresh.is_empty() {
+                    let mut credits = Credits::new(&mut conn);
+                    credits.get_users_balances_bulk(&needs_refresh, Some(1)).await.unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, "Failed to refresh balances for low-balance users");
+                        Default::default()
+                    })
+                } else {
+                    Default::default()
+                };
+
+                // Look up balance: prefer refreshed, fall back to checkpoint
+                let balance_for =
+                    |u: &LowBalanceUser| -> Option<rust_decimal::Decimal> { refreshed.get(&u.id).copied().or(u.checkpoint_balance) };
+
+                // 3. Send notifications for users below threshold who haven't been notified
+                let to_notify: Vec<_> = candidates
+                    .iter()
+                    .filter(|u| !u.low_balance_notification_sent && balance_for(u).map(|b| b < u.low_balance_threshold).unwrap_or(false))
+                    .collect();
+
+                if !to_notify.is_empty() {
+                    tracing::info!(count = to_notify.len(), "Found users with low balance");
+                    send_low_balance_notifications(email_service, &to_notify, &balance_for, &mut conn).await;
+                }
+
+                // 4. Clear recovered flags (after emails sent so we don't lose state on failure)
+                let recovered: Vec<Uuid> = candidates
+                    .iter()
+                    .filter(|u| u.low_balance_notification_sent && balance_for(u).map(|b| b >= u.low_balance_threshold).unwrap_or(false))
+                    .map(|u| u.id)
+                    .collect();
+
+                if !recovered.is_empty() {
+                    let mut users = Users::new(&mut conn);
+                    let _ = users
+                        .clear_low_balance_notification_sent(&recovered)
+                        .await
+                        .inspect_err(|e| tracing::warn!(error = %e, "Failed to clear recovered low-balance flags"));
+                }
             }
         }
 
-        // === Step 5: Dispatch webhooks (claim → sign → send → process results) ===
+        // === Step 5: Auto top-up charges ===
+        if let Some(ref provider) = payment_provider {
+            process_auto_topups(provider.as_ref(), &mut conn, email_service.as_ref()).await;
+        }
+
+        // === Step 6: Dispatch webhooks (claim → sign → send → process results) ===
         if let Some(ref mut dispatcher) = dispatcher {
             dispatcher.tick().await;
         }
@@ -344,18 +407,363 @@ async fn send_email_notifications(
     }
 }
 
+/// Process auto top-up charges for users whose balance has dropped below their threshold.
+///
+/// For each eligible user:
+/// 1. Refreshes balance to get an accurate reading
+/// 2. Checks if balance is below the user's configured threshold
+/// 3. Charges the saved payment method via the payment provider
+/// 4. Creates a credit transaction (idempotent via unique source_id)
+///
+/// **Rate limit**: At most one charge per user per minute, enforced via a deterministic
+/// `source_id` of the form `auto_topup_{user_id}_{YYYY-MM-DDTHH:MM}` and the unique
+/// constraint on `credits_transactions.source_id`.
+async fn process_auto_topups(
+    provider: &dyn PaymentProvider,
+    conn: &mut sqlx::pool::PoolConnection<sqlx::Postgres>,
+    email_service: Option<&EmailService>,
+) {
+    // 1. Get users with auto top-up configured
+    let candidates = {
+        let mut users = Users::new(&mut *conn);
+        users.users_with_auto_topup_enabled().await.unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "Failed to fetch auto-topup eligible users");
+            vec![]
+        })
+    };
+
+    if candidates.is_empty() {
+        return;
+    }
+
+    // 2. Always refresh balances for auto-topup candidates.
+    //    Unlike low-balance notifications (which use a margin-based heuristic), auto-topup
+    //    needs accurate balances because a stale checkpoint can cause us to miss charges entirely.
+    //    The candidate set is typically small, so the cost of refreshing all is negligible.
+    let all_ids: Vec<Uuid> = candidates.iter().map(|u| u.id).collect();
+
+    let refreshed = {
+        let mut credits = Credits::new(&mut *conn);
+        credits.get_users_balances_bulk(&all_ids, Some(1)).await.unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "Failed to refresh balances for auto-topup users");
+            Default::default()
+        })
+    };
+
+    let balance_for = |u: &AutoTopupUser| -> Option<rust_decimal::Decimal> { refreshed.get(&u.id).copied().or(u.checkpoint_balance) };
+
+    // 3. Filter to users below their threshold
+    let to_charge: Vec<_> = candidates
+        .iter()
+        .filter(|u| balance_for(u).map(|b| b < u.auto_topup_threshold).unwrap_or(false))
+        .collect();
+
+    if to_charge.is_empty() {
+        return;
+    }
+
+    tracing::info!(count = to_charge.len(), "Found users eligible for auto top-up");
+
+    // 4. Charge each user
+    for user in &to_charge {
+        let amount_cents = (user.auto_topup_amount * rust_decimal::Decimal::new(100, 0))
+            .round_dp(0)
+            .to_i64()
+            .unwrap_or(0);
+
+        if amount_cents <= 0 {
+            tracing::warn!(user_id = %user.id, "Auto top-up amount resolved to zero cents, skipping");
+            continue;
+        }
+
+        // Use a deterministic source_id so duplicate charges within a short window
+        // are caught by the unique constraint on credits_transactions.source_id.
+        // We include the minute so a user can be charged again in a subsequent minute if
+        // they drop below threshold again (at most once per minute per user).
+        let now_minute = chrono::Utc::now().format("%Y-%m-%dT%H:%M");
+        let source_id = format!("auto_topup_{}_{}", user.id, now_minute);
+
+        // Check idempotency: skip if we already charged this user this minute
+        {
+            let mut credits = Credits::new(&mut *conn);
+            match credits.transaction_exists_by_source_id(&source_id).await {
+                Ok(true) => {
+                    tracing::warn!(user_id = %user.id, "Auto top-up already processed this minute, skipping");
+                    continue;
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::warn!(user_id = %user.id, error = %e, "Failed to check auto-topup idempotency");
+                    counter!("dwctl_auto_topup_errors_total", "stage" => "idempotency_check").increment(1);
+                    continue;
+                }
+            }
+        }
+
+        // Fetch the customer's default payment method from the provider
+        let payment_method_id = match provider.get_default_payment_method(&user.payment_provider_id).await {
+            Ok(Some(pm_id)) => pm_id,
+            Ok(None) => {
+                tracing::warn!(user_id = %user.id, "No default payment method found, skipping auto top-up");
+                counter!("dwctl_auto_topup_charge_failures_total").increment(1);
+                if let Some(email_svc) = email_service {
+                    let name = user.display_name.as_deref().unwrap_or(&user.username);
+                    if let Err(e) = email_svc
+                        .send_auto_topup_failed_email(&user.email, Some(name), &user.auto_topup_amount, &user.auto_topup_threshold)
+                        .await
+                    {
+                        tracing::warn!(user_id = %user.id, error = %e, "Failed to send auto top-up failure email");
+                    }
+                }
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(user_id = %user.id, error = %e, "Failed to fetch default payment method");
+                counter!("dwctl_auto_topup_errors_total", "stage" => "payment_method_lookup").increment(1);
+                continue;
+            }
+        };
+
+        // Charge the payment provider
+        let payment_intent_id = match provider
+            .charge_auto_topup(amount_cents, &user.payment_provider_id, &payment_method_id, &source_id)
+            .await
+        {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::warn!(
+                    user_id = %user.id,
+                    error = %e,
+                    "Failed to charge auto top-up"
+                );
+                counter!("dwctl_auto_topup_charge_failures_total").increment(1);
+                if let Some(email_svc) = email_service {
+                    let name = user.display_name.as_deref().unwrap_or(&user.username);
+                    if let Err(e) = email_svc
+                        .send_auto_topup_failed_email(&user.email, Some(name), &user.auto_topup_amount, &user.auto_topup_threshold)
+                        .await
+                    {
+                        tracing::warn!(user_id = %user.id, error = %e, "Failed to send auto top-up failure email");
+                    }
+                }
+                continue;
+            }
+        };
+
+        // Create the credit transaction
+        let request = CreditTransactionCreateDBRequest {
+            user_id: user.id,
+            transaction_type: CreditTransactionType::Purchase,
+            amount: user.auto_topup_amount,
+            source_id,
+            description: Some("Automatic top-up".to_string()),
+            fusillade_batch_id: None,
+            api_key_id: None,
+        };
+
+        let mut credits = Credits::new(&mut *conn);
+        match credits.create_transaction(&request).await {
+            Ok(_) => {
+                tracing::info!(
+                    user_id = %user.id,
+                    amount = %user.auto_topup_amount,
+                    "Auto top-up charged successfully"
+                );
+                counter!("dwctl_auto_topup_success_total").increment(1);
+                if let Some(email_svc) = email_service {
+                    let name = user.display_name.as_deref().unwrap_or(&user.username);
+                    let new_balance = balance_for(user).unwrap_or_default() + user.auto_topup_amount;
+                    if let Err(e) = email_svc
+                        .send_auto_topup_success_email(
+                            &user.email,
+                            Some(name),
+                            &user.auto_topup_amount,
+                            &user.auto_topup_threshold,
+                            &new_balance,
+                        )
+                        .await
+                    {
+                        tracing::warn!(user_id = %user.id, error = %e, "Failed to send auto top-up success email");
+                    }
+                }
+            }
+            Err(crate::db::errors::DbError::UniqueViolation { constraint, .. })
+                if constraint.as_deref() == Some("credits_transactions_source_id_unique") =>
+            {
+                // Another poller instance already inserted the credit — this is fine.
+                tracing::info!(user_id = %user.id, "Auto top-up credit transaction already exists (race), treating as success");
+            }
+            Err(e) => {
+                tracing::error!(
+                    user_id = %user.id,
+                    payment_intent_id = %payment_intent_id,
+                    amount = %user.auto_topup_amount,
+                    error = %e,
+                    "CRITICAL: Auto top-up payment succeeded but credit transaction failed. \
+                     User was charged but did not receive credits. Manual reconciliation required."
+                );
+                counter!("dwctl_auto_topup_credit_failures_total").increment(1);
+                // Do NOT send "payment failed" email here — the payment actually succeeded.
+                // The user was charged but credits weren't recorded due to a DB error.
+                // The CRITICAL log + metric above should trigger an alert for manual reconciliation.
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::models::users::Role;
+    use crate::config::DummyConfig;
+    use crate::payment_providers;
+    use rust_decimal::Decimal;
+    use sqlx::PgPool;
+
+    #[sqlx::test]
+    async fn test_process_auto_topups_charges_below_threshold(pool: PgPool) {
+        // Create a test user with auto top-up configured
+        let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+
+        // Set up auto top-up: threshold $10, amount $25, with payment IDs
+        sqlx::query!(
+            r#"UPDATE users SET
+                auto_topup_amount = 25.0,
+                auto_topup_threshold = 10.0,
+                payment_provider_id = 'cus_test_456'
+            WHERE id = $1"#,
+            user.id
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // User has $0 balance (below $10 threshold) — should trigger charge
+
+        let provider = payment_providers::create_provider(crate::config::PaymentConfig::Dummy(DummyConfig {
+            amount: Decimal::new(100, 0),
+        }));
+
+        let mut conn = pool.acquire().await.unwrap();
+        process_auto_topups(provider.as_ref(), &mut conn, None).await;
+
+        // Verify a credit transaction was created
+        let txn = sqlx::query!("SELECT amount, source_id FROM credits_transactions WHERE user_id = $1", user.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(txn.amount, Decimal::new(2500, 2)); // $25.00
+        assert!(txn.source_id.starts_with("auto_topup_"), "source_id should start with auto_topup_");
+        assert!(txn.source_id.contains(&user.id.to_string()), "source_id should contain user ID");
+    }
+
+    #[sqlx::test]
+    async fn test_process_auto_topups_skips_above_threshold(pool: PgPool) {
+        let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+
+        // Set up auto top-up: threshold $5, amount $25
+        sqlx::query!(
+            r#"UPDATE users SET
+                auto_topup_amount = 25.0,
+                auto_topup_threshold = 5.0,
+                payment_provider_id = 'cus_test_456'
+            WHERE id = $1"#,
+            user.id
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Give user $50 balance (well above $5 threshold)
+        let mut conn = pool.acquire().await.unwrap();
+        {
+            let mut credits = Credits::new(&mut conn);
+            credits
+                .create_transaction(&CreditTransactionCreateDBRequest {
+                    user_id: user.id,
+                    transaction_type: CreditTransactionType::Purchase,
+                    amount: Decimal::new(5000, 2),
+                    source_id: "seed_balance".to_string(),
+                    description: Some("Test seed".to_string()),
+                    fusillade_batch_id: None,
+                    api_key_id: None,
+                })
+                .await
+                .unwrap();
+        }
+
+        let provider = payment_providers::create_provider(crate::config::PaymentConfig::Dummy(DummyConfig {
+            amount: Decimal::new(100, 0),
+        }));
+
+        process_auto_topups(provider.as_ref(), &mut conn, None).await;
+
+        // Should only have the seed transaction, no auto-topup
+        let count = sqlx::query!("SELECT COUNT(*) as count FROM credits_transactions WHERE user_id = $1", user.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(count.count.unwrap(), 1, "Should only have the seed transaction");
+    }
+
+    #[sqlx::test]
+    async fn test_process_auto_topups_idempotent(pool: PgPool) {
+        let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+
+        sqlx::query!(
+            r#"UPDATE users SET
+                auto_topup_amount = 25.0,
+                auto_topup_threshold = 10.0,
+                payment_provider_id = 'cus_test_456'
+            WHERE id = $1"#,
+            user.id
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let provider = payment_providers::create_provider(crate::config::PaymentConfig::Dummy(DummyConfig {
+            amount: Decimal::new(100, 0),
+        }));
+
+        // Run twice
+        let mut conn = pool.acquire().await.unwrap();
+        process_auto_topups(provider.as_ref(), &mut conn, None).await;
+        process_auto_topups(provider.as_ref(), &mut conn, None).await;
+
+        // Should only have one transaction (idempotent via source_id)
+        let count = sqlx::query!(
+            "SELECT COUNT(*) as count FROM credits_transactions WHERE user_id = $1 AND source_id LIKE 'auto_topup_%'",
+            user.id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            count.count.unwrap(),
+            1,
+            "Should only create one transaction per minute (idempotent)"
+        );
+    }
+}
+
 /// Send low-balance notification emails to the given users.
 async fn send_low_balance_notifications(
     email_service: &EmailService,
-    users: &[LowBalanceUser],
+    users: &[&LowBalanceUser],
+    balance_for: &impl Fn(&LowBalanceUser) -> Option<rust_decimal::Decimal>,
     conn: &mut sqlx::pool::PoolConnection<sqlx::Postgres>,
 ) {
     let mut sent_ids = Vec::new();
 
     for user in users {
+        let Some(balance) = balance_for(user) else { continue };
         let name = user.display_name.as_deref().unwrap_or(&user.username);
 
-        if let Err(e) = email_service.send_low_balance_email(&user.email, Some(name), &user.balance).await {
+        if let Err(e) = email_service.send_low_balance_email(&user.email, Some(name), &balance).await {
             tracing::warn!(
                 user_id = %user.id,
                 email = %user.email,
@@ -365,7 +773,7 @@ async fn send_low_balance_notifications(
             continue;
         }
 
-        tracing::info!(user_id = %user.id, email = %user.email, balance = %user.balance, "Sent low-balance notification");
+        tracing::info!(user_id = %user.id, email = %user.email, balance = %balance, "Sent low-balance notification");
         sent_ids.push(user.id);
     }
 

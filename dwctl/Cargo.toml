@@ -1,6 +1,6 @@
 [package]
 name = "dwctl"
-version = "8.14.0"
+version = "8.15.0"
 edition = "2024"
 description = "The Doubleword Control Layer - A self-hostable observability and analytics platform for LLM applications"
 license = "MIT OR Apache-2.0"
@@ -128,6 +128,13 @@ async-stripe-webhook = { version = "1.0.0-rc.0", features = [
   "deserialize",
 ] }
 async-stripe-types = { version = "1.0.0-rc.0" }
+async-stripe-core = { version = "1.0.0-rc.0", features = [
+  "payment_intent",
+  "customer",
+] }
+async-stripe-misc = { version = "1.0.0-rc.0", features = [
+  "tax_calculation",
+] }
 rustls = { version = "0.23", features = ["aws-lc-rs"] }
 async-stripe-billing = { version = "1.0.0-rc.0", features = [
   "billing_portal_session",

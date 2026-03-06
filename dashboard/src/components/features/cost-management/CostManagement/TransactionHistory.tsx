@@ -12,7 +12,7 @@ import {
 } from "lucide-react";
 import { Card } from "../../../ui/card.tsx";
 import { Button } from "@/components";
-import { useState, useMemo, useCallback } from "react";
+import { useState, useMemo, useCallback, type ReactNode } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { useServerPagination } from "@/hooks/useServerPagination";
 import {
@@ -59,6 +59,7 @@ export interface TransactionHistoryProps {
   showCard?: boolean;
   addFundsConfig?: AddFundsConfig;
   filterUserId?: string;
+  headerExtra?: ReactNode;
 }
 
 export function TransactionHistory({
@@ -66,6 +67,7 @@ export function TransactionHistory({
   showCard = true,
   addFundsConfig,
   filterUserId,
+  headerExtra,
 }: TransactionHistoryProps) {
   const { isFeatureEnabled } = useSettings();
   const isDemoMode = isFeatureEnabled("demo");
@@ -311,7 +313,8 @@ export function TransactionHistory({
             </p>
           )}
         </div>
-        <div className="flex items-center gap-3">
+        <div className="flex items-center gap-6">
+          {headerExtra}
           {addFundsConfig && (
             <>
               {addFundsConfig.type === "admin-only" && (

@@ -102,6 +102,16 @@
         "ordinal": 19,
         "name": "user_type",
         "type_info": "Varchar"
+      },
+      {
+        "ordinal": 20,
+        "name": "auto_topup_amount",
+        "type_info": "Float4"
+      },
+      {
+        "ordinal": 21,
+        "name": "auto_topup_threshold",
+        "type_info": "Float4"
       }
     ],
     "parameters": {
@@ -137,7 +147,9 @@
       false,
       false,
       true,
-      false
+      false,
+      true,
+      true
     ]
   },
   "hash": "df59ccd8080d8eb0bd1e11ab6e5a2b8fcdfbb3ae2c95a05ccd9f76042320f41a"
