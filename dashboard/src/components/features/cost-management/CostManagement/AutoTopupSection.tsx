@@ -47,8 +47,10 @@ export function AutoTopupSection({
         onSetupRequired();
         return;
       }
-      const thresholdNum = parseFloat(threshold) || 5.0;
-      const amountNum = parseFloat(amount) || 25.0;
+      const parsedThreshold = parseFloat(threshold);
+      const thresholdNum = Number.isFinite(parsedThreshold) ? parsedThreshold : 5.0;
+      const parsedAmount = parseFloat(amount);
+      const amountNum = Number.isFinite(parsedAmount) ? parsedAmount : 25.0;
       try {
         await updateUserMutation.mutateAsync({
           id: userId,

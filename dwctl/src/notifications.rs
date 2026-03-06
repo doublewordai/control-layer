@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use fusillade::manager::postgres::PostgresRequestManager;
+use metrics::counter;
 use rust_decimal::prelude::ToPrimitive;
 use sqlx::PgPool;
 use sqlx_pool_router::DbPools;
@@ -501,6 +502,7 @@ async fn process_auto_topups(
                 Ok(false) => {}
                 Err(e) => {
                     tracing::warn!(user_id = %user.id, error = %e, "Failed to check auto-topup idempotency");
+                    counter!("dwctl_auto_topup_errors_total", "stage" => "idempotency_check").increment(1);
                     continue;
                 }
             }
@@ -518,6 +520,7 @@ async fn process_auto_topups(
                     error = %e,
                     "Failed to charge auto top-up"
                 );
+                counter!("dwctl_auto_topup_charge_failures_total").increment(1);
                 if let Some(email_svc) = email_service {
                     let name = user.display_name.as_deref().unwrap_or(&user.username);
                     if let Err(e) = email_svc
@@ -549,6 +552,7 @@ async fn process_auto_topups(
                     amount = %user.auto_topup_amount,
                     "Auto top-up charged successfully"
                 );
+                counter!("dwctl_auto_topup_success_total").increment(1);
                 if let Some(email_svc) = email_service {
                     let name = user.display_name.as_deref().unwrap_or(&user.username);
                     let new_balance = balance_for(user).unwrap_or_default() + user.auto_topup_amount;
@@ -575,16 +579,10 @@ async fn process_auto_topups(
                     "CRITICAL: Auto top-up payment succeeded but credit transaction failed. \
                      User was charged but did not receive credits. Manual reconciliation required."
                 );
-                // Send failure email so the user knows something went wrong
-                if let Some(email_svc) = email_service {
-                    let name = user.display_name.as_deref().unwrap_or(&user.username);
-                    if let Err(email_err) = email_svc
-                        .send_auto_topup_failed_email(&user.email, Some(name), &user.auto_topup_amount, &user.auto_topup_threshold)
-                        .await
-                    {
-                        tracing::error!(user_id = %user.id, error = %email_err, "Failed to send failure email for charge-without-credits");
-                    }
-                }
+                counter!("dwctl_auto_topup_credit_failures_total").increment(1);
+                // Do NOT send "payment failed" email here — the payment actually succeeded.
+                // The user was charged but credits weren't recorded due to a DB error.
+                // The CRITICAL log + metric above should trigger an alert for manual reconciliation.
             }
         }
     }
