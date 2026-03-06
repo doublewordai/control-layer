@@ -176,8 +176,8 @@ pub trait PaymentProvider: Send + Sync {
 
     /// Create a checkout session for auto top-up setup
     ///
-    /// Checks if the user can set up auto top-up (e.g., has a saved payment method)
-    /// and creates a checkout session for it. Returns the checkout URL.
+    /// Creates a setup-mode checkout session to collect and save a payment method
+    /// for future off-session charges. Returns the checkout URL.
     ///
     /// # Arguments
     /// * `user` - The authenticated user
@@ -198,7 +198,8 @@ pub trait PaymentProvider: Send + Sync {
     /// Charge a saved payment method off-session for auto top-up.
     ///
     /// Creates a payment intent using the saved payment method and customer ID.
-    /// Returns the payment intent ID on success (used as `source_id` for the credit transaction).
+    /// Returns the payment intent ID on success (logged for reconciliation; the caller
+    /// uses a deterministic `source_id` for the credit transaction, not this ID).
     ///
     /// # Arguments
     /// * `amount_cents` - Amount to charge in cents

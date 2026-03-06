@@ -491,7 +491,7 @@ async fn process_auto_topups(
         let now_minute = chrono::Utc::now().format("%Y-%m-%dT%H:%M");
         let source_id = format!("auto_topup_{}_{}", user.id, now_minute);
 
-        // Check idempotency: skip if we already charged this user today
+        // Check idempotency: skip if we already charged this user this minute
         {
             let mut credits = Credits::new(&mut *conn);
             match credits.transaction_exists_by_source_id(&source_id).await {
@@ -569,6 +569,12 @@ async fn process_auto_topups(
                         tracing::warn!(user_id = %user.id, error = %e, "Failed to send auto top-up success email");
                     }
                 }
+            }
+            Err(crate::db::errors::DbError::UniqueViolation { constraint, .. })
+                if constraint.as_deref() == Some("credits_transactions_source_id_unique") =>
+            {
+                // Another poller instance already inserted the credit — this is fine.
+                tracing::info!(user_id = %user.id, "Auto top-up credit transaction already exists (race), treating as success");
             }
             Err(e) => {
                 tracing::error!(

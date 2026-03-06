@@ -205,7 +205,7 @@ export function AutoTopupModal({
           <>
             <DialogHeader>
               <DialogTitle className="flex items-center gap-2">
-                {processSetupMutation.isPending ? (
+                {processSetupMutation.isPending || processSetupMutation.isIdle ? (
                   <>
                     <Loader2 className="h-6 w-6 animate-spin text-blue-500" />
                     Setting Up Auto Top-Up
@@ -223,7 +223,7 @@ export function AutoTopupModal({
                 )}
               </DialogTitle>
               <DialogDescription>
-                {processSetupMutation.isPending
+                {processSetupMutation.isPending || processSetupMutation.isIdle
                   ? "Verifying your payment method and saving your settings..."
                   : processSetupMutation.isError
                     ? "Failed to enable auto top-up. Your payment method was set up but the settings could not be saved. Please try again."

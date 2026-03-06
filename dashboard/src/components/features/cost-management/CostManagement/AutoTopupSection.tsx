@@ -20,9 +20,11 @@ export function AutoTopupSection({
   onSetupRequired,
   onSuccess,
 }: AutoTopupSectionProps) {
-  const isEnabled =
-    user.auto_topup_amount != null && user.auto_topup_threshold != null;
   const hasPaymentMethod = user.has_auto_topup_payment_method;
+  const isEnabled =
+    user.auto_topup_amount != null &&
+    user.auto_topup_threshold != null &&
+    hasPaymentMethod;
 
   const [isEditing, setIsEditing] = useState(false);
   const [threshold, setThreshold] = useState(
