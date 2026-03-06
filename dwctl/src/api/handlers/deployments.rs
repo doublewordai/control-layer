@@ -128,7 +128,12 @@ fn db_component_to_response(c: DeploymentComponentDBResponse) -> ModelComponentR
     params(
         ("endpoint" = Option<i32>, Query, description = "Filter by inference endpoint ID"),
         ("accessible" = Option<bool>, Query, description = "Filter to only models the current user can access (defaults to false for admins, true for users)"),
-        ("include" = Option<String>, Query, description = "Include additional data (comma-separated: 'groups', 'metrics', 'status', 'pricing', 'endpoints'). Only platform managers can include groups. Status shows probe monitoring information. Pricing shows simple customer rates for regular users, full pricing structure including current active tariffs for users with Pricing::ReadAll permission. Endpoints includes full inference endpoint details."),
+        ("include" = Option<String>, Query, description = "Include additional data (comma-separated: 'groups', 'metrics', 'status', 'pricing', 'endpoints', 'facets'). Only platform managers can include groups. Status shows probe monitoring information. Pricing shows simple customer rates for regular users, full pricing structure including current active tariffs for users with Pricing::ReadAll permission. Endpoints includes full inference endpoint details. Facets returns distinct providers, capabilities, and model types for filter dropdowns."),
+        ("provider" = Option<String>, Query, description = "Filter by provider name (case-insensitive exact match against metadata.provider)"),
+        ("model_type" = Option<String>, Query, description = "Filter by model type (CHAT, EMBEDDINGS, RERANKER)"),
+        ("capability" = Option<String>, Query, description = "Filter by capability (returns models that have this capability)"),
+        ("sort" = Option<String>, Query, description = "Sort field: created_at (default), alias, intelligence_index, released_at, context_window, provider, price_from"),
+        ("sort_direction" = Option<String>, Query, description = "Sort direction: asc or desc (default depends on sort field)"),
         ("deleted" = Option<bool>, Query, description = "Show deleted models when true (admin only), non-deleted models when false, and all models when not specified"),
         ("inactive" = Option<bool>, Query, description = "Show inactive models when true (admin only)"),
         ("limit" = Option<i64>, Query, description = "Maximum number of items to return (default: 10, max: 100)"),
@@ -258,7 +263,9 @@ pub async fn list_deployed_models<P: PoolProvider>(
     }
 
     // Apply provider filter if specified
-    if let Some(ref provider) = query.provider {
+    if let Some(ref provider) = query.provider
+        && !provider.trim().is_empty()
+    {
         filter = filter.with_provider(provider.trim().to_string());
     }
 
@@ -268,7 +275,9 @@ pub async fn list_deployed_models<P: PoolProvider>(
     }
 
     // Apply capability filter if specified
-    if let Some(ref capability) = query.capability {
+    if let Some(ref capability) = query.capability
+        && !capability.trim().is_empty()
+    {
         filter = filter.with_capability(capability.trim().to_string());
     }
 

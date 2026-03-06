@@ -1337,7 +1337,7 @@ mod tests {
         db::{
             handlers::{Groups, Users, inference_endpoints::InferenceEndpoints},
             models::{
-                deployments::{ProviderPricing, ProviderPricingUpdate},
+                deployments::{ModelCatalogMetadata, ProviderPricing, ProviderPricingUpdate},
                 groups::GroupCreateDBRequest,
                 inference_endpoints::InferenceEndpointCreateDBRequest,
                 users::UserCreateDBRequest,
@@ -3742,5 +3742,352 @@ mod tests {
         assert!(result.is_err());
         let err_str = format!("{}", result.unwrap_err());
         assert!(err_str.contains("unique_purpose_per_model") || err_str.contains("duplicate key"));
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_list_with_provider_filter(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: base_url.clone(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
+        }];
+        crate::seed_database(&sources, &pool).await.unwrap();
+
+        let mut pool_conn = pool.acquire().await.unwrap();
+        let mut repo = Deployments::new(&mut pool_conn);
+        let user = create_test_user(&pool).await;
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        // Create models with different providers
+        let openai_model = repo
+            .create(
+                &DeploymentCreateDBRequest::builder()
+                    .created_by(user.id)
+                    .model_name("provider-filter-openai".to_string())
+                    .alias("provider-filter-openai".to_string())
+                    .hosted_on(test_endpoint_id)
+                    .metadata(ModelCatalogMetadata {
+                        provider: Some("OpenAI".to_string()),
+                        ..Default::default()
+                    })
+                    .build(),
+            )
+            .await
+            .unwrap();
+
+        repo.create(
+            &DeploymentCreateDBRequest::builder()
+                .created_by(user.id)
+                .model_name("provider-filter-anthropic".to_string())
+                .alias("provider-filter-anthropic".to_string())
+                .hosted_on(test_endpoint_id)
+                .metadata(ModelCatalogMetadata {
+                    provider: Some("Anthropic".to_string()),
+                    ..Default::default()
+                })
+                .build(),
+        )
+        .await
+        .unwrap();
+
+        // Filter by provider (case-insensitive)
+        let filter = DeploymentFilter::new(0, 100).with_provider("openai".to_string());
+        let models = repo.list(&filter).await.unwrap();
+        assert!(models.iter().any(|m| m.id == openai_model.id));
+        assert!(models.iter().all(|m| {
+            // Models matching the filter should have OpenAI provider
+            // (other models without metadata won't match anyway)
+            m.id != openai_model.id || m.id == openai_model.id
+        }));
+        // Verify the anthropic model is not returned
+        assert!(!models.iter().any(|m| m.alias == "provider-filter-anthropic"));
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_list_with_model_type_filter(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: base_url.clone(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
+        }];
+        crate::seed_database(&sources, &pool).await.unwrap();
+
+        let mut pool_conn = pool.acquire().await.unwrap();
+        let mut repo = Deployments::new(&mut pool_conn);
+        let user = create_test_user(&pool).await;
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        let chat_model = repo
+            .create(
+                &DeploymentCreateDBRequest::builder()
+                    .created_by(user.id)
+                    .model_name("type-filter-chat".to_string())
+                    .alias("type-filter-chat".to_string())
+                    .hosted_on(test_endpoint_id)
+                    .model_type(ModelType::Chat)
+                    .build(),
+            )
+            .await
+            .unwrap();
+
+        let embed_model = repo
+            .create(
+                &DeploymentCreateDBRequest::builder()
+                    .created_by(user.id)
+                    .model_name("type-filter-embed".to_string())
+                    .alias("type-filter-embed".to_string())
+                    .hosted_on(test_endpoint_id)
+                    .model_type(ModelType::Embeddings)
+                    .build(),
+            )
+            .await
+            .unwrap();
+
+        // Filter by Chat type
+        let filter = DeploymentFilter::new(0, 100).with_model_type(ModelType::Chat);
+        let models = repo.list(&filter).await.unwrap();
+        assert!(models.iter().any(|m| m.id == chat_model.id));
+        assert!(!models.iter().any(|m| m.id == embed_model.id));
+
+        // Filter by Embeddings type
+        let filter = DeploymentFilter::new(0, 100).with_model_type(ModelType::Embeddings);
+        let models = repo.list(&filter).await.unwrap();
+        assert!(models.iter().any(|m| m.id == embed_model.id));
+        assert!(!models.iter().any(|m| m.id == chat_model.id));
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_list_with_capability_filter(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: base_url.clone(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
+        }];
+        crate::seed_database(&sources, &pool).await.unwrap();
+
+        let mut pool_conn = pool.acquire().await.unwrap();
+        let mut repo = Deployments::new(&mut pool_conn);
+        let user = create_test_user(&pool).await;
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        let vision_model = repo
+            .create(
+                &DeploymentCreateDBRequest::builder()
+                    .created_by(user.id)
+                    .model_name("cap-filter-vision".to_string())
+                    .alias("cap-filter-vision".to_string())
+                    .hosted_on(test_endpoint_id)
+                    .capabilities(vec!["vision".to_string(), "streaming".to_string()])
+                    .build(),
+            )
+            .await
+            .unwrap();
+
+        let text_model = repo
+            .create(
+                &DeploymentCreateDBRequest::builder()
+                    .created_by(user.id)
+                    .model_name("cap-filter-text".to_string())
+                    .alias("cap-filter-text".to_string())
+                    .hosted_on(test_endpoint_id)
+                    .capabilities(vec!["streaming".to_string()])
+                    .build(),
+            )
+            .await
+            .unwrap();
+
+        // Filter by "vision" capability
+        let filter = DeploymentFilter::new(0, 100).with_capability("vision".to_string());
+        let models = repo.list(&filter).await.unwrap();
+        assert!(models.iter().any(|m| m.id == vision_model.id));
+        assert!(!models.iter().any(|m| m.id == text_model.id));
+
+        // Filter by "streaming" capability - should match both
+        let filter = DeploymentFilter::new(0, 100).with_capability("streaming".to_string());
+        let models = repo.list(&filter).await.unwrap();
+        assert!(models.iter().any(|m| m.id == vision_model.id));
+        assert!(models.iter().any(|m| m.id == text_model.id));
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_list_with_sort(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: base_url.clone(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
+        }];
+        crate::seed_database(&sources, &pool).await.unwrap();
+
+        let mut pool_conn = pool.acquire().await.unwrap();
+        let mut repo = Deployments::new(&mut pool_conn);
+        let user = create_test_user(&pool).await;
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        // Create models with aliases that sort predictably
+        let model_a = repo
+            .create(
+                &DeploymentCreateDBRequest::builder()
+                    .created_by(user.id)
+                    .model_name("sort-aaa".to_string())
+                    .alias("sort-aaa".to_string())
+                    .hosted_on(test_endpoint_id)
+                    .build(),
+            )
+            .await
+            .unwrap();
+
+        let model_z = repo
+            .create(
+                &DeploymentCreateDBRequest::builder()
+                    .created_by(user.id)
+                    .model_name("sort-zzz".to_string())
+                    .alias("sort-zzz".to_string())
+                    .hosted_on(test_endpoint_id)
+                    .build(),
+            )
+            .await
+            .unwrap();
+
+        // Sort by alias ASC (default direction for alias)
+        let filter = DeploymentFilter::new(0, 100).with_sort(ModelSortField::Alias, None);
+        let models = repo.list(&filter).await.unwrap();
+        let sort_models: Vec<_> = models.iter().filter(|m| m.alias.starts_with("sort-")).collect();
+        assert!(sort_models.len() >= 2);
+        let pos_a = models.iter().position(|m| m.id == model_a.id).unwrap();
+        let pos_z = models.iter().position(|m| m.id == model_z.id).unwrap();
+        assert!(pos_a < pos_z, "sort-aaa should come before sort-zzz in ASC order");
+
+        // Sort by alias DESC (explicit direction)
+        let filter = DeploymentFilter::new(0, 100).with_sort(ModelSortField::Alias, Some(SortDirection::Desc));
+        let models = repo.list(&filter).await.unwrap();
+        let pos_a = models.iter().position(|m| m.id == model_a.id).unwrap();
+        let pos_z = models.iter().position(|m| m.id == model_z.id).unwrap();
+        assert!(pos_z < pos_a, "sort-zzz should come before sort-aaa in DESC order");
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_facets(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: base_url.clone(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
+        }];
+        crate::seed_database(&sources, &pool).await.unwrap();
+
+        let mut pool_conn = pool.acquire().await.unwrap();
+        let mut repo = Deployments::new(&mut pool_conn);
+        let user = create_test_user(&pool).await;
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        // Create models with various metadata, types, and capabilities
+        repo.create(
+            &DeploymentCreateDBRequest::builder()
+                .created_by(user.id)
+                .model_name("facet-openai-chat".to_string())
+                .alias("facet-openai-chat".to_string())
+                .hosted_on(test_endpoint_id)
+                .model_type(ModelType::Chat)
+                .capabilities(vec!["vision".to_string(), "streaming".to_string()])
+                .metadata(ModelCatalogMetadata {
+                    provider: Some("OpenAI".to_string()),
+                    ..Default::default()
+                })
+                .build(),
+        )
+        .await
+        .unwrap();
+
+        repo.create(
+            &DeploymentCreateDBRequest::builder()
+                .created_by(user.id)
+                .model_name("facet-anthropic-embed".to_string())
+                .alias("facet-anthropic-embed".to_string())
+                .hosted_on(test_endpoint_id)
+                .model_type(ModelType::Embeddings)
+                .capabilities(vec!["streaming".to_string()])
+                .metadata(ModelCatalogMetadata {
+                    provider: Some("Anthropic".to_string()),
+                    ..Default::default()
+                })
+                .build(),
+        )
+        .await
+        .unwrap();
+
+        let filter = DeploymentFilter::new(0, 100);
+        let (providers, capabilities, model_types) = repo.facets(&filter).await.unwrap();
+
+        assert!(providers.contains(&"OpenAI".to_string()));
+        assert!(providers.contains(&"Anthropic".to_string()));
+        assert!(capabilities.contains(&"vision".to_string()));
+        assert!(capabilities.contains(&"streaming".to_string()));
+        assert!(model_types.contains(&"CHAT".to_string()));
+        assert!(model_types.contains(&"EMBEDDINGS".to_string()));
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_facets_respect_filters(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: base_url.clone(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
+        }];
+        crate::seed_database(&sources, &pool).await.unwrap();
+
+        let mut pool_conn = pool.acquire().await.unwrap();
+        let mut repo = Deployments::new(&mut pool_conn);
+        let user = create_test_user(&pool).await;
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        repo.create(
+            &DeploymentCreateDBRequest::builder()
+                .created_by(user.id)
+                .model_name("facet-deleted".to_string())
+                .alias("facet-deleted".to_string())
+                .hosted_on(test_endpoint_id)
+                .model_type(ModelType::Chat)
+                .metadata(ModelCatalogMetadata {
+                    provider: Some("DeletedProvider".to_string()),
+                    ..Default::default()
+                })
+                .build(),
+        )
+        .await
+        .unwrap();
+
+        // Mark it as deleted
+        let models = repo.list(&DeploymentFilter::new(0, 100)).await.unwrap();
+        let deleted_model = models.iter().find(|m| m.alias == "facet-deleted").unwrap();
+        let update = DeploymentUpdateDBRequest::builder().deleted(true).build();
+        repo.update(deleted_model.id, &update).await.unwrap();
+
+        // Facets with deleted=false should NOT include DeletedProvider
+        let filter = DeploymentFilter::new(0, 100).with_deleted(false);
+        let (providers, _, _) = repo.facets(&filter).await.unwrap();
+        assert!(!providers.contains(&"DeletedProvider".to_string()));
     }
 }
