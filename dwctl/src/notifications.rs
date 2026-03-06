@@ -423,6 +423,14 @@ async fn process_auto_topups(
     conn: &mut sqlx::pool::PoolConnection<sqlx::Postgres>,
     email_service: Option<&EmailService>,
 ) {
+    // Pre-register counters so they appear in Prometheus as 0 before any code path hits them.
+    // Without this, metrics only exist after first increment, breaking alerts and dashboards.
+    let _ = counter!("dwctl_auto_topup_success_total");
+    let _ = counter!("dwctl_auto_topup_charge_failures_total");
+    let _ = counter!("dwctl_auto_topup_credit_failures_total");
+    let _ = counter!("dwctl_auto_topup_errors_total", "stage" => "idempotency_check");
+    let _ = counter!("dwctl_auto_topup_errors_total", "stage" => "payment_method_lookup");
+
     // 1. Get users with auto top-up configured
     let candidates = {
         let mut users = Users::new(&mut *conn);
