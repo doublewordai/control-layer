@@ -271,6 +271,45 @@ pub async fn create_batch<P: PoolProvider>(
         }
     }
 
+    // Check that the file owner (whose API key is embedded in the request templates)
+    // has sufficient balance. This catches cases where an admin creates a batch from
+    // a file owned by another user/org that has negative balance.
+    if let Some(ref uploaded_by) = file.uploaded_by
+        && let Ok(file_owner_id) = uuid::Uuid::parse_str(uploaded_by)
+    {
+        let file_owner_id = crate::types::UserId::from(file_owner_id);
+        if file_owner_id != current_user.id {
+            let mut conn = state.db.write().acquire().await.map_err(|e| Error::Internal {
+                operation: format!("get db connection for file owner credit check: {}", e),
+            })?;
+            let owner_balance = Credits::new(&mut conn)
+                .get_user_balance(file_owner_id)
+                .await
+                .map_err(|e| Error::Internal {
+                    operation: format!("check file owner credit balance: {}", e),
+                })?;
+            if owner_balance < rust_decimal::Decimal::ZERO {
+                let owner_name = {
+                    let mut users_repo = Users::new(&mut conn);
+                    users_repo
+                        .get_by_id(file_owner_id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(|u| u.display_name.unwrap_or(u.username))
+                        .unwrap_or_else(|| file_owner_id.to_string())
+                };
+                return Err(Error::InsufficientCredits {
+                    current_balance: owner_balance,
+                    message: format!(
+                        "File owner ({}) does not have enough balance. Please add credits to their account or upload a new file.",
+                        owner_name
+                    ),
+                });
+            }
+        }
+    }
+
     // Get per-model request counts from the file
     let file_stats = state
         .request_manager

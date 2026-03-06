@@ -335,7 +335,9 @@ export function CreateBatchModal({
       onClose();
     } catch (error) {
       console.error("Failed to create batch:", error);
-      setError("Failed to create batch. Please try again.");
+      const message =
+        error instanceof Error ? error.message : "An unexpected error occurred";
+      setError(message);
     }
   };
 

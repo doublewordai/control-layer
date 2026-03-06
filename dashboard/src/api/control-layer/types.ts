@@ -291,6 +291,7 @@ export interface User {
   has_auto_topup_payment_method: boolean; // Whether user has a saved payment method for auto top-up
   user_type?: "individual" | "organization"; // User type
   organizations?: OrganizationSummary[]; // only present when include=organizations or for current user
+  active_organization_id?: string; // only present for /users/current
 }
 
 export interface ApiKey {

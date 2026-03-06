@@ -35,9 +35,10 @@ export function AuthProvider({ children }: AuthProviderProps) {
       // Fetch directly to avoid 401 errors entering the React Query cache,
       // which would trigger the global onError handler and redirect to /login.
       // On success, populate the cache manually for downstream consumers.
-      const user = await dwctlApi.users.get("current");
+      // Include organizations so OrganizationProvider can read from the same cache entry.
+      const user = await dwctlApi.users.get("current", { include: "organizations" });
       queryClient.setQueryData(
-        queryKeys.users.byId("current", undefined),
+        queryKeys.users.byId("current", "organizations"),
         user,
       );
 

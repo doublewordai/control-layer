@@ -1642,15 +1642,7 @@ const usageApi = {
   },
 };
 
-// ===== Organization context header =====
 
-/**
- * Get active organization ID from localStorage.
- * Used by the fetch wrapper to include X-Organization-Id header.
- */
-export function getActiveOrganizationId(): string | null {
-  return localStorage.getItem("activeOrganizationId");
-}
 
 const organizationsApi = {
   async list(
