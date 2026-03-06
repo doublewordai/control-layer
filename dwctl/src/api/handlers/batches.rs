@@ -302,9 +302,7 @@ pub async fn create_batch<P: PoolProvider>(
                 return Err(Error::InsufficientCredits {
                     current_balance: owner_balance,
                     message: format!(
-                        "File owner ({}) does not have enough balance. \
-                         This file was uploaded under their account and requests will be billed to them. \
-                         Please add credits to their account or upload a new file.",
+                        "File owner ({}) does not have enough balance. Please add credits to their account or upload a new file.",
                         owner_name
                     ),
                 });
