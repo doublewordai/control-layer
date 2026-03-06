@@ -11,6 +11,7 @@ import {
 import { toast } from "sonner";
 import { useSettings, useOrganizationContext } from "@/contexts";
 import { TransactionHistory } from "@/components/features/cost-management/CostManagement/TransactionHistory.tsx";
+import { AutoTopupSection } from "@/components/features/cost-management/CostManagement/AutoTopupSection.tsx";
 import { AddFundsModal } from "@/components/modals/AddCreditsModal/AddCreditsModal";
 import {
   Dialog,
@@ -33,7 +34,6 @@ export function CostManagement() {
   const [showSuccessModal, setShowSuccessModal] = useState(false);
   const [showCancelledModal, setShowCancelledModal] = useState(false);
   const [showAddFundsModal, setShowAddFundsModal] = useState(false);
-
   // Check if we're filtering by a specific user
   const filterUserId = searchParams.get("user");
 
@@ -223,6 +223,20 @@ export function CostManagement() {
     }
   })();
 
+  const showAutoTopupSection =
+    (isDemoMode || !!config?.payment_enabled) && displayUser && !filterUserId;
+
+  const autoTopupElement = showAutoTopupSection ? (
+    <AutoTopupSection
+      user={displayUser!}
+      userId={currentUser!.id}
+      onSuccess={() => {
+        refetchCurrentUser();
+        refetchDisplayUser();
+      }}
+    />
+  ) : undefined;
+
   return (
     <div className="p-6">
       {currentUser && displayUser && (
@@ -232,6 +246,7 @@ export function CostManagement() {
             addFundsConfig={addFundsConfig}
             showCard={false}
             filterUserId={filterUserId || undefined}
+            headerExtra={autoTopupElement}
           />
           {/* Admin modal for gifting funds to users */}
           {canManageFunds && (

@@ -378,6 +378,22 @@ pub async fn update_user<P: PoolProvider>(
         });
     }
 
+    // Validate auto-topup fields if provided
+    if let Some(Some(amount)) = &user_data.auto_topup_amount
+        && *amount <= 0.0
+    {
+        return Err(Error::BadRequest {
+            message: "Auto top-up amount must be positive".to_string(),
+        });
+    }
+    if let Some(Some(threshold)) = &user_data.auto_topup_threshold
+        && *threshold < 0.0
+    {
+        return Err(Error::BadRequest {
+            message: "Auto top-up threshold must be non-negative".to_string(),
+        });
+    }
+
     let mut conn = state.db.write().acquire().await.expect("Failed to acquire database connection");
 
     let mut repo = Users::new(&mut conn);

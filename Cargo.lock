@@ -1429,6 +1429,8 @@ dependencies = [
  "async-stripe",
  "async-stripe-billing",
  "async-stripe-checkout",
+ "async-stripe-core",
+ "async-stripe-misc",
  "async-stripe-types",
  "async-stripe-webhook",
  "async-trait",

@@ -104,7 +104,8 @@ impl<'c> Organizations<'c> {
             RETURNING id, username, email, display_name, avatar_url, auth_source, created_at, updated_at,
                       is_admin, password_hash, external_user_id, payment_provider_id,
                       is_deleted, is_internal, batch_notifications_enabled, first_batch_email_sent,
-                      low_balance_notification_sent, low_balance_threshold, user_type
+                      low_balance_notification_sent, low_balance_threshold,
+                      auto_topup_amount, auto_topup_threshold, user_type
             "#,
             org_id,
             request.name,
@@ -144,6 +145,8 @@ impl<'c> Organizations<'c> {
             first_batch_email_sent: row.first_batch_email_sent,
             low_balance_notification_sent: row.low_balance_notification_sent,
             low_balance_threshold: row.low_balance_threshold,
+            auto_topup_amount: row.auto_topup_amount,
+            auto_topup_threshold: row.auto_topup_threshold,
             user_type: row.user_type,
         })
     }
@@ -179,7 +182,8 @@ impl<'c> Organizations<'c> {
             RETURNING id, username, email, display_name, avatar_url, auth_source, created_at, updated_at,
                       is_admin, password_hash, external_user_id, payment_provider_id,
                       batch_notifications_enabled, first_batch_email_sent,
-                      low_balance_notification_sent, low_balance_threshold, user_type
+                      low_balance_notification_sent, low_balance_threshold,
+                      auto_topup_amount, auto_topup_threshold, user_type
             "#,
             id,
             request.display_name,
@@ -208,6 +212,8 @@ impl<'c> Organizations<'c> {
             first_batch_email_sent: row.first_batch_email_sent,
             low_balance_notification_sent: row.low_balance_notification_sent,
             low_balance_threshold: row.low_balance_threshold,
+            auto_topup_amount: row.auto_topup_amount,
+            auto_topup_threshold: row.auto_topup_threshold,
             user_type: row.user_type,
         })
     }

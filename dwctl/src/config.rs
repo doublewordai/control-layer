@@ -476,6 +476,9 @@ pub struct StripeConfig {
     /// Whether to enable invoice creation for checkout sessions (default: false)
     #[serde(default)]
     pub enable_invoice_creation: bool,
+    /// Custom text displayed for terms of service acceptance during auto top-up setup.
+    /// If not set, no terms of service acceptance text is shown.
+    pub auto_topup_terms_of_service_text: Option<String>,
 }
 
 /// Dummy payment configuration for testing.

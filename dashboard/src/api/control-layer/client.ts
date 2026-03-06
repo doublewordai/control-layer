@@ -1105,6 +1105,33 @@ const paymentsApi = {
 
     return response.json();
   },
+
+  async enableAutoTopup(
+    threshold: number,
+    amount: number,
+  ): Promise<{
+    has_payment_method?: boolean;
+    needs_billing_portal?: boolean;
+    threshold?: number;
+    amount?: number;
+  }> {
+    const response = await fetch("/admin/api/v1/auto-topup/enable", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ threshold, amount }),
+    });
+
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({}));
+      throw new Error(
+        errorData.message ||
+          `Failed to enable auto top-up: ${response.status}`,
+      );
+    }
+
+    return response.json();
+  },
+
 };
 
 // Probes API

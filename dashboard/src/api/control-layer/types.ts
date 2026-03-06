@@ -286,6 +286,9 @@ export interface User {
   has_payment_provider_id: boolean; // Whether the user has a payment provider customer ID set
   batch_notifications_enabled: boolean; // Whether the user receives batch completion emails
   low_balance_threshold: number | null; // Threshold for low balance notifications (null = disabled)
+  auto_topup_amount: number | null; // Auto top-up amount in dollars (null = disabled)
+  auto_topup_threshold: number | null; // Balance threshold that triggers auto top-up (null = disabled)
+  has_auto_topup_payment_method: boolean; // Whether user has a saved payment method for auto top-up
   user_type?: "individual" | "organization"; // User type
   organizations?: OrganizationSummary[]; // only present when include=organizations or for current user
 }
@@ -385,6 +388,8 @@ export interface UserUpdateRequest {
   roles?: Role[];
   batch_notifications_enabled?: boolean;
   low_balance_threshold?: number | null; // Set a threshold to enable, null to disable
+  auto_topup_amount?: number | null; // Set an amount to enable, null to disable
+  auto_topup_threshold?: number | null; // Set a threshold to enable, null to disable
 }
 
 export interface GroupUpdateRequest {

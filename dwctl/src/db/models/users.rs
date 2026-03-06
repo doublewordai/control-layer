@@ -45,6 +45,12 @@ pub struct UserUpdateDBRequest {
     /// Low balance notification threshold.
     /// `None` = don't change, `Some(None)` = disable, `Some(Some(val))` = set threshold.
     pub low_balance_threshold: Option<Option<f32>>,
+    /// Auto top-up amount.
+    /// `None` = don't change, `Some(None)` = disable, `Some(Some(val))` = set amount.
+    pub auto_topup_amount: Option<Option<f32>>,
+    /// Auto top-up threshold (balance level that triggers auto top-up).
+    /// `None` = don't change, `Some(None)` = disable, `Some(Some(val))` = set threshold.
+    pub auto_topup_threshold: Option<Option<f32>>,
 }
 
 impl UserUpdateDBRequest {
@@ -56,6 +62,8 @@ impl UserUpdateDBRequest {
             password_hash: None, // Regular updates don't include password changes
             batch_notifications_enabled: update.batch_notifications_enabled,
             low_balance_threshold: update.low_balance_threshold,
+            auto_topup_amount: update.auto_topup_amount,
+            auto_topup_threshold: update.auto_topup_threshold,
         }
     }
 }
@@ -81,6 +89,10 @@ pub struct UserDBResponse {
     pub low_balance_notification_sent: bool,
     /// Low balance notification threshold. NULL means notifications are disabled.
     pub low_balance_threshold: Option<f32>,
+    /// Auto top-up amount. NULL means auto top-up is disabled.
+    pub auto_topup_amount: Option<f32>,
+    /// Auto top-up threshold. When balance drops below this, auto top-up triggers.
+    pub auto_topup_threshold: Option<f32>,
     /// User type: 'individual' or 'organization'
     pub user_type: String,
 }
