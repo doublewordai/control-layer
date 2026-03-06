@@ -288,6 +288,7 @@ export interface User {
   low_balance_threshold: number | null; // Threshold for low balance notifications (null = disabled)
   auto_topup_amount: number | null; // Auto top-up amount in dollars (null = disabled)
   auto_topup_threshold: number | null; // Balance threshold that triggers auto top-up (null = disabled)
+  has_auto_topup_payment_method: boolean; // Whether user has a saved payment method for auto top-up
 }
 
 export interface ApiKey {

@@ -548,7 +548,7 @@ mod tests {
     use crate::config::DummyConfig;
     use crate::{config::PaymentConfig, test::utils::create_test_config};
     use axum::Router;
-    use axum::routing::{patch, post};
+    use axum::routing::{patch, post, put};
     use axum_test::TestServer;
     use rust_decimal::Decimal;
     use sqlx::PgPool;
@@ -857,5 +857,174 @@ mod tests {
 
         // Assert 503 Service Unavailable because no payment provider configured
         response.assert_status(StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[sqlx::test]
+    async fn test_auto_topup_checkout_success(pool: PgPool) {
+        let mut config = create_test_config();
+        config.payment = Some(PaymentConfig::Dummy(DummyConfig {
+            amount: Decimal::new(100, 0),
+        }));
+
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
+
+        let user = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
+
+        // User needs a payment_provider_id for auto top-up checkout
+        sqlx::query!("UPDATE users SET payment_provider_id = $1 WHERE id = $2", "cus_test_123", user.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let auth_headers = crate::test::utils::add_auth_headers(&user);
+
+        let app = Router::new()
+            .route("/auto-topup/checkout", post(create_auto_topup_checkout))
+            .with_state(state);
+
+        let server = TestServer::new(app).unwrap();
+
+        let mut request = server.post("/auto-topup/checkout");
+        for (key, value) in &auth_headers {
+            request = request.add_header(key.as_str(), value.as_str());
+        }
+        let response = request.await;
+
+        response.assert_status(StatusCode::OK);
+        let body: serde_json::Value = response.json();
+        let url = body["url"].as_str().expect("Should contain checkout URL");
+        assert!(url.contains("autoTopupId="), "URL should contain autoTopupId param");
+        assert!(url.contains("autoTopup=true"), "URL should contain autoTopup param");
+    }
+
+    #[sqlx::test]
+    async fn test_auto_topup_checkout_no_provider(pool: PgPool) {
+        let config = create_test_config();
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
+
+        let user = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
+        let auth_headers = crate::test::utils::add_auth_headers(&user);
+
+        let app = Router::new()
+            .route("/auto-topup/checkout", post(create_auto_topup_checkout))
+            .with_state(state);
+
+        let server = TestServer::new(app).unwrap();
+
+        let mut request = server.post("/auto-topup/checkout");
+        for (key, value) in &auth_headers {
+            request = request.add_header(key.as_str(), value.as_str());
+        }
+        let response = request.await;
+
+        response.assert_status(StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[sqlx::test]
+    async fn test_process_auto_topup_success(pool: PgPool) {
+        let mut config = create_test_config();
+        config.payment = Some(PaymentConfig::Dummy(DummyConfig {
+            amount: Decimal::new(100, 0),
+        }));
+
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
+
+        let user = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
+        let auth_headers = crate::test::utils::add_auth_headers(&user);
+
+        // First create a checkout session to get a valid session ID
+        let app = Router::new()
+            .route("/auto-topup/checkout", post(create_auto_topup_checkout))
+            .route("/auto-topup/{id}", put(process_auto_topup))
+            .with_state(state);
+
+        let server = TestServer::new(app).unwrap();
+
+        // Get checkout URL
+        let mut request = server.post("/auto-topup/checkout");
+        for (key, value) in &auth_headers {
+            request = request.add_header(key.as_str(), value.as_str());
+        }
+        let response = request.await;
+        response.assert_status(StatusCode::OK);
+
+        let body: serde_json::Value = response.json();
+        let checkout_url = body["url"].as_str().unwrap();
+
+        // Extract session ID from URL
+        let url = url::Url::parse(checkout_url).unwrap();
+        let query_pairs: std::collections::HashMap<_, _> = url.query_pairs().collect();
+        let session_id = query_pairs.get("autoTopupId").unwrap();
+
+        // Process auto top-up with threshold and amount
+        let mut request = server.put(&format!("/auto-topup/{}", session_id)).json(&serde_json::json!({
+            "threshold": 5.0,
+            "amount": 25.0
+        }));
+        for (key, value) in &auth_headers {
+            request = request.add_header(key.as_str(), value.as_str());
+        }
+        let response = request.await;
+
+        response.assert_status(StatusCode::OK);
+        let body: serde_json::Value = response.json();
+        assert_eq!(body["threshold"], 5.0);
+        assert_eq!(body["amount"], 25.0);
+
+        // Verify auto top-up settings saved in DB
+        let row = sqlx::query!(
+            "SELECT auto_topup_amount, auto_topup_threshold, auto_topup_payment_id FROM users WHERE id = $1",
+            user.id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(row.auto_topup_amount, Some(25.0));
+        assert_eq!(row.auto_topup_threshold, Some(5.0));
+        assert!(row.auto_topup_payment_id.is_some(), "Payment method ID should be saved");
+        assert!(
+            row.auto_topup_payment_id.unwrap().starts_with("dummy_pm_"),
+            "Should be a dummy payment method ID"
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_process_auto_topup_invalid_params(pool: PgPool) {
+        let mut config = create_test_config();
+        config.payment = Some(PaymentConfig::Dummy(DummyConfig {
+            amount: Decimal::new(100, 0),
+        }));
+
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
+
+        let user = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
+        let auth_headers = crate::test::utils::add_auth_headers(&user);
+
+        let app = Router::new().route("/auto-topup/{id}", put(process_auto_topup)).with_state(state);
+
+        let server = TestServer::new(app).unwrap();
+
+        // Test negative threshold
+        let mut request = server.put("/auto-topup/dummy_session_fake").json(&serde_json::json!({
+            "threshold": -1.0,
+            "amount": 25.0
+        }));
+        for (key, value) in &auth_headers {
+            request = request.add_header(key.as_str(), value.as_str());
+        }
+        let response = request.await;
+        response.assert_status(StatusCode::BAD_REQUEST);
+
+        // Test zero amount
+        let mut request = server.put("/auto-topup/dummy_session_fake").json(&serde_json::json!({
+            "threshold": 5.0,
+            "amount": 0.0
+        }));
+        for (key, value) in &auth_headers {
+            request = request.add_header(key.as_str(), value.as_str());
+        }
+        let response = request.await;
+        response.assert_status(StatusCode::BAD_REQUEST);
     }
 }

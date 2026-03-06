@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            UPDATE users SET\n                display_name = COALESCE($2, display_name),\n                avatar_url = COALESCE($3, avatar_url),\n                password_hash = COALESCE($4, password_hash),\n                batch_notifications_enabled = COALESCE($5, batch_notifications_enabled),\n                low_balance_threshold = CASE\n                    WHEN $6::boolean THEN $7\n                    ELSE low_balance_threshold\n                END,\n                low_balance_notification_sent = CASE\n                    WHEN $6::boolean THEN false\n                    ELSE low_balance_notification_sent\n                END,\n                auto_topup_amount = CASE\n                    WHEN $8::boolean THEN $9\n                    ELSE auto_topup_amount\n                END,\n                updated_at = NOW()\n            WHERE id = $1\n            RETURNING *\n            ",
+  "query": "\n            UPDATE users SET\n                display_name = COALESCE($2, display_name),\n                avatar_url = COALESCE($3, avatar_url),\n                password_hash = COALESCE($4, password_hash),\n                batch_notifications_enabled = COALESCE($5, batch_notifications_enabled),\n                low_balance_threshold = CASE\n                    WHEN $6::boolean THEN $7\n                    ELSE low_balance_threshold\n                END,\n                low_balance_notification_sent = CASE\n                    WHEN $6::boolean THEN false\n                    ELSE low_balance_notification_sent\n                END,\n                auto_topup_amount = CASE\n                    WHEN $8::boolean THEN $9\n                    ELSE auto_topup_amount\n                END,\n                auto_topup_threshold = CASE\n                    WHEN $10::boolean THEN $11\n                    ELSE auto_topup_threshold\n                END,\n                auto_topup_payment_id = CASE\n                    WHEN $12::boolean THEN $13\n                    ELSE auto_topup_payment_id\n                END,\n                updated_at = NOW()\n            WHERE id = $1\n            RETURNING *\n            ",
   "describe": {
     "columns": [
       {
@@ -102,6 +102,16 @@
         "ordinal": 19,
         "name": "auto_topup_amount",
         "type_info": "Float4"
+      },
+      {
+        "ordinal": 20,
+        "name": "auto_topup_threshold",
+        "type_info": "Float4"
+      },
+      {
+        "ordinal": 21,
+        "name": "auto_topup_payment_id",
+        "type_info": "Text"
       }
     ],
     "parameters": {
@@ -114,7 +124,11 @@
         "Bool",
         "Float4",
         "Bool",
-        "Float4"
+        "Float4",
+        "Bool",
+        "Float4",
+        "Bool",
+        "Text"
       ]
     },
     "nullable": [
@@ -137,8 +151,10 @@
       false,
       false,
       true,
+      true,
+      true,
       true
     ]
   },
-  "hash": "0fc4473f7c10a2bf6e55563ab84646ea1c20b031149807ce6fc5963a2853301a"
+  "hash": "152d2e1375f5c926d343c647bc2740b42221ff779126b4815efd3e1544f462ec"
 }

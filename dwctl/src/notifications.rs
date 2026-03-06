@@ -22,10 +22,12 @@ use uuid::Uuid;
 
 use crate::config::NotificationsConfig;
 use crate::db::handlers::repository::Repository;
-use crate::db::handlers::users::{LowBalanceUser, Users};
+use crate::db::handlers::users::{AutoTopupUser, LowBalanceUser, Users};
 use crate::db::handlers::{Credits, Webhooks};
+use crate::db::models::credits::{CreditTransactionCreateDBRequest, CreditTransactionType};
 use crate::db::models::webhooks::WebhookDeliveryCreateDBRequest;
 use crate::email::EmailService;
+use crate::payment_providers::{self, PaymentProvider};
 use crate::webhooks::WebhookDispatcher;
 use crate::webhooks::events::{WebhookEvent, WebhookEventType};
 
@@ -126,6 +128,9 @@ pub async fn run_notification_poller(
     } else {
         None
     };
+
+    let payment_provider: Option<Box<dyn PaymentProvider>> =
+        app_config.payment.as_ref().map(|pc| payment_providers::create_provider(pc.clone()));
 
     let email_service = if config.enabled {
         match EmailService::new(&app_config) {
@@ -262,7 +267,12 @@ pub async fn run_notification_poller(
             }
         }
 
-        // === Step 5: Dispatch webhooks (claim → sign → send → process results) ===
+        // === Step 5: Auto top-up charges ===
+        if let Some(ref provider) = payment_provider {
+            process_auto_topups(provider.as_ref(), &mut conn).await;
+        }
+
+        // === Step 6: Dispatch webhooks (claim → sign → send → process results) ===
         if let Some(ref mut dispatcher) = dispatcher {
             dispatcher.tick().await;
         }
@@ -389,6 +399,144 @@ async fn send_email_notifications(
                     user_id = %info.user_id,
                     error = %e,
                     "Failed to mark first batch email as sent"
+                );
+            }
+        }
+    }
+}
+
+/// Process auto top-up charges for users whose balance has dropped below their threshold.
+///
+/// For each eligible user:
+/// 1. Refreshes balance to get an accurate reading
+/// 2. Checks if balance is below the user's configured threshold
+/// 3. Charges the saved payment method via the payment provider
+/// 4. Creates a credit transaction (idempotent via unique source_id)
+async fn process_auto_topups(provider: &dyn PaymentProvider, conn: &mut sqlx::pool::PoolConnection<sqlx::Postgres>) {
+    // 1. Get users with auto top-up configured
+    let candidates = {
+        let mut users = Users::new(&mut *conn);
+        users.users_with_auto_topup_enabled().await.unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "Failed to fetch auto-topup eligible users");
+            vec![]
+        })
+    };
+
+    if candidates.is_empty() {
+        return;
+    }
+
+    // 2. Refresh balances for users near their threshold (same pattern as low-balance)
+    const REFRESH_MARGIN: rust_decimal::Decimal = rust_decimal::Decimal::from_parts(30, 0, 0, false, 0);
+
+    let needs_refresh: Vec<Uuid> = candidates
+        .iter()
+        .filter(|u| match u.checkpoint_balance {
+            Some(b) => (b - u.auto_topup_threshold) < REFRESH_MARGIN,
+            None => true,
+        })
+        .map(|u| u.id)
+        .collect();
+
+    let refreshed = if !needs_refresh.is_empty() {
+        let mut credits = Credits::new(&mut *conn);
+        credits.get_users_balances_bulk(&needs_refresh, Some(1)).await.unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "Failed to refresh balances for auto-topup users");
+            Default::default()
+        })
+    } else {
+        Default::default()
+    };
+
+    let balance_for = |u: &AutoTopupUser| -> Option<rust_decimal::Decimal> { refreshed.get(&u.id).copied().or(u.checkpoint_balance) };
+
+    // 3. Filter to users below their threshold
+    let to_charge: Vec<_> = candidates
+        .iter()
+        .filter(|u| balance_for(u).map(|b| b < u.auto_topup_threshold).unwrap_or(false))
+        .collect();
+
+    if to_charge.is_empty() {
+        return;
+    }
+
+    tracing::info!(count = to_charge.len(), "Found users eligible for auto top-up");
+
+    // 4. Charge each user
+    for user in &to_charge {
+        let amount_cents = (user.auto_topup_amount * rust_decimal::Decimal::new(100, 0))
+            .to_string()
+            .parse::<i64>()
+            .unwrap_or(0);
+
+        if amount_cents <= 0 {
+            tracing::warn!(user_id = %user.id, "Auto top-up amount resolved to zero cents, skipping");
+            continue;
+        }
+
+        // Use a deterministic source_id prefix so duplicate charges within a short window
+        // are caught by the unique constraint on credits_transactions.source_id.
+        // We include the date so a user can be charged again on a subsequent day if they
+        // drop below threshold again.
+        let today = chrono::Utc::now().format("%Y-%m-%d");
+        let source_id = format!("auto_topup_{}_{}", user.id, today);
+
+        // Check idempotency: skip if we already charged this user today
+        {
+            let mut credits = Credits::new(&mut *conn);
+            match credits.transaction_exists_by_source_id(&source_id).await {
+                Ok(true) => {
+                    tracing::debug!(user_id = %user.id, "Auto top-up already processed today, skipping");
+                    continue;
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::warn!(user_id = %user.id, error = %e, "Failed to check auto-topup idempotency");
+                    continue;
+                }
+            }
+        }
+
+        // Charge the payment provider
+        let payment_intent_id = match provider
+            .charge_auto_topup(amount_cents, &user.payment_provider_id, &user.auto_topup_payment_id)
+            .await
+        {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::warn!(
+                    user_id = %user.id,
+                    error = %e,
+                    "Failed to charge auto top-up"
+                );
+                continue;
+            }
+        };
+
+        // Create the credit transaction
+        let request = CreditTransactionCreateDBRequest {
+            user_id: user.id,
+            transaction_type: CreditTransactionType::Purchase,
+            amount: user.auto_topup_amount,
+            source_id,
+            description: Some(format!("Automatic top-up ({})", payment_intent_id)),
+            fusillade_batch_id: None,
+        };
+
+        let mut credits = Credits::new(&mut *conn);
+        match credits.create_transaction(&request).await {
+            Ok(_) => {
+                tracing::info!(
+                    user_id = %user.id,
+                    amount = %user.auto_topup_amount,
+                    "Auto top-up charged successfully"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    user_id = %user.id,
+                    error = %e,
+                    "Failed to create credit transaction for auto top-up"
                 );
             }
         }

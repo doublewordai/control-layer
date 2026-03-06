@@ -183,4 +183,15 @@ pub trait PaymentProvider: Send + Sync {
     /// Unlike `process_payment_session`, this does not create a credit transaction.
     /// It only validates the session so the caller can safely enable auto top-up.
     async fn process_auto_topup_session(&self, db_pool: &PgPool, session_id: &str) -> Result<String>;
+
+    /// Charge a saved payment method off-session for auto top-up.
+    ///
+    /// Creates a payment intent using the saved payment method and customer ID.
+    /// Returns the payment intent ID on success (used as `source_id` for the credit transaction).
+    ///
+    /// # Arguments
+    /// * `amount_cents` - Amount to charge in cents
+    /// * `customer_id` - Payment provider customer ID
+    /// * `payment_method_id` - Saved payment method ID
+    async fn charge_auto_topup(&self, amount_cents: i64, customer_id: &str, payment_method_id: &str) -> Result<String>;
 }

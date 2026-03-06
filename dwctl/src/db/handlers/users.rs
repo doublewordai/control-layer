@@ -37,6 +37,21 @@ impl UserFilter {
     }
 }
 
+/// User eligible for auto top-up (has payment method + threshold + amount configured).
+#[derive(Debug, Clone)]
+pub struct AutoTopupUser {
+    pub id: UserId,
+    pub email: String,
+    pub username: String,
+    pub display_name: Option<String>,
+    pub payment_provider_id: String,
+    pub auto_topup_payment_id: String,
+    pub auto_topup_threshold: rust_decimal::Decimal,
+    pub auto_topup_amount: rust_decimal::Decimal,
+    /// Cached checkpoint balance, if one exists.
+    pub checkpoint_balance: Option<rust_decimal::Decimal>,
+}
+
 /// User with a low-balance threshold configured.
 #[derive(Debug, Clone)]
 pub struct LowBalanceUser {
@@ -764,6 +779,34 @@ impl<'c> Users<'c> {
         .execute(&mut *self.db)
         .await?;
         Ok(())
+    }
+
+    /// Return all users who have auto top-up fully configured (threshold + amount + payment method).
+    #[instrument(skip(self), err)]
+    pub async fn users_with_auto_topup_enabled(&mut self) -> Result<Vec<AutoTopupUser>> {
+        let rows = sqlx::query_as!(
+            AutoTopupUser,
+            r#"
+            SELECT u.id, u.email, u.username, u.display_name,
+                   u.payment_provider_id as "payment_provider_id!",
+                   u.auto_topup_payment_id as "auto_topup_payment_id!",
+                   u.auto_topup_threshold::decimal(20, 9) as "auto_topup_threshold!",
+                   u.auto_topup_amount::decimal(20, 9) as "auto_topup_amount!",
+                   c.balance as "checkpoint_balance?"
+            FROM users u
+            LEFT JOIN user_balance_checkpoints c ON c.user_id = u.id
+            WHERE u.id != '00000000-0000-0000-0000-000000000000'
+              AND u.is_deleted = false
+              AND u.auto_topup_payment_id IS NOT NULL
+              AND u.auto_topup_threshold IS NOT NULL
+              AND u.auto_topup_amount IS NOT NULL
+              AND u.payment_provider_id IS NOT NULL
+            "#,
+        )
+        .fetch_all(&mut *self.db)
+        .await?;
+
+        Ok(rows)
     }
 
     /// Set the payment provider ID for a user if it's not already set

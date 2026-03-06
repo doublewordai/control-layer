@@ -169,12 +169,7 @@ impl PaymentProvider for DummyProvider {
         Ok(())
     }
 
-    async fn create_auto_topup_checkout_session(
-        &self,
-        user: &CurrentUser,
-        _cancel_url: &str,
-        success_url: &str,
-    ) -> Result<String> {
+    async fn create_auto_topup_checkout_session(&self, user: &CurrentUser, _cancel_url: &str, success_url: &str) -> Result<String> {
         // Dummy provider: always redirect to success URL (no real payment flow)
         let session_id = format!("dummy_session_{}_{}", user.id, uuid::Uuid::new_v4());
         let redirect_url = success_url.replace("{CHECKOUT_SESSION_ID}", &session_id);
@@ -187,6 +182,11 @@ impl PaymentProvider for DummyProvider {
             return Err(PaymentError::InvalidData("Invalid dummy session ID format".to_string()));
         }
         Ok(format!("dummy_pm_{}", uuid::Uuid::new_v4()))
+    }
+
+    async fn charge_auto_topup(&self, _amount_cents: i64, _customer_id: &str, _payment_method_id: &str) -> Result<String> {
+        // Dummy provider always succeeds - return a fake payment intent ID
+        Ok(format!("dummy_pi_{}", uuid::Uuid::new_v4()))
     }
 
     async fn create_billing_portal_session(&self, user: &CurrentUser, return_url: &str) -> Result<String> {

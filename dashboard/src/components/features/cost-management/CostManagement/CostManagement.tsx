@@ -11,6 +11,7 @@ import {
 import { toast } from "sonner";
 import { useSettings } from "@/contexts";
 import { TransactionHistory } from "@/components/features/cost-management/CostManagement/TransactionHistory.tsx";
+import { AutoTopupSection } from "@/components/features/cost-management/CostManagement/AutoTopupSection.tsx";
 import { AddFundsModal } from "@/components/modals/AddCreditsModal/AddCreditsModal";
 import { AutoTopupModal } from "@/components/modals/AutoTopupModal/AutoTopupModal";
 import {
@@ -47,13 +48,11 @@ export function CostManagement() {
       setAutoTopupId(autoTopupIdParam ?? undefined);
       setShowAutoTopupModal(true);
 
-      // Clean autoTopupId from URL but preserve other params
-      if (autoTopupIdParam) {
-        const url = new URL(window.location.href);
-        url.searchParams.delete("autoTopupId");
-        url.searchParams.delete("autoTopup");
-        window.history.replaceState({}, "", url.pathname + url.search);
-      }
+      // Clean auto-topup params from URL to prevent modal reopening on refresh
+      const url = new URL(window.location.href);
+      url.searchParams.delete("autoTopupId");
+      url.searchParams.delete("autoTopup");
+      window.history.replaceState({}, "", url.pathname + url.search);
     }
   }, [openAutoTopup, autoTopupIdParam]);
 
@@ -225,7 +224,6 @@ export function CostManagement() {
         onGiftFunds: canManageFunds ? handleGiftFunds : undefined,
         // Only show "Billing Portal" if user has a customer ID
         onBillingPortal: hasCustomerId ? handleBillingPortal : undefined,
-        onManageAutoTopup: () => setShowAutoTopupModal(true),
       };
     } else {
       // Non-admin without customer ID: simple payment button
@@ -238,6 +236,21 @@ export function CostManagement() {
     }
   })();
 
+  const showAutoTopupSection =
+    (isDemoMode || !!config?.payment_enabled) && displayUser && !filterUserId;
+
+  const autoTopupElement = showAutoTopupSection ? (
+    <AutoTopupSection
+      user={displayUser!}
+      userId={currentUser!.id}
+      onSetupRequired={() => setShowAutoTopupModal(true)}
+      onSuccess={() => {
+        refetchCurrentUser();
+        refetchDisplayUser();
+      }}
+    />
+  ) : undefined;
+
   return (
     <div className="p-6">
       {currentUser && displayUser && (
@@ -247,6 +260,7 @@ export function CostManagement() {
             addFundsConfig={addFundsConfig}
             showCard={false}
             filterUserId={filterUserId || undefined}
+            headerExtra={autoTopupElement}
           />
           {/* Admin modal for gifting funds to users */}
           {canManageFunds && (

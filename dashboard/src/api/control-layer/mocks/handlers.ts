@@ -596,6 +596,7 @@ export const handlers = [
       low_balance_threshold: 2.0,
       auto_topup_amount: null,
       auto_topup_threshold: null,
+      has_auto_topup_payment_method: false,
     };
     return HttpResponse.json(newUser, { status: 201 });
   }),

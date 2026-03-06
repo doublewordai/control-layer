@@ -102,6 +102,16 @@
         "ordinal": 19,
         "name": "auto_topup_amount",
         "type_info": "Float4"
+      },
+      {
+        "ordinal": 20,
+        "name": "auto_topup_threshold",
+        "type_info": "Float4"
+      },
+      {
+        "ordinal": 21,
+        "name": "auto_topup_payment_id",
+        "type_info": "Text"
       }
     ],
     "parameters": {
@@ -136,6 +146,8 @@
       false,
       false,
       false,
+      true,
+      true,
       true,
       true
     ]
