@@ -995,7 +995,6 @@ mod tests {
                     description: Some("Initial credit for testing".to_string()),
                     fusillade_batch_id: None,
                     api_key_id: None,
-                    performed_by: None,
                 })
                 .await
                 .unwrap();
@@ -1128,7 +1127,6 @@ mod tests {
                     description: Some("Initial credit for testing".to_string()),
                     fusillade_batch_id: None,
                     api_key_id: None,
-                    performed_by: None,
                 })
                 .await
                 .unwrap();
@@ -1274,7 +1272,6 @@ mod tests {
                     description: Some("Initial credit for testing".to_string()),
                     fusillade_batch_id: None,
                     api_key_id: None,
-                    performed_by: None,
                 })
                 .await
                 .unwrap();
@@ -1457,7 +1454,6 @@ mod tests {
                     description: Some("Initial credit for testing".to_string()),
                     fusillade_batch_id: None,
                     api_key_id: None,
-                    performed_by: None,
                 })
                 .await
                 .unwrap();
@@ -1470,7 +1466,6 @@ mod tests {
                     description: Some("Initial credit for testing".to_string()),
                     fusillade_batch_id: None,
                     api_key_id: None,
-                    performed_by: None,
                 })
                 .await
                 .unwrap();
@@ -1634,7 +1629,6 @@ mod tests {
                     description: Some("Initial credit for testing".to_string()),
                     fusillade_batch_id: None,
                     api_key_id: None,
-                    performed_by: None,
                 })
                 .await
                 .unwrap();
@@ -1776,7 +1770,6 @@ mod tests {
                     description: Some("Initial credit for testing".to_string()),
                     fusillade_batch_id: None,
                     api_key_id: None,
-                    performed_by: None,
                 })
                 .await
                 .unwrap();
@@ -1984,7 +1977,6 @@ mod tests {
                     description: Some("Initial credit for testing".to_string()),
                     fusillade_batch_id: None,
                     api_key_id: None,
-                    performed_by: None,
                 })
                 .await
                 .unwrap();
@@ -2859,7 +2851,6 @@ mod tests {
                 description: Some("Initial credits".to_string()),
                 fusillade_batch_id: None,
                 api_key_id: None,
-                performed_by: None,
             })
             .await
             .unwrap();
@@ -2874,7 +2865,6 @@ mod tests {
                 description: Some("Initial credits".to_string()),
                 fusillade_batch_id: None,
                 api_key_id: None,
-                performed_by: None,
             })
             .await
             .unwrap();
@@ -2888,7 +2878,6 @@ mod tests {
                 description: Some("Used all credits".to_string()),
                 fusillade_batch_id: None,
                 api_key_id: None,
-                performed_by: None,
             })
             .await
             .unwrap();
@@ -3005,7 +2994,6 @@ mod tests {
                     description: Some("Platform Manager credits".to_string()),
                     fusillade_batch_id: None,
                     api_key_id: None,
-                    performed_by: None,
                 })
                 .await
                 .unwrap();
@@ -3148,7 +3136,6 @@ mod tests {
                     description: Some("Initial credits".to_string()),
                     fusillade_batch_id: None,
                     api_key_id: None,
-                    performed_by: None,
                 })
                 .await
                 .unwrap();
@@ -3162,7 +3149,6 @@ mod tests {
                     description: Some("Negative balance".to_string()),
                     fusillade_batch_id: None,
                     api_key_id: None,
-                    performed_by: None,
                 })
                 .await
                 .unwrap();
@@ -3256,7 +3242,6 @@ mod tests {
                     description: Some("Added credits".to_string()),
                     fusillade_batch_id: None,
                     api_key_id: None,
-                    performed_by: None,
                 })
                 .await
                 .unwrap();

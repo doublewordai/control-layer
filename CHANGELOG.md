@@ -1,5 +1,17 @@
 # Changelog
 
+## [8.13.0](https://github.com/doublewordai/control-layer/compare/v8.12.0...v8.13.0) (2026-03-04)
+
+
+### Features
+
+* support legacy /v1/completions endpoint ([#803](https://github.com/doublewordai/control-layer/issues/803)) ([78e1712](https://github.com/doublewordai/control-layer/commit/78e1712c20e5101589cd7f6d6563c75142ea2e03))
+
+
+### Bug Fixes
+
+* reject batch creation when account balance is negative ([#799](https://github.com/doublewordai/control-layer/issues/799)) ([64fa3f0](https://github.com/doublewordai/control-layer/commit/64fa3f0e7a8c6735464c42cf9da9166a1de5bbaf))
+
 ## [8.12.0](https://github.com/doublewordai/control-layer/compare/v8.11.0...v8.12.0) (2026-03-03)
 
 

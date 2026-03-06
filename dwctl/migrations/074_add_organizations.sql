@@ -57,13 +57,13 @@ CREATE TRIGGER user_organizations_notify
 ALTER TABLE http_analytics ADD COLUMN api_key_id UUID;
 CREATE INDEX idx_http_analytics_api_key_id ON http_analytics(api_key_id);
 
--- Add api_key_id and performed_by to credits_transactions.
--- api_key_id: direct attribution for usage deductions — avoids joining through http_analytics.
--- performed_by: audit trail for management actions (e.g., admin granting credits).
--- Both are NULL for legacy rows and system-generated transactions.
+-- Add api_key_id to credits_transactions for per-key usage attribution within orgs.
+-- Matches the http_analytics pattern: filter by user_id, then join through api_keys
+-- to attribute usage to the org member whose key was used.
+-- NULL for legacy rows, system-generated transactions, and non-usage types
+-- (purchases, admin grants) which have no associated API key.
 ALTER TABLE credits_transactions ADD COLUMN api_key_id UUID;
 CREATE INDEX idx_credits_transactions_api_key_id ON credits_transactions(api_key_id) WHERE api_key_id IS NOT NULL;
-ALTER TABLE credits_transactions ADD COLUMN performed_by UUID REFERENCES users(id);
 
 -- Soft-delete for api_keys. Hard delete would orphan api_key_id references in
 -- credits_transactions and http_analytics, losing attribution data.

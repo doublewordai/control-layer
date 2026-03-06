@@ -14,7 +14,7 @@ use crate::api::models::batches::{
 };
 use crate::api::models::users::CurrentUser;
 use crate::auth::permissions::{RequiresPermission, can_read_all_resources, has_permission, operation, resource};
-use crate::db::handlers::{Users, repository::Repository};
+use crate::db::handlers::{Credits, Users, repository::Repository};
 use crate::errors::{Error, Result};
 use crate::types::{Operation, Resource};
 use axum::{
@@ -187,6 +187,7 @@ The batch will begin processing immediately. Use `GET /batches/{batch_id}` to mo
     responses(
         (status = 201, description = "Batch created and queued for processing.", body = BatchResponse),
         (status = 400, description = "Invalid request — check that the endpoint and completion_window are valid."),
+        (status = 402, description = "Insufficient credits — account balance is below zero."),
         (status = 404, description = "Input file not found or you don't have access to it."),
         (status = 500, description = "An unexpected error occurred. Retry the request or contact support if the issue persists.")
     )
@@ -223,6 +224,25 @@ pub async fn create_batch<P: PoolProvider>(
     let file_id = Uuid::parse_str(&req.input_file_id).map_err(|_| Error::BadRequest {
         message: "Invalid input_file_id format".to_string(),
     })?;
+
+    // Reject batches from users with negative credit balance
+    {
+        let mut conn = state.db.write().acquire().await.map_err(|e| Error::Internal {
+            operation: format!("get db connection for credit check: {}", e),
+        })?;
+        let balance = Credits::new(&mut conn)
+            .get_user_balance(current_user.id)
+            .await
+            .map_err(|e| Error::Internal {
+                operation: format!("check credit balance: {}", e),
+            })?;
+        if balance < rust_decimal::Decimal::ZERO {
+            return Err(Error::InsufficientCredits {
+                current_balance: balance,
+                message: "Account balance too low. Please add credits to continue.".to_string(),
+            });
+        }
+    }
 
     // Verify file exists and user has access
     // Use primary pool to avoid read-after-write consistency issues with replicas
@@ -1325,9 +1345,12 @@ pub async fn list_batches<P: PoolProvider>(
 mod tests {
     use crate::api::models::batches::CreateBatchRequest;
     use crate::api::models::users::Role;
+    use crate::db::handlers::Credits;
+    use crate::db::models::credits::{CreditTransactionCreateDBRequest, CreditTransactionType};
     use crate::errors::Error;
     use crate::test::utils::*;
     use axum::http::StatusCode;
+    use rust_decimal::Decimal;
     use sqlx::PgPool;
     use std::collections::HashMap;
     use uuid::Uuid;
@@ -2755,6 +2778,110 @@ mod tests {
             .await;
 
         // Should be accepted because relaxation factor makes effective capacity > 0
+        resp.assert_status(StatusCode::CREATED);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_create_batch_rejected_with_negative_balance(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+
+        // Give user credits then deduct more to make balance negative
+        let mut conn = pool.acquire().await.unwrap();
+        let mut credits_repo = Credits::new(&mut conn);
+        credits_repo
+            .create_transaction(&CreditTransactionCreateDBRequest {
+                user_id: user.id,
+                transaction_type: CreditTransactionType::AdminGrant,
+                amount: Decimal::new(100, 2), // $1.00
+                source_id: Uuid::new_v4().to_string(),
+                description: Some("Initial credits".to_string()),
+                fusillade_batch_id: None,
+                api_key_id: None,
+            })
+            .await
+            .unwrap();
+        credits_repo
+            .create_transaction(&CreditTransactionCreateDBRequest {
+                user_id: user.id,
+                transaction_type: CreditTransactionType::Usage,
+                amount: Decimal::new(200, 2), // -$2.00, net = -$1.00
+                source_id: Uuid::new_v4().to_string(),
+                description: Some("Usage".to_string()),
+                fusillade_batch_id: None,
+                api_key_id: None,
+            })
+            .await
+            .unwrap();
+        drop(credits_repo);
+        drop(conn);
+
+        let create_req = CreateBatchRequest {
+            input_file_id: Uuid::new_v4().to_string(),
+            endpoint: "/v1/chat/completions".to_string(),
+            completion_window: "24h".to_string(),
+            metadata: None,
+        };
+
+        let auth = add_auth_headers(&user);
+        let resp = app
+            .post("/ai/v1/batches")
+            .json(&create_req)
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+
+        resp.assert_status(StatusCode::PAYMENT_REQUIRED);
+        let body = resp.text();
+        assert!(body.contains("balance too low"), "Expected balance too low message, got: {}", body);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_create_batch_allowed_with_zero_balance(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        // Create a deployment and add to group so user has access to the model
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        // User has zero balance (no credits granted) — should still be allowed
+
+        // Upload a batch file
+        let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}"#;
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test-batch.jsonl");
+        let multipart = axum_test::multipart::MultipartForm::new()
+            .add_part("file", file_part)
+            .add_part("purpose", axum_test::multipart::Part::text("batch"));
+        let upload_resp = app
+            .post("/ai/v1/files")
+            .multipart(multipart)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        upload_resp.assert_status(StatusCode::CREATED);
+        let file: serde_json::Value = upload_resp.json();
+        let file_id = file["id"].as_str().unwrap();
+
+        let create_req = CreateBatchRequest {
+            input_file_id: file_id.to_string(),
+            endpoint: "/v1/chat/completions".to_string(),
+            completion_window: "24h".to_string(),
+            metadata: None,
+        };
+
+        let resp = app
+            .post("/ai/v1/batches")
+            .json(&create_req)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+
+        // Zero balance should be accepted (only negative is rejected)
         resp.assert_status(StatusCode::CREATED);
     }
 }

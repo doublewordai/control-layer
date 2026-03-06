@@ -265,7 +265,6 @@ impl PaymentProvider for StripeProvider {
             description: Some(description),
             fusillade_batch_id: None,
             api_key_id: None,
-            performed_by: None,
         };
 
         let mut credits = Credits::new(&mut conn);
@@ -423,7 +422,6 @@ mod tests {
             description: Some("Test Stripe payment".to_string()),
             fusillade_batch_id: None,
             api_key_id: None,
-            performed_by: None,
         };
 
         credits.create_transaction(&request).await.unwrap();

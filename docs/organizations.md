@@ -71,12 +71,10 @@ CREATE TRIGGER user_organizations_notify
 ALTER TABLE http_analytics ADD COLUMN api_key_id UUID;
 CREATE INDEX idx_http_analytics_api_key_id ON http_analytics(api_key_id);
 
--- Add api_key_id and performed_by to credits_transactions.
--- api_key_id: direct attribution for usage deductions — avoids joining through http_analytics.
--- performed_by: audit trail for management actions (e.g., admin granting credits).
--- Both are NULL for legacy rows and system-generated transactions.
+-- Add api_key_id to credits_transactions for per-key usage attribution within orgs.
+-- Matches http_analytics pattern: filter by user_id, join through api_keys to attribute to org member.
+-- NULL for legacy rows, system-generated transactions, and non-usage types.
 ALTER TABLE credits_transactions ADD COLUMN api_key_id UUID;
-ALTER TABLE credits_transactions ADD COLUMN performed_by UUID REFERENCES users(id);
 
 -- Soft-delete for api_keys. Hard delete would orphan api_key_id references in
 -- credits_transactions and http_analytics, losing attribution data.
@@ -112,7 +110,6 @@ CREATE UNIQUE INDEX idx_api_keys_user_hidden_purpose
 - NOTIFY trigger so onwards reloads if org membership affects routing (future-proofing)
 - `api_key_id` on `http_analytics` enables per-member usage attribution within an org
 - `api_key_id` on `credits_transactions` enables direct billing queries without joining through `http_analytics`
-- `performed_by` on `credits_transactions` enables audit trail for management actions
 - `is_deleted` on `api_keys` — soft-delete preserves attribution data in `credits_transactions` and `http_analytics`
 - `created_by` on `api_keys` — tracks which individual created each key; enables per-member hidden keys for orgs
 - Hidden key unique constraint changes from `(user_id, purpose)` to `(user_id, created_by, purpose)` — each org member gets their own hidden keys
@@ -339,7 +336,6 @@ Add organization routes in `build_router()`, after the groups section:
 When an org's API key is used for inference, the system currently tracks `user_id` (= the org) in `http_analytics` and `credits_transactions`. Two gaps:
 
 1. **Which member's key?** — `http_analytics` has no `api_key_id` column, so we can't attribute usage to a specific key (and thus to the member who created it)
-2. **Who performed management actions?** — `credits_transactions` has no `performed_by` column, so we can't trace "Alice granted 100 credits to Acme Corp"
 
 ### Solution
 
@@ -363,15 +359,7 @@ WHERE ct.user_id = <org_id> AND ct.transaction_type = 'usage';
 
 Within an org, each member creates their own API key. Usage per key = usage per member. The dashboard can show a breakdown: "Alice's key used 50k tokens, Bob's key used 120k tokens" for Acme Corp.
 
-**B. Management path — `performed_by` on `credits_transactions`**
-
-Migration adds `performed_by UUID` to `credits_transactions` (see Phase 1).
-
-Updated in `api/handlers/transactions.rs`: when a credit transaction is created via the admin API, `performed_by = current_user.id`. For automated usage deductions, `performed_by = NULL` (system-generated).
-
-This also benefits non-org flows — today there's no record of which admin granted credits to any user.
-
-**C. Soft-delete for `api_keys`**
+**B. Soft-delete for `api_keys`**
 
 Migration adds `is_deleted BOOLEAN` to `api_keys` (see Phase 1).
 
@@ -743,7 +731,7 @@ Add an organization/personal context toggle in the expandable profile dropdown a
 | `dwctl/src/api/models/api_keys.rs` | Add `created_by` to `ApiKeyResponse` |
 | `dwctl/src/api/handlers/api_keys.rs` | Add `can_manage_org_resource` check; pass `current_user.id` as `created_by` on create |
 | `dwctl/src/api/handlers/webhooks.rs` | Add `can_manage_org_resource` check to all CRUD handlers |
-| `dwctl/src/api/handlers/transactions.rs` | Add `can_manage_org_resource` check; set `performed_by` on create |
+| `dwctl/src/api/handlers/transactions.rs` | Add `can_manage_org_resource` check |
 | `dwctl/src/api/handlers/files.rs` | Read `current_user.active_organization` for target; pass `(target_user_id, purpose, current_user.id)` to hidden key; pass `api_key_id` to fusillade |
 | `dwctl/src/auth/middleware.rs` | Read `current_user.active_organization` for playground proxy; update `get_or_create_hidden_key` call with `created_by` |
 | `dwctl/src/api/handlers/auth.rs` | Update `get_or_create_hidden_key` call with `created_by` |
@@ -754,8 +742,8 @@ Add an organization/personal context toggle in the expandable profile dropdown a
 | `dwctl/src/types.rs` | Add `Organizations` to `Resource` enum |
 | `dwctl/src/lib.rs` | Add organization routes |
 | `dwctl/src/request_logging/analytics_handler.rs` | Populate `api_key_id` in http_analytics |
-| `dwctl/src/db/handlers/credits.rs` | Accept and store `performed_by` and `api_key_id` on transaction creation |
-| `dwctl/src/db/models/credits.rs` | Add `performed_by` and `api_key_id` to `CreditTransactionCreateDBRequest` |
+| `dwctl/src/db/handlers/credits.rs` | Accept and store `api_key_id` on transaction creation |
+| `dwctl/src/db/models/credits.rs` | Add `api_key_id` to `CreditTransactionCreateDBRequest` |
 | `dwctl/src/sync/onwards_config/mod.rs` | Add `AND ak.is_deleted = false` to API key queries in `load_targets_from_db` |
 | `dashboard/src/api/control-layer/types.ts` | Add org types, `user_type`, `created_by` on API keys |
 | `dashboard/src/api/control-layer/client.ts` | Add org API methods; add `setActiveOrganization` / `clearActiveOrganization` (localStorage + `X-Organization-Id` header) |
@@ -769,7 +757,7 @@ Each PR is non-breaking — existing functionality is preserved at every step.
 | PR | Repo | Scope | Key changes |
 |----|------|-------|-------------|
 | **1** | control-layer | Migration + all Rust backend | `072_add_organizations.sql` + all Phases 2–4: organization models/handlers/API, permissions, routes, CurrentUser changes, API key soft-delete + created_by + hidden key updates, attribution (api_key_id + performed_by), org permission checks on existing handlers, header-based org context + validation endpoint, onwards sync filter |
-| **2** | control-layer | Dashboard | TS types, API client, hooks, query keys. AppSidebar org toggle (7h), org management page (7e) |
+| **2** | control-layer | Dashboard | TS types, API client, hooks, query keys. AppSidebar org toggle (7h), org management page (7e), batch status sorting COR-88 (7f) |
 | **3** | fusillade | Schema + release | Migration: api_key_id on batches + files. Pass-through in creation. Release new version to crates.io |
 | **4** | control-layer | Org-scoped batch/file filtering + batch UX | Bump fusillade version, pass api_key_id from file upload handler to fusillade, org-scoped batch/file member filtering in dashboard (7g), batch status sorting COR-88 (7f) |
 
@@ -797,7 +785,6 @@ Each PR is non-breaking — existing functionality is preserved at every step.
    - Verify usage billed to org's credit balance
    - Verify `http_analytics` row has `api_key_id` populated
    - Verify `credits_transactions` usage row has `api_key_id` populated
-   - Grant credits to org, verify `performed_by` set on transaction
    - Delete an org API key, verify it's soft-deleted (`is_deleted = true`, not removed)
    - Verify deleted key no longer routes in onwards (no inference access)
    - Verify `credits_transactions` referencing the deleted key still resolves (JOIN works)

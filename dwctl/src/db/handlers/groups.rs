@@ -1135,7 +1135,6 @@ mod tests {
                     description: Some("Added credits".to_string()),
                     fusillade_batch_id: None,
                     api_key_id: None,
-                    performed_by: None,
                 })
                 .await
                 .unwrap();
