@@ -14,6 +14,17 @@ export function OrganizationProvider({ children }: { children: ReactNode }) {
   const queryClient = useQueryClient();
   const { data: currentUser } = useUser("current", { include: "organizations" });
 
+  // Sync cookie with localStorage on mount: if localStorage has no active org,
+  // clear the HttpOnly cookie too. This prevents stale cookies from persisting
+  // after localStorage is cleared (e.g. browser data clear, new tab, etc.).
+  useEffect(() => {
+    if (!currentUser) return; // Wait until user data is loaded
+    if (!activeOrganizationId) {
+      dwctlApi.organizations.setActive(null).catch(() => {});
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- only on mount + first user load
+  }, [!!currentUser]);
+
   // Validate stored org ID against current user's memberships
   useEffect(() => {
     if (!currentUser?.organizations || !activeOrganizationId) return;
@@ -23,6 +34,10 @@ export function OrganizationProvider({ children }: { children: ReactNode }) {
     if (!isMember) {
       localStorage.removeItem(STORAGE_KEY);
       setActiveOrgId(null);
+      // Clear the HttpOnly dw_active_org cookie on the backend to prevent
+      // desync where the UI shows personal context but requests still carry
+      // the org cookie (which would charge the org instead of the user).
+      dwctlApi.organizations.setActive(null).catch(() => {});
     }
   }, [currentUser?.organizations, activeOrganizationId]);
 
