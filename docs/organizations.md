@@ -756,7 +756,7 @@ Each PR is non-breaking — existing functionality is preserved at every step.
 
 | PR | Repo | Scope | Key changes |
 |----|------|-------|-------------|
-| **1** | control-layer | Migration + all Rust backend | `072_add_organizations.sql` + all Phases 2–4: organization models/handlers/API, permissions, routes, CurrentUser changes, API key soft-delete + created_by + hidden key updates, attribution (api_key_id + performed_by), org permission checks on existing handlers, header-based org context + validation endpoint, onwards sync filter |
+| **1** | control-layer | Migration + all Rust backend | `072_add_organizations.sql` + all Phases 2–4: organization models/handlers/API, permissions, routes, CurrentUser changes, API key soft-delete + created_by + hidden key updates, attribution (api_key_id), org permission checks on existing handlers, header-based org context + validation endpoint, onwards sync filter |
 | **2** | control-layer | Dashboard | TS types, API client, hooks, query keys. AppSidebar org toggle (7h), org management page (7e), batch status sorting COR-88 (7f) |
 | **3** | fusillade | Schema + release | Migration: api_key_id on batches + files. Pass-through in creation. Release new version to crates.io |
 | **4** | control-layer | Org-scoped batch/file filtering + batch UX | Bump fusillade version, pass api_key_id from file upload handler to fusillade, org-scoped batch/file member filtering in dashboard (7g), batch status sorting COR-88 (7f) |
