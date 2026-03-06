@@ -15,6 +15,8 @@ struct EmailTemplates {
     batch_complete: String,
     first_batch: String,
     low_balance: String,
+    auto_topup_success: String,
+    auto_topup_failed: String,
 }
 
 impl EmailTemplates {
@@ -24,6 +26,8 @@ impl EmailTemplates {
             batch_complete: include_str!("../default_templates/batch_complete.html").to_string(),
             first_batch: include_str!("../default_templates/first_batch.html").to_string(),
             low_balance: include_str!("../default_templates/low_balance.html").to_string(),
+            auto_topup_success: include_str!("../default_templates/auto_topup_success.html").to_string(),
+            auto_topup_failed: include_str!("../default_templates/auto_topup_failed.html").to_string(),
         }
     }
 
@@ -40,6 +44,8 @@ impl EmailTemplates {
             batch_complete: load("batch_complete.html")?,
             first_batch: load("first_batch.html")?,
             low_balance: load("low_balance.html")?,
+            auto_topup_success: load("auto_topup_success.html")?,
+            auto_topup_failed: load("auto_topup_failed.html")?,
         })
     }
 }
@@ -314,6 +320,66 @@ impl EmailService {
             profile_link,
             from_name => &self.from_name,
             reply_to => self.reply_to.as_deref().unwrap_or(&self.from_email),
+        })
+    }
+
+    pub async fn send_auto_topup_success_email(
+        &self,
+        to_email: &str,
+        to_name: Option<&str>,
+        amount: &rust_decimal::Decimal,
+        threshold: &rust_decimal::Decimal,
+        new_balance: &rust_decimal::Decimal,
+    ) -> Result<(), Error> {
+        let subject = format!("Auto top-up: ${:.2} added to your account", amount);
+        let name = to_name.unwrap_or("User");
+        let body = self
+            .render_auto_topup_body(&self.templates.auto_topup_success, name, amount, threshold, Some(new_balance))
+            .map_err(|e| Error::Internal {
+                operation: format!("render email template: {e}"),
+            })?;
+        self.send_email(to_email, to_name, &subject, &body).await
+    }
+
+    pub async fn send_auto_topup_failed_email(
+        &self,
+        to_email: &str,
+        to_name: Option<&str>,
+        amount: &rust_decimal::Decimal,
+        threshold: &rust_decimal::Decimal,
+    ) -> Result<(), Error> {
+        let subject = "Auto top-up failed — action required";
+        let name = to_name.unwrap_or("User");
+        let body = self
+            .render_auto_topup_body(&self.templates.auto_topup_failed, name, amount, threshold, None)
+            .map_err(|e| Error::Internal {
+                operation: format!("render email template: {e}"),
+            })?;
+        self.send_email(to_email, to_name, subject, &body).await
+    }
+
+    fn render_auto_topup_body(
+        &self,
+        template: &str,
+        to_name: &str,
+        amount: &rust_decimal::Decimal,
+        threshold: &rust_decimal::Decimal,
+        new_balance: Option<&rust_decimal::Decimal>,
+    ) -> Result<String, minijinja::Error> {
+        let mut env = Environment::new();
+        env.add_template("email", template)?;
+
+        let base = self.base_url.trim_end_matches('/');
+        let dashboard_link = format!("{base}/cost-management");
+        let profile_link = format!("{base}/profile");
+
+        env.get_template("email")?.render(context! {
+            to_name,
+            amount => format!("{:.2}", amount),
+            threshold => format!("{:.2}", threshold),
+            new_balance => new_balance.map(|b| format!("{:.2}", b)).unwrap_or_default(),
+            dashboard_link,
+            profile_link,
         })
     }
 }

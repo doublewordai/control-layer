@@ -31,7 +31,7 @@ use crate::{
         handlers::{credits::Credits, repository::Repository},
         models::credits::{CreditTransactionCreateDBRequest, CreditTransactionType},
     },
-    payment_providers::{PaymentError, PaymentProvider, PaymentSession, Result, WebhookEvent},
+    payment_providers::{AutoTopupSetupResult, PaymentError, PaymentProvider, PaymentSession, Result, WebhookEvent},
     types::UserId,
 };
 
@@ -476,13 +476,20 @@ impl PaymentProvider for StripeProvider {
         })
     }
 
-    async fn process_auto_topup_session(&self, _db_pool: &PgPool, session_id: &str) -> Result<String> {
+    async fn process_auto_topup_session(&self, _db_pool: &PgPool, session_id: &str) -> Result<AutoTopupSetupResult> {
         let session = self.get_setup_session(session_id).await?;
 
         // Check if setup was completed
         if session.status != Some(CheckoutSessionStatus::Complete) {
             return Err(PaymentError::PaymentNotCompleted);
         }
+
+        // Extract customer ID (may be newly created by Stripe during checkout)
+        let customer_id = match &session.customer {
+            Some(stripe_types::Expandable::Id(id)) => Some(id.to_string()),
+            Some(stripe_types::Expandable::Object(c)) => Some(c.id.to_string()),
+            None => None,
+        };
 
         // Extract the expanded SetupIntent
         let setup_intent = match session.setup_intent {
@@ -496,11 +503,16 @@ impl PaymentProvider for StripeProvider {
         }
 
         // Get the payment method ID
-        match setup_intent.payment_method {
-            Some(stripe_types::Expandable::Object(pm)) => Ok(pm.id.to_string()),
-            Some(stripe_types::Expandable::Id(id)) => Ok(id.to_string()),
-            None => Err(PaymentError::InvalidData("Payment method not found".to_string())),
-        }
+        let payment_method_id = match setup_intent.payment_method {
+            Some(stripe_types::Expandable::Object(pm)) => pm.id.to_string(),
+            Some(stripe_types::Expandable::Id(id)) => id.to_string(),
+            None => return Err(PaymentError::InvalidData("Payment method not found".to_string())),
+        };
+
+        Ok(AutoTopupSetupResult {
+            payment_method_id,
+            customer_id,
+        })
     }
 
     async fn charge_auto_topup(&self, amount_cents: i64, customer_id: &str, payment_method_id: &str) -> Result<String> {

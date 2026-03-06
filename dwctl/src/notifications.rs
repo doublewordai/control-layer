@@ -270,7 +270,7 @@ pub async fn run_notification_poller(
 
         // === Step 5: Auto top-up charges ===
         if let Some(ref provider) = payment_provider {
-            process_auto_topups(provider.as_ref(), &mut conn).await;
+            process_auto_topups(provider.as_ref(), &mut conn, email_service.as_ref()).await;
         }
 
         // === Step 6: Dispatch webhooks (claim → sign → send → process results) ===
@@ -413,7 +413,11 @@ async fn send_email_notifications(
 /// 2. Checks if balance is below the user's configured threshold
 /// 3. Charges the saved payment method via the payment provider
 /// 4. Creates a credit transaction (idempotent via unique source_id)
-async fn process_auto_topups(provider: &dyn PaymentProvider, conn: &mut sqlx::pool::PoolConnection<sqlx::Postgres>) {
+async fn process_auto_topups(
+    provider: &dyn PaymentProvider,
+    conn: &mut sqlx::pool::PoolConnection<sqlx::Postgres>,
+    email_service: Option<&EmailService>,
+) {
     // 1. Get users with auto top-up configured
     let candidates = {
         let mut users = Users::new(&mut *conn);
@@ -510,6 +514,15 @@ async fn process_auto_topups(provider: &dyn PaymentProvider, conn: &mut sqlx::po
                     error = %e,
                     "Failed to charge auto top-up"
                 );
+                if let Some(email_svc) = email_service {
+                    let name = user.display_name.as_deref().unwrap_or(&user.username);
+                    if let Err(e) = email_svc
+                        .send_auto_topup_failed_email(&user.email, Some(name), &user.auto_topup_amount, &user.auto_topup_threshold)
+                        .await
+                    {
+                        tracing::warn!(user_id = %user.id, error = %e, "Failed to send auto top-up failure email");
+                    }
+                }
                 continue;
             }
         };
@@ -532,6 +545,22 @@ async fn process_auto_topups(provider: &dyn PaymentProvider, conn: &mut sqlx::po
                     amount = %user.auto_topup_amount,
                     "Auto top-up charged successfully"
                 );
+                if let Some(email_svc) = email_service {
+                    let name = user.display_name.as_deref().unwrap_or(&user.username);
+                    let new_balance = balance_for(user).unwrap_or_default() + user.auto_topup_amount;
+                    if let Err(e) = email_svc
+                        .send_auto_topup_success_email(
+                            &user.email,
+                            Some(name),
+                            &user.auto_topup_amount,
+                            &user.auto_topup_threshold,
+                            &new_balance,
+                        )
+                        .await
+                    {
+                        tracing::warn!(user_id = %user.id, error = %e, "Failed to send auto top-up success email");
+                    }
+                }
             }
             Err(e) => {
                 tracing::warn!(

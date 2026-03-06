@@ -485,8 +485,8 @@ pub async fn process_auto_topup<P: PoolProvider>(
         }
     };
 
-    let payment_method_id = match provider.process_auto_topup_session(state.db.write(), &id).await {
-        Ok(pm_id) => pm_id,
+    let setup_result = match provider.process_auto_topup_session(state.db.write(), &id).await {
+        Ok(result) => result,
         Err(e) => match e {
             payment_providers::PaymentError::PaymentNotCompleted => {
                 return Ok((
@@ -520,7 +520,7 @@ pub async fn process_auto_topup<P: PoolProvider>(
         low_balance_threshold: None,
         auto_topup_amount: Some(Some(body.amount)),
         auto_topup_threshold: Some(Some(body.threshold)),
-        auto_topup_payment_id: Some(Some(payment_method_id)),
+        auto_topup_payment_id: Some(Some(setup_result.payment_method_id)),
     };
 
     let mut conn = state.db.write().acquire().await.map_err(|e| {
@@ -533,6 +533,16 @@ pub async fn process_auto_topup<P: PoolProvider>(
         tracing::error!("Failed to enable auto top-up: {:?}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
+
+    // Save the customer ID if the user didn't have one (first-time Stripe customer)
+    if let Some(customer_id) = &setup_result.customer_id {
+        if user.payment_provider_id.is_none() {
+            let mut users = Users::new(&mut conn);
+            if let Err(e) = users.set_payment_provider_id_if_empty(user.id, customer_id).await {
+                tracing::warn!(user_id = %user.id, error = %e, "Failed to save customer ID from auto top-up setup");
+            }
+        }
+    }
 
     Ok(Json(json!({
         "message": "Auto top-up enabled successfully",
@@ -973,7 +983,7 @@ mod tests {
 
         // Verify auto top-up settings saved in DB
         let row = sqlx::query!(
-            "SELECT auto_topup_amount, auto_topup_threshold, auto_topup_payment_id FROM users WHERE id = $1",
+            "SELECT auto_topup_amount, auto_topup_threshold, auto_topup_payment_id, payment_provider_id FROM users WHERE id = $1",
             user.id
         )
         .fetch_one(&pool)
@@ -986,6 +996,14 @@ mod tests {
         assert!(
             row.auto_topup_payment_id.unwrap().starts_with("dummy_pm_"),
             "Should be a dummy payment method ID"
+        );
+        assert!(
+            row.payment_provider_id.is_some(),
+            "Customer ID should be saved for first-time users"
+        );
+        assert!(
+            row.payment_provider_id.unwrap().starts_with("dummy_cus_"),
+            "Should be a dummy customer ID"
         );
     }
 

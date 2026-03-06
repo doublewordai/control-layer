@@ -83,6 +83,15 @@ impl From<crate::db::errors::DbError> for PaymentError {
     }
 }
 
+/// Result of processing an auto top-up setup session
+#[derive(Debug, Clone)]
+pub struct AutoTopupSetupResult {
+    /// Payment method ID saved for future charges
+    pub payment_method_id: String,
+    /// Payment provider customer ID (may be newly created)
+    pub customer_id: Option<String>,
+}
+
 /// Represents a completed payment session
 #[derive(Debug, Clone)]
 pub struct PaymentSession {
@@ -182,7 +191,7 @@ pub trait PaymentProvider: Send + Sync {
     ///
     /// Unlike `process_payment_session`, this does not create a credit transaction.
     /// It only validates the session so the caller can safely enable auto top-up.
-    async fn process_auto_topup_session(&self, db_pool: &PgPool, session_id: &str) -> Result<String>;
+    async fn process_auto_topup_session(&self, db_pool: &PgPool, session_id: &str) -> Result<AutoTopupSetupResult>;
 
     /// Charge a saved payment method off-session for auto top-up.
     ///

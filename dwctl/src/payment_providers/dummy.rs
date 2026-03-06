@@ -176,12 +176,15 @@ impl PaymentProvider for DummyProvider {
         Ok(redirect_url)
     }
 
-    async fn process_auto_topup_session(&self, _db_pool: &PgPool, session_id: &str) -> Result<String> {
+    async fn process_auto_topup_session(&self, _db_pool: &PgPool, session_id: &str) -> Result<super::AutoTopupSetupResult> {
         // For dummy provider, just validate the session format
         if !session_id.starts_with("dummy_session_") {
             return Err(PaymentError::InvalidData("Invalid dummy session ID format".to_string()));
         }
-        Ok(format!("dummy_pm_{}", uuid::Uuid::new_v4()))
+        Ok(super::AutoTopupSetupResult {
+            payment_method_id: format!("dummy_pm_{}", uuid::Uuid::new_v4()),
+            customer_id: Some(format!("dummy_cus_{}", uuid::Uuid::new_v4())),
+        })
     }
 
     async fn charge_auto_topup(&self, _amount_cents: i64, _customer_id: &str, _payment_method_id: &str) -> Result<String> {
