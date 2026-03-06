@@ -361,6 +361,8 @@ pub async fn get_system_user(pool: &mut PgConnection) -> UserResponse {
         has_payment_provider_id: false,
         batch_notifications_enabled: false,
         low_balance_threshold: None,
+        user_type: "individual".to_string(),
+        organizations: None,
     }
 }
 
@@ -377,6 +379,7 @@ pub async fn create_test_api_key_for_user(pool: &PgPool, user_id: UserId) -> Api
     let mut conn = pool.acquire().await.expect("Failed to acquire connection");
     let mut api_key_repo = ApiKeys::new(&mut conn);
     let request = ApiKeyCreateDBRequest::new(
+        user_id,
         user_id,
         ApiKeyCreate {
             name: format!("Test API Key {}", Uuid::new_v4().simple()),
@@ -460,6 +463,57 @@ pub async fn create_test_endpoint(pool: &PgPool, name: &str, created_by: UserId)
     .await
     .expect("Failed to create test endpoint");
     endpoint_id
+}
+
+/// Create a test organization and return the org's UserResponse.
+/// The `created_by` user is automatically added as owner.
+pub async fn create_test_org(pool: &PgPool, created_by: UserId) -> UserResponse {
+    use crate::db::handlers::Organizations;
+    use crate::db::models::organizations::OrganizationCreateDBRequest;
+
+    let org_name = format!("testorg_{}", Uuid::new_v4().simple());
+    let mut conn = pool.acquire().await.expect("Failed to acquire connection");
+    let mut orgs = Organizations::new(&mut conn);
+    let org = orgs
+        .create(&OrganizationCreateDBRequest {
+            name: org_name.clone(),
+            email: format!("{org_name}@example.com"),
+            display_name: Some("Test Organization".to_string()),
+            avatar_url: None,
+            created_by,
+        })
+        .await
+        .expect("Failed to create test organization");
+    UserResponse {
+        id: org.id,
+        username: org.username,
+        email: org.email,
+        display_name: org.display_name,
+        avatar_url: org.avatar_url,
+        is_admin: org.is_admin,
+        roles: vec![],
+        created_at: org.created_at,
+        updated_at: org.updated_at,
+        last_login: None,
+        auth_source: org.auth_source,
+        external_user_id: None,
+        groups: None,
+        credit_balance: None,
+        has_payment_provider_id: false,
+        batch_notifications_enabled: false,
+        low_balance_threshold: None,
+        user_type: org.user_type,
+        organizations: None,
+    }
+}
+
+/// Add a user as a member of an organization with the given role.
+pub async fn add_org_member(pool: &PgPool, org_id: UserId, user_id: UserId, role: &str) {
+    use crate::db::handlers::Organizations;
+
+    let mut conn = pool.acquire().await.expect("Failed to acquire connection");
+    let mut orgs = Organizations::new(&mut conn);
+    orgs.add_member(org_id, user_id, role).await.expect("Failed to add org member");
 }
 
 pub async fn create_test_model(pool: &PgPool, model_name: &str, alias: &str, endpoint_id: uuid::Uuid, created_by: UserId) -> uuid::Uuid {

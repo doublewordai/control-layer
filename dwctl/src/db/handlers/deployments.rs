@@ -2319,10 +2319,11 @@ mod tests {
         } else {
             // If system key doesn't exist in test environment, create it
             sqlx::query!(
-                "INSERT INTO api_keys (id, name, secret, user_id) VALUES ($1, $2, $3, $4)",
+                "INSERT INTO api_keys (id, name, secret, user_id, created_by) VALUES ($1, $2, $3, $4, $5)",
                 uuid::Uuid::from_u128(0), // 00000000-0000-0000-0000-000000000000
                 "System Key",
                 "test_system_secret",
+                user.id,
                 user.id
             )
             .execute(&pool)

@@ -775,10 +775,11 @@ pub async fn upload_file<P: PoolProvider>(
     let uploaded_by = Some(current_user.id.to_string());
 
     // Get or create user-specific hidden batch API key for batch request execution
+    let target_user_id = current_user.active_organization.unwrap_or(current_user.id);
     let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut api_keys_repo = ApiKeys::new(&mut conn);
     let user_api_key = api_keys_repo
-        .get_or_create_hidden_key(current_user.id, ApiKeyPurpose::Batch)
+        .get_or_create_hidden_key(target_user_id, ApiKeyPurpose::Batch, current_user.id)
         .await
         .map_err(Error::Database)?;
 
