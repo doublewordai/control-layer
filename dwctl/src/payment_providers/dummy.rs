@@ -188,7 +188,6 @@ impl PaymentProvider for DummyProvider {
             .map(String::from);
 
         Ok(super::AutoTopupSetupResult {
-            payment_method_id: format!("dummy_pm_{}", uuid::Uuid::new_v4()),
             customer_id: Some(format!("dummy_cus_{}", uuid::Uuid::new_v4())),
             user_id,
         })
@@ -203,6 +202,14 @@ impl PaymentProvider for DummyProvider {
     ) -> Result<String> {
         // Dummy provider always succeeds - return a fake payment intent ID
         Ok(format!("dummy_pi_{}", uuid::Uuid::new_v4()))
+    }
+
+    async fn get_default_payment_method(&self, customer_id: &str) -> Result<Option<String>> {
+        Ok(Some(format!("dummy_pm_{}", customer_id)))
+    }
+
+    async fn create_customer(&self, _email: &str, _name: Option<&str>) -> Result<String> {
+        Ok(format!("dummy_cus_{}", uuid::Uuid::new_v4()))
     }
 
     async fn create_billing_portal_session(&self, user: &CurrentUser, return_url: &str) -> Result<String> {

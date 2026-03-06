@@ -427,7 +427,7 @@ pub async fn create_auto_topup_checkout<P: PoolProvider>(
     .into_response())
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize, utoipa::ToSchema)]
 pub struct ProcessAutoTopupRequest {
     /// Balance threshold in dollars that triggers auto top-up.
     pub threshold: f32,
@@ -547,7 +547,6 @@ pub async fn process_auto_topup<P: PoolProvider>(
         low_balance_threshold: None,
         auto_topup_amount: Some(Some(body.amount)),
         auto_topup_threshold: Some(Some(body.threshold)),
-        auto_topup_payment_id: Some(Some(setup_result.payment_method_id)),
     };
 
     let mut conn = state.db.write().acquire().await.map_err(|e| {
@@ -577,6 +576,141 @@ pub async fn process_auto_topup<P: PoolProvider>(
         "amount": body.amount
     }))
     .into_response())
+}
+
+/// Enable auto top-up by checking if a payment method exists
+///
+/// Smart toggle: checks the payment provider for a default payment method.
+/// Creates a customer if one doesn't exist. Returns one of two outcomes:
+/// - `has_payment_method: true` — auto top-up enabled directly
+/// - `needs_billing_portal: true` — no card on file, redirect to billing portal
+#[utoipa::path(
+    post,
+    path = "/auto-topup/enable",
+    tag = "payments",
+    summary = "Enable auto top-up",
+    description = "Validates threshold/amount, checks for a default payment method with the payment provider, and enables auto top-up if possible. Returns instructions for the frontend on what to do next.",
+    request_body(content = ProcessAutoTopupRequest, description = "Auto top-up configuration"),
+    responses(
+        (status = 200, description = "Result of the enable attempt", body = inline(Object)),
+        (status = 400, description = "Invalid threshold or amount"),
+        (status = 503, description = "No payment provider configured"),
+    ),
+    security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
+        ("X-Doubleword-User" = [])
+    )
+)]
+#[tracing::instrument(skip_all)]
+pub async fn enable_auto_topup<P: PoolProvider>(
+    State(state): State<AppState<P>>,
+    user: CurrentUser,
+    Json(body): Json<ProcessAutoTopupRequest>,
+) -> Result<Response, StatusCode> {
+    if body.threshold < 0.0 || body.amount <= 0.0 {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "message": "Threshold must be non-negative and amount must be positive"
+            })),
+        )
+            .into_response());
+    }
+
+    let provider = match state.config.payment.clone() {
+        Some(payment_config) => payment_providers::create_provider(payment_config),
+        None => {
+            tracing::warn!("Auto top-up enable requested but no payment provider is configured");
+            return Ok((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "message": "Payment processing is currently unavailable. Please contact support."
+                })),
+            )
+                .into_response());
+        }
+    };
+
+    // Check if user has a customer ID with the payment provider, create one if not
+    let customer_id = match &user.payment_provider_id {
+        Some(id) if !id.is_empty() => id.clone(),
+        _ => {
+            // No customer — create one so we can redirect to the billing portal
+            let new_id = provider
+                .create_customer(&user.email, user.display_name.as_deref())
+                .await
+                .map_err(|e| {
+                    tracing::error!("Failed to create payment provider customer: {:?}", e);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?;
+
+            // Persist the new customer ID
+            let mut conn = state.db.write().acquire().await.map_err(|e| {
+                tracing::error!("Failed to acquire database connection: {:?}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+            let mut users = Users::new(&mut conn);
+            users.set_payment_provider_id_if_empty(user.id, &new_id).await.map_err(|e| {
+                tracing::error!("Failed to save customer ID: {:?}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+            new_id
+        }
+    };
+
+    // Check if the customer has a default payment method
+    match provider.get_default_payment_method(&customer_id).await {
+        Ok(Some(_pm_id)) => {
+            // Has a payment method — enable auto top-up directly
+            let update = UserUpdateDBRequest {
+                display_name: None,
+                avatar_url: None,
+                roles: None,
+                password_hash: None,
+                batch_notifications_enabled: None,
+                low_balance_threshold: None,
+                auto_topup_amount: Some(Some(body.amount)),
+                auto_topup_threshold: Some(Some(body.threshold)),
+            };
+
+            let mut conn = state.db.write().acquire().await.map_err(|e| {
+                tracing::error!("Failed to acquire database connection: {:?}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+            let mut users = Users::new(&mut conn);
+            users.update(user.id, &update).await.map_err(|e| {
+                tracing::error!("Failed to enable auto top-up: {:?}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+            Ok(Json(json!({
+                "has_payment_method": true,
+                "threshold": body.threshold,
+                "amount": body.amount
+            }))
+            .into_response())
+        }
+        Ok(None) => {
+            // Has customer but no default payment method — redirect to billing portal
+            Ok(Json(json!({
+                "needs_billing_portal": true
+            }))
+            .into_response())
+        }
+        Err(e) => {
+            tracing::error!("Failed to check payment method: {:?}", e);
+            Ok((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "message": "Failed to check payment method with payment provider."
+                })),
+            )
+                .into_response())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1010,7 +1144,7 @@ mod tests {
 
         // Verify auto top-up settings saved in DB
         let row = sqlx::query!(
-            "SELECT auto_topup_amount, auto_topup_threshold, auto_topup_payment_id, payment_provider_id FROM users WHERE id = $1",
+            "SELECT auto_topup_amount, auto_topup_threshold, payment_provider_id FROM users WHERE id = $1",
             user.id
         )
         .fetch_one(&pool)
@@ -1019,11 +1153,6 @@ mod tests {
 
         assert_eq!(row.auto_topup_amount, Some(25.0));
         assert_eq!(row.auto_topup_threshold, Some(5.0));
-        assert!(row.auto_topup_payment_id.is_some(), "Payment method ID should be saved");
-        assert!(
-            row.auto_topup_payment_id.unwrap().starts_with("dummy_pm_"),
-            "Should be a dummy payment method ID"
-        );
         assert!(
             row.payment_provider_id.is_some(),
             "Customer ID should be saved for first-time users"
@@ -1071,5 +1200,93 @@ mod tests {
         }
         let response = request.await;
         response.assert_status(StatusCode::BAD_REQUEST);
+    }
+
+    #[sqlx::test]
+    async fn test_enable_auto_topup_with_payment_method(pool: PgPool) {
+        let mut config = create_test_config();
+        config.payment = Some(PaymentConfig::Dummy(DummyConfig {
+            amount: Decimal::new(100, 0),
+        }));
+
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
+
+        let user = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
+
+        // Set up a payment provider ID (dummy provider always returns a payment method)
+        sqlx::query!("UPDATE users SET payment_provider_id = $1 WHERE id = $2", "cus_test_123", user.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let auth_headers = crate::test::utils::add_auth_headers(&user);
+
+        let app = Router::new().route("/auto-topup/enable", post(enable_auto_topup)).with_state(state);
+
+        let server = TestServer::new(app).unwrap();
+
+        let mut request = server.post("/auto-topup/enable").json(&serde_json::json!({
+            "threshold": 5.0,
+            "amount": 25.0
+        }));
+        for (key, value) in &auth_headers {
+            request = request.add_header(key.as_str(), value.as_str());
+        }
+        let response = request.await;
+
+        response.assert_status(StatusCode::OK);
+        let body: serde_json::Value = response.json();
+        assert_eq!(body["has_payment_method"], true);
+        assert_eq!(body["threshold"], 5.0);
+        assert_eq!(body["amount"], 25.0);
+
+        // Verify settings saved in DB
+        let row = sqlx::query!("SELECT auto_topup_amount, auto_topup_threshold FROM users WHERE id = $1", user.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(row.auto_topup_amount, Some(25.0));
+        assert_eq!(row.auto_topup_threshold, Some(5.0));
+    }
+
+    #[sqlx::test]
+    async fn test_enable_auto_topup_no_customer(pool: PgPool) {
+        let mut config = create_test_config();
+        config.payment = Some(PaymentConfig::Dummy(DummyConfig {
+            amount: Decimal::new(100, 0),
+        }));
+
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
+
+        // User has no payment_provider_id — should create customer and return needs_billing_portal
+        let user = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
+        let auth_headers = crate::test::utils::add_auth_headers(&user);
+
+        let app = Router::new().route("/auto-topup/enable", post(enable_auto_topup)).with_state(state);
+
+        let server = TestServer::new(app).unwrap();
+
+        let mut request = server.post("/auto-topup/enable").json(&serde_json::json!({
+            "threshold": 5.0,
+            "amount": 25.0
+        }));
+        for (key, value) in &auth_headers {
+            request = request.add_header(key.as_str(), value.as_str());
+        }
+        let response = request.await;
+
+        response.assert_status(StatusCode::OK);
+        let body: serde_json::Value = response.json();
+        // Dummy provider creates a customer and always returns a payment method,
+        // so auto top-up is enabled directly
+        assert_eq!(body["has_payment_method"], true);
+
+        // Verify customer was created and saved
+        let row = sqlx::query!("SELECT payment_provider_id FROM users WHERE id = $1", user.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(row.payment_provider_id.is_some(), "Customer ID should be saved");
     }
 }

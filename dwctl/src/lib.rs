@@ -188,7 +188,7 @@ use axum::extract::DefaultBodyLimit;
 use axum::http::HeaderValue;
 use axum::{
     Router, ServiceExt, http, middleware,
-    routing::{delete, get, patch, post, put},
+    routing::{delete, get, patch, post},
 };
 use axum_prometheus::PrometheusMetricLayerBuilder;
 use bon::Builder;
@@ -1037,8 +1037,7 @@ pub async fn build_router(
         .route("/payments", post(api::handlers::payments::create_payment))
         .route("/payments/{id}", patch(api::handlers::payments::process_payment))
         .route("/billing-portal", post(api::handlers::payments::create_billing_portal_session))
-        .route("/auto-topup/checkout", post(api::handlers::payments::create_auto_topup_checkout))
-        .route("/auto-topup/{id}", put(api::handlers::payments::process_auto_topup))
+        .route("/auto-topup/enable", post(api::handlers::payments::enable_auto_topup))
         // Inference endpoints management (admin only for write operations)
         .route("/endpoints", get(api::handlers::inference_endpoints::list_inference_endpoints))
         .route("/endpoints", post(api::handlers::inference_endpoints::create_inference_endpoint))

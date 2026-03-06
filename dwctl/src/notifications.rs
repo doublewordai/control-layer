@@ -508,9 +508,33 @@ async fn process_auto_topups(
             }
         }
 
+        // Fetch the customer's default payment method from the provider
+        let payment_method_id = match provider.get_default_payment_method(&user.payment_provider_id).await {
+            Ok(Some(pm_id)) => pm_id,
+            Ok(None) => {
+                tracing::warn!(user_id = %user.id, "No default payment method found, skipping auto top-up");
+                counter!("dwctl_auto_topup_charge_failures_total").increment(1);
+                if let Some(email_svc) = email_service {
+                    let name = user.display_name.as_deref().unwrap_or(&user.username);
+                    if let Err(e) = email_svc
+                        .send_auto_topup_failed_email(&user.email, Some(name), &user.auto_topup_amount, &user.auto_topup_threshold)
+                        .await
+                    {
+                        tracing::warn!(user_id = %user.id, error = %e, "Failed to send auto top-up failure email");
+                    }
+                }
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(user_id = %user.id, error = %e, "Failed to fetch default payment method");
+                counter!("dwctl_auto_topup_errors_total", "stage" => "payment_method_lookup").increment(1);
+                continue;
+            }
+        };
+
         // Charge the payment provider
         let payment_intent_id = match provider
-            .charge_auto_topup(amount_cents, &user.payment_provider_id, &user.auto_topup_payment_id, &source_id)
+            .charge_auto_topup(amount_cents, &user.payment_provider_id, &payment_method_id, &source_id)
             .await
         {
             Ok(id) => id,
@@ -613,7 +637,6 @@ mod tests {
             r#"UPDATE users SET
                 auto_topup_amount = 25.0,
                 auto_topup_threshold = 10.0,
-                auto_topup_payment_id = 'pm_test_123',
                 payment_provider_id = 'cus_test_456'
             WHERE id = $1"#,
             user.id
@@ -651,7 +674,6 @@ mod tests {
             r#"UPDATE users SET
                 auto_topup_amount = 25.0,
                 auto_topup_threshold = 5.0,
-                auto_topup_payment_id = 'pm_test_123',
                 payment_provider_id = 'cus_test_456'
             WHERE id = $1"#,
             user.id
@@ -700,7 +722,6 @@ mod tests {
             r#"UPDATE users SET
                 auto_topup_amount = 25.0,
                 auto_topup_threshold = 10.0,
-                auto_topup_payment_id = 'pm_test_123',
                 payment_provider_id = 'cus_test_456'
             WHERE id = $1"#,
             user.id

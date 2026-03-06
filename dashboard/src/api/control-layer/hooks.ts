@@ -1287,32 +1287,19 @@ export function useCreateBillingPortalSession() {
   });
 }
 
-export function useCreateAutoTopupCheckout() {
-  return useMutation({
-    mutationKey: ["payments", "auto-topup-checkout"],
-    mutationFn: () => dwctlApi.payments.autoTopupCheckout(),
-  });
-}
-
-export function useProcessAutoTopupSetup() {
+export function useEnableAutoTopup() {
   const queryClient = useQueryClient();
 
   return useMutation({
-    mutationKey: ["payments", "auto-topup-setup"],
-    mutationFn: ({
-      sessionId,
-      threshold,
-      amount,
-    }: {
-      sessionId: string;
-      threshold: number;
-      amount: number;
-    }) => dwctlApi.payments.processAutoTopupSetup(sessionId, threshold, amount),
+    mutationKey: ["payments", "auto-topup-enable"],
+    mutationFn: ({ threshold, amount }: { threshold: number; amount: number }) =>
+      dwctlApi.payments.enableAutoTopup(threshold, amount),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.users.all });
     },
   });
 }
+
 
 // ===== DAEMONS HOOKS =====
 

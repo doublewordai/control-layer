@@ -2,7 +2,8 @@ import { useState, useEffect } from "react";
 import { Switch } from "@/components/ui/switch";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
-import { useUpdateUser } from "@/api/control-layer";
+import { useUpdateUser, useEnableAutoTopup } from "@/api/control-layer";
+import { useCreateBillingPortalSession } from "@/api/control-layer";
 import { toast } from "sonner";
 import { formatDollars } from "@/utils/money";
 import type { User } from "@/api/control-layer";
@@ -10,14 +11,12 @@ import type { User } from "@/api/control-layer";
 interface AutoTopupSectionProps {
   user: User;
   userId: string;
-  onSetupRequired: () => void;
   onSuccess: () => void;
 }
 
 export function AutoTopupSection({
   user,
   userId,
-  onSetupRequired,
   onSuccess,
 }: AutoTopupSectionProps) {
   const hasPaymentMethod = user.has_auto_topup_payment_method;
@@ -35,6 +34,13 @@ export function AutoTopupSection({
   );
 
   const updateUserMutation = useUpdateUser();
+  const enableAutoTopupMutation = useEnableAutoTopup();
+  const billingPortalMutation = useCreateBillingPortalSession();
+
+  const isPending =
+    updateUserMutation.isPending ||
+    enableAutoTopupMutation.isPending ||
+    billingPortalMutation.isPending;
 
   useEffect(() => {
     if (user.auto_topup_threshold != null)
@@ -45,24 +51,27 @@ export function AutoTopupSection({
 
   const handleToggle = async (checked: boolean) => {
     if (checked) {
-      if (!hasPaymentMethod) {
-        onSetupRequired();
-        return;
-      }
       const parsedThreshold = parseFloat(threshold);
-      const thresholdNum = Number.isFinite(parsedThreshold) ? parsedThreshold : 5.0;
+      const thresholdNum = Number.isFinite(parsedThreshold)
+        ? parsedThreshold
+        : 5.0;
       const parsedAmount = parseFloat(amount);
       const amountNum = Number.isFinite(parsedAmount) ? parsedAmount : 25.0;
+
       try {
-        await updateUserMutation.mutateAsync({
-          id: userId,
-          data: {
-            auto_topup_threshold: thresholdNum,
-            auto_topup_amount: amountNum,
-          },
+        const result = await enableAutoTopupMutation.mutateAsync({
+          threshold: thresholdNum,
+          amount: amountNum,
         });
-        toast.success("Auto top-up enabled");
-        onSuccess();
+
+        if (result.has_payment_method) {
+          toast.success("Auto top-up enabled");
+          onSuccess();
+        } else if (result.needs_billing_portal) {
+          // No card on file — redirect to billing portal to add one
+          const portal = await billingPortalMutation.mutateAsync();
+          window.location.href = portal.url;
+        }
       } catch (err) {
         console.error("Failed to enable auto top-up:", err);
         toast.error("Failed to enable auto top-up");
@@ -119,7 +128,7 @@ export function AutoTopupSection({
       <Switch
         checked={isEnabled}
         onCheckedChange={handleToggle}
-        disabled={updateUserMutation.isPending}
+        disabled={isPending}
         aria-label="Toggle auto top-up"
       />
       <span className="text-sm text-doubleword-neutral-600 whitespace-nowrap">
@@ -183,10 +192,10 @@ export function AutoTopupSection({
           <Button
             size="sm"
             onClick={handleSave}
-            disabled={updateUserMutation.isPending}
+            disabled={isPending}
             className="h-7 px-2 text-xs"
           >
-            {updateUserMutation.isPending ? "..." : "Save"}
+            {isPending ? "..." : "Save"}
           </Button>
         </>
       )}

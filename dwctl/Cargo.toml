@@ -130,6 +130,7 @@ async-stripe-webhook = { version = "1.0.0-rc.0", features = [
 async-stripe-types = { version = "1.0.0-rc.0" }
 async-stripe-core = { version = "1.0.0-rc.0", features = [
   "payment_intent",
+  "customer",
 ] }
 async-stripe-misc = { version = "1.0.0-rc.0", features = [
   "tax_calculation",

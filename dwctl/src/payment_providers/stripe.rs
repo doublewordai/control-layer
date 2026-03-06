@@ -64,12 +64,18 @@ impl StripeProvider {
         };
         use stripe_misc::tax_calculation::{CreateTaxCalculation, CreateTaxCalculationLineItems};
 
-        // Calculate tax
+        // Calculate tax (with idempotency key so retries within the same minute
+        // get the same tax calculation ID back, preventing PaymentIntent conflicts)
         let mut line_item = CreateTaxCalculationLineItems::new(amount_cents);
         line_item.reference = Some("auto_topup".to_string());
 
+        let tax_idem_key = IdempotencyKey::new(format!("{}_tax", idempotency_key))
+            .map_err(|e| PaymentError::InvalidData(format!("Invalid tax idempotency key: {e}")))?;
+
         let tax_calc = CreateTaxCalculation::new(Currency::USD, vec![line_item])
             .customer(customer_id)
+            .customize()
+            .request_strategy(RequestStrategy::Idempotent(tax_idem_key))
             .send(&self.client)
             .await
             .map_err(|e| {
@@ -514,15 +520,25 @@ impl PaymentProvider for StripeProvider {
             return Err(PaymentError::InvalidData("Payment method setup failed".to_string()));
         }
 
-        // Get the payment method ID
-        let payment_method_id = match setup_intent.payment_method {
-            Some(stripe_types::Expandable::Object(pm)) => pm.id.to_string(),
-            Some(stripe_types::Expandable::Id(id)) => id.to_string(),
-            None => return Err(PaymentError::InvalidData("Payment method not found".to_string())),
-        };
+        // Set the payment method as the customer's default for invoices,
+        // so get_default_payment_method can find it later for auto top-up charges.
+        // Checkout setup mode attaches the PM but doesn't set it as the default.
+        if let (Some(cust_id), Some(pm)) = (&customer_id, &setup_intent.payment_method) {
+            let pm_id = pm.id().to_string();
+            let mut invoice_settings = stripe_core::customer::UpdateCustomerInvoiceSettings::new();
+            invoice_settings.default_payment_method = Some(pm_id.clone());
+
+            if let Err(e) = stripe_core::customer::UpdateCustomer::new(cust_id.as_str())
+                .invoice_settings(invoice_settings)
+                .send(&self.client)
+                .await
+            {
+                tracing::warn!("Failed to set default payment method {} on customer {}: {:?}", pm_id, cust_id, e);
+                // Non-fatal: the payment method is still attached, just not set as default
+            }
+        }
 
         Ok(AutoTopupSetupResult {
-            payment_method_id,
             customer_id,
             user_id: session.client_reference_id,
         })
@@ -539,6 +555,66 @@ impl PaymentProvider for StripeProvider {
             .charge_auto_topup_internal(amount_cents, customer_id, payment_method_id, idempotency_key)
             .await?;
         Ok(pi.id.to_string())
+    }
+
+    async fn get_default_payment_method(&self, customer_id: &str) -> Result<Option<String>> {
+        use stripe_core::customer::{ListPaymentMethodsCustomer, RetrieveCustomer, RetrieveCustomerReturned};
+
+        let result = RetrieveCustomer::new(customer_id.to_string())
+            .send(&self.client)
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to retrieve Stripe customer: {:?}", e);
+                PaymentError::ProviderApi(e.to_string())
+            })?;
+
+        let customer = match result {
+            RetrieveCustomerReturned::Customer(c) => c,
+            RetrieveCustomerReturned::DeletedCustomer(_) => {
+                tracing::warn!("Stripe customer {} has been deleted", customer_id);
+                return Ok(None);
+            }
+        };
+
+        // Prefer invoice_settings.default_payment_method (set by billing portal or our setup flow)
+        let pm = customer
+            .invoice_settings
+            .and_then(|s| s.default_payment_method)
+            .map(|expandable: stripe_types::Expandable<_>| expandable.id().to_string());
+
+        if pm.is_some() {
+            return Ok(pm);
+        }
+
+        // Fallback: list payment methods attached to the customer.
+        // Checkout setup mode attaches the PM but may not set invoice_settings default
+        // (e.g. if the UpdateCustomer call in process_auto_topup_session failed).
+        let methods = ListPaymentMethodsCustomer::new(customer_id.to_string())
+            .limit(1)
+            .send(&self.client)
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to list payment methods for customer {}: {:?}", customer_id, e);
+                PaymentError::ProviderApi(e.to_string())
+            })?;
+
+        Ok(methods.data.first().map(|pm| pm.id.to_string()))
+    }
+
+    async fn create_customer(&self, email: &str, name: Option<&str>) -> Result<String> {
+        use stripe_core::customer::CreateCustomer;
+
+        let mut params = CreateCustomer::new().email(email);
+        if let Some(n) = name {
+            params = params.name(n);
+        }
+
+        let customer = params.send(&self.client).await.map_err(|e| {
+            tracing::error!("Failed to create Stripe customer: {:?}", e);
+            PaymentError::ProviderApi(e.to_string())
+        })?;
+
+        Ok(customer.id.to_string())
     }
 
     async fn create_billing_portal_session(&self, user: &CurrentUser, return_url: &str) -> Result<String> {

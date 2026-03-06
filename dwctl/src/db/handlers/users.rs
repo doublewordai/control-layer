@@ -37,7 +37,7 @@ impl UserFilter {
     }
 }
 
-/// User eligible for auto top-up (has payment method + threshold + amount configured).
+/// User eligible for auto top-up (has threshold + amount + payment provider configured).
 #[derive(Debug, Clone)]
 pub struct AutoTopupUser {
     pub id: UserId,
@@ -45,7 +45,6 @@ pub struct AutoTopupUser {
     pub username: String,
     pub display_name: Option<String>,
     pub payment_provider_id: String,
-    pub auto_topup_payment_id: String,
     pub auto_topup_threshold: rust_decimal::Decimal,
     pub auto_topup_amount: rust_decimal::Decimal,
     /// Cached checkpoint balance, if one exists.
@@ -89,7 +88,6 @@ struct User {
     pub low_balance_threshold: Option<f32>,
     pub auto_topup_amount: Option<f32>,
     pub auto_topup_threshold: Option<f32>,
-    pub auto_topup_payment_id: Option<String>,
 }
 
 pub struct Users<'c> {
@@ -118,7 +116,6 @@ impl From<(Vec<Role>, User)> for UserDBResponse {
             low_balance_threshold: user.low_balance_threshold,
             auto_topup_amount: user.auto_topup_amount,
             auto_topup_threshold: user.auto_topup_threshold,
-            auto_topup_payment_id: user.auto_topup_payment_id,
         }
     }
 }
@@ -209,12 +206,11 @@ impl<'c> Repository for Users<'c> {
                 u.low_balance_threshold,
                 u.auto_topup_amount,
                 u.auto_topup_threshold,
-                u.auto_topup_payment_id,
                 ARRAY_AGG(ur.role) FILTER (WHERE ur.role IS NOT NULL) as "roles: Vec<Role>"
             FROM users u
             LEFT JOIN user_roles ur ON ur.user_id = u.id
             WHERE u.id = $1 AND u.id != '00000000-0000-0000-0000-000000000000' AND u.is_deleted = false
-            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id, u.is_deleted, u.is_internal, u.batch_notifications_enabled, u.first_batch_email_sent, u.low_balance_notification_sent, u.low_balance_threshold, u.auto_topup_amount, u.auto_topup_threshold, u.auto_topup_payment_id
+            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id, u.is_deleted, u.is_internal, u.batch_notifications_enabled, u.first_batch_email_sent, u.low_balance_notification_sent, u.low_balance_threshold, u.auto_topup_amount, u.auto_topup_threshold
             "#,
             id
         )
@@ -244,7 +240,6 @@ impl<'c> Repository for Users<'c> {
                 low_balance_threshold: row.low_balance_threshold,
                 auto_topup_amount: row.auto_topup_amount,
                 auto_topup_threshold: row.auto_topup_threshold,
-                auto_topup_payment_id: row.auto_topup_payment_id,
             };
 
             let roles = row.roles.unwrap_or_default();
@@ -286,12 +281,11 @@ impl<'c> Repository for Users<'c> {
                 u.low_balance_threshold,
                 u.auto_topup_amount,
                 u.auto_topup_threshold,
-                u.auto_topup_payment_id,
                 ARRAY_AGG(ur.role) FILTER (WHERE ur.role IS NOT NULL) as "roles: Vec<Role>"
             FROM users u
             LEFT JOIN user_roles ur ON ur.user_id = u.id
             WHERE u.id = ANY($1) AND u.id != '00000000-0000-0000-0000-000000000000' AND u.is_deleted = false
-            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id, u.is_deleted, u.is_internal, u.batch_notifications_enabled, u.first_batch_email_sent, u.low_balance_notification_sent, u.low_balance_threshold, u.auto_topup_amount, u.auto_topup_threshold, u.auto_topup_payment_id
+            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id, u.is_deleted, u.is_internal, u.batch_notifications_enabled, u.first_batch_email_sent, u.low_balance_notification_sent, u.low_balance_threshold, u.auto_topup_amount, u.auto_topup_threshold
             "#,
             ids.as_slice()
         )
@@ -323,7 +317,6 @@ impl<'c> Repository for Users<'c> {
                 low_balance_threshold: row.low_balance_threshold,
                 auto_topup_amount: row.auto_topup_amount,
                 auto_topup_threshold: row.auto_topup_threshold,
-                auto_topup_payment_id: row.auto_topup_payment_id,
             };
 
             let roles = row.roles.unwrap_or_default();
@@ -440,10 +433,6 @@ impl<'c> Repository for Users<'c> {
                     WHEN $10::boolean THEN $11
                     ELSE auto_topup_threshold
                 END,
-                auto_topup_payment_id = CASE
-                    WHEN $12::boolean THEN $13
-                    ELSE auto_topup_payment_id
-                END,
                 updated_at = NOW()
             WHERE id = $1
             RETURNING *
@@ -459,8 +448,6 @@ impl<'c> Repository for Users<'c> {
                 request.auto_topup_amount.flatten(),
                 request.auto_topup_threshold.is_some() as bool,
                 request.auto_topup_threshold.flatten(),
-                request.auto_topup_payment_id.is_some() as bool,
-                request.auto_topup_payment_id.clone().flatten(),
             )
             .fetch_optional(&mut *tx)
             .await?
@@ -789,7 +776,6 @@ impl<'c> Users<'c> {
             r#"
             SELECT u.id, u.email, u.username, u.display_name,
                    u.payment_provider_id as "payment_provider_id!",
-                   u.auto_topup_payment_id as "auto_topup_payment_id!",
                    u.auto_topup_threshold::decimal(20, 9) as "auto_topup_threshold!",
                    u.auto_topup_amount::decimal(20, 9) as "auto_topup_amount!",
                    c.balance as "checkpoint_balance?"
@@ -797,7 +783,6 @@ impl<'c> Users<'c> {
             LEFT JOIN user_balance_checkpoints c ON c.user_id = u.id
             WHERE u.id != '00000000-0000-0000-0000-000000000000'
               AND u.is_deleted = false
-              AND u.auto_topup_payment_id IS NOT NULL
               AND u.auto_topup_threshold IS NOT NULL
               AND u.auto_topup_amount IS NOT NULL
               AND u.payment_provider_id IS NOT NULL
@@ -927,7 +912,6 @@ mod tests {
             low_balance_threshold: None,
             auto_topup_amount: None,
             auto_topup_threshold: None,
-            auto_topup_payment_id: None,
         };
 
         let updated_user = repo.update(created_user.id, &update_request).await.unwrap();
@@ -948,7 +932,6 @@ mod tests {
             low_balance_threshold: None,
             auto_topup_amount: None,
             auto_topup_threshold: None,
-            auto_topup_payment_id: None,
         };
 
         let updated_user = repo.update(created_user.id, &update_request).await.unwrap();
@@ -983,7 +966,6 @@ mod tests {
                 low_balance_threshold: Some(threshold),
                 auto_topup_amount: None,
                 auto_topup_threshold: None,
-                auto_topup_payment_id: None,
             };
             repo.update(user.id, &update).await.unwrap();
         }
@@ -1086,7 +1068,6 @@ mod tests {
             low_balance_threshold: Some(Some(5.0)),
             auto_topup_amount: None,
             auto_topup_threshold: None,
-            auto_topup_payment_id: None,
         };
         let updated = users.update(user_id, &update).await.unwrap();
         assert!(!updated.low_balance_notification_sent);
@@ -1119,7 +1100,6 @@ mod tests {
             r#"UPDATE users SET
                 auto_topup_amount = 25.0,
                 auto_topup_threshold = 5.0,
-                auto_topup_payment_id = 'pm_test_123',
                 payment_provider_id = 'cus_test_456'
             WHERE id = $1"#,
             user_id
@@ -1135,7 +1115,6 @@ mod tests {
         assert_eq!(result[0].id, user_id);
         assert_eq!(result[0].auto_topup_amount, Decimal::from_str("25.0").unwrap());
         assert_eq!(result[0].auto_topup_threshold, Decimal::from_str("5.0").unwrap());
-        assert_eq!(result[0].auto_topup_payment_id, "pm_test_123");
         assert_eq!(result[0].payment_provider_id, "cus_test_456");
     }
 
@@ -1155,12 +1134,11 @@ mod tests {
             repo.create(&user_create).await.unwrap().id
         };
 
-        // Set only some auto-topup fields (missing payment_id)
+        // Set only some auto-topup fields (missing payment_provider_id)
         sqlx::query!(
             r#"UPDATE users SET
                 auto_topup_amount = 25.0,
-                auto_topup_threshold = 5.0,
-                payment_provider_id = 'cus_test_456'
+                auto_topup_threshold = 5.0
             WHERE id = $1"#,
             user_id
         )
@@ -1171,6 +1149,6 @@ mod tests {
         let mut users = Users::new(&mut conn);
         let result = users.users_with_auto_topup_enabled().await.unwrap();
 
-        assert!(result.is_empty(), "Should not include user with missing auto_topup_payment_id");
+        assert!(result.is_empty(), "Should not include user with missing payment_provider_id");
     }
 }

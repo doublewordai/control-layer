@@ -1096,52 +1096,32 @@ const paymentsApi = {
     return response.json();
   },
 
-  async autoTopupCheckout(): Promise<{ url: string }> {
-    const response = await fetch("/admin/api/v1/auto-topup/checkout", {
+  async enableAutoTopup(
+    threshold: number,
+    amount: number,
+  ): Promise<{
+    has_payment_method?: boolean;
+    needs_billing_portal?: boolean;
+    threshold?: number;
+    amount?: number;
+  }> {
+    const response = await fetch("/admin/api/v1/auto-topup/enable", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ threshold, amount }),
     });
 
     if (!response.ok) {
       const errorData = await response.json().catch(() => ({}));
       throw new Error(
         errorData.message ||
-          `Failed to create auto top-up checkout: ${response.status}`,
+          `Failed to enable auto top-up: ${response.status}`,
       );
     }
 
     return response.json();
   },
 
-  async processAutoTopupSetup(
-    sessionId: string,
-    threshold: number,
-    amount: number,
-  ): Promise<void> {
-    const response = await fetch(
-      `/admin/api/v1/auto-topup/${sessionId}`,
-      {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ threshold, amount }),
-      },
-    );
-
-    if (!response.ok) {
-      if (response.status === 402) {
-        throw new ApiError(
-          402,
-          "Session is still processing. Please check back in a moment.",
-          response,
-        );
-      }
-      const errorData = await response.json().catch(() => ({}));
-      throw new Error(
-        errorData.message ||
-          `Failed to process auto top-up setup: ${response.status}`,
-      );
-    }
-  },
 };
 
 // Probes API

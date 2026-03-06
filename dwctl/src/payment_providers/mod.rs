@@ -86,8 +86,6 @@ impl From<crate::db::errors::DbError> for PaymentError {
 /// Result of processing an auto top-up setup session
 #[derive(Debug, Clone)]
 pub struct AutoTopupSetupResult {
-    /// Payment method ID saved for future charges
-    pub payment_method_id: String,
     /// Payment provider customer ID (may be newly created)
     pub customer_id: Option<String>,
     /// The user ID that initiated this session (from `client_reference_id`)
@@ -213,4 +211,15 @@ pub trait PaymentProvider: Send + Sync {
         payment_method_id: &str,
         idempotency_key: &str,
     ) -> Result<String>;
+
+    /// Get the customer's default payment method from the payment provider.
+    ///
+    /// Returns `Some(payment_method_id)` if the customer has a default payment method,
+    /// or `None` if no default is set.
+    async fn get_default_payment_method(&self, customer_id: &str) -> Result<Option<String>>;
+
+    /// Create a new customer with the payment provider.
+    ///
+    /// Returns the provider's customer ID for the newly created customer.
+    async fn create_customer(&self, email: &str, name: Option<&str>) -> Result<String>;
 }

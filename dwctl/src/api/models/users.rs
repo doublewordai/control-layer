@@ -200,7 +200,7 @@ impl From<UserDBResponse> for UserResponse {
             low_balance_threshold: db.low_balance_threshold,
             auto_topup_amount: db.auto_topup_amount,
             auto_topup_threshold: db.auto_topup_threshold,
-            has_auto_topup_payment_method: db.auto_topup_payment_id.as_ref().is_some_and(|s| !s.is_empty()),
+            has_auto_topup_payment_method: db.payment_provider_id.as_ref().is_some_and(|s| !s.is_empty()),
         }
     }
 }

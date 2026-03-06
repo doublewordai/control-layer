@@ -51,9 +51,6 @@ pub struct UserUpdateDBRequest {
     /// Auto top-up threshold (balance level that triggers auto top-up).
     /// `None` = don't change, `Some(None)` = disable, `Some(Some(val))` = set threshold.
     pub auto_topup_threshold: Option<Option<f32>>,
-    /// Payment method ID for auto top-up charges.
-    /// `None` = don't change, `Some(None)` = clear, `Some(Some(val))` = set.
-    pub auto_topup_payment_id: Option<Option<String>>,
 }
 
 impl UserUpdateDBRequest {
@@ -67,7 +64,6 @@ impl UserUpdateDBRequest {
             low_balance_threshold: update.low_balance_threshold,
             auto_topup_amount: update.auto_topup_amount,
             auto_topup_threshold: update.auto_topup_threshold,
-            auto_topup_payment_id: None,
         }
     }
 }
@@ -97,6 +93,4 @@ pub struct UserDBResponse {
     pub auto_topup_amount: Option<f32>,
     /// Auto top-up threshold. When balance drops below this, auto top-up triggers.
     pub auto_topup_threshold: Option<f32>,
-    /// Payment method ID for auto top-up charges.
-    pub auto_topup_payment_id: Option<String>,
 }

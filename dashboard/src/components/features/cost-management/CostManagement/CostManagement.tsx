@@ -13,7 +13,6 @@ import { useSettings } from "@/contexts";
 import { TransactionHistory } from "@/components/features/cost-management/CostManagement/TransactionHistory.tsx";
 import { AutoTopupSection } from "@/components/features/cost-management/CostManagement/AutoTopupSection.tsx";
 import { AddFundsModal } from "@/components/modals/AddCreditsModal/AddCreditsModal";
-import { AutoTopupModal } from "@/components/modals/AutoTopupModal/AutoTopupModal";
 import {
   Dialog,
   DialogContent,
@@ -34,27 +33,8 @@ export function CostManagement() {
   const [showSuccessModal, setShowSuccessModal] = useState(false);
   const [showCancelledModal, setShowCancelledModal] = useState(false);
   const [showAddFundsModal, setShowAddFundsModal] = useState(false);
-  const [showAutoTopupModal, setShowAutoTopupModal] = useState(false);
-  const [autoTopupId, setAutoTopupId] = useState<string | undefined>(undefined);
-
   // Check if we're filtering by a specific user
   const filterUserId = searchParams.get("user");
-
-  // Open auto top-up modal on Stripe redirect (autoTopupId present in URL)
-  // Only allow for the user's own billing page, not when an admin is viewing another user
-  const autoTopupIdParam = searchParams.get("autoTopupId");
-  useEffect(() => {
-    if (autoTopupIdParam && !filterUserId) {
-      setAutoTopupId(autoTopupIdParam);
-      setShowAutoTopupModal(true);
-
-      // Clean auto-topup params from URL to prevent modal reopening on refresh
-      const url = new URL(window.location.href);
-      url.searchParams.delete("autoTopupId");
-      url.searchParams.delete("autoTopup");
-      window.history.replaceState({}, "", url.pathname + url.search);
-    }
-  }, [autoTopupIdParam, filterUserId]);
 
   // Fetch current user and display user (the one we're viewing billing for)
   const { data: currentUser, refetch: refetchCurrentUser } = useUser("current");
@@ -243,7 +223,6 @@ export function CostManagement() {
     <AutoTopupSection
       user={displayUser!}
       userId={currentUser!.id}
-      onSetupRequired={() => setShowAutoTopupModal(true)}
       onSuccess={() => {
         refetchCurrentUser();
         refetchDisplayUser();
@@ -271,21 +250,6 @@ export function CostManagement() {
               onSuccess={handleAddFundsSuccess}
             />
           )}
-          <AutoTopupModal
-            isOpen={showAutoTopupModal}
-            onClose={() => {
-              setShowAutoTopupModal(false);
-              setAutoTopupId(undefined);
-            }}
-            autoTopupAmount={displayUser?.auto_topup_amount ?? null}
-            autoTopupThreshold={displayUser?.auto_topup_threshold ?? null}
-            userId={filterUserId || currentUser.id}
-            onSuccess={() => {
-              refetchCurrentUser();
-              refetchDisplayUser();
-            }}
-            autoTopupId={autoTopupId}
-          />
         </>
       )}
 

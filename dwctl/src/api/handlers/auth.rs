@@ -487,7 +487,6 @@ pub async fn confirm_password_reset<P: PoolProvider>(
         low_balance_threshold: None,
         auto_topup_amount: None,
         auto_topup_threshold: None,
-        auto_topup_payment_id: None,
     };
 
     let mut tx = state.db.write().begin().await.unwrap();
@@ -622,7 +621,6 @@ pub async fn change_password<P: PoolProvider>(
         low_balance_threshold: None,
         auto_topup_amount: None,
         auto_topup_threshold: None,
-        auto_topup_payment_id: None,
     };
 
     user_repo.update(current_user.id, &update_request).await?;

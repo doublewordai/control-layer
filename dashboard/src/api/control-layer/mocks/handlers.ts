@@ -2096,30 +2096,4 @@ export const handlers = [
     return HttpResponse.json(cancelledBatch);
   }),
 
-  // Auto top-up checkout (demo mode redirects back with demo session ID)
-  http.post("/admin/api/v1/auto-topup/checkout", () => {
-    const url = `${window.location.origin}/cost-management?autoTopupId=demo_auto_topup_123&autoTopup=true`;
-    return HttpResponse.json({ url });
-  }),
-
-  // Auto top-up setup processing
-  http.put("/admin/api/v1/auto-topup/:id", async ({ request }) => {
-    const body = (await request.json()) as {
-      threshold: number;
-      amount: number;
-    };
-
-    // Update the first user (Sarah Chen) in mock data as a demo
-    const user = usersData[0];
-    if (user) {
-      user.auto_topup_amount = body.amount;
-      (user as User & { auto_topup_threshold: number | null }).auto_topup_threshold = body.threshold;
-    }
-
-    return HttpResponse.json({
-      message: "Auto top-up enabled successfully",
-      threshold: body.threshold,
-      amount: body.amount,
-    });
-  }),
 ];
