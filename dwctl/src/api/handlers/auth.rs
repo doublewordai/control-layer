@@ -347,22 +347,30 @@ pub async fn login<P: PoolProvider>(State(state): State<AppState<P>>, Json(reque
 )]
 #[tracing::instrument(skip_all)]
 pub async fn logout<P: PoolProvider>(State(state): State<AppState<P>>) -> Result<LogoutResponse, Error> {
-    // Create expired cookie to clear session
-    let secure = if state.config.auth.native.session.cookie_secure {
-        "; Secure"
-    } else {
-        ""
-    };
+    let session_config = &state.config.auth.native.session;
+    let secure = if session_config.cookie_secure { "; Secure" } else { "" };
+
+    // Clear session cookie
     let cookie = format!(
-        "{}=; Path=/; HttpOnly{}; SameSite=Strict; Max-Age=0",
-        state.config.auth.native.session.cookie_name, secure
+        "{}=; Path=/; HttpOnly{}; SameSite={}; Max-Age=0",
+        session_config.cookie_name, secure, session_config.cookie_same_site
+    );
+
+    // Also clear the active organization cookie
+    let org_cookie = format!(
+        "dw_active_org=; Path=/; HttpOnly{}; SameSite={}; Max-Age=0",
+        secure, session_config.cookie_same_site
     );
 
     let auth_response = AuthSuccessResponse {
         message: "Logout successful".to_string(),
     };
 
-    Ok(LogoutResponse { auth_response, cookie })
+    Ok(LogoutResponse {
+        auth_response,
+        cookie,
+        extra_cookies: vec![org_cookie],
+    })
 }
 
 /// Request password reset (send email)

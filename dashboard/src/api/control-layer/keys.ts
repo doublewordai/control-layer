@@ -142,4 +142,14 @@ export const queryKeys = {
     all: ["webhooks"] as const,
     byUser: (userId: string) => ["webhooks", "byUser", userId] as const,
   },
+
+  // Organizations
+  organizations: {
+    all: ["organizations"] as const,
+    query: (options?: { skip?: number; limit?: number; search?: string; include?: string }) =>
+      ["organizations", "query", options] as const,
+    byId: (id: string) => ["organizations", "byId", id] as const,
+    members: (orgId: string) =>
+      ["organizations", "members", orgId] as const,
+  },
 } as const;

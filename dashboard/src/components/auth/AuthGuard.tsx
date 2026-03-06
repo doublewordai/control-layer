@@ -1,4 +1,4 @@
-import { Navigate } from "react-router-dom";
+import { Navigate, useSearchParams } from "react-router-dom";
 import { useAuth } from "../../contexts/auth";
 
 interface AuthGuardProps {
@@ -8,6 +8,7 @@ interface AuthGuardProps {
 
 export function AuthGuard({ children, requireAuth = false }: AuthGuardProps) {
   const { isAuthenticated, isLoading } = useAuth();
+  const [searchParams] = useSearchParams();
 
   if (isLoading) {
     return (
@@ -22,9 +23,10 @@ export function AuthGuard({ children, requireAuth = false }: AuthGuardProps) {
     return <Navigate to="/login" replace />;
   }
 
-  // If auth is not required (login/register pages) but user is authenticated, redirect to dashboard
+  // If auth is not required (login/register pages) but user is authenticated, redirect
   if (!requireAuth && isAuthenticated) {
-    return <Navigate to="/" replace />;
+    const redirect = searchParams.get("redirect");
+    return <Navigate to={redirect || "/"} replace />;
   }
 
   return <>{children}</>;

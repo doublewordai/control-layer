@@ -286,6 +286,8 @@ export interface User {
   has_payment_provider_id: boolean; // Whether the user has a payment provider customer ID set
   batch_notifications_enabled: boolean; // Whether the user receives batch completion emails
   low_balance_threshold: number | null; // Threshold for low balance notifications (null = disabled)
+  user_type?: "individual" | "organization"; // User type
+  organizations?: OrganizationSummary[]; // only present when include=organizations or for current user
 }
 
 export interface ApiKey {
@@ -297,6 +299,7 @@ export interface ApiKey {
   last_used?: string; // ISO 8601 timestamp
   requests_per_second?: number | null; // Rate limiting: requests per second
   burst_size?: number | null; // Rate limiting: burst capacity
+  created_by?: string; // UUID of the user who created the key
   // Note: actual key value only returned on creation
 }
 
@@ -1286,4 +1289,80 @@ export interface WebhookUpdateRequest {
   enabled?: boolean;
   event_types?: string[] | null;
   description?: string | null;
+}
+
+// ===== ORGANIZATION TYPES =====
+
+export type OrgMemberRole = "owner" | "admin" | "member";
+
+export interface OrganizationSummary {
+  id: string;
+  name: string;
+  role: string;
+}
+
+/** Organization response — flattened User with org-specific fields */
+export interface Organization extends User {
+  member_count?: number;
+}
+
+export interface OrganizationMember {
+  id: string;
+  user?: User;
+  role: string;
+  status: "active" | "pending";
+  created_at: string;
+  invite_email?: string;
+}
+
+export interface OrganizationCreateRequest {
+  name: string;
+  email: string;
+  display_name?: string;
+  owner_id?: string;
+}
+
+export interface OrganizationUpdateRequest {
+  display_name?: string;
+  email?: string;
+}
+
+export interface InviteMemberRequest {
+  email: string;
+  role?: OrgMemberRole;
+}
+
+export interface InviteMemberResponse {
+  id: string;
+  email: string;
+  role: string;
+  status: string;
+  created_at: string;
+  expires_at: string;
+}
+
+export interface InviteDetailsResponse {
+  org_name: string;
+  role: string;
+  inviter_name?: string;
+  expires_at: string;
+}
+
+export interface UpdateMemberRoleRequest {
+  role: OrgMemberRole;
+}
+
+export interface OrganizationsQuery {
+  skip?: number;
+  limit?: number;
+  search?: string;
+  include?: string;
+}
+
+export interface SetActiveOrganizationRequest {
+  organization_id: string | null;
+}
+
+export interface SetActiveOrganizationResponse {
+  active_organization_id: string | null;
 }

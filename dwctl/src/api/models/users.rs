@@ -221,6 +221,12 @@ impl UserResponse {
         self.credit_balance = Some(balance);
         self
     }
+
+    /// Create a response with organizations included
+    pub fn with_organizations(mut self, organizations: Vec<super::organizations::OrganizationSummary>) -> Self {
+        self.organizations = Some(organizations);
+        self
+    }
 }
 
 impl From<UserDBResponse> for CurrentUser {

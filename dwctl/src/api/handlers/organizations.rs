@@ -4,25 +4,39 @@ use crate::{
     AppState,
     api::models::{
         organizations::{
-            AddMemberRequest, ListOrganizationsQuery, OrganizationCreate, OrganizationMemberResponse, OrganizationResponse,
-            OrganizationUpdate, SetActiveOrganizationRequest, SetActiveOrganizationResponse, UpdateMemberRoleRequest,
+            AddMemberRequest, InviteDetailsResponse, InviteMemberRequest, InviteMemberResponse, ListOrganizationsQuery, OrganizationCreate,
+            OrganizationMemberResponse, OrganizationResponse, OrganizationUpdate, SetActiveOrganizationRequest,
+            SetActiveOrganizationResponse, UpdateMemberRoleRequest,
         },
         pagination::PaginatedResponse,
         users::{CurrentUser, UserResponse},
     },
     auth::permissions::{can_manage_org_resource, can_read_all_resources, can_read_own_resource},
-    db::handlers::{Organizations, Repository, Users, organizations::OrganizationFilter},
+    db::handlers::{Credits, Organizations, Repository, Users, organizations::OrganizationFilter},
     db::models::organizations::{OrganizationCreateDBRequest, OrganizationUpdateDBRequest},
+    email::EmailService,
     errors::{Error, Result},
     types::{Operation, Permission, Resource, UserId, UserIdOrCurrent},
 };
+use chrono::Duration;
+use rust_decimal::prelude::ToPrimitive;
+use sha2::{Digest, Sha256};
 use sqlx_pool_router::PoolProvider;
 
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode, header},
     response::Json,
 };
+
+/// Hash a token with SHA-256 for deterministic DB lookup.
+/// Since invite tokens are 256 bits of cryptographic randomness,
+/// a fast hash is secure enough (no brute-force risk).
+fn hash_invite_token(token: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(token.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
 
 const VALID_ROLES: [&str; 3] = ["owner", "admin", "member"];
 
@@ -83,10 +97,10 @@ pub async fn create_organization<P: PoolProvider>(
     current_user: CurrentUser,
     Json(data): Json<OrganizationCreate>,
 ) -> Result<(StatusCode, Json<OrganizationResponse>)> {
-    if !crate::auth::permissions::has_permission(&current_user, Resource::Organizations, Operation::CreateOwn) {
+    if !crate::auth::permissions::has_permission(&current_user, Resource::Organizations, Operation::CreateAll) {
         return Err(Error::InsufficientPermissions {
-            required: Permission::Allow(Resource::Organizations, Operation::CreateOwn),
-            action: Operation::CreateOwn,
+            required: Permission::Allow(Resource::Organizations, Operation::CreateAll),
+            action: Operation::CreateAll,
             resource: "Organizations".to_string(),
         });
     }
@@ -97,12 +111,14 @@ pub async fn create_organization<P: PoolProvider>(
         });
     }
 
+    let owner_id = data.owner_id.unwrap_or(current_user.id);
+
     let db_request = OrganizationCreateDBRequest {
         name: data.name,
         email: data.email,
         display_name: data.display_name,
         avatar_url: None,
-        created_by: current_user.id,
+        created_by: owner_id,
     };
 
     let mut pool_conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
@@ -258,7 +274,16 @@ pub async fn get_organization<P: PoolProvider>(
     let mut org_repo = Organizations::new(&mut pool_conn);
     let members = org_repo.list_members(id).await?;
 
-    let response = OrganizationResponse::from_user(UserResponse::from(org)).with_member_count(members.len() as i64);
+    let mut response = OrganizationResponse::from_user(UserResponse::from(org)).with_member_count(members.len() as i64);
+
+    // Include credit balance if the user has permission to view billing data
+    let can_view_billing = crate::auth::permissions::has_permission(&current_user, Resource::Credits, Operation::ReadAll)
+        || crate::auth::permissions::has_permission(&current_user, Resource::Credits, Operation::ReadOwn);
+    if can_view_billing {
+        let mut credits_repo = Credits::new(&mut pool_conn);
+        let balance = credits_repo.get_user_balance(id).await?.to_f64().unwrap_or(0.0);
+        response.user = response.user.with_credit_balance(balance);
+    }
 
     Ok(Json(response))
 }
@@ -415,19 +440,35 @@ pub async fn list_members<P: PoolProvider>(
     let mut repo = Organizations::new(&mut pool_conn);
     let memberships = repo.list_members(id).await?;
 
-    // Fetch user details for each member
-    let user_ids: Vec<UserId> = memberships.iter().map(|m| m.user_id).collect();
+    // Fetch user details for members that have a user_id (excludes pending invites without accounts)
+    let user_ids: Vec<UserId> = memberships.iter().filter_map(|m| m.user_id).collect();
     let mut users_repo = Users::new(&mut pool_conn);
     let user_map = users_repo.get_bulk(user_ids).await?;
 
     let members: Vec<OrganizationMemberResponse> = memberships
         .iter()
         .filter_map(|m| {
-            user_map.get(&m.user_id).map(|u| OrganizationMemberResponse {
-                user: UserResponse::from(u.clone()),
-                role: m.role.clone(),
-                created_at: m.created_at,
-            })
+            if let Some(uid) = m.user_id {
+                // Active member or pending invite for existing user
+                user_map.get(&uid).map(|u| OrganizationMemberResponse {
+                    id: m.id,
+                    user: Some(UserResponse::from(u.clone())),
+                    role: m.role.clone(),
+                    status: m.status.clone(),
+                    created_at: m.created_at,
+                    invite_email: m.invite_email.clone(),
+                })
+            } else {
+                // Pending invite for user who hasn't signed up yet
+                Some(OrganizationMemberResponse {
+                    id: m.id,
+                    user: None,
+                    role: m.role.clone(),
+                    status: m.status.clone(),
+                    created_at: m.created_at,
+                    invite_email: m.invite_email.clone(),
+                })
+            }
         })
         .collect();
 
@@ -497,9 +538,12 @@ pub async fn add_member<P: PoolProvider>(
     Ok((
         StatusCode::CREATED,
         Json(OrganizationMemberResponse {
-            user: UserResponse::from(user),
+            id: membership.id,
+            user: Some(UserResponse::from(user)),
             role: membership.role,
+            status: membership.status,
             created_at: membership.created_at,
+            invite_email: None,
         }),
     ))
 }
@@ -582,9 +626,12 @@ pub async fn update_member_role<P: PoolProvider>(
 
     tx.commit().await.map_err(|e| Error::Database(e.into()))?;
     Ok(Json(OrganizationMemberResponse {
-        user: UserResponse::from(user),
+        id: membership.id,
+        user: Some(UserResponse::from(user)),
         role: membership.role,
+        status: membership.status,
         created_at: membership.created_at,
+        invite_email: None,
     }))
 }
 
@@ -730,16 +777,14 @@ pub async fn list_user_organizations<P: PoolProvider>(
 
 /// Validate and confirm an active organization context.
 ///
-/// The client sends `X-Organization-Id` header on subsequent requests.
-/// This endpoint validates membership and returns the confirmed org ID.
-/// The dashboard stores the org ID in localStorage and includes it as a header.
-/// CLI tools pass it as a flag or environment variable.
+/// Sets a `dw_active_org` cookie so the browser sends it automatically with all
+/// subsequent requests.  CLI tools can still use the `X-Organization-Id` header.
 #[utoipa::path(
     post,
     path = "/session/organization",
     tag = "organizations",
     summary = "Set active organization",
-    description = "Validate organization membership. The client should store the returned organization_id and send it as the X-Organization-Id header on subsequent requests.",
+    description = "Validate organization membership and set a cookie for the active organization context.",
     responses(
         (status = 200, description = "Organization context validated", body = SetActiveOrganizationResponse),
         (status = 401, description = "Unauthorized"),
@@ -756,7 +801,7 @@ pub async fn set_active_organization<P: PoolProvider>(
     State(state): State<AppState<P>>,
     current_user: CurrentUser,
     Json(data): Json<SetActiveOrganizationRequest>,
-) -> Result<Json<SetActiveOrganizationResponse>> {
+) -> Result<(HeaderMap, Json<SetActiveOrganizationResponse>)> {
     // If organization_id is provided, verify membership
     if let Some(org_id) = data.organization_id {
         let mut pool_conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
@@ -771,9 +816,407 @@ pub async fn set_active_organization<P: PoolProvider>(
         }
     }
 
-    Ok(Json(SetActiveOrganizationResponse {
-        active_organization_id: data.organization_id,
+    // Build the dw_active_org cookie using the same security settings as the session cookie
+    let session_config = &state.config.auth.native.session;
+    let secure = if session_config.cookie_secure { "; Secure" } else { "" };
+    let cookie = if let Some(org_id) = data.organization_id {
+        // Set cookie with long max-age (30 days) — cleared explicitly when switching back
+        format!(
+            "dw_active_org={}; Path=/; HttpOnly{}; SameSite={}; Max-Age={}",
+            org_id,
+            secure,
+            session_config.cookie_same_site,
+            30 * 24 * 60 * 60
+        )
+    } else {
+        // Clear cookie
+        format!(
+            "dw_active_org=; Path=/; HttpOnly{}; SameSite={}; Max-Age=0",
+            secure, session_config.cookie_same_site
+        )
+    };
+
+    let mut headers = HeaderMap::new();
+    headers.insert(header::SET_COOKIE, cookie.parse().unwrap());
+
+    Ok((
+        headers,
+        Json(SetActiveOrganizationResponse {
+            active_organization_id: data.organization_id,
+        }),
+    ))
+}
+
+/// Invite a user to an organization by email
+#[utoipa::path(
+    post,
+    path = "/organizations/{id}/invites",
+    tag = "organizations",
+    summary = "Invite member by email",
+    description = "Send an invitation email to join the organization. Requires owner/admin role or platform manager access.",
+    params(
+        ("id" = String, Path, description = "Organization ID (UUID)"),
+    ),
+    responses(
+        (status = 201, description = "Invite created", body = InviteMemberResponse),
+        (status = 400, description = "Bad request"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden"),
+        (status = 409, description = "Conflict - already a member or pending invite"),
+    ),
+    security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
+        ("X-Doubleword-User" = [])
+    )
+)]
+#[tracing::instrument(skip_all)]
+pub async fn invite_member<P: PoolProvider>(
+    State(state): State<AppState<P>>,
+    Path(id): Path<UserId>,
+    current_user: CurrentUser,
+    Json(data): Json<InviteMemberRequest>,
+) -> Result<(StatusCode, Json<InviteMemberResponse>)> {
+    let can_all = crate::auth::permissions::has_permission(&current_user, Resource::Organizations, Operation::UpdateAll);
+
+    let mut pool_conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
+
+    if !can_all {
+        let can_org = can_manage_org_resource(&current_user, id, &mut pool_conn).await?;
+        if !can_org {
+            return Err(Error::InsufficientPermissions {
+                required: Permission::Allow(Resource::Organizations, Operation::UpdateOwn),
+                action: Operation::UpdateOwn,
+                resource: format!("Organization {id} members"),
+            });
+        }
+    }
+
+    // Basic email validation
+    let email = data.email.trim().to_lowercase();
+    if !email.contains('@') || !email.contains('.') {
+        return Err(Error::BadRequest {
+            message: "Invalid email address".to_string(),
+        });
+    }
+
+    let role = data.role.as_deref().unwrap_or("member");
+    validate_role(role)?;
+
+    // Only owners (or platform managers) can assign the owner role
+    check_role_assignment_privilege(&current_user, id, role, can_all, &mut pool_conn).await?;
+
+    // Check if email is already an active member
+    let mut users_repo = Users::new(&mut pool_conn);
+    let existing_user = users_repo.get_user_by_email(&email).await?;
+    let existing_user_id = existing_user.as_ref().map(|u| u.id);
+
+    if let Some(ref user) = existing_user {
+        let mut org_repo = Organizations::new(&mut pool_conn);
+        let existing_role = org_repo.get_user_org_role(user.id, id).await?;
+        if existing_role.is_some() {
+            return Err(Error::Conflict {
+                message: "User is already an active member of this organization".to_string(),
+                conflicts: None,
+            });
+        }
+    }
+
+    // Generate invite token and hash
+    let mut org_repo = Organizations::new(&mut pool_conn);
+    let token = crate::auth::password::generate_reset_token();
+    let token_hash = hash_invite_token(&token);
+    let expires_at = chrono::Utc::now() + Duration::days(7);
+
+    // Create the invite
+    let invite = org_repo
+        .create_invite(id, existing_user_id, &email, role, current_user.id, &token_hash, expires_at)
+        .await?;
+
+    // Get org name and inviter name for the email
+    let mut users_repo = Users::new(&mut pool_conn);
+    let org_user = users_repo.get_by_id(id).await?;
+    let org_name = org_user
+        .as_ref()
+        .and_then(|u| u.display_name.clone())
+        .unwrap_or_else(|| org_user.as_ref().map(|u| u.username.clone()).unwrap_or_default());
+
+    let inviter = users_repo.get_by_id(current_user.id).await?;
+    let inviter_name = inviter
+        .as_ref()
+        .and_then(|u| u.display_name.clone())
+        .unwrap_or_else(|| inviter.as_ref().map(|u| u.username.clone()).unwrap_or_default());
+
+    // Send invite email
+    let invite_link = format!("{}/org-invite?token={}", state.config.dashboard_url.trim_end_matches('/'), token);
+    let email_service = EmailService::new(&state.config)?;
+    if let Err(e) = email_service
+        .send_org_invite_email(&email, &org_name, &inviter_name, role, &invite_link)
+        .await
+    {
+        tracing::warn!("Failed to send invite email to {email}: {e}");
+    }
+
+    Ok((
+        StatusCode::CREATED,
+        Json(InviteMemberResponse {
+            id: invite.id,
+            email,
+            role: invite.role,
+            status: invite.status,
+            created_at: invite.created_at,
+            expires_at: invite.expires_at.expect("invite must have expires_at"),
+        }),
+    ))
+}
+
+/// Get details about a pending invite by token
+#[utoipa::path(
+    get,
+    path = "/organizations/invites/{token}",
+    tag = "organizations",
+    summary = "Get invite details",
+    description = "Look up a pending invite by its token. Returns organization name, role, and inviter info.",
+    params(
+        ("token" = String, Path, description = "Invite token"),
+    ),
+    responses(
+        (status = 200, description = "Invite details", body = InviteDetailsResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 400, description = "Bad request - invite has expired"),
+        (status = 404, description = "Not found"),
+    ),
+    security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
+        ("X-Doubleword-User" = [])
+    )
+)]
+#[tracing::instrument(skip_all)]
+pub async fn get_invite_details<P: PoolProvider>(
+    State(state): State<AppState<P>>,
+    Path(token): Path<String>,
+    _current_user: CurrentUser,
+) -> Result<Json<InviteDetailsResponse>> {
+    let token_hash = hash_invite_token(&token);
+
+    let mut pool_conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+    let mut org_repo = Organizations::new(&mut pool_conn);
+
+    let invite = org_repo
+        .find_invite_by_token_hash(&token_hash)
+        .await?
+        .ok_or_else(|| Error::NotFound {
+            resource: "Invite".to_string(),
+            id: "invalid or expired token".to_string(),
+        })?;
+
+    // Check expiry
+    if let Some(expires_at) = invite.expires_at
+        && expires_at < chrono::Utc::now()
+    {
+        return Err(Error::BadRequest {
+            message: "This invite has expired".to_string(),
+        });
+    }
+
+    // Get org name
+    let mut users_repo = Users::new(&mut pool_conn);
+    let org_user = users_repo.get_by_id(invite.organization_id).await?;
+    let org_name = org_user
+        .as_ref()
+        .and_then(|u| u.display_name.clone())
+        .unwrap_or_else(|| org_user.as_ref().map(|u| u.username.clone()).unwrap_or_default());
+
+    // Get inviter name
+    let inviter_name = if let Some(invited_by) = invite.invited_by {
+        let inviter = users_repo.get_by_id(invited_by).await?;
+        inviter.and_then(|u| u.display_name.or(Some(u.username)))
+    } else {
+        None
+    };
+
+    Ok(Json(InviteDetailsResponse {
+        org_name,
+        role: invite.role,
+        inviter_name,
+        expires_at: invite.expires_at.expect("invite must have expires_at"),
     }))
+}
+
+/// Accept a pending invite
+#[utoipa::path(
+    post,
+    path = "/organizations/invites/{token}/accept",
+    tag = "organizations",
+    summary = "Accept invite",
+    description = "Accept a pending organization invite. The authenticated user's email must match the invite email.",
+    params(
+        ("token" = String, Path, description = "Invite token"),
+    ),
+    responses(
+        (status = 200, description = "Invite accepted"),
+        (status = 400, description = "Bad request - expired or email mismatch"),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Not found"),
+    ),
+    security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
+        ("X-Doubleword-User" = [])
+    )
+)]
+#[tracing::instrument(skip_all)]
+pub async fn accept_invite<P: PoolProvider>(
+    State(state): State<AppState<P>>,
+    Path(token): Path<String>,
+    current_user: CurrentUser,
+) -> Result<Json<serde_json::Value>> {
+    let token_hash = hash_invite_token(&token);
+
+    let mut pool_conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
+    let mut org_repo = Organizations::new(&mut pool_conn);
+
+    let invite = org_repo
+        .find_invite_by_token_hash(&token_hash)
+        .await?
+        .ok_or_else(|| Error::NotFound {
+            resource: "Invite".to_string(),
+            id: "invalid or expired token".to_string(),
+        })?;
+
+    // Check expiry
+    if let Some(expires_at) = invite.expires_at
+        && expires_at < chrono::Utc::now()
+    {
+        return Err(Error::BadRequest {
+            message: "This invite has expired".to_string(),
+        });
+    }
+
+    // Verify the current user's email matches the invite
+    if let Some(ref invite_email) = invite.invite_email
+        && current_user.email.to_lowercase() != invite_email.to_lowercase()
+    {
+        return Err(Error::BadRequest {
+            message: "Your email address does not match this invite".to_string(),
+        });
+    }
+
+    org_repo.accept_invite(invite.id, current_user.id).await?;
+
+    Ok(Json(serde_json::json!({ "message": "Invite accepted" })))
+}
+
+/// Decline a pending invite
+#[utoipa::path(
+    post,
+    path = "/organizations/invites/{token}/decline",
+    tag = "organizations",
+    summary = "Decline invite",
+    description = "Decline a pending organization invite. The authenticated user's email must match the invite email.",
+    params(
+        ("token" = String, Path, description = "Invite token"),
+    ),
+    responses(
+        (status = 200, description = "Invite declined"),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Not found"),
+    ),
+    security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
+        ("X-Doubleword-User" = [])
+    )
+)]
+#[tracing::instrument(skip_all)]
+pub async fn decline_invite<P: PoolProvider>(
+    State(state): State<AppState<P>>,
+    Path(token): Path<String>,
+    current_user: CurrentUser,
+) -> Result<Json<serde_json::Value>> {
+    let token_hash = hash_invite_token(&token);
+
+    let mut pool_conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
+    let mut org_repo = Organizations::new(&mut pool_conn);
+
+    let invite = org_repo
+        .find_invite_by_token_hash(&token_hash)
+        .await?
+        .ok_or_else(|| Error::NotFound {
+            resource: "Invite".to_string(),
+            id: "invalid or expired token".to_string(),
+        })?;
+
+    // Verify the current user's email matches the invite
+    if let Some(ref invite_email) = invite.invite_email
+        && current_user.email.to_lowercase() != invite_email.to_lowercase()
+    {
+        return Err(Error::BadRequest {
+            message: "Your email address does not match this invite".to_string(),
+        });
+    }
+
+    // Delete the pending invite row
+    org_repo.cancel_invite(invite.organization_id, invite.id).await?;
+
+    Ok(Json(serde_json::json!({ "message": "Invite declined" })))
+}
+
+/// Cancel a pending invite (by org admin/owner)
+#[utoipa::path(
+    delete,
+    path = "/organizations/{id}/invites/{invite_id}",
+    tag = "organizations",
+    summary = "Cancel invite",
+    description = "Cancel a pending invite. Requires owner/admin role or platform manager access.",
+    params(
+        ("id" = String, Path, description = "Organization ID (UUID)"),
+        ("invite_id" = String, Path, description = "Invite row ID (UUID)"),
+    ),
+    responses(
+        (status = 204, description = "Invite cancelled"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden"),
+        (status = 404, description = "Not found"),
+    ),
+    security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
+        ("X-Doubleword-User" = [])
+    )
+)]
+#[tracing::instrument(skip_all)]
+pub async fn cancel_invite<P: PoolProvider>(
+    State(state): State<AppState<P>>,
+    Path((id, invite_id)): Path<(UserId, UserId)>,
+    current_user: CurrentUser,
+) -> Result<StatusCode> {
+    let can_all = crate::auth::permissions::has_permission(&current_user, Resource::Organizations, Operation::UpdateAll);
+
+    let mut pool_conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
+
+    if !can_all {
+        let can_org = can_manage_org_resource(&current_user, id, &mut pool_conn).await?;
+        if !can_org {
+            return Err(Error::InsufficientPermissions {
+                required: Permission::Allow(Resource::Organizations, Operation::UpdateOwn),
+                action: Operation::UpdateOwn,
+                resource: format!("Organization {id} invites"),
+            });
+        }
+    }
+
+    let mut org_repo = Organizations::new(&mut pool_conn);
+    let cancelled = org_repo.cancel_invite(id, invite_id).await?;
+    if !cancelled {
+        return Err(Error::NotFound {
+            resource: "Pending invite".to_string(),
+            id: format!("{invite_id} in organization {id}"),
+        });
+    }
+
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[cfg(test)]
@@ -793,14 +1236,13 @@ mod tests {
         let admin_headers = add_auth_headers(&admin);
 
         let owner = create_test_user(&pool, Role::StandardUser).await;
-        let owner_headers = add_auth_headers(&owner);
 
-        // Owner creates an org
+        // Platform manager creates an org with owner as the designated owner
         let resp = server
             .post("/admin/api/v1/organizations")
-            .add_header(&owner_headers[0].0, &owner_headers[0].1)
-            .add_header(&owner_headers[1].0, &owner_headers[1].1)
-            .json(&json!({ "name": "test-org-last-owner", "email": "org@example.com" }))
+            .add_header(&admin_headers[0].0, &admin_headers[0].1)
+            .add_header(&admin_headers[1].0, &admin_headers[1].1)
+            .json(&json!({ "name": "test-org-last-owner", "email": "org@example.com", "owner_id": owner.id }))
             .await;
         resp.assert_status(axum::http::StatusCode::CREATED);
         let org_id = resp.json::<serde_json::Value>()["id"].as_str().unwrap().to_string();
@@ -824,15 +1266,14 @@ mod tests {
         let admin_headers = add_auth_headers(&admin);
 
         let owner1 = create_test_user(&pool, Role::StandardUser).await;
-        let owner1_headers = add_auth_headers(&owner1);
         let owner2 = create_test_user(&pool, Role::StandardUser).await;
 
-        // Owner1 creates an org
+        // Platform manager creates an org with owner1 as the designated owner
         let resp = server
             .post("/admin/api/v1/organizations")
-            .add_header(&owner1_headers[0].0, &owner1_headers[0].1)
-            .add_header(&owner1_headers[1].0, &owner1_headers[1].1)
-            .json(&json!({ "name": "test-org-two-owners", "email": "org@example.com" }))
+            .add_header(&admin_headers[0].0, &admin_headers[0].1)
+            .add_header(&admin_headers[1].0, &admin_headers[1].1)
+            .json(&json!({ "name": "test-org-two-owners", "email": "org@example.com", "owner_id": owner1.id }))
             .await;
         resp.assert_status(axum::http::StatusCode::CREATED);
         let org_id = resp.json::<serde_json::Value>()["id"].as_str().unwrap().to_string();
@@ -863,14 +1304,13 @@ mod tests {
         let admin_headers = add_auth_headers(&admin);
 
         let owner = create_test_user(&pool, Role::StandardUser).await;
-        let owner_headers = add_auth_headers(&owner);
 
-        // Owner creates an org
+        // Platform manager creates an org with owner as the designated owner
         let resp = server
             .post("/admin/api/v1/organizations")
-            .add_header(&owner_headers[0].0, &owner_headers[0].1)
-            .add_header(&owner_headers[1].0, &owner_headers[1].1)
-            .json(&json!({ "name": "test-org-demote", "email": "org@example.com" }))
+            .add_header(&admin_headers[0].0, &admin_headers[0].1)
+            .add_header(&admin_headers[1].0, &admin_headers[1].1)
+            .json(&json!({ "name": "test-org-demote", "email": "org@example.com", "owner_id": owner.id }))
             .await;
         resp.assert_status(axum::http::StatusCode::CREATED);
         let org_id = resp.json::<serde_json::Value>()["id"].as_str().unwrap().to_string();
@@ -893,37 +1333,38 @@ mod tests {
     #[test_log::test]
     async fn test_admin_cannot_assign_owner_role(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let pm = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let pm_headers = add_auth_headers(&pm);
 
         let owner = create_test_user(&pool, Role::StandardUser).await;
-        let owner_headers = add_auth_headers(&owner);
         let org_admin = create_test_user(&pool, Role::StandardUser).await;
         let org_admin_headers = add_auth_headers(&org_admin);
         let member = create_test_user(&pool, Role::StandardUser).await;
 
-        // Owner creates an org
+        // Platform manager creates an org with owner as the designated owner
         let resp = server
             .post("/admin/api/v1/organizations")
-            .add_header(&owner_headers[0].0, &owner_headers[0].1)
-            .add_header(&owner_headers[1].0, &owner_headers[1].1)
-            .json(&json!({ "name": "test-org-priv-esc", "email": "org@example.com" }))
+            .add_header(&pm_headers[0].0, &pm_headers[0].1)
+            .add_header(&pm_headers[1].0, &pm_headers[1].1)
+            .json(&json!({ "name": "test-org-priv-esc", "email": "org@example.com", "owner_id": owner.id }))
             .await;
         resp.assert_status(axum::http::StatusCode::CREATED);
         let org_id = resp.json::<serde_json::Value>()["id"].as_str().unwrap().to_string();
 
-        // Owner adds org_admin as admin
+        // Platform manager adds org_admin as admin
         let resp = server
             .post(&format!("/admin/api/v1/organizations/{org_id}/members"))
-            .add_header(&owner_headers[0].0, &owner_headers[0].1)
-            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .add_header(&pm_headers[0].0, &pm_headers[0].1)
+            .add_header(&pm_headers[1].0, &pm_headers[1].1)
             .json(&json!({ "user_id": org_admin.id, "role": "admin" }))
             .await;
         resp.assert_status(axum::http::StatusCode::CREATED);
 
-        // Owner adds member
+        // Platform manager adds member
         let resp = server
             .post(&format!("/admin/api/v1/organizations/{org_id}/members"))
-            .add_header(&owner_headers[0].0, &owner_headers[0].1)
-            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .add_header(&pm_headers[0].0, &pm_headers[0].1)
+            .add_header(&pm_headers[1].0, &pm_headers[1].1)
             .json(&json!({ "user_id": member.id, "role": "member" }))
             .await;
         resp.assert_status(axum::http::StatusCode::CREATED);
@@ -942,28 +1383,29 @@ mod tests {
     #[test_log::test]
     async fn test_admin_cannot_add_member_as_owner(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let pm = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let pm_headers = add_auth_headers(&pm);
 
         let owner = create_test_user(&pool, Role::StandardUser).await;
-        let owner_headers = add_auth_headers(&owner);
         let org_admin = create_test_user(&pool, Role::StandardUser).await;
         let org_admin_headers = add_auth_headers(&org_admin);
         let new_user = create_test_user(&pool, Role::StandardUser).await;
 
-        // Owner creates an org
+        // Platform manager creates an org with owner as the designated owner
         let resp = server
             .post("/admin/api/v1/organizations")
-            .add_header(&owner_headers[0].0, &owner_headers[0].1)
-            .add_header(&owner_headers[1].0, &owner_headers[1].1)
-            .json(&json!({ "name": "test-org-add-owner", "email": "org@example.com" }))
+            .add_header(&pm_headers[0].0, &pm_headers[0].1)
+            .add_header(&pm_headers[1].0, &pm_headers[1].1)
+            .json(&json!({ "name": "test-org-add-owner", "email": "org@example.com", "owner_id": owner.id }))
             .await;
         resp.assert_status(axum::http::StatusCode::CREATED);
         let org_id = resp.json::<serde_json::Value>()["id"].as_str().unwrap().to_string();
 
-        // Owner adds org_admin as admin
+        // Platform manager adds org_admin as admin
         let resp = server
             .post(&format!("/admin/api/v1/organizations/{org_id}/members"))
-            .add_header(&owner_headers[0].0, &owner_headers[0].1)
-            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .add_header(&pm_headers[0].0, &pm_headers[0].1)
+            .add_header(&pm_headers[1].0, &pm_headers[1].1)
             .json(&json!({ "user_id": org_admin.id, "role": "admin" }))
             .await;
         resp.assert_status(axum::http::StatusCode::CREATED);
@@ -982,17 +1424,19 @@ mod tests {
     #[test_log::test]
     async fn test_owner_can_assign_owner_role(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let pm = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let pm_headers = add_auth_headers(&pm);
 
         let owner = create_test_user(&pool, Role::StandardUser).await;
         let owner_headers = add_auth_headers(&owner);
         let new_user = create_test_user(&pool, Role::StandardUser).await;
 
-        // Owner creates an org
+        // Platform manager creates an org with owner as the designated owner
         let resp = server
             .post("/admin/api/v1/organizations")
-            .add_header(&owner_headers[0].0, &owner_headers[0].1)
-            .add_header(&owner_headers[1].0, &owner_headers[1].1)
-            .json(&json!({ "name": "test-org-owner-assign", "email": "org@example.com" }))
+            .add_header(&pm_headers[0].0, &pm_headers[0].1)
+            .add_header(&pm_headers[1].0, &pm_headers[1].1)
+            .json(&json!({ "name": "test-org-owner-assign", "email": "org@example.com", "owner_id": owner.id }))
             .await;
         resp.assert_status(axum::http::StatusCode::CREATED);
         let org_id = resp.json::<serde_json::Value>()["id"].as_str().unwrap().to_string();
@@ -1017,15 +1461,14 @@ mod tests {
         let pm = create_test_admin_user(&pool, Role::PlatformManager).await;
         let pm_headers = add_auth_headers(&pm);
         let owner = create_test_user(&pool, Role::StandardUser).await;
-        let owner_headers = add_auth_headers(&owner);
         let new_user = create_test_user(&pool, Role::StandardUser).await;
 
-        // Owner creates an org
+        // Platform manager creates an org with owner as the designated owner
         let resp = server
             .post("/admin/api/v1/organizations")
-            .add_header(&owner_headers[0].0, &owner_headers[0].1)
-            .add_header(&owner_headers[1].0, &owner_headers[1].1)
-            .json(&json!({ "name": "test-org-pm-assign", "email": "org@example.com" }))
+            .add_header(&pm_headers[0].0, &pm_headers[0].1)
+            .add_header(&pm_headers[1].0, &pm_headers[1].1)
+            .json(&json!({ "name": "test-org-pm-assign", "email": "org@example.com", "owner_id": owner.id }))
             .await;
         resp.assert_status(axum::http::StatusCode::CREATED);
         let org_id = resp.json::<serde_json::Value>()["id"].as_str().unwrap().to_string();
@@ -1048,18 +1491,20 @@ mod tests {
     #[test_log::test]
     async fn test_set_active_organization_validates_membership(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let pm = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let pm_headers = add_auth_headers(&pm);
 
         let owner = create_test_user(&pool, Role::StandardUser).await;
         let owner_headers = add_auth_headers(&owner);
         let non_member = create_test_user(&pool, Role::StandardUser).await;
         let non_member_headers = add_auth_headers(&non_member);
 
-        // Owner creates an org
+        // Platform manager creates an org with owner as the designated owner
         let resp = server
             .post("/admin/api/v1/organizations")
-            .add_header(&owner_headers[0].0, &owner_headers[0].1)
-            .add_header(&owner_headers[1].0, &owner_headers[1].1)
-            .json(&json!({ "name": "test-org-session", "email": "org@example.com" }))
+            .add_header(&pm_headers[0].0, &pm_headers[0].1)
+            .add_header(&pm_headers[1].0, &pm_headers[1].1)
+            .json(&json!({ "name": "test-org-session", "email": "org@example.com", "owner_id": owner.id }))
             .await;
         resp.assert_status(axum::http::StatusCode::CREATED);
         let org_id = resp.json::<serde_json::Value>()["id"].as_str().unwrap().to_string();

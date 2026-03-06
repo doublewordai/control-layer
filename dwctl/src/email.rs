@@ -15,6 +15,7 @@ struct EmailTemplates {
     batch_complete: String,
     first_batch: String,
     low_balance: String,
+    org_invite: String,
 }
 
 impl EmailTemplates {
@@ -24,6 +25,7 @@ impl EmailTemplates {
             batch_complete: include_str!("../default_templates/batch_complete.html").to_string(),
             first_batch: include_str!("../default_templates/first_batch.html").to_string(),
             low_balance: include_str!("../default_templates/low_balance.html").to_string(),
+            org_invite: include_str!("../default_templates/org_invite.html").to_string(),
         }
     }
 
@@ -40,6 +42,7 @@ impl EmailTemplates {
             batch_complete: load("batch_complete.html")?,
             first_batch: load("first_batch.html")?,
             low_balance: load("low_balance.html")?,
+            org_invite: load("org_invite.html")?,
         })
     }
 }
@@ -314,6 +317,42 @@ impl EmailService {
             profile_link,
             from_name => &self.from_name,
             reply_to => self.reply_to.as_deref().unwrap_or(&self.from_email),
+        })
+    }
+
+    pub async fn send_org_invite_email(
+        &self,
+        to_email: &str,
+        org_name: &str,
+        inviter_name: &str,
+        role: &str,
+        invite_link: &str,
+    ) -> Result<(), Error> {
+        let subject = format!("You've been invited to join {org_name}");
+        let body = self
+            .render_org_invite_body(org_name, inviter_name, role, invite_link)
+            .map_err(|e| Error::Internal {
+                operation: format!("render email template: {e}"),
+            })?;
+
+        self.send_email(to_email, None, &subject, &body).await
+    }
+
+    fn render_org_invite_body(
+        &self,
+        org_name: &str,
+        inviter_name: &str,
+        role: &str,
+        invite_link: &str,
+    ) -> Result<String, minijinja::Error> {
+        let mut env = Environment::new();
+        env.add_template("email", &self.templates.org_invite)?;
+
+        env.get_template("email")?.render(context! {
+            org_name,
+            inviter_name,
+            role,
+            invite_link,
         })
     }
 }

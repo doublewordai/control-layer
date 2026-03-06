@@ -24,8 +24,13 @@ pub struct OrganizationUpdateDBRequest {
 /// Database response for an organization membership
 #[derive(Debug, Clone)]
 pub struct OrganizationMemberDBResponse {
-    pub user_id: UserId,
+    pub id: UserId,
+    pub user_id: Option<UserId>,
     pub organization_id: UserId,
     pub role: String,
+    pub status: String,
     pub created_at: DateTime<Utc>,
+    pub invite_email: Option<String>,
+    pub invited_by: Option<UserId>,
+    pub expires_at: Option<DateTime<Utc>>,
 }

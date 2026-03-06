@@ -1,0 +1,76 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO user_organizations (user_id, organization_id, role, status, invite_email, invited_by, invite_token_hash, expires_at)\n            VALUES ($1, $2, $3, 'pending', $4, $5, $6, $7)\n            RETURNING id, user_id, organization_id, role, status, created_at,\n                      invite_email, invited_by, expires_at\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "user_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "organization_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "role",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 4,
+        "name": "status",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 5,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 6,
+        "name": "invite_email",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 7,
+        "name": "invited_by",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 8,
+        "name": "expires_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Varchar",
+        "Varchar",
+        "Uuid",
+        "Varchar",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "dfd3211c4cc8dd876b9438ef0b6a9a53030f444e78cd3c5905df708cf78930a2"
+}

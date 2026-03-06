@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Link } from "react-router-dom";
+import { Link, useSearchParams, useNavigate } from "react-router-dom";
 import { Eye, EyeOff } from "lucide-react";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
@@ -22,6 +22,8 @@ export function RegisterForm() {
   const [showPasswords, setShowPasswords] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const { register } = useAuth();
+  const [searchParams] = useSearchParams();
+  const navigate = useNavigate();
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -41,6 +43,10 @@ export function RegisterForm() {
         password,
         displayName: undefined, // Let user set this later
       });
+      const redirect = searchParams.get("redirect");
+      if (redirect) {
+        navigate(redirect);
+      }
       toast.success("Registration successful!");
     } catch (error) {
       toast.error(
@@ -143,7 +149,7 @@ export function RegisterForm() {
             <p className="text-sm text-center text-gray-600">
               Already have an account?{" "}
               <Link
-                to="/login"
+                to={`/login${searchParams.get("redirect") ? `?redirect=${encodeURIComponent(searchParams.get("redirect")!)}` : ""}`}
                 className="font-medium text-doubleword-neutral-800 hover:text-doubleword-neutral-900 hover:underline"
               >
                 Sign in

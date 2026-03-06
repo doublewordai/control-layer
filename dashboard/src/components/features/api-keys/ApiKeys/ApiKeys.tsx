@@ -50,9 +50,13 @@ import {
   HoverCardTrigger,
 } from "../../../ui/hover-card";
 import { useServerPagination } from "@/hooks/useServerPagination";
+import { useOrganizationContext } from "@/contexts";
 
 export const ApiKeys: React.FC = () => {
   const { data: user } = useUser("current");
+  const { activeOrganizationId } = useOrganizationContext();
+  // In org context, use org ID for API key operations (orgs are virtual users)
+  const targetUserId = activeOrganizationId || user?.id || "current";
   const [showCreateForm, setShowCreateForm] = useState(false);
   const [newKeyName, setNewKeyName] = useState("");
   const [newKeyDescription, setNewKeyDescription] = useState("");
@@ -79,7 +83,7 @@ export const ApiKeys: React.FC = () => {
     data: apiKeysData,
     isLoading,
     error,
-  } = useApiKeys(user?.id || "current", {
+  } = useApiKeys(targetUserId, {
     ...pagination.queryParams,
   });
 
@@ -103,7 +107,7 @@ export const ApiKeys: React.FC = () => {
             : Number(newKeyRequestsPerSecond),
         burst_size: newKeyBurstSize === "" ? null : Number(newKeyBurstSize),
       },
-      userId: user?.id || "current",
+      userId: targetUserId,
     });
 
     setNewKeyResponse(newKey);
@@ -114,7 +118,7 @@ export const ApiKeys: React.FC = () => {
     deleteApiKeyMutation.mutate(
       {
         keyId,
-        userId: user?.id || "current",
+        userId: targetUserId,
       },
       {
         onSuccess: () => setDeleteModal(null),
@@ -135,7 +139,7 @@ export const ApiKeys: React.FC = () => {
       for (const key of selectedKeys) {
         await deleteApiKeyMutation.mutateAsync({
           keyId: key.id,
-          userId: user?.id || "current",
+          userId: targetUserId,
         });
       }
       setSelectedKeys([]);

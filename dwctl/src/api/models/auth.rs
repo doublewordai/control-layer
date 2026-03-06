@@ -99,6 +99,8 @@ impl IntoResponse for LoginResponse {
 pub struct LogoutResponse {
     pub auth_response: AuthSuccessResponse,
     pub cookie: String,
+    /// Additional cookies to clear (e.g. dw_active_org)
+    pub extra_cookies: Vec<String>,
 }
 
 /// Request to initiate password reset
@@ -136,7 +138,10 @@ pub struct ChangePasswordRequest {
 impl IntoResponse for LogoutResponse {
     fn into_response(self) -> Response {
         let mut headers = HeaderMap::new();
-        headers.insert(header::SET_COOKIE, self.cookie.parse().unwrap());
+        headers.append(header::SET_COOKIE, self.cookie.parse().unwrap());
+        for cookie in &self.extra_cookies {
+            headers.append(header::SET_COOKIE, cookie.parse().unwrap());
+        }
         (StatusCode::OK, headers, Json(self.auth_response)).into_response()
     }
 }
