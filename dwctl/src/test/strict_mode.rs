@@ -3,7 +3,7 @@
 //! Strict mode enables schema validation and only accepts known OpenAI API paths.
 //! This test module verifies that:
 //! - Unknown endpoints are rejected with 404
-//! - Allowed endpoints (chat/completions, embeddings, responses, models) work correctly
+//! - Allowed endpoints (chat/completions, completions, embeddings, responses, models) work correctly
 //! - Responses are properly sanitized and validated
 
 use crate::api::models::users::Role;
@@ -52,7 +52,6 @@ async fn test_strict_mode_rejects_unknown_endpoints(pool: PgPool) {
     // Note: /v1/files and /v1/batches are handled by dwctl's batch API, not onwards
     let unknown_endpoints = vec![
         "/v1/unknown/endpoint",
-        "/v1/completions", // Legacy endpoint
         "/v1/engines/test/completions",
         "/v1/audio/speech",
         "/v1/images/generations",
@@ -337,6 +336,184 @@ async fn test_strict_mode_allows_chat_completions(pool: PgPool) {
     let body: serde_json::Value = serde_json::from_str(&body_text).expect("Response body should be valid JSON");
     assert_eq!(body["id"].as_str(), Some("chatcmpl-strict-test"));
     assert_eq!(body["object"].as_str(), Some("chat.completion"));
+    assert_eq!(body["model"].as_str(), Some("gpt-4"));
+    assert!(body["choices"].is_array());
+    assert!(body["usage"].is_object());
+}
+
+/// Test that strict mode allows POST /v1/completions (legacy completions endpoint)
+#[sqlx::test]
+#[test_log::test]
+async fn test_strict_mode_allows_completions(pool: PgPool) {
+    // Setup wiremock server to mock inference endpoint
+    let mock_server = wiremock::MockServer::start().await;
+
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/completions"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "cmpl-strict-test",
+            "object": "text_completion",
+            "created": 1677652288,
+            "model": "gpt-4",
+            "choices": [{
+                "index": 0,
+                "text": "This is a test response from legacy completions",
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 5,
+                "completion_tokens": 9,
+                "total_tokens": 14
+            }
+        })))
+        .mount(&mock_server)
+        .await;
+
+    // Create test app with strict mode enabled
+    let mut config = create_test_config();
+    config.onwards.strict_mode = true;
+    config.background_services.onwards_sync.enabled = true;
+
+    let app = crate::Application::new_with_pool(config, Some(pool.clone()), None)
+        .await
+        .expect("Failed to create application");
+    let (server, bg_services) = app.into_test_server();
+
+    // Setup: Create endpoint, deployment, group, user, and API key
+    let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
+    let admin_headers = add_auth_headers(&admin_user);
+
+    // Create inference endpoint (without auto-sync)
+    let endpoint_response = server
+        .post("/admin/api/v1/endpoints")
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .json(&serde_json::json!({
+            "name": "test-openai",
+            "url": mock_server.uri(),
+            "description": "Test OpenAI endpoint for completions",
+            "auto_sync_models": false
+        }))
+        .await;
+
+    assert_eq!(endpoint_response.status_code(), 201);
+    let endpoint: serde_json::Value = endpoint_response.json();
+    let endpoint_id = endpoint["id"].as_str().unwrap();
+
+    // Manually create gpt-4 model
+    let model_response = server
+        .post("/admin/api/v1/models")
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .json(&serde_json::json!({
+            "type": "standard",
+            "model_name": "gpt-4",
+            "alias": "gpt-4",
+            "hosted_on": endpoint_id
+        }))
+        .await;
+
+    assert!(
+        model_response.status_code().is_success(),
+        "Failed to create model: {}",
+        model_response.status_code()
+    );
+    let model: serde_json::Value = model_response.json();
+    let deployment_id = model["id"].as_str().unwrap();
+
+    // Use the public group (all zeros UUID) so model is accessible to all users
+    let group_id = "00000000-0000-0000-0000-000000000000";
+
+    // Associate deployment with group
+    let assoc_response = server
+        .post(&format!("/admin/api/v1/groups/{}/models/{}", group_id, deployment_id))
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .await;
+    assert!(
+        assoc_response.status_code().is_success(),
+        "Failed to associate model with group: {}",
+        assoc_response.status_code()
+    );
+
+    // Create user (automatically has access via public group, no need to add explicitly)
+    let user = create_test_user(&pool, Role::StandardUser).await;
+
+    // Grant credits
+    server
+        .post("/admin/api/v1/transactions")
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .json(&serde_json::json!({
+            "user_id": user.id,
+            "transaction_type": "admin_grant",
+            "amount": 1000,
+            "source_id": admin_user.id
+        }))
+        .await;
+
+    // Create API key
+    let key_response = server
+        .post(&format!("/admin/api/v1/users/{}/api-keys", user.id))
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .json(&serde_json::json!({
+            "purpose": "realtime",
+            "name": "Strict mode completions test key"
+        }))
+        .await;
+
+    let key_data: serde_json::Value = key_response.json();
+    let api_key = key_data["key"].as_str().unwrap();
+
+    // Sync onwards config
+    bg_services.sync_onwards_config(&pool).await.unwrap();
+
+    // Poll until onwards picks up the API key and model deployment
+    let start = std::time::Instant::now();
+    let mut model_available = false;
+    while !model_available && start.elapsed() < std::time::Duration::from_secs(3) {
+        let check_response = server
+            .get("/ai/v1/models")
+            .add_header("Authorization", &format!("Bearer {}", api_key))
+            .await;
+
+        if check_response.status_code() == 200 {
+            let models: serde_json::Value = check_response.json();
+            if let Some(data) = models["data"].as_array() {
+                model_available = data.iter().any(|m| m["id"].as_str() == Some("gpt-4"));
+            }
+        }
+
+        if !model_available {
+            tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+        }
+    }
+    assert!(model_available, "Model gpt-4 should be available in onwards within 3 seconds");
+
+    // Make legacy completions request
+    let completions_response = server
+        .post("/ai/v1/completions")
+        .add_header("Authorization", &format!("Bearer {}", api_key))
+        .add_header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "model": "gpt-4",
+            "prompt": "Say hello"
+        }))
+        .await;
+
+    let status = completions_response.status_code();
+    let body_text = completions_response.text();
+    assert_eq!(
+        status, 200,
+        "Expected 200 for legacy completions in strict mode. Got {}: {}",
+        status, body_text
+    );
+
+    // Verify response structure
+    let body: serde_json::Value = serde_json::from_str(&body_text).expect("Response body should be valid JSON");
+    assert_eq!(body["id"].as_str(), Some("cmpl-strict-test"));
+    assert_eq!(body["object"].as_str(), Some("text_completion"));
     assert_eq!(body["model"].as_str(), Some("gpt-4"));
     assert!(body["choices"].is_array());
     assert!(body["usage"].is_object());

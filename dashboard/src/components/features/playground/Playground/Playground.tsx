@@ -6,6 +6,7 @@ import OpenAI from "openai";
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 import { useModels } from "../../../../api/control-layer";
 import { type ModelType } from "../../../../utils/modelType";
+import { isPlaygroundDenied } from "../../../../utils/modelAccess";
 import type {
   Model,
   RerankResponse,
@@ -83,9 +84,10 @@ const Playground: React.FC = () => {
   });
   const urlModels = useMemo(() => urlModelsData?.data ?? [], [urlModelsData]);
 
-  // Fetch first accessible chat model as default (only when no URL model specified)
+  // Fetch accessible models as default candidates (only when no URL model specified).
+  // We fetch more than 1 so we can skip playground-denied models.
   const { data: defaultModelsData } = useModels({
-    limit: 1,
+    limit: 10,
     accessible: true,
   });
   const defaultModels = useMemo(
@@ -102,18 +104,26 @@ const Playground: React.FC = () => {
       // If a model ID is specified in URL, select it
       const model = urlModels.find((m) => m.alias === selectedModelAlias);
       if (model) {
+        if (isPlaygroundDenied(model)) {
+          setError(
+            `Playground access to "${model.alias}" is restricted by traffic routing rules.`,
+          );
+          return;
+        }
         setSelectedModel(model);
         setModelType((model.model_type?.toLowerCase() as ModelType) || "chat");
       }
     } else if (!selectedModelAlias && defaultModels.length > 0) {
-      // No URL model specified, select the first accessible model as default
-      const model = defaultModels[0];
-      setSelectedModel(model);
-      setModelType((model.model_type?.toLowerCase() as ModelType) || "chat");
-      // Update URL to reflect the selected model
-      navigate(`/playground?model=${encodeURIComponent(model.alias)}`, {
-        replace: true,
-      });
+      // No URL model specified, select the first accessible model that allows playground
+      const model = defaultModels.find((m) => !isPlaygroundDenied(m));
+      if (model) {
+        setSelectedModel(model);
+        setModelType((model.model_type?.toLowerCase() as ModelType) || "chat");
+        // Update URL to reflect the selected model
+        navigate(`/playground?model=${encodeURIComponent(model.alias)}`, {
+          replace: true,
+        });
+      }
     }
   }, [urlModels, selectedModelAlias, defaultModels, selectedModel, navigate]);
 
@@ -982,6 +992,7 @@ const Playground: React.FC = () => {
               onValueChange={handleModelChange}
               placeholder="Search models..."
               className="w-full md:w-[200px]"
+              filterFn={(model) => !isPlaygroundDenied(model)}
             />
 
             {/* Comparison Mode Button - Only show for chat models */}
@@ -1000,7 +1011,8 @@ const Playground: React.FC = () => {
                     className="w-full md:w-[180px]"
                     filterFn={(model) =>
                       model.alias !== selectedModel?.alias &&
-                      (model.model_type?.toLowerCase() as ModelType) === "chat"
+                      (model.model_type?.toLowerCase() as ModelType) === "chat" &&
+                      !isPlaygroundDenied(model)
                     }
                   />
                 ) : (
