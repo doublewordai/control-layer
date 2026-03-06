@@ -63,7 +63,10 @@ impl StripeProvider {
         use stripe_misc::tax_calculation::{CreateTaxCalculation, CreateTaxCalculationLineItems};
 
         // Calculate tax
-        let tax_calc = CreateTaxCalculation::new(Currency::USD, vec![CreateTaxCalculationLineItems::new(amount_cents)])
+        let mut line_item = CreateTaxCalculationLineItems::new(amount_cents);
+        line_item.reference = Some("auto_topup".to_string());
+
+        let tax_calc = CreateTaxCalculation::new(Currency::USD, vec![line_item])
             .customer(customer_id)
             .send(&self.client)
             .await
@@ -426,7 +429,7 @@ impl PaymentProvider for StripeProvider {
                     .config
                     .auto_topup_terms_of_service_text
                     .as_ref()
-                    .map(|text| CustomTextPositionParam::new(text)),
+                    .map(CustomTextPositionParam::new),
                 submit: Some(CustomTextPositionParam::new("Set up auto top-up")),
                 after_submit: None,
                 shipping_address: None,

@@ -195,12 +195,12 @@ impl From<UserDBResponse> for UserResponse {
             last_login: None,     // UserDBResponse doesn't have last_login
             groups: None,         // By default, relationships are not included
             credit_balance: None, // By default, credit balances are not included
-            has_payment_provider_id: db.payment_provider_id.is_some(),
+            has_payment_provider_id: db.payment_provider_id.as_ref().is_some_and(|s| !s.is_empty()),
             batch_notifications_enabled: db.batch_notifications_enabled,
             low_balance_threshold: db.low_balance_threshold,
             auto_topup_amount: db.auto_topup_amount,
             auto_topup_threshold: db.auto_topup_threshold,
-            has_auto_topup_payment_method: db.auto_topup_payment_id.is_some(),
+            has_auto_topup_payment_method: db.auto_topup_payment_id.as_ref().is_some_and(|s| !s.is_empty()),
         }
     }
 }

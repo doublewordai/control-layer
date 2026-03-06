@@ -535,14 +535,13 @@ pub async fn process_auto_topup<P: PoolProvider>(
     })?;
 
     // Save the customer ID if the user didn't have one (first-time Stripe customer)
-    if let Some(customer_id) = &setup_result.customer_id {
-        if user.payment_provider_id.is_none() {
+    if let Some(customer_id) = &setup_result.customer_id
+        && user.payment_provider_id.is_none() {
             let mut users = Users::new(&mut conn);
             if let Err(e) = users.set_payment_provider_id_if_empty(user.id, customer_id).await {
                 tracing::warn!(user_id = %user.id, error = %e, "Failed to save customer ID from auto top-up setup");
             }
         }
-    }
 
     Ok(Json(json!({
         "message": "Auto top-up enabled successfully",

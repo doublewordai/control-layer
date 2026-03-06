@@ -931,7 +931,7 @@ export const Profile: React.FC = () => {
                       <button
                         type="button"
                         className="text-blue-600 hover:text-blue-700 underline"
-                        onClick={() => navigate("/cost-management?autoTopup=true")}
+                        onClick={() => navigate("/cost-management")}
                       >
                         Configure auto top-up
                       </button>
