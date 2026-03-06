@@ -660,6 +660,28 @@ pub async fn enable_auto_topup<P: PoolProvider>(
         }
     };
 
+    // Check if customer has an address (required for tax calculation)
+    match provider.customer_has_address(&customer_id).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return Ok(Json(json!({
+                "needs_billing_portal": true,
+                "reason": "Customer must have an address on file for tax calculation. Please update your billing details."
+            }))
+            .into_response());
+        }
+        Err(e) => {
+            tracing::error!("Failed to check customer address: {:?}", e);
+            return Ok((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "message": "Failed to verify billing address with payment provider."
+                })),
+            )
+                .into_response());
+        }
+    }
+
     // Check if the customer has a default payment method
     match provider.get_default_payment_method(&customer_id).await {
         Ok(Some(_pm_id)) => {

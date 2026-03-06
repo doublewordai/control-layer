@@ -209,6 +209,10 @@ impl PaymentProvider for DummyProvider {
         Ok(Some(format!("dummy_pm_{}", customer_id)))
     }
 
+    async fn customer_has_address(&self, _customer_id: &str) -> Result<bool> {
+        Ok(true)
+    }
+
     async fn create_customer(&self, _email: &str, _name: Option<&str>) -> Result<String> {
         Ok(format!("dummy_cus_{}", uuid::Uuid::new_v4()))
     }

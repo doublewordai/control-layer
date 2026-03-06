@@ -602,6 +602,25 @@ impl PaymentProvider for StripeProvider {
         Ok(methods.data.first().map(|pm| pm.id.to_string()))
     }
 
+    async fn customer_has_address(&self, customer_id: &str) -> Result<bool> {
+        use stripe_core::customer::{RetrieveCustomer, RetrieveCustomerReturned};
+
+        let result = RetrieveCustomer::new(customer_id.to_string())
+            .send(&self.client)
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to retrieve Stripe customer for address check: {:?}", e);
+                PaymentError::ProviderApi(e.to_string())
+            })?;
+
+        let customer = match result {
+            RetrieveCustomerReturned::Customer(c) => c,
+            RetrieveCustomerReturned::DeletedCustomer(_) => return Ok(false),
+        };
+
+        Ok(customer.address.is_some())
+    }
+
     async fn create_customer(&self, email: &str, name: Option<&str>) -> Result<String> {
         use stripe_core::customer::CreateCustomer;
 

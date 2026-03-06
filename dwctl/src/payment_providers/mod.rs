@@ -218,6 +218,11 @@ pub trait PaymentProvider: Send + Sync {
     /// or `None` if no default is set.
     async fn get_default_payment_method(&self, customer_id: &str) -> Result<Option<String>>;
 
+    /// Check whether the customer has an address on file with the payment provider.
+    ///
+    /// Required for tax calculation — auto top-up must not be enabled without one.
+    async fn customer_has_address(&self, customer_id: &str) -> Result<bool>;
+
     /// Create a new customer with the payment provider.
     ///
     /// Returns the provider's customer ID for the newly created customer.
