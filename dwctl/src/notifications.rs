@@ -436,26 +436,18 @@ async fn process_auto_topups(
         return;
     }
 
-    // 2. Refresh balances for users near their threshold (same pattern as low-balance)
-    const REFRESH_MARGIN: rust_decimal::Decimal = rust_decimal::Decimal::from_parts(30, 0, 0, false, 0);
+    // 2. Always refresh balances for auto-topup candidates.
+    //    Unlike low-balance notifications (which use a margin-based heuristic), auto-topup
+    //    needs accurate balances because a stale checkpoint can cause us to miss charges entirely.
+    //    The candidate set is typically small, so the cost of refreshing all is negligible.
+    let all_ids: Vec<Uuid> = candidates.iter().map(|u| u.id).collect();
 
-    let needs_refresh: Vec<Uuid> = candidates
-        .iter()
-        .filter(|u| match u.checkpoint_balance {
-            Some(b) => (b - u.auto_topup_threshold) < REFRESH_MARGIN,
-            None => true,
-        })
-        .map(|u| u.id)
-        .collect();
-
-    let refreshed = if !needs_refresh.is_empty() {
+    let refreshed = {
         let mut credits = Credits::new(&mut *conn);
-        credits.get_users_balances_bulk(&needs_refresh, Some(1)).await.unwrap_or_else(|e| {
+        credits.get_users_balances_bulk(&all_ids, Some(1)).await.unwrap_or_else(|e| {
             tracing::warn!(error = %e, "Failed to refresh balances for auto-topup users");
             Default::default()
         })
-    } else {
-        Default::default()
     };
 
     let balance_for = |u: &AutoTopupUser| -> Option<rust_decimal::Decimal> { refreshed.get(&u.id).copied().or(u.checkpoint_balance) };
