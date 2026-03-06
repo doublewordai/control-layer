@@ -48,7 +48,7 @@ describe("UsersGroups Component", () => {
 
     // Should render the component after loading
     await waitFor(() => {
-      expect(within(container).getByText("Users, Orgs & Groups")).toBeInTheDocument();
+      expect(within(container).getByText("User Access")).toBeInTheDocument();
     });
   });
 

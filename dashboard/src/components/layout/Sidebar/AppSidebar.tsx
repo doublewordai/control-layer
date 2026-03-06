@@ -209,7 +209,7 @@ export function AppSidebar() {
                     Switch Account
                   </DropdownMenuLabel>
                   <DropdownMenuItem
-                    onClick={() => setActiveOrganization(null)}
+                    onClick={() => void setActiveOrganization(null).catch(console.error)}
                   >
                     <User className="w-4 h-4 mr-2" />
                     Personal
@@ -220,7 +220,7 @@ export function AppSidebar() {
                   {currentUser.organizations.map((org) => (
                     <DropdownMenuItem
                       key={org.id}
-                      onClick={() => setActiveOrganization(org.id)}
+                      onClick={() => void setActiveOrganization(org.id).catch(console.error)}
                     >
                       <Building className="w-4 h-4 mr-2" />
                       <span className="truncate">{org.name}</span>

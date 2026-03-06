@@ -352,8 +352,8 @@ pub async fn logout<P: PoolProvider>(State(state): State<AppState<P>>) -> Result
 
     // Clear session cookie
     let cookie = format!(
-        "{}=; Path=/; HttpOnly{}; SameSite=Strict; Max-Age=0",
-        session_config.cookie_name, secure
+        "{}=; Path=/; HttpOnly{}; SameSite={}; Max-Age=0",
+        session_config.cookie_name, secure, session_config.cookie_same_site
     );
 
     // Also clear the active organization cookie

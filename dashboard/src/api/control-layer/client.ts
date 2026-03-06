@@ -1752,7 +1752,7 @@ const organizationsApi = {
     return response.json();
   },
 
-  async acceptInvite(token: string): Promise<OrganizationMember> {
+  async acceptInvite(token: string): Promise<{ message: string }> {
     const response = await fetch(
       `/admin/api/v1/organizations/invites/${token}/accept`,
       {

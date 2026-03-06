@@ -922,20 +922,8 @@ pub async fn invite_member<P: PoolProvider>(
         }
     }
 
-    // Check for existing pending invite for same email+org
-    let mut org_repo = Organizations::new(&mut pool_conn);
-    let members = org_repo.list_members(id).await?;
-    let has_pending = members
-        .iter()
-        .any(|m| m.status == "pending" && m.invite_email.as_deref() == Some(email.as_str()));
-    if has_pending {
-        return Err(Error::Conflict {
-            message: "A pending invite already exists for this email address".to_string(),
-            conflicts: None,
-        });
-    }
-
     // Generate invite token and hash
+    let mut org_repo = Organizations::new(&mut pool_conn);
     let token = crate::auth::password::generate_reset_token();
     let token_hash = hash_invite_token(&token);
     let expires_at = chrono::Utc::now() + Duration::days(7);
@@ -995,7 +983,8 @@ pub async fn invite_member<P: PoolProvider>(
     responses(
         (status = 200, description = "Invite details", body = InviteDetailsResponse),
         (status = 401, description = "Unauthorized"),
-        (status = 404, description = "Not found or expired"),
+        (status = 400, description = "Bad request - invite has expired"),
+        (status = 404, description = "Not found"),
     ),
     security(
         ("BearerAuth" = []),
