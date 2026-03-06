@@ -29,11 +29,21 @@ pub struct UserFilter {
 
 impl UserFilter {
     pub fn new(skip: i64, limit: i64) -> Self {
-        Self { skip, limit, search: None, user_type: "individual".to_string() }
+        Self {
+            skip,
+            limit,
+            search: None,
+            user_type: "individual".to_string(),
+        }
     }
 
     pub fn organizations(skip: i64, limit: i64) -> Self {
-        Self { skip, limit, search: None, user_type: "organization".to_string() }
+        Self {
+            skip,
+            limit,
+            search: None,
+            user_type: "organization".to_string(),
+        }
     }
 
     pub fn with_search(mut self, search: String) -> Self {

@@ -77,7 +77,9 @@ pub async fn create_user_api_key<P: PoolProvider>(
 
     if !can_create_all && !can_create_own {
         let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
-        let member = is_org_member(&current_user, target_user_id, &mut conn).await.map_err(Error::Database)?;
+        let member = is_org_member(&current_user, target_user_id, &mut conn)
+            .await
+            .map_err(Error::Database)?;
         if !member {
             return Err(Error::InsufficientPermissions {
                 required: Permission::Any(vec![
@@ -163,7 +165,9 @@ pub async fn list_user_api_keys<P: PoolProvider>(
 
     if !can_read_all && !can_read_own {
         let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
-        let member = is_org_member(&current_user, target_user_id, &mut conn).await.map_err(Error::Database)?;
+        let member = is_org_member(&current_user, target_user_id, &mut conn)
+            .await
+            .map_err(Error::Database)?;
         if !member {
             return Err(Error::InsufficientPermissions {
                 required: Permission::Any(vec![
@@ -248,7 +252,9 @@ pub async fn get_user_api_key<P: PoolProvider>(
 
     if !can_read_all && !can_read_own {
         let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
-        let member = is_org_member(&current_user, target_user_id, &mut conn).await.map_err(Error::Database)?;
+        let member = is_org_member(&current_user, target_user_id, &mut conn)
+            .await
+            .map_err(Error::Database)?;
         if !member {
             return Err(Error::InsufficientPermissions {
                 required: Permission::Any(vec![
@@ -323,7 +329,9 @@ pub async fn delete_user_api_key<P: PoolProvider>(
 
     if !can_delete_all && !can_delete_own {
         let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
-        let member = is_org_member(&current_user, target_user_id, &mut conn).await.map_err(Error::Database)?;
+        let member = is_org_member(&current_user, target_user_id, &mut conn)
+            .await
+            .map_err(Error::Database)?;
         if !member {
             return Err(Error::InsufficientPermissions {
                 required: Permission::Any(vec![
