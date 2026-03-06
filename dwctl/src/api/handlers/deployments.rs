@@ -246,8 +246,10 @@ pub async fn list_deployed_models<P: PoolProvider>(
     };
 
     // Apply accessibility filtering based if user doesn't have PlatformManager role
+    // When an organization is active, filter by the org's group memberships instead
     if !can_read_all_models || query.accessible.unwrap_or(false) {
-        filter = filter.with_accessible_to(current_user.id);
+        let target_user_id = current_user.active_organization.unwrap_or(current_user.id);
+        filter = filter.with_accessible_to(target_user_id);
     }
 
     // Apply search filter if specified

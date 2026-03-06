@@ -16,7 +16,7 @@ import {
 import { Popover, PopoverContent, PopoverTrigger } from "./popover";
 
 interface ComboboxProps {
-  options: { value: string; label: string }[];
+  options: { value: string; label: string; description?: string }[];
   value?: string;
   onValueChange?: (value: string) => void;
   onSearchChange?: (search: string) => void;
@@ -94,9 +94,16 @@ export function Combobox({
                       value === option.value ? "opacity-100" : "opacity-0",
                     )}
                   />
-                  <span className="truncate" title={option.label}>
-                    {option.label}
-                  </span>
+                  <div className="min-w-0">
+                    <span className="truncate block" title={option.label}>
+                      {option.label}
+                    </span>
+                    {option.description && (
+                      <span className="truncate block text-xs text-muted-foreground">
+                        {option.description}
+                      </span>
+                    )}
+                  </div>
                 </CommandItem>
               ))}
             </CommandGroup>

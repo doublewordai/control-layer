@@ -17,6 +17,7 @@ struct EmailTemplates {
     low_balance: String,
     auto_topup_success: String,
     auto_topup_failed: String,
+    org_invite: String,
 }
 
 impl EmailTemplates {
@@ -28,6 +29,7 @@ impl EmailTemplates {
             low_balance: include_str!("../default_templates/low_balance.html").to_string(),
             auto_topup_success: include_str!("../default_templates/auto_topup_success.html").to_string(),
             auto_topup_failed: include_str!("../default_templates/auto_topup_failed.html").to_string(),
+            org_invite: include_str!("../default_templates/org_invite.html").to_string(),
         }
     }
 
@@ -46,6 +48,7 @@ impl EmailTemplates {
             low_balance: load("low_balance.html")?,
             auto_topup_success: load("auto_topup_success.html")?,
             auto_topup_failed: load("auto_topup_failed.html")?,
+            org_invite: load("org_invite.html")?,
         })
     }
 }
@@ -380,6 +383,42 @@ impl EmailService {
             new_balance => new_balance.map(|b| format!("{:.2}", b)).unwrap_or_default(),
             dashboard_link,
             profile_link,
+        })
+    }
+
+    pub async fn send_org_invite_email(
+        &self,
+        to_email: &str,
+        org_name: &str,
+        inviter_name: &str,
+        role: &str,
+        invite_link: &str,
+    ) -> Result<(), Error> {
+        let subject = format!("You've been invited to join {org_name}");
+        let body = self
+            .render_org_invite_body(org_name, inviter_name, role, invite_link)
+            .map_err(|e| Error::Internal {
+                operation: format!("render email template: {e}"),
+            })?;
+
+        self.send_email(to_email, None, &subject, &body).await
+    }
+
+    fn render_org_invite_body(
+        &self,
+        org_name: &str,
+        inviter_name: &str,
+        role: &str,
+        invite_link: &str,
+    ) -> Result<String, minijinja::Error> {
+        let mut env = Environment::new();
+        env.add_template("email", &self.templates.org_invite)?;
+
+        env.get_template("email")?.render(context! {
+            org_name,
+            inviter_name,
+            role,
+            invite_link,
         })
     }
 }

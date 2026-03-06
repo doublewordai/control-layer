@@ -759,13 +759,13 @@ Each PR is non-breaking — existing functionality is preserved at every step.
 | **1** | control-layer | Migration + all Rust backend | `072_add_organizations.sql` + all Phases 2–4: organization models/handlers/API, permissions, routes, CurrentUser changes, API key soft-delete + created_by + hidden key updates, attribution (api_key_id), org permission checks on existing handlers, header-based org context + validation endpoint, onwards sync filter |
 | **2** | control-layer | Dashboard | TS types, API client, hooks, query keys. AppSidebar org toggle (7h), org management page (7e), batch status sorting COR-88 (7f) |
 | **3** | fusillade | Schema + release | Migration: api_key_id on batches + files. Pass-through in creation. Release new version to crates.io |
-| **4** | control-layer | Org-scoped batch/file filtering | Bump fusillade version, pass api_key_id from file upload handler to fusillade, org-scoped batch/file member filtering in dashboard (7g) |
+| **4** | control-layer | Org-scoped batch/file filtering + batch UX | Bump fusillade version, pass api_key_id from file upload handler to fusillade, org-scoped batch/file member filtering in dashboard (7g), batch status sorting COR-88 (7f) |
 
 **Why this order:**
 - PR 1 merges migration with all backend logic that depends on it — avoids intermediate states where columns exist but aren't used, and keeps review context together
-- PR 2 (dashboard) uses the backend APIs from PR 1 but doesn't need fusillade changes — org toggle, management page, and COR-88 sorting are all independent
+- PR 2 (dashboard) uses the backend APIs from PR 1 but doesn't need fusillade changes — org toggle and management page are independent
 - PR 3 (fusillade) is a separate repo and needs to be released + published to crates.io before control-layer can consume it
-- PR 4 ties it together: bumps the fusillade dependency, wires api_key_id through file upload, and adds the member filter dropdown in the dashboard
+- PR 4 ties it together: bumps the fusillade dependency, wires api_key_id through file upload, adds the member filter dropdown in the dashboard, and includes batch status sorting (COR-88) alongside the batches view updates
 
 ## Verification
 

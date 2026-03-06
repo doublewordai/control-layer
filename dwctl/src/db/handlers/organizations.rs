@@ -52,10 +52,31 @@ impl OrganizationFilter {
 /// Internal row struct for organization membership
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 struct MemberRow {
-    pub user_id: UserId,
+    pub id: UserId,
+    pub user_id: Option<UserId>,
     pub organization_id: UserId,
     pub role: String,
+    pub status: String,
     pub created_at: DateTime<Utc>,
+    pub invite_email: Option<String>,
+    pub invited_by: Option<UserId>,
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
+impl From<MemberRow> for OrganizationMemberDBResponse {
+    fn from(r: MemberRow) -> Self {
+        Self {
+            id: r.id,
+            user_id: r.user_id,
+            organization_id: r.organization_id,
+            role: r.role,
+            status: r.status,
+            created_at: r.created_at,
+            invite_email: r.invite_email,
+            invited_by: r.invited_by,
+            expires_at: r.expires_at,
+        }
+    }
 }
 
 pub struct Organizations<'c> {
@@ -97,7 +118,7 @@ impl<'c> Organizations<'c> {
 
         // Add creator as owner
         sqlx::query!(
-            "INSERT INTO user_organizations (user_id, organization_id, role) VALUES ($1, $2, 'owner')",
+            "INSERT INTO user_organizations (user_id, organization_id, role, status) VALUES ($1, $2, 'owner', 'active')",
             request.created_by,
             org_id
         )
@@ -225,15 +246,16 @@ impl<'c> Organizations<'c> {
         Ok(result.rows_affected() > 0)
     }
 
-    /// Add a member to an organization
+    /// Add a member to an organization (active status)
     #[instrument(skip(self), fields(org_id = %abbrev_uuid(&org_id), user_id = %abbrev_uuid(&user_id)), err)]
     pub async fn add_member(&mut self, org_id: UserId, user_id: UserId, role: &str) -> Result<OrganizationMemberDBResponse> {
         let row = sqlx::query_as!(
             MemberRow,
             r#"
-            INSERT INTO user_organizations (user_id, organization_id, role)
-            VALUES ($1, $2, $3)
-            RETURNING user_id as "user_id!", organization_id as "organization_id!", role, created_at
+            INSERT INTO user_organizations (user_id, organization_id, role, status)
+            VALUES ($1, $2, $3, 'active')
+            RETURNING id, user_id, organization_id, role, status, created_at,
+                      invite_email, invited_by, expires_at
             "#,
             user_id,
             org_id,
@@ -242,12 +264,7 @@ impl<'c> Organizations<'c> {
         .fetch_one(&mut *self.db)
         .await?;
 
-        Ok(OrganizationMemberDBResponse {
-            user_id: row.user_id,
-            organization_id: row.organization_id,
-            role: row.role,
-            created_at: row.created_at,
-        })
+        Ok(row.into())
     }
 
     /// Remove a member from an organization
@@ -271,8 +288,9 @@ impl<'c> Organizations<'c> {
             MemberRow,
             r#"
             UPDATE user_organizations SET role = $3
-            WHERE user_id = $1 AND organization_id = $2
-            RETURNING user_id as "user_id!", organization_id as "organization_id!", role, created_at
+            WHERE user_id = $1 AND organization_id = $2 AND status = 'active'
+            RETURNING id, user_id, organization_id, role, status, created_at,
+                      invite_email, invited_by, expires_at
             "#,
             user_id,
             org_id,
@@ -282,52 +300,42 @@ impl<'c> Organizations<'c> {
         .await?
         .ok_or(DbError::NotFound)?;
 
-        Ok(OrganizationMemberDBResponse {
-            user_id: row.user_id,
-            organization_id: row.organization_id,
-            role: row.role,
-            created_at: row.created_at,
-        })
+        Ok(row.into())
     }
 
-    /// List members of an organization
+    /// List members of an organization (includes both active and pending)
     #[instrument(skip(self), fields(org_id = %abbrev_uuid(&org_id)), err)]
     pub async fn list_members(&mut self, org_id: UserId) -> Result<Vec<OrganizationMemberDBResponse>> {
         let rows = sqlx::query_as!(
             MemberRow,
             r#"
-            SELECT uo.user_id as "user_id!", uo.organization_id as "organization_id!", uo.role, uo.created_at
+            SELECT uo.id, uo.user_id, uo.organization_id, uo.role, uo.status,
+                   uo.created_at, uo.invite_email, uo.invited_by, uo.expires_at
             FROM user_organizations uo
-            INNER JOIN users u ON u.id = uo.user_id
-            WHERE uo.organization_id = $1 AND u.is_deleted = false
-            ORDER BY uo.created_at ASC
+            LEFT JOIN users u ON u.id = uo.user_id
+            WHERE uo.organization_id = $1
+              AND (uo.user_id IS NULL OR u.is_deleted = false)
+            ORDER BY uo.status ASC, uo.created_at ASC
             "#,
             org_id
         )
         .fetch_all(&mut *self.db)
         .await?;
 
-        Ok(rows
-            .into_iter()
-            .map(|r| OrganizationMemberDBResponse {
-                user_id: r.user_id,
-                organization_id: r.organization_id,
-                role: r.role,
-                created_at: r.created_at,
-            })
-            .collect())
+        Ok(rows.into_iter().map(Into::into).collect())
     }
 
-    /// List organizations a user belongs to
+    /// List organizations a user belongs to (active memberships only)
     #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
     pub async fn list_user_organizations(&mut self, user_id: UserId) -> Result<Vec<OrganizationMemberDBResponse>> {
         let rows = sqlx::query_as!(
             MemberRow,
             r#"
-            SELECT uo.user_id as "user_id!", uo.organization_id as "organization_id!", uo.role, uo.created_at
+            SELECT uo.id, uo.user_id, uo.organization_id, uo.role, uo.status,
+                   uo.created_at, uo.invite_email, uo.invited_by, uo.expires_at
             FROM user_organizations uo
             INNER JOIN users u ON u.id = uo.organization_id
-            WHERE uo.user_id = $1 AND u.is_deleted = false
+            WHERE uo.user_id = $1 AND uo.status = 'active' AND u.is_deleted = false
             ORDER BY uo.created_at ASC
             "#,
             user_id
@@ -335,22 +343,14 @@ impl<'c> Organizations<'c> {
         .fetch_all(&mut *self.db)
         .await?;
 
-        Ok(rows
-            .into_iter()
-            .map(|r| OrganizationMemberDBResponse {
-                user_id: r.user_id,
-                organization_id: r.organization_id,
-                role: r.role,
-                created_at: r.created_at,
-            })
-            .collect())
+        Ok(rows.into_iter().map(Into::into).collect())
     }
 
-    /// Get a user's role in an organization (None if not a member)
+    /// Get a user's role in an organization (active memberships only, None if not a member)
     #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id), org_id = %abbrev_uuid(&org_id)), err)]
     pub async fn get_user_org_role(&mut self, user_id: UserId, org_id: UserId) -> Result<Option<String>> {
         let row = sqlx::query_scalar!(
-            "SELECT role FROM user_organizations WHERE user_id = $1 AND organization_id = $2",
+            "SELECT role FROM user_organizations WHERE user_id = $1 AND organization_id = $2 AND status = 'active'",
             user_id,
             org_id
         )
@@ -358,6 +358,109 @@ impl<'c> Organizations<'c> {
         .await?;
 
         Ok(row)
+    }
+
+    /// Create a pending invite
+    #[allow(clippy::too_many_arguments)]
+    #[instrument(skip(self, token_hash), fields(org_id = %abbrev_uuid(&org_id), invite_email = %invite_email), err)]
+    pub async fn create_invite(
+        &mut self,
+        org_id: UserId,
+        user_id: Option<UserId>,
+        invite_email: &str,
+        role: &str,
+        invited_by: UserId,
+        token_hash: &str,
+        expires_at: DateTime<Utc>,
+    ) -> Result<OrganizationMemberDBResponse> {
+        let row = sqlx::query_as!(
+            MemberRow,
+            r#"
+            INSERT INTO user_organizations (user_id, organization_id, role, status, invite_email, invited_by, invite_token_hash, expires_at)
+            VALUES ($1, $2, $3, 'pending', $4, $5, $6, $7)
+            RETURNING id, user_id, organization_id, role, status, created_at,
+                      invite_email, invited_by, expires_at
+            "#,
+            user_id,
+            org_id,
+            role,
+            invite_email,
+            invited_by,
+            token_hash,
+            expires_at,
+        )
+        .fetch_one(&mut *self.db)
+        .await?;
+
+        Ok(row.into())
+    }
+
+    /// Find a pending invite by token hash
+    #[instrument(skip(self, token_hash), err)]
+    pub async fn find_invite_by_token_hash(&mut self, token_hash: &str) -> Result<Option<OrganizationMemberDBResponse>> {
+        let row = sqlx::query_as!(
+            MemberRow,
+            r#"
+            SELECT id, user_id, organization_id, role, status, created_at,
+                   invite_email, invited_by, expires_at
+            FROM user_organizations
+            WHERE invite_token_hash = $1 AND status = 'pending'
+            "#,
+            token_hash,
+        )
+        .fetch_optional(&mut *self.db)
+        .await?;
+
+        Ok(row.map(Into::into))
+    }
+
+    /// Accept an invite: set status to active, set user_id, clear token
+    #[instrument(skip(self), fields(invite_id = %abbrev_uuid(&invite_id), user_id = %abbrev_uuid(&user_id)), err)]
+    pub async fn accept_invite(&mut self, invite_id: UserId, user_id: UserId) -> Result<OrganizationMemberDBResponse> {
+        let row = sqlx::query_as!(
+            MemberRow,
+            r#"
+            UPDATE user_organizations
+            SET status = 'active', user_id = $2, invite_token_hash = NULL
+            WHERE id = $1 AND status = 'pending'
+            RETURNING id, user_id, organization_id, role, status, created_at,
+                      invite_email, invited_by, expires_at
+            "#,
+            invite_id,
+            user_id,
+        )
+        .fetch_optional(&mut *self.db)
+        .await?
+        .ok_or(DbError::NotFound)?;
+
+        Ok(row.into())
+    }
+
+    /// Cancel (delete) a pending invite by row ID
+    #[instrument(skip(self), fields(org_id = %abbrev_uuid(&org_id), invite_id = %abbrev_uuid(&invite_id)), err)]
+    pub async fn cancel_invite(&mut self, org_id: UserId, invite_id: UserId) -> Result<bool> {
+        let result = sqlx::query!(
+            "DELETE FROM user_organizations WHERE id = $1 AND organization_id = $2 AND status = 'pending'",
+            invite_id,
+            org_id
+        )
+        .execute(&mut *self.db)
+        .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Count active members of an organization (for member_count in list responses)
+    #[instrument(skip(self), fields(org_id = %abbrev_uuid(&org_id)), err)]
+    pub async fn count_members(&mut self, org_id: UserId) -> Result<i64> {
+        let count = sqlx::query_scalar!(
+            "SELECT COUNT(*) FROM user_organizations WHERE organization_id = $1 AND status = 'active'",
+            org_id
+        )
+        .fetch_one(&mut *self.db)
+        .await?;
+
+        Ok(count.unwrap_or(0))
     }
 }
 
@@ -443,7 +546,7 @@ mod tests {
         // Should appear in member list
         let members = orgs.list_members(org.id).await.unwrap();
         assert_eq!(members.len(), 1);
-        assert_eq!(members[0].user_id, creator);
+        assert_eq!(members[0].user_id, Some(creator));
         assert_eq!(members[0].role, "owner");
     }
 
@@ -713,9 +816,10 @@ mod tests {
             .unwrap();
 
         let member = orgs.add_member(org.id, bob, "member").await.unwrap();
-        assert_eq!(member.user_id, bob);
+        assert_eq!(member.user_id, Some(bob));
         assert_eq!(member.organization_id, org.id);
         assert_eq!(member.role, "member");
+        assert_eq!(member.status, "active");
 
         // Should now have two members
         let members = orgs.list_members(org.id).await.unwrap();
@@ -777,7 +881,7 @@ mod tests {
         // Should only have the creator
         let members = orgs.list_members(org.id).await.unwrap();
         assert_eq!(members.len(), 1);
-        assert_eq!(members[0].user_id, creator);
+        assert_eq!(members[0].user_id, Some(creator));
 
         // Removing non-member returns false
         let removed_again = orgs.remove_member(org.id, bob).await.unwrap();

@@ -1,0 +1,70 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT uo.id, uo.user_id, uo.organization_id, uo.role, uo.status,\n                   uo.created_at, uo.invite_email, uo.invited_by, uo.expires_at\n            FROM user_organizations uo\n            INNER JOIN users u ON u.id = uo.organization_id\n            WHERE uo.user_id = $1 AND uo.status = 'active' AND u.is_deleted = false\n            ORDER BY uo.created_at ASC\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "user_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "organization_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "role",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 4,
+        "name": "status",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 5,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 6,
+        "name": "invite_email",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 7,
+        "name": "invited_by",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 8,
+        "name": "expires_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "8817b0cfa8dec8e2cafe88078542d1ccc0f3e1de6c861753dcf168eaa110eb8a"
+}

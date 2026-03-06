@@ -1,0 +1,40 @@
+[
+  {
+    "id": "org-550e8400-0001",
+    "username": "acme-corp",
+    "external_user_id": "org|acme-corp",
+    "email": "admin@acme.com",
+    "display_name": "Acme Corporation",
+    "avatar_url": null,
+    "is_admin": false,
+    "roles": ["StandardUser"],
+    "created_at": "2025-01-15T10:00:00Z",
+    "updated_at": "2025-06-01T12:00:00Z",
+    "auth_source": "proxy-header",
+    "credit_balance": 250.0,
+    "has_payment_provider_id": false,
+    "batch_notifications_enabled": false,
+    "low_balance_threshold": null,
+    "user_type": "organization",
+    "member_count": 5
+  },
+  {
+    "id": "org-550e8400-0002",
+    "username": "widgets-inc",
+    "external_user_id": "org|widgets-inc",
+    "email": "admin@widgets.io",
+    "display_name": "Widgets Inc",
+    "avatar_url": null,
+    "is_admin": false,
+    "roles": ["StandardUser"],
+    "created_at": "2025-03-20T14:00:00Z",
+    "updated_at": "2025-06-15T09:00:00Z",
+    "auth_source": "proxy-header",
+    "credit_balance": 100.0,
+    "has_payment_provider_id": false,
+    "batch_notifications_enabled": false,
+    "low_balance_threshold": null,
+    "user_type": "organization",
+    "member_count": 3
+  }
+]

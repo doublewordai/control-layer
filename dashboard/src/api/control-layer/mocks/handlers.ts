@@ -38,6 +38,15 @@ import filesDataRaw from "./files.json";
 import batchesDataRaw from "./batches.json";
 import batchRequestsDataRaw from "./batch-requests.json";
 import fileRequestsDataRaw from "./file-requests.json";
+import organizationsDataRaw from "./organizations.json";
+import type {
+  Organization,
+  OrganizationMember,
+  OrganizationCreateRequest,
+  OrganizationUpdateRequest,
+  InviteMemberRequest,
+  InviteDetailsResponse,
+} from "../types";
 import {
   loadDemoState,
   addModelToGroup as addModelToGroupState,
@@ -74,6 +83,43 @@ const endpointsData = endpointsDataRaw as Endpoint[];
 const modelsData = modelsDataRaw.data as Model[];
 const apiKeysData = apiKeysDataRaw as ApiKey[];
 const transactionsData = transactionsDataRaw as Transaction[];
+const organizationsData = organizationsDataRaw as unknown as Organization[];
+
+// Mock organization members
+const orgMembersData: Record<string, OrganizationMember[]> = {
+  "org-550e8400-0001": [
+    {
+      id: "mem-001",
+      user: usersData[0],
+      role: "owner",
+      status: "active",
+      created_at: "2025-01-15T10:00:00Z",
+    },
+    {
+      id: "mem-002",
+      user: usersData[1],
+      role: "member",
+      status: "active",
+      created_at: "2025-02-01T10:00:00Z",
+    },
+    {
+      id: "mem-003",
+      role: "member",
+      status: "pending",
+      created_at: "2025-06-01T10:00:00Z",
+      invite_email: "newuser@acme.com",
+    },
+  ],
+  "org-550e8400-0002": [
+    {
+      id: "mem-004",
+      user: usersData[2],
+      role: "owner",
+      status: "active",
+      created_at: "2025-03-20T14:00:00Z",
+    },
+  ],
+};
 const userGroupsInitial = userGroups as Record<string, string[]>;
 const modelsGroupsInitial = modelsGroups as Record<string, string[]>;
 const requestsData = requestsDataRaw as DemoRequest[];
@@ -2096,4 +2142,143 @@ export const handlers = [
     return HttpResponse.json(cancelledBatch);
   }),
 
+  // ===== ORGANIZATIONS =====
+
+  http.get("/admin/api/v1/organizations", ({ request }) => {
+    const url = new URL(request.url);
+    const skip = Number(url.searchParams.get("skip") || "0");
+    const limit = Number(url.searchParams.get("limit") || "10");
+    const search = url.searchParams.get("search") || "";
+
+    let filtered = [...organizationsData];
+    if (search) {
+      const lower = search.toLowerCase();
+      filtered = filtered.filter(
+        (o) =>
+          o.username.toLowerCase().includes(lower) ||
+          (o.display_name || "").toLowerCase().includes(lower) ||
+          o.email.toLowerCase().includes(lower),
+      );
+    }
+
+    return HttpResponse.json({
+      data: filtered.slice(skip, skip + limit),
+      total_count: filtered.length,
+      skip,
+      limit,
+    });
+  }),
+
+  http.get("/admin/api/v1/organizations/:id", ({ params }) => {
+    const org = organizationsData.find((o) => o.id === params.id);
+    if (!org) return HttpResponse.json({ error: "Not found" }, { status: 404 });
+    return HttpResponse.json(org);
+  }),
+
+  http.post("/admin/api/v1/organizations", async ({ request }) => {
+    const body = (await request.json()) as OrganizationCreateRequest;
+    const newOrg = {
+      id: `org-${Date.now()}`,
+      username: body.name,
+      external_user_id: `org|${body.name}`,
+      email: body.email,
+      display_name: body.display_name || null,
+      avatar_url: null,
+      is_admin: false,
+      roles: ["StandardUser"],
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+      auth_source: "proxy-header",
+      credit_balance: 0,
+      has_payment_provider_id: false,
+      batch_notifications_enabled: false,
+      low_balance_threshold: null,
+      user_type: "organization",
+      member_count: 1,
+    };
+    return HttpResponse.json(newOrg, { status: 201 });
+  }),
+
+  http.patch("/admin/api/v1/organizations/:id", async ({ params, request }) => {
+    const body = (await request.json()) as OrganizationUpdateRequest;
+    const org = organizationsData.find((o) => o.id === params.id);
+    if (!org) return HttpResponse.json({ error: "Not found" }, { status: 404 });
+    return HttpResponse.json({ ...org, ...body });
+  }),
+
+  http.delete("/admin/api/v1/organizations/:id", ({ params }) => {
+    const org = organizationsData.find((o) => o.id === params.id);
+    if (!org) return HttpResponse.json({ error: "Not found" }, { status: 404 });
+    return new HttpResponse(null, { status: 204 });
+  }),
+
+  http.get("/admin/api/v1/organizations/:orgId/members", ({ params }) => {
+    const members = orgMembersData[params.orgId as string] || [];
+    return HttpResponse.json(members);
+  }),
+
+  http.post(
+    "/admin/api/v1/organizations/:orgId/invites",
+    async ({ request }) => {
+      const body = (await request.json()) as InviteMemberRequest;
+      return HttpResponse.json(
+        {
+          id: `inv-${Date.now()}`,
+          email: body.email,
+          role: body.role || "member",
+          status: "pending",
+          created_at: new Date().toISOString(),
+          expires_at: new Date(
+            Date.now() + 7 * 24 * 60 * 60 * 1000,
+          ).toISOString(),
+        },
+        { status: 201 },
+      );
+    },
+  ),
+
+  http.delete(
+    "/admin/api/v1/organizations/:orgId/invites/:inviteId",
+    () => {
+      return new HttpResponse(null, { status: 204 });
+    },
+  ),
+
+  http.patch(
+    "/admin/api/v1/organizations/:orgId/members/:userId",
+    async ({ request }) => {
+      const body = (await request.json()) as Record<string, unknown>;
+      return HttpResponse.json({ role: body.role });
+    },
+  ),
+
+  http.delete(
+    "/admin/api/v1/organizations/:orgId/members/:userId",
+    () => {
+      return new HttpResponse(null, { status: 204 });
+    },
+  ),
+
+  http.get("/admin/api/v1/organizations/invites/:token", () => {
+    return HttpResponse.json({
+      org_name: "Acme Corporation",
+      role: "member",
+      inviter_name: "Sarah Chen",
+      expires_at: new Date(
+        Date.now() + 7 * 24 * 60 * 60 * 1000,
+      ).toISOString(),
+    } satisfies InviteDetailsResponse);
+  }),
+
+  http.post("/admin/api/v1/organizations/invites/:token/accept", () => {
+    return HttpResponse.json({ success: true });
+  }),
+
+  http.post("/admin/api/v1/organizations/invites/:token/decline", () => {
+    return HttpResponse.json({ success: true });
+  }),
+
+  http.post("/admin/api/v1/session/organization", () => {
+    return HttpResponse.json({ active_organization_id: null });
+  }),
 ];

@@ -32,12 +32,14 @@ export function AuthProvider({ children }: AuthProviderProps) {
     try {
       setAuthState((prev) => ({ ...prev, isLoading: true }));
 
-      // Use queryClient.fetchQuery to leverage React Query caching
-      // This deduplicates simultaneous requests and caches the result
-      const user = await queryClient.fetchQuery({
-        queryKey: queryKeys.users.byId("current", undefined),
-        queryFn: () => dwctlApi.users.get("current"),
-      });
+      // Fetch directly to avoid 401 errors entering the React Query cache,
+      // which would trigger the global onError handler and redirect to /login.
+      // On success, populate the cache manually for downstream consumers.
+      const user = await dwctlApi.users.get("current");
+      queryClient.setQueryData(
+        queryKeys.users.byId("current", undefined),
+        user,
+      );
 
       // Determine auth method based on response headers or user data
       const authMethod = user.auth_source === "native" ? "native" : "proxy";

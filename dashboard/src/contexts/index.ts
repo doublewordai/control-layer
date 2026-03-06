@@ -9,5 +9,8 @@ export { SettingsProvider } from "./settings/SettingsContext";
 export { useSettings } from "./settings/hooks";
 export type { FeatureFlags, AppSettings } from "./settings/types";
 
+// Organization Context - active organization switching
+export { OrganizationProvider, useOrganizationContext } from "./organization";
+
 // User types (moved to Control Layer API types)
 // Note: User context replaced with TanStack Query hooks in api/control-layer
