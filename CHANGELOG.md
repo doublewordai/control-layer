@@ -1,5 +1,14 @@
 # Changelog
 
+## [8.14.0](https://github.com/doublewordai/control-layer/compare/v8.13.0...v8.14.0) (2026-03-06)
+
+
+### Features
+
+* add server-side filtering, sorting, and facets for models API ([#804](https://github.com/doublewordai/control-layer/issues/804)) ([a716b95](https://github.com/doublewordai/control-layer/commit/a716b95a62de2c60ec2d51743964f76e8b90e9cb))
+* migration and initial organisation backend infrastructure ([#797](https://github.com/doublewordai/control-layer/issues/797)) ([df159d9](https://github.com/doublewordai/control-layer/commit/df159d9d740992250b0e8532145686a68d6e5264))
+* organisation invites + views ([#801](https://github.com/doublewordai/control-layer/issues/801)) ([5ed7561](https://github.com/doublewordai/control-layer/commit/5ed7561c7f004eab533887bebc353cda39f4597b))
+
 ## [8.13.0](https://github.com/doublewordai/control-layer/compare/v8.12.0...v8.13.0) (2026-03-04)
 
 
