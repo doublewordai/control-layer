@@ -1,45 +1,16 @@
-import { useState, useCallback, useEffect, type ReactNode } from "react";
+import { useCallback, type ReactNode } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useUser } from "../../api/control-layer/hooks";
 import { dwctlApi } from "../../api/control-layer/client";
 import { queryKeys } from "../../api/control-layer/keys";
 import { OrganizationContext } from "./context";
 
-const STORAGE_KEY = "activeOrganizationId";
-
 export function OrganizationProvider({ children }: { children: ReactNode }) {
-  const [activeOrganizationId, setActiveOrgId] = useState<string | null>(
-    () => localStorage.getItem(STORAGE_KEY),
-  );
   const queryClient = useQueryClient();
   const { data: currentUser } = useUser("current", { include: "organizations" });
 
-  // Sync cookie with localStorage on mount: if localStorage has no active org,
-  // clear the HttpOnly cookie too. This prevents stale cookies from persisting
-  // after localStorage is cleared (e.g. browser data clear, new tab, etc.).
-  useEffect(() => {
-    if (!currentUser) return; // Wait until user data is loaded
-    if (!activeOrganizationId) {
-      dwctlApi.organizations.setActive(null).catch(() => {});
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- only on mount + first user load
-  }, [!!currentUser]);
-
-  // Validate stored org ID against current user's memberships
-  useEffect(() => {
-    if (!currentUser?.organizations || !activeOrganizationId) return;
-    const isMember = currentUser.organizations.some(
-      (org) => org.id === activeOrganizationId,
-    );
-    if (!isMember) {
-      localStorage.removeItem(STORAGE_KEY);
-      setActiveOrgId(null);
-      // Clear the HttpOnly dw_active_org cookie on the backend to prevent
-      // desync where the UI shows personal context but requests still carry
-      // the org cookie (which would charge the org instead of the user).
-      dwctlApi.organizations.setActive(null).catch(() => {});
-    }
-  }, [currentUser?.organizations, activeOrganizationId]);
+  // Derive active organization from the server response (source of truth)
+  const activeOrganizationId = currentUser?.active_organization_id ?? null;
 
   const activeOrganization =
     currentUser?.organizations?.find(
@@ -48,15 +19,13 @@ export function OrganizationProvider({ children }: { children: ReactNode }) {
 
   const setActiveOrganization = useCallback(
     async (orgId: string | null) => {
-      // Validate membership with the backend
+      // Update the server-side cookie
       await dwctlApi.organizations.setActive(orgId);
 
-      if (orgId) {
-        localStorage.setItem(STORAGE_KEY, orgId);
-      } else {
-        localStorage.removeItem(STORAGE_KEY);
-      }
-      setActiveOrgId(orgId);
+      // Re-fetch current user to get updated active_organization_id
+      await queryClient.invalidateQueries({
+        queryKey: queryKeys.users.byId("current", "organizations"),
+      });
 
       // Invalidate queries that are scoped to user/org context
       queryClient.invalidateQueries({ queryKey: queryKeys.models.all });

@@ -363,6 +363,7 @@ pub async fn get_system_user(pool: &mut PgConnection) -> UserResponse {
         low_balance_threshold: None,
         user_type: "individual".to_string(),
         organizations: None,
+        active_organization_id: None,
     }
 }
 
@@ -504,6 +505,7 @@ pub async fn create_test_org(pool: &PgPool, created_by: UserId) -> UserResponse 
         low_balance_threshold: None,
         user_type: org.user_type,
         organizations: None,
+        active_organization_id: None,
     }
 }
 

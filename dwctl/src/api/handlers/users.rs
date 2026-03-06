@@ -185,6 +185,7 @@ pub async fn get_user<P: PoolProvider>(
     // Can't use RequiresPermission here because we need conditional logic for own vs other users
     current_user: CurrentUser,
 ) -> Result<Json<UserResponse>> {
+    let is_current = matches!(user_id, UserIdOrCurrent::Current(_));
     let target_user_id = match user_id {
         UserIdOrCurrent::Current(_) => {
             // Even for /current, verify they have permission to read their own user data
@@ -234,13 +235,16 @@ pub async fn get_user<P: PoolProvider>(
 
     let mut response = UserResponse::from(user);
 
-    // Include groups if requested and permitted
+    // Include billing if requested and permitted
     // Permitted if:
     //     1. You have ReadAll on Credits
     //     2. You are requesting your own data and have ReadOwn on Credits
+    //     3. You are a member of the org being queried (org balance is shared)
+    let is_org_member = current_user.organizations.iter().any(|o| o.id == target_user_id);
     if query.include.as_deref().is_some_and(|includes| includes.contains("billing"))
         && (permissions::has_permission(&current_user, Resource::Credits, Operation::ReadAll)
-            || (target_user_id == current_user.id && permissions::has_permission(&current_user, Resource::Credits, Operation::ReadOwn)))
+            || (target_user_id == current_user.id && permissions::has_permission(&current_user, Resource::Credits, Operation::ReadOwn))
+            || is_org_member)
     {
         let mut credits_repo = Credits::new(&mut pool_conn);
         let balance = credits_repo.get_user_balance(target_user_id).await?.to_f64().unwrap_or_else(|| {
@@ -277,6 +281,11 @@ pub async fn get_user<P: PoolProvider>(
         } else {
             response = response.with_organizations(vec![]);
         }
+    }
+
+    // Include active organization for /users/current requests
+    if is_current {
+        response = response.with_active_organization(current_user.active_organization);
     }
 
     Ok(Json(response))

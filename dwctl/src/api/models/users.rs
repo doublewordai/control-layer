@@ -121,6 +121,10 @@ pub struct UserResponse {
     /// Organizations this user belongs to (only included if `include=organizations` is specified)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub organizations: Option<Vec<super::organizations::OrganizationSummary>>,
+    /// Active organization ID from the session cookie (only present for /users/current)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>, format = "uuid")]
+    pub active_organization_id: Option<UserId>,
 }
 
 /// Query parameters for listing users
@@ -205,6 +209,7 @@ impl From<UserDBResponse> for UserResponse {
             low_balance_threshold: db.low_balance_threshold,
             user_type: db.user_type,
             organizations: None,
+            active_organization_id: None,
         }
     }
 }
@@ -225,6 +230,12 @@ impl UserResponse {
     /// Create a response with organizations included
     pub fn with_organizations(mut self, organizations: Vec<super::organizations::OrganizationSummary>) -> Self {
         self.organizations = Some(organizations);
+        self
+    }
+
+    /// Set the active organization ID (from session cookie)
+    pub fn with_active_organization(mut self, id: Option<UserId>) -> Self {
+        self.active_organization_id = id;
         self
     }
 }

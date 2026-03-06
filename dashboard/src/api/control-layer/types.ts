@@ -288,6 +288,7 @@ export interface User {
   low_balance_threshold: number | null; // Threshold for low balance notifications (null = disabled)
   user_type?: "individual" | "organization"; // User type
   organizations?: OrganizationSummary[]; // only present when include=organizations or for current user
+  active_organization_id?: string; // only present for /users/current
 }
 
 export interface ApiKey {
