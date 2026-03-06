@@ -583,7 +583,9 @@ export const ModelCatalog: React.FC = () => {
   const groups = groupsData?.data || [];
 
   const groupFilter =
-    selectedGroups.length > 0 ? selectedGroups.join(",") : undefined;
+    canManageGroups && selectedGroups.length > 0
+      ? selectedGroups.join(",")
+      : undefined;
 
   const { data, isLoading } = useModels({
     limit: 100,
