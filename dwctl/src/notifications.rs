@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use fusillade::manager::postgres::PostgresRequestManager;
+use rust_decimal::prelude::ToPrimitive;
 use sqlx::PgPool;
 use sqlx_pool_router::DbPools;
 use tokio_util::sync::CancellationToken;
@@ -465,8 +466,8 @@ async fn process_auto_topups(provider: &dyn PaymentProvider, conn: &mut sqlx::po
     // 4. Charge each user
     for user in &to_charge {
         let amount_cents = (user.auto_topup_amount * rust_decimal::Decimal::new(100, 0))
-            .to_string()
-            .parse::<i64>()
+            .round_dp(0)
+            .to_i64()
             .unwrap_or(0);
 
         if amount_cents <= 0 {

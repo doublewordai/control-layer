@@ -41,10 +41,11 @@ export function CostManagement() {
   const filterUserId = searchParams.get("user");
 
   // Open auto top-up modal from URL param (e.g. linked from profile page or Stripe redirect)
+  // Only allow for the user's own billing page, not when an admin is viewing another user
   const openAutoTopup = searchParams.get("autoTopup");
   const autoTopupIdParam = searchParams.get("autoTopupId");
   useEffect(() => {
-    if (openAutoTopup === "true") {
+    if (openAutoTopup === "true" && !filterUserId) {
       setAutoTopupId(autoTopupIdParam ?? undefined);
       setShowAutoTopupModal(true);
 
@@ -54,7 +55,7 @@ export function CostManagement() {
       url.searchParams.delete("autoTopup");
       window.history.replaceState({}, "", url.pathname + url.search);
     }
-  }, [openAutoTopup, autoTopupIdParam]);
+  }, [openAutoTopup, autoTopupIdParam, filterUserId]);
 
   // Fetch current user and display user (the one we're viewing billing for)
   const { data: currentUser, refetch: refetchCurrentUser } = useUser("current");

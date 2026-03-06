@@ -403,10 +403,6 @@ impl PaymentProvider for StripeProvider {
     }
 
     async fn create_auto_topup_checkout_session(&self, user: &CurrentUser, cancel_url: &str, success_url: &str) -> Result<String> {
-        // This should verify the user has a saved payment method and create
-        // a checkout session for auto top-up setup.
-        let _customer_id = user.payment_provider_id.as_ref().ok_or(PaymentError::NoCustomerId)?;
-
         let mut checkout_params = CreateCheckoutSession::new()
             .cancel_url(cancel_url)
             .success_url(success_url)
@@ -485,7 +481,7 @@ impl PaymentProvider for StripeProvider {
 
         // Check if setup was completed
         if session.status != Some(CheckoutSessionStatus::Complete) {
-            return Err(PaymentError::InvalidData("Setup was not completed".to_string()));
+            return Err(PaymentError::PaymentNotCompleted);
         }
 
         // Extract the expanded SetupIntent
