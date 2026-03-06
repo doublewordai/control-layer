@@ -55,7 +55,9 @@ impl StripeProvider {
         amount_cents: i64,
         customer_id: &str,
         payment_method_id: &str,
+        idempotency_key: &str,
     ) -> Result<stripe_core::PaymentIntent> {
+        use stripe::{IdempotencyKey, RequestStrategy, StripeRequest};
         use stripe_core::payment_intent::{
             AsyncWorkflowsInputsParam, AsyncWorkflowsInputsTaxParam, AsyncWorkflowsParam, CreatePaymentIntent,
             CreatePaymentIntentOffSession,
@@ -79,7 +81,10 @@ impl StripeProvider {
             .id
             .ok_or_else(|| PaymentError::ProviderApi("Tax calculation missing ID".to_string()))?;
 
-        // Create PaymentIntent with tax calculation linked
+        let idem_key =
+            IdempotencyKey::new(idempotency_key).map_err(|e| PaymentError::InvalidData(format!("Invalid idempotency key: {e}")))?;
+
+        // Create PaymentIntent with tax calculation linked and idempotency key
         CreatePaymentIntent::new(tax_calc.amount_total, Currency::USD)
             .customer(customer_id)
             .payment_method(payment_method_id)
@@ -92,6 +97,8 @@ impl StripeProvider {
                     tax: Some(AsyncWorkflowsInputsTaxParam::new(tax_calc_id.to_string())),
                 }),
             })
+            .customize()
+            .request_strategy(RequestStrategy::Idempotent(idem_key))
             .send(&self.client)
             .await
             .map_err(|e| {
@@ -387,9 +394,11 @@ impl PaymentProvider for StripeProvider {
     }
 
     async fn process_webhook_event(&self, db_pool: &PgPool, event: &WebhookEvent) -> Result<()> {
-        // Only process checkout session completion events
+        // Only process checkout session completion events — ignore all others silently.
+        // Stripe may send events like charge.updated, payment_intent.succeeded, etc.
+        // that we don't need to act on.
         if event.event_type != "checkout.session.completed" && event.event_type != "checkout.session.async_payment_succeeded" {
-            tracing::error!("Unexpected webhook received of type: {}", event.event_type); // Stripe should be configured to only send the two types above
+            tracing::trace!("Ignoring webhook event type: {}", event.event_type);
             return Ok(());
         }
 
@@ -515,12 +524,19 @@ impl PaymentProvider for StripeProvider {
         Ok(AutoTopupSetupResult {
             payment_method_id,
             customer_id,
+            user_id: session.client_reference_id,
         })
     }
 
-    async fn charge_auto_topup(&self, amount_cents: i64, customer_id: &str, payment_method_id: &str) -> Result<String> {
+    async fn charge_auto_topup(
+        &self,
+        amount_cents: i64,
+        customer_id: &str,
+        payment_method_id: &str,
+        idempotency_key: &str,
+    ) -> Result<String> {
         let pi = self
-            .charge_auto_topup_internal(amount_cents, customer_id, payment_method_id)
+            .charge_auto_topup_internal(amount_cents, customer_id, payment_method_id, idempotency_key)
             .await?;
         Ok(pi.id.to_string())
     }

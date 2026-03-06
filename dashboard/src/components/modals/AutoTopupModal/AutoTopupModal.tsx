@@ -146,7 +146,8 @@ export function AutoTopupModal({
       } else {
         toast.error("Failed to get checkout URL");
       }
-    } catch {
+    } catch (err) {
+      console.error("Failed to start payment setup:", err);
       toast.error("Failed to start payment setup. Please try again.");
     }
   };
@@ -176,7 +177,8 @@ export function AutoTopupModal({
       );
       onSuccess?.();
       onClose();
-    } catch {
+    } catch (err) {
+      console.error("Failed to update auto top-up settings:", err);
       toast.error("Failed to update auto top-up settings.");
     }
   };
@@ -190,7 +192,8 @@ export function AutoTopupModal({
       toast.success("Auto top-up disabled");
       onSuccess?.();
       onClose();
-    } catch {
+    } catch (err) {
+      console.error("Failed to disable auto top-up:", err);
       toast.error("Failed to disable auto top-up.");
     }
   };

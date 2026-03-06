@@ -413,6 +413,10 @@ async fn send_email_notifications(
 /// 2. Checks if balance is below the user's configured threshold
 /// 3. Charges the saved payment method via the payment provider
 /// 4. Creates a credit transaction (idempotent via unique source_id)
+///
+/// **Rate limit**: At most one charge per user per minute, enforced via a deterministic
+/// `source_id` of the form `auto_topup_{user_id}_{YYYY-MM-DDTHH:MM}` and the unique
+/// constraint on `credits_transactions.source_id`.
 async fn process_auto_topups(
     provider: &dyn PaymentProvider,
     conn: &mut sqlx::pool::PoolConnection<sqlx::Postgres>,
@@ -479,19 +483,19 @@ async fn process_auto_topups(
             continue;
         }
 
-        // Use a deterministic source_id prefix so duplicate charges within a short window
+        // Use a deterministic source_id so duplicate charges within a short window
         // are caught by the unique constraint on credits_transactions.source_id.
-        // We include the date so a user can be charged again on a subsequent day if they
-        // drop below threshold again.
-        let today = chrono::Utc::now().format("%Y-%m-%d");
-        let source_id = format!("auto_topup_{}_{}", user.id, today);
+        // We include the minute so a user can be charged again in a subsequent minute if
+        // they drop below threshold again (at most once per minute per user).
+        let now_minute = chrono::Utc::now().format("%Y-%m-%dT%H:%M");
+        let source_id = format!("auto_topup_{}_{}", user.id, now_minute);
 
         // Check idempotency: skip if we already charged this user today
         {
             let mut credits = Credits::new(&mut *conn);
             match credits.transaction_exists_by_source_id(&source_id).await {
                 Ok(true) => {
-                    tracing::debug!(user_id = %user.id, "Auto top-up already processed today, skipping");
+                    tracing::warn!(user_id = %user.id, "Auto top-up already processed this minute, skipping");
                     continue;
                 }
                 Ok(false) => {}
@@ -504,7 +508,7 @@ async fn process_auto_topups(
 
         // Charge the payment provider
         let payment_intent_id = match provider
-            .charge_auto_topup(amount_cents, &user.payment_provider_id, &user.auto_topup_payment_id)
+            .charge_auto_topup(amount_cents, &user.payment_provider_id, &user.auto_topup_payment_id, &source_id)
             .await
         {
             Ok(id) => id,
@@ -533,7 +537,7 @@ async fn process_auto_topups(
             transaction_type: CreditTransactionType::Purchase,
             amount: user.auto_topup_amount,
             source_id,
-            description: Some(format!("Automatic top-up ({})", payment_intent_id)),
+            description: Some("Automatic top-up".to_string()),
             fusillade_batch_id: None,
         };
 
@@ -563,13 +567,167 @@ async fn process_auto_topups(
                 }
             }
             Err(e) => {
-                tracing::warn!(
+                tracing::error!(
                     user_id = %user.id,
+                    payment_intent_id = %payment_intent_id,
+                    amount = %user.auto_topup_amount,
                     error = %e,
-                    "Failed to create credit transaction for auto top-up"
+                    "CRITICAL: Auto top-up payment succeeded but credit transaction failed. \
+                     User was charged but did not receive credits. Manual reconciliation required."
                 );
+                // Send failure email so the user knows something went wrong
+                if let Some(email_svc) = email_service {
+                    let name = user.display_name.as_deref().unwrap_or(&user.username);
+                    if let Err(email_err) = email_svc
+                        .send_auto_topup_failed_email(&user.email, Some(name), &user.auto_topup_amount, &user.auto_topup_threshold)
+                        .await
+                    {
+                        tracing::error!(user_id = %user.id, error = %email_err, "Failed to send failure email for charge-without-credits");
+                    }
+                }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::models::users::Role;
+    use crate::config::DummyConfig;
+    use crate::payment_providers;
+    use rust_decimal::Decimal;
+    use sqlx::PgPool;
+
+    #[sqlx::test]
+    async fn test_process_auto_topups_charges_below_threshold(pool: PgPool) {
+        // Create a test user with auto top-up configured
+        let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+
+        // Set up auto top-up: threshold $10, amount $25, with payment IDs
+        sqlx::query!(
+            r#"UPDATE users SET
+                auto_topup_amount = 25.0,
+                auto_topup_threshold = 10.0,
+                auto_topup_payment_id = 'pm_test_123',
+                payment_provider_id = 'cus_test_456'
+            WHERE id = $1"#,
+            user.id
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // User has $0 balance (below $10 threshold) — should trigger charge
+
+        let provider = payment_providers::create_provider(crate::config::PaymentConfig::Dummy(DummyConfig {
+            amount: Decimal::new(100, 0),
+        }));
+
+        let mut conn = pool.acquire().await.unwrap();
+        process_auto_topups(provider.as_ref(), &mut conn, None).await;
+
+        // Verify a credit transaction was created
+        let txn = sqlx::query!("SELECT amount, source_id FROM credits_transactions WHERE user_id = $1", user.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(txn.amount, Decimal::new(2500, 2)); // $25.00
+        assert!(txn.source_id.starts_with("auto_topup_"), "source_id should start with auto_topup_");
+        assert!(txn.source_id.contains(&user.id.to_string()), "source_id should contain user ID");
+    }
+
+    #[sqlx::test]
+    async fn test_process_auto_topups_skips_above_threshold(pool: PgPool) {
+        let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+
+        // Set up auto top-up: threshold $5, amount $25
+        sqlx::query!(
+            r#"UPDATE users SET
+                auto_topup_amount = 25.0,
+                auto_topup_threshold = 5.0,
+                auto_topup_payment_id = 'pm_test_123',
+                payment_provider_id = 'cus_test_456'
+            WHERE id = $1"#,
+            user.id
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Give user $50 balance (well above $5 threshold)
+        let mut conn = pool.acquire().await.unwrap();
+        {
+            let mut credits = Credits::new(&mut conn);
+            credits
+                .create_transaction(&CreditTransactionCreateDBRequest {
+                    user_id: user.id,
+                    transaction_type: CreditTransactionType::Purchase,
+                    amount: Decimal::new(5000, 2),
+                    source_id: "seed_balance".to_string(),
+                    description: Some("Test seed".to_string()),
+                    fusillade_batch_id: None,
+                })
+                .await
+                .unwrap();
+        }
+
+        let provider = payment_providers::create_provider(crate::config::PaymentConfig::Dummy(DummyConfig {
+            amount: Decimal::new(100, 0),
+        }));
+
+        process_auto_topups(provider.as_ref(), &mut conn, None).await;
+
+        // Should only have the seed transaction, no auto-topup
+        let count = sqlx::query!("SELECT COUNT(*) as count FROM credits_transactions WHERE user_id = $1", user.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(count.count.unwrap(), 1, "Should only have the seed transaction");
+    }
+
+    #[sqlx::test]
+    async fn test_process_auto_topups_idempotent(pool: PgPool) {
+        let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+
+        sqlx::query!(
+            r#"UPDATE users SET
+                auto_topup_amount = 25.0,
+                auto_topup_threshold = 10.0,
+                auto_topup_payment_id = 'pm_test_123',
+                payment_provider_id = 'cus_test_456'
+            WHERE id = $1"#,
+            user.id
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let provider = payment_providers::create_provider(crate::config::PaymentConfig::Dummy(DummyConfig {
+            amount: Decimal::new(100, 0),
+        }));
+
+        // Run twice
+        let mut conn = pool.acquire().await.unwrap();
+        process_auto_topups(provider.as_ref(), &mut conn, None).await;
+        process_auto_topups(provider.as_ref(), &mut conn, None).await;
+
+        // Should only have one transaction (idempotent via source_id)
+        let count = sqlx::query!(
+            "SELECT COUNT(*) as count FROM credits_transactions WHERE user_id = $1 AND source_id LIKE 'auto_topup_%'",
+            user.id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            count.count.unwrap(),
+            1,
+            "Should only create one transaction per minute (idempotent)"
+        );
     }
 }
 

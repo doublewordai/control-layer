@@ -59,7 +59,8 @@ export function AutoTopupSection({
         });
         toast.success("Auto top-up enabled");
         onSuccess();
-      } catch {
+      } catch (err) {
+        console.error("Failed to enable auto top-up:", err);
         toast.error("Failed to enable auto top-up");
       }
     } else {
@@ -71,7 +72,8 @@ export function AutoTopupSection({
         toast.success("Auto top-up disabled");
         setIsEditing(false);
         onSuccess();
-      } catch {
+      } catch (err) {
+        console.error("Failed to disable auto top-up:", err);
         toast.error("Failed to disable auto top-up");
       }
     }
@@ -101,7 +103,8 @@ export function AutoTopupSection({
       );
       setIsEditing(false);
       onSuccess();
-    } catch {
+    } catch (err) {
+      console.error("Failed to update auto top-up settings:", err);
       toast.error("Failed to update auto top-up settings");
     }
   };

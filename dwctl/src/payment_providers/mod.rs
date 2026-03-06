@@ -90,6 +90,8 @@ pub struct AutoTopupSetupResult {
     pub payment_method_id: String,
     /// Payment provider customer ID (may be newly created)
     pub customer_id: Option<String>,
+    /// The user ID that initiated this session (from `client_reference_id`)
+    pub user_id: Option<String>,
 }
 
 /// Represents a completed payment session
@@ -202,5 +204,12 @@ pub trait PaymentProvider: Send + Sync {
     /// * `amount_cents` - Amount to charge in cents
     /// * `customer_id` - Payment provider customer ID
     /// * `payment_method_id` - Saved payment method ID
-    async fn charge_auto_topup(&self, amount_cents: i64, customer_id: &str, payment_method_id: &str) -> Result<String>;
+    /// * `idempotency_key` - Idempotency key to prevent duplicate charges (e.g. `auto_topup_{user_id}_{minute}`)
+    async fn charge_auto_topup(
+        &self,
+        amount_cents: i64,
+        customer_id: &str,
+        payment_method_id: &str,
+        idempotency_key: &str,
+    ) -> Result<String>;
 }

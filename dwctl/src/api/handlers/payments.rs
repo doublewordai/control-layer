@@ -298,9 +298,18 @@ pub async fn webhook_handler<P: PoolProvider>(
             tracing::trace!("Successfully processed webhook event: {}", event.event_type);
             StatusCode::OK
         }
+        Err(payment_providers::PaymentError::AlreadyProcessed) => {
+            tracing::trace!("Webhook event already processed (idempotent): {}", event.event_type);
+            StatusCode::OK
+        }
+        Err(payment_providers::PaymentError::Database(_)) => {
+            // Transient DB errors: return 500 so the payment provider retries
+            tracing::error!("Transient database error processing webhook event: {}", event.event_type);
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
         Err(e) => {
-            tracing::error!("Failed to process webhook event: {:?}", e);
-            // Always return 200 to prevent provider retries for events we've already seen
+            // Permanent errors (invalid data, etc.): return 200 to prevent infinite retries
+            tracing::error!("Failed to process webhook event (non-retryable): {:?}", e);
             StatusCode::OK
         }
     }
@@ -510,6 +519,23 @@ pub async fn process_auto_topup<P: PoolProvider>(
         },
     };
 
+    // Verify session ownership: the session must belong to the authenticated user
+    if let Some(ref session_user_id) = setup_result.user_id
+        && session_user_id != &user.id.to_string() {
+            tracing::warn!(
+                authenticated_user = %user.id,
+                session_user = %session_user_id,
+                "Auto top-up session ownership mismatch"
+            );
+            return Ok((
+                StatusCode::FORBIDDEN,
+                Json(json!({
+                    "message": "This session does not belong to your account."
+                })),
+            )
+                .into_response());
+        }
+
     // Session validated - enable auto top-up
     let update = UserUpdateDBRequest {
         display_name: None,
@@ -536,12 +562,13 @@ pub async fn process_auto_topup<P: PoolProvider>(
 
     // Save the customer ID if the user didn't have one (first-time Stripe customer)
     if let Some(customer_id) = &setup_result.customer_id
-        && user.payment_provider_id.is_none() {
-            let mut users = Users::new(&mut conn);
-            if let Err(e) = users.set_payment_provider_id_if_empty(user.id, customer_id).await {
-                tracing::warn!(user_id = %user.id, error = %e, "Failed to save customer ID from auto top-up setup");
-            }
+        && user.payment_provider_id.is_none()
+    {
+        let mut users = Users::new(&mut conn);
+        if let Err(e) = users.set_payment_provider_id_if_empty(user.id, customer_id).await {
+            tracing::warn!(user_id = %user.id, error = %e, "Failed to save customer ID from auto top-up setup");
         }
+    }
 
     Ok(Json(json!({
         "message": "Auto top-up enabled successfully",

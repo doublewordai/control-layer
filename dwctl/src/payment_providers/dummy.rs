@@ -181,13 +181,26 @@ impl PaymentProvider for DummyProvider {
         if !session_id.starts_with("dummy_session_") {
             return Err(PaymentError::InvalidData("Invalid dummy session ID format".to_string()));
         }
+        // Extract user ID from session format: dummy_session_{user_id}_{uuid}
+        let user_id = session_id
+            .strip_prefix("dummy_session_")
+            .and_then(|s| s.split('_').next())
+            .map(String::from);
+
         Ok(super::AutoTopupSetupResult {
             payment_method_id: format!("dummy_pm_{}", uuid::Uuid::new_v4()),
             customer_id: Some(format!("dummy_cus_{}", uuid::Uuid::new_v4())),
+            user_id,
         })
     }
 
-    async fn charge_auto_topup(&self, _amount_cents: i64, _customer_id: &str, _payment_method_id: &str) -> Result<String> {
+    async fn charge_auto_topup(
+        &self,
+        _amount_cents: i64,
+        _customer_id: &str,
+        _payment_method_id: &str,
+        _idempotency_key: &str,
+    ) -> Result<String> {
         // Dummy provider always succeeds - return a fake payment intent ID
         Ok(format!("dummy_pi_{}", uuid::Uuid::new_v4()))
     }

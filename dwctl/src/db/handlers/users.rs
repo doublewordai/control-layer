@@ -1096,4 +1096,81 @@ mod tests {
         assert_eq!(result[0].low_balance_threshold, Decimal::from_str("5.0").unwrap());
         assert!(!result[0].low_balance_notification_sent);
     }
+
+    #[sqlx::test]
+    async fn test_users_with_auto_topup_enabled(pool: PgPool) {
+        let mut conn = pool.acquire().await.unwrap();
+
+        // Create a user with auto top-up fully configured
+        let user_id = {
+            let mut repo = Users::new(&mut conn);
+            let user_create = UserCreateDBRequest::from(UserCreate {
+                username: format!("autotopup_{}", Uuid::new_v4().simple()),
+                email: format!("autotopup_{}@example.com", Uuid::new_v4().simple()),
+                display_name: Some("Auto Topup Test".to_string()),
+                avatar_url: None,
+                roles: vec![Role::StandardUser],
+            });
+            repo.create(&user_create).await.unwrap().id
+        };
+
+        // Set up auto top-up fields via direct SQL (simulating the process_auto_topup handler)
+        sqlx::query!(
+            r#"UPDATE users SET
+                auto_topup_amount = 25.0,
+                auto_topup_threshold = 5.0,
+                auto_topup_payment_id = 'pm_test_123',
+                payment_provider_id = 'cus_test_456'
+            WHERE id = $1"#,
+            user_id
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut users = Users::new(&mut conn);
+        let result = users.users_with_auto_topup_enabled().await.unwrap();
+
+        assert_eq!(result.len(), 1, "Should find exactly one auto-topup user");
+        assert_eq!(result[0].id, user_id);
+        assert_eq!(result[0].auto_topup_amount, Decimal::from_str("25.0").unwrap());
+        assert_eq!(result[0].auto_topup_threshold, Decimal::from_str("5.0").unwrap());
+        assert_eq!(result[0].auto_topup_payment_id, "pm_test_123");
+        assert_eq!(result[0].payment_provider_id, "cus_test_456");
+    }
+
+    #[sqlx::test]
+    async fn test_users_with_auto_topup_enabled_excludes_incomplete(pool: PgPool) {
+        let mut conn = pool.acquire().await.unwrap();
+
+        let user_id = {
+            let mut repo = Users::new(&mut conn);
+            let user_create = UserCreateDBRequest::from(UserCreate {
+                username: format!("autotopup_{}", Uuid::new_v4().simple()),
+                email: format!("autotopup_{}@example.com", Uuid::new_v4().simple()),
+                display_name: Some("Incomplete Topup Test".to_string()),
+                avatar_url: None,
+                roles: vec![Role::StandardUser],
+            });
+            repo.create(&user_create).await.unwrap().id
+        };
+
+        // Set only some auto-topup fields (missing payment_id)
+        sqlx::query!(
+            r#"UPDATE users SET
+                auto_topup_amount = 25.0,
+                auto_topup_threshold = 5.0,
+                payment_provider_id = 'cus_test_456'
+            WHERE id = $1"#,
+            user_id
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut users = Users::new(&mut conn);
+        let result = users.users_with_auto_topup_enabled().await.unwrap();
+
+        assert!(result.is_empty(), "Should not include user with missing auto_topup_payment_id");
+    }
 }

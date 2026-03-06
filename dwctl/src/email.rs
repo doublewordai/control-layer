@@ -560,4 +560,48 @@ mod tests {
         assert!(body.contains("problem processing your batch"));
         assert!(body.contains(">100<"));
     }
+
+    #[tokio::test]
+    async fn test_auto_topup_success_email_body() {
+        let config = create_test_config();
+        let email_service = EmailService::new(&config).unwrap();
+
+        let amount = rust_decimal::Decimal::new(2500, 2); // $25.00
+        let threshold = rust_decimal::Decimal::new(500, 2); // $5.00
+        let new_balance = rust_decimal::Decimal::new(3000, 2); // $30.00
+
+        let body = email_service
+            .render_auto_topup_body(
+                &email_service.templates.auto_topup_success,
+                "Alice",
+                &amount,
+                &threshold,
+                Some(&new_balance),
+            )
+            .unwrap();
+
+        assert!(body.contains("Alice"), "Should contain user name");
+        assert!(body.contains("25.00"), "Should contain amount");
+        assert!(body.contains("5.00"), "Should contain threshold");
+        assert!(body.contains("30.00"), "Should contain new balance");
+        assert!(body.contains("cost-management"), "Should contain dashboard link");
+    }
+
+    #[tokio::test]
+    async fn test_auto_topup_failed_email_body() {
+        let config = create_test_config();
+        let email_service = EmailService::new(&config).unwrap();
+
+        let amount = rust_decimal::Decimal::new(2500, 2); // $25.00
+        let threshold = rust_decimal::Decimal::new(500, 2); // $5.00
+
+        let body = email_service
+            .render_auto_topup_body(&email_service.templates.auto_topup_failed, "Bob", &amount, &threshold, None)
+            .unwrap();
+
+        assert!(body.contains("Bob"), "Should contain user name");
+        assert!(body.contains("25.00"), "Should contain amount");
+        assert!(body.contains("5.00"), "Should contain threshold");
+        assert!(body.contains("cost-management"), "Should contain dashboard link");
+    }
 }
