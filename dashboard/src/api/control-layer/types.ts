@@ -150,6 +150,20 @@ export interface TariffDefinition {
   completion_window?: string | null; // Completion window like "24h", "1h" (display as priority in UI)
 }
 
+// Model metadata (enriched model information from provider data)
+export interface ModelMetadata {
+  provider?: string;
+  intelligence_index?: number;
+  context_window?: number;
+  released_at?: string; // ISO date string (YYYY-MM-DD)
+  attribution?: string;
+  extra?: {
+    evaluations?: Record<string, number>;
+    summary?: string; // Short one-line description for catalog views
+    use_cases?: string[]; // e.g., ["Research & analysis", "High volume tasks"]
+  };
+}
+
 // Base model types
 export interface Model {
   id: string;
@@ -179,6 +193,7 @@ export interface Model {
   open_responses_adapter?: boolean; // Enable adapter that converts /v1/responses to /v1/chat/completions
   traffic_routing_rules?: TrafficRoutingRule[] | null;
   allowed_batch_completion_windows?: string[] | null;
+  metadata?: ModelMetadata | null;
 }
 
 // Model creation types - discriminated union with "type" field
@@ -310,10 +325,34 @@ export interface ApiKeyCreateResponse extends ApiKey {
 // /admin/api/v1/groups?include=users,models will return user ids and model ids
 // in each element of the groups response. Note that this is only the id; and
 // we need to make another query for the actual data.
-// ModelsInclude: comma-separated combination of: groups, metrics, status, endpoints, pricing, components
+// ModelsInclude: comma-separated combination of: groups, metrics, status, endpoints, pricing, components, facets
 export type ModelsInclude = string;
 export type GroupsInclude = "users" | "models" | "users,models";
 export type UsersInclude = "groups";
+
+// Sort field for model listing
+export type ModelSortField =
+  | "created_at"
+  | "alias"
+  | "intelligence_index"
+  | "released_at"
+  | "context_window"
+  | "provider"
+  | "price_from";
+
+export type SortDirection = "asc" | "desc";
+
+// Facets: distinct values for filter dropdowns
+export interface ModelFacets {
+  providers: string[];
+  capabilities: string[];
+  model_types: string[];
+}
+
+// Model list response (extends PaginatedResponse with optional facets)
+export interface ModelListResponse extends PaginatedResponse<Model> {
+  facets?: ModelFacets;
+}
 
 // List endpoint query parameters
 export interface ModelsQuery {
@@ -325,6 +364,11 @@ export interface ModelsQuery {
   accessible?: boolean; // Filter to only models the current user can access
   search?: string; // Search query to filter models by alias or model_name
   is_composite?: boolean; // Filter by composite/virtual model status (true = virtual, false = hosted)
+  provider?: string; // Filter by provider name (case-insensitive exact match)
+  model_type?: ModelType; // Filter by model type (CHAT, EMBEDDINGS, RERANKER)
+  capability?: string; // Filter to models with this capability
+  sort?: ModelSortField; // Sort field (default: created_at)
+  sort_direction?: SortDirection; // Sort direction (default depends on sort field)
 }
 
 export interface EndpointsQuery {
@@ -412,6 +456,7 @@ export interface ModelUpdateRequest {
   open_responses_adapter?: boolean | null;
   traffic_routing_rules?: TrafficRoutingRule[] | null;
   allowed_batch_completion_windows?: string[] | null;
+  metadata?: ModelMetadata | null;
 }
 
 // Endpoint-specific types

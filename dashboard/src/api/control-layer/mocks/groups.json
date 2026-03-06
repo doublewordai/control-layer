@@ -1,5 +1,14 @@
 [
   {
+    "id": "00000000-0000-0000-0000-000000000000",
+    "name": "Everyone",
+    "description": "Default group that includes all users",
+    "created_by": "550e8400-e29b-41d4-a716-446655440001",
+    "created_at": "2025-01-01T00:00:00Z",
+    "updated_at": "2025-01-01T00:00:00Z",
+    "source": "native"
+  },
+  {
     "id": "550e8400-e29b-41d4-a716-446655441001",
     "name": "Engineering",
     "description": "Core engineering team with full model access",

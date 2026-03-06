@@ -79,6 +79,16 @@ const Endpoints = lazy(() =>
     default: m.Endpoints,
   })),
 );
+const ModelCatalog = lazy(() =>
+  import("./components/features/models").then((m) => ({
+    default: m.ModelCatalog,
+  })),
+);
+const ModelDetail = lazy(() =>
+  import("./components/features/models").then((m) => ({
+    default: m.ModelDetail,
+  })),
+);
 const Models = lazy(() =>
   import("./components/features/models").then((m) => ({ default: m.Models })),
 );
@@ -381,7 +391,31 @@ function AppRoutes() {
             <AppLayout>
               <ProtectedRoute path="/models">
                 <Suspense fallback={<RouteLoader />}>
+                  <ModelCatalog />
+                </Suspense>
+              </ProtectedRoute>
+            </AppLayout>
+          }
+        />
+        <Route
+          path="/models/manage"
+          element={
+            <AppLayout>
+              <ProtectedRoute path="/models/manage">
+                <Suspense fallback={<RouteLoader />}>
                   <Models />
+                </Suspense>
+              </ProtectedRoute>
+            </AppLayout>
+          }
+        />
+        <Route
+          path="/models/manage/:modelId"
+          element={
+            <AppLayout>
+              <ProtectedRoute path="/models/manage">
+                <Suspense fallback={<RouteLoader />}>
+                  <ModelInfo />
                 </Suspense>
               </ProtectedRoute>
             </AppLayout>
@@ -391,9 +425,9 @@ function AppRoutes() {
           path="/models/:modelId"
           element={
             <AppLayout>
-              <ProtectedRoute path="/models/:modelId">
+              <ProtectedRoute path="/models">
                 <Suspense fallback={<RouteLoader />}>
-                  <ModelInfo />
+                  <ModelDetail />
                 </Suspense>
               </ProtectedRoute>
             </AppLayout>
