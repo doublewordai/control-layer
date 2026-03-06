@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.15.1](https://github.com/doublewordai/control-layer/compare/v8.15.0...v8.15.1) (2026-03-06)
+
+
+### Bug Fixes
+
+* cookie sync + file owner balance check ([#810](https://github.com/doublewordai/control-layer/issues/810)) ([da4a88e](https://github.com/doublewordai/control-layer/commit/da4a88e204cca9cc03f5ff01b819857694c160c4))
+
 ## [8.15.0](https://github.com/doublewordai/control-layer/compare/v8.14.0...v8.15.0) (2026-03-06)
 
 
