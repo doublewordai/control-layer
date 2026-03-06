@@ -142,6 +142,15 @@ pub mod resource {
             Resource::Webhooks
         }
     }
+
+    #[derive(Default)]
+    pub struct Organizations;
+
+    impl From<Organizations> for Resource {
+        fn from(_: Organizations) -> Resource {
+            Resource::Organizations
+        }
+    }
 }
 
 pub mod operation {
@@ -316,6 +325,9 @@ pub fn role_has_permission(role: &Role, resource: Resource, operation: Operation
                     | (Resource::Webhooks, Operation::ReadOwn)    // Can read own webhooks
                     | (Resource::Webhooks, Operation::UpdateOwn)  // Can update own webhooks
                     | (Resource::Webhooks, Operation::DeleteOwn) // Can delete own webhooks
+                    | (Resource::Organizations, Operation::CreateOwn) // Can create own organizations
+                    | (Resource::Organizations, Operation::ReadOwn)   // Can read own organizations
+                    | (Resource::Organizations, Operation::UpdateOwn) // Can manage orgs they belong to
             )
         }
         Role::RequestViewer => {
@@ -392,6 +404,31 @@ generate_permission_helpers!(create, Operation::CreateAll, Operation::CreateOwn)
 generate_permission_helpers!(update, Operation::UpdateAll, Operation::UpdateOwn);
 generate_permission_helpers!(delete, Operation::DeleteAll, Operation::DeleteOwn);
 
+/// Check if the current user can manage resources belonging to an organization.
+/// Returns true if target_user_id is an org and current_user is an owner/admin of it.
+pub async fn can_manage_org_resource(
+    current_user: &CurrentUser,
+    target_user_id: UserId,
+    db: &mut sqlx::PgConnection,
+) -> std::result::Result<bool, crate::db::errors::DbError> {
+    let mut repo = crate::db::handlers::Organizations::new(db);
+    match repo.get_user_org_role(current_user.id, target_user_id).await? {
+        Some(role) if role == "owner" || role == "admin" => Ok(true),
+        _ => Ok(false),
+    }
+}
+
+/// Check if the current user is a member of the organization (any role).
+/// Returns true if target_user_id is an org and current_user has any membership role.
+pub async fn is_org_member(
+    current_user: &CurrentUser,
+    target_user_id: UserId,
+    db: &mut sqlx::PgConnection,
+) -> std::result::Result<bool, crate::db::errors::DbError> {
+    let mut repo = crate::db::handlers::Organizations::new(db);
+    Ok(repo.get_user_org_role(current_user.id, target_user_id).await?.is_some())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -407,6 +444,8 @@ mod tests {
             display_name: None,
             avatar_url: None,
             payment_provider_id: None,
+            organizations: vec![],
+            active_organization: None,
         }
     }
 
@@ -612,5 +651,173 @@ mod tests {
         // StandardUser should NOT have access to System resource
         assert!(!has_permission(&standard_user, Resource::System, Operation::ReadAll));
         assert!(!has_permission(&standard_user, Resource::System, Operation::ReadOwn));
+    }
+
+    // ── Database-backed org permission tests ──────────────────────────────
+
+    use crate::api::models::users::UserCreate;
+    use crate::db::handlers::{Organizations, Repository, Users};
+    use crate::db::models::{organizations::OrganizationCreateDBRequest, users::UserCreateDBRequest};
+    use sqlx::PgPool;
+
+    /// Helper: create an individual user in the database and return a CurrentUser
+    async fn create_db_user(pool: &PgPool, username: &str, email: &str) -> CurrentUser {
+        let mut conn = pool.acquire().await.unwrap();
+        let mut repo = Users::new(&mut conn);
+        let user = repo
+            .create(&UserCreateDBRequest::from(UserCreate {
+                username: username.to_string(),
+                email: email.to_string(),
+                display_name: None,
+                avatar_url: None,
+                roles: vec![Role::StandardUser],
+            }))
+            .await
+            .unwrap();
+        let user: crate::db::models::users::UserDBResponse = user;
+        CurrentUser {
+            id: user.id,
+            username: user.username,
+            email: user.email,
+            is_admin: false,
+            roles: vec![Role::StandardUser],
+            display_name: None,
+            avatar_url: None,
+            payment_provider_id: None,
+            organizations: vec![],
+            active_organization: None,
+        }
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_is_org_member_returns_true_for_owner(pool: PgPool) {
+        let alice = create_db_user(&pool, "alice", "alice@example.com").await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut orgs = Organizations::new(&mut conn);
+        let org = orgs
+            .create(&OrganizationCreateDBRequest {
+                name: "acme".to_string(),
+                email: "org@acme.com".to_string(),
+                display_name: None,
+                avatar_url: None,
+                created_by: alice.id,
+            })
+            .await
+            .unwrap();
+
+        let mut conn = pool.acquire().await.unwrap();
+        let result = is_org_member(&alice, org.id, &mut conn).await.unwrap();
+        assert!(result, "Owner should be recognized as org member");
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_is_org_member_returns_true_for_member(pool: PgPool) {
+        let alice = create_db_user(&pool, "alice", "alice@example.com").await;
+        let bob = create_db_user(&pool, "bob", "bob@example.com").await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut orgs = Organizations::new(&mut conn);
+        let org = orgs
+            .create(&OrganizationCreateDBRequest {
+                name: "acme".to_string(),
+                email: "org@acme.com".to_string(),
+                display_name: None,
+                avatar_url: None,
+                created_by: alice.id,
+            })
+            .await
+            .unwrap();
+        orgs.add_member(org.id, bob.id, "member").await.unwrap();
+
+        let mut conn = pool.acquire().await.unwrap();
+        let result = is_org_member(&bob, org.id, &mut conn).await.unwrap();
+        assert!(result, "Member should be recognized as org member");
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_is_org_member_returns_true_for_admin(pool: PgPool) {
+        let alice = create_db_user(&pool, "alice", "alice@example.com").await;
+        let charlie = create_db_user(&pool, "charlie", "charlie@example.com").await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut orgs = Organizations::new(&mut conn);
+        let org = orgs
+            .create(&OrganizationCreateDBRequest {
+                name: "acme".to_string(),
+                email: "org@acme.com".to_string(),
+                display_name: None,
+                avatar_url: None,
+                created_by: alice.id,
+            })
+            .await
+            .unwrap();
+        orgs.add_member(org.id, charlie.id, "admin").await.unwrap();
+
+        let mut conn = pool.acquire().await.unwrap();
+        let result = is_org_member(&charlie, org.id, &mut conn).await.unwrap();
+        assert!(result, "Admin should be recognized as org member");
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_is_org_member_returns_false_for_non_member(pool: PgPool) {
+        let alice = create_db_user(&pool, "alice", "alice@example.com").await;
+        let outsider = create_db_user(&pool, "outsider", "outsider@example.com").await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut orgs = Organizations::new(&mut conn);
+        let org = orgs
+            .create(&OrganizationCreateDBRequest {
+                name: "acme".to_string(),
+                email: "org@acme.com".to_string(),
+                display_name: None,
+                avatar_url: None,
+                created_by: alice.id,
+            })
+            .await
+            .unwrap();
+
+        let mut conn = pool.acquire().await.unwrap();
+        let result = is_org_member(&outsider, org.id, &mut conn).await.unwrap();
+        assert!(!result, "Non-member should not be recognized as org member");
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_can_manage_org_resource_owner_and_admin_only(pool: PgPool) {
+        let alice = create_db_user(&pool, "alice", "alice@example.com").await;
+        let bob = create_db_user(&pool, "bob", "bob@example.com").await;
+        let charlie = create_db_user(&pool, "charlie", "charlie@example.com").await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut orgs = Organizations::new(&mut conn);
+        let org = orgs
+            .create(&OrganizationCreateDBRequest {
+                name: "acme".to_string(),
+                email: "org@acme.com".to_string(),
+                display_name: None,
+                avatar_url: None,
+                created_by: alice.id, // alice = owner
+            })
+            .await
+            .unwrap();
+        orgs.add_member(org.id, bob.id, "member").await.unwrap();
+        orgs.add_member(org.id, charlie.id, "admin").await.unwrap();
+
+        // Owner can manage
+        let mut conn = pool.acquire().await.unwrap();
+        assert!(can_manage_org_resource(&alice, org.id, &mut conn).await.unwrap());
+
+        // Admin can manage
+        let mut conn = pool.acquire().await.unwrap();
+        assert!(can_manage_org_resource(&charlie, org.id, &mut conn).await.unwrap());
+
+        // Member cannot manage
+        let mut conn = pool.acquire().await.unwrap();
+        assert!(!can_manage_org_resource(&bob, org.id, &mut conn).await.unwrap());
     }
 }

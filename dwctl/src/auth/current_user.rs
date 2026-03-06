@@ -76,6 +76,8 @@ async fn try_jwt_session_auth(
                 display_name: user.display_name,
                 avatar_url: user.avatar_url,
                 payment_provider_id: user.payment_provider_id,
+                organizations: vec![],
+                active_organization: None,
             }));
         }
     }
@@ -188,6 +190,8 @@ async fn try_proxy_header_auth<P: sqlx_pool_router::PoolProvider + Clone + Send 
                     display_name: user.display_name,
                     avatar_url: user.avatar_url,
                     payment_provider_id: user.payment_provider_id,
+                    organizations: vec![],
+                    active_organization: None,
                 })
             }
             Err(e) => return Some(Err(Error::Database(e))),
@@ -207,6 +211,8 @@ async fn try_proxy_header_auth<P: sqlx_pool_router::PoolProvider + Clone + Send 
                     display_name: user.display_name,
                     avatar_url: user.avatar_url,
                     payment_provider_id: user.payment_provider_id,
+                    organizations: vec![],
+                    active_organization: None,
                 })
             }
             Ok(None) => {
@@ -279,7 +285,7 @@ async fn try_api_key_auth(parts: &axum::http::request::Parts, db: &PgPool) -> Op
         SELECT ak.user_id, ak.purpose, u.username, u.email, u.is_admin, u.display_name, u.avatar_url, u.payment_provider_id
         FROM api_keys ak
         INNER JOIN users u ON ak.user_id = u.id
-        WHERE ak.secret = $1
+        WHERE ak.secret = $1 AND ak.is_deleted = false
         "#,
         api_key
     )
@@ -354,6 +360,8 @@ async fn try_api_key_auth(parts: &axum::http::request::Parts, db: &PgPool) -> Op
         display_name: api_key_data.display_name,
         avatar_url: api_key_data.avatar_url,
         payment_provider_id: api_key_data.payment_provider_id,
+        organizations: vec![],
+        active_organization: None,
     }))
 }
 
@@ -380,6 +388,80 @@ impl FromRequestParts<AppState> for HasApiKey {
     }
 }
 
+/// The HTTP header name used to specify the active organization context.
+/// Clients (browser via localStorage, CLI via flag) send this header to indicate
+/// which organization the request should operate in.
+pub const ORGANIZATION_HEADER: &str = "x-organization-id";
+
+/// Populate organization context on an authenticated user.
+/// Reads the `X-Organization-Id` header and queries the user's org memberships.
+async fn populate_org_context(user: &mut CurrentUser, parts: &Parts, db: &PgPool) {
+    // Query all organizations the user belongs to
+    let mut conn = match db.acquire().await {
+        Ok(conn) => conn,
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to acquire connection for org context");
+            return;
+        }
+    };
+
+    let mut org_repo = crate::db::handlers::Organizations::new(&mut conn);
+
+    // Get the user's organization memberships
+    match org_repo.list_user_organizations(user.id).await {
+        Ok(memberships) => {
+            user.organizations = memberships
+                .into_iter()
+                .map(|m| crate::api::models::users::UserOrganizationContext {
+                    id: m.organization_id,
+                    name: String::new(), // Will be populated below
+                    role: m.role,
+                })
+                .collect();
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to load user organizations");
+            return;
+        }
+    }
+
+    // Populate organization names by fetching org user records
+    if !user.organizations.is_empty() {
+        let org_ids: Vec<uuid::Uuid> = user.organizations.iter().map(|o| o.id).collect();
+        match sqlx::query!(r#"SELECT id, username FROM users WHERE id = ANY($1)"#, &org_ids)
+            .fetch_all(&mut *conn)
+            .await
+        {
+            Ok(rows) => {
+                for org in &mut user.organizations {
+                    if let Some(row) = rows.iter().find(|r| r.id == org.id) {
+                        org.name = row.username.clone();
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to load organization names");
+            }
+        }
+    }
+
+    // Read X-Organization-Id header for active organization
+    if let Some(header_value) = parts.headers.get(ORGANIZATION_HEADER)
+        && let Ok(value_str) = header_value.to_str()
+        && let Ok(org_id) = value_str.parse::<uuid::Uuid>()
+    {
+        // Verify the user is a member of this organization
+        if user.organizations.iter().any(|o| o.id == org_id) {
+            user.active_organization = Some(org_id);
+        } else {
+            tracing::debug!(
+                org_id = %org_id,
+                "X-Organization-Id header references org user is not a member of"
+            );
+        }
+    }
+}
+
 impl<P: sqlx_pool_router::PoolProvider + Clone + Send + Sync> FromRequestParts<crate::AppState<P>> for CurrentUser {
     type Rejection = Error;
 
@@ -400,9 +482,10 @@ impl<P: sqlx_pool_router::PoolProvider + Clone + Send + Sync> FromRequestParts<c
 
         // Try API key authentication first (most specific)
         match try_api_key_auth(parts, state.db.read()).await {
-            Some(Ok(user)) => {
+            Some(Ok(mut user)) => {
                 debug!("Authentication successful via API key");
                 trace!("Authenticated user: {}", user.id);
+                populate_org_context(&mut user, parts, state.db.read()).await;
                 return Ok(user);
             }
             Some(Err(e)) => {
@@ -418,9 +501,10 @@ impl<P: sqlx_pool_router::PoolProvider + Clone + Send + Sync> FromRequestParts<c
         // Native authentication (JWT sessions)
         if state.config.auth.native.enabled {
             match try_jwt_session_auth(parts, &state.config, state.db.read()).await {
-                Some(Ok(user)) => {
+                Some(Ok(mut user)) => {
                     debug!("Authentication successful via JWT session");
                     trace!("Authenticated user: {}", user.id);
+                    populate_org_context(&mut user, parts, state.db.read()).await;
                     return Ok(user);
                 }
                 Some(Err(e)) => {
@@ -437,9 +521,10 @@ impl<P: sqlx_pool_router::PoolProvider + Clone + Send + Sync> FromRequestParts<c
         // Fall back to proxy header authentication
         if state.config.auth.proxy_header.enabled {
             match try_proxy_header_auth(parts, state).await {
-                Some(Ok(user)) => {
+                Some(Ok(mut user)) => {
                     debug!("Authentication successful via proxy header");
                     trace!("Authenticated user: {}", user.id);
+                    populate_org_context(&mut user, parts, state.db.read()).await;
                     return Ok(user);
                 }
                 Some(Err(e)) => {
@@ -1009,6 +1094,8 @@ mod tests {
             display_name: None,
             avatar_url: None,
             payment_provider_id: None,
+            organizations: vec![],
+            active_organization: None,
         };
 
         let result = require_admin(admin_user);
@@ -1024,6 +1111,8 @@ mod tests {
             display_name: None,
             avatar_url: None,
             payment_provider_id: None,
+            organizations: vec![],
+            active_organization: None,
         };
 
         let result = require_admin(regular_user);
@@ -1052,6 +1141,8 @@ mod tests {
             display_name: user.display_name.clone(),
             avatar_url: user.avatar_url.clone(),
             payment_provider_id: None,
+            organizations: vec![],
+            active_organization: None,
         };
         let jwt_token = session::create_session_token(&current_user, &config).unwrap();
 
@@ -1120,6 +1211,8 @@ mod tests {
             display_name: user.display_name.clone(),
             avatar_url: user.avatar_url.clone(),
             payment_provider_id: None,
+            organizations: vec![],
+            active_organization: None,
         };
         let jwt_token = session::create_session_token(&current_user, &config).unwrap();
 
@@ -1264,5 +1357,150 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(transactions.len(), 1, "Should still have exactly one transaction");
+    }
+
+    // ── X-Organization-Id header tests ───────────────────────────────────
+
+    #[sqlx::test]
+    async fn test_org_context_from_header(pool: PgPool) {
+        use crate::db::handlers::Organizations;
+        use crate::db::models::organizations::OrganizationCreateDBRequest;
+
+        let config = create_test_config();
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
+
+        // Create a user
+        let test_user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+        let external_user_id = test_user.external_user_id.as_ref().unwrap();
+
+        // Create an org with this user as owner
+        let mut conn = pool.acquire().await.unwrap();
+        let mut orgs = Organizations::new(&mut conn);
+        let org = orgs
+            .create(&OrganizationCreateDBRequest {
+                name: "test-org-header".to_string(),
+                email: "org@example.com".to_string(),
+                display_name: Some("Test Org".to_string()),
+                avatar_url: None,
+                created_by: test_user.id,
+            })
+            .await
+            .unwrap();
+        drop(conn);
+
+        // Request with X-Organization-Id header set to the org
+        let request = axum::http::Request::builder()
+            .uri("http://localhost/test")
+            .header("x-doubleword-user", external_user_id)
+            .header("x-doubleword-email", &test_user.email)
+            .header(super::ORGANIZATION_HEADER, org.id.to_string())
+            .body(())
+            .unwrap();
+        let (mut parts, _body) = request.into_parts();
+
+        let result = CurrentUser::from_request_parts(&mut parts, &state).await;
+        assert!(result.is_ok());
+
+        let current_user = result.unwrap();
+        assert_eq!(current_user.active_organization, Some(org.id));
+        assert!(!current_user.organizations.is_empty());
+        assert!(current_user.organizations.iter().any(|o| o.id == org.id));
+    }
+
+    #[sqlx::test]
+    async fn test_org_context_invalid_org_id_ignored(pool: PgPool) {
+        let config = create_test_config();
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
+
+        let test_user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+        let external_user_id = test_user.external_user_id.as_ref().unwrap();
+
+        // Request with X-Organization-Id header set to a random UUID (not a member)
+        let fake_org_id = uuid::Uuid::new_v4();
+        let request = axum::http::Request::builder()
+            .uri("http://localhost/test")
+            .header("x-doubleword-user", external_user_id)
+            .header("x-doubleword-email", &test_user.email)
+            .header(super::ORGANIZATION_HEADER, fake_org_id.to_string())
+            .body(())
+            .unwrap();
+        let (mut parts, _body) = request.into_parts();
+
+        let result = CurrentUser::from_request_parts(&mut parts, &state).await;
+        assert!(result.is_ok());
+
+        let current_user = result.unwrap();
+        // active_organization should be None because user is not a member
+        assert_eq!(current_user.active_organization, None);
+    }
+
+    #[sqlx::test]
+    async fn test_org_context_no_header_means_personal(pool: PgPool) {
+        use crate::db::handlers::Organizations;
+        use crate::db::models::organizations::OrganizationCreateDBRequest;
+
+        let config = create_test_config();
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
+
+        let test_user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+        let external_user_id = test_user.external_user_id.as_ref().unwrap();
+
+        // Create an org (user is a member)
+        let mut conn = pool.acquire().await.unwrap();
+        let mut orgs = Organizations::new(&mut conn);
+        orgs.create(&OrganizationCreateDBRequest {
+            name: "test-org-no-header".to_string(),
+            email: "org@example.com".to_string(),
+            display_name: None,
+            avatar_url: None,
+            created_by: test_user.id,
+        })
+        .await
+        .unwrap();
+        drop(conn);
+
+        // Request WITHOUT X-Organization-Id header
+        let request = axum::http::Request::builder()
+            .uri("http://localhost/test")
+            .header("x-doubleword-user", external_user_id)
+            .header("x-doubleword-email", &test_user.email)
+            .body(())
+            .unwrap();
+        let (mut parts, _body) = request.into_parts();
+
+        let result = CurrentUser::from_request_parts(&mut parts, &state).await;
+        assert!(result.is_ok());
+
+        let current_user = result.unwrap();
+        // active_organization should be None (personal context)
+        assert_eq!(current_user.active_organization, None);
+        // But organizations list should still contain the org
+        assert_eq!(current_user.organizations.len(), 1);
+    }
+
+    #[sqlx::test]
+    async fn test_org_context_malformed_header_ignored(pool: PgPool) {
+        let config = create_test_config();
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
+
+        let test_user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+        let external_user_id = test_user.external_user_id.as_ref().unwrap();
+
+        // Request with malformed X-Organization-Id header (not a UUID)
+        let request = axum::http::Request::builder()
+            .uri("http://localhost/test")
+            .header("x-doubleword-user", external_user_id)
+            .header("x-doubleword-email", &test_user.email)
+            .header(super::ORGANIZATION_HEADER, "not-a-uuid")
+            .body(())
+            .unwrap();
+        let (mut parts, _body) = request.into_parts();
+
+        let result = CurrentUser::from_request_parts(&mut parts, &state).await;
+        assert!(result.is_ok());
+
+        let current_user = result.unwrap();
+        // Should silently ignore the malformed header
+        assert_eq!(current_user.active_organization, None);
     }
 }

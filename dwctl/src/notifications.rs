@@ -558,6 +558,7 @@ async fn process_auto_topups(
             source_id,
             description: Some("Automatic top-up".to_string()),
             fusillade_batch_id: None,
+            api_key_id: None,
         };
 
         let mut credits = Credits::new(&mut *conn);
@@ -686,6 +687,7 @@ mod tests {
                     source_id: "seed_balance".to_string(),
                     description: Some("Test seed".to_string()),
                     fusillade_batch_id: None,
+                    api_key_id: None,
                 })
                 .await
                 .unwrap();

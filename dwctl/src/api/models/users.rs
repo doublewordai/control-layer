@@ -130,6 +130,11 @@ pub struct UserResponse {
     pub auto_topup_threshold: Option<f32>,
     /// Whether the user has a payment method set up for auto top-up.
     pub has_auto_topup_payment_method: bool,
+    /// User type: 'individual' or 'organization'
+    pub user_type: String,
+    /// Organizations this user belongs to (only included if `include=organizations` is specified)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub organizations: Option<Vec<super::organizations::OrganizationSummary>>,
 }
 
 /// Query parameters for listing users
@@ -169,6 +174,20 @@ pub struct CurrentUser {
     pub avatar_url: Option<String>,
     /// ID in external payment provider
     pub payment_provider_id: Option<String>,
+    /// Organizations the user belongs to
+    pub organizations: Vec<UserOrganizationContext>,
+    /// Active organization ID (from X-Organization-Id header)
+    #[schema(value_type = Option<String>, format = "uuid")]
+    pub active_organization: Option<UserId>,
+}
+
+/// Context about a user's organization membership
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct UserOrganizationContext {
+    #[schema(value_type = String, format = "uuid")]
+    pub id: UserId,
+    pub name: String,
+    pub role: String,
 }
 
 impl CurrentUser {
@@ -201,6 +220,8 @@ impl From<UserDBResponse> for UserResponse {
             auto_topup_amount: db.auto_topup_amount,
             auto_topup_threshold: db.auto_topup_threshold,
             has_auto_topup_payment_method: db.payment_provider_id.as_ref().is_some_and(|s| !s.is_empty()),
+            user_type: db.user_type,
+            organizations: None,
         }
     }
 }
@@ -230,6 +251,8 @@ impl From<UserDBResponse> for CurrentUser {
             display_name: db.display_name,
             avatar_url: db.avatar_url,
             payment_provider_id: db.payment_provider_id,
+            organizations: vec![],
+            active_organization: None,
         }
     }
 }

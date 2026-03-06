@@ -93,4 +93,6 @@ pub struct UserDBResponse {
     pub auto_topup_amount: Option<f32>,
     /// Auto top-up threshold. When balance drops below this, auto top-up triggers.
     pub auto_topup_threshold: Option<f32>,
+    /// User type: 'individual' or 'organization'
+    pub user_type: String,
 }

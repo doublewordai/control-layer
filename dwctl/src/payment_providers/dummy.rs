@@ -146,6 +146,7 @@ impl PaymentProvider for DummyProvider {
             source_id: session_id.to_string(),
             description: Some(description),
             fusillade_batch_id: None,
+            api_key_id: None,
         };
 
         let mut credits = Credits::new(&mut conn);
@@ -241,6 +242,8 @@ mod tests {
             payment_provider_id: None,
             is_admin: false,
             avatar_url: None,
+            organizations: vec![],
+            active_organization: None,
         }
     }
 

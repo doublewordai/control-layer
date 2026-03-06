@@ -24,11 +24,26 @@ pub struct UserFilter {
     pub skip: i64,
     pub limit: i64,
     pub search: Option<String>, // Case-insensitive substring search on display_name, username, and email
+    pub user_type: String,
 }
 
 impl UserFilter {
     pub fn new(skip: i64, limit: i64) -> Self {
-        Self { skip, limit, search: None }
+        Self {
+            skip,
+            limit,
+            search: None,
+            user_type: "individual".to_string(),
+        }
+    }
+
+    pub fn organizations(skip: i64, limit: i64) -> Self {
+        Self {
+            skip,
+            limit,
+            search: None,
+            user_type: "organization".to_string(),
+        }
     }
 
     pub fn with_search(mut self, search: String) -> Self {
@@ -88,6 +103,7 @@ struct User {
     pub low_balance_threshold: Option<f32>,
     pub auto_topup_amount: Option<f32>,
     pub auto_topup_threshold: Option<f32>,
+    pub user_type: String,
 }
 
 pub struct Users<'c> {
@@ -116,6 +132,7 @@ impl From<(Vec<Role>, User)> for UserDBResponse {
             low_balance_threshold: user.low_balance_threshold,
             auto_topup_amount: user.auto_topup_amount,
             auto_topup_threshold: user.auto_topup_threshold,
+            user_type: user.user_type,
         }
     }
 }
@@ -172,8 +189,12 @@ impl<'c> Repository for Users<'c> {
         // These keys must exist before the user's first request to ensure immediate access
         // Realtime keys are NOT pre-created - users create them explicitly via API and can tolerate activation delay
         let mut api_keys_repo = ApiKeys::new(&mut tx);
-        api_keys_repo.get_or_create_hidden_key(user_id, ApiKeyPurpose::Batch).await?;
-        api_keys_repo.get_or_create_hidden_key(user_id, ApiKeyPurpose::Playground).await?;
+        api_keys_repo
+            .get_or_create_hidden_key(user_id, ApiKeyPurpose::Batch, user_id)
+            .await?;
+        api_keys_repo
+            .get_or_create_hidden_key(user_id, ApiKeyPurpose::Playground, user_id)
+            .await?;
 
         tx.commit().await?;
 
@@ -206,11 +227,12 @@ impl<'c> Repository for Users<'c> {
                 u.low_balance_threshold,
                 u.auto_topup_amount,
                 u.auto_topup_threshold,
+                u.user_type,
                 ARRAY_AGG(ur.role) FILTER (WHERE ur.role IS NOT NULL) as "roles: Vec<Role>"
             FROM users u
             LEFT JOIN user_roles ur ON ur.user_id = u.id
             WHERE u.id = $1 AND u.id != '00000000-0000-0000-0000-000000000000' AND u.is_deleted = false
-            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id, u.is_deleted, u.is_internal, u.batch_notifications_enabled, u.first_batch_email_sent, u.low_balance_notification_sent, u.low_balance_threshold, u.auto_topup_amount, u.auto_topup_threshold
+            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id, u.is_deleted, u.is_internal, u.batch_notifications_enabled, u.first_batch_email_sent, u.low_balance_notification_sent, u.low_balance_threshold, u.auto_topup_amount, u.auto_topup_threshold, u.user_type
             "#,
             id
         )
@@ -240,6 +262,7 @@ impl<'c> Repository for Users<'c> {
                 low_balance_threshold: row.low_balance_threshold,
                 auto_topup_amount: row.auto_topup_amount,
                 auto_topup_threshold: row.auto_topup_threshold,
+                user_type: row.user_type,
             };
 
             let roles = row.roles.unwrap_or_default();
@@ -281,11 +304,12 @@ impl<'c> Repository for Users<'c> {
                 u.low_balance_threshold,
                 u.auto_topup_amount,
                 u.auto_topup_threshold,
+                u.user_type,
                 ARRAY_AGG(ur.role) FILTER (WHERE ur.role IS NOT NULL) as "roles: Vec<Role>"
             FROM users u
             LEFT JOIN user_roles ur ON ur.user_id = u.id
             WHERE u.id = ANY($1) AND u.id != '00000000-0000-0000-0000-000000000000' AND u.is_deleted = false
-            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id, u.is_deleted, u.is_internal, u.batch_notifications_enabled, u.first_batch_email_sent, u.low_balance_notification_sent, u.low_balance_threshold, u.auto_topup_amount, u.auto_topup_threshold
+            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id, u.is_deleted, u.is_internal, u.batch_notifications_enabled, u.first_batch_email_sent, u.low_balance_notification_sent, u.low_balance_threshold, u.auto_topup_amount, u.auto_topup_threshold, u.user_type
             "#,
             ids.as_slice()
         )
@@ -317,6 +341,7 @@ impl<'c> Repository for Users<'c> {
                 low_balance_threshold: row.low_balance_threshold,
                 auto_topup_amount: row.auto_topup_amount,
                 auto_topup_threshold: row.auto_topup_threshold,
+                user_type: row.user_type,
             };
 
             let roles = row.roles.unwrap_or_default();
@@ -330,7 +355,10 @@ impl<'c> Repository for Users<'c> {
     async fn list(&mut self, filter: &Self::Filter) -> Result<Vec<Self::Response>> {
         use sqlx::QueryBuilder;
 
-        let mut query = QueryBuilder::new("SELECT * FROM users WHERE id != '00000000-0000-0000-0000-000000000000' AND is_deleted = false");
+        let mut query = QueryBuilder::new(
+            "SELECT * FROM users WHERE id != '00000000-0000-0000-0000-000000000000' AND is_deleted = false AND user_type = ",
+        );
+        query.push_bind(filter.user_type.clone());
 
         // Add search filter if specified (case-insensitive substring match on display_name, username, or email)
         if let Some(ref search) = filter.search {
@@ -497,8 +525,10 @@ impl<'c> Users<'c> {
     pub async fn count(&mut self, filter: &UserFilter) -> Result<i64> {
         use sqlx::QueryBuilder;
 
-        let mut query =
-            QueryBuilder::new("SELECT COUNT(*) FROM users WHERE id != '00000000-0000-0000-0000-000000000000' AND is_deleted = false");
+        let mut query = QueryBuilder::new(
+            "SELECT COUNT(*) FROM users WHERE id != '00000000-0000-0000-0000-000000000000' AND is_deleted = false AND user_type = ",
+        );
+        query.push_bind(filter.user_type.clone());
 
         // Add search filter if specified (case-insensitive substring match on display_name, username, or email)
         if let Some(ref search) = filter.search {
@@ -766,6 +796,41 @@ impl<'c> Users<'c> {
         .execute(&mut *self.db)
         .await?;
         Ok(())
+    }
+
+    /// Clear recovered users and fetch low-balance users in one round-trip.
+    /// Uses the cached checkpoint balance — good enough for notification thresholds.
+    #[instrument(skip(self), err)]
+    pub async fn poll_low_balance_users(&mut self) -> Result<Vec<LowBalanceUser>> {
+        let rows = sqlx::query_as!(
+            LowBalanceUser,
+            r#"
+            WITH clear_recovered AS (
+                UPDATE users u
+                SET low_balance_notification_sent = false
+                FROM user_balance_checkpoints c
+                WHERE u.id = c.user_id
+                  AND u.low_balance_notification_sent = true
+                  AND u.low_balance_threshold IS NOT NULL
+                  AND c.balance >= u.low_balance_threshold
+            )
+            SELECT u.id, u.email, u.username, u.display_name,
+                   u.low_balance_threshold::decimal(20, 9) as "low_balance_threshold!",
+                   u.low_balance_notification_sent,
+                   c.balance as "checkpoint_balance?"
+            FROM users u
+            LEFT JOIN user_balance_checkpoints c ON u.id = c.user_id
+            WHERE u.id != '00000000-0000-0000-0000-000000000000'
+              AND u.is_deleted = false
+              AND u.low_balance_notification_sent = false
+              AND u.low_balance_threshold IS NOT NULL
+              AND c.balance < u.low_balance_threshold
+            "#,
+        )
+        .fetch_all(&mut *self.db)
+        .await?;
+
+        Ok(rows)
     }
 
     /// Return all users who have auto top-up fully configured (threshold + amount + payment method).
@@ -1041,10 +1106,160 @@ mod tests {
         let result = users.users_with_low_balance_threshold().await.unwrap();
         assert!(result[0].low_balance_notification_sent);
 
+        // Second poll: user should not appear (already marked notified)
+        let low = users.poll_low_balance_users().await.unwrap();
+        assert!(low.is_empty());
+
         // Clear
         users.clear_low_balance_notification_sent(&[user_id]).await.unwrap();
         let result = users.users_with_low_balance_threshold().await.unwrap();
         assert!(!result[0].low_balance_notification_sent);
+
+        // Third poll: user reappears (flag cleared, still below threshold)
+        let low = users.poll_low_balance_users().await.unwrap();
+        assert_eq!(low.len(), 1);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_poll_low_balance_clears_flag_after_topup(pool: PgPool) {
+        let user_id = create_user_with_balance(&pool, "1.00", Some(2.0)).await;
+
+        // Poll and mark notified
+        let mut conn = pool.acquire().await.unwrap();
+        let mut users = Users::new(&mut conn);
+        let low = users.poll_low_balance_users().await.unwrap();
+        assert_eq!(low.len(), 1);
+        users.mark_low_balance_notification_sent(&[user_id]).await.unwrap();
+        drop(conn);
+
+        // Topup: add credits and refresh checkpoint so balance > threshold
+        let mut conn = pool.acquire().await.unwrap();
+        let mut credits = Credits::new(&mut conn);
+        let grant = CreditTransactionCreateDBRequest::admin_grant(user_id, user_id, Decimal::from_str("10.00").unwrap(), None);
+        credits.create_transaction(&grant).await.unwrap();
+        credits.refresh_checkpoint(user_id).await.unwrap();
+        drop(conn);
+
+        // Poll again: the clear_recovered CTE should reset the flag,
+        // and the user should NOT appear (balance is now above threshold)
+        let mut conn = pool.acquire().await.unwrap();
+        let mut users = Users::new(&mut conn);
+        let low = users.poll_low_balance_users().await.unwrap();
+        assert!(low.is_empty());
+
+        // Verify flag was actually cleared
+        let user = users.get_by_id(user_id).await.unwrap().unwrap();
+        assert!(!user.low_balance_notification_sent);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_poll_low_balance_full_cycle(pool: PgPool) {
+        // 1. Create user with $100, threshold $2
+        let user_id = create_user_with_balance(&pool, "100.00", Some(2.0)).await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut users = Users::new(&mut conn);
+        let low = users.poll_low_balance_users().await.unwrap();
+        assert!(low.is_empty(), "User above threshold should not appear");
+        drop(conn);
+
+        // 2. Deduct $99 → balance $1 (below threshold)
+        let mut conn = pool.acquire().await.unwrap();
+        let mut credits = Credits::new(&mut conn);
+        let deduct = CreditTransactionCreateDBRequest {
+            user_id,
+            transaction_type: crate::db::models::credits::CreditTransactionType::AdminRemoval,
+            amount: Decimal::from_str("99.00").unwrap(),
+            source_id: Uuid::new_v4().to_string(),
+            description: None,
+            fusillade_batch_id: None,
+            api_key_id: None,
+        };
+        credits.create_transaction(&deduct).await.unwrap();
+        credits.refresh_checkpoint(user_id).await.unwrap();
+        drop(conn);
+
+        // 3. Poll: user should appear
+        let mut conn = pool.acquire().await.unwrap();
+        let mut users = Users::new(&mut conn);
+        let low = users.poll_low_balance_users().await.unwrap();
+        assert_eq!(low.len(), 1, "User below threshold should appear");
+        assert_eq!(low[0].id, user_id);
+
+        // 4. Mark notified
+        users.mark_low_balance_notification_sent(&[user_id]).await.unwrap();
+        let low = users.poll_low_balance_users().await.unwrap();
+        assert!(low.is_empty(), "Notified user should not appear again");
+        drop(conn);
+
+        // 5. Topup $50 → balance $51 (above threshold)
+        let mut conn = pool.acquire().await.unwrap();
+        let mut credits = Credits::new(&mut conn);
+        let grant = CreditTransactionCreateDBRequest::admin_grant(user_id, user_id, Decimal::from_str("50.00").unwrap(), None);
+        credits.create_transaction(&grant).await.unwrap();
+        credits.refresh_checkpoint(user_id).await.unwrap();
+        drop(conn);
+
+        // 6. Poll: clear_recovered CTE resets the flag, user above threshold → not returned
+        let mut conn = pool.acquire().await.unwrap();
+        let mut users = Users::new(&mut conn);
+        let low = users.poll_low_balance_users().await.unwrap();
+        assert!(low.is_empty(), "Topped-up user should not appear");
+        drop(conn);
+
+        // 7. Deduct $50 → balance $1 again (below threshold)
+        let mut conn = pool.acquire().await.unwrap();
+        let mut credits = Credits::new(&mut conn);
+        let deduct2 = CreditTransactionCreateDBRequest {
+            user_id,
+            transaction_type: crate::db::models::credits::CreditTransactionType::AdminRemoval,
+            amount: Decimal::from_str("50.00").unwrap(),
+            source_id: Uuid::new_v4().to_string(),
+            description: None,
+            fusillade_batch_id: None,
+            api_key_id: None,
+        };
+        credits.create_transaction(&deduct2).await.unwrap();
+        credits.refresh_checkpoint(user_id).await.unwrap();
+        drop(conn);
+
+        // 8. Poll: user should appear again (flag was cleared by step 6)
+        let mut conn = pool.acquire().await.unwrap();
+        let mut users = Users::new(&mut conn);
+        let low = users.poll_low_balance_users().await.unwrap();
+        assert_eq!(low.len(), 1, "User should be notifiable again after recovery + re-drop");
+        assert_eq!(low[0].id, user_id);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_poll_low_balance_negative_balance(pool: PgPool) {
+        // User with negative balance should still be returned
+        let user_id = create_user_with_balance(&pool, "5.00", Some(2.0)).await;
+
+        // Deduct more than the balance
+        let mut conn = pool.acquire().await.unwrap();
+        let mut credits = Credits::new(&mut conn);
+        let deduct = CreditTransactionCreateDBRequest {
+            user_id,
+            transaction_type: crate::db::models::credits::CreditTransactionType::AdminRemoval,
+            amount: Decimal::from_str("10.00").unwrap(),
+            source_id: Uuid::new_v4().to_string(),
+            description: None,
+            fusillade_batch_id: None,
+            api_key_id: None,
+        };
+        credits.create_transaction(&deduct).await.unwrap();
+        credits.refresh_checkpoint(user_id).await.unwrap();
+        drop(conn);
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut users = Users::new(&mut conn);
+        let low = users.poll_low_balance_users().await.unwrap();
+        assert_eq!(low.len(), 1);
+        assert_eq!(low[0].id, user_id);
     }
 
     #[sqlx::test]
@@ -1150,5 +1365,77 @@ mod tests {
         let result = users.users_with_auto_topup_enabled().await.unwrap();
 
         assert!(result.is_empty(), "Should not include user with missing payment_provider_id");
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_list_users_excludes_organizations(pool: PgPool) {
+        let mut conn = pool.acquire().await.unwrap();
+        let mut repo = Users::new(&mut conn);
+
+        // Create a regular user
+        let user_create = UserCreateDBRequest::from(UserCreate {
+            username: "individual".to_string(),
+            email: "individual@example.com".to_string(),
+            display_name: Some("Individual User".to_string()),
+            avatar_url: None,
+            roles: vec![Role::StandardUser],
+        });
+        repo.create(&user_create).await.unwrap();
+
+        // Create an organization user directly via SQL (since Users::create always creates individuals)
+        sqlx::query!(
+            "INSERT INTO users (id, username, email, auth_source, user_type) VALUES ($1, $2, $3, 'organization', 'organization')",
+            uuid::Uuid::new_v4(),
+            "acme-org",
+            "billing@acme.example.com",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // List should only return individual users (plus any seeded system user)
+        let filter = UserFilter::new(0, 100);
+        let users = repo.list(&filter).await.unwrap();
+
+        for u in &users {
+            assert_eq!(u.user_type, "individual", "Organization users should not appear in list");
+        }
+        assert!(users.iter().any(|u| u.username == "individual"));
+        assert!(!users.iter().any(|u| u.username == "acme-org"));
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_count_users_excludes_organizations(pool: PgPool) {
+        let mut conn = pool.acquire().await.unwrap();
+        let mut repo = Users::new(&mut conn);
+
+        let initial_count = repo.count(&UserFilter::new(0, 100)).await.unwrap();
+
+        // Create a regular user
+        repo.create(&UserCreateDBRequest::from(UserCreate {
+            username: "countuser".to_string(),
+            email: "countuser@example.com".to_string(),
+            display_name: None,
+            avatar_url: None,
+            roles: vec![Role::StandardUser],
+        }))
+        .await
+        .unwrap();
+
+        // Create an org user via raw SQL
+        sqlx::query!(
+            "INSERT INTO users (id, username, email, auth_source, user_type) VALUES ($1, $2, $3, 'organization', 'organization')",
+            uuid::Uuid::new_v4(),
+            "count-org",
+            "count-org@example.com",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let new_count = repo.count(&UserFilter::new(0, 100)).await.unwrap();
+        assert_eq!(new_count, initial_count + 1, "Count should increase by 1 (the individual), not 2");
     }
 }

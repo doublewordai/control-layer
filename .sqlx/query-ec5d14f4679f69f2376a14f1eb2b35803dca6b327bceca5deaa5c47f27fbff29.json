@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, name, description, secret, purpose, user_id, created_at, last_used, requests_per_second, burst_size, hidden FROM api_keys WHERE id = $1",
+  "query": "SELECT id, name, description, secret, purpose, user_id, created_by, created_at, last_used, requests_per_second, burst_size, hidden, is_deleted FROM api_keys WHERE id = ANY($1) AND is_deleted = false",
   "describe": {
     "columns": [
       {
@@ -35,33 +35,43 @@
       },
       {
         "ordinal": 6,
+        "name": "created_by",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 7,
         "name": "created_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 7,
+        "ordinal": 8,
         "name": "last_used",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 8,
+        "ordinal": 9,
         "name": "requests_per_second",
         "type_info": "Float4"
       },
       {
-        "ordinal": 9,
+        "ordinal": 10,
         "name": "burst_size",
         "type_info": "Int4"
       },
       {
-        "ordinal": 10,
+        "ordinal": 11,
         "name": "hidden",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 12,
+        "name": "is_deleted",
         "type_info": "Bool"
       }
     ],
     "parameters": {
       "Left": [
-        "Uuid"
+        "UuidArray"
       ]
     },
     "nullable": [
@@ -72,11 +82,13 @@
       false,
       false,
       false,
+      false,
       true,
       true,
       true,
+      false,
       false
     ]
   },
-  "hash": "d940e292da1c1971a4a02c1e05a60419bdcac007ac5501849960ba2081e45116"
+  "hash": "ec5d14f4679f69f2376a14f1eb2b35803dca6b327bceca5deaa5c47f27fbff29"
 }

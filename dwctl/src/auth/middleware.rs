@@ -55,12 +55,18 @@ pub(crate) async fn admin_ai_proxy<P: sqlx_pool_router::PoolProvider + Clone>(
     debug!("Model name extracted from request: {}", model_name);
 
     // Get or create user-specific hidden playground API key for this request
+    let target_user_id = current_user.active_organization.unwrap_or(current_user.id);
     let mut api_key_conn = state.db.write().acquire().await.unwrap();
     let mut api_keys_repo = ApiKeys::new(&mut api_key_conn);
     let user_api_key = api_keys_repo
-        .get_or_create_hidden_key(current_user.id, ApiKeyPurpose::Playground)
+        .get_or_create_hidden_key(target_user_id, ApiKeyPurpose::Playground, current_user.id)
         .await
-        .with_context(|| format!("Failed to get or create hidden playground API key for user {}", current_user.id))?;
+        .with_context(|| {
+            format!(
+                "Failed to get or create hidden playground API key for target user {} (current user {})",
+                target_user_id, current_user.id
+            )
+        })?;
 
     // Rewrite the path from /admin/api/v1/ai/* to /ai/*
     debug!("User has access to model: {}", model_name);
@@ -485,6 +491,8 @@ mod tests {
             display_name: user.display_name,
             avatar_url: user.avatar_url,
             payment_provider_id: None,
+            organizations: vec![],
+            active_organization: None,
         };
         let jwt_token = session::create_session_token(&current_user, &config).unwrap();
 
@@ -589,6 +597,8 @@ mod tests {
             display_name: jwt_user.display_name,
             avatar_url: jwt_user.avatar_url,
             payment_provider_id: None,
+            organizations: vec![],
+            active_organization: None,
         };
         let jwt_token = session::create_session_token(&current_user, &config).unwrap();
 
@@ -695,6 +705,8 @@ mod tests {
             display_name: user.display_name,
             avatar_url: user.avatar_url,
             payment_provider_id: None,
+            organizations: vec![],
+            active_organization: None,
         };
         let jwt_token = session::create_session_token(&current_user, &config).unwrap();
 
@@ -976,6 +988,8 @@ mod tests {
             display_name: user.display_name,
             avatar_url: user.avatar_url,
             payment_provider_id: None,
+            organizations: vec![],
+            active_organization: None,
         };
         let jwt_token = session::create_session_token(&current_user, &config).unwrap();
 

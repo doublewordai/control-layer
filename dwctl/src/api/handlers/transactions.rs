@@ -73,6 +73,7 @@ pub async fn create_transaction<P: PoolProvider>(
         source_id: data.source_id,
         description: data.description,
         fusillade_batch_id: None,
+        api_key_id: None,
     };
 
     let transaction = repo.create_transaction(&db_request).await?;
@@ -112,18 +113,22 @@ pub async fn get_transaction<P: PoolProvider>(
     let mut repo = Credits::new(&mut pool_conn);
 
     // Check permissions: if not BillingManager and not admin, must be own transaction
-    let has_read_all = permissions::has_permission(&current_user, Resource::Credits, Operation::ReadAll);
+    let can_read_all = permissions::has_permission(&current_user, Resource::Credits, Operation::ReadAll);
 
     let transaction = repo.get_transaction_by_id(transaction_id).await?;
 
     let transaction = match transaction {
         Some(tx) => {
-            if !has_read_all && tx.user_id != current_user.id {
-                // Return 404 to avoid leaking existence
-                return Err(Error::NotFound {
-                    resource: "Transaction".to_string(),
-                    id: transaction_id.to_string(),
-                });
+            if !can_read_all && tx.user_id != current_user.id {
+                let can_org = permissions::can_manage_org_resource(&current_user, tx.user_id, &mut pool_conn)
+                    .await
+                    .map_err(Error::Database)?;
+                if !can_org {
+                    return Err(Error::NotFound {
+                        resource: "Transaction".to_string(),
+                        id: transaction_id.to_string(),
+                    });
+                }
             }
             tx
         }
@@ -169,11 +174,11 @@ pub async fn list_transactions<P: PoolProvider>(
     let skip = query.pagination.skip();
     let limit = query.pagination.limit();
 
-    // Check if user has ReadAll permission
-    let has_read_all = permissions::has_permission(&current_user, Resource::Credits, Operation::ReadAll);
+    // Check permissions
+    let can_read_all = permissions::has_permission(&current_user, Resource::Credits, Operation::ReadAll);
 
     // Check if requesting all transactions
-    if query.all == Some(true) && !has_read_all {
+    if query.all == Some(true) && !can_read_all {
         return Err(Error::InsufficientPermissions {
             required: Permission::Allow(Resource::Credits, Operation::ReadAll),
             action: Operation::ReadAll,
@@ -188,12 +193,18 @@ pub async fn list_transactions<P: PoolProvider>(
         // user_id specified - filter to that user
         (_, Some(requested_user_id)) => {
             // If requesting specific user's transactions
-            if !has_read_all && requested_user_id != current_user.id {
-                return Err(Error::InsufficientPermissions {
-                    required: Permission::Allow(Resource::Credits, Operation::ReadAll),
-                    action: Operation::ReadAll,
-                    resource: "transactions".to_string(),
-                });
+            if !can_read_all && requested_user_id != current_user.id {
+                let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+                let can_org = permissions::can_manage_org_resource(&current_user, requested_user_id, &mut conn)
+                    .await
+                    .map_err(Error::Database)?;
+                if !can_org {
+                    return Err(Error::InsufficientPermissions {
+                        required: Permission::Allow(Resource::Credits, Operation::ReadAll),
+                        action: Operation::ReadAll,
+                        resource: "transactions".to_string(),
+                    });
+                }
             }
             Some(requested_user_id)
         }
@@ -1250,6 +1261,7 @@ mod tests {
             source_id: Uuid::new_v4().to_string(),
             description: Some("Purchase".to_string()),
             fusillade_batch_id: None,
+            api_key_id: None,
         };
         credits_repo
             .create_transaction(&purchase_request)
@@ -1288,6 +1300,7 @@ mod tests {
                 source_id: analytics_record.id.to_string(),
                 description: Some(format!("Batch 1 request {}", i)),
                 fusillade_batch_id: Some(batch_id_1),
+                api_key_id: None,
             };
             credits_repo
                 .create_transaction(&usage_request)
@@ -1323,6 +1336,7 @@ mod tests {
                 source_id: analytics_record.id.to_string(),
                 description: Some(format!("Batch 2 request {}", i)),
                 fusillade_batch_id: Some(batch_id_2),
+                api_key_id: None,
             };
             credits_repo
                 .create_transaction(&usage_request)
@@ -1357,6 +1371,7 @@ mod tests {
                 source_id: analytics_record.id.to_string(),
                 description: Some(format!("Individual request {}", i)),
                 fusillade_batch_id: None, // Not in a batch
+                api_key_id: None,
             };
             credits_repo
                 .create_transaction(&usage_request)
@@ -1491,6 +1506,7 @@ mod tests {
                     source_id: analytics_record.id.to_string(),
                     description: Some(format!("Batch {} request {}", batch_num, req_num)),
                     fusillade_batch_id: Some(batch_id),
+                    api_key_id: None,
                 };
                 credits_repo
                     .create_transaction(&usage_request)
@@ -1604,6 +1620,7 @@ mod tests {
                 source_id: analytics_record.id.to_string(),
                 description: Some(format!("Batch 1 request {}", i)),
                 fusillade_batch_id: Some(batch_id_1),
+                api_key_id: None,
             };
             credits_repo
                 .create_transaction(&usage_request)
@@ -1640,6 +1657,7 @@ mod tests {
                 source_id: analytics_record.id.to_string(),
                 description: Some(format!("Batch 2 request {}", i)),
                 fusillade_batch_id: Some(batch_id_2),
+                api_key_id: None,
             };
             credits_repo
                 .create_transaction(&usage_request)
@@ -1676,6 +1694,7 @@ mod tests {
                 source_id: analytics_record.id.to_string(),
                 description: Some(format!("Batch 3 request {}", i)),
                 fusillade_batch_id: Some(batch_id_3),
+                api_key_id: None,
             };
             credits_repo
                 .create_transaction(&usage_request)
@@ -1691,6 +1710,7 @@ mod tests {
             source_id: Uuid::new_v4().to_string(),
             description: Some("Dummy payment (test)".to_string()),
             fusillade_batch_id: None,
+            api_key_id: None,
         };
         credits_repo
             .create_transaction(&payment_request)

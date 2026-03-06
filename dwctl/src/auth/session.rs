@@ -124,6 +124,8 @@ mod tests {
             display_name: Some("Test User".to_string()),
             avatar_url: None,
             payment_provider_id: None,
+            organizations: vec![],
+            active_organization: None,
         }
     }
 
