@@ -17,7 +17,7 @@ use crate::{
         handlers::{Deployments, Groups, Users, api_keys::ApiKeys},
         models::{
             api_keys::{ApiKeyCreateDBRequest, ApiKeyDBResponse},
-            deployments::{DeploymentCreateDBRequest, DeploymentDBResponse},
+            deployments::{DeploymentCreateDBRequest, DeploymentDBResponse, ModelType},
             groups::{GroupCreateDBRequest, GroupDBResponse},
             users::UserCreateDBRequest,
         },
@@ -415,6 +415,38 @@ pub async fn create_test_deployment(pool: &PgPool, created_by: UserId, model_nam
         .created_by(created_by)
         .model_name(model_name.to_string())
         .alias(alias.to_string())
+        .hosted_on(test_endpoint_id)
+        .build();
+
+    let response = deployment_repo.create(&request).await.expect("Failed to create test deployment");
+    tx.commit().await.expect("Failed to commit transaction");
+    response
+}
+
+pub async fn create_test_deployment_with_model_type(
+    pool: &PgPool,
+    created_by: UserId,
+    model_name: &str,
+    alias: &str,
+    model_type: ModelType,
+) -> DeploymentDBResponse {
+    let mut tx = pool.begin().await.expect("Failed to begin transaction");
+
+    let mut endpoints_repo = InferenceEndpoints::new(&mut tx);
+    let filter = InferenceEndpointFilter::new(0, 100);
+    let endpoints = endpoints_repo.list(&filter).await.expect("Failed to list endpoints");
+    let test_endpoint_id = endpoints
+        .into_iter()
+        .find(|e| e.name == "test")
+        .expect("Test endpoint should exist")
+        .id;
+
+    let mut deployment_repo = Deployments::new(&mut tx);
+    let request = DeploymentCreateDBRequest::builder()
+        .created_by(created_by)
+        .model_name(model_name.to_string())
+        .alias(alias.to_string())
+        .model_type(model_type)
         .hosted_on(test_endpoint_id)
         .build();
 
