@@ -26,7 +26,7 @@ async fn get_batch_api_key(pool: &PgPool, user_id: Uuid) -> String {
     let mut conn = pool.acquire().await.expect("Failed to acquire connection");
     let mut api_keys_repo = ApiKeys::new(&mut conn);
     api_keys_repo
-        .get_or_create_hidden_key(user_id, ApiKeyPurpose::Batch)
+        .get_or_create_hidden_key(user_id, ApiKeyPurpose::Batch, user_id)
         .await
         .expect("Failed to get batch API key")
 }
@@ -36,7 +36,7 @@ async fn get_realtime_api_key(pool: &PgPool, user_id: Uuid) -> String {
     let mut conn = pool.acquire().await.expect("Failed to acquire connection");
     let mut api_keys_repo = ApiKeys::new(&mut conn);
     api_keys_repo
-        .get_or_create_hidden_key(user_id, ApiKeyPurpose::Realtime)
+        .get_or_create_hidden_key(user_id, ApiKeyPurpose::Realtime, user_id)
         .await
         .expect("Failed to get realtime API key")
 }

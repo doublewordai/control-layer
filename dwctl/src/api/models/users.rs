@@ -66,6 +66,14 @@ pub struct UserUpdate {
     /// Omit entirely to leave unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
     pub low_balance_threshold: Option<Option<f32>>,
+    /// Auto top-up amount in dollars. Set to a number to enable automatic credit
+    /// replenishment, set to null to disable. Omit entirely to leave unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
+    pub auto_topup_amount: Option<Option<f32>>,
+    /// Auto top-up threshold in dollars. When balance drops below this amount,
+    /// auto top-up is triggered. Set to null to disable. Omit entirely to leave unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
+    pub auto_topup_threshold: Option<Option<f32>>,
 }
 
 /// Full user details returned by the API.
@@ -116,6 +124,21 @@ pub struct UserResponse {
     pub batch_notifications_enabled: bool,
     /// Low balance notification threshold in dollars. Null means notifications are disabled.
     pub low_balance_threshold: Option<f32>,
+    /// Auto top-up amount in dollars. Null means auto top-up is disabled.
+    pub auto_topup_amount: Option<f32>,
+    /// Auto top-up threshold in dollars. When balance drops below this, auto top-up triggers.
+    pub auto_topup_threshold: Option<f32>,
+    /// Whether the user has a payment method set up for auto top-up.
+    pub has_auto_topup_payment_method: bool,
+    /// User type: 'individual' or 'organization'
+    pub user_type: String,
+    /// Organizations this user belongs to (only included if `include=organizations` is specified)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub organizations: Option<Vec<super::organizations::OrganizationSummary>>,
+    /// Active organization ID from the session cookie (only present for /users/current)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>, format = "uuid")]
+    pub active_organization_id: Option<UserId>,
 }
 
 /// Query parameters for listing users
@@ -155,6 +178,20 @@ pub struct CurrentUser {
     pub avatar_url: Option<String>,
     /// ID in external payment provider
     pub payment_provider_id: Option<String>,
+    /// Organizations the user belongs to
+    pub organizations: Vec<UserOrganizationContext>,
+    /// Active organization ID (from X-Organization-Id header)
+    #[schema(value_type = Option<String>, format = "uuid")]
+    pub active_organization: Option<UserId>,
+}
+
+/// Context about a user's organization membership
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct UserOrganizationContext {
+    #[schema(value_type = String, format = "uuid")]
+    pub id: UserId,
+    pub name: String,
+    pub role: String,
 }
 
 impl CurrentUser {
@@ -181,9 +218,15 @@ impl From<UserDBResponse> for UserResponse {
             last_login: None,     // UserDBResponse doesn't have last_login
             groups: None,         // By default, relationships are not included
             credit_balance: None, // By default, credit balances are not included
-            has_payment_provider_id: db.payment_provider_id.is_some(),
+            has_payment_provider_id: db.payment_provider_id.as_ref().is_some_and(|s| !s.is_empty()),
             batch_notifications_enabled: db.batch_notifications_enabled,
             low_balance_threshold: db.low_balance_threshold,
+            auto_topup_amount: db.auto_topup_amount,
+            auto_topup_threshold: db.auto_topup_threshold,
+            has_auto_topup_payment_method: db.payment_provider_id.as_ref().is_some_and(|s| !s.is_empty()),
+            user_type: db.user_type,
+            organizations: None,
+            active_organization_id: None,
         }
     }
 }
@@ -200,6 +243,18 @@ impl UserResponse {
         self.credit_balance = Some(balance);
         self
     }
+
+    /// Create a response with organizations included
+    pub fn with_organizations(mut self, organizations: Vec<super::organizations::OrganizationSummary>) -> Self {
+        self.organizations = Some(organizations);
+        self
+    }
+
+    /// Set the active organization ID (from session cookie)
+    pub fn with_active_organization(mut self, id: Option<UserId>) -> Self {
+        self.active_organization_id = id;
+        self
+    }
 }
 
 impl From<UserDBResponse> for CurrentUser {
@@ -213,6 +268,8 @@ impl From<UserDBResponse> for CurrentUser {
             display_name: db.display_name,
             avatar_url: db.avatar_url,
             payment_provider_id: db.payment_provider_id,
+            organizations: vec![],
+            active_organization: None,
         }
     }
 }

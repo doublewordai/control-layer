@@ -1,14 +1,17 @@
-import React, { useState, useRef, useEffect } from "react";
+import React, { useState, useRef, useEffect, useMemo } from "react";
 import { useSearchParams, useNavigate } from "react-router-dom";
-import { Users, UserPlus, Search, X, Trash2 } from "lucide-react";
+import { Users, UserPlus, Search, X, Trash2, Plus } from "lucide-react";
 import { useDebounce } from "@/hooks/useDebounce";
 import {
   useUsers,
   useGroups,
   useDeleteUser,
   useDeleteGroup,
+  useOrganizations,
+  useDeleteOrganization,
   type Group as BackendGroup,
 } from "../../../../api/control-layer";
+import type { Organization } from "../../../../api/control-layer/types";
 import {
   CreateUserModal,
   CreateGroupModal,
@@ -19,10 +22,13 @@ import {
   GroupManagementModal,
   DeleteGroupModal,
 } from "../../../modals";
+import { CreateOrganizationModal } from "../../organizations/CreateOrganizationModal";
+import { EditOrganizationModal } from "../../organizations/EditOrganizationModal";
 import { GroupActionsDropdown } from "../";
 import { UserAvatar, Button } from "../../../ui";
 import { DataTable } from "../../../ui/data-table";
 import { createUserColumns } from "./columns";
+import { createOrganizationColumns } from "../../organizations/columns";
 import { Input } from "../../../ui/input";
 import { toast } from "sonner";
 import {
@@ -36,26 +42,8 @@ import {
 import type { DisplayUser, DisplayGroup } from "../../../../types/display";
 import { TablePagination } from "@/components/ui/table-pagination";
 import { useServerPagination } from "@/hooks/useServerPagination";
+import { useAuthorization } from "../../../../utils";
 
-// Predefined color classes that Tailwind will include
-const GROUP_COLOR_CLASSES = [
-  "bg-blue-500",
-  "bg-purple-500",
-  "bg-green-500",
-  "bg-yellow-500",
-  "bg-red-500",
-  "bg-indigo-500",
-  "bg-teal-500",
-  "bg-orange-500",
-  "bg-pink-500",
-  "bg-cyan-500",
-];
-
-// Function to get a consistent color for a group
-const getGroupColor = (_groupId: string, index: number): string => {
-  // Use index to assign colors consistently
-  return GROUP_COLOR_CLASSES[index % GROUP_COLOR_CLASSES.length];
-};
 
 const UsersGroups: React.FC = () => {
   const [searchParams] = useSearchParams();
@@ -72,22 +60,29 @@ const UsersGroups: React.FC = () => {
     defaultPageSize: 9,
   });
 
+  const orgsPagination = useServerPagination({
+    paramPrefix: "orgs",
+    defaultPageSize: 10,
+  });
+
   // Get tab from URL or default to "users"
+  type TabType = "users" | "orgs" | "groups";
   const tabFromUrl = searchParams.get("tab");
-  const [activeTab, setActiveTab] = useState<"users" | "groups">(() => {
-    return tabFromUrl === "groups" ? "groups" : "users";
+  const [activeTab, setActiveTab] = useState<TabType>(() => {
+    if (tabFromUrl === "groups" || tabFromUrl === "orgs") return tabFromUrl;
+    return "users";
   });
 
   // Update activeTab when URL changes
   useEffect(() => {
     const tabFromUrl = searchParams.get("tab");
-    if (tabFromUrl === "groups" || tabFromUrl === "users") {
+    if (tabFromUrl === "groups" || tabFromUrl === "users" || tabFromUrl === "orgs") {
       setActiveTab(tabFromUrl);
     }
   }, [searchParams]);
 
   // Handle tab change
-  const handleTabChange = (tab: "users" | "groups") => {
+  const handleTabChange = (tab: TabType) => {
     setActiveTab(tab);
     const newParams = new URLSearchParams(searchParams);
     newParams.set("tab", tab);
@@ -101,6 +96,10 @@ const UsersGroups: React.FC = () => {
   // Search state for groups (server-side) - must be declared before useGroups hook
   const [groupSearchQuery, setGroupSearchQuery] = useState("");
   const debouncedGroupSearch = useDebounce(groupSearchQuery, 300);
+
+  // Search state for organizations (server-side)
+  const [orgSearchQuery, setOrgSearchQuery] = useState("");
+  const debouncedOrgSearch = useDebounce(orgSearchQuery, 300);
 
   // Data from the API: uses the tanstack query hooks to fetch both users and groups TODO: (this is a bit redundant right now, but we can optimize later)
   const {
@@ -121,6 +120,16 @@ const UsersGroups: React.FC = () => {
     include: "users",
     search: debouncedGroupSearch || undefined,
     ...groupsPagination.queryParams,
+  });
+
+  const {
+    data: orgsData,
+    isLoading: orgsLoading,
+    error: _orgsError,
+  } = useOrganizations({
+    search: debouncedOrgSearch || undefined,
+    include: "member_count",
+    ...orgsPagination.queryParams,
   });
 
   const loading = usersLoading || groupsLoading;
@@ -145,6 +154,11 @@ const UsersGroups: React.FC = () => {
   const [showBulkDeleteGroupsModal, setShowBulkDeleteGroupsModal] =
     useState(false);
 
+  // Org modals
+  const [showCreateOrgModal, setShowCreateOrgModal] = useState(false);
+  const [editingOrg, setEditingOrg] = useState<Organization | null>(null);
+  const [deletingOrg, setDeletingOrg] = useState<Organization | null>(null);
+
   // 'active' means the 3 dots have been clicked on a user or group, vs. selected in the table.
   const [activeUser, setActiveUser] = useState<DisplayUser | null>(null);
   const [activeGroup, setActiveGroup] = useState<DisplayGroup | null>(null);
@@ -152,6 +166,11 @@ const UsersGroups: React.FC = () => {
   // Bulk operations
   const deleteUserMutation = useDeleteUser();
   const deleteGroupMutation = useDeleteGroup();
+  const deleteOrgMutation = useDeleteOrganization();
+
+  // Authorization
+  const { hasPermission } = useAuthorization();
+  const isPlatformManager = hasPermission("users-groups");
 
   const handleSelectGroup = (groupId: string) => {
     setSelectedGroups((prev) => {
@@ -250,6 +269,33 @@ const UsersGroups: React.FC = () => {
     showTransactions: true,
   });
 
+  // Column configuration for organizations DataTable
+  const orgColumns = useMemo(
+    () =>
+      createOrganizationColumns({
+        onView: (org) => navigate(`/organizations/${org.id}`),
+        onEdit: (org) => setEditingOrg(org),
+        onDelete: (org) => setDeletingOrg(org),
+        canDelete: isPlatformManager,
+      }),
+    [navigate, isPlatformManager],
+  );
+
+  const handleDeleteOrg = async () => {
+    if (!deletingOrg) return;
+    try {
+      await deleteOrgMutation.mutateAsync(deletingOrg.id);
+      toast.success("Organization deleted");
+      setDeletingOrg(null);
+    } catch (error) {
+      toast.error(
+        error instanceof Error
+          ? error.message
+          : "Failed to delete organization",
+      );
+    }
+  };
+
   if (loading) {
     return (
       <div className="flex items-center justify-center h-full">
@@ -288,10 +334,10 @@ const UsersGroups: React.FC = () => {
       {/* Header */}
       <div className="mb-8">
         <h1 className="text-3xl font-bold text-doubleword-neutral-900">
-          Users & Groups
+          User Access
         </h1>
         <p className="text-doubleword-neutral-600 mt-2">
-          Manage user access and group permissions
+          Manage users, organizations, and access groups
         </p>
       </div>
 
@@ -316,6 +362,21 @@ const UsersGroups: React.FC = () => {
             }`}
           >
             Users
+          </button>
+          <button
+            id="orgs-tab"
+            role="tab"
+            aria-label="Organizations"
+            aria-selected={activeTab === "orgs"}
+            aria-controls="orgs-panel"
+            onClick={() => handleTabChange("orgs")}
+            className={`pb-3 px-1 border-b-2 transition-colors ${
+              activeTab === "orgs"
+                ? "border-doubleword-primary text-doubleword-primary font-medium"
+                : "border-transparent text-doubleword-neutral-500 hover:text-doubleword-neutral-700"
+            }`}
+          >
+            Organizations
           </button>
           <button
             id="groups-tab"
@@ -378,9 +439,9 @@ const UsersGroups: React.FC = () => {
 
       {/* Bulk action bar for groups */}
       {activeTab === "groups" && selectedGroups.size > 0 && (
-        <div className="bg-blue-50 border border-blue-200 rounded-lg p-3 mb-4 flex items-center justify-between">
+        <div className="bg-muted border rounded-lg p-3 mb-4 flex items-center justify-between">
           <div className="flex items-center gap-2">
-            <span className="text-sm font-medium text-blue-900">
+            <span className="text-sm font-medium text-foreground">
               {selectedGroups.size} group{selectedGroups.size !== 1 ? "s" : ""}{" "}
               selected
             </span>
@@ -435,9 +496,9 @@ const UsersGroups: React.FC = () => {
               </div>
             }
             actionBar={
-              <div className="bg-blue-50 border border-blue-200 rounded-lg p-3 mb-4 flex items-center justify-between">
+              <div className="bg-muted border rounded-lg p-3 mb-4 flex items-center justify-between">
                 <div className="flex items-center gap-2">
-                  <span className="text-sm font-medium text-blue-900">
+                  <span className="text-sm font-medium text-foreground">
                     {selectedUsers.length} user
                     {selectedUsers.length !== 1 ? "s" : ""} selected
                   </span>
@@ -458,6 +519,42 @@ const UsersGroups: React.FC = () => {
       </div>
       <div
         role="tabpanel"
+        id="orgs-panel"
+        aria-labelledby="orgs-tab"
+        hidden={activeTab !== "orgs"}
+      >
+        {activeTab === "orgs" && (
+          <DataTable
+            columns={orgColumns}
+            data={orgsData?.data ?? []}
+            isLoading={orgsLoading}
+            searchPlaceholder="Search organizations..."
+            externalSearch={{
+              value: orgSearchQuery,
+              onChange: (value) => {
+                setOrgSearchQuery(value);
+                orgsPagination.handleReset();
+              },
+            }}
+            paginationMode="server"
+            serverPagination={{
+              page: orgsPagination.page,
+              pageSize: orgsPagination.pageSize,
+              totalItems: orgsData?.total_count ?? 0,
+              onPageChange: orgsPagination.handlePageChange,
+              onPageSizeChange: orgsPagination.handlePageSizeChange,
+            }}
+            headerActions={
+              <Button onClick={() => setShowCreateOrgModal(true)} size="sm">
+                <Plus className="w-4 h-4" />
+                Create Organization
+              </Button>
+            }
+          />
+        )}
+      </div>
+      <div
+        role="tabpanel"
         id="groups-panel"
         aria-labelledby="groups-tab"
         hidden={activeTab !== "groups"}
@@ -465,16 +562,15 @@ const UsersGroups: React.FC = () => {
         {activeTab === "groups" && (
           /* Groups Grid */
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-            {groups.map((group, index) => {
-              const colorClass = getGroupColor(group.id, index);
+            {groups.map((group) => {
               const isSelected = selectedGroups.has(group.id);
               return (
                 <div
                   key={group.id}
-                  className={`bg-white rounded-xl shadow-sm border-2 p-6 hover:shadow-md transition-all cursor-pointer ${
+                  className={`bg-white dark:bg-doubleword-background-dark rounded-lg border p-6 transition-colors cursor-pointer ${
                     isSelected
-                      ? "border-blue-500 bg-blue-50 shadow-md"
-                      : "border-transparent hover:border-gray-200"
+                      ? "border-doubleword-primary bg-doubleword-primary/5"
+                      : "border-doubleword-neutral-200 dark:border-doubleword-neutral-700 hover:border-doubleword-neutral-300 dark:hover:border-doubleword-neutral-600"
                   }`}
                   onClick={(e) => {
                     // Only select if not clicking on the dropdown or its children
@@ -486,9 +582,9 @@ const UsersGroups: React.FC = () => {
                   <div className="flex items-start justify-between mb-4">
                     <div className="flex items-center gap-3">
                       <div
-                        className={`w-10 h-10 ${colorClass} rounded-lg flex items-center justify-center`}
+                        className="w-10 h-10 bg-doubleword-neutral-100 dark:bg-doubleword-neutral-800 rounded-lg flex items-center justify-center"
                       >
-                        <Users className="w-5 h-5 text-white" />
+                        <Users className="w-5 h-5 text-doubleword-neutral-500" />
                       </div>
                       <div className="min-w-0 flex-1">
                         <h3 className="font-semibold text-doubleword-neutral-900 truncate break-all">
@@ -672,6 +768,47 @@ const UsersGroups: React.FC = () => {
           }}
         />
       )}
+      {/* Organization Modals */}
+      <CreateOrganizationModal
+        isOpen={showCreateOrgModal}
+        onClose={() => setShowCreateOrgModal(false)}
+        isPlatformManager={isPlatformManager}
+      />
+      <EditOrganizationModal
+        isOpen={!!editingOrg}
+        onClose={() => setEditingOrg(null)}
+        organization={editingOrg}
+      />
+      <Dialog
+        open={!!deletingOrg}
+        onOpenChange={(open) => !open && setDeletingOrg(null)}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Delete Organization</DialogTitle>
+            <DialogDescription>
+              Are you sure you want to delete{" "}
+              <strong>
+                {deletingOrg?.display_name || deletingOrg?.username}
+              </strong>
+              ? This action cannot be undone.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setDeletingOrg(null)}>
+              Cancel
+            </Button>
+            <Button
+              variant="destructive"
+              onClick={handleDeleteOrg}
+              disabled={deleteOrgMutation.isPending}
+            >
+              {deleteOrgMutation.isPending ? "Deleting..." : "Delete"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       {/* Bulk Delete Confirmation Modal */}
       <Dialog open={showBulkDeleteModal} onOpenChange={setShowBulkDeleteModal}>
         <DialogContent className="sm:max-w-md">

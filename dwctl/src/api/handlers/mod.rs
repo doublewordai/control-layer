@@ -40,6 +40,7 @@ pub mod deployments;
 pub mod files;
 pub mod groups;
 pub mod inference_endpoints;
+pub mod organizations;
 pub mod payments;
 pub mod probes;
 pub mod queue;

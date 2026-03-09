@@ -264,6 +264,7 @@ batches:
   # This is used by both /files upload validation and /batches endpoint validation.
   allowed_url_paths:
     - "/v1/chat/completions"
+    - "/v1/completions"
     - "/v1/embeddings"
     - "/v1/responses"
 

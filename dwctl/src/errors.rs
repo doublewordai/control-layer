@@ -189,6 +189,9 @@ impl Error {
                         (Some("deployed_models"), Some("deployed_models_alias_unique")) => {
                             "The specified alias is already in use. Please choose a different alias.".to_string()
                         }
+                        (Some("user_organizations"), Some(c)) if c.contains("invite_email") => {
+                            "A pending invite already exists for this email address".to_string()
+                        }
                         _ => "Resource already exists".to_string(),
                     }
                 }

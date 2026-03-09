@@ -36,6 +36,11 @@ import type {
   ModelsInclude,
   WebhookCreateRequest,
   WebhookUpdateRequest,
+  OrganizationsQuery,
+  OrganizationCreateRequest,
+  OrganizationUpdateRequest,
+  InviteMemberRequest,
+  OrgMemberRole,
 } from "./types";
 
 // Config hooks
@@ -1287,6 +1292,20 @@ export function useCreateBillingPortalSession() {
   });
 }
 
+export function useEnableAutoTopup() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationKey: ["payments", "auto-topup-enable"],
+    mutationFn: ({ threshold, amount }: { threshold: number; amount: number }) =>
+      dwctlApi.payments.enableAutoTopup(threshold, amount),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.users.all });
+    },
+  });
+}
+
+
 // ===== DAEMONS HOOKS =====
 
 export function useDaemons(
@@ -1376,5 +1395,214 @@ export function useRotateWebhookSecret() {
       webhookId: string;
       userId?: string;
     }) => dwctlApi.users.webhooks.rotateSecret(webhookId, userId),
+  });
+}
+
+// Organization hooks
+export function useOrganizations(
+  options?: OrganizationsQuery & { enabled?: boolean },
+) {
+  const { enabled = true, ...queryOptions } = options || {};
+  return useQuery({
+    queryKey: queryKeys.organizations.query(queryOptions),
+    queryFn: () => dwctlApi.organizations.list(queryOptions),
+    enabled,
+  });
+}
+
+export function useOrganization(id: string) {
+  return useQuery({
+    queryKey: queryKeys.organizations.byId(id),
+    queryFn: () => dwctlApi.organizations.get(id),
+    staleTime: 30 * 1000,
+  });
+}
+
+export function useOrganizationMembers(orgId: string) {
+  return useQuery({
+    queryKey: queryKeys.organizations.members(orgId),
+    queryFn: () => dwctlApi.organizations.listMembers(orgId),
+    enabled: !!orgId,
+  });
+}
+
+export function useCreateOrganization() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationKey: ["organizations", "create"],
+    mutationFn: (data: OrganizationCreateRequest) =>
+      dwctlApi.organizations.create(data),
+    onSettled: () => {
+      queryClient.invalidateQueries({
+        queryKey: queryKeys.organizations.all,
+      });
+      // Refresh current user to update their organizations list
+      // Use raw prefix key so it matches both ["users","byId","current",undefined]
+      // and ["users","byId","current","organizations"]
+      queryClient.invalidateQueries({
+        queryKey: ["users", "byId", "current"],
+      });
+    },
+  });
+}
+
+export function useUpdateOrganization() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationKey: ["organizations", "update"],
+    mutationFn: ({
+      id,
+      data,
+    }: {
+      id: string;
+      data: OrganizationUpdateRequest;
+    }) => dwctlApi.organizations.update(id, data),
+    onSettled: () => {
+      queryClient.invalidateQueries({
+        queryKey: queryKeys.organizations.all,
+      });
+    },
+  });
+}
+
+export function useDeleteOrganization() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationKey: ["organizations", "delete"],
+    mutationFn: (id: string) => dwctlApi.organizations.delete(id),
+    onSettled: () => {
+      queryClient.invalidateQueries({
+        queryKey: queryKeys.organizations.all,
+      });
+      queryClient.invalidateQueries({
+        queryKey: ["users", "byId", "current"],
+      });
+    },
+  });
+}
+
+export function useInviteMember() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationKey: ["organizations", "inviteMember"],
+    mutationFn: ({
+      orgId,
+      data,
+    }: {
+      orgId: string;
+      data: InviteMemberRequest;
+    }) => dwctlApi.organizations.inviteMember(orgId, data),
+    onSettled: (_data, _error, variables) => {
+      queryClient.invalidateQueries({
+        queryKey: queryKeys.organizations.members(variables.orgId),
+      });
+      queryClient.invalidateQueries({
+        queryKey: queryKeys.organizations.byId(variables.orgId),
+      });
+    },
+  });
+}
+
+export function useCancelInvite() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationKey: ["organizations", "cancelInvite"],
+    mutationFn: ({
+      orgId,
+      inviteId,
+    }: {
+      orgId: string;
+      inviteId: string;
+    }) => dwctlApi.organizations.cancelInvite(orgId, inviteId),
+    onSettled: (_data, _error, variables) => {
+      queryClient.invalidateQueries({
+        queryKey: queryKeys.organizations.members(variables.orgId),
+      });
+    },
+  });
+}
+
+export function useInviteDetails(token: string, options?: { enabled?: boolean }) {
+  const { enabled = true } = options || {};
+  return useQuery({
+    queryKey: ["organizations", "invite", token],
+    queryFn: () => dwctlApi.organizations.getInviteDetails(token),
+    enabled: !!token && enabled,
+  });
+}
+
+export function useAcceptInvite() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationKey: ["organizations", "acceptInvite"],
+    mutationFn: (token: string) => dwctlApi.organizations.acceptInvite(token),
+    onSettled: () => {
+      queryClient.invalidateQueries({
+        queryKey: queryKeys.organizations.all,
+      });
+      queryClient.invalidateQueries({
+        queryKey: ["users", "byId", "current"],
+      });
+    },
+  });
+}
+
+export function useDeclineInvite() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationKey: ["organizations", "declineInvite"],
+    mutationFn: (token: string) => dwctlApi.organizations.declineInvite(token),
+    onSettled: () => {
+      queryClient.invalidateQueries({
+        queryKey: queryKeys.organizations.all,
+      });
+    },
+  });
+}
+
+export function useUpdateMemberRole() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationKey: ["organizations", "updateMemberRole"],
+    mutationFn: ({
+      orgId,
+      userId,
+      role,
+    }: {
+      orgId: string;
+      userId: string;
+      role: OrgMemberRole;
+    }) => dwctlApi.organizations.updateMemberRole(orgId, userId, { role }),
+    onSettled: (_data, _error, variables) => {
+      queryClient.invalidateQueries({
+        queryKey: queryKeys.organizations.members(variables.orgId),
+      });
+    },
+  });
+}
+
+export function useRemoveMember() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationKey: ["organizations", "removeMember"],
+    mutationFn: ({ orgId, userId }: { orgId: string; userId: string }) =>
+      dwctlApi.organizations.removeMember(orgId, userId),
+    onSettled: (_data, _error, variables) => {
+      queryClient.invalidateQueries({
+        queryKey: queryKeys.organizations.members(variables.orgId),
+      });
+      queryClient.invalidateQueries({
+        queryKey: queryKeys.organizations.byId(variables.orgId),
+      });
+    },
   });
 }

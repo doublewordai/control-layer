@@ -201,7 +201,7 @@ pub async fn create_sample_files_for_new_user<P: PoolProvider>(state: &AppState<
     // Get the user's batch API key
     let mut api_keys_repo = ApiKeys::new(&mut conn);
     let api_key = api_keys_repo
-        .get_or_create_hidden_key(user_id, ApiKeyPurpose::Batch)
+        .get_or_create_hidden_key(user_id, ApiKeyPurpose::Batch, user_id)
         .await
         .map_err(Error::Database)?;
 
@@ -347,22 +347,30 @@ pub async fn login<P: PoolProvider>(State(state): State<AppState<P>>, Json(reque
 )]
 #[tracing::instrument(skip_all)]
 pub async fn logout<P: PoolProvider>(State(state): State<AppState<P>>) -> Result<LogoutResponse, Error> {
-    // Create expired cookie to clear session
-    let secure = if state.config.auth.native.session.cookie_secure {
-        "; Secure"
-    } else {
-        ""
-    };
+    let session_config = &state.config.auth.native.session;
+    let secure = if session_config.cookie_secure { "; Secure" } else { "" };
+
+    // Clear session cookie
     let cookie = format!(
-        "{}=; Path=/; HttpOnly{}; SameSite=Strict; Max-Age=0",
-        state.config.auth.native.session.cookie_name, secure
+        "{}=; Path=/; HttpOnly{}; SameSite={}; Max-Age=0",
+        session_config.cookie_name, secure, session_config.cookie_same_site
+    );
+
+    // Also clear the active organization cookie
+    let org_cookie = format!(
+        "dw_active_org=; Path=/; HttpOnly{}; SameSite={}; Max-Age=0",
+        secure, session_config.cookie_same_site
     );
 
     let auth_response = AuthSuccessResponse {
         message: "Logout successful".to_string(),
     };
 
-    Ok(LogoutResponse { auth_response, cookie })
+    Ok(LogoutResponse {
+        auth_response,
+        cookie,
+        extra_cookies: vec![org_cookie],
+    })
 }
 
 /// Request password reset (send email)
@@ -485,6 +493,8 @@ pub async fn confirm_password_reset<P: PoolProvider>(
         password_hash: Some(new_password_hash),
         batch_notifications_enabled: None,
         low_balance_threshold: None,
+        auto_topup_amount: None,
+        auto_topup_threshold: None,
     };
 
     let mut tx = state.db.write().begin().await.unwrap();
@@ -617,6 +627,8 @@ pub async fn change_password<P: PoolProvider>(
         password_hash: Some(new_password_hash),
         batch_notifications_enabled: None,
         low_balance_threshold: None,
+        auto_topup_amount: None,
+        auto_topup_threshold: None,
     };
 
     user_repo.update(current_user.id, &update_request).await?;

@@ -26,6 +26,16 @@ vi.mock("sonner", () => {
   };
 });
 
+// Mock organization context - tests run in personal (non-org) context
+vi.mock("@/contexts", () => ({
+  useOrganizationContext: () => ({
+    activeOrganizationId: null,
+    activeOrganization: null,
+    isOrgContext: false,
+    setActiveOrganization: vi.fn(),
+  }),
+}));
+
 import { ApiKeys } from "./ApiKeys";
 import { handlers } from "../../../../api/control-layer/mocks/handlers";
 import { toast } from "sonner";

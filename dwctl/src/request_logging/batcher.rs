@@ -100,6 +100,7 @@ pub struct RawAnalyticsRecord {
 struct EnrichedRecord {
     raw: RawAnalyticsRecord,
     user_id: Option<Uuid>,
+    api_key_id: Option<Uuid>,
     access_source: String,
     api_key_purpose: Option<ApiKeyPurpose>,
     provider_name: Option<String>,
@@ -399,14 +400,14 @@ where
         // Enrich each record
         let mut enriched = Vec::with_capacity(buffer.len());
         for raw in buffer.iter().cloned() {
-            let (user_id, access_source, api_key_purpose) = if let Some(ref token) = raw.bearer_token {
-                if let Some((uid, purpose)) = user_map.get(token) {
-                    (Some(*uid), "api_key".to_string(), Some(purpose.clone()))
+            let (user_id, api_key_id, access_source, api_key_purpose) = if let Some(ref token) = raw.bearer_token {
+                if let Some((uid, akid, purpose)) = user_map.get(token) {
+                    (Some(*uid), Some(*akid), "api_key".to_string(), Some(purpose.clone()))
                 } else {
-                    (None, "unknown_api_key".to_string(), None)
+                    (None, None, "unknown_api_key".to_string(), None)
                 }
             } else {
-                (None, "unauthenticated".to_string(), None)
+                (None, None, "unauthenticated".to_string(), None)
             };
 
             if raw.request_model.is_none() && (raw.completion_tokens > 0 || raw.prompt_tokens > 0) {
@@ -444,6 +445,7 @@ where
             enriched.push(EnrichedRecord {
                 raw,
                 user_id,
+                api_key_id,
                 access_source,
                 api_key_purpose,
                 provider_name,
@@ -457,21 +459,22 @@ where
 
     /// Batch lookup user info by bearer tokens.
     #[tracing::instrument(skip_all)]
-    async fn batch_lookup_users(&self, tokens: &[&str]) -> Result<HashMap<String, (Uuid, ApiKeyPurpose)>, sqlx::Error> {
+    async fn batch_lookup_users(&self, tokens: &[&str]) -> Result<HashMap<String, (Uuid, Uuid, ApiKeyPurpose)>, sqlx::Error> {
         let tokens_vec: Vec<String> = tokens.iter().map(|s| s.to_string()).collect();
 
         struct UserRow {
             secret: String,
             user_id: Uuid,
+            api_key_id: Uuid,
             purpose: String,
         }
 
         let rows: Vec<UserRow> = sqlx::query_as!(
             UserRow,
             r#"
-            SELECT ak.secret, ak.user_id, ak.purpose
+            SELECT ak.secret, ak.user_id, ak.id as api_key_id, ak.purpose
             FROM api_keys ak
-            WHERE ak.secret = ANY($1)
+            WHERE ak.secret = ANY($1) AND ak.is_deleted = false
             "#,
             &tokens_vec
         )
@@ -481,7 +484,7 @@ where
         let mut map = HashMap::with_capacity(rows.len());
         for row in rows {
             let purpose = parse_api_key_purpose(&row.purpose);
-            map.insert(row.secret, (row.user_id, purpose));
+            map.insert(row.secret, (row.user_id, row.api_key_id, purpose));
         }
 
         trace!(count = map.len(), "Batch lookup users completed");
@@ -667,6 +670,7 @@ where
         let mut request_origins: Vec<String> = Vec::with_capacity(records.len());
         let mut batch_slas: Vec<String> = Vec::with_capacity(records.len());
         let mut batch_request_sources: Vec<String> = Vec::with_capacity(records.len());
+        let mut api_key_ids: Vec<Option<Uuid>> = Vec::with_capacity(records.len());
 
         for record in records {
             instance_ids.push(record.raw.instance_id);
@@ -695,6 +699,7 @@ where
 
             batch_slas.push(record.raw.batch_completion_window.clone().unwrap_or_default());
             batch_request_sources.push(record.raw.batch_request_source.clone());
+            api_key_ids.push(record.api_key_id);
         }
 
         let rows = sqlx::query!(
@@ -704,14 +709,14 @@ where
                 status_code, duration_ms, duration_to_first_byte_ms, prompt_tokens, completion_tokens,
                 total_tokens, response_type, user_id, access_source,
                 input_price_per_token, output_price_per_token, fusillade_batch_id, fusillade_request_id, custom_id,
-                request_origin, batch_sla, batch_request_source
+                request_origin, batch_sla, batch_request_source, api_key_id
             )
             SELECT * FROM UNNEST(
                 $1::uuid[], $2::bigint[], $3::timestamptz[], $4::text[], $5::text[], $6::text[],
                 $7::int[], $8::bigint[], $9::bigint[], $10::bigint[], $11::bigint[],
                 $12::bigint[], $13::text[], $14::uuid[], $15::text[],
                 $16::numeric[], $17::numeric[], $18::uuid[], $19::uuid[], $20::text[],
-                $21::text[], $22::text[], $23::text[]
+                $21::text[], $22::text[], $23::text[], $24::uuid[]
             )
             ON CONFLICT (instance_id, correlation_id)
             DO UPDATE SET
@@ -731,7 +736,8 @@ where
                 custom_id = EXCLUDED.custom_id,
                 request_origin = EXCLUDED.request_origin,
                 batch_sla = EXCLUDED.batch_sla,
-                batch_request_source = EXCLUDED.batch_request_source
+                batch_request_source = EXCLUDED.batch_request_source,
+                api_key_id = EXCLUDED.api_key_id
             RETURNING id, instance_id, correlation_id
             "#,
             &instance_ids,
@@ -757,6 +763,7 @@ where
             &request_origins,
             &batch_slas,
             &batch_request_sources,
+            &api_key_ids as &[Option<Uuid>],
         )
         .fetch_all(&mut **tx)
         .await?;
@@ -791,6 +798,7 @@ where
         let mut descriptions: Vec<Option<String>> = Vec::new();
         let mut fusillade_batch_ids: Vec<Option<Uuid>> = Vec::new();
         let mut models: Vec<String> = Vec::new();
+        let mut api_key_ids_credit: Vec<Option<Uuid>> = Vec::new();
 
         for record in records {
             // Skip if no user or no pricing
@@ -836,6 +844,7 @@ where
             )));
             fusillade_batch_ids.push(record.raw.fusillade_batch_id);
             models.push(model);
+            api_key_ids_credit.push(record.api_key_id);
         }
 
         if user_ids.is_empty() {
@@ -854,9 +863,9 @@ where
         // Batch INSERT with RETURNING source_id to know exactly which were inserted
         let inserted_rows = sqlx::query_scalar!(
             r#"
-            INSERT INTO credits_transactions (user_id, transaction_type, amount, source_id, description, fusillade_batch_id)
+            INSERT INTO credits_transactions (user_id, transaction_type, amount, source_id, description, fusillade_batch_id, api_key_id)
             SELECT * FROM UNNEST(
-                $1::uuid[], $2::text[], $3::numeric[], $4::text[], $5::text[], $6::uuid[]
+                $1::uuid[], $2::text[], $3::numeric[], $4::text[], $5::text[], $6::uuid[], $7::uuid[]
             )
             ON CONFLICT (source_id) DO NOTHING
             RETURNING source_id
@@ -867,6 +876,7 @@ where
             &source_ids,
             &descriptions as &[Option<String>],
             &fusillade_batch_ids as &[Option<Uuid>],
+            &api_key_ids_credit as &[Option<Uuid>],
         )
         .fetch_all(&mut **tx)
         .await?;
@@ -1551,6 +1561,7 @@ mod integration_tests {
                     source_id: format!("test-topup-{}", Uuid::new_v4()),
                     description: Some("Test topup".to_string()),
                     fusillade_batch_id: None,
+                    api_key_id: None,
                 })
                 .await
                 .unwrap();
@@ -1574,6 +1585,7 @@ mod integration_tests {
                 purpose,
                 requests_per_second: None,
                 burst_size: None,
+                created_by: user_id,
             })
             .await
             .unwrap();

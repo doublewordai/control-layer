@@ -97,6 +97,21 @@
         "ordinal": 18,
         "name": "low_balance_threshold",
         "type_info": "Float4"
+      },
+      {
+        "ordinal": 19,
+        "name": "user_type",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 20,
+        "name": "auto_topup_amount",
+        "type_info": "Float4"
+      },
+      {
+        "ordinal": 21,
+        "name": "auto_topup_threshold",
+        "type_info": "Float4"
       }
     ],
     "parameters": {
@@ -131,6 +146,9 @@
       false,
       false,
       false,
+      true,
+      false,
+      true,
       true
     ]
   },

@@ -1,0 +1,18 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"></head>
+<body style="font-family: system-ui, sans-serif; max-width: 600px; margin: 40px auto; padding: 20px; color: #333;">
+    <p>Hi {{ to_name }},</p>
+
+    <p>We attempted to automatically top up your account with <strong>${{ amount }}</strong>, but the payment failed.</p>
+
+    <p>This may be because your card was declined, expired, or has insufficient funds.</p>
+
+    <p>To keep your workflows running, please <a href="{{ dashboard_link }}">add funds manually</a> or update your payment method.</p>
+
+    <p style="font-size: 12px; color: #888; margin-top: 30px; border-top: 1px solid #eee; padding-top: 15px;">
+        You're receiving this because you have auto top-up enabled on your account.
+        <a href="{{ profile_link }}">Manage notification preferences</a>
+    </p>
+</body>
+</html>

@@ -1037,6 +1037,7 @@ pub async fn build_router(
         .route("/payments", post(api::handlers::payments::create_payment))
         .route("/payments/{id}", patch(api::handlers::payments::process_payment))
         .route("/billing-portal", post(api::handlers::payments::create_billing_portal_session))
+        .route("/auto-topup/enable", post(api::handlers::payments::enable_auto_topup))
         // Inference endpoints management (admin only for write operations)
         .route("/endpoints", get(api::handlers::inference_endpoints::list_inference_endpoints))
         .route("/endpoints", post(api::handlers::inference_endpoints::create_inference_endpoint))
@@ -1101,6 +1102,48 @@ pub async fn build_router(
             delete(api::handlers::groups::remove_deployment_from_group),
         )
         .route("/models/{deployment_id}/groups", get(api::handlers::groups::get_deployment_groups))
+        // Organization management
+        .route("/organizations", get(api::handlers::organizations::list_organizations))
+        .route("/organizations", post(api::handlers::organizations::create_organization))
+        .route("/organizations/{id}", get(api::handlers::organizations::get_organization))
+        .route("/organizations/{id}", patch(api::handlers::organizations::update_organization))
+        .route("/organizations/{id}", delete(api::handlers::organizations::delete_organization))
+        // Organization membership
+        .route("/organizations/{id}/members", get(api::handlers::organizations::list_members))
+        .route("/organizations/{id}/members", post(api::handlers::organizations::add_member))
+        .route(
+            "/organizations/{id}/members/{user_id}",
+            patch(api::handlers::organizations::update_member_role),
+        )
+        .route(
+            "/organizations/{id}/members/{user_id}",
+            delete(api::handlers::organizations::remove_member),
+        )
+        // Organization invites
+        .route("/organizations/{id}/invites", post(api::handlers::organizations::invite_member))
+        .route(
+            "/organizations/{id}/invites/{invite_id}",
+            delete(api::handlers::organizations::cancel_invite),
+        )
+        .route(
+            "/organizations/invites/{token}",
+            get(api::handlers::organizations::get_invite_details),
+        )
+        .route(
+            "/organizations/invites/{token}/accept",
+            post(api::handlers::organizations::accept_invite),
+        )
+        .route(
+            "/organizations/invites/{token}/decline",
+            post(api::handlers::organizations::decline_invite),
+        )
+        // User's organizations (sub-resource on users)
+        .route(
+            "/users/{user_id}/organizations",
+            get(api::handlers::organizations::list_user_organizations),
+        )
+        // Organization session context (validates membership, client stores org ID for X-Organization-Id header)
+        .route("/session/organization", post(api::handlers::organizations::set_active_organization))
         .route("/requests", get(api::handlers::requests::list_requests))
         .route("/requests/aggregate", get(api::handlers::requests::aggregate_requests))
         .route("/requests/aggregate-by-user", get(api::handlers::requests::aggregate_by_user))
