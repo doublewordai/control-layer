@@ -19,6 +19,7 @@ import {
   Radio,
   ArrowUpToLine,
   ArrowDownToLine,
+  Brain,
 } from "lucide-react";
 import {
   useModels,
@@ -68,6 +69,11 @@ const COMPLETION_WINDOWS: Record<
 > = {
   "1h": { label: "High", icon: Zap, sort: 0 },
   "24h": { label: "Standard", icon: Clock, sort: 1 },
+};
+
+const formatReleaseDate = (dateStr: string): string => {
+  const date = new Date(dateStr + "T00:00:00");
+  return date.toLocaleDateString("en-US", { month: "short", year: "numeric" });
 };
 
 const CopyableModelName: React.FC<{
@@ -325,7 +331,7 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                 probesData={probesData}
                 onNavigate={(modelId: string) =>
                   navigate(
-                    `/models/${modelId}?from=${encodeURIComponent("/models?view=status")}`,
+                    `/models/manage/${modelId}?from=${encodeURIComponent("/models/manage?view=status")}`,
                   )
                 }
               />
@@ -368,13 +374,13 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                     className="cursor-pointer hover:bg-gray-50 transition-colors group grow flex flex-col min-w-0"
                     onClick={() => {
                       navigate(
-                        `/models/${model.id}?from=${encodeURIComponent("/models")}`,
+                        `/models/manage/${model.id}?from=${encodeURIComponent("/models/manage")}`,
                       );
                     }}
                   >
                     <CardHeader className="px-6 pt-5 pb-0">
                       <div
-                        className={`min-w-0 ${canViewEndpoints ? "space-y-0" : "space-y-2"}`}
+                        className="min-w-0"
                       >
                         {/* ROW 1: Alias on left, groups/chevron on right */}
                         <div className="flex items-center justify-between gap-1">
@@ -481,14 +487,14 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                               </HoverCard>
                             )}
 
-                            {model.metrics && (
+                            {model.description && (
                               <HoverCard openDelay={200} closeDelay={100}>
                                 <HoverCardTrigger asChild>
                                   <button
-                                    className="text-gray-500 hover:text-gray-700 transition-colors p-1"
+                                    className="text-gray-400 hover:text-gray-600 transition-colors p-1"
                                     onClick={(e) => e.stopPropagation()}
                                   >
-                                    <Info className="h-4 w-4" />
+                                    <Info className="h-3.5 w-3.5" />
                                     <span className="sr-only">
                                       View model description
                                     </span>
@@ -498,18 +504,12 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                                   className="w-96 max-h-80 overflow-y-auto"
                                   sideOffset={5}
                                 >
-                                  {model.description ? (
-                                    <Markdown
-                                      className="text-sm text-muted-foreground"
-                                      compact
-                                    >
-                                      {model.description}
-                                    </Markdown>
-                                  ) : (
-                                    <p className="text-sm text-muted-foreground">
-                                      No description provided
-                                    </p>
-                                  )}
+                                  <Markdown
+                                    className="text-sm text-muted-foreground"
+                                    compact
+                                  >
+                                    {model.description}
+                                  </Markdown>
                                 </HoverCardContent>
                               </HoverCard>
                             )}
@@ -608,33 +608,81 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                           )}
                         </div>
 
-                        {/* ROW 2: Endpoint or Hosted Model Count (only for platform managers) */}
-                        {canManageGroups && model.is_composite ? (
-                          <CardDescription className="flex items-center gap-1.5 min-w-0 mb-2">
-                            <span className="text-gray-600 text-sm">
-                              <span className="font-medium">
-                                {model.components?.length || 0} hosted model
-                                {(model.components?.length || 0) !== 1
-                                  ? "s"
-                                  : ""}
-                              </span>
-                            </span>
-                          </CardDescription>
-                        ) : (
-                          !model.is_composite &&
-                          canViewEndpoints &&
-                          model.endpoint && (
-                            <CardDescription className="flex items-center gap-1.5 min-w-0 mb-2">
-                              <span className="text-gray-600 text-sm">
-                                <span className="font-medium">
-                                  {model.endpoint.name}
-                                </span>
-                              </span>
-                            </CardDescription>
-                          )
+                        {/* ROW 2: Intelligence + capability badges */}
+                        {((model.capabilities && model.capabilities.length > 0) || model.metadata?.intelligence_index != null) && (
+                          <div className="flex items-center gap-1.5 mt-1.5">
+                            {model.metadata?.intelligence_index != null && (
+                              <Tooltip>
+                                <TooltipTrigger asChild>
+                                  <div className="flex items-center gap-1 cursor-default">
+                                    <Brain className="w-3 h-3 text-gray-400" />
+                                    <div className="flex items-end gap-[2px] h-4">
+                                      {[12, 24, 36, 45].map((threshold, i) => (
+                                        <div
+                                          key={threshold}
+                                          className={`w-[3px] rounded-sm ${
+                                            model.metadata!.intelligence_index! >= threshold
+                                              ? "bg-gray-500"
+                                              : "bg-gray-200"
+                                          }`}
+                                          style={{ height: `${6 + i * 3}px` }}
+                                        />
+                                      ))}
+                                    </div>
+                                  </div>
+                                </TooltipTrigger>
+                                <TooltipContent side="top" className="text-xs">
+                                  Intelligence: {Math.round(model.metadata.intelligence_index)}
+                                </TooltipContent>
+                              </Tooltip>
+                            )}
+                            {model.capabilities?.map((cap) => (
+                              <Badge
+                                key={cap}
+                                variant="outline"
+                                className="text-[11px] px-1.5 py-0 h-5 font-normal text-gray-500 border-gray-200 bg-transparent"
+                              >
+                                {cap.charAt(0).toUpperCase() + cap.slice(1)}
+                              </Badge>
+                            ))}
+                          </div>
                         )}
 
-                        {/* ROW 3: Access tiers */}
+                        {/* ROW 3: Provider, endpoint, release date */}
+                        {(model.metadata?.provider || (canViewEndpoints && model.endpoint) || (canManageGroups && model.is_composite)) && (
+                          <CardDescription className="flex items-center gap-1.5 min-w-0 mt-1 mb-1">
+                            <span className="text-gray-500 text-sm">
+                              {canManageGroups && model.is_composite ? (
+                                <span className="font-medium text-gray-600">
+                                  {model.components?.length || 0} hosted model
+                                  {(model.components?.length || 0) !== 1 ? "s" : ""}
+                                </span>
+                              ) : (
+                                <>
+                                  {model.metadata?.provider && (
+                                    <span className="font-medium text-gray-600">{model.metadata.provider}</span>
+                                  )}
+                                  {model.metadata?.provider && canViewEndpoints && model.endpoint && (
+                                    <span className="text-gray-400"> via </span>
+                                  )}
+                                  {canViewEndpoints && model.endpoint && !model.is_composite && (
+                                    <span className={model.metadata?.provider ? "" : "font-medium text-gray-600"}>
+                                      {model.endpoint.name}
+                                    </span>
+                                  )}
+                                </>
+                              )}
+                              {model.metadata?.released_at && (
+                                <>
+                                  <span className="text-gray-300 mx-0.5">&middot;</span>
+                                  <span>{formatReleaseDate(model.metadata.released_at)}</span>
+                                </>
+                              )}
+                            </span>
+                          </CardDescription>
+                        )}
+
+                        {/* ROW 4: Access tiers */}
                         <CardDescription className="flex items-center flex-wrap gap-1.5 min-w-0">
                           {showPricing && (
                             <>
@@ -780,113 +828,40 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                     </CardHeader>
 
                     <CardContent className="grow px-0 pt-0 pb-0 flex flex-col">
+                      {/* Metrics */}
                       {model.metrics ? (
-                        <div
-                          className="flex gap-6 items-center px-6 pb-4"
-                          style={{ minHeight: "90px" }}
-                        >
+                        <div className="flex gap-6 items-center px-6 pb-4">
                           <div className="flex-1">
                             <div className="grid grid-cols-2 gap-2 text-xs">
                               <div className="flex items-center gap-1.5">
-                                <HoverCard openDelay={200} closeDelay={100}>
-                                  <HoverCardTrigger asChild>
-                                    <BarChart3 className="h-3.5 w-3.5 text-gray-500 " />
-                                  </HoverCardTrigger>
-                                  <HoverCardContent
-                                    className="w-40"
-                                    sideOffset={5}
-                                  >
-                                    <p className="text-xs text-muted-foreground">
-                                      Total requests made to this model
-                                    </p>
-                                  </HoverCardContent>
-                                </HoverCard>
+                                <BarChart3 className="h-3.5 w-3.5 text-gray-400 shrink-0" />
                                 <span className="text-gray-600">
-                                  {formatNumber(model.metrics.total_requests)}{" "}
-                                  requests
+                                  {formatNumber(model.metrics.total_requests)} requests
                                 </span>
                               </div>
-
                               <div className="flex items-center gap-1.5">
-                                <HoverCard openDelay={200} closeDelay={100}>
-                                  <HoverCardTrigger asChild>
-                                    <Activity className="h-3.5 w-3.5 text-gray-500 " />
-                                  </HoverCardTrigger>
-                                  <HoverCardContent
-                                    className="w-40"
-                                    sideOffset={5}
-                                  >
-                                    <p className="text-xs text-muted-foreground">
-                                      Average response time across all requests
-                                    </p>
-                                  </HoverCardContent>
-                                </HoverCard>
+                                <Activity className="h-3.5 w-3.5 text-gray-400 shrink-0" />
                                 <span className="text-gray-600">
-                                  {formatLatency(model.metrics.avg_latency_ms)}{" "}
-                                  avg
+                                  {formatLatency(model.metrics.avg_latency_ms)} avg
                                 </span>
                               </div>
-
                               <div className="flex items-center gap-1.5">
-                                <HoverCard openDelay={200} closeDelay={100}>
-                                  <HoverCardTrigger asChild>
-                                    <ArrowUpDown className="h-3.5 w-3.5 text-gray-500 " />
-                                  </HoverCardTrigger>
-                                  <HoverCardContent
-                                    className="w-48"
-                                    sideOffset={5}
-                                  >
-                                    <div className="text-xs text-muted-foreground">
-                                      <p>
-                                        Input:{" "}
-                                        {formatNumber(
-                                          model.metrics.total_input_tokens,
-                                        )}
-                                      </p>
-                                      <p>
-                                        Output:{" "}
-                                        {formatNumber(
-                                          model.metrics.total_output_tokens,
-                                        )}
-                                      </p>
-                                      <p className="mt-1 font-medium">
-                                        Total tokens processed
-                                      </p>
-                                    </div>
-                                  </HoverCardContent>
-                                </HoverCard>
+                                <ArrowUpDown className="h-3.5 w-3.5 text-gray-400 shrink-0" />
                                 <span className="text-gray-600">
                                   {formatNumber(
                                     model.metrics.total_input_tokens +
                                       model.metrics.total_output_tokens,
-                                  )}{" "}
-                                  tokens
+                                  )} tokens
                                 </span>
                               </div>
-
                               <div className="flex items-center gap-1.5">
-                                <HoverCard openDelay={200} closeDelay={100}>
-                                  <HoverCardTrigger asChild>
-                                    <Clock className="h-3.5 w-3.5 text-gray-500 " />
-                                  </HoverCardTrigger>
-                                  <HoverCardContent
-                                    className="w-36"
-                                    sideOffset={5}
-                                  >
-                                    <p className="text-xs text-muted-foreground">
-                                      Last request received
-                                    </p>
-                                  </HoverCardContent>
-                                </HoverCard>
+                                <Clock className="h-3.5 w-3.5 text-gray-400 shrink-0" />
                                 <span className="text-gray-600">
-                                  {formatRelativeTime(
-                                    model.metrics.last_active_at,
-                                  )}
+                                  {formatRelativeTime(model.metrics.last_active_at)}
                                 </span>
                               </div>
                             </div>
                           </div>
-
                           <div className="flex-1 flex items-center justify-center px-2">
                             <div className="w-full max-w-[200px] min-w-[120px]">
                               <Sparkline
@@ -899,10 +874,7 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                           </div>
                         </div>
                       ) : canViewAnalytics && metricsLoading ? (
-                        <div
-                          className="flex gap-6 items-center px-6 pb-4"
-                          style={{ minHeight: "90px" }}
-                        >
+                        <div className="flex gap-6 items-center px-6 pb-4">
                           <div className="flex-1">
                             <div className="grid grid-cols-2 gap-3">
                               <Skeleton className="h-4 w-24" />
@@ -916,52 +888,7 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                           </div>
                         </div>
                       ) : (
-                        <div
-                          className="px-6 pb-4"
-                          style={{ minHeight: "90px" }}
-                        >
-                          {model.description ? (
-                            <div className="text-sm text-gray-700 break-words [&_p]:inline">
-                              <Markdown className="inline" compact>
-                                {(() => {
-                                  const firstLine =
-                                    model.description.split("\n")[0];
-                                  const hasMore =
-                                    firstLine.length > 120 ||
-                                    model.description.split("\n").length >
-                                      1;
-                                  const maxChars = 120;
-                                  if (!hasMore) return firstLine;
-                                  let truncated = firstLine.substring(
-                                    0,
-                                    maxChars,
-                                  );
-                                  const lastSpace =
-                                    truncated.lastIndexOf(" ");
-                                  if (lastSpace > 0) {
-                                    truncated = truncated.substring(
-                                      0,
-                                      lastSpace,
-                                    );
-                                  }
-                                  return truncated + "…";
-                                })()}
-                              </Markdown>
-                              {(model.description.split("\n")[0].length >
-                                120 ||
-                                model.description.split("\n").length > 1) && (
-                                <span className="italic text-gray-400 group-hover:underline decoration-gray-300">
-                                  {" "}
-                                  read more
-                                </span>
-                              )}
-                            </div>
-                          ) : (
-                            <p className="text-sm text-gray-700">
-                              No description provided
-                            </p>
-                          )}
-                        </div>
+                        <div className="pb-3" />
                       )}
                     </CardContent>
                   </div>
@@ -988,7 +915,7 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                               className="flex items-center justify-center gap-1.5 py-3.5 text-sm font-medium text-gray-600 hover:bg-gray-50 hover:text-gray-700 transition-colors rounded-br-lg group"
                               onClick={() => {
                                 navigate(
-                                  `/playground?model=${encodeURIComponent(model.alias)}&from=${encodeURIComponent("/models")}`,
+                                  `/playground?model=${encodeURIComponent(model.id)}&from=${encodeURIComponent("/models/manage")}`,
                                 );
                               }}
                             >

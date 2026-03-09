@@ -293,13 +293,14 @@ describe("dwctlApi.models", () => {
 
     it("should construct URL correctly with multiple parameters", async () => {
       const response = await dwctlApi.models.list({
-        endpoint: "c3d4e5f6-7890-1234-5678-90abcdef0123",
+        endpoint: "a1b2c3d4-e5f6-7890-1234-567890abcdef",
         include: "groups",
       });
 
       expect(
         response.data.every(
-          (model) => model.hosted_on === "c3d4e5f6-7890-1234-5678-90abcdef0123",
+          (model) =>
+            model.hosted_on === "a1b2c3d4-e5f6-7890-1234-567890abcdef",
         ),
       ).toBe(true);
       expect(response.data[0]).toHaveProperty("groups");
@@ -308,7 +309,7 @@ describe("dwctlApi.models", () => {
 
   describe("get", () => {
     it("should fetch specific model", async () => {
-      const modelId = "f914c573-4c00-4a37-a878-53318a6d5a5b";
+      const modelId = "d1a2b3c4-e5f6-4a7b-8c9d-0e1f2a3b4c5d";
       const model = await dwctlApi.models.get(modelId);
 
       expect(model).toHaveProperty("id", modelId);
@@ -327,7 +328,7 @@ describe("dwctlApi.models", () => {
 
   describe("update", () => {
     it("should update model properties", async () => {
-      const modelId = "f914c573-4c00-4a37-a878-53318a6d5a5b";
+      const modelId = "d1a2b3c4-e5f6-4a7b-8c9d-0e1f2a3b4c5d";
       const updateData: ModelUpdateRequest = {
         alias: "Updated Claude",
         description: "Updated description",
@@ -342,7 +343,7 @@ describe("dwctlApi.models", () => {
     });
 
     it("should handle null values in updates", async () => {
-      const modelId = "4c561f35-4823-4d25-aa70-72bbf314a6ba";
+      const modelId = "d2a3b4c5-e6f7-4a8b-9c0d-1e2f3a4b5c6d";
       const updateData: ModelUpdateRequest = {
         description: null,
         model_type: null,
@@ -517,7 +518,7 @@ describe("dwctlApi.groups", () => {
     describe("addModel", () => {
       it("should add model to group", async () => {
         const groupId = "550e8400-e29b-41d4-a716-446655441001";
-        const modelId = "f914c573-4c00-4a37-a878-53318a6d5a5b";
+        const modelId = "d1a2b3c4-e5f6-4a7b-8c9d-0e1f2a3b4c5d";
 
         await expect(
           dwctlApi.groups.addModel(groupId, modelId),
@@ -528,7 +529,7 @@ describe("dwctlApi.groups", () => {
     describe("removeModel", () => {
       it("should remove model from group", async () => {
         const groupId = "550e8400-e29b-41d4-a716-446655441001";
-        const modelId = "f914c573-4c00-4a37-a878-53318a6d5a5b";
+        const modelId = "d1a2b3c4-e5f6-4a7b-8c9d-0e1f2a3b4c5d";
 
         await expect(
           dwctlApi.groups.removeModel(groupId, modelId),
@@ -582,29 +583,24 @@ describe("URL Construction", () => {
 
   it("should handle single query parameters", async () => {
     const usersWithGroups = await dwctlApi.users.list({ include: "groups" });
-    const modelsFiltered = await dwctlApi.models.list({ endpoint: "2" });
+    const modelsWithPricing = await dwctlApi.models.list({
+      include: "pricing",
+    });
 
     expect(usersWithGroups.data[0]).toHaveProperty("groups");
-    expect(modelsFiltered.data.every((model) => model.hosted_on === "2")).toBe(
-      true,
-    );
+    expect(modelsWithPricing.data[0]).toHaveProperty("tariffs");
   });
 
   it("should handle multiple query parameters", async () => {
     const modelsResponse = await dwctlApi.models.list({
-      endpoint: "c3d4e5f6-7890-1234-5678-90abcdef0123",
-      include: "groups",
+      include: "groups,pricing",
     });
     const groupsResponse = await dwctlApi.groups.list({
       include: "users,models",
     });
 
-    expect(
-      modelsResponse.data.every(
-        (model) => model.hosted_on === "c3d4e5f6-7890-1234-5678-90abcdef0123",
-      ),
-    ).toBe(true);
     expect(modelsResponse.data[0]).toHaveProperty("groups");
+    expect(modelsResponse.data[0]).toHaveProperty("tariffs");
 
     expect(groupsResponse.data[0]).toHaveProperty("users");
     expect(groupsResponse.data[0]).toHaveProperty("models");
@@ -617,7 +613,7 @@ describe("Type Safety", () => {
       "550e8400-e29b-41d4-a716-446655440001",
     );
     const model = await dwctlApi.models.get(
-      "f914c573-4c00-4a37-a878-53318a6d5a5b",
+      "d1a2b3c4-e5f6-4a7b-8c9d-0e1f2a3b4c5d",
     );
     const group = await dwctlApi.groups.get(
       "550e8400-e29b-41d4-a716-446655441001",
@@ -634,7 +630,10 @@ describe("Type Safety", () => {
 
     expect(typeof model.id).toBe("string");
     expect(typeof model.alias).toBe("string");
-    expect(typeof model.hosted_on).toBe("string");
+    // Virtual models have hosted_on: null
+    expect(
+      model.hosted_on === null || typeof model.hosted_on === "string",
+    ).toBe(true);
 
     expect(typeof group.id).toBe("string");
     expect(typeof group.name).toBe("string");

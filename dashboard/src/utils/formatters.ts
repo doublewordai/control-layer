@@ -156,6 +156,70 @@ export function formatRelativeTime(dateString?: string): string {
 }
 
 /**
+ * Format a context length in tokens to a human-readable string
+ * e.g. 262144 -> "256k", 32768 -> "32k", 512 -> "512"
+ */
+export function formatContextLength(tokens: number): string {
+  if (tokens >= 1024) {
+    return `${Math.round(tokens / 1024)}k`;
+  }
+  return `${tokens}`;
+}
+
+/**
+ * Derive a user-facing display name for a tariff from its api_key_purpose and completion_window.
+ * Playground tariffs should be filtered out before calling this.
+ */
+export function getTariffDisplayName(
+  apiKeyPurpose: string | null | undefined,
+  completionWindow: string | null | undefined,
+): string {
+  if (apiKeyPurpose === "realtime") return "Realtime";
+  if (apiKeyPurpose === "batch") {
+    if (completionWindow === "1h") return "Priority";
+    return "Standard"; // 24h or any other batch window
+  }
+  return "Realtime"; // fallback for null/undefined purpose
+}
+
+/** Tariff sort order for consistent display: Realtime → Priority → Standard */
+const TARIFF_SORT_ORDER: Record<string, number> = {
+  realtime: 0,
+  "batch:1h": 1,
+  "batch:24h": 2,
+  batch: 3,
+};
+
+function tariffSortKey(
+  apiKeyPurpose: string | null | undefined,
+  completionWindow: string | null | undefined,
+): number {
+  if (apiKeyPurpose === "batch" && completionWindow) {
+    return TARIFF_SORT_ORDER[`batch:${completionWindow}`] ?? 3;
+  }
+  return TARIFF_SORT_ORDER[apiKeyPurpose ?? "realtime"] ?? 0;
+}
+
+/**
+ * Filter out playground tariffs and sort in display order.
+ */
+export function getUserFacingTariffs<
+  T extends {
+    is_active?: boolean;
+    api_key_purpose?: string | null;
+    completion_window?: string | null;
+  },
+>(tariffs: T[]): T[] {
+  return tariffs
+    .filter((t) => t.api_key_purpose !== "playground" && t.is_active !== false)
+    .sort(
+      (a, b) =>
+        tariffSortKey(a.api_key_purpose, a.completion_window) -
+        tariffSortKey(b.api_key_purpose, b.completion_window),
+    );
+}
+
+/**
  * Format a single tariff price (stored as price per token) for display as price per million tokens
  * @param pricePerToken - Price per token as a decimal string (e.g., "0.000001")
  * @returns Formatted price per million tokens (e.g., "$1.00")

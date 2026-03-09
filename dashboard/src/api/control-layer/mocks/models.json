@@ -1,172 +1,579 @@
 {
   "data": [
     {
-      "id": "f914c573-4c00-4a37-a878-53318a6d5a5b",
-      "alias": "claude-sonnet-4",
-      "model_name": "claude-sonnet-4-20250514",
-      "description": "Claude Sonnet 4 by Anthropic - fast, capable chat model",
+      "id": "d1a2b3c4-e5f6-4a7b-8c9d-0e1f2a3b4c5d",
+      "alias": "Qwen/Qwen3.5-397B-A17B-FP8",
+      "model_name": "Qwen/Qwen3.5-397B-A17B-FP8",
+      "description": "Meet Qwen3.5-397B-A17B - released Feb 2026, it is Qwen's most powerful model, delivering performance similar to GPT-5.2 and Claude Opus 4.5 on challenging tasks including advanced reasoning, mathematics, and complex code generation. Offers frontier-level capabilities at a fraction of the cost.\n\n**Best for:**\n- Tasks requiring maximum intelligence\n- Complex analysis\n- Sophisticated coding projects\n- Scenarios where quality justifies the additional cost over smaller models\n\n**Max New Tokens:** 16384\n\n**Max Total Tokens:** 262144\n\n**Sampling Parameters:**\n\nWe have set the default sampling parameters using the recommended values set out by the Qwen team:\n\nWe suggest using Temperature=0.7, TopP=0.8, TopK=20, and MinP=0.\n\nFor supported frameworks, you can adjust the `presence_penalty` parameter between 0 and 2 to reduce endless repetitions. However, using a higher value may occasionally result in language mixing and a slight decrease in model performance.\n\nWe use a default `presence_penalty` of 1.5 to bias the model against endless repetitions, if you still notice this behaviour try increasing the `presence_penalty`.\n\nYou can adjust these on a per-request basis by setting the sampling parameters in the request body.",
       "model_type": "CHAT",
-      "capabilities": ["text"],
-      "hosted_on": "b2c3d4e5-f678-9012-3456-7890abcdef01",
-      "created_by": "550e8400-e29b-41d4-a716-446655440001",
-      "created_at": "2025-06-01T10:00:00Z",
-      "updated_at": "2025-12-15T14:30:00Z",
-      "is_composite": false,
-      "sanitize_responses": false
-    },
-    {
-      "id": "a1b2c3d4-0001-4a37-a878-53318a6d5001",
-      "alias": "claude-opus-4",
-      "model_name": "claude-opus-4-20250514",
-      "description": "Claude Opus 4 by Anthropic - highest capability model",
-      "model_type": "CHAT",
-      "capabilities": ["text"],
-      "hosted_on": "b2c3d4e5-f678-9012-3456-7890abcdef01",
-      "created_by": "550e8400-e29b-41d4-a716-446655440001",
-      "created_at": "2025-06-01T10:00:00Z",
-      "updated_at": "2025-12-15T14:30:00Z",
-      "is_composite": false,
-      "sanitize_responses": false
-    },
-    {
-      "id": "4c561f35-4823-4d25-aa70-72bbf314a6ba",
-      "alias": "gpt-4o",
-      "model_name": "gpt-4o",
-      "description": "OpenAI GPT-4o with vision capabilities",
-      "model_type": "CHAT",
-      "capabilities": ["text", "vision"],
-      "hosted_on": "c3d4e5f6-7890-1234-5678-90abcdef0123",
-      "created_by": "550e8400-e29b-41d4-a716-446655440001",
-      "created_at": "2025-04-15T11:00:00Z",
-      "updated_at": "2025-11-20T09:45:00Z",
-      "is_composite": false,
-      "sanitize_responses": false
-    },
-    {
-      "id": "a1b2c3d4-0002-4a37-a878-53318a6d5002",
-      "alias": "gpt-4o-mini",
-      "model_name": "gpt-4o-mini",
-      "description": "OpenAI GPT-4o Mini - fast and cost-effective",
-      "model_type": "CHAT",
-      "capabilities": ["text", "vision"],
-      "hosted_on": "c3d4e5f6-7890-1234-5678-90abcdef0123",
-      "created_by": "550e8400-e29b-41d4-a716-446655440001",
-      "created_at": "2025-05-20T08:30:00Z",
-      "updated_at": "2025-10-10T16:15:00Z",
-      "is_composite": false,
-      "sanitize_responses": false
-    },
-    {
-      "id": "beb5ecb0-8f93-499f-aae0-a9aee9512adf",
-      "alias": "deepseek-v3",
-      "model_name": "deepseek-v3",
-      "description": "DeepSeek V3 - open-source reasoning model",
-      "model_type": "CHAT",
-      "capabilities": ["text", "reasoning"],
-      "hosted_on": "a1b2c3d4-e5f6-7890-1234-567890abcdef",
-      "created_by": "550e8400-e29b-41d4-a716-446655440001",
-      "created_at": "2025-07-10T14:00:00Z",
-      "updated_at": "2025-12-05T11:30:00Z",
-      "is_composite": false,
-      "sanitize_responses": false
-    },
-    {
-      "id": "a1b2c3d4-0003-4a37-a878-53318a6d5003",
-      "alias": "llama-3.3-70b",
-      "model_name": "meta-llama/Llama-3.3-70B-Instruct",
-      "description": "Meta Llama 3.3 70B - open-weight instruction-tuned model",
-      "model_type": "CHAT",
-      "capabilities": ["text"],
-      "hosted_on": "a1b2c3d4-e5f6-7890-1234-567890abcdef",
-      "created_by": "550e8400-e29b-41d4-a716-446655440001",
-      "created_at": "2025-08-01T09:00:00Z",
-      "updated_at": "2026-01-15T10:20:00Z",
-      "is_composite": false,
-      "sanitize_responses": false
-    },
-    {
-      "id": "a1b2c3d4-0004-4a37-a878-53318a6d5004",
-      "alias": "qwen-2.5-72b",
-      "model_name": "Qwen/Qwen2.5-72B-Instruct",
-      "description": "Qwen 2.5 72B - multilingual instruction-tuned model",
-      "model_type": "CHAT",
-      "capabilities": ["text"],
-      "hosted_on": "a1b2c3d4-e5f6-7890-1234-567890abcdef",
-      "created_by": "550e8400-e29b-41d4-a716-446655440001",
-      "created_at": "2025-09-12T13:45:00Z",
-      "updated_at": "2026-01-08T15:00:00Z",
-      "is_composite": false,
-      "sanitize_responses": true
-    },
-    {
-      "id": "a1b2c3d4-0005-4a37-a878-53318a6d5005",
-      "alias": "gemini-2.0-flash",
-      "model_name": "gemini-2.0-flash",
-      "description": "Google Gemini 2.0 Flash - fast multimodal model",
-      "model_type": "CHAT",
-      "capabilities": ["text", "vision"],
-      "hosted_on": "e5f6a7b8-9012-3456-7890-abcdef012345",
-      "created_by": "550e8400-e29b-41d4-a716-446655440001",
-      "created_at": "2025-10-05T10:30:00Z",
-      "updated_at": "2026-02-01T08:15:00Z",
-      "is_composite": false,
-      "sanitize_responses": false
-    },
-    {
-      "id": "a1b2c3d4-0006-4a37-a878-53318a6d5006",
-      "alias": "smart-router",
-      "model_name": "smart-router",
-      "description": "Composite model - routes to best available model based on task",
-      "model_type": "CHAT",
-      "capabilities": ["text", "vision"],
+      "capabilities": [
+        "vision",
+        "reasoning"
+      ],
       "hosted_on": null,
-      "created_by": "550e8400-e29b-41d4-a716-446655440001",
-      "created_at": "2025-11-20T16:00:00Z",
-      "updated_at": "2026-02-10T12:00:00Z",
       "is_composite": true,
-      "sanitize_responses": false
+      "lb_strategy": "weighted_random",
+      "fallback": {
+        "enabled": true,
+        "on_rate_limit": true,
+        "on_status": [
+          502,
+          503
+        ],
+        "with_replacement": false,
+        "max_attempts": null
+      },
+      "sanitize_responses": false,
+      "metadata": {
+        "provider": "Alibaba",
+        "intelligence_index": 45.0,
+        "context_window": 262144,
+        "released_at": "2026-02-16",
+        "attribution": "artificial_analysis",
+        "extra": {
+          "evaluations": {
+            "artificial_analysis_coding_index": 41.3,
+            "gpqa": 0.893,
+            "hle": 0.273,
+            "ifbench": 0.788,
+            "lcr": 0.657,
+            "scicode": 0.42,
+            "tau2": 0.956,
+            "terminalbench_hard": 0.409
+          },
+          "summary": "Qwen's most powerful model, delivering performance similar to GPT-5.2 and Claude Opus 4.5 on challenging tasks.",
+          "use_cases": [
+            "Research & analysis",
+            "Complex reasoning",
+            "Sophisticated coding",
+            "Max performance tasks"
+          ]
+        }
+      }
     },
     {
-      "id": "c9d0e1f2-3456-7890-1234-cdef12345678",
-      "alias": "text-embedding-3-small",
-      "model_name": "text-embedding-3-small",
-      "description": "OpenAI text embeddings model - 1536 dimensions",
+      "id": "d2a3b4c5-e6f7-4a8b-9c0d-1e2f3a4b5c6d",
+      "alias": "Qwen/Qwen3.5-35B-A3B-FP8",
+      "model_name": "Qwen/Qwen3.5-35B-A3B-FP8",
+      "description": "Qwen3.5-35B-A3B is a high-intelligence, mid-sized model that hits a very compelling price/performance point for async workloads. In Qwen's published benchmarks, this model outperformed GPT-5-mini, GPT-OSS-120B, and Claude Sonnet 4.5.\n\n**Thinking Mode:**\n\nThis model reasons step-by-step before responding by default. To disable thinking, include the following in your request body: `\"chat_template_kwargs\": {\"enable_thinking\": false}` This model does not support graduated thinking levels. Parameters such as `reasoning_effort` are not supported and will have no effect.",
+      "model_type": "CHAT",
+      "capabilities": [
+        "vision",
+        "reasoning"
+      ],
+      "hosted_on": null,
+      "is_composite": true,
+      "lb_strategy": "weighted_random",
+      "fallback": {
+        "enabled": true,
+        "on_rate_limit": true,
+        "on_status": [
+          502,
+          503
+        ],
+        "with_replacement": false,
+        "max_attempts": null
+      },
+      "sanitize_responses": false,
+      "metadata": {
+        "provider": "Alibaba",
+        "intelligence_index": 37.1,
+        "context_window": 262144,
+        "released_at": "2026-02-24",
+        "attribution": "artificial_analysis",
+        "extra": {
+          "evaluations": {
+            "artificial_analysis_coding_index": 30.3,
+            "gpqa": 0.845,
+            "hle": 0.197,
+            "ifbench": 0.725,
+            "lcr": 0.627,
+            "scicode": 0.377,
+            "tau2": 0.892,
+            "terminalbench_hard": 0.265
+          },
+          "summary": "High-intelligence mid-sized model with a compelling price/performance point for async workloads.",
+          "use_cases": [
+            "Async batch workloads",
+            "Reasoning tasks",
+            "Cost-effective intelligence"
+          ]
+        }
+      }
+    },
+    {
+      "id": "d3a4b5c6-e7f8-4a9b-0c1d-2e3f4a5b6c7d",
+      "alias": "openai/gpt-oss-20b",
+      "model_name": "openai/gpt-oss-20b",
+      "description": "Meet gpt-oss-20b \u2014 for lower latency, and local or specialized use cases (21B parameters with 3.6B active parameters).",
+      "model_type": "CHAT",
+      "capabilities": [
+        "reasoning"
+      ],
+      "hosted_on": null,
+      "is_composite": true,
+      "lb_strategy": "priority",
+      "fallback": {
+        "enabled": true,
+        "on_rate_limit": true,
+        "on_status": [
+          502,
+          503
+        ],
+        "with_replacement": false,
+        "max_attempts": 2
+      },
+      "sanitize_responses": false,
+      "metadata": {
+        "provider": "OpenAI",
+        "intelligence_index": 24.5,
+        "context_window": 131072,
+        "released_at": "2025-08-05",
+        "attribution": "artificial_analysis",
+        "extra": {
+          "evaluations": {
+            "aime_25": 0.893,
+            "artificial_analysis_coding_index": 18.5,
+            "artificial_analysis_math_index": 89.3,
+            "gpqa": 0.688,
+            "hle": 0.098,
+            "ifbench": 0.651,
+            "lcr": 0.307,
+            "livecodebench": 0.777,
+            "mmlu_pro": 0.748,
+            "scicode": 0.344,
+            "tau2": 0.602,
+            "terminalbench_hard": 0.106
+          },
+          "summary": "Lower latency, smaller model for local or specialized use cases.",
+          "use_cases": [
+            "Low latency tasks",
+            "Specialized use cases",
+            "Cost-sensitive workloads"
+          ]
+        }
+      }
+    },
+    {
+      "id": "d4a5b6c7-e8f9-4a0b-1c2d-3e4f5a6b7c8d",
+      "alias": "Qwen/Qwen3-VL-235B-A22B-Instruct-FP8",
+      "model_name": "Qwen/Qwen3-VL-235B-A22B-Instruct-FP8",
+      "description": "Meet Qwen3-VL-235B - delivering performance similar to GPT-5 Chat and Claude 4 Opus Thinking on challenging tasks including advanced reasoning, mathematics, and complex code generation. Offers frontier-level capabilities at a fraction of the cost.\n\n**Best for:**\n- Tasks requiring maximum intelligence\n- Complex analysis\n- Sophisticated coding projects\n- Scenarios where quality justifies the additional cost over smaller models\n\n**Max New Tokens:** 16384\n\n**Max Total Tokens:** 262144\n\n**Sampling Parameters:**\n\nWe have set the default sampling parameters using the recommended values set out by the Qwen team:\n\nWe suggest using Temperature=0.7, TopP=0.8, TopK=20, and MinP=0.\n\nFor supported frameworks, you can adjust the `presence_penalty` parameter between 0 and 2 to reduce endless repetitions. However, using a higher value may occasionally result in language mixing and a slight decrease in model performance.\n\nWe use a default `presence_penalty` of 1.5 to bias the model against endless repetitions, if you still notice this behaviour try increasing the `presence_penalty`.\n\nYou can adjust these on a per-request basis by setting the sampling parameters in the request body.",
+      "model_type": "CHAT",
+      "capabilities": [
+        "vision",
+        "reasoning"
+      ],
+      "hosted_on": null,
+      "is_composite": true,
+      "lb_strategy": "weighted_random",
+      "fallback": {
+        "enabled": true,
+        "on_rate_limit": true,
+        "on_status": [
+          502,
+          503
+        ],
+        "with_replacement": false,
+        "max_attempts": null
+      },
+      "sanitize_responses": false,
+      "metadata": {
+        "provider": "Alibaba",
+        "intelligence_index": 20.8,
+        "context_window": 262144,
+        "released_at": "2025-09-23",
+        "attribution": "artificial_analysis",
+        "extra": {
+          "evaluations": {
+            "aime_25": 0.707,
+            "artificial_analysis_coding_index": 16.5,
+            "artificial_analysis_math_index": 70.7,
+            "gpqa": 0.712,
+            "hle": 0.063,
+            "ifbench": 0.427,
+            "lcr": 0.317,
+            "livecodebench": 0.594,
+            "mmlu_pro": 0.823,
+            "scicode": 0.359,
+            "tau2": 0.351,
+            "terminalbench_hard": 0.068
+          },
+          "summary": "Frontier-level vision and text model, similar to GPT-5 Chat and Claude 4 Opus Thinking.",
+          "use_cases": [
+            "Research & analysis",
+            "Multi-step vision reasoning",
+            "Max performance tasks"
+          ]
+        }
+      }
+    },
+    {
+      "id": "d5a6b7c8-e9f0-4a1b-2c3d-4e5f6a7b8c9d",
+      "alias": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
+      "model_name": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
+      "description": "Meet Qwen3-VL-30B, the smaller model of the Qwen3-VL family, delivering performance similar to GPT-4.1-mini and Claude Sonnet 4. This highly capable mid-size model is suited for tasks that are constrained or require high token volumes. Excels at reasoning, coding, and structured output generation.\n\n**Best for:**\n- Production workloads requiring strong performance without frontier model costs\n- Complex reasoning tasks\n- Code generation",
+      "model_type": "CHAT",
+      "capabilities": [
+        "vision",
+        "reasoning"
+      ],
+      "hosted_on": null,
+      "is_composite": true,
+      "lb_strategy": "priority",
+      "fallback": {
+        "enabled": true,
+        "on_rate_limit": true,
+        "on_status": [
+          502,
+          503
+        ],
+        "with_replacement": false,
+        "max_attempts": null
+      },
+      "sanitize_responses": false,
+      "metadata": {
+        "provider": "Alibaba",
+        "intelligence_index": 16.1,
+        "context_window": 262144,
+        "released_at": "2025-10-03",
+        "attribution": "artificial_analysis",
+        "extra": {
+          "evaluations": {
+            "aime_25": 0.723,
+            "artificial_analysis_coding_index": 14.3,
+            "artificial_analysis_math_index": 72.3,
+            "gpqa": 0.695,
+            "hle": 0.064,
+            "ifbench": 0.331,
+            "lcr": 0.237,
+            "livecodebench": 0.476,
+            "mmlu_pro": 0.764,
+            "scicode": 0.308,
+            "tau2": 0.19,
+            "terminalbench_hard": 0.061
+          },
+          "summary": "Capable mid-size vision model, similar to GPT-4.1-mini and Claude Sonnet 4.",
+          "use_cases": [
+            "Production workloads",
+            "Complex reasoning",
+            "Code generation"
+          ]
+        }
+      }
+    },
+    {
+      "id": "d6a7b8c9-e0f1-4a2b-3c4d-5e6f7a8b9c0d",
+      "alias": "Qwen/Qwen3-14B-FP8",
+      "model_name": "Qwen/Qwen3-14B-FP8",
+      "description": "Meet Qwen3-14B - a small text-only model from the Qwen3 release.\n\n**Best for:**\n- High volume tasks\n- Tasks that do not require maximum performance, such as classification, extraction, or summarization\n\n**Max New Tokens:** 16384\n\n**Max Total Tokens:** 262144\n\n**Sampling Parameters:**\n\nWe have set the default sampling parameters using the recommended values set out by the Qwen team:\n\nWe suggest using Temperature=0.7, TopP=0.8, TopK=20, and MinP=0.\n\nFor supported frameworks, you can adjust the `presence_penalty` parameter between 0 and 2 to reduce endless repetitions. However, using a higher value may occasionally result in language mixing and a slight decrease in model performance.\n\nWe use a default `presence_penalty` of 1.5 to bias the model against endless repetitions, if you still notice this behaviour try increasing the `presence_penalty`.\n\nYou can adjust these on a per-request basis by setting the sampling parameters in the request body.",
+      "model_type": "CHAT",
+      "capabilities": [],
+      "hosted_on": null,
+      "is_composite": true,
+      "lb_strategy": "weighted_random",
+      "fallback": {
+        "enabled": true,
+        "on_rate_limit": true,
+        "on_status": [
+          502,
+          503
+        ],
+        "with_replacement": false,
+        "max_attempts": null
+      },
+      "sanitize_responses": false,
+      "metadata": {
+        "provider": "Alibaba",
+        "intelligence_index": 12.8,
+        "context_window": 32768,
+        "released_at": "2025-04-28",
+        "attribution": "artificial_analysis",
+        "extra": {
+          "evaluations": {
+            "aime": 0.28,
+            "aime_25": 0.58,
+            "artificial_analysis_coding_index": 12.4,
+            "artificial_analysis_math_index": 58,
+            "gpqa": 0.47,
+            "hle": 0.042,
+            "ifbench": 0.239,
+            "lcr": 0,
+            "livecodebench": 0.28,
+            "math_500": 0.871,
+            "mmlu_pro": 0.675,
+            "scicode": 0.265,
+            "tau2": 0.322,
+            "terminalbench_hard": 0.053
+          },
+          "summary": "Small, fast text-only model for high volume tasks.",
+          "use_cases": [
+            "High volume tasks",
+            "Classification",
+            "Extraction",
+            "Summarization"
+          ]
+        }
+      }
+    },
+    {
+      "id": "d7a8b9c0-e1f2-4a3b-4c5d-6e7f8a9b0c1d",
+      "alias": "Qwen/Qwen3-Embedding-8B",
+      "model_name": "Qwen/Qwen3-Embedding-8B",
+      "description": "The Qwen3 Embedding model series is the latest embeddings model in the Qwen family, specifically designed for text embedding and ranking tasks. Building upon the dense foundational models of the Qwen3 series, it provides a comprehensive range of text embeddings and reranking models in various sizes (0.6B, 4B, and 8B). This series inherits the exceptional multilingual capabilities, long-text understanding, and reasoning skills of its foundational model.\n\n**Exceptional Versatility:** The embedding model has achieved state-of-the-art performance across a wide range of downstream application evaluations. The 8B size embedding model ranks No.1 in the MTEB multilingual leaderboard (as of June 5, 2025, score 70.58), while the reranking model excels in various text retrieval scenarios.\n\n**Comprehensive Flexibility:** The Qwen3 Embedding series offers a full spectrum of sizes (from 0.6B to 8B) for both embedding and reranking models, catering to diverse use cases that prioritize efficiency and effectiveness.\n\n**Multilingual Capability:** The Qwen3 Embedding series offer support for over 100 languages, thanks to the multilingual capabilities of Qwen3 models. This includes various programming languages, and provides robust multilingual, cross-lingual, and code retrieval capabilities.\n\nQwen3-Embedding-8B has the following features:\n- **Model Type:** Text Embedding\n- **Supported Languages:** 100+ Languages\n- **Number of Parameters:** 8B\n- **Context Length:** 32k\n- **Embedding Dimension:** Up to 4096, supports user-defined output dimensions ranging from 32 to 4096",
       "model_type": "EMBEDDINGS",
-      "capabilities": ["embeddings"],
-      "hosted_on": "c3d4e5f6-7890-1234-5678-90abcdef0123",
-      "created_by": "550e8400-e29b-41d4-a716-446655440001",
-      "created_at": "2025-04-01T12:00:00Z",
-      "updated_at": "2025-09-15T14:30:00Z",
-      "is_composite": false,
-      "sanitize_responses": false
+      "capabilities": [],
+      "hosted_on": null,
+      "is_composite": true,
+      "lb_strategy": "weighted_random",
+      "fallback": {
+        "enabled": true,
+        "on_rate_limit": true,
+        "on_status": [
+          502,
+          503
+        ],
+        "with_replacement": false,
+        "max_attempts": null
+      },
+      "sanitize_responses": false,
+      "metadata": {
+        "provider": "Alibaba",
+        "context_window": 32768,
+        "released_at": "2025-06-05",
+        "attribution": "mteb",
+        "extra": {
+          "evaluations": {
+            "mteb_multilingual": 70.58
+          },
+          "summary": "State-of-the-art multilingual embedding model, #1 on MTEB multilingual leaderboard.",
+          "use_cases": [
+            "Text retrieval",
+            "Semantic search",
+            "Multilingual embeddings"
+          ]
+        }
+      }
     },
     {
-      "id": "a1b2c3d4-0007-4a37-a878-53318a6d5007",
-      "alias": "text-embedding-3-large",
-      "model_name": "text-embedding-3-large",
-      "description": "OpenAI text embeddings model - 3072 dimensions",
-      "model_type": "EMBEDDINGS",
-      "capabilities": ["embeddings"],
-      "hosted_on": "c3d4e5f6-7890-1234-5678-90abcdef0123",
-      "created_by": "550e8400-e29b-41d4-a716-446655440001",
-      "created_at": "2025-04-01T12:00:00Z",
-      "updated_at": "2025-09-15T14:30:00Z",
-      "is_composite": false,
-      "sanitize_responses": false
+      "id": "d8b9c0d1-e2f3-4a4b-5c6d-7e8f9a0b1c2d",
+      "alias": "Qwen/Qwen3.5-9B",
+      "model_name": "Qwen/Qwen3.5-9B",
+      "description": "Qwen3.5-9B is a small, highly efficient multimodal model from the Qwen3.5 Small Model Series. Despite having only 9B parameters, it matches or surpasses GPT-OSS-120B on GPQA Diamond (81.7 vs 71.5) and beats GPT-5-Nano on MMMU-Pro by 13 points. Uses a hybrid Gated DeltaNet + MoE architecture for fast inference.\n\n**Best for:**\n- On-device / edge deployment\n- High volume tasks requiring strong reasoning\n- Vision and video understanding at low cost\n- Scenarios where efficiency matters more than absolute peak performance",
+      "model_type": "CHAT",
+      "capabilities": [
+        "vision",
+        "reasoning"
+      ],
+      "hosted_on": null,
+      "is_composite": true,
+      "lb_strategy": "weighted_random",
+      "fallback": {
+        "enabled": true,
+        "on_rate_limit": true,
+        "on_status": [
+          502,
+          503
+        ],
+        "with_replacement": false,
+        "max_attempts": null
+      },
+      "sanitize_responses": false,
+      "metadata": {
+        "provider": "Alibaba",
+        "intelligence_index": 32,
+        "context_window": 262144,
+        "released_at": "2026-03-02",
+        "attribution": "artificial_analysis",
+        "extra": {
+          "summary": "Small, efficient multimodal model that punches far above its weight class.",
+          "use_cases": [
+            "Edge / on-device deployment",
+            "High volume reasoning",
+            "Vision and video understanding",
+            "Cost-efficient intelligence"
+          ]
+        }
+      }
     },
     {
-      "id": "b8c9d0e1-2345-6789-0123-bcdef1234567",
-      "alias": "bge-reranker-v2",
-      "model_name": "BAAI/bge-reranker-v2-m3",
-      "description": "BGE Reranker v2 - multilingual document reranking",
-      "model_type": "RERANK",
-      "capabilities": ["rerank"],
+      "id": "h1000001-aaaa-4bbb-8ccc-ddddeeee0012",
+      "alias": "qwen3.5-9b-vllm-primary",
+      "model_name": "Qwen/Qwen3.5-9B",
+      "description": "Qwen3.5 9B on vLLM on-premise cluster (primary)",
+      "model_type": "CHAT",
+      "capabilities": [
+        "vision"
+      ],
       "hosted_on": "a1b2c3d4-e5f6-7890-1234-567890abcdef",
-      "created_by": "550e8400-e29b-41d4-a716-446655440001",
-      "created_at": "2025-08-20T09:00:00Z",
-      "updated_at": "2025-12-10T11:45:00Z",
       "is_composite": false,
-      "sanitize_responses": false
+      "sanitize_responses": false,
+      "requests_per_second": 120,
+      "capacity": 256
+    },
+    {
+      "id": "h1000001-aaaa-4bbb-8ccc-ddddeeee0013",
+      "alias": "qwen3.5-9b-vllm-burst",
+      "model_name": "Qwen/Qwen3.5-9B",
+      "description": "Qwen3.5 9B on GPU burst capacity (RunPod)",
+      "model_type": "CHAT",
+      "capabilities": [
+        "vision"
+      ],
+      "hosted_on": "f6a7b8c9-0123-4567-8901-bcdef0123456",
+      "is_composite": false,
+      "sanitize_responses": false,
+      "requests_per_second": 80,
+      "capacity": 128
+    },
+    {
+      "id": "h1000001-aaaa-4bbb-8ccc-ddddeeee0001",
+      "alias": "qwen3.5-397b-vllm-primary",
+      "model_name": "Qwen/Qwen3.5-397B-A17B-FP8",
+      "description": "Qwen3.5 397B on vLLM on-premise cluster (primary)",
+      "model_type": "CHAT",
+      "capabilities": [],
+      "hosted_on": "a1b2c3d4-e5f6-7890-1234-567890abcdef",
+      "is_composite": false,
+      "sanitize_responses": false,
+      "requests_per_second": 20,
+      "capacity": 32
+    },
+    {
+      "id": "h1000001-aaaa-4bbb-8ccc-ddddeeee0002",
+      "alias": "qwen3.5-397b-vllm-burst",
+      "model_name": "Qwen/Qwen3.5-397B-A17B-FP8",
+      "description": "Qwen3.5 397B on GPU burst capacity (RunPod)",
+      "model_type": "CHAT",
+      "capabilities": [],
+      "hosted_on": "f6a7b8c9-0123-4567-8901-bcdef0123456",
+      "is_composite": false,
+      "sanitize_responses": false,
+      "requests_per_second": 10,
+      "capacity": 16
+    },
+    {
+      "id": "h1000001-aaaa-4bbb-8ccc-ddddeeee0003",
+      "alias": "qwen3.5-35b-vllm-primary",
+      "model_name": "Qwen/Qwen3.5-35B-A3B-FP8",
+      "description": "Qwen3.5 35B on vLLM on-premise cluster (primary)",
+      "model_type": "CHAT",
+      "capabilities": [],
+      "hosted_on": "a1b2c3d4-e5f6-7890-1234-567890abcdef",
+      "is_composite": false,
+      "sanitize_responses": false,
+      "requests_per_second": 50,
+      "capacity": 64
+    },
+    {
+      "id": "h1000001-aaaa-4bbb-8ccc-ddddeeee0004",
+      "alias": "qwen3.5-35b-vllm-burst",
+      "model_name": "Qwen/Qwen3.5-35B-A3B-FP8",
+      "description": "Qwen3.5 35B on GPU burst capacity (RunPod)",
+      "model_type": "CHAT",
+      "capabilities": [],
+      "hosted_on": "f6a7b8c9-0123-4567-8901-bcdef0123456",
+      "is_composite": false,
+      "sanitize_responses": false,
+      "requests_per_second": 30,
+      "capacity": 32
+    },
+    {
+      "id": "h1000001-aaaa-4bbb-8ccc-ddddeeee0005",
+      "alias": "gpt-oss-20b-vllm-primary",
+      "model_name": "openai/gpt-oss-20b",
+      "description": "GPT-oss 20B on vLLM on-premise cluster",
+      "model_type": "CHAT",
+      "capabilities": [],
+      "hosted_on": "a1b2c3d4-e5f6-7890-1234-567890abcdef",
+      "is_composite": false,
+      "sanitize_responses": false,
+      "requests_per_second": 80,
+      "capacity": 128
+    },
+    {
+      "id": "h1000001-aaaa-4bbb-8ccc-ddddeeee0006",
+      "alias": "qwen3-vl-235b-vllm-primary",
+      "model_name": "Qwen/Qwen3-VL-235B-A22B-Instruct-FP8",
+      "description": "Qwen3-VL 235B on vLLM on-premise cluster",
+      "model_type": "CHAT",
+      "capabilities": [
+        "vision"
+      ],
+      "hosted_on": "a1b2c3d4-e5f6-7890-1234-567890abcdef",
+      "is_composite": false,
+      "sanitize_responses": false,
+      "requests_per_second": 15,
+      "capacity": 24
+    },
+    {
+      "id": "h1000001-aaaa-4bbb-8ccc-ddddeeee0007",
+      "alias": "qwen3-vl-30b-vllm-primary",
+      "model_name": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
+      "description": "Qwen3-VL 30B on vLLM on-premise cluster (primary)",
+      "model_type": "CHAT",
+      "capabilities": [
+        "vision"
+      ],
+      "hosted_on": "a1b2c3d4-e5f6-7890-1234-567890abcdef",
+      "is_composite": false,
+      "sanitize_responses": false,
+      "requests_per_second": 40,
+      "capacity": 48
+    },
+    {
+      "id": "h1000001-aaaa-4bbb-8ccc-ddddeeee0008",
+      "alias": "qwen3-vl-30b-vllm-burst",
+      "model_name": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
+      "description": "Qwen3-VL 30B on GPU burst capacity (RunPod)",
+      "model_type": "CHAT",
+      "capabilities": [
+        "vision"
+      ],
+      "hosted_on": "f6a7b8c9-0123-4567-8901-bcdef0123456",
+      "is_composite": false,
+      "sanitize_responses": false,
+      "requests_per_second": 20,
+      "capacity": 24
+    },
+    {
+      "id": "h1000001-aaaa-4bbb-8ccc-ddddeeee0009",
+      "alias": "qwen3-14b-vllm-primary",
+      "model_name": "Qwen/Qwen3-14B-FP8",
+      "description": "Qwen3 14B on vLLM on-premise cluster (primary)",
+      "model_type": "CHAT",
+      "capabilities": [],
+      "hosted_on": "a1b2c3d4-e5f6-7890-1234-567890abcdef",
+      "is_composite": false,
+      "sanitize_responses": false,
+      "requests_per_second": 100,
+      "capacity": 128
+    },
+    {
+      "id": "h1000001-aaaa-4bbb-8ccc-ddddeeee0010",
+      "alias": "qwen3-14b-vllm-burst",
+      "model_name": "Qwen/Qwen3-14B-FP8",
+      "description": "Qwen3 14B on GPU burst capacity (RunPod)",
+      "model_type": "CHAT",
+      "capabilities": [],
+      "hosted_on": "f6a7b8c9-0123-4567-8901-bcdef0123456",
+      "is_composite": false,
+      "sanitize_responses": false,
+      "requests_per_second": 60,
+      "capacity": 64
+    },
+    {
+      "id": "h1000001-aaaa-4bbb-8ccc-ddddeeee0011",
+      "alias": "qwen3-embed-8b-vllm-primary",
+      "model_name": "Qwen/Qwen3-Embedding-8B",
+      "description": "Qwen3 Embedding 8B on vLLM on-premise cluster",
+      "model_type": "EMBEDDINGS",
+      "capabilities": [],
+      "hosted_on": "a1b2c3d4-e5f6-7890-1234-567890abcdef",
+      "is_composite": false,
+      "sanitize_responses": false,
+      "requests_per_second": 200,
+      "capacity": 256
     }
   ]
 }

@@ -9,7 +9,7 @@
         "method": "POST",
         "url": "/v1/chat/completions",
         "body": {
-          "model": "gpt-4o-mini",
+          "model": "openai/gpt-oss-20b",
           "messages": [
             { "role": "system", "content": "You are a helpful assistant." },
             { "role": "user", "content": "What is 2+2?" }
@@ -49,7 +49,7 @@
         "method": "POST",
         "url": "/v1/chat/completions",
         "body": {
-          "model": "gpt-4o-mini",
+          "model": "openai/gpt-oss-20b",
           "messages": [
             { "role": "system", "content": "You are a helpful assistant." },
             { "role": "user", "content": "What is the capital of France?" }
@@ -89,7 +89,7 @@
         "method": "POST",
         "url": "/v1/chat/completions",
         "body": {
-          "model": "gpt-4o-mini",
+          "model": "openai/gpt-oss-20b",
           "messages": [
             {
               "role": "user",
@@ -117,7 +117,7 @@
         "method": "POST",
         "url": "/v1/chat/completions",
         "body": {
-          "model": "gpt-4o-mini",
+          "model": "openai/gpt-oss-20b",
           "messages": [
             { "role": "system", "content": "You are a helpful assistant." },
             { "role": "user", "content": "Explain quantum computing." }
@@ -136,7 +136,7 @@
         "method": "POST",
         "url": "/v1/chat/completions",
         "body": {
-          "model": "gpt-4o-mini",
+          "model": "openai/gpt-oss-20b",
           "messages": [
             { "role": "system", "content": "You are a helpful assistant." },
             { "role": "user", "content": "What is machine learning?" }

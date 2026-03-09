@@ -444,7 +444,7 @@ describe("User Hooks", () => {
 
       result.current.mutate({
         groupId: "550e8400-e29b-41d4-a716-446655441001",
-        modelId: "f914c573-4c00-4a37-a878-53318a6d5a5b",
+        modelId: "d1a2b3c4-e5f6-4a7b-8c9d-0e1f2a3b4c5d",
       });
 
       await waitFor(() => {

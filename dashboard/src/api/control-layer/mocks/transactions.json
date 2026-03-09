@@ -14,7 +14,7 @@
     "transaction_type": "usage",
     "amount": 125.50,
     "source_id": "batch-demo-1",
-    "description": "Batch processing - claude-sonnet-4 (250 requests)",
+    "description": "Batch processing - Qwen3.5-397B (250 requests)",
     "created_at": "2025-04-02T14:30:00Z"
   },
   {
@@ -32,7 +32,7 @@
     "transaction_type": "usage",
     "amount": 45.25,
     "source_id": "request-batch-456",
-    "description": "API usage - gpt-4o (batch evaluation)",
+    "description": "API usage - Qwen3.5-35B (batch evaluation)",
     "created_at": "2025-05-10T11:20:00Z"
   },
   {
@@ -50,7 +50,7 @@
     "transaction_type": "usage",
     "amount": 342.75,
     "source_id": "batch-demo-5",
-    "description": "Batch processing - claude-opus-4 (large eval suite)",
+    "description": "Batch processing - Qwen3.5-397B (large eval suite)",
     "created_at": "2025-08-15T16:45:00Z"
   },
   {
@@ -68,7 +68,7 @@
     "transaction_type": "usage",
     "amount": 1819.50,
     "source_id": "batch-demo-8",
-    "description": "Batch processing - gpt-4o (customer data classification)",
+    "description": "Batch processing - Qwen3.5-35B (customer data classification)",
     "created_at": "2025-09-05T10:15:00Z"
   },
   {
@@ -86,7 +86,7 @@
     "transaction_type": "usage",
     "amount": 2600.0,
     "source_id": "batch-demo-10",
-    "description": "Batch processing - smart-router (10K requests)",
+    "description": "Batch processing - Qwen3-VL-30B (10K requests)",
     "created_at": "2025-11-20T08:30:00Z"
   },
   {
@@ -104,7 +104,7 @@
     "transaction_type": "usage",
     "amount": 2800.0,
     "source_id": "batch-demo-12",
-    "description": "Batch processing - gpt-4o-mini (content moderation)",
+    "description": "Batch processing - gpt-oss-20b (content moderation)",
     "created_at": "2025-10-15T12:45:00Z"
   },
   {
@@ -122,7 +122,7 @@
     "transaction_type": "usage",
     "amount": 2700.0,
     "source_id": "batch-demo-14",
-    "description": "Batch processing - llama-3.3-70b (translation pipeline)",
+    "description": "Batch processing - Qwen3-14B (translation pipeline)",
     "created_at": "2025-12-01T09:30:00Z"
   },
   {
@@ -140,7 +140,7 @@
     "transaction_type": "usage",
     "amount": 250.0,
     "source_id": "request-789",
-    "description": "API usage - deepseek-v3 (code review automation)",
+    "description": "API usage - Qwen3-VL-235B (code review automation)",
     "created_at": "2025-09-20T15:00:00Z"
   },
   {
@@ -167,7 +167,7 @@
     "transaction_type": "usage",
     "amount": 900.0,
     "source_id": "batch-demo-19",
-    "description": "Batch processing - claude-sonnet-4 (document summarization)",
+    "description": "Batch processing - Qwen3.5-397B (document summarization)",
     "created_at": "2025-12-15T14:20:00Z"
   },
   {
@@ -185,7 +185,7 @@
     "transaction_type": "usage",
     "amount": 380.0,
     "source_id": "batch-demo-21",
-    "description": "Batch processing - gpt-4o (sentiment analysis)",
+    "description": "Batch processing - Qwen3.5-35B (sentiment analysis)",
     "created_at": "2025-11-08T11:30:00Z"
   },
   {
@@ -203,7 +203,7 @@
     "transaction_type": "usage",
     "amount": 520.0,
     "source_id": "batch-demo-23",
-    "description": "Batch processing - text-embedding-3-large (vector indexing)",
+    "description": "Batch processing - Qwen3-Embedding-8B (vector indexing)",
     "created_at": "2025-12-20T16:00:00Z"
   },
   {
@@ -212,7 +212,7 @@
     "transaction_type": "usage",
     "amount": 907.0,
     "source_id": "batch-demo-24",
-    "description": "Batch processing - qwen-2.5-72b (multilingual eval)",
+    "description": "Batch processing - Qwen3.5-35B (multilingual eval)",
     "created_at": "2026-01-10T13:15:00Z"
   }
 ]

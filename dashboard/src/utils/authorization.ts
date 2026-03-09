@@ -73,6 +73,7 @@ const ROLE_PERMISSIONS: Record<Role, PagePermission[]> = {
 // Map route paths to permissions
 export const ROUTE_PERMISSIONS: Record<string, PagePermission> = {
   "/models": "models",
+  "/models/manage": "manage-models",
   "/endpoints": "endpoints",
   "/playground": "playground",
   "/analytics": "analytics",
