@@ -487,7 +487,7 @@ impl<'c> Credits<'c> {
             FROM credits_transactions
             WHERE user_id = $1
               AND source_id LIKE 'auto_topup_%'
-              AND created_at >= date_trunc('month', now() AT TIME ZONE 'UTC')
+              AND created_at >= date_trunc('month', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
             "#,
             user_id
         )
@@ -495,6 +495,35 @@ impl<'c> Credits<'c> {
         .await?;
 
         Ok(row.total)
+    }
+
+    /// Get the total auto top-up spend for multiple users in the current calendar month (UTC).
+    /// Returns a map of user_id → total spend. Users with zero spend are included with `Decimal::ZERO`.
+    #[instrument(skip(self, user_ids), fields(count = user_ids.len()), err)]
+    pub async fn get_monthly_auto_topup_spend_bulk(&mut self, user_ids: &[UserId]) -> Result<HashMap<UserId, rust_decimal::Decimal>> {
+        if user_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let rows = sqlx::query!(
+            r#"
+            SELECT user_id, COALESCE(SUM(amount), 0)::decimal(20, 9) as "total!"
+            FROM credits_transactions
+            WHERE user_id = ANY($1)
+              AND source_id LIKE 'auto_topup_%'
+              AND created_at >= date_trunc('month', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
+            GROUP BY user_id
+            "#,
+            user_ids
+        )
+        .fetch_all(&mut *self.db)
+        .await?;
+
+        let mut map = HashMap::with_capacity(rows.len());
+        for row in rows {
+            map.insert(row.user_id, row.total);
+        }
+        Ok(map)
     }
 
     /// Count total transactions for a specific user with optional filters

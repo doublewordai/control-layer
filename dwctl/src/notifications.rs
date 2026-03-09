@@ -464,7 +464,28 @@ async fn process_auto_topups(
 
     tracing::info!(count = to_charge.len(), "Found users eligible for auto top-up");
 
-    // 4. Charge each user
+    // 4. Batch-fetch monthly auto-topup spend for users with a monthly limit
+    let limit_user_ids: Vec<Uuid> = to_charge
+        .iter()
+        .filter(|u| u.auto_topup_monthly_limit.is_some())
+        .map(|u| u.id)
+        .collect();
+
+    let monthly_spends = if !limit_user_ids.is_empty() {
+        let mut credits = Credits::new(&mut *conn);
+        credits
+            .get_monthly_auto_topup_spend_bulk(&limit_user_ids)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "Failed to batch-fetch monthly auto-topup spend");
+                counter!("dwctl_auto_topup_errors_total", "stage" => "monthly_limit_check").increment(1);
+                Default::default()
+            })
+    } else {
+        Default::default()
+    };
+
+    // 5. Charge each user
     for user in &to_charge {
         let amount_cents = (user.auto_topup_amount * rust_decimal::Decimal::new(100, 0))
             .round_dp(0)
@@ -478,17 +499,7 @@ async fn process_auto_topups(
 
         // Check monthly spending limit
         if let Some(monthly_limit) = user.auto_topup_monthly_limit {
-            let monthly_spend = {
-                let mut credits = Credits::new(&mut *conn);
-                match credits.get_monthly_auto_topup_spend(user.id).await {
-                    Ok(spend) => spend,
-                    Err(e) => {
-                        tracing::warn!(user_id = %user.id, error = %e, "Failed to check monthly auto-topup spend");
-                        counter!("dwctl_auto_topup_errors_total", "stage" => "monthly_limit_check").increment(1);
-                        continue;
-                    }
-                }
-            };
+            let monthly_spend = monthly_spends.get(&user.id).copied().unwrap_or(rust_decimal::Decimal::ZERO);
 
             if monthly_spend + user.auto_topup_amount > monthly_limit {
                 tracing::info!(

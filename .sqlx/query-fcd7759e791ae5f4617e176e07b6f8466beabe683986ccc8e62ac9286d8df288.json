@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT COALESCE(SUM(amount), 0)::decimal(20, 9) as \"total!\"\n            FROM credits_transactions\n            WHERE user_id = $1\n              AND source_id LIKE 'auto_topup_%'\n              AND created_at >= date_trunc('month', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "total!",
+        "type_info": "Numeric"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "fcd7759e791ae5f4617e176e07b6f8466beabe683986ccc8e62ac9286d8df288"
+}
