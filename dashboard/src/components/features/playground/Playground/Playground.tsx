@@ -4,7 +4,8 @@ import { Play, ArrowLeft, GitCompare, X as XIcon } from "lucide-react";
 import { toast } from "sonner";
 import OpenAI from "openai";
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
-import { useModels, useModel } from "../../../../api/control-layer";
+import { useQuery } from "@tanstack/react-query";
+import { useModels, dwctlApi } from "../../../../api/control-layer";
 import { type ModelType } from "../../../../utils/modelType";
 import { isPlaygroundDenied } from "../../../../utils/modelAccess";
 import type {
@@ -87,7 +88,11 @@ const Playground: React.FC = () => {
 
   // When a model ID is specified via URL, fetch it directly rather than
   // hoping it appears in the first page of the list.
-  const { data: urlModel } = useModel(selectedModelId ?? "", {
+  // Uses an isolated query key to avoid a render cycle with useModels'
+  // cache-seeding select function (which calls setQueryData on model keys).
+  const { data: urlModel } = useQuery({
+    queryKey: ["playground-model", selectedModelId],
+    queryFn: () => dwctlApi.models.get(selectedModelId!),
     enabled: !!selectedModelId && !selectedModel,
   });
 
