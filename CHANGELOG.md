@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.15.5](https://github.com/doublewordai/control-layer/compare/v8.15.4...v8.15.5) (2026-03-09)
+
+
+### Bug Fixes
+
+* keep composite models in routing table when all components disabled ([#823](https://github.com/doublewordai/control-layer/issues/823)) ([f242540](https://github.com/doublewordai/control-layer/commit/f2425409d21617a9d713fddb3a023fb78031e0b2))
+
 ## [8.15.4](https://github.com/doublewordai/control-layer/compare/v8.15.3...v8.15.4) (2026-03-09)
 
 
