@@ -11,7 +11,6 @@ import {
   Eye,
   Layers,
   Brain,
-  Play,
   Code,
 } from "lucide-react";
 import { useModels, useGroups } from "../../../../api/control-layer";
@@ -198,16 +197,7 @@ function PricingTiers({ tariffs }: { tariffs: Model["tariffs"] }) {
   );
 }
 
-function ExpandedContent({
-  model,
-  onApiClick,
-}: {
-  model: Model;
-  onApiClick: () => void;
-}) {
-  const navigate = useNavigate();
-  const playgroundAvailable = !isPlaygroundDenied(model);
-
+function ExpandedContent({ model }: { model: Model }) {
   const summary = model.metadata?.extra?.summary ?? null;
   const useCases = model.metadata?.extra?.use_cases ?? [];
 
@@ -235,26 +225,6 @@ function ExpandedContent({
           ))}
         </div>
       )}
-
-      <div className="flex items-center gap-2 pt-1">
-        <Button variant="outline" size="sm" onClick={onApiClick}>
-          <Code className="h-4 w-4 mr-1" />
-          API
-        </Button>
-        {playgroundAvailable && (
-          <Button
-            size="sm"
-            onClick={() =>
-              navigate(
-                `/playground?model=${encodeURIComponent(model.id)}`,
-              )
-            }
-          >
-            <Play className="h-4 w-4 mr-1" />
-            Playground
-          </Button>
-        )}
-      </div>
     </div>
   );
 }
@@ -375,27 +345,41 @@ function ModelRow({
             : "\u2014"}
         </TableCell>
         <TableCell className="text-right pr-3 lg:pr-6">
-          {playgroundAvailable && (
+          <div className="flex items-center justify-end gap-1.5">
             <Button
-              variant="outline"
+              variant="ghost"
               size="sm"
               onClick={(e) => {
                 e.stopPropagation();
-                navigate(
-                  `/playground?model=${encodeURIComponent(model.id)}`,
-                );
+                onApiClick();
               }}
-              className="text-xs h-7 px-2.5 border-blue-200 text-blue-700 hover:bg-blue-50 hover:text-blue-800"
+              className="text-xs h-7 px-2 text-gray-500 hover:text-gray-700"
             >
-              Try it &rarr;
+              <Code className="h-3.5 w-3.5" />
+              <span className="hidden lg:inline ml-1">API</span>
             </Button>
-          )}
+            {playgroundAvailable && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  navigate(
+                    `/playground?model=${encodeURIComponent(model.id)}`,
+                  );
+                }}
+                className="text-xs h-7 px-2.5 border-blue-200 text-blue-700 hover:bg-blue-50 hover:text-blue-800"
+              >
+                Try it &rarr;
+              </Button>
+            )}
+          </div>
         </TableCell>
       </TableRow>
       {isExpanded && (
         <TableRow className="hover:bg-transparent">
           <TableCell colSpan={colCount} className="pt-0 pb-4 pl-10">
-            <ExpandedContent model={model} onApiClick={onApiClick} />
+            <ExpandedContent model={model} />
           </TableCell>
         </TableRow>
       )}
