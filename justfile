@@ -514,7 +514,7 @@ lint target *args="":
         ts)
             cd dashboard
             echo "Checking pnpm-lock.yaml sync..."
-            pnpm install --frozen-lockfile --dry-run
+            pnpm install --frozen-lockfile
             echo "Running TypeScript checks..."
             pnpm exec tsc -b --noEmit
             echo "Running ESLint..."
