@@ -498,7 +498,10 @@ async fn process_auto_topups(
                     "Auto top-up skipped: monthly limit would be exceeded"
                 );
                 counter!("dwctl_auto_topup_limit_reached_total").increment(1);
-                if let Some(email_svc) = email_service {
+                // Send email only once per limit-reached episode
+                if !user.auto_topup_limit_notification_sent
+                    && let Some(email_svc) = email_service
+                {
                     let name = user.display_name.as_deref().unwrap_or(&user.username);
                     let balance = balance_for(user).unwrap_or_default();
                     if let Err(e) = email_svc
@@ -506,9 +509,21 @@ async fn process_auto_topups(
                         .await
                     {
                         tracing::warn!(user_id = %user.id, error = %e, "Failed to send auto top-up limit reached email");
+                    } else {
+                        let mut users = Users::new(&mut *conn);
+                        let _ = users.mark_auto_topup_limit_notification_sent(&[user.id]).await.inspect_err(
+                            |e| tracing::warn!(user_id = %user.id, error = %e, "Failed to mark auto-topup limit notification as sent"),
+                        );
                     }
                 }
                 continue;
+            } else if user.auto_topup_limit_notification_sent {
+                // Spend is back under the limit (new month or limit raised) — clear the flag
+                let mut users = Users::new(&mut *conn);
+                let _ = users
+                    .clear_auto_topup_limit_notification_sent(&[user.id])
+                    .await
+                    .inspect_err(|e| tracing::warn!(user_id = %user.id, error = %e, "Failed to clear auto-topup limit notification flag"));
             }
         }
 

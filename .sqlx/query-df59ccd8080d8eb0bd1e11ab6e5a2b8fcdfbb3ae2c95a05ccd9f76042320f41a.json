@@ -117,6 +117,11 @@
         "ordinal": 22,
         "name": "auto_topup_monthly_limit",
         "type_info": "Float4"
+      },
+      {
+        "ordinal": 23,
+        "name": "auto_topup_limit_notification_sent",
+        "type_info": "Bool"
       }
     ],
     "parameters": {
@@ -155,7 +160,8 @@
       false,
       true,
       true,
-      true
+      true,
+      false
     ]
   },
   "hash": "df59ccd8080d8eb0bd1e11ab6e5a2b8fcdfbb3ae2c95a05ccd9f76042320f41a"

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT\n                u.id,\n                u.username,\n                u.email,\n                u.display_name,\n                u.avatar_url,\n                u.auth_source,\n                u.created_at,\n                u.updated_at,\n                u.last_login,\n                u.is_admin,\n                u.password_hash,\n                u.external_user_id,\n                u.payment_provider_id,\n                u.is_deleted,\n                u.is_internal,\n                u.batch_notifications_enabled,\n                u.first_batch_email_sent,\n                u.low_balance_notification_sent,\n                u.low_balance_threshold,\n                u.auto_topup_amount,\n                u.auto_topup_threshold,\n                u.auto_topup_monthly_limit,\n                u.user_type,\n                ARRAY_AGG(ur.role) FILTER (WHERE ur.role IS NOT NULL) as \"roles: Vec<Role>\"\n            FROM users u\n            LEFT JOIN user_roles ur ON ur.user_id = u.id\n            WHERE u.id = $1 AND u.id != '00000000-0000-0000-0000-000000000000' AND u.is_deleted = false\n            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id, u.is_deleted, u.is_internal, u.batch_notifications_enabled, u.first_batch_email_sent, u.low_balance_notification_sent, u.low_balance_threshold, u.auto_topup_amount, u.auto_topup_threshold, u.auto_topup_monthly_limit, u.user_type\n            ",
+  "query": "\n            SELECT\n                u.id,\n                u.username,\n                u.email,\n                u.display_name,\n                u.avatar_url,\n                u.auth_source,\n                u.created_at,\n                u.updated_at,\n                u.last_login,\n                u.is_admin,\n                u.password_hash,\n                u.external_user_id,\n                u.payment_provider_id,\n                u.is_deleted,\n                u.is_internal,\n                u.batch_notifications_enabled,\n                u.first_batch_email_sent,\n                u.low_balance_notification_sent,\n                u.low_balance_threshold,\n                u.auto_topup_amount,\n                u.auto_topup_threshold,\n                u.auto_topup_monthly_limit,\n                u.auto_topup_limit_notification_sent,\n                u.user_type,\n                ARRAY_AGG(ur.role) FILTER (WHERE ur.role IS NOT NULL) as \"roles: Vec<Role>\"\n            FROM users u\n            LEFT JOIN user_roles ur ON ur.user_id = u.id\n            WHERE u.id = ANY($1) AND u.id != '00000000-0000-0000-0000-000000000000' AND u.is_deleted = false\n            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id, u.is_deleted, u.is_internal, u.batch_notifications_enabled, u.first_batch_email_sent, u.low_balance_notification_sent, u.low_balance_threshold, u.auto_topup_amount, u.auto_topup_threshold, u.auto_topup_monthly_limit, u.auto_topup_limit_notification_sent, u.user_type\n            ",
   "describe": {
     "columns": [
       {
@@ -115,11 +115,16 @@
       },
       {
         "ordinal": 22,
+        "name": "auto_topup_limit_notification_sent",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 23,
         "name": "user_type",
         "type_info": "Varchar"
       },
       {
-        "ordinal": 23,
+        "ordinal": 24,
         "name": "roles: Vec<Role>",
         "type_info": {
           "Custom": {
@@ -146,7 +151,7 @@
     ],
     "parameters": {
       "Left": [
-        "Uuid"
+        "UuidArray"
       ]
     },
     "nullable": [
@@ -173,8 +178,9 @@
       true,
       true,
       false,
+      false,
       null
     ]
   },
-  "hash": "b327bc9d2fdda2808c74ca7ba39008a7bf24dc05ce0b69e1f80ba08760264760"
+  "hash": "b4675c5889b85ffb826ffbc8cec18df8646d53abb7e0481d1efa63c0f8cfdd7c"
 }

@@ -481,6 +481,18 @@ pub async fn process_auto_topup<P: PoolProvider>(
             .into_response());
     }
 
+    if let Some(limit) = body.monthly_limit
+        && limit <= 0.0
+    {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "message": "Monthly limit must be positive"
+            })),
+        )
+            .into_response());
+    }
+
     // Validate the session with the payment provider
     let provider = match state.config.payment.clone() {
         Some(payment_config) => payment_providers::create_provider(payment_config),
@@ -576,7 +588,8 @@ pub async fn process_auto_topup<P: PoolProvider>(
     Ok(Json(json!({
         "message": "Auto top-up enabled successfully",
         "threshold": body.threshold,
-        "amount": body.amount
+        "amount": body.amount,
+        "monthly_limit": body.monthly_limit
     }))
     .into_response())
 }
@@ -727,7 +740,8 @@ pub async fn enable_auto_topup<P: PoolProvider>(
             Ok(Json(json!({
                 "has_payment_method": true,
                 "threshold": body.threshold,
-                "amount": body.amount
+                "amount": body.amount,
+                "monthly_limit": body.monthly_limit
             }))
             .into_response())
         }
