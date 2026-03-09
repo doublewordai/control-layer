@@ -24,11 +24,26 @@ pub struct UserFilter {
     pub skip: i64,
     pub limit: i64,
     pub search: Option<String>, // Case-insensitive substring search on display_name, username, and email
+    pub user_type: String,
 }
 
 impl UserFilter {
     pub fn new(skip: i64, limit: i64) -> Self {
-        Self { skip, limit, search: None }
+        Self {
+            skip,
+            limit,
+            search: None,
+            user_type: "individual".to_string(),
+        }
+    }
+
+    pub fn organizations(skip: i64, limit: i64) -> Self {
+        Self {
+            skip,
+            limit,
+            search: None,
+            user_type: "organization".to_string(),
+        }
     }
 
     pub fn with_search(mut self, search: String) -> Self {
@@ -37,14 +52,31 @@ impl UserFilter {
     }
 }
 
-/// Minimal user info for low-balance notifications.
+/// User eligible for auto top-up (has threshold + amount + payment provider configured).
+#[derive(Debug, Clone)]
+pub struct AutoTopupUser {
+    pub id: UserId,
+    pub email: String,
+    pub username: String,
+    pub display_name: Option<String>,
+    pub payment_provider_id: String,
+    pub auto_topup_threshold: rust_decimal::Decimal,
+    pub auto_topup_amount: rust_decimal::Decimal,
+    /// Cached checkpoint balance, if one exists.
+    pub checkpoint_balance: Option<rust_decimal::Decimal>,
+}
+
+/// User with a low-balance threshold configured.
 #[derive(Debug, Clone)]
 pub struct LowBalanceUser {
     pub id: UserId,
     pub email: String,
     pub username: String,
     pub display_name: Option<String>,
-    pub balance: rust_decimal::Decimal,
+    pub low_balance_threshold: rust_decimal::Decimal,
+    pub low_balance_notification_sent: bool,
+    /// Cached checkpoint balance, if one exists.
+    pub checkpoint_balance: Option<rust_decimal::Decimal>,
 }
 
 // Database entity model
@@ -69,6 +101,9 @@ struct User {
     pub first_batch_email_sent: bool,
     pub low_balance_notification_sent: bool,
     pub low_balance_threshold: Option<f32>,
+    pub auto_topup_amount: Option<f32>,
+    pub auto_topup_threshold: Option<f32>,
+    pub user_type: String,
 }
 
 pub struct Users<'c> {
@@ -95,6 +130,9 @@ impl From<(Vec<Role>, User)> for UserDBResponse {
             first_batch_email_sent: user.first_batch_email_sent,
             low_balance_notification_sent: user.low_balance_notification_sent,
             low_balance_threshold: user.low_balance_threshold,
+            auto_topup_amount: user.auto_topup_amount,
+            auto_topup_threshold: user.auto_topup_threshold,
+            user_type: user.user_type,
         }
     }
 }
@@ -151,8 +189,12 @@ impl<'c> Repository for Users<'c> {
         // These keys must exist before the user's first request to ensure immediate access
         // Realtime keys are NOT pre-created - users create them explicitly via API and can tolerate activation delay
         let mut api_keys_repo = ApiKeys::new(&mut tx);
-        api_keys_repo.get_or_create_hidden_key(user_id, ApiKeyPurpose::Batch).await?;
-        api_keys_repo.get_or_create_hidden_key(user_id, ApiKeyPurpose::Playground).await?;
+        api_keys_repo
+            .get_or_create_hidden_key(user_id, ApiKeyPurpose::Batch, user_id)
+            .await?;
+        api_keys_repo
+            .get_or_create_hidden_key(user_id, ApiKeyPurpose::Playground, user_id)
+            .await?;
 
         tx.commit().await?;
 
@@ -183,11 +225,14 @@ impl<'c> Repository for Users<'c> {
                 u.first_batch_email_sent,
                 u.low_balance_notification_sent,
                 u.low_balance_threshold,
+                u.auto_topup_amount,
+                u.auto_topup_threshold,
+                u.user_type,
                 ARRAY_AGG(ur.role) FILTER (WHERE ur.role IS NOT NULL) as "roles: Vec<Role>"
             FROM users u
             LEFT JOIN user_roles ur ON ur.user_id = u.id
             WHERE u.id = $1 AND u.id != '00000000-0000-0000-0000-000000000000' AND u.is_deleted = false
-            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id, u.is_deleted, u.is_internal, u.batch_notifications_enabled, u.first_batch_email_sent, u.low_balance_notification_sent, u.low_balance_threshold
+            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id, u.is_deleted, u.is_internal, u.batch_notifications_enabled, u.first_batch_email_sent, u.low_balance_notification_sent, u.low_balance_threshold, u.auto_topup_amount, u.auto_topup_threshold, u.user_type
             "#,
             id
         )
@@ -215,6 +260,9 @@ impl<'c> Repository for Users<'c> {
                 first_batch_email_sent: row.first_batch_email_sent,
                 low_balance_notification_sent: row.low_balance_notification_sent,
                 low_balance_threshold: row.low_balance_threshold,
+                auto_topup_amount: row.auto_topup_amount,
+                auto_topup_threshold: row.auto_topup_threshold,
+                user_type: row.user_type,
             };
 
             let roles = row.roles.unwrap_or_default();
@@ -254,11 +302,14 @@ impl<'c> Repository for Users<'c> {
                 u.first_batch_email_sent,
                 u.low_balance_notification_sent,
                 u.low_balance_threshold,
+                u.auto_topup_amount,
+                u.auto_topup_threshold,
+                u.user_type,
                 ARRAY_AGG(ur.role) FILTER (WHERE ur.role IS NOT NULL) as "roles: Vec<Role>"
             FROM users u
             LEFT JOIN user_roles ur ON ur.user_id = u.id
             WHERE u.id = ANY($1) AND u.id != '00000000-0000-0000-0000-000000000000' AND u.is_deleted = false
-            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id, u.is_deleted, u.is_internal, u.batch_notifications_enabled, u.first_batch_email_sent, u.low_balance_notification_sent, u.low_balance_threshold
+            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id, u.is_deleted, u.is_internal, u.batch_notifications_enabled, u.first_batch_email_sent, u.low_balance_notification_sent, u.low_balance_threshold, u.auto_topup_amount, u.auto_topup_threshold, u.user_type
             "#,
             ids.as_slice()
         )
@@ -288,6 +339,9 @@ impl<'c> Repository for Users<'c> {
                 first_batch_email_sent: row.first_batch_email_sent,
                 low_balance_notification_sent: row.low_balance_notification_sent,
                 low_balance_threshold: row.low_balance_threshold,
+                auto_topup_amount: row.auto_topup_amount,
+                auto_topup_threshold: row.auto_topup_threshold,
+                user_type: row.user_type,
             };
 
             let roles = row.roles.unwrap_or_default();
@@ -301,7 +355,10 @@ impl<'c> Repository for Users<'c> {
     async fn list(&mut self, filter: &Self::Filter) -> Result<Vec<Self::Response>> {
         use sqlx::QueryBuilder;
 
-        let mut query = QueryBuilder::new("SELECT * FROM users WHERE id != '00000000-0000-0000-0000-000000000000' AND is_deleted = false");
+        let mut query = QueryBuilder::new(
+            "SELECT * FROM users WHERE id != '00000000-0000-0000-0000-000000000000' AND is_deleted = false AND user_type = ",
+        );
+        query.push_bind(filter.user_type.clone());
 
         // Add search filter if specified (case-insensitive substring match on display_name, username, or email)
         if let Some(ref search) = filter.search {
@@ -396,6 +453,14 @@ impl<'c> Repository for Users<'c> {
                     WHEN $6::boolean THEN false
                     ELSE low_balance_notification_sent
                 END,
+                auto_topup_amount = CASE
+                    WHEN $8::boolean THEN $9
+                    ELSE auto_topup_amount
+                END,
+                auto_topup_threshold = CASE
+                    WHEN $10::boolean THEN $11
+                    ELSE auto_topup_threshold
+                END,
                 updated_at = NOW()
             WHERE id = $1
             RETURNING *
@@ -407,6 +472,10 @@ impl<'c> Repository for Users<'c> {
                 request.batch_notifications_enabled,
                 request.low_balance_threshold.is_some() as bool,
                 request.low_balance_threshold.flatten(),
+                request.auto_topup_amount.is_some() as bool,
+                request.auto_topup_amount.flatten(),
+                request.auto_topup_threshold.is_some() as bool,
+                request.auto_topup_threshold.flatten(),
             )
             .fetch_optional(&mut *tx)
             .await?
@@ -456,8 +525,10 @@ impl<'c> Users<'c> {
     pub async fn count(&mut self, filter: &UserFilter) -> Result<i64> {
         use sqlx::QueryBuilder;
 
-        let mut query =
-            QueryBuilder::new("SELECT COUNT(*) FROM users WHERE id != '00000000-0000-0000-0000-000000000000' AND is_deleted = false");
+        let mut query = QueryBuilder::new(
+            "SELECT COUNT(*) FROM users WHERE id != '00000000-0000-0000-0000-000000000000' AND is_deleted = false AND user_type = ",
+        );
+        query.push_bind(filter.user_type.clone());
 
         // Add search filter if specified (case-insensitive substring match on display_name, username, or email)
         if let Some(ref search) = filter.search {
@@ -479,7 +550,7 @@ impl<'c> Users<'c> {
     pub async fn get_user_by_email(&mut self, email: &str) -> Result<Option<UserDBResponse>> {
         let user = sqlx::query_as!(
             User,
-            "SELECT * FROM users WHERE email = $1 AND id != '00000000-0000-0000-0000-000000000000' AND is_deleted = false",
+            "SELECT * FROM users WHERE email = $1 AND id != '00000000-0000-0000-0000-000000000000' AND is_deleted = false AND user_type = 'individual'",
             email
         )
         .fetch_optional(&mut *self.db)
@@ -683,41 +754,21 @@ impl<'c> Users<'c> {
         Ok(())
     }
 
-    /// Get users whose balance is below their configured threshold and haven't been notified yet.
-    ///
-    /// Uses the checkpoint+delta CTE to calculate balance efficiently.
-    /// Only includes users with low_balance_threshold set (non-NULL = opted in).
-    /// Clear recovered notification flags and return users needing low-balance notifications.
-    ///
-    /// In a single query:
-    /// 1. Computes balance for all users with a threshold set
-    /// 2. Clears `low_balance_notification_sent` for users whose balance recovered above threshold
-    /// 3. Returns users whose balance is below threshold and haven't been notified yet
+    /// Return all users who have a low-balance threshold configured.
     #[instrument(skip(self), err)]
-    pub async fn poll_low_balance_users(&mut self) -> Result<Vec<LowBalanceUser>> {
-        // Clear recovered users and fetch low-balance users in one round-trip.
-        // Uses the cached checkpoint balance (not the full delta recalculation) — good enough
-        // for notification thresholds and avoids expensive per-tick aggregation.
+    pub async fn users_with_low_balance_threshold(&mut self) -> Result<Vec<LowBalanceUser>> {
         let rows = sqlx::query_as!(
             LowBalanceUser,
             r#"
-            WITH clear_recovered AS (
-                UPDATE users u
-                SET low_balance_notification_sent = false
-                FROM user_balance_checkpoints c
-                WHERE u.id = c.user_id
-                  AND u.low_balance_notification_sent = true
-                  AND u.low_balance_threshold IS NOT NULL
-                  AND c.balance >= u.low_balance_threshold
-            )
-            SELECT u.id, u.email, u.username, u.display_name, c.balance
+            SELECT u.id, u.email, u.username, u.display_name,
+                   u.low_balance_threshold::decimal(20, 9) as "low_balance_threshold!",
+                   u.low_balance_notification_sent,
+                   c.balance as "checkpoint_balance?"
             FROM users u
-            JOIN user_balance_checkpoints c ON u.id = c.user_id
+            LEFT JOIN user_balance_checkpoints c ON c.user_id = u.id
             WHERE u.id != '00000000-0000-0000-0000-000000000000'
               AND u.is_deleted = false
-              AND u.low_balance_notification_sent = false
               AND u.low_balance_threshold IS NOT NULL
-              AND c.balance < u.low_balance_threshold
             "#,
         )
         .fetch_all(&mut *self.db)
@@ -733,6 +784,79 @@ impl<'c> Users<'c> {
             .execute(&mut *self.db)
             .await?;
         Ok(())
+    }
+
+    /// Clear the low-balance notification flag for users who have recovered.
+    #[instrument(skip(self, user_ids), fields(count = user_ids.len()), err)]
+    pub async fn clear_low_balance_notification_sent(&mut self, user_ids: &[UserId]) -> Result<()> {
+        sqlx::query!(
+            "UPDATE users SET low_balance_notification_sent = false WHERE id = ANY($1)",
+            user_ids
+        )
+        .execute(&mut *self.db)
+        .await?;
+        Ok(())
+    }
+
+    /// Clear recovered users and fetch low-balance users in one round-trip.
+    /// Uses the cached checkpoint balance — good enough for notification thresholds.
+    #[instrument(skip(self), err)]
+    pub async fn poll_low_balance_users(&mut self) -> Result<Vec<LowBalanceUser>> {
+        let rows = sqlx::query_as!(
+            LowBalanceUser,
+            r#"
+            WITH clear_recovered AS (
+                UPDATE users u
+                SET low_balance_notification_sent = false
+                FROM user_balance_checkpoints c
+                WHERE u.id = c.user_id
+                  AND u.low_balance_notification_sent = true
+                  AND u.low_balance_threshold IS NOT NULL
+                  AND c.balance >= u.low_balance_threshold
+            )
+            SELECT u.id, u.email, u.username, u.display_name,
+                   u.low_balance_threshold::decimal(20, 9) as "low_balance_threshold!",
+                   u.low_balance_notification_sent,
+                   c.balance as "checkpoint_balance?"
+            FROM users u
+            LEFT JOIN user_balance_checkpoints c ON u.id = c.user_id
+            WHERE u.id != '00000000-0000-0000-0000-000000000000'
+              AND u.is_deleted = false
+              AND u.low_balance_notification_sent = false
+              AND u.low_balance_threshold IS NOT NULL
+              AND c.balance < u.low_balance_threshold
+            "#,
+        )
+        .fetch_all(&mut *self.db)
+        .await?;
+
+        Ok(rows)
+    }
+
+    /// Return all users who have auto top-up fully configured (threshold + amount + payment method).
+    #[instrument(skip(self), err)]
+    pub async fn users_with_auto_topup_enabled(&mut self) -> Result<Vec<AutoTopupUser>> {
+        let rows = sqlx::query_as!(
+            AutoTopupUser,
+            r#"
+            SELECT u.id, u.email, u.username, u.display_name,
+                   u.payment_provider_id as "payment_provider_id!",
+                   u.auto_topup_threshold::decimal(20, 9) as "auto_topup_threshold!",
+                   u.auto_topup_amount::decimal(20, 9) as "auto_topup_amount!",
+                   c.balance as "checkpoint_balance?"
+            FROM users u
+            LEFT JOIN user_balance_checkpoints c ON c.user_id = u.id
+            WHERE u.id != '00000000-0000-0000-0000-000000000000'
+              AND u.is_deleted = false
+              AND u.auto_topup_threshold IS NOT NULL
+              AND u.auto_topup_amount IS NOT NULL
+              AND u.payment_provider_id IS NOT NULL
+            "#,
+        )
+        .fetch_all(&mut *self.db)
+        .await?;
+
+        Ok(rows)
     }
 
     /// Set the payment provider ID for a user if it's not already set
@@ -851,6 +975,8 @@ mod tests {
             password_hash: None,
             batch_notifications_enabled: None,
             low_balance_threshold: None,
+            auto_topup_amount: None,
+            auto_topup_threshold: None,
         };
 
         let updated_user = repo.update(created_user.id, &update_request).await.unwrap();
@@ -869,6 +995,8 @@ mod tests {
             password_hash: None,
             batch_notifications_enabled: None,
             low_balance_threshold: None,
+            auto_topup_amount: None,
+            auto_topup_threshold: None,
         };
 
         let updated_user = repo.update(created_user.id, &update_request).await.unwrap();
@@ -901,11 +1029,13 @@ mod tests {
                 password_hash: None,
                 batch_notifications_enabled: None,
                 low_balance_threshold: Some(threshold),
+                auto_topup_amount: None,
+                auto_topup_threshold: None,
             };
             repo.update(user.id, &update).await.unwrap();
         }
 
-        // Grant credits and refresh checkpoint so poll_low_balance_users can see it
+        // Grant credits and refresh checkpoint
         let amount = Decimal::from_str(balance).unwrap();
         if amount > Decimal::ZERO {
             drop(conn);
@@ -921,57 +1051,73 @@ mod tests {
 
     #[sqlx::test]
     #[test_log::test]
-    async fn test_poll_low_balance_skips_users_without_threshold(pool: PgPool) {
-        // User with no threshold set should never appear
+    async fn test_users_with_threshold_skips_users_without_threshold(pool: PgPool) {
         create_user_with_balance(&pool, "1.00", None).await;
 
         let mut conn = pool.acquire().await.unwrap();
         let mut users = Users::new(&mut conn);
-        let low = users.poll_low_balance_users().await.unwrap();
-        assert!(low.is_empty());
+        let result = users.users_with_low_balance_threshold().await.unwrap();
+        assert!(result.is_empty());
     }
 
     #[sqlx::test]
     #[test_log::test]
-    async fn test_poll_low_balance_returns_user_below_threshold(pool: PgPool) {
+    async fn test_users_with_threshold_returns_user_with_checkpoint(pool: PgPool) {
         let user_id = create_user_with_balance(&pool, "1.50", Some(2.0)).await;
 
         let mut conn = pool.acquire().await.unwrap();
         let mut users = Users::new(&mut conn);
-        let low = users.poll_low_balance_users().await.unwrap();
-        assert_eq!(low.len(), 1);
-        assert_eq!(low[0].id, user_id);
+        let result = users.users_with_low_balance_threshold().await.unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].id, user_id);
+        assert_eq!(result[0].low_balance_threshold, Decimal::from_str("2.0").unwrap());
+        assert!(!result[0].low_balance_notification_sent);
+        assert_eq!(result[0].checkpoint_balance, Some(Decimal::from_str("1.50").unwrap()));
     }
 
     #[sqlx::test]
     #[test_log::test]
-    async fn test_poll_low_balance_skips_user_above_threshold(pool: PgPool) {
-        create_user_with_balance(&pool, "10.00", Some(2.0)).await;
+    async fn test_users_with_threshold_returns_user_without_checkpoint(pool: PgPool) {
+        // Create user with threshold but no credits (so no checkpoint)
+        let user_id = create_user_with_balance(&pool, "0", Some(2.0)).await;
 
         let mut conn = pool.acquire().await.unwrap();
         let mut users = Users::new(&mut conn);
-        let low = users.poll_low_balance_users().await.unwrap();
-        assert!(low.is_empty());
+        let result = users.users_with_low_balance_threshold().await.unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].id, user_id);
+        assert!(result[0].checkpoint_balance.is_none());
     }
 
     #[sqlx::test]
     #[test_log::test]
-    async fn test_poll_low_balance_skips_already_notified(pool: PgPool) {
+    async fn test_mark_and_clear_low_balance_notification(pool: PgPool) {
         let user_id = create_user_with_balance(&pool, "1.00", Some(2.0)).await;
 
         let mut conn = pool.acquire().await.unwrap();
         let mut users = Users::new(&mut conn);
 
-        // First poll: user appears
-        let low = users.poll_low_balance_users().await.unwrap();
-        assert_eq!(low.len(), 1);
+        // Initially not notified
+        let result = users.users_with_low_balance_threshold().await.unwrap();
+        assert!(!result[0].low_balance_notification_sent);
 
-        // Mark as notified
+        // Mark notified
         users.mark_low_balance_notification_sent(&[user_id]).await.unwrap();
+        let result = users.users_with_low_balance_threshold().await.unwrap();
+        assert!(result[0].low_balance_notification_sent);
 
-        // Second poll: user should not appear
+        // Second poll: user should not appear (already marked notified)
         let low = users.poll_low_balance_users().await.unwrap();
         assert!(low.is_empty());
+
+        // Clear
+        users.clear_low_balance_notification_sent(&[user_id]).await.unwrap();
+        let result = users.users_with_low_balance_threshold().await.unwrap();
+        assert!(!result[0].low_balance_notification_sent);
+
+        // Third poll: user reappears (flag cleared, still below threshold)
+        let low = users.poll_low_balance_users().await.unwrap();
+        assert_eq!(low.len(), 1);
     }
 
     #[sqlx::test]
@@ -1029,6 +1175,7 @@ mod tests {
             source_id: Uuid::new_v4().to_string(),
             description: None,
             fusillade_batch_id: None,
+            api_key_id: None,
         };
         credits.create_transaction(&deduct).await.unwrap();
         credits.refresh_checkpoint(user_id).await.unwrap();
@@ -1072,6 +1219,7 @@ mod tests {
             source_id: Uuid::new_v4().to_string(),
             description: None,
             fusillade_batch_id: None,
+            api_key_id: None,
         };
         credits.create_transaction(&deduct2).await.unwrap();
         credits.refresh_checkpoint(user_id).await.unwrap();
@@ -1101,6 +1249,7 @@ mod tests {
             source_id: Uuid::new_v4().to_string(),
             description: None,
             fusillade_batch_id: None,
+            api_key_id: None,
         };
         credits.create_transaction(&deduct).await.unwrap();
         credits.refresh_checkpoint(user_id).await.unwrap();
@@ -1121,9 +1270,7 @@ mod tests {
         let mut conn = pool.acquire().await.unwrap();
         let mut users = Users::new(&mut conn);
 
-        // Trigger notification
-        let low = users.poll_low_balance_users().await.unwrap();
-        assert_eq!(low.len(), 1);
+        // Mark notified
         users.mark_low_balance_notification_sent(&[user_id]).await.unwrap();
 
         // Update threshold — should reset the flag so user can be re-notified at new level
@@ -1134,13 +1281,161 @@ mod tests {
             password_hash: None,
             batch_notifications_enabled: None,
             low_balance_threshold: Some(Some(5.0)),
+            auto_topup_amount: None,
+            auto_topup_threshold: None,
         };
         let updated = users.update(user_id, &update).await.unwrap();
         assert!(!updated.low_balance_notification_sent);
         assert_eq!(updated.low_balance_threshold, Some(5.0));
 
-        // Poll again: user should appear at new threshold
-        let low = users.poll_low_balance_users().await.unwrap();
-        assert_eq!(low.len(), 1);
+        let result = users.users_with_low_balance_threshold().await.unwrap();
+        assert_eq!(result[0].low_balance_threshold, Decimal::from_str("5.0").unwrap());
+        assert!(!result[0].low_balance_notification_sent);
+    }
+
+    #[sqlx::test]
+    async fn test_users_with_auto_topup_enabled(pool: PgPool) {
+        let mut conn = pool.acquire().await.unwrap();
+
+        // Create a user with auto top-up fully configured
+        let user_id = {
+            let mut repo = Users::new(&mut conn);
+            let user_create = UserCreateDBRequest::from(UserCreate {
+                username: format!("autotopup_{}", Uuid::new_v4().simple()),
+                email: format!("autotopup_{}@example.com", Uuid::new_v4().simple()),
+                display_name: Some("Auto Topup Test".to_string()),
+                avatar_url: None,
+                roles: vec![Role::StandardUser],
+            });
+            repo.create(&user_create).await.unwrap().id
+        };
+
+        // Set up auto top-up fields via direct SQL (simulating the process_auto_topup handler)
+        sqlx::query!(
+            r#"UPDATE users SET
+                auto_topup_amount = 25.0,
+                auto_topup_threshold = 5.0,
+                payment_provider_id = 'cus_test_456'
+            WHERE id = $1"#,
+            user_id
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut users = Users::new(&mut conn);
+        let result = users.users_with_auto_topup_enabled().await.unwrap();
+
+        assert_eq!(result.len(), 1, "Should find exactly one auto-topup user");
+        assert_eq!(result[0].id, user_id);
+        assert_eq!(result[0].auto_topup_amount, Decimal::from_str("25.0").unwrap());
+        assert_eq!(result[0].auto_topup_threshold, Decimal::from_str("5.0").unwrap());
+        assert_eq!(result[0].payment_provider_id, "cus_test_456");
+    }
+
+    #[sqlx::test]
+    async fn test_users_with_auto_topup_enabled_excludes_incomplete(pool: PgPool) {
+        let mut conn = pool.acquire().await.unwrap();
+
+        let user_id = {
+            let mut repo = Users::new(&mut conn);
+            let user_create = UserCreateDBRequest::from(UserCreate {
+                username: format!("autotopup_{}", Uuid::new_v4().simple()),
+                email: format!("autotopup_{}@example.com", Uuid::new_v4().simple()),
+                display_name: Some("Incomplete Topup Test".to_string()),
+                avatar_url: None,
+                roles: vec![Role::StandardUser],
+            });
+            repo.create(&user_create).await.unwrap().id
+        };
+
+        // Set only some auto-topup fields (missing payment_provider_id)
+        sqlx::query!(
+            r#"UPDATE users SET
+                auto_topup_amount = 25.0,
+                auto_topup_threshold = 5.0
+            WHERE id = $1"#,
+            user_id
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut users = Users::new(&mut conn);
+        let result = users.users_with_auto_topup_enabled().await.unwrap();
+
+        assert!(result.is_empty(), "Should not include user with missing payment_provider_id");
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_list_users_excludes_organizations(pool: PgPool) {
+        let mut conn = pool.acquire().await.unwrap();
+        let mut repo = Users::new(&mut conn);
+
+        // Create a regular user
+        let user_create = UserCreateDBRequest::from(UserCreate {
+            username: "individual".to_string(),
+            email: "individual@example.com".to_string(),
+            display_name: Some("Individual User".to_string()),
+            avatar_url: None,
+            roles: vec![Role::StandardUser],
+        });
+        repo.create(&user_create).await.unwrap();
+
+        // Create an organization user directly via SQL (since Users::create always creates individuals)
+        sqlx::query!(
+            "INSERT INTO users (id, username, email, auth_source, user_type) VALUES ($1, $2, $3, 'organization', 'organization')",
+            uuid::Uuid::new_v4(),
+            "acme-org",
+            "billing@acme.example.com",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // List should only return individual users (plus any seeded system user)
+        let filter = UserFilter::new(0, 100);
+        let users = repo.list(&filter).await.unwrap();
+
+        for u in &users {
+            assert_eq!(u.user_type, "individual", "Organization users should not appear in list");
+        }
+        assert!(users.iter().any(|u| u.username == "individual"));
+        assert!(!users.iter().any(|u| u.username == "acme-org"));
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_count_users_excludes_organizations(pool: PgPool) {
+        let mut conn = pool.acquire().await.unwrap();
+        let mut repo = Users::new(&mut conn);
+
+        let initial_count = repo.count(&UserFilter::new(0, 100)).await.unwrap();
+
+        // Create a regular user
+        repo.create(&UserCreateDBRequest::from(UserCreate {
+            username: "countuser".to_string(),
+            email: "countuser@example.com".to_string(),
+            display_name: None,
+            avatar_url: None,
+            roles: vec![Role::StandardUser],
+        }))
+        .await
+        .unwrap();
+
+        // Create an org user via raw SQL
+        sqlx::query!(
+            "INSERT INTO users (id, username, email, auth_source, user_type) VALUES ($1, $2, $3, 'organization', 'organization')",
+            uuid::Uuid::new_v4(),
+            "count-org",
+            "count-org@example.com",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let new_count = repo.count(&UserFilter::new(0, 100)).await.unwrap();
+        assert_eq!(new_count, initial_count + 1, "Count should increase by 1 (the individual), not 2");
     }
 }

@@ -146,6 +146,7 @@ impl PaymentProvider for DummyProvider {
             source_id: session_id.to_string(),
             description: Some(description),
             fusillade_batch_id: None,
+            api_key_id: None,
         };
 
         let mut credits = Credits::new(&mut conn);
@@ -167,6 +168,53 @@ impl PaymentProvider for DummyProvider {
     async fn process_webhook_event(&self, _db_pool: &PgPool, _event: &WebhookEvent) -> Result<()> {
         // Dummy provider doesn't use webhooks
         Ok(())
+    }
+
+    async fn create_auto_topup_checkout_session(&self, user: &CurrentUser, _cancel_url: &str, success_url: &str) -> Result<String> {
+        // Dummy provider: always redirect to success URL (no real payment flow)
+        let session_id = format!("dummy_session_{}_{}", user.id, uuid::Uuid::new_v4());
+        let redirect_url = success_url.replace("{CHECKOUT_SESSION_ID}", &session_id);
+        Ok(redirect_url)
+    }
+
+    async fn process_auto_topup_session(&self, _db_pool: &PgPool, session_id: &str) -> Result<super::AutoTopupSetupResult> {
+        // For dummy provider, just validate the session format
+        if !session_id.starts_with("dummy_session_") {
+            return Err(PaymentError::InvalidData("Invalid dummy session ID format".to_string()));
+        }
+        // Extract user ID from session format: dummy_session_{user_id}_{uuid}
+        let user_id = session_id
+            .strip_prefix("dummy_session_")
+            .and_then(|s| s.split('_').next())
+            .map(String::from);
+
+        Ok(super::AutoTopupSetupResult {
+            customer_id: Some(format!("dummy_cus_{}", uuid::Uuid::new_v4())),
+            user_id,
+        })
+    }
+
+    async fn charge_auto_topup(
+        &self,
+        _amount_cents: i64,
+        _customer_id: &str,
+        _payment_method_id: &str,
+        _idempotency_key: &str,
+    ) -> Result<String> {
+        // Dummy provider always succeeds - return a fake payment intent ID
+        Ok(format!("dummy_pi_{}", uuid::Uuid::new_v4()))
+    }
+
+    async fn get_default_payment_method(&self, customer_id: &str) -> Result<Option<String>> {
+        Ok(Some(format!("dummy_pm_{}", customer_id)))
+    }
+
+    async fn customer_has_address(&self, _customer_id: &str) -> Result<bool> {
+        Ok(true)
+    }
+
+    async fn create_customer(&self, _email: &str, _name: Option<&str>) -> Result<String> {
+        Ok(format!("dummy_cus_{}", uuid::Uuid::new_v4()))
     }
 
     async fn create_billing_portal_session(&self, user: &CurrentUser, return_url: &str) -> Result<String> {
@@ -198,6 +246,8 @@ mod tests {
             payment_provider_id: None,
             is_admin: false,
             avatar_url: None,
+            organizations: vec![],
+            active_organization: None,
         }
     }
 

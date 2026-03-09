@@ -19,6 +19,7 @@ import {
   Globe,
   Mail,
 } from "lucide-react";
+import { useNavigate } from "react-router-dom";
 import {
   useUser,
   useUpdateUser,
@@ -109,6 +110,7 @@ export const Profile: React.FC = () => {
     refetch: refetchUser,
   } = useUser("current");
   const updateUserMutation = useUpdateUser();
+  const navigate = useNavigate();
   const [displayName, setDisplayName] = useState("");
   const [avatarUrl, setAvatarUrl] = useState("");
   const [roles, setRoles] = useState<Role[]>([]);
@@ -925,7 +927,14 @@ export const Profile: React.FC = () => {
                       Low Balance Alerts
                     </Label>
                     <p className="text-xs text-gray-500 mt-0.5">
-                      Receive email when your balance drops below the specified threshold
+                      Receive email when your balance drops below the specified threshold.{" "}
+                      <button
+                        type="button"
+                        className="text-blue-600 hover:text-blue-700 underline"
+                        onClick={() => navigate("/cost-management")}
+                      >
+                        Configure auto top-up
+                      </button>
                     </p>
                   </div>
                 </div>

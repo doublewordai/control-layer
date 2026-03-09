@@ -2,7 +2,7 @@
 
 use sqlx_pool_router::PoolProvider;
 
-use crate::api::models::deployments::{TrafficRoutingAction, TrafficRoutingRule};
+use crate::api::models::deployments::{ModelFacets, ModelListResponse, TrafficRoutingAction, TrafficRoutingRule};
 use crate::db::models::deployments::{
     MODEL_CATALOG_METADATA_MAX_BYTES, MODEL_CATALOG_METADATA_MAX_EXTRA_KEYS, ModelCatalogMetadata, TrafficRuleAction,
 };
@@ -14,7 +14,6 @@ use crate::{
             ComponentEndpointSummary, ComponentModelSummary, DeployedModelCreate, DeployedModelResponse, DeployedModelUpdate,
             GetModelQuery, ListModelsQuery, ModelComponentResponse, enrichment::DeployedModelEnricher,
         },
-        pagination::PaginatedResponse,
         users::CurrentUser,
     },
     auth::permissions::{RequiresPermission, can_read_all_resources, has_permission, operation, resource},
@@ -129,7 +128,12 @@ fn db_component_to_response(c: DeploymentComponentDBResponse) -> ModelComponentR
     params(
         ("endpoint" = Option<i32>, Query, description = "Filter by inference endpoint ID"),
         ("accessible" = Option<bool>, Query, description = "Filter to only models the current user can access (defaults to false for admins, true for users)"),
-        ("include" = Option<String>, Query, description = "Include additional data (comma-separated: 'groups', 'metrics', 'status', 'pricing', 'endpoints'). Only platform managers can include groups. Status shows probe monitoring information. Pricing shows simple customer rates for regular users, full pricing structure including current active tariffs for users with Pricing::ReadAll permission. Endpoints includes full inference endpoint details."),
+        ("include" = Option<String>, Query, description = "Include additional data (comma-separated: 'groups', 'metrics', 'status', 'pricing', 'endpoints', 'facets'). Only platform managers can include groups. Status shows probe monitoring information. Pricing shows simple customer rates for regular users, full pricing structure including current active tariffs for users with Pricing::ReadAll permission. Endpoints includes full inference endpoint details. Facets returns distinct providers, capabilities, and model types for filter dropdowns."),
+        ("provider" = Option<String>, Query, description = "Filter by provider name (case-insensitive exact match against metadata.provider)"),
+        ("model_type" = Option<String>, Query, description = "Filter by model type (CHAT, EMBEDDINGS, RERANKER)"),
+        ("capability" = Option<String>, Query, description = "Filter by capability (returns models that have this capability)"),
+        ("sort" = Option<String>, Query, description = "Sort field: created_at (default), alias, intelligence_index, released_at, context_window, provider, price_from"),
+        ("sort_direction" = Option<String>, Query, description = "Sort direction: asc or desc (default depends on sort field)"),
         ("deleted" = Option<bool>, Query, description = "Show deleted models when true (admin only), non-deleted models when false, and all models when not specified"),
         ("inactive" = Option<bool>, Query, description = "Show inactive models when true (admin only)"),
         ("limit" = Option<i64>, Query, description = "Maximum number of items to return (default: 10, max: 100)"),
@@ -138,7 +142,7 @@ fn db_component_to_response(c: DeploymentComponentDBResponse) -> ModelComponentR
         ("is_composite" = Option<bool>, Query, description = "Filter by composite/virtual model status (true = virtual models only, false = hosted models only)"),
     ),
     responses(
-        (status = 200, description = "Paginated list of deployed models", body = PaginatedResponse<DeployedModelResponse>),
+        (status = 200, description = "Paginated list of deployed models", body = ModelListResponse),
         (status = 401, description = "Unauthorized"),
         (status = 404, description = "Inference endpoint not found"),
         (status = 500, description = "Internal server error"),
@@ -155,7 +159,7 @@ pub async fn list_deployed_models<P: PoolProvider>(
     Query(query): Query<ListModelsQuery>,
     // Lots of conditional logic here, so no logic in extractor
     current_user: CurrentUser,
-) -> Result<Json<PaginatedResponse<DeployedModelResponse>>> {
+) -> Result<Json<ModelListResponse>> {
     let has_system_access = has_permission(&current_user, resource::Models.into(), operation::SystemAccess.into());
     let can_read_all_models = can_read_all_resources(&current_user, Resource::Models);
     let can_read_groups = can_read_all_resources(&current_user, Resource::Groups);
@@ -242,8 +246,10 @@ pub async fn list_deployed_models<P: PoolProvider>(
     };
 
     // Apply accessibility filtering based if user doesn't have PlatformManager role
+    // When an organization is active, filter by the org's group memberships instead
     if !can_read_all_models || query.accessible.unwrap_or(false) {
-        filter = filter.with_accessible_to(current_user.id);
+        let target_user_id = current_user.active_organization.unwrap_or(current_user.id);
+        filter = filter.with_accessible_to(target_user_id);
     }
 
     // Apply search filter if specified
@@ -256,6 +262,30 @@ pub async fn list_deployed_models<P: PoolProvider>(
     // Apply is_composite filter if specified
     if let Some(is_composite) = query.is_composite {
         filter = filter.with_composite(is_composite);
+    }
+
+    // Apply provider filter if specified
+    if let Some(ref provider) = query.provider
+        && !provider.trim().is_empty()
+    {
+        filter = filter.with_provider(provider.trim().to_string());
+    }
+
+    // Apply model_type filter if specified
+    if let Some(model_type) = query.model_type {
+        filter = filter.with_model_type(model_type);
+    }
+
+    // Apply capability filter if specified
+    if let Some(ref capability) = query.capability
+        && !capability.trim().is_empty()
+    {
+        filter = filter.with_capability(capability.trim().to_string());
+    }
+
+    // Apply sort if specified
+    if let Some(sort_field) = query.sort {
+        filter = filter.with_sort(sort_field, query.sort_direction);
     }
 
     // Parse include parameter
@@ -348,7 +378,29 @@ pub async fn list_deployed_models<P: PoolProvider>(
 
     let response = enricher.enrich_many(models).await?;
 
-    Ok(Json(PaginatedResponse::new(response, total_count, skip, limit)))
+    // Fetch facets if requested (reuse existing repo/connection to avoid
+    // acquiring a second read connection which could self-deadlock under pool
+    // saturation). The filter ensures facets respect the same access-control
+    // as the model list.
+    let include_facets = includes.contains(&"facets");
+    let facets = if include_facets {
+        let (providers, capabilities, model_types) = repo.facets(&filter).await?;
+        Some(ModelFacets {
+            providers,
+            capabilities,
+            model_types,
+        })
+    } else {
+        None
+    };
+
+    Ok(Json(ModelListResponse {
+        data: response,
+        total_count,
+        skip,
+        limit,
+        facets,
+    }))
 }
 
 #[utoipa::path(

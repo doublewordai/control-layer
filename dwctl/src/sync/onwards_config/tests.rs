@@ -640,6 +640,7 @@ async fn test_batch_api_key_access_to_composite_escalation_target(pool: sqlx::Pg
             purpose: ApiKeyPurpose::Batch,
             requests_per_second: None,
             burst_size: None,
+            created_by: test_user.id,
         })
         .await
         .unwrap();

@@ -16,6 +16,8 @@ import {
   BarChart3,
   LifeBuoy,
   Activity,
+  Building,
+  Check,
 } from "lucide-react";
 import {
   useUser,
@@ -26,7 +28,7 @@ import {
 import { UserAvatar } from "../../ui";
 import { useAuthorization } from "../../../utils";
 import { useAuth } from "../../../contexts/auth";
-import { useSettings } from "../../../contexts";
+import { useSettings, useOrganizationContext } from "../../../contexts";
 import { SupportRequestModal } from "../../modals";
 import type { FeatureFlags } from "../../../contexts/settings/types";
 import onwardsLogo from "../../../assets/onwards-logo.svg";
@@ -49,6 +51,8 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { formatDollars } from "@/utils/money";
@@ -64,10 +68,12 @@ interface NavItem {
 
 export function AppSidebar() {
   const navigate = useNavigate();
-  const { data: currentUser, isLoading: loading } = useUser("current");
+  const { data: currentUser, isLoading: loading } = useUser("current", { include: "organizations" });
   const { canAccessRoute } = useAuthorization();
   const { logout } = useAuth();
   const { isFeatureEnabled } = useSettings();
+  const { activeOrganizationId, isOrgContext, setActiveOrganization } =
+    useOrganizationContext();
   const { data: config } = useConfig();
   const [isSupportModalOpen, setIsSupportModalOpen] = useState(false);
 
@@ -83,7 +89,10 @@ export function AppSidebar() {
     { path: "/endpoints", icon: Server, label: "Endpoints" },
     { path: "/playground", icon: Play, label: "Playground" },
     { path: "/analytics", icon: BarChart3, label: "Analytics" },
-    { path: "/users-groups", icon: Users, label: "Users & Groups" },
+    { path: "/users-groups", icon: Users, label: "User Access" },
+    ...(isOrgContext
+      ? [{ path: "/organization", icon: Building, label: "Organization" }]
+      : []),
     { path: "/api-keys", icon: Key, label: "API Keys" },
     { path: "/usage", icon: Activity, label: "Usage" },
     { path: "/system", icon: Settings, label: "System" },
@@ -193,6 +202,36 @@ export function AppSidebar() {
             </Button>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="end" className="w-56">
+            {currentUser?.organizations &&
+              currentUser.organizations.length > 0 && (
+                <>
+                  <DropdownMenuLabel className="text-xs text-muted-foreground">
+                    Switch Account
+                  </DropdownMenuLabel>
+                  <DropdownMenuItem
+                    onClick={() => void setActiveOrganization(null).catch(console.error)}
+                  >
+                    <User className="w-4 h-4 mr-2" />
+                    Personal
+                    {!activeOrganizationId && (
+                      <Check className="w-4 h-4 ml-auto" />
+                    )}
+                  </DropdownMenuItem>
+                  {currentUser.organizations.map((org) => (
+                    <DropdownMenuItem
+                      key={org.id}
+                      onClick={() => void setActiveOrganization(org.id).catch(console.error)}
+                    >
+                      <Building className="w-4 h-4 mr-2" />
+                      <span className="truncate">{org.name}</span>
+                      {activeOrganizationId === org.id && (
+                        <Check className="w-4 h-4 ml-auto flex-shrink-0" />
+                      )}
+                    </DropdownMenuItem>
+                  ))}
+                  <DropdownMenuSeparator />
+                </>
+              )}
             <DropdownMenuItem onClick={() => navigate("/profile")}>
               <User className="w-4 h-4 mr-2" />
               Profile
@@ -225,13 +264,18 @@ export function AppLayout({ children }: { children: React.ReactNode }) {
   const { user } = useAuth();
   const { data: config, isLoading: configLoading } = useConfig();
   const { isFeatureEnabled } = useSettings();
+  const { activeOrganizationId, activeOrganization } =
+    useOrganizationContext();
   const isDemoMode = isFeatureEnabled("demo");
   const [isSupportModalOpen, setIsSupportModalOpen] = useState(false);
 
+  // When in org context, show org's balance; otherwise show personal balance
+  const balanceUserId = activeOrganizationId || user?.id || "";
+
   // Fetch balance and transactions
-  const { data: balance = 0 } = useUserBalance(user?.id || "");
+  const { data: balance = 0 } = useUserBalance(balanceUserId);
   const { data: transactionsData } = useTransactions({
-    userId: user?.id || "",
+    userId: balanceUserId,
   });
 
   // Calculate current balance
@@ -247,7 +291,15 @@ export function AppLayout({ children }: { children: React.ReactNode }) {
         <AppSidebar />
         <SidebarInset className="flex flex-col flex-1">
           <header className="flex h-16 items-center justify-between border-b px-4 md:px-6">
-            <SidebarTrigger />
+            <div className="flex items-center gap-2">
+              <SidebarTrigger />
+              {activeOrganization && (
+                <div className="flex items-center gap-2 rounded-md bg-muted px-3 py-1.5 text-sm">
+                  <Building className="h-3.5 w-3.5 text-muted-foreground" />
+                  <span className="font-medium">{activeOrganization.name}</span>
+                </div>
+              )}
+            </div>
             <div className="flex items-center gap-3 md:gap-6 text-sm text-muted-foreground">
               {!configLoading && config && (
                 <>

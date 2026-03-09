@@ -1,5 +1,35 @@
 # Changelog
 
+## [8.15.2](https://github.com/doublewordai/control-layer/compare/v8.15.1...v8.15.2) (2026-03-08)
+
+
+### Bug Fixes
+
+* validate endpoint-to-model-type matching in batch file uploads ([#813](https://github.com/doublewordai/control-layer/issues/813)) ([817cc03](https://github.com/doublewordai/control-layer/commit/817cc032cbd8ae1964181d53bc1ee6ad7016d42c))
+
+## [8.15.1](https://github.com/doublewordai/control-layer/compare/v8.15.0...v8.15.1) (2026-03-06)
+
+
+### Bug Fixes
+
+* cookie sync + file owner balance check ([#810](https://github.com/doublewordai/control-layer/issues/810)) ([da4a88e](https://github.com/doublewordai/control-layer/commit/da4a88e204cca9cc03f5ff01b819857694c160c4))
+
+## [8.15.0](https://github.com/doublewordai/control-layer/compare/v8.14.0...v8.15.0) (2026-03-06)
+
+
+### Features
+
+* auto top-up for credit balances ([#805](https://github.com/doublewordai/control-layer/issues/805)) ([957a1d5](https://github.com/doublewordai/control-layer/commit/957a1d53e6d3d53873e4e8db8270833846534bbd))
+
+## [8.14.0](https://github.com/doublewordai/control-layer/compare/v8.13.0...v8.14.0) (2026-03-06)
+
+
+### Features
+
+* add server-side filtering, sorting, and facets for models API ([#804](https://github.com/doublewordai/control-layer/issues/804)) ([a716b95](https://github.com/doublewordai/control-layer/commit/a716b95a62de2c60ec2d51743964f76e8b90e9cb))
+* migration and initial organisation backend infrastructure ([#797](https://github.com/doublewordai/control-layer/issues/797)) ([df159d9](https://github.com/doublewordai/control-layer/commit/df159d9d740992250b0e8532145686a68d6e5264))
+* organisation invites + views ([#801](https://github.com/doublewordai/control-layer/issues/801)) ([5ed7561](https://github.com/doublewordai/control-layer/commit/5ed7561c7f004eab533887bebc353cda39f4597b))
+
 ## [8.13.0](https://github.com/doublewordai/control-layer/compare/v8.12.0...v8.13.0) (2026-03-04)
 
 

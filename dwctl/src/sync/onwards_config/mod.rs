@@ -548,6 +548,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                     WHERE ub.user_id = ak.user_id AND ub.balance > 0
                 )
             )
+            AND ak.is_deleted = false
         ) ak
         WHERE cm.is_composite = TRUE
           AND cm.deleted = FALSE
@@ -1072,6 +1073,7 @@ pub async fn load_targets_from_db(db: &PgPool, escalation_models: &[String], str
                     )
                 )
             )
+            AND ak.is_deleted = false
         ) ak ON true
         WHERE dm.deleted = FALSE
           AND dm.is_composite = FALSE

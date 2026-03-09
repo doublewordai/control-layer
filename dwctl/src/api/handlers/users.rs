@@ -11,7 +11,7 @@ use crate::{
     },
     auth::permissions::{self as permissions, RequiresPermission, can_read_all_resources, can_read_own_resource, operation, resource},
     db::{
-        handlers::{Credits, Groups, Repository, Users, users::UserFilter},
+        handlers::{Credits, Groups, Organizations, Repository, Users, users::UserFilter},
         models::users::{UserCreateDBRequest, UserUpdateDBRequest},
     },
     errors::{Error, Result},
@@ -185,6 +185,7 @@ pub async fn get_user<P: PoolProvider>(
     // Can't use RequiresPermission here because we need conditional logic for own vs other users
     current_user: CurrentUser,
 ) -> Result<Json<UserResponse>> {
+    let is_current = matches!(user_id, UserIdOrCurrent::Current(_));
     let target_user_id = match user_id {
         UserIdOrCurrent::Current(_) => {
             // Even for /current, verify they have permission to read their own user data
@@ -201,16 +202,23 @@ pub async fn get_user<P: PoolProvider>(
             let can_read_all_users = can_read_all_resources(&current_user, Resource::Users);
             let can_read_own_user = can_read_own_resource(&current_user, Resource::Users, uuid);
 
-            // Allow access if user can read all users OR read their own user data
+            // Allow access if user can read all users, read their own user data,
+            // or is a member of the org (orgs are virtual users)
             if !can_read_all_users && !can_read_own_user {
-                return Err(Error::InsufficientPermissions {
-                    required: Permission::Any(vec![
-                        Permission::Allow(Resource::Users, Operation::ReadAll),
-                        Permission::Allow(Resource::Users, Operation::ReadOwn),
-                    ]),
-                    action: Operation::ReadAll,
-                    resource: format!("user data for user {uuid}"),
-                });
+                let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+                let is_member = permissions::is_org_member(&current_user, uuid, &mut conn)
+                    .await
+                    .map_err(Error::Database)?;
+                if !is_member {
+                    return Err(Error::InsufficientPermissions {
+                        required: Permission::Any(vec![
+                            Permission::Allow(Resource::Users, Operation::ReadAll),
+                            Permission::Allow(Resource::Users, Operation::ReadOwn),
+                        ]),
+                        action: Operation::ReadAll,
+                        resource: format!("user data for user {uuid}"),
+                    });
+                }
             }
             uuid
         }
@@ -227,13 +235,16 @@ pub async fn get_user<P: PoolProvider>(
 
     let mut response = UserResponse::from(user);
 
-    // Include groups if requested and permitted
+    // Include billing if requested and permitted
     // Permitted if:
     //     1. You have ReadAll on Credits
     //     2. You are requesting your own data and have ReadOwn on Credits
+    //     3. You are a member of the org being queried (org balance is shared)
+    let is_org_member = current_user.organizations.iter().any(|o| o.id == target_user_id);
     if query.include.as_deref().is_some_and(|includes| includes.contains("billing"))
         && (permissions::has_permission(&current_user, Resource::Credits, Operation::ReadAll)
-            || (target_user_id == current_user.id && permissions::has_permission(&current_user, Resource::Credits, Operation::ReadOwn)))
+            || (target_user_id == current_user.id && permissions::has_permission(&current_user, Resource::Credits, Operation::ReadOwn))
+            || is_org_member)
     {
         let mut credits_repo = Credits::new(&mut pool_conn);
         let balance = credits_repo.get_user_balance(target_user_id).await?.to_f64().unwrap_or_else(|| {
@@ -241,6 +252,40 @@ pub async fn get_user<P: PoolProvider>(
             0.0
         });
         response = response.with_credit_balance(balance);
+    }
+
+    // Include organizations if requested
+    if query.include.as_deref().is_some_and(|includes| includes.contains("organizations")) {
+        let mut org_repo = Organizations::new(&mut pool_conn);
+        let memberships = org_repo.list_user_organizations(target_user_id).await?;
+
+        let org_ids: Vec<UserId> = memberships.iter().map(|m| m.organization_id).collect();
+        if !org_ids.is_empty() {
+            let mut users_repo = Users::new(&mut pool_conn);
+            let org_map = users_repo.get_bulk(org_ids).await?;
+
+            let summaries: Vec<crate::api::models::organizations::OrganizationSummary> = memberships
+                .iter()
+                .filter_map(|m| {
+                    org_map
+                        .get(&m.organization_id)
+                        .map(|org| crate::api::models::organizations::OrganizationSummary {
+                            id: m.organization_id,
+                            name: org.display_name.clone().unwrap_or_else(|| org.username.clone()),
+                            role: m.role.clone(),
+                        })
+                })
+                .collect();
+
+            response = response.with_organizations(summaries);
+        } else {
+            response = response.with_organizations(vec![]);
+        }
+    }
+
+    // Include active organization for /users/current requests
+    if is_current {
+        response = response.with_active_organization(current_user.active_organization);
     }
 
     Ok(Json(response))
@@ -339,6 +384,22 @@ pub async fn update_user<P: PoolProvider>(
             required: Permission::Allow(Resource::Users, Operation::UpdateAll),
             action: Operation::UpdateAll,
             resource: "user roles".to_string(),
+        });
+    }
+
+    // Validate auto-topup fields if provided
+    if let Some(Some(amount)) = &user_data.auto_topup_amount
+        && *amount <= 0.0
+    {
+        return Err(Error::BadRequest {
+            message: "Auto top-up amount must be positive".to_string(),
+        });
+    }
+    if let Some(Some(threshold)) = &user_data.auto_topup_threshold
+        && *threshold < 0.0
+    {
+        return Err(Error::BadRequest {
+            message: "Auto top-up threshold must be non-negative".to_string(),
         });
     }
 

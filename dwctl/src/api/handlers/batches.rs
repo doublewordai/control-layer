@@ -12,6 +12,7 @@ use crate::api::models::batches::{
     BatchAnalytics, BatchErrors, BatchListResponse, BatchObjectType, BatchResponse, BatchResultsQuery, CreateBatchRequest,
     ListBatchesQuery, ListObjectType, RequestCounts, RetryRequestsRequest,
 };
+use crate::api::models::users::CurrentUser;
 use crate::auth::permissions::{RequiresPermission, can_read_all_resources, has_permission, operation, resource};
 use crate::db::handlers::{Credits, Users, repository::Repository};
 use crate::errors::{Error, Result};
@@ -29,6 +30,22 @@ use futures::StreamExt;
 use std::collections::HashMap;
 use std::pin::Pin;
 use uuid::Uuid;
+
+/// Check if the current user "owns" a batch, considering org context.
+/// Returns true if the batch creator matches the user's ID or their active organization.
+fn is_batch_owner(current_user: &CurrentUser, created_by: Option<&str>) -> bool {
+    let user_id = current_user.id.to_string();
+    if created_by == Some(user_id.as_str()) {
+        return true;
+    }
+    if let Some(org_id) = current_user.active_organization {
+        let org_id_str = org_id.to_string();
+        if created_by == Some(org_id_str.as_str()) {
+            return true;
+        }
+    }
+    false
+}
 
 /// Helper function to convert fusillade Batch to OpenAI BatchResponse
 ///
@@ -254,6 +271,45 @@ pub async fn create_batch<P: PoolProvider>(
         }
     }
 
+    // Check that the file owner (whose API key is embedded in the request templates)
+    // has sufficient balance. This catches cases where an admin creates a batch from
+    // a file owned by another user/org that has negative balance.
+    if let Some(ref uploaded_by) = file.uploaded_by
+        && let Ok(file_owner_id) = uuid::Uuid::parse_str(uploaded_by)
+    {
+        let file_owner_id = crate::types::UserId::from(file_owner_id);
+        if file_owner_id != current_user.id {
+            let mut conn = state.db.write().acquire().await.map_err(|e| Error::Internal {
+                operation: format!("get db connection for file owner credit check: {}", e),
+            })?;
+            let owner_balance = Credits::new(&mut conn)
+                .get_user_balance(file_owner_id)
+                .await
+                .map_err(|e| Error::Internal {
+                    operation: format!("check file owner credit balance: {}", e),
+                })?;
+            if owner_balance < rust_decimal::Decimal::ZERO {
+                let owner_name = {
+                    let mut users_repo = Users::new(&mut conn);
+                    users_repo
+                        .get_by_id(file_owner_id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(|u| u.display_name.unwrap_or(u.username))
+                        .unwrap_or_else(|| file_owner_id.to_string())
+                };
+                return Err(Error::InsufficientCredits {
+                    current_balance: owner_balance,
+                    message: format!(
+                        "File owner ({}) does not have enough balance. Please add credits to their account or upload a new file.",
+                        owner_name
+                    ),
+                });
+            }
+        }
+    }
+
     // Get per-model request counts from the file
     let file_stats = state
         .request_manager
@@ -311,21 +367,25 @@ pub async fn create_batch<P: PoolProvider>(
     // - No API key (cookie auth) -> "frontend"
     let request_source = if has_api_key.0 { "api" } else { "frontend" };
 
+    // When in org context, attribute batch ownership to the org
+    let target_user_id = current_user.active_organization.unwrap_or(current_user.id);
+
     // Convert metadata to HashMap and inject request_source and user info
     // Note: created_by_email is NOT stored in metadata to avoid PII in denormalized storage.
     // The email is fetched via user lookup when building API responses.
+    // metadata.created_by tracks the individual user for audit trail
     let mut metadata_map = req.metadata.unwrap_or_default();
     metadata_map.insert("request_source".to_string(), request_source.to_string());
     metadata_map.insert("created_by".to_string(), current_user.id.to_string());
     let metadata = serde_json::to_value(metadata_map).ok();
 
-    // Create batch input
+    // Create batch input — created_by uses org ID when in org context for ownership scoping
     let batch_input = fusillade::BatchInput {
         file_id: fusillade::FileId(file_id),
         endpoint: req.endpoint.clone(),
         completion_window: req.completion_window.clone(),
         metadata,
-        created_by: Some(current_user.id.to_string()),
+        created_by: Some(target_user_id.to_string()),
     };
 
     let reservation_ids = reserve_capacity_for_batch(
@@ -636,16 +696,13 @@ pub async fn get_batch<P: PoolProvider>(
             id: batch_id_str.clone(),
         })?;
 
-    // Check ownership: users without ReadAll permission can only see their own batches
+    // Check ownership: users without ReadAll permission can only see their own batches (or org batches)
     let can_read_all = can_read_all_resources(&current_user, Resource::Batches);
-    if !can_read_all {
-        let user_id = current_user.id.to_string();
-        if batch.created_by.as_deref() != Some(user_id.as_str()) {
-            return Err(Error::NotFound {
-                resource: "Batch".to_string(),
-                id: batch_id_str,
-            });
-        }
+    if !can_read_all && !is_batch_owner(&current_user, batch.created_by.as_deref()) {
+        return Err(Error::NotFound {
+            resource: "Batch".to_string(),
+            id: batch_id_str,
+        });
     }
 
     // Fetch creator email for the response
@@ -689,16 +746,13 @@ pub async fn get_batch_analytics<P: PoolProvider>(
             id: batch_id_str.clone(),
         })?;
 
-    // Check ownership: users without ReadAll permission can only see their own batches
+    // Check ownership: users without ReadAll permission can only see their own batches (or org batches)
     let can_read_all = can_read_all_resources(&current_user, Resource::Batches);
-    if !can_read_all {
-        let user_id = current_user.id.to_string();
-        if batch.created_by.as_deref() != Some(user_id.as_str()) {
-            return Err(Error::NotFound {
-                resource: "Batch".to_string(),
-                id: batch_id_str.clone(),
-            });
-        }
+    if !can_read_all && !is_batch_owner(&current_user, batch.created_by.as_deref()) {
+        return Err(Error::NotFound {
+            resource: "Batch".to_string(),
+            id: batch_id_str.clone(),
+        });
     }
 
     // Fetch aggregated analytics metrics for this batch
@@ -752,16 +806,13 @@ pub async fn get_batch_results<P: PoolProvider>(
             id: batch_id_str.clone(),
         })?;
 
-    // Check ownership: users without ReadAll permission can only see their own batches
+    // Check ownership: users without ReadAll permission can only see their own batches (or org batches)
     let can_read_all = can_read_all_resources(&current_user, Resource::Batches);
-    if !can_read_all {
-        let user_id = current_user.id.to_string();
-        if batch.created_by.as_deref() != Some(user_id.as_str()) {
-            return Err(Error::NotFound {
-                resource: "Batch".to_string(),
-                id: batch_id_str.clone(),
-            });
-        }
+    if !can_read_all && !is_batch_owner(&current_user, batch.created_by.as_deref()) {
+        return Err(Error::NotFound {
+            resource: "Batch".to_string(),
+            id: batch_id_str.clone(),
+        });
     }
 
     // Check if batch is still processing (more results may arrive).
@@ -911,16 +962,13 @@ pub async fn cancel_batch<P: PoolProvider>(
             id: batch_id_str.clone(),
         })?;
 
-    // Check ownership: users without UpdateAll permission can only cancel their own batches
+    // Check ownership: users without UpdateAll permission can only cancel their own batches (or org batches)
     let can_update_all = has_permission(&current_user, Resource::Batches, Operation::UpdateAll);
-    if !can_update_all {
-        let user_id = current_user.id.to_string();
-        if batch.created_by.as_deref() != Some(user_id.as_str()) {
-            return Err(Error::NotFound {
-                resource: "Batch".to_string(),
-                id: batch_id_str.clone(),
-            });
-        }
+    if !can_update_all && !is_batch_owner(&current_user, batch.created_by.as_deref()) {
+        return Err(Error::NotFound {
+            resource: "Batch".to_string(),
+            id: batch_id_str.clone(),
+        });
     }
 
     // Cancel the batch
@@ -987,16 +1035,13 @@ pub async fn delete_batch<P: PoolProvider>(
             id: batch_id_str.clone(),
         })?;
 
-    // Check ownership: users without DeleteAll permission can only delete their own batches
+    // Check ownership: users without DeleteAll permission can only delete their own batches (or org batches)
     let can_delete_all = has_permission(&current_user, Resource::Batches, Operation::DeleteAll);
-    if !can_delete_all {
-        let user_id = current_user.id.to_string();
-        if batch.created_by.as_deref() != Some(user_id.as_str()) {
-            return Err(Error::NotFound {
-                resource: "Batch".to_string(),
-                id: batch_id_str.clone(),
-            });
-        }
+    if !can_delete_all && !is_batch_owner(&current_user, batch.created_by.as_deref()) {
+        return Err(Error::NotFound {
+            resource: "Batch".to_string(),
+            id: batch_id_str.clone(),
+        });
     }
 
     // Delete the batch
@@ -1051,16 +1096,13 @@ pub async fn retry_failed_batch_requests<P: PoolProvider>(
             id: batch_id_str.clone(),
         })?;
 
-    // Check ownership: users without UpdateAll permission can only retry their own batches
+    // Check ownership: users without UpdateAll permission can only retry their own batches (or org batches)
     let can_update_all = has_permission(&current_user, Resource::Batches, Operation::UpdateAll);
-    if !can_update_all {
-        let user_id = current_user.id.to_string();
-        if batch.created_by.as_deref() != Some(user_id.as_str()) {
-            return Err(Error::NotFound {
-                resource: "Batch".to_string(),
-                id: batch_id_str.clone(),
-            });
-        }
+    if !can_update_all && !is_batch_owner(&current_user, batch.created_by.as_deref()) {
+        return Err(Error::NotFound {
+            resource: "Batch".to_string(),
+            id: batch_id_str.clone(),
+        });
     }
 
     // Retry all failed requests for the batch in a single database operation
@@ -1139,16 +1181,13 @@ pub async fn retry_specific_requests<P: PoolProvider>(
             id: batch_id_str.clone(),
         })?;
 
-    // Check ownership: users without UpdateAll permission can only retry their own batches
+    // Check ownership: users without UpdateAll permission can only retry their own batches (or org batches)
     let can_update_all = has_permission(&current_user, Resource::Batches, Operation::UpdateAll);
-    if !can_update_all {
-        let user_id = current_user.id.to_string();
-        if batch.created_by.as_deref() != Some(user_id.as_str()) {
-            return Err(Error::NotFound {
-                resource: "Batch".to_string(),
-                id: batch_id_str.clone(),
-            });
-        }
+    if !can_update_all && !is_batch_owner(&current_user, batch.created_by.as_deref()) {
+        return Err(Error::NotFound {
+            resource: "Batch".to_string(),
+            id: batch_id_str.clone(),
+        });
     }
 
     // Parse request IDs
@@ -1248,8 +1287,14 @@ pub async fn list_batches<P: PoolProvider>(
         .and_then(|after_str| Uuid::parse_str(after_str).ok().map(fusillade::BatchId));
 
     // Determine if user can read all batches or just their own
+    // In org context, show batches owned by the org instead of the individual user
     let can_read_all = can_read_all_resources(&current_user, Resource::Batches);
-    let created_by = if can_read_all { None } else { Some(current_user.id.to_string()) };
+    let created_by = if can_read_all {
+        None
+    } else {
+        let target_user_id = current_user.active_organization.unwrap_or(current_user.id);
+        Some(target_user_id.to_string())
+    };
 
     // Fetch batches with ownership filtering, search, and cursor-based pagination
     let batches = state
@@ -2792,6 +2837,7 @@ mod tests {
                 source_id: Uuid::new_v4().to_string(),
                 description: Some("Initial credits".to_string()),
                 fusillade_batch_id: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -2803,6 +2849,7 @@ mod tests {
                 source_id: Uuid::new_v4().to_string(),
                 description: Some("Usage".to_string()),
                 fusillade_batch_id: None,
+                api_key_id: None,
             })
             .await
             .unwrap();

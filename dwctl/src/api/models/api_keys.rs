@@ -49,6 +49,9 @@ pub struct ApiKeyResponse {
     pub purpose: ApiKeyPurpose,
     #[schema(value_type = String, format = "uuid")]
     pub user_id: UserId,
+    /// The individual user who created this key
+    #[schema(value_type = String, format = "uuid")]
+    pub created_by: UserId,
     pub created_at: DateTime<Utc>,
     pub last_used: Option<DateTime<Utc>>,
     #[schema(value_type = Vec<String>)]
@@ -68,6 +71,9 @@ pub struct ApiKeyInfoResponse {
     pub purpose: ApiKeyPurpose,
     #[schema(value_type = String, format = "uuid")]
     pub user_id: UserId,
+    /// The individual user who created this key
+    #[schema(value_type = String, format = "uuid")]
+    pub created_by: UserId,
     pub created_at: DateTime<Utc>,
     pub last_used: Option<DateTime<Utc>>,
     #[schema(value_type = Vec<String>)]
@@ -95,6 +101,7 @@ impl From<ApiKeyDBResponse> for ApiKeyResponse {
             key: db.secret,
             purpose: db.purpose,
             user_id: db.user_id,
+            created_by: db.created_by,
             created_at: db.created_at,
             last_used: db.last_used,
             model_access: db.model_access,
@@ -112,6 +119,7 @@ impl From<ApiKeyDBResponse> for ApiKeyInfoResponse {
             description: db.description,
             purpose: db.purpose,
             user_id: db.user_id,
+            created_by: db.created_by,
             created_at: db.created_at,
             last_used: db.last_used,
             model_access: db.model_access,

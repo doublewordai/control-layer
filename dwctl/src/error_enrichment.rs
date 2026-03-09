@@ -201,6 +201,7 @@ mod tests {
                 purpose: ApiKeyPurpose::Realtime,
                 requests_per_second: None,
                 burst_size: None,
+                created_by: user.id,
             })
             .await
             .unwrap();
@@ -216,6 +217,7 @@ mod tests {
                 source_id: uuid::Uuid::new_v4().to_string(),
                 description: Some("Initial credits".to_string()),
                 fusillade_batch_id: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -265,6 +267,7 @@ mod tests {
                 source_id: uuid::Uuid::new_v4().to_string(),
                 description: Some("Usage".to_string()),
                 fusillade_batch_id: None,
+                api_key_id: None,
             })
             .await
             .unwrap();
@@ -320,6 +323,7 @@ mod tests {
                 purpose: ApiKeyPurpose::Realtime,
                 requests_per_second: None,
                 burst_size: None,
+                created_by: user.id,
             })
             .await
             .unwrap();
@@ -335,6 +339,7 @@ mod tests {
                 source_id: uuid::Uuid::new_v4().to_string(),
                 description: Some("Initial credits".to_string()),
                 fusillade_batch_id: None,
+                api_key_id: None,
             })
             .await
             .unwrap();

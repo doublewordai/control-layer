@@ -60,14 +60,20 @@ pub async fn list_webhooks<P: PoolProvider>(
         target_user_id == current_user.id && permissions::has_permission(&current_user, Resource::Webhooks, Operation::ReadOwn);
 
     if !can_read_all && !can_read_own {
-        return Err(Error::InsufficientPermissions {
-            required: Permission::Any(vec![
-                Permission::Allow(Resource::Webhooks, Operation::ReadAll),
-                Permission::Allow(Resource::Webhooks, Operation::ReadOwn),
-            ]),
-            action: Operation::ReadAll,
-            resource: format!("webhooks for user {}", target_user_id),
-        });
+        let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+        let can_org = permissions::can_manage_org_resource(&current_user, target_user_id, &mut conn)
+            .await
+            .map_err(Error::Database)?;
+        if !can_org {
+            return Err(Error::InsufficientPermissions {
+                required: Permission::Any(vec![
+                    Permission::Allow(Resource::Webhooks, Operation::ReadAll),
+                    Permission::Allow(Resource::Webhooks, Operation::ReadOwn),
+                ]),
+                action: Operation::ReadAll,
+                resource: format!("webhooks for user {}", target_user_id),
+            });
+        }
     }
 
     let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
@@ -121,14 +127,20 @@ pub async fn create_webhook<P: PoolProvider>(
         target_user_id == current_user.id && permissions::has_permission(&current_user, Resource::Webhooks, Operation::CreateOwn);
 
     if !can_create_all && !can_create_own {
-        return Err(Error::InsufficientPermissions {
-            required: Permission::Any(vec![
-                Permission::Allow(Resource::Webhooks, Operation::CreateAll),
-                Permission::Allow(Resource::Webhooks, Operation::CreateOwn),
-            ]),
-            action: Operation::CreateAll,
-            resource: format!("webhooks for user {}", target_user_id),
-        });
+        let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+        let can_org = permissions::can_manage_org_resource(&current_user, target_user_id, &mut conn)
+            .await
+            .map_err(Error::Database)?;
+        if !can_org {
+            return Err(Error::InsufficientPermissions {
+                required: Permission::Any(vec![
+                    Permission::Allow(Resource::Webhooks, Operation::CreateAll),
+                    Permission::Allow(Resource::Webhooks, Operation::CreateOwn),
+                ]),
+                action: Operation::CreateAll,
+                resource: format!("webhooks for user {}", target_user_id),
+            });
+        }
     }
 
     // Validate URL is HTTPS (allow HTTP for localhost/127.0.0.1 in development)
@@ -211,14 +223,20 @@ pub async fn get_webhook<P: PoolProvider>(
         target_user_id == current_user.id && permissions::has_permission(&current_user, Resource::Webhooks, Operation::ReadOwn);
 
     if !can_read_all && !can_read_own {
-        return Err(Error::InsufficientPermissions {
-            required: Permission::Any(vec![
-                Permission::Allow(Resource::Webhooks, Operation::ReadAll),
-                Permission::Allow(Resource::Webhooks, Operation::ReadOwn),
-            ]),
-            action: Operation::ReadAll,
-            resource: format!("webhook {}", params.webhook_id),
-        });
+        let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+        let can_org = permissions::can_manage_org_resource(&current_user, target_user_id, &mut conn)
+            .await
+            .map_err(Error::Database)?;
+        if !can_org {
+            return Err(Error::InsufficientPermissions {
+                required: Permission::Any(vec![
+                    Permission::Allow(Resource::Webhooks, Operation::ReadAll),
+                    Permission::Allow(Resource::Webhooks, Operation::ReadOwn),
+                ]),
+                action: Operation::ReadAll,
+                resource: format!("webhook {}", params.webhook_id),
+            });
+        }
     }
 
     let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
@@ -284,14 +302,20 @@ pub async fn update_webhook<P: PoolProvider>(
         target_user_id == current_user.id && permissions::has_permission(&current_user, Resource::Webhooks, Operation::UpdateOwn);
 
     if !can_update_all && !can_update_own {
-        return Err(Error::InsufficientPermissions {
-            required: Permission::Any(vec![
-                Permission::Allow(Resource::Webhooks, Operation::UpdateAll),
-                Permission::Allow(Resource::Webhooks, Operation::UpdateOwn),
-            ]),
-            action: Operation::UpdateAll,
-            resource: format!("webhook {}", params.webhook_id),
-        });
+        let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+        let can_org = permissions::can_manage_org_resource(&current_user, target_user_id, &mut conn)
+            .await
+            .map_err(Error::Database)?;
+        if !can_org {
+            return Err(Error::InsufficientPermissions {
+                required: Permission::Any(vec![
+                    Permission::Allow(Resource::Webhooks, Operation::UpdateAll),
+                    Permission::Allow(Resource::Webhooks, Operation::UpdateOwn),
+                ]),
+                action: Operation::UpdateAll,
+                resource: format!("webhook {}", params.webhook_id),
+            });
+        }
     }
 
     // Validate URL if provided (same localhost exception as create)
@@ -389,14 +413,20 @@ pub async fn delete_webhook<P: PoolProvider>(
         target_user_id == current_user.id && permissions::has_permission(&current_user, Resource::Webhooks, Operation::DeleteOwn);
 
     if !can_delete_all && !can_delete_own {
-        return Err(Error::InsufficientPermissions {
-            required: Permission::Any(vec![
-                Permission::Allow(Resource::Webhooks, Operation::DeleteAll),
-                Permission::Allow(Resource::Webhooks, Operation::DeleteOwn),
-            ]),
-            action: Operation::DeleteAll,
-            resource: format!("webhook {}", params.webhook_id),
-        });
+        let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+        let can_org = permissions::can_manage_org_resource(&current_user, target_user_id, &mut conn)
+            .await
+            .map_err(Error::Database)?;
+        if !can_org {
+            return Err(Error::InsufficientPermissions {
+                required: Permission::Any(vec![
+                    Permission::Allow(Resource::Webhooks, Operation::DeleteAll),
+                    Permission::Allow(Resource::Webhooks, Operation::DeleteOwn),
+                ]),
+                action: Operation::DeleteAll,
+                resource: format!("webhook {}", params.webhook_id),
+            });
+        }
     }
 
     let mut tx = state.db.write().begin().await.map_err(|e| Error::Database(e.into()))?;
@@ -469,14 +499,20 @@ pub async fn rotate_secret<P: PoolProvider>(
         target_user_id == current_user.id && permissions::has_permission(&current_user, Resource::Webhooks, Operation::UpdateOwn);
 
     if !can_update_all && !can_update_own {
-        return Err(Error::InsufficientPermissions {
-            required: Permission::Any(vec![
-                Permission::Allow(Resource::Webhooks, Operation::UpdateAll),
-                Permission::Allow(Resource::Webhooks, Operation::UpdateOwn),
-            ]),
-            action: Operation::UpdateAll,
-            resource: format!("webhook {}", params.webhook_id),
-        });
+        let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+        let can_org = permissions::can_manage_org_resource(&current_user, target_user_id, &mut conn)
+            .await
+            .map_err(Error::Database)?;
+        if !can_org {
+            return Err(Error::InsufficientPermissions {
+                required: Permission::Any(vec![
+                    Permission::Allow(Resource::Webhooks, Operation::UpdateAll),
+                    Permission::Allow(Resource::Webhooks, Operation::UpdateOwn),
+                ]),
+                action: Operation::UpdateAll,
+                resource: format!("webhook {}", params.webhook_id),
+            });
+        }
     }
 
     let mut tx = state.db.write().begin().await.map_err(|e| Error::Database(e.into()))?;

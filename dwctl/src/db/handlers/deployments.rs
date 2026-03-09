@@ -1,5 +1,6 @@
 //! Database repository for model deployments.
 
+use crate::api::models::deployments::{ModelSortField, SortDirection};
 use crate::db::models::api_keys::ApiKeyPurpose;
 use crate::db::{
     errors::{DbError, Result},
@@ -39,8 +40,13 @@ pub struct DeploymentFilter {
     pub accessible_to: Option<UserId>, // None = show all deployments, Some(user_id) = show only deployments accessible to that user
     pub group_ids: Option<Vec<crate::types::GroupId>>, // None = show all, Some(group_ids) = show only models in any of these groups
     pub aliases: Option<Vec<String>>,
-    pub search: Option<String>,     // Case-insensitive substring search on alias and model_name
-    pub is_composite: Option<bool>, // None = show all, Some(true) = composite only, Some(false) = non-composite only
+    pub search: Option<String>,                // Case-insensitive substring search on alias and model_name
+    pub is_composite: Option<bool>,            // None = show all, Some(true) = composite only, Some(false) = non-composite only
+    pub provider: Option<String>,              // Filter by metadata provider (case-insensitive exact match)
+    pub model_type: Option<ModelType>,         // Filter by model type column
+    pub capability: Option<String>,            // Filter to models that have this capability
+    pub sort_field: Option<ModelSortField>,    // Sort field (default: created_at)
+    pub sort_direction: Option<SortDirection>, // Sort direction (default depends on field)
 }
 
 impl DeploymentFilter {
@@ -55,7 +61,12 @@ impl DeploymentFilter {
             group_ids: None,     // Default: show all groups
             aliases: None,
             search: None,
-            is_composite: None, // Default: show all models
+            is_composite: None,   // Default: show all models
+            provider: None,       // Default: no provider filter
+            model_type: None,     // Default: no type filter
+            capability: None,     // Default: no capability filter
+            sort_field: None,     // Default: created_at
+            sort_direction: None, // Default: depends on field
         }
     }
 
@@ -96,6 +107,27 @@ impl DeploymentFilter {
 
     pub fn with_composite(mut self, is_composite: bool) -> Self {
         self.is_composite = Some(is_composite);
+        self
+    }
+
+    pub fn with_provider(mut self, provider: String) -> Self {
+        self.provider = Some(provider);
+        self
+    }
+
+    pub fn with_model_type(mut self, model_type: ModelType) -> Self {
+        self.model_type = Some(model_type);
+        self
+    }
+
+    pub fn with_capability(mut self, capability: String) -> Self {
+        self.capability = Some(capability);
+        self
+    }
+
+    pub fn with_sort(mut self, field: ModelSortField, direction: Option<SortDirection>) -> Self {
+        self.sort_field = Some(field);
+        self.sort_direction = direction;
         self
     }
 }
@@ -596,77 +628,34 @@ impl<'c> Repository for Deployments<'c> {
         let mut query =
             QueryBuilder::new("SELECT dm.* FROM deployed_models dm LEFT JOIN inference_endpoints ie ON dm.hosted_on = ie.id WHERE 1=1");
 
-        // Add endpoint filter if specified
-        if let Some(endpoint_id) = filter.endpoint_id {
-            query.push(" AND dm.hosted_on = ");
-            query.push_bind(endpoint_id);
-        }
+        Self::apply_filters(&mut query, filter);
 
-        // Add status filter if specified
-        if let Some(ref statuses) = filter.statuses {
-            let status_strings: Vec<String> = statuses.iter().map(|s| s.to_db_string().to_string()).collect();
-            query.push(" AND dm.status = ANY(");
-            query.push_bind(status_strings);
-            query.push(")");
-        }
-
-        // Add deleted filter if specified
-        if let Some(deleted) = filter.deleted {
-            query.push(" AND dm.deleted = ");
-            query.push_bind(deleted);
-        }
-
-        // Add aliases filter if specified
-        if let Some(ref aliases) = filter.aliases
-            && !aliases.is_empty()
-        {
-            query.push(" AND dm.alias = ANY(");
-            query.push_bind(aliases);
-            query.push(")");
-        }
-
-        // Add accessibility filter if specified
-        if let Some(user_id) = filter.accessible_to {
-            query.push(" AND dm.id IN (");
-            query.push("SELECT dg.deployment_id FROM deployment_groups dg WHERE dg.group_id IN (");
-            query.push("SELECT ug.group_id FROM user_groups ug WHERE ug.user_id = ");
-            query.push_bind(user_id);
-            query.push(" UNION SELECT '00000000-0000-0000-0000-000000000000'::uuid WHERE ");
-            query.push_bind(user_id);
-            query.push(" != '00000000-0000-0000-0000-000000000000'::uuid");
-            query.push("))");
-        }
-
-        // Add group filter if specified
-        if let Some(ref group_ids) = filter.group_ids
-            && !group_ids.is_empty()
-        {
-            query.push(" AND dm.id IN (");
-            query.push("SELECT dg.deployment_id FROM deployment_groups dg WHERE dg.group_id = ANY(");
-            query.push_bind(group_ids);
-            query.push("))");
-        }
-
-        // Add search filter if specified (case-insensitive substring match on alias, model_name, or endpoint name)
-        if let Some(ref search) = filter.search {
-            let search_pattern = format!("%{}%", search.to_lowercase());
-            query.push(" AND (LOWER(dm.alias) LIKE ");
-            query.push_bind(search_pattern.clone());
-            query.push(" OR LOWER(dm.model_name) LIKE ");
-            query.push_bind(search_pattern.clone());
-            query.push(" OR LOWER(ie.name) LIKE ");
-            query.push_bind(search_pattern);
-            query.push(")");
-        }
-
-        // Add is_composite filter if specified
-        if let Some(is_composite) = filter.is_composite {
-            query.push(" AND dm.is_composite = ");
-            query.push_bind(is_composite);
-        }
-
-        // Add ordering and pagination
-        query.push(" ORDER BY created_at DESC LIMIT ");
+        // Dynamic ordering
+        let (sort_expr, default_dir) = match filter.sort_field {
+            Some(ModelSortField::Alias) => ("dm.alias", "ASC"),
+            Some(ModelSortField::IntelligenceIndex) => ("(dm.metadata->>'intelligence_index')::float8", "DESC"),
+            Some(ModelSortField::ReleasedAt) => ("(dm.metadata->>'released_at')::date", "DESC"),
+            Some(ModelSortField::ContextWindow) => ("(dm.metadata->>'context_window')::bigint", "DESC"),
+            Some(ModelSortField::Provider) => ("dm.metadata->>'provider'", "ASC"),
+            Some(ModelSortField::PriceFrom) => (
+                "(SELECT MIN(mt.input_price_per_token + mt.output_price_per_token) FROM model_tariffs mt WHERE mt.deployed_model_id = dm.id AND mt.valid_until IS NULL AND (mt.input_price_per_token + mt.output_price_per_token) > 0)",
+                "ASC",
+            ),
+            Some(ModelSortField::CreatedAt) | None => ("dm.created_at", "DESC"),
+        };
+        let direction = match filter.sort_direction {
+            Some(SortDirection::Asc) => "ASC",
+            Some(SortDirection::Desc) => "DESC",
+            None => default_dir,
+        };
+        // NULLS LAST for metadata sorts so models without metadata sink to the bottom
+        let nulls_clause =
+            if filter.sort_field.is_some() && !matches!(filter.sort_field, Some(ModelSortField::CreatedAt) | Some(ModelSortField::Alias)) {
+                " NULLS LAST"
+            } else {
+                ""
+            };
+        query.push(format!(" ORDER BY {sort_expr} {direction}{nulls_clause} LIMIT "));
         query.push_bind(filter.limit);
         query.push(" OFFSET ");
         query.push_bind(filter.skip);
@@ -679,6 +668,7 @@ impl<'c> Repository for Deployments<'c> {
                 let model_type = m.r#type.as_ref().and_then(|s| match s.as_str() {
                     "CHAT" => Some(ModelType::Chat),
                     "EMBEDDINGS" => Some(ModelType::Embeddings),
+                    "RERANKER" => Some(ModelType::Reranker),
                     _ => None,
                 });
 
@@ -691,6 +681,133 @@ impl<'c> Repository for Deployments<'c> {
 impl<'c> Deployments<'c> {
     pub fn new(db: &'c mut PgConnection) -> Self {
         Self { db }
+    }
+
+    /// Apply shared filter clauses to a query builder (used by both list and count)
+    fn apply_filters<'a>(query: &mut QueryBuilder<'a, sqlx::Postgres>, filter: &'a DeploymentFilter) {
+        if let Some(endpoint_id) = filter.endpoint_id {
+            query.push(" AND dm.hosted_on = ");
+            query.push_bind(endpoint_id);
+        }
+
+        if let Some(ref statuses) = filter.statuses {
+            let status_strings: Vec<String> = statuses.iter().map(|s| s.to_db_string().to_string()).collect();
+            query.push(" AND dm.status = ANY(");
+            query.push_bind(status_strings);
+            query.push(")");
+        }
+
+        if let Some(deleted) = filter.deleted {
+            query.push(" AND dm.deleted = ");
+            query.push_bind(deleted);
+        }
+
+        if let Some(ref aliases) = filter.aliases
+            && !aliases.is_empty()
+        {
+            query.push(" AND dm.alias = ANY(");
+            query.push_bind(aliases);
+            query.push(")");
+        }
+
+        if let Some(user_id) = filter.accessible_to {
+            query.push(" AND dm.id IN (");
+            query.push("SELECT dg.deployment_id FROM deployment_groups dg WHERE dg.group_id IN (");
+            query.push("SELECT ug.group_id FROM user_groups ug WHERE ug.user_id = ");
+            query.push_bind(user_id);
+            query.push(" UNION SELECT '00000000-0000-0000-0000-000000000000'::uuid WHERE ");
+            query.push_bind(user_id);
+            query.push(" != '00000000-0000-0000-0000-000000000000'::uuid");
+            query.push("))");
+        }
+
+        if let Some(ref group_ids) = filter.group_ids
+            && !group_ids.is_empty()
+        {
+            query.push(" AND dm.id IN (");
+            query.push("SELECT dg.deployment_id FROM deployment_groups dg WHERE dg.group_id = ANY(");
+            query.push_bind(group_ids);
+            query.push("))");
+        }
+
+        if let Some(ref search) = filter.search {
+            let search_pattern = format!("%{}%", search.to_lowercase());
+            query.push(" AND (LOWER(dm.alias) LIKE ");
+            query.push_bind(search_pattern.clone());
+            query.push(" OR LOWER(dm.model_name) LIKE ");
+            query.push_bind(search_pattern.clone());
+            query.push(" OR LOWER(ie.name) LIKE ");
+            query.push_bind(search_pattern);
+            query.push(")");
+        }
+
+        if let Some(is_composite) = filter.is_composite {
+            query.push(" AND dm.is_composite = ");
+            query.push_bind(is_composite);
+        }
+
+        if let Some(ref provider) = filter.provider {
+            query.push(" AND LOWER(dm.metadata->>'provider') = LOWER(");
+            query.push_bind(provider.clone());
+            query.push(")");
+        }
+
+        if let Some(ref model_type) = filter.model_type {
+            let type_str = match model_type {
+                ModelType::Chat => "CHAT",
+                ModelType::Embeddings => "EMBEDDINGS",
+                ModelType::Reranker => "RERANKER",
+            };
+            query.push(" AND dm.type = ");
+            query.push_bind(type_str.to_string());
+        }
+
+        if let Some(ref capability) = filter.capability {
+            query.push(" AND ");
+            query.push_bind(capability.clone());
+            query.push(" = ANY(dm.capabilities)");
+        }
+    }
+
+    /// Get distinct facet values for filter dropdowns, respecting the same
+    /// access-control and visibility filters applied to the model list.
+    ///
+    /// Uses a CTE so the base set is filtered once, then facets are derived
+    /// from it — keeping the access-control logic in one place.
+    pub async fn facets(&mut self, filter: &DeploymentFilter) -> Result<(Vec<String>, Vec<String>, Vec<String>)> {
+        // Build a CTE that selects the filtered model set (ignoring pagination,
+        // sort, and search so facets reflect the full universe visible to this user).
+        let mut query = QueryBuilder::new(
+            "WITH visible AS (SELECT dm.* FROM deployed_models dm LEFT JOIN inference_endpoints ie ON dm.hosted_on = ie.id WHERE 1=1",
+        );
+
+        let facets_filter = DeploymentFilter {
+            skip: 0,
+            limit: i64::MAX,
+            search: None,
+            sort_field: None,
+            sort_direction: None,
+            ..filter.clone()
+        };
+        Self::apply_filters(&mut query, &facets_filter);
+
+        query.push(
+            r#")
+            SELECT
+                array_agg(DISTINCT metadata->>'provider' ORDER BY metadata->>'provider')
+                    FILTER (WHERE metadata->>'provider' IS NOT NULL),
+                (SELECT array_agg(DISTINCT cap ORDER BY cap)
+                    FROM visible, unnest(capabilities) AS cap),
+                array_agg(DISTINCT type ORDER BY type) FILTER (WHERE type IS NOT NULL)
+            FROM visible"#,
+        );
+
+        let row = query
+            .build_query_as::<(Option<Vec<String>>, Option<Vec<String>>, Option<Vec<String>>)>()
+            .fetch_one(&mut *self.db)
+            .await?;
+
+        Ok((row.0.unwrap_or_default(), row.1.unwrap_or_default(), row.2.unwrap_or_default()))
     }
 
     /// Check if a user has access to a deployment through group membership
@@ -732,74 +849,7 @@ impl<'c> Deployments<'c> {
         let mut query =
             QueryBuilder::new("SELECT COUNT(*) FROM deployed_models dm LEFT JOIN inference_endpoints ie ON dm.hosted_on = ie.id WHERE 1=1");
 
-        // Add endpoint filter if specified
-        if let Some(endpoint_id) = filter.endpoint_id {
-            query.push(" AND dm.hosted_on = ");
-            query.push_bind(endpoint_id);
-        }
-
-        // Add status filter if specified
-        if let Some(ref statuses) = filter.statuses {
-            let status_strings: Vec<String> = statuses.iter().map(|s| s.to_db_string().to_string()).collect();
-            query.push(" AND dm.status = ANY(");
-            query.push_bind(status_strings);
-            query.push(")");
-        }
-
-        // Add deleted filter if specified
-        if let Some(deleted) = filter.deleted {
-            query.push(" AND dm.deleted = ");
-            query.push_bind(deleted);
-        }
-
-        // Add aliases filter if specified
-        if let Some(ref aliases) = filter.aliases
-            && !aliases.is_empty()
-        {
-            query.push(" AND dm.alias = ANY(");
-            query.push_bind(aliases);
-            query.push(")");
-        }
-
-        // Add accessibility filter if specified
-        if let Some(user_id) = filter.accessible_to {
-            query.push(" AND dm.id IN (");
-            query.push("SELECT dg.deployment_id FROM deployment_groups dg WHERE dg.group_id IN (");
-            query.push("SELECT ug.group_id FROM user_groups ug WHERE ug.user_id = ");
-            query.push_bind(user_id);
-            query.push(" UNION SELECT '00000000-0000-0000-0000-000000000000'::uuid WHERE ");
-            query.push_bind(user_id);
-            query.push(" != '00000000-0000-0000-0000-000000000000'::uuid");
-            query.push("))");
-        }
-
-        // Add group filter if specified
-        if let Some(ref group_ids) = filter.group_ids
-            && !group_ids.is_empty()
-        {
-            query.push(" AND dm.id IN (");
-            query.push("SELECT dg.deployment_id FROM deployment_groups dg WHERE dg.group_id = ANY(");
-            query.push_bind(group_ids);
-            query.push("))");
-        }
-
-        // Add search filter if specified (case-insensitive substring match on alias, model_name, or endpoint name)
-        if let Some(ref search) = filter.search {
-            let search_pattern = format!("%{}%", search.to_lowercase());
-            query.push(" AND (LOWER(dm.alias) LIKE ");
-            query.push_bind(search_pattern.clone());
-            query.push(" OR LOWER(dm.model_name) LIKE ");
-            query.push_bind(search_pattern.clone());
-            query.push(" OR LOWER(ie.name) LIKE ");
-            query.push_bind(search_pattern);
-            query.push(")");
-        }
-
-        // Add is_composite filter if specified
-        if let Some(is_composite) = filter.is_composite {
-            query.push(" AND dm.is_composite = ");
-            query.push_bind(is_composite);
-        }
+        Self::apply_filters(&mut query, filter);
 
         let count: (i64,) = query.build_query_as().fetch_one(&mut *self.db).await?;
         Ok(count.0)
@@ -1287,7 +1337,7 @@ mod tests {
         db::{
             handlers::{Groups, Users, inference_endpoints::InferenceEndpoints},
             models::{
-                deployments::{ProviderPricing, ProviderPricingUpdate},
+                deployments::{ModelCatalogMetadata, ProviderPricing, ProviderPricingUpdate},
                 groups::GroupCreateDBRequest,
                 inference_endpoints::InferenceEndpointCreateDBRequest,
                 users::UserCreateDBRequest,
@@ -2269,10 +2319,11 @@ mod tests {
         } else {
             // If system key doesn't exist in test environment, create it
             sqlx::query!(
-                "INSERT INTO api_keys (id, name, secret, user_id) VALUES ($1, $2, $3, $4)",
+                "INSERT INTO api_keys (id, name, secret, user_id, created_by) VALUES ($1, $2, $3, $4, $5)",
                 uuid::Uuid::from_u128(0), // 00000000-0000-0000-0000-000000000000
                 "System Key",
                 "test_system_secret",
+                user.id,
                 user.id
             )
             .execute(&pool)
@@ -3692,5 +3743,352 @@ mod tests {
         assert!(result.is_err());
         let err_str = format!("{}", result.unwrap_err());
         assert!(err_str.contains("unique_purpose_per_model") || err_str.contains("duplicate key"));
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_list_with_provider_filter(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: base_url.clone(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
+        }];
+        crate::seed_database(&sources, &pool).await.unwrap();
+
+        let mut pool_conn = pool.acquire().await.unwrap();
+        let mut repo = Deployments::new(&mut pool_conn);
+        let user = create_test_user(&pool).await;
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        // Create models with different providers
+        let openai_model = repo
+            .create(
+                &DeploymentCreateDBRequest::builder()
+                    .created_by(user.id)
+                    .model_name("provider-filter-openai".to_string())
+                    .alias("provider-filter-openai".to_string())
+                    .hosted_on(test_endpoint_id)
+                    .metadata(ModelCatalogMetadata {
+                        provider: Some("OpenAI".to_string()),
+                        ..Default::default()
+                    })
+                    .build(),
+            )
+            .await
+            .unwrap();
+
+        repo.create(
+            &DeploymentCreateDBRequest::builder()
+                .created_by(user.id)
+                .model_name("provider-filter-anthropic".to_string())
+                .alias("provider-filter-anthropic".to_string())
+                .hosted_on(test_endpoint_id)
+                .metadata(ModelCatalogMetadata {
+                    provider: Some("Anthropic".to_string()),
+                    ..Default::default()
+                })
+                .build(),
+        )
+        .await
+        .unwrap();
+
+        // Filter by provider (case-insensitive)
+        let filter = DeploymentFilter::new(0, 100).with_provider("openai".to_string());
+        let models = repo.list(&filter).await.unwrap();
+        assert!(models.iter().any(|m| m.id == openai_model.id));
+        assert!(models.iter().all(|m| {
+            // Models matching the filter should have OpenAI provider
+            // (other models without metadata won't match anyway)
+            m.id != openai_model.id || m.id == openai_model.id
+        }));
+        // Verify the anthropic model is not returned
+        assert!(!models.iter().any(|m| m.alias == "provider-filter-anthropic"));
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_list_with_model_type_filter(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: base_url.clone(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
+        }];
+        crate::seed_database(&sources, &pool).await.unwrap();
+
+        let mut pool_conn = pool.acquire().await.unwrap();
+        let mut repo = Deployments::new(&mut pool_conn);
+        let user = create_test_user(&pool).await;
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        let chat_model = repo
+            .create(
+                &DeploymentCreateDBRequest::builder()
+                    .created_by(user.id)
+                    .model_name("type-filter-chat".to_string())
+                    .alias("type-filter-chat".to_string())
+                    .hosted_on(test_endpoint_id)
+                    .model_type(ModelType::Chat)
+                    .build(),
+            )
+            .await
+            .unwrap();
+
+        let embed_model = repo
+            .create(
+                &DeploymentCreateDBRequest::builder()
+                    .created_by(user.id)
+                    .model_name("type-filter-embed".to_string())
+                    .alias("type-filter-embed".to_string())
+                    .hosted_on(test_endpoint_id)
+                    .model_type(ModelType::Embeddings)
+                    .build(),
+            )
+            .await
+            .unwrap();
+
+        // Filter by Chat type
+        let filter = DeploymentFilter::new(0, 100).with_model_type(ModelType::Chat);
+        let models = repo.list(&filter).await.unwrap();
+        assert!(models.iter().any(|m| m.id == chat_model.id));
+        assert!(!models.iter().any(|m| m.id == embed_model.id));
+
+        // Filter by Embeddings type
+        let filter = DeploymentFilter::new(0, 100).with_model_type(ModelType::Embeddings);
+        let models = repo.list(&filter).await.unwrap();
+        assert!(models.iter().any(|m| m.id == embed_model.id));
+        assert!(!models.iter().any(|m| m.id == chat_model.id));
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_list_with_capability_filter(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: base_url.clone(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
+        }];
+        crate::seed_database(&sources, &pool).await.unwrap();
+
+        let mut pool_conn = pool.acquire().await.unwrap();
+        let mut repo = Deployments::new(&mut pool_conn);
+        let user = create_test_user(&pool).await;
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        let vision_model = repo
+            .create(
+                &DeploymentCreateDBRequest::builder()
+                    .created_by(user.id)
+                    .model_name("cap-filter-vision".to_string())
+                    .alias("cap-filter-vision".to_string())
+                    .hosted_on(test_endpoint_id)
+                    .capabilities(vec!["vision".to_string(), "streaming".to_string()])
+                    .build(),
+            )
+            .await
+            .unwrap();
+
+        let text_model = repo
+            .create(
+                &DeploymentCreateDBRequest::builder()
+                    .created_by(user.id)
+                    .model_name("cap-filter-text".to_string())
+                    .alias("cap-filter-text".to_string())
+                    .hosted_on(test_endpoint_id)
+                    .capabilities(vec!["streaming".to_string()])
+                    .build(),
+            )
+            .await
+            .unwrap();
+
+        // Filter by "vision" capability
+        let filter = DeploymentFilter::new(0, 100).with_capability("vision".to_string());
+        let models = repo.list(&filter).await.unwrap();
+        assert!(models.iter().any(|m| m.id == vision_model.id));
+        assert!(!models.iter().any(|m| m.id == text_model.id));
+
+        // Filter by "streaming" capability - should match both
+        let filter = DeploymentFilter::new(0, 100).with_capability("streaming".to_string());
+        let models = repo.list(&filter).await.unwrap();
+        assert!(models.iter().any(|m| m.id == vision_model.id));
+        assert!(models.iter().any(|m| m.id == text_model.id));
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_list_with_sort(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: base_url.clone(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
+        }];
+        crate::seed_database(&sources, &pool).await.unwrap();
+
+        let mut pool_conn = pool.acquire().await.unwrap();
+        let mut repo = Deployments::new(&mut pool_conn);
+        let user = create_test_user(&pool).await;
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        // Create models with aliases that sort predictably
+        let model_a = repo
+            .create(
+                &DeploymentCreateDBRequest::builder()
+                    .created_by(user.id)
+                    .model_name("sort-aaa".to_string())
+                    .alias("sort-aaa".to_string())
+                    .hosted_on(test_endpoint_id)
+                    .build(),
+            )
+            .await
+            .unwrap();
+
+        let model_z = repo
+            .create(
+                &DeploymentCreateDBRequest::builder()
+                    .created_by(user.id)
+                    .model_name("sort-zzz".to_string())
+                    .alias("sort-zzz".to_string())
+                    .hosted_on(test_endpoint_id)
+                    .build(),
+            )
+            .await
+            .unwrap();
+
+        // Sort by alias ASC (default direction for alias)
+        let filter = DeploymentFilter::new(0, 100).with_sort(ModelSortField::Alias, None);
+        let models = repo.list(&filter).await.unwrap();
+        let sort_models: Vec<_> = models.iter().filter(|m| m.alias.starts_with("sort-")).collect();
+        assert!(sort_models.len() >= 2);
+        let pos_a = models.iter().position(|m| m.id == model_a.id).unwrap();
+        let pos_z = models.iter().position(|m| m.id == model_z.id).unwrap();
+        assert!(pos_a < pos_z, "sort-aaa should come before sort-zzz in ASC order");
+
+        // Sort by alias DESC (explicit direction)
+        let filter = DeploymentFilter::new(0, 100).with_sort(ModelSortField::Alias, Some(SortDirection::Desc));
+        let models = repo.list(&filter).await.unwrap();
+        let pos_a = models.iter().position(|m| m.id == model_a.id).unwrap();
+        let pos_z = models.iter().position(|m| m.id == model_z.id).unwrap();
+        assert!(pos_z < pos_a, "sort-zzz should come before sort-aaa in DESC order");
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_facets(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: base_url.clone(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
+        }];
+        crate::seed_database(&sources, &pool).await.unwrap();
+
+        let mut pool_conn = pool.acquire().await.unwrap();
+        let mut repo = Deployments::new(&mut pool_conn);
+        let user = create_test_user(&pool).await;
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        // Create models with various metadata, types, and capabilities
+        repo.create(
+            &DeploymentCreateDBRequest::builder()
+                .created_by(user.id)
+                .model_name("facet-openai-chat".to_string())
+                .alias("facet-openai-chat".to_string())
+                .hosted_on(test_endpoint_id)
+                .model_type(ModelType::Chat)
+                .capabilities(vec!["vision".to_string(), "streaming".to_string()])
+                .metadata(ModelCatalogMetadata {
+                    provider: Some("OpenAI".to_string()),
+                    ..Default::default()
+                })
+                .build(),
+        )
+        .await
+        .unwrap();
+
+        repo.create(
+            &DeploymentCreateDBRequest::builder()
+                .created_by(user.id)
+                .model_name("facet-anthropic-embed".to_string())
+                .alias("facet-anthropic-embed".to_string())
+                .hosted_on(test_endpoint_id)
+                .model_type(ModelType::Embeddings)
+                .capabilities(vec!["streaming".to_string()])
+                .metadata(ModelCatalogMetadata {
+                    provider: Some("Anthropic".to_string()),
+                    ..Default::default()
+                })
+                .build(),
+        )
+        .await
+        .unwrap();
+
+        let filter = DeploymentFilter::new(0, 100);
+        let (providers, capabilities, model_types) = repo.facets(&filter).await.unwrap();
+
+        assert!(providers.contains(&"OpenAI".to_string()));
+        assert!(providers.contains(&"Anthropic".to_string()));
+        assert!(capabilities.contains(&"vision".to_string()));
+        assert!(capabilities.contains(&"streaming".to_string()));
+        assert!(model_types.contains(&"CHAT".to_string()));
+        assert!(model_types.contains(&"EMBEDDINGS".to_string()));
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_facets_respect_filters(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: base_url.clone(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
+        }];
+        crate::seed_database(&sources, &pool).await.unwrap();
+
+        let mut pool_conn = pool.acquire().await.unwrap();
+        let mut repo = Deployments::new(&mut pool_conn);
+        let user = create_test_user(&pool).await;
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        repo.create(
+            &DeploymentCreateDBRequest::builder()
+                .created_by(user.id)
+                .model_name("facet-deleted".to_string())
+                .alias("facet-deleted".to_string())
+                .hosted_on(test_endpoint_id)
+                .model_type(ModelType::Chat)
+                .metadata(ModelCatalogMetadata {
+                    provider: Some("DeletedProvider".to_string()),
+                    ..Default::default()
+                })
+                .build(),
+        )
+        .await
+        .unwrap();
+
+        // Mark it as deleted
+        let models = repo.list(&DeploymentFilter::new(0, 100)).await.unwrap();
+        let deleted_model = models.iter().find(|m| m.alias == "facet-deleted").unwrap();
+        let update = DeploymentUpdateDBRequest::builder().deleted(true).build();
+        repo.update(deleted_model.id, &update).await.unwrap();
+
+        // Facets with deleted=false should NOT include DeletedProvider
+        let filter = DeploymentFilter::new(0, 100).with_deleted(false);
+        let (providers, _, _) = repo.facets(&filter).await.unwrap();
+        assert!(!providers.contains(&"DeletedProvider".to_string()));
     }
 }

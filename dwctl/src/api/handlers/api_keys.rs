@@ -10,7 +10,7 @@ use crate::{
     },
     auth::permissions::{
         can_create_all_resources, can_create_own_resource, can_delete_all_resources, can_delete_own_resource, can_read_all_resources,
-        can_read_own_resource,
+        can_read_own_resource, is_org_member,
     },
     db::handlers::{Repository, api_keys::ApiKeyFilter, api_keys::ApiKeys},
     db::models::api_keys::ApiKeyCreateDBRequest,
@@ -67,35 +67,34 @@ pub async fn create_user_api_key<P: PoolProvider>(
     }
 
     let target_user_id = match user_id {
-        UserIdOrCurrent::Current(_) => {
-            // For /current, verify they have permission to create their own API keys
-            if !can_create_own_resource(&current_user, Resource::ApiKeys, current_user.id) {
-                return Err(Error::InsufficientPermissions {
-                    required: Permission::Allow(Resource::ApiKeys, Operation::CreateOwn),
-                    action: Operation::CreateOwn,
-                    resource: "API keys for current user".to_string(),
-                });
-            }
-            current_user.id
-        }
-        UserIdOrCurrent::Id(uuid) => {
-            let can_create_all_api_keys = can_create_all_resources(&current_user, Resource::ApiKeys);
-            let can_create_own_api_keys = can_create_own_resource(&current_user, Resource::ApiKeys, uuid);
-
-            // Allow creation if user can create all API keys OR create their own API keys
-            if !can_create_all_api_keys && !can_create_own_api_keys {
-                return Err(Error::InsufficientPermissions {
-                    required: Permission::Any(vec![
-                        Permission::Allow(Resource::ApiKeys, Operation::CreateAll),
-                        Permission::Allow(Resource::ApiKeys, Operation::CreateOwn),
-                    ]),
-                    action: Operation::CreateOwn,
-                    resource: format!("API keys for user {uuid}"),
-                });
-            }
-            uuid
-        }
+        UserIdOrCurrent::Current(_) => current_user.id,
+        UserIdOrCurrent::Id(uuid) => uuid,
     };
+
+    // Check permissions: CreateAll, CreateOwn, or org membership
+    let can_create_all = can_create_all_resources(&current_user, Resource::ApiKeys);
+    let can_create_own = can_create_own_resource(&current_user, Resource::ApiKeys, target_user_id);
+
+    if !can_create_all && !can_create_own {
+        let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+        let member = is_org_member(&current_user, target_user_id, &mut conn)
+            .await
+            .map_err(Error::Database)?;
+        if !member {
+            return Err(Error::InsufficientPermissions {
+                required: Permission::Any(vec![
+                    Permission::Allow(Resource::ApiKeys, Operation::CreateAll),
+                    Permission::Allow(Resource::ApiKeys, Operation::CreateOwn),
+                ]),
+                action: Operation::CreateOwn,
+                resource: format!("API keys for user {target_user_id}"),
+            });
+        }
+    }
+
+    // Track whether a PM is creating on behalf of another user.
+    // Org members reach here via is_org_member — they are NOT PMs creating on behalf.
+    let pm_creating_for_other = can_create_all && target_user_id != current_user.id;
 
     // Validate purpose: restrict batch/playground to system use only (purpose defaults to Realtime via serde)
     match &data.purpose {
@@ -111,7 +110,13 @@ pub async fn create_user_api_key<P: PoolProvider>(
 
     let mut pool_conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut repo = ApiKeys::new(&mut pool_conn);
-    let db_request = ApiKeyCreateDBRequest::new(target_user_id, data);
+
+    // When a PlatformManager creates a key on behalf of another user, set created_by
+    // to the target user so the key is visible to them. For org members creating keys
+    // for their org, created_by stays as current_user.id so the member can see their
+    // own keys. PlatformManagers bypass the created_by filter in list/get/delete.
+    let created_by = if pm_creating_for_other { target_user_id } else { current_user.id };
+    let db_request = ApiKeyCreateDBRequest::new(target_user_id, created_by, data);
 
     let api_key = repo.create(&db_request).await?;
     Ok((StatusCode::CREATED, Json(ApiKeyResponse::from(api_key))))
@@ -150,35 +155,33 @@ pub async fn list_user_api_keys<P: PoolProvider>(
     current_user: CurrentUser,
 ) -> Result<Json<PaginatedResponse<ApiKeyInfoResponse>>> {
     let target_user_id = match user_id {
-        UserIdOrCurrent::Current(_) => {
-            // Even for /current, verify they have permission to read their own API keys
-            if !can_read_own_resource(&current_user, Resource::ApiKeys, current_user.id) {
-                return Err(Error::InsufficientPermissions {
-                    required: Permission::Allow(Resource::ApiKeys, Operation::ReadOwn),
-                    action: Operation::ReadOwn,
-                    resource: "API keys for current user".to_string(),
-                });
-            }
-            current_user.id
-        }
-        UserIdOrCurrent::Id(uuid) => {
-            let can_read_all_api_keys = can_read_all_resources(&current_user, Resource::ApiKeys);
-            let can_read_own_api_keys = can_read_own_resource(&current_user, Resource::ApiKeys, uuid);
-
-            // Allow access if user can read all API keys OR read their own API keys
-            if !can_read_all_api_keys && !can_read_own_api_keys {
-                return Err(Error::InsufficientPermissions {
-                    required: Permission::Any(vec![
-                        Permission::Allow(Resource::ApiKeys, Operation::ReadAll),
-                        Permission::Allow(Resource::ApiKeys, Operation::ReadOwn),
-                    ]),
-                    action: Operation::ReadOwn,
-                    resource: format!("API keys for user {uuid}"),
-                });
-            }
-            uuid
-        }
+        UserIdOrCurrent::Current(_) => current_user.id,
+        UserIdOrCurrent::Id(uuid) => uuid,
     };
+
+    // Check permissions: ReadAll, ReadOwn, or org membership
+    let can_read_all = can_read_all_resources(&current_user, Resource::ApiKeys);
+    let can_read_own = can_read_own_resource(&current_user, Resource::ApiKeys, target_user_id);
+
+    if !can_read_all && !can_read_own {
+        let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+        let member = is_org_member(&current_user, target_user_id, &mut conn)
+            .await
+            .map_err(Error::Database)?;
+        if !member {
+            return Err(Error::InsufficientPermissions {
+                required: Permission::Any(vec![
+                    Permission::Allow(Resource::ApiKeys, Operation::ReadAll),
+                    Permission::Allow(Resource::ApiKeys, Operation::ReadOwn),
+                ]),
+                action: Operation::ReadOwn,
+                resource: format!("API keys for user {target_user_id}"),
+            });
+        }
+    }
+
+    // PlatformManagers (ReadAll) see all keys for a user; everyone else is scoped to created_by.
+    let skip_created_by_filter = can_read_all;
 
     // Use read replica for this read-only operation
     let mut pool_conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
@@ -188,10 +191,14 @@ pub async fn list_user_api_keys<P: PoolProvider>(
     let skip = query.pagination.skip();
     let limit = query.pagination.limit();
 
+    // Scope to keys created by this user, unless they have ReadAll (PlatformManager).
+    // PM-created keys on behalf of users have created_by = target_user_id, so the target
+    // user can always see them. PMs bypass the filter to see all keys for any user.
     let filter = ApiKeyFilter {
         skip,
         limit,
         user_id: Some(target_user_id),
+        created_by: if skip_created_by_filter { None } else { Some(current_user.id) },
     };
 
     // Get total count and list of items
@@ -235,45 +242,43 @@ pub async fn get_user_api_key<P: PoolProvider>(
     current_user: CurrentUser,
 ) -> Result<Json<ApiKeyInfoResponse>> {
     let target_user_id = match user_id {
-        UserIdOrCurrent::Current(_) => {
-            // Even for /current, verify they have permission to read their own API keys
-            if !can_read_own_resource(&current_user, Resource::ApiKeys, current_user.id) {
-                return Err(Error::InsufficientPermissions {
-                    required: Permission::Allow(Resource::ApiKeys, Operation::ReadOwn),
-                    action: Operation::ReadOwn,
-                    resource: "API keys for current user".to_string(),
-                });
-            }
-            current_user.id
-        }
-        UserIdOrCurrent::Id(uuid) => {
-            let can_read_all_api_keys = can_read_all_resources(&current_user, Resource::ApiKeys);
-            let can_read_own_api_keys = can_read_own_resource(&current_user, Resource::ApiKeys, uuid);
-
-            // Allow access if user can read all API keys OR read their own API keys
-            if !can_read_all_api_keys && !can_read_own_api_keys {
-                return Err(Error::InsufficientPermissions {
-                    required: Permission::Any(vec![
-                        Permission::Allow(Resource::ApiKeys, Operation::ReadAll),
-                        Permission::Allow(Resource::ApiKeys, Operation::ReadOwn),
-                    ]),
-                    action: Operation::ReadOwn,
-                    resource: format!("API keys for user {uuid}"),
-                });
-            }
-            uuid
-        }
+        UserIdOrCurrent::Current(_) => current_user.id,
+        UserIdOrCurrent::Id(uuid) => uuid,
     };
+
+    // Check permissions: ReadAll, ReadOwn, or org membership
+    let can_read_all = can_read_all_resources(&current_user, Resource::ApiKeys);
+    let can_read_own = can_read_own_resource(&current_user, Resource::ApiKeys, target_user_id);
+
+    if !can_read_all && !can_read_own {
+        let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+        let member = is_org_member(&current_user, target_user_id, &mut conn)
+            .await
+            .map_err(Error::Database)?;
+        if !member {
+            return Err(Error::InsufficientPermissions {
+                required: Permission::Any(vec![
+                    Permission::Allow(Resource::ApiKeys, Operation::ReadAll),
+                    Permission::Allow(Resource::ApiKeys, Operation::ReadOwn),
+                ]),
+                action: Operation::ReadOwn,
+                resource: format!("API keys for user {target_user_id}"),
+            });
+        }
+    }
+
+    let skip_created_by_filter = can_read_all;
 
     // Use read replica for this read-only operation
     let mut pool_conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut repo = ApiKeys::new(&mut pool_conn);
 
-    // Get the specific API key and verify ownership
+    // Get the specific API key, verify ownership and created_by visibility
     let api_key = repo
         .get_by_id(api_key_id)
         .await?
         .filter(|key| key.user_id == target_user_id)
+        .filter(|key| skip_created_by_filter || key.created_by == current_user.id)
         .ok_or_else(|| Error::NotFound {
             resource: "API key".to_string(),
             id: api_key_id.to_string(),
@@ -314,43 +319,41 @@ pub async fn delete_user_api_key<P: PoolProvider>(
     current_user: CurrentUser,
 ) -> Result<StatusCode> {
     let target_user_id = match user_id {
-        UserIdOrCurrent::Current(_) => {
-            // Even for /current, verify they have permission to delete their own API keys
-            if !can_delete_own_resource(&current_user, Resource::ApiKeys, current_user.id) {
-                return Err(Error::InsufficientPermissions {
-                    required: Permission::Allow(Resource::ApiKeys, Operation::DeleteOwn),
-                    action: Operation::DeleteOwn,
-                    resource: "API keys for current user".to_string(),
-                });
-            }
-            current_user.id
-        }
-        UserIdOrCurrent::Id(uuid) => {
-            let can_delete_all_api_keys = can_delete_all_resources(&current_user, Resource::ApiKeys);
-            let can_delete_own_api_keys = can_delete_own_resource(&current_user, Resource::ApiKeys, uuid);
-
-            // Allow deletion if user can delete all API keys OR delete their own API keys
-            if !can_delete_all_api_keys && !can_delete_own_api_keys {
-                return Err(Error::InsufficientPermissions {
-                    required: Permission::Any(vec![
-                        Permission::Allow(Resource::ApiKeys, Operation::DeleteAll),
-                        Permission::Allow(Resource::ApiKeys, Operation::DeleteOwn),
-                    ]),
-                    action: Operation::DeleteOwn,
-                    resource: format!("API keys for user {uuid}"),
-                });
-            }
-            uuid
-        }
+        UserIdOrCurrent::Current(_) => current_user.id,
+        UserIdOrCurrent::Id(uuid) => uuid,
     };
+
+    // Check permissions: DeleteAll, DeleteOwn, or org membership
+    let can_delete_all = can_delete_all_resources(&current_user, Resource::ApiKeys);
+    let can_delete_own = can_delete_own_resource(&current_user, Resource::ApiKeys, target_user_id);
+
+    if !can_delete_all && !can_delete_own {
+        let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+        let member = is_org_member(&current_user, target_user_id, &mut conn)
+            .await
+            .map_err(Error::Database)?;
+        if !member {
+            return Err(Error::InsufficientPermissions {
+                required: Permission::Any(vec![
+                    Permission::Allow(Resource::ApiKeys, Operation::DeleteAll),
+                    Permission::Allow(Resource::ApiKeys, Operation::DeleteOwn),
+                ]),
+                action: Operation::DeleteOwn,
+                resource: format!("API keys for user {target_user_id}"),
+            });
+        }
+    }
+
+    let skip_created_by_filter = can_delete_all;
 
     let mut tx = state.db.write().begin().await.map_err(|e| Error::Database(e.into()))?;
     let mut repo = ApiKeys::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
 
-    // Check if the API key exists and belongs to the target user before deleting
+    // Check if the API key exists, belongs to the target user, and was created by current user
     repo.get_by_id(api_key_id)
         .await?
         .filter(|key| key.user_id == target_user_id)
+        .filter(|key| skip_created_by_filter || key.created_by == current_user.id)
         .ok_or_else(|| Error::NotFound {
             resource: "API key".to_string(),
             id: api_key_id.to_string(),
@@ -910,6 +913,18 @@ mod tests {
 
         response.assert_status_ok();
 
+        // The target user can also see the key created on their behalf
+        let response = app
+            .get("/admin/api/v1/users/current/api-keys")
+            .add_header(&add_auth_headers(&standard_user)[0].0, &add_auth_headers(&standard_user)[0].1)
+            .add_header(&add_auth_headers(&standard_user)[1].0, &add_auth_headers(&standard_user)[1].1)
+            .await;
+
+        response.assert_status_ok();
+        let paginated: PaginatedResponse<ApiKeyInfoResponse> = response.json();
+        assert_eq!(paginated.data.len(), 1);
+        assert_eq!(paginated.data[0].name, "Manager Created Key");
+
         // Platform manager should be able to delete other users' API keys
         let response = app
             .delete(&format!("/admin/api/v1/users/{}/api-keys/{}", standard_user.id, api_key_id))
@@ -1072,5 +1087,241 @@ mod tests {
         // ApiKeyInfoResponse doesn't have a key field - this is the security feature
         assert_eq!(retrieved_key.id, created_key.id);
         assert_eq!(retrieved_key.name, created_key.name);
+    }
+
+    // ── Organization API key tests ────────────────────────────────────────
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_org_member_can_create_api_key(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let alice = create_test_user(&pool, Role::StandardUser).await;
+        let bob = create_test_user(&pool, Role::StandardUser).await;
+        let org = create_test_org(&pool, alice.id).await;
+        add_org_member(&pool, org.id, bob.id, "member").await;
+
+        // Bob (member, not admin) creates a key for the org
+        let api_key_data = json!({
+            "name": "Bob Org Key",
+            "description": "Created by member",
+            "purpose": "realtime"
+        });
+
+        let response = app
+            .post(&format!("/admin/api/v1/users/{}/api-keys", org.id))
+            .add_header(&add_auth_headers(&bob)[0].0, &add_auth_headers(&bob)[0].1)
+            .add_header(&add_auth_headers(&bob)[1].0, &add_auth_headers(&bob)[1].1)
+            .json(&api_key_data)
+            .await;
+
+        response.assert_status(axum::http::StatusCode::CREATED);
+        let api_key: ApiKeyResponse = response.json();
+        assert_eq!(api_key.name, "Bob Org Key");
+        assert!(api_key.key.starts_with("sk-"));
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_non_member_cannot_create_org_api_key(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let alice = create_test_user(&pool, Role::StandardUser).await;
+        let outsider = create_test_user(&pool, Role::StandardUser).await;
+        let org = create_test_org(&pool, alice.id).await;
+
+        // Outsider (not a member) tries to create a key for the org
+        let api_key_data = json!({
+            "name": "Outsider Key",
+            "purpose": "realtime"
+        });
+
+        let response = app
+            .post(&format!("/admin/api/v1/users/{}/api-keys", org.id))
+            .add_header(&add_auth_headers(&outsider)[0].0, &add_auth_headers(&outsider)[0].1)
+            .add_header(&add_auth_headers(&outsider)[1].0, &add_auth_headers(&outsider)[1].1)
+            .json(&api_key_data)
+            .await;
+
+        response.assert_status_forbidden();
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_org_member_list_only_own_keys(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let alice = create_test_user(&pool, Role::StandardUser).await;
+        let bob = create_test_user(&pool, Role::StandardUser).await;
+        let org = create_test_org(&pool, alice.id).await;
+        add_org_member(&pool, org.id, bob.id, "member").await;
+
+        // Alice (owner) creates a key for the org
+        let response = app
+            .post(&format!("/admin/api/v1/users/{}/api-keys", org.id))
+            .add_header(&add_auth_headers(&alice)[0].0, &add_auth_headers(&alice)[0].1)
+            .add_header(&add_auth_headers(&alice)[1].0, &add_auth_headers(&alice)[1].1)
+            .json(&json!({"name": "Alice Key", "purpose": "realtime"}))
+            .await;
+        response.assert_status(axum::http::StatusCode::CREATED);
+
+        // Bob (member) creates a key for the org
+        let response = app
+            .post(&format!("/admin/api/v1/users/{}/api-keys", org.id))
+            .add_header(&add_auth_headers(&bob)[0].0, &add_auth_headers(&bob)[0].1)
+            .add_header(&add_auth_headers(&bob)[1].0, &add_auth_headers(&bob)[1].1)
+            .json(&json!({"name": "Bob Key", "purpose": "realtime"}))
+            .await;
+        response.assert_status(axum::http::StatusCode::CREATED);
+
+        // Alice lists org keys → should only see her own key
+        let response = app
+            .get(&format!("/admin/api/v1/users/{}/api-keys", org.id))
+            .add_header(&add_auth_headers(&alice)[0].0, &add_auth_headers(&alice)[0].1)
+            .add_header(&add_auth_headers(&alice)[1].0, &add_auth_headers(&alice)[1].1)
+            .await;
+        response.assert_status_ok();
+        let paginated: PaginatedResponse<ApiKeyInfoResponse> = response.json();
+        assert_eq!(paginated.data.len(), 1);
+        assert_eq!(paginated.data[0].name, "Alice Key");
+
+        // Bob lists org keys → should only see his own key
+        let response = app
+            .get(&format!("/admin/api/v1/users/{}/api-keys", org.id))
+            .add_header(&add_auth_headers(&bob)[0].0, &add_auth_headers(&bob)[0].1)
+            .add_header(&add_auth_headers(&bob)[1].0, &add_auth_headers(&bob)[1].1)
+            .await;
+        response.assert_status_ok();
+        let paginated: PaginatedResponse<ApiKeyInfoResponse> = response.json();
+        assert_eq!(paginated.data.len(), 1);
+        assert_eq!(paginated.data[0].name, "Bob Key");
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_org_member_cannot_get_other_members_key(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let alice = create_test_user(&pool, Role::StandardUser).await;
+        let bob = create_test_user(&pool, Role::StandardUser).await;
+        let org = create_test_org(&pool, alice.id).await;
+        add_org_member(&pool, org.id, bob.id, "member").await;
+
+        // Bob creates a key
+        let response = app
+            .post(&format!("/admin/api/v1/users/{}/api-keys", org.id))
+            .add_header(&add_auth_headers(&bob)[0].0, &add_auth_headers(&bob)[0].1)
+            .add_header(&add_auth_headers(&bob)[1].0, &add_auth_headers(&bob)[1].1)
+            .json(&json!({"name": "Bob Key", "purpose": "realtime"}))
+            .await;
+        response.assert_status(axum::http::StatusCode::CREATED);
+        let bob_key: ApiKeyResponse = response.json();
+
+        // Alice tries to get Bob's key by ID → should get 404
+        let response = app
+            .get(&format!("/admin/api/v1/users/{}/api-keys/{}", org.id, bob_key.id))
+            .add_header(&add_auth_headers(&alice)[0].0, &add_auth_headers(&alice)[0].1)
+            .add_header(&add_auth_headers(&alice)[1].0, &add_auth_headers(&alice)[1].1)
+            .await;
+        response.assert_status_not_found();
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_org_member_cannot_delete_other_members_key(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let alice = create_test_user(&pool, Role::StandardUser).await;
+        let bob = create_test_user(&pool, Role::StandardUser).await;
+        let org = create_test_org(&pool, alice.id).await;
+        add_org_member(&pool, org.id, bob.id, "member").await;
+
+        // Bob creates a key
+        let response = app
+            .post(&format!("/admin/api/v1/users/{}/api-keys", org.id))
+            .add_header(&add_auth_headers(&bob)[0].0, &add_auth_headers(&bob)[0].1)
+            .add_header(&add_auth_headers(&bob)[1].0, &add_auth_headers(&bob)[1].1)
+            .json(&json!({"name": "Bob Key", "purpose": "realtime"}))
+            .await;
+        response.assert_status(axum::http::StatusCode::CREATED);
+        let bob_key: ApiKeyResponse = response.json();
+
+        // Alice tries to delete Bob's key → should get 404
+        let response = app
+            .delete(&format!("/admin/api/v1/users/{}/api-keys/{}", org.id, bob_key.id))
+            .add_header(&add_auth_headers(&alice)[0].0, &add_auth_headers(&alice)[0].1)
+            .add_header(&add_auth_headers(&alice)[1].0, &add_auth_headers(&alice)[1].1)
+            .await;
+        response.assert_status_not_found();
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_org_member_can_delete_own_key(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let alice = create_test_user(&pool, Role::StandardUser).await;
+        let bob = create_test_user(&pool, Role::StandardUser).await;
+        let org = create_test_org(&pool, alice.id).await;
+        add_org_member(&pool, org.id, bob.id, "member").await;
+
+        // Bob creates a key
+        let response = app
+            .post(&format!("/admin/api/v1/users/{}/api-keys", org.id))
+            .add_header(&add_auth_headers(&bob)[0].0, &add_auth_headers(&bob)[0].1)
+            .add_header(&add_auth_headers(&bob)[1].0, &add_auth_headers(&bob)[1].1)
+            .json(&json!({"name": "Bob Key", "purpose": "realtime"}))
+            .await;
+        response.assert_status(axum::http::StatusCode::CREATED);
+        let bob_key: ApiKeyResponse = response.json();
+
+        // Bob deletes his own key → should succeed
+        let response = app
+            .delete(&format!("/admin/api/v1/users/{}/api-keys/{}", org.id, bob_key.id))
+            .add_header(&add_auth_headers(&bob)[0].0, &add_auth_headers(&bob)[0].1)
+            .add_header(&add_auth_headers(&bob)[1].0, &add_auth_headers(&bob)[1].1)
+            .await;
+        response.assert_status(axum::http::StatusCode::NO_CONTENT);
+
+        // Verify key is gone from Bob's list
+        let response = app
+            .get(&format!("/admin/api/v1/users/{}/api-keys", org.id))
+            .add_header(&add_auth_headers(&bob)[0].0, &add_auth_headers(&bob)[0].1)
+            .add_header(&add_auth_headers(&bob)[1].0, &add_auth_headers(&bob)[1].1)
+            .await;
+        response.assert_status_ok();
+        let paginated: PaginatedResponse<ApiKeyInfoResponse> = response.json();
+        assert_eq!(paginated.data.len(), 0);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_platform_manager_sees_all_org_keys(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let alice = create_test_user(&pool, Role::StandardUser).await;
+        let bob = create_test_user(&pool, Role::StandardUser).await;
+        let pm = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let org = create_test_org(&pool, alice.id).await;
+        add_org_member(&pool, org.id, bob.id, "member").await;
+
+        // Alice creates a key
+        app.post(&format!("/admin/api/v1/users/{}/api-keys", org.id))
+            .add_header(&add_auth_headers(&alice)[0].0, &add_auth_headers(&alice)[0].1)
+            .add_header(&add_auth_headers(&alice)[1].0, &add_auth_headers(&alice)[1].1)
+            .json(&json!({"name": "Alice Key", "purpose": "realtime"}))
+            .await
+            .assert_status(axum::http::StatusCode::CREATED);
+
+        // Bob creates a key
+        app.post(&format!("/admin/api/v1/users/{}/api-keys", org.id))
+            .add_header(&add_auth_headers(&bob)[0].0, &add_auth_headers(&bob)[0].1)
+            .add_header(&add_auth_headers(&bob)[1].0, &add_auth_headers(&bob)[1].1)
+            .json(&json!({"name": "Bob Key", "purpose": "realtime"}))
+            .await
+            .assert_status(axum::http::StatusCode::CREATED);
+
+        // PlatformManager lists org keys → should see all keys (bypasses created_by filter)
+        let response = app
+            .get(&format!("/admin/api/v1/users/{}/api-keys", org.id))
+            .add_header(&add_auth_headers(&pm)[0].0, &add_auth_headers(&pm)[0].1)
+            .add_header(&add_auth_headers(&pm)[1].0, &add_auth_headers(&pm)[1].1)
+            .await;
+        response.assert_status_ok();
+        let paginated: PaginatedResponse<ApiKeyInfoResponse> = response.json();
+        assert_eq!(paginated.data.len(), 2);
     }
 }

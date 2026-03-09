@@ -9,8 +9,9 @@ import {
   useCreateBillingPortalSession,
 } from "@/api/control-layer";
 import { toast } from "sonner";
-import { useSettings } from "@/contexts";
+import { useSettings, useOrganizationContext } from "@/contexts";
 import { TransactionHistory } from "@/components/features/cost-management/CostManagement/TransactionHistory.tsx";
+import { AutoTopupSection } from "@/components/features/cost-management/CostManagement/AutoTopupSection.tsx";
 import { AddFundsModal } from "@/components/modals/AddCreditsModal/AddCreditsModal";
 import {
   Dialog,
@@ -28,18 +29,24 @@ export function CostManagement() {
   const { isFeatureEnabled, settings } = useSettings();
   const isDemoMode = isFeatureEnabled("demo");
   const { data: config } = useConfig();
+  const { activeOrganizationId } = useOrganizationContext();
 
   const [showSuccessModal, setShowSuccessModal] = useState(false);
   const [showCancelledModal, setShowCancelledModal] = useState(false);
   const [showAddFundsModal, setShowAddFundsModal] = useState(false);
-
   // Check if we're filtering by a specific user
   const filterUserId = searchParams.get("user");
+
+  // Determine the effective billing user:
+  // 1. URL filter param (admin viewing another user) takes priority
+  // 2. Active organization's user account when in org context
+  // 3. Current user's personal account
+  const billingUserId = filterUserId || activeOrganizationId || undefined;
 
   // Fetch current user and display user (the one we're viewing billing for)
   const { data: currentUser, refetch: refetchCurrentUser } = useUser("current");
   const { data: displayUser, refetch: refetchDisplayUser } = useUser(
-    filterUserId || "current",
+    billingUserId || "current",
   );
 
   const addFundsMutation = useAddFunds();
@@ -138,9 +145,9 @@ export function CostManagement() {
     } else if (config?.payment_enabled) {
       // Payment processing enabled: Get checkout URL and redirect using the mutation hook
       try {
-        // Pass filterUserId as creditee_id when viewing another user's billing
+        // Pass the billing user as creditee_id when not the current user
         const data = await createPaymentMutation.mutateAsync(
-          filterUserId || undefined,
+          billingUserId || undefined,
         );
         if (data.url) {
           // Navigate to payment provider checkout page
@@ -216,15 +223,30 @@ export function CostManagement() {
     }
   })();
 
+  const showAutoTopupSection =
+    (isDemoMode || !!config?.payment_enabled) && displayUser && !filterUserId;
+
+  const autoTopupElement = showAutoTopupSection ? (
+    <AutoTopupSection
+      user={displayUser!}
+      userId={currentUser!.id}
+      onSuccess={() => {
+        refetchCurrentUser();
+        refetchDisplayUser();
+      }}
+    />
+  ) : undefined;
+
   return (
     <div className="p-6">
       {currentUser && displayUser && (
         <>
           <TransactionHistory
-            userId={filterUserId || currentUser.id}
+            userId={billingUserId || currentUser.id}
             addFundsConfig={addFundsConfig}
             showCard={false}
             filterUserId={filterUserId || undefined}
+            headerExtra={autoTopupElement}
           />
           {/* Admin modal for gifting funds to users */}
           {canManageFunds && (

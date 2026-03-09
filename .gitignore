@@ -53,3 +53,7 @@ dwctl/static/
 
 # Extra lock files
 dashboard/pnpm-lock.yaml
+emails
+.scratch
+LOCAL_OVERRIDES.md
+docker-compose.local.yml

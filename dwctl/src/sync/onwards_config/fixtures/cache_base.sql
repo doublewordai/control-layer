@@ -19,11 +19,11 @@ VALUES
     ('10000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-0000000000a1', '00000000-0000-0000-0000-000000000aa1');
 
 -- API keys
-INSERT INTO api_keys (id, name, description, secret, user_id, hidden, purpose, requests_per_second, burst_size)
+INSERT INTO api_keys (id, name, description, secret, user_id, created_by, hidden, purpose, requests_per_second, burst_size)
 VALUES
-    ('20000000-0000-0000-0000-0000000000a1', 'cache-key-a', 'Realtime key for user A', 'sk-cache-a', '00000000-0000-0000-0000-0000000000a1', false, 'realtime', NULL, NULL),
-    ('20000000-0000-0000-0000-0000000000b1', 'cache-key-b', 'Realtime key for user B', 'sk-cache-b', '00000000-0000-0000-0000-0000000000b1', false, 'realtime', NULL, NULL),
-    ('20000000-0000-0000-0000-0000000000c1', 'cache-batch-key', 'Batch key for escalation tests', 'sk-cache-batch', '00000000-0000-0000-0000-0000000000c1', false, 'batch', NULL, NULL);
+    ('20000000-0000-0000-0000-0000000000a1', 'cache-key-a', 'Realtime key for user A', 'sk-cache-a', '00000000-0000-0000-0000-0000000000a1', '00000000-0000-0000-0000-0000000000a1', false, 'realtime', NULL, NULL),
+    ('20000000-0000-0000-0000-0000000000b1', 'cache-key-b', 'Realtime key for user B', 'sk-cache-b', '00000000-0000-0000-0000-0000000000b1', '00000000-0000-0000-0000-0000000000b1', false, 'realtime', NULL, NULL),
+    ('20000000-0000-0000-0000-0000000000c1', 'cache-batch-key', 'Batch key for escalation tests', 'sk-cache-batch', '00000000-0000-0000-0000-0000000000c1', '00000000-0000-0000-0000-0000000000c1', false, 'batch', NULL, NULL);
 
 -- Endpoints
 INSERT INTO inference_endpoints (
