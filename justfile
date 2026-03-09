@@ -518,7 +518,7 @@ lint target *args="":
             echo "Running TypeScript checks..."
             pnpm exec tsc -b --noEmit
             echo "Running ESLint..."
-            pnpm run lint -- --max-warnings 0 {{args}}
+            pnpm exec eslint . --max-warnings 0 {{args}}
             ;;
         rust)
             echo "Checking Cargo.lock sync..."
