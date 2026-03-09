@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.15.2](https://github.com/doublewordai/control-layer/compare/v8.15.1...v8.15.2) (2026-03-08)
+
+
+### Bug Fixes
+
+* validate endpoint-to-model-type matching in batch file uploads ([#813](https://github.com/doublewordai/control-layer/issues/813)) ([817cc03](https://github.com/doublewordai/control-layer/commit/817cc032cbd8ae1964181d53bc1ee6ad7016d42c))
+
 ## [8.15.1](https://github.com/doublewordai/control-layer/compare/v8.15.0...v8.15.1) (2026-03-06)
 
 

@@ -21,7 +21,7 @@ use crate::db::{
     handlers::repository::Repository,
     handlers::tariffs::Tariffs,
     models::api_keys::ApiKeyPurpose,
-    models::deployments::ModelStatus,
+    models::deployments::{ModelStatus, ModelType},
 };
 use crate::errors::{Error, Result};
 use crate::types::Resource;
@@ -37,7 +37,7 @@ use fusillade::Storage;
 use futures::StreamExt;
 use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
@@ -131,18 +131,45 @@ fn validate_custom_id(custom_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Validate that the requested endpoint is compatible with the model's type.
+///
+/// For example, `/v1/embeddings` requires an `Embeddings` model, while
+/// `/v1/chat/completions` requires a `Chat` model.
+fn validate_endpoint_model_type(url: &str, model: &str, model_type: &ModelType) -> Result<()> {
+    let expected = match url {
+        "/v1/chat/completions" | "/v1/completions" | "/v1/responses" => ModelType::Chat,
+        "/v1/embeddings" => ModelType::Embeddings,
+        // Unknown endpoints skip type validation
+        _ => return Ok(()),
+    };
+
+    if *model_type != expected {
+        return Err(Error::BadRequest {
+            message: format!(
+                "Model '{}' is a {} model but endpoint '{}' requires a {} model",
+                model,
+                format!("{:?}", model_type).to_uppercase(),
+                url,
+                format!("{:?}", expected).to_uppercase(),
+            ),
+        });
+    }
+
+    Ok(())
+}
+
 impl OpenAIBatchRequest {
     /// Transform OpenAI format to internal format
     ///
     /// # Arguments
     /// * `endpoint` - The target endpoint (e.g., "http://localhost:8080/ai")
     /// * `api_key` - The API key to inject for request execution
-    /// * `accessible_models` - Set of model aliases the user can access
+    /// * `accessible_models` - Map of model aliases to their optional ModelType
     fn to_internal(
         &self,
         endpoint: &str,
         api_key: String,
-        accessible_models: &HashSet<String>,
+        accessible_models: &HashMap<String, Option<ModelType>>,
         allowed_url_paths: &[String],
     ) -> Result<fusillade::RequestTemplateInput> {
         // Validate custom_id is safe for HTTP headers
@@ -165,11 +192,14 @@ impl OpenAIBatchRequest {
             .to_string();
 
         // Validate model access
-        if !accessible_models.contains(&model) {
-            return Err(Error::ModelAccessDenied {
-                model_name: model.clone(),
-                message: format!("Model '{}' has not been configured or is not available to user.", model),
-            });
+        let model_type = accessible_models.get(&model).ok_or_else(|| Error::ModelAccessDenied {
+            model_name: model.clone(),
+            message: format!("Model '{}' has not been configured or is not available to user.", model),
+        })?;
+
+        // Validate endpoint matches model type (skip if model type is unknown)
+        if let Some(model_type) = model_type {
+            validate_endpoint_model_type(&self.url, &model, model_type)?;
         }
 
         // Strip 'priority' key from body if present (users shouldn't control priority)
@@ -374,7 +404,7 @@ fn create_file_stream(
     uploaded_by: Option<String>,
     endpoint: String,
     api_key: String,
-    accessible_models: HashSet<String>,
+    accessible_models: HashMap<String, Option<ModelType>>,
     allowed_url_paths: Vec<String>,
 ) -> FileStreamResult {
     let (tx, rx) = mpsc::channel(config.buffer_size);
@@ -813,7 +843,8 @@ pub async fn upload_file<P: PoolProvider>(
         .with_statuses(vec![ModelStatus::Active])
         .with_deleted(false);
     let accessible_deployments = deployments_repo.list(&filter).await.map_err(Error::Database)?;
-    let accessible_models: HashSet<String> = accessible_deployments.into_iter().map(|d| d.alias).collect();
+    let accessible_models: HashMap<String, Option<ModelType>> =
+        accessible_deployments.into_iter().map(|d| (d.alias, d.model_type)).collect();
 
     // drop conn so it isn't persisted for entire upload process
     drop(conn);
@@ -3207,6 +3238,169 @@ mod tests {
 
         // Create a small request well within the limit
         let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}"#;
+
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test.jsonl");
+
+        let upload_response = app
+            .post("/ai/v1/files")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .multipart(
+                axum_test::multipart::MultipartForm::new()
+                    .add_text("purpose", "batch")
+                    .add_part("file", file_part),
+            )
+            .await;
+
+        upload_response.assert_status(axum::http::StatusCode::CREATED);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_upload_rejects_embeddings_model_on_chat_endpoint(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        let deployment = create_test_deployment_with_model_type(
+            &pool,
+            user.id,
+            "text-embedding-3-small",
+            "my-embed",
+            crate::db::models::deployments::ModelType::Embeddings,
+        )
+        .await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        let jsonl_content = r#"{"custom_id":"req-1","method":"POST","url":"/v1/chat/completions","body":{"model":"my-embed","messages":[{"role":"user","content":"Hello"}]}}"#;
+
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test.jsonl");
+
+        let upload_response = app
+            .post("/ai/v1/files")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .multipart(
+                axum_test::multipart::MultipartForm::new()
+                    .add_text("purpose", "batch")
+                    .add_part("file", file_part),
+            )
+            .await;
+
+        upload_response.assert_status(axum::http::StatusCode::BAD_REQUEST);
+        let body = upload_response.text();
+        assert!(body.contains("EMBEDDINGS"), "Expected EMBEDDINGS in error, got: {}", body);
+        assert!(body.contains("/v1/chat/completions"), "Expected endpoint in error, got: {}", body);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_upload_rejects_chat_model_on_embeddings_endpoint(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        let deployment = create_test_deployment_with_model_type(
+            &pool,
+            user.id,
+            "gpt-4-model",
+            "my-chat",
+            crate::db::models::deployments::ModelType::Chat,
+        )
+        .await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        let jsonl_content =
+            r#"{"custom_id":"req-1","method":"POST","url":"/v1/embeddings","body":{"model":"my-chat","input":"Hello world"}}"#;
+
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test.jsonl");
+
+        let upload_response = app
+            .post("/ai/v1/files")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .multipart(
+                axum_test::multipart::MultipartForm::new()
+                    .add_text("purpose", "batch")
+                    .add_part("file", file_part),
+            )
+            .await;
+
+        upload_response.assert_status(axum::http::StatusCode::BAD_REQUEST);
+        let body = upload_response.text();
+        assert!(body.contains("CHAT"), "Expected CHAT in error, got: {}", body);
+        assert!(body.contains("/v1/embeddings"), "Expected endpoint in error, got: {}", body);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_upload_allows_matching_endpoint_and_model_type(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        let chat_deployment = create_test_deployment_with_model_type(
+            &pool,
+            user.id,
+            "gpt-4-model",
+            "my-chat",
+            crate::db::models::deployments::ModelType::Chat,
+        )
+        .await;
+        add_deployment_to_group(&pool, chat_deployment.id, group.id, user.id).await;
+
+        let embed_deployment = create_test_deployment_with_model_type(
+            &pool,
+            user.id,
+            "text-embedding-3-small",
+            "my-embed",
+            crate::db::models::deployments::ModelType::Embeddings,
+        )
+        .await;
+        add_deployment_to_group(&pool, embed_deployment.id, group.id, user.id).await;
+
+        // Chat model on chat endpoint — should succeed
+        let jsonl_content = concat!(
+            r#"{"custom_id":"req-1","method":"POST","url":"/v1/chat/completions","body":{"model":"my-chat","messages":[{"role":"user","content":"Hello"}]}}"#,
+            "\n",
+            r#"{"custom_id":"req-2","method":"POST","url":"/v1/embeddings","body":{"model":"my-embed","input":"Hello world"}}"#,
+            "\n",
+        );
+
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test.jsonl");
+
+        let upload_response = app
+            .post("/ai/v1/files")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .multipart(
+                axum_test::multipart::MultipartForm::new()
+                    .add_text("purpose", "batch")
+                    .add_part("file", file_part),
+            )
+            .await;
+
+        upload_response.assert_status(axum::http::StatusCode::CREATED);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_upload_skips_validation_for_untyped_models(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        // create_test_deployment sets model_type = None
+        let deployment = create_test_deployment(&pool, user.id, "mystery-model", "mystery").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        // Untyped model on embeddings endpoint — should be allowed
+        let jsonl_content =
+            r#"{"custom_id":"req-1","method":"POST","url":"/v1/embeddings","body":{"model":"mystery","input":"Hello world"}}"#;
 
         let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test.jsonl");
 
