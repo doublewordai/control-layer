@@ -15,17 +15,17 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v6
 
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
       - name: Setup Node.js
         uses: actions/setup-node@v6
         with:
           node-version: "24"
           cache: "pnpm"
           cache-dependency-path: dashboard/pnpm-lock.yaml
-
-      - name: Install pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          version: 10
 
       - name: Install dependencies
         working-directory: ./dashboard
@@ -340,17 +340,17 @@ jobs:
       - name: Install just
         uses: extractions/setup-just@v3
 
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
       - name: Setup Node.js
         uses: actions/setup-node@v6
         with:
           node-version: "24"
           cache: "pnpm"
           cache-dependency-path: dashboard/pnpm-lock.yaml
-
-      - name: Install pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          version: 10
 
       - name: Install dashboard dependencies
         working-directory: ./dashboard
