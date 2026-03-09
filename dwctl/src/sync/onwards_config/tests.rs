@@ -254,9 +254,13 @@ async fn test_cache_shape_composite_batch_escalation_access(pool: sqlx::PgPool) 
 #[sqlx::test(fixtures(path = "fixtures", scripts("cache_base", "cache_components_all_disabled")))]
 async fn test_cache_shape_composite_with_all_components_disabled(pool: sqlx::PgPool) {
     let targets = super::load_targets_from_db(&pool, &[], false).await.unwrap();
+    let pool_entry = targets
+        .targets
+        .get("composite-priority")
+        .expect("composite should still exist in cache even with all components disabled");
     assert!(
-        targets.targets.get("composite-priority").is_none(),
-        "composite alias is removed from cache when all components are disabled"
+        pool_entry.is_empty(),
+        "composite pool should have zero providers when all components are disabled"
     );
 }
 
