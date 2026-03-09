@@ -246,7 +246,7 @@ function ExpandedContent({
             size="sm"
             onClick={() =>
               navigate(
-                `/playground?model=${encodeURIComponent(model.alias)}`,
+                `/playground?model=${encodeURIComponent(model.id)}`,
               )
             }
           >
@@ -382,7 +382,7 @@ function ModelRow({
               onClick={(e) => {
                 e.stopPropagation();
                 navigate(
-                  `/playground?model=${encodeURIComponent(model.alias)}`,
+                  `/playground?model=${encodeURIComponent(model.id)}`,
                 );
               }}
               className="text-xs h-7 px-2.5 border-blue-200 text-blue-700 hover:bg-blue-50 hover:text-blue-800"

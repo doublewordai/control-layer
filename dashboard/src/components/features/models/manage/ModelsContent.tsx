@@ -915,7 +915,7 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                               className="flex items-center justify-center gap-1.5 py-3.5 text-sm font-medium text-gray-600 hover:bg-gray-50 hover:text-gray-700 transition-colors rounded-br-lg group"
                               onClick={() => {
                                 navigate(
-                                  `/playground?model=${encodeURIComponent(model.alias)}&from=${encodeURIComponent("/models/manage")}`,
+                                  `/playground?model=${encodeURIComponent(model.id)}&from=${encodeURIComponent("/models/manage")}`,
                                 );
                               }}
                             >

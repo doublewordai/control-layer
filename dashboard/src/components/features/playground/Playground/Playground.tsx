@@ -55,7 +55,7 @@ interface DeltaWithReasoning {
 const Playground: React.FC = () => {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
-  const selectedModelAlias = searchParams.get("model") || undefined;
+  const selectedModelId = searchParams.get("model") || undefined;
   const fromUrl = searchParams.get("from");
 
   const [messages, setMessages] = useState<Message[]>([]);
@@ -77,32 +77,23 @@ const Playground: React.FC = () => {
     category: string;
   } | null>(null);
 
-  // Fetch model from URL if specified
-  const { data: urlModelsData, error: modelsError } = useModels({
-    limit: 1,
-    search: selectedModelAlias,
-  });
-  const urlModels = useMemo(() => urlModelsData?.data ?? [], [urlModelsData]);
-
-  // Fetch accessible models as default candidates (only when no URL model specified).
-  // We fetch more than 1 so we can skip playground-denied models.
-  const { data: defaultModelsData } = useModels({
-    limit: 10,
+  // Fetch all accessible models — used both for URL model lookup and as
+  // default candidates when no model is specified.
+  const { data: modelsData, error: modelsError } = useModels({
+    limit: 100,
     accessible: true,
   });
-  const defaultModels = useMemo(
-    () => defaultModelsData?.data ?? [],
-    [defaultModelsData],
-  );
+  const models = useMemo(() => modelsData?.data ?? [], [modelsData]);
 
-  // Convert models data to array and handle URL model selection
+  // Handle URL model selection
   useEffect(() => {
     // If already have a selected model, don't change it
     if (selectedModel) return;
+    if (models.length === 0) return;
 
-    if (selectedModelAlias && urlModels && urlModels.length > 0) {
-      // If a model ID is specified in URL, select it
-      const model = urlModels.find((m) => m.alias === selectedModelAlias);
+    if (selectedModelId) {
+      // Find the exact model by ID from the URL
+      const model = models.find((m) => m.id === selectedModelId);
       if (model) {
         if (isPlaygroundDenied(model)) {
           setError(
@@ -113,19 +104,19 @@ const Playground: React.FC = () => {
         setSelectedModel(model);
         setModelType((model.model_type?.toLowerCase() as ModelType) || "chat");
       }
-    } else if (!selectedModelAlias && defaultModels.length > 0) {
+    } else {
       // No URL model specified, select the first accessible model that allows playground
-      const model = defaultModels.find((m) => !isPlaygroundDenied(m));
+      const model = models.find((m) => !isPlaygroundDenied(m));
       if (model) {
         setSelectedModel(model);
         setModelType((model.model_type?.toLowerCase() as ModelType) || "chat");
         // Update URL to reflect the selected model
-        navigate(`/playground?model=${encodeURIComponent(model.alias)}`, {
+        navigate(`/playground?model=${encodeURIComponent(model.id)}`, {
           replace: true,
         });
       }
     }
-  }, [urlModels, selectedModelAlias, defaultModels, selectedModel, navigate]);
+  }, [models, selectedModelId, selectedModel, navigate]);
 
   // Handle models loading error
   useEffect(() => {
@@ -171,7 +162,7 @@ const Playground: React.FC = () => {
     if (model) {
       setSelectedModel(model);
       setModelType((model.model_type?.toLowerCase() as ModelType) || "chat");
-      navigate(`/playground?model=${encodeURIComponent(model.alias)}`);
+      navigate(`/playground?model=${encodeURIComponent(model.id)}`);
     }
   };
 

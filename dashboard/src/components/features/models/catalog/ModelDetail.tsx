@@ -178,7 +178,7 @@ export const ModelDetail: React.FC = () => {
                     size="sm"
                     onClick={() =>
                       navigate(
-                        `/playground?model=${encodeURIComponent(model.alias)}`,
+                        `/playground?model=${encodeURIComponent(model.id)}`,
                       )
                     }
                   >

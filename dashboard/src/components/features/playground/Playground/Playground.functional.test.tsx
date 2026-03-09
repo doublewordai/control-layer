@@ -185,7 +185,7 @@ describe("Playground Component - Functional Tests", () => {
 
   it("loads chat playground when model parameter is provided", async () => {
     const { container } = render(<Playground />, {
-      wrapper: createWrapper(["/?model=Qwen/Qwen3.5-397B-A17B-FP8"]),
+      wrapper: createWrapper(["/?model=d1a2b3c4-e5f6-4a7b-8c9d-0e1f2a3b4c5d"]),
     });
 
     // Wait for models to load and model to be selected
@@ -227,7 +227,7 @@ describe("Playground Component - Functional Tests", () => {
   it("sends message and displays conversation", async () => {
     const user = userEvent.setup();
     const { container } = render(<Playground />, {
-      wrapper: createWrapper(["/?model=Qwen/Qwen3.5-397B-A17B-FP8"]),
+      wrapper: createWrapper(["/?model=d1a2b3c4-e5f6-4a7b-8c9d-0e1f2a3b4c5d"]),
     });
 
     // Wait for chat playground to load
@@ -268,7 +268,7 @@ describe("Playground Component - Functional Tests", () => {
   it("loads embedding playground and compares text similarity", async () => {
     const user = userEvent.setup();
     const { container } = render(<Playground />, {
-      wrapper: createWrapper(["/?model=Qwen/Qwen3-Embedding-8B"]),
+      wrapper: createWrapper(["/?model=d7a8b9c0-e1f2-4a3b-4c5d-6e7f8a9b0c1d"]),
     });
 
     // Wait for embedding playground to load

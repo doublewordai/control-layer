@@ -2327,7 +2327,7 @@ const ModelInfo: React.FC = () => {
                       onClick={() => {
                         const currentUrl = `/models/${model.id}${fromUrl ? `?from=${encodeURIComponent(fromUrl)}` : ""}`;
                         navigate(
-                          `/playground?model=${encodeURIComponent(model.alias)}&from=${encodeURIComponent(currentUrl)}`,
+                          `/playground?model=${encodeURIComponent(model.id)}&from=${encodeURIComponent(currentUrl)}`,
                         );
                       }}
                     >
