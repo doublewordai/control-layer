@@ -52,7 +52,7 @@ dwctl/static/
 .worktrees/
 
 # Extra lock files
-dashboard/pnpm-lock.yaml
+dashboard/package-lock.json
 emails
 .scratch
 LOCAL_OVERRIDES.md
