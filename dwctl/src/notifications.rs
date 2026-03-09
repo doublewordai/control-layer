@@ -473,14 +473,14 @@ async fn process_auto_topups(
 
     let monthly_spends = if !limit_user_ids.is_empty() {
         let mut credits = Credits::new(&mut *conn);
-        credits
-            .get_monthly_auto_topup_spend_bulk(&limit_user_ids)
-            .await
-            .unwrap_or_else(|e| {
-                tracing::warn!(error = %e, "Failed to batch-fetch monthly auto-topup spend");
+        match credits.get_monthly_auto_topup_spend_bulk(&limit_user_ids).await {
+            Ok(spends) => spends,
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to batch-fetch monthly auto-topup spend, aborting auto-topup run");
                 counter!("dwctl_auto_topup_errors_total", "stage" => "monthly_limit_check").increment(1);
-                Default::default()
-            })
+                return;
+            }
+        }
     } else {
         Default::default()
     };

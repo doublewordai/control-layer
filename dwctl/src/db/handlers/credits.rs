@@ -498,7 +498,8 @@ impl<'c> Credits<'c> {
     }
 
     /// Get the total auto top-up spend for multiple users in the current calendar month (UTC).
-    /// Returns a map of user_id → total spend. Users with zero spend are included with `Decimal::ZERO`.
+    /// Returns a map of user_id → total spend. Users with no auto-topup transactions this month
+    /// will be absent from the map; callers should treat missing entries as zero.
     #[instrument(skip(self, user_ids), fields(count = user_ids.len()), err)]
     pub async fn get_monthly_auto_topup_spend_bulk(&mut self, user_ids: &[UserId]) -> Result<HashMap<UserId, rust_decimal::Decimal>> {
         if user_ids.is_empty() {
