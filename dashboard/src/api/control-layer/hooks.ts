@@ -1297,8 +1297,8 @@ export function useEnableAutoTopup() {
 
   return useMutation({
     mutationKey: ["payments", "auto-topup-enable"],
-    mutationFn: ({ threshold, amount }: { threshold: number; amount: number }) =>
-      dwctlApi.payments.enableAutoTopup(threshold, amount),
+    mutationFn: ({ threshold, amount, monthlyLimit }: { threshold: number; amount: number; monthlyLimit: number | null }) =>
+      dwctlApi.payments.enableAutoTopup(threshold, amount, monthlyLimit),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.users.all });
     },

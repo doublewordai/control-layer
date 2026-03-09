@@ -476,6 +476,42 @@ async fn process_auto_topups(
             continue;
         }
 
+        // Check monthly spending limit
+        if let Some(monthly_limit) = user.auto_topup_monthly_limit {
+            let monthly_spend = {
+                let mut credits = Credits::new(&mut *conn);
+                match credits.get_monthly_auto_topup_spend(user.id).await {
+                    Ok(spend) => spend,
+                    Err(e) => {
+                        tracing::warn!(user_id = %user.id, error = %e, "Failed to check monthly auto-topup spend");
+                        counter!("dwctl_auto_topup_errors_total", "stage" => "monthly_limit_check").increment(1);
+                        continue;
+                    }
+                }
+            };
+
+            if monthly_spend + user.auto_topup_amount > monthly_limit {
+                tracing::info!(
+                    user_id = %user.id,
+                    monthly_spend = %monthly_spend,
+                    monthly_limit = %monthly_limit,
+                    "Auto top-up skipped: monthly limit would be exceeded"
+                );
+                counter!("dwctl_auto_topup_limit_reached_total").increment(1);
+                if let Some(email_svc) = email_service {
+                    let name = user.display_name.as_deref().unwrap_or(&user.username);
+                    let balance = balance_for(user).unwrap_or_default();
+                    if let Err(e) = email_svc
+                        .send_auto_topup_limit_reached_email(&user.email, Some(name), &monthly_limit, &balance)
+                        .await
+                    {
+                        tracing::warn!(user_id = %user.id, error = %e, "Failed to send auto top-up limit reached email");
+                    }
+                }
+                continue;
+            }
+        }
+
         // Use a deterministic source_id so duplicate charges within a short window
         // are caught by the unique constraint on credits_transactions.source_id.
         // We include the minute so a user can be charged again in a subsequent minute if
@@ -747,6 +783,142 @@ mod tests {
             1,
             "Should only create one transaction per minute (idempotent)"
         );
+    }
+
+    #[sqlx::test]
+    async fn test_process_auto_topups_respects_monthly_limit(pool: PgPool) {
+        let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+
+        // Set up auto top-up with a $50 monthly limit
+        sqlx::query!(
+            r#"UPDATE users SET
+                auto_topup_amount = 25.0,
+                auto_topup_threshold = 10.0,
+                auto_topup_monthly_limit = 50.0,
+                payment_provider_id = 'cus_test_456'
+            WHERE id = $1"#,
+            user.id
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Seed an existing auto top-up transaction for $25 this month,
+        // then drain the balance below threshold so the next charge triggers
+        {
+            let mut conn = pool.acquire().await.unwrap();
+            let mut credits = Credits::new(&mut conn);
+            credits
+                .create_transaction(&CreditTransactionCreateDBRequest {
+                    user_id: user.id,
+                    transaction_type: CreditTransactionType::Purchase,
+                    amount: Decimal::new(2500, 2), // $25
+                    source_id: format!("auto_topup_{}_2026-03-01T00:00", user.id),
+                    description: Some("Auto top-up".to_string()),
+                    fusillade_batch_id: None,
+                    api_key_id: None,
+                })
+                .await
+                .unwrap();
+            // Drain balance below threshold via admin removal ($20 removed, leaving $5 < $10 threshold)
+            credits
+                .create_transaction(&CreditTransactionCreateDBRequest {
+                    user_id: user.id,
+                    transaction_type: CreditTransactionType::AdminRemoval,
+                    amount: Decimal::new(2000, 2), // $20 removal, leaving $5 balance
+                    source_id: "drain_1".to_string(),
+                    description: Some("Drain".to_string()),
+                    fusillade_batch_id: None,
+                    api_key_id: None,
+                })
+                .await
+                .unwrap();
+        }
+
+        // Monthly spend is $25, limit is $50, next charge is $25 -> $25 + $25 = $50 <= $50 -> should charge
+        let provider = payment_providers::create_provider(crate::config::PaymentConfig::Dummy(DummyConfig {
+            amount: Decimal::new(100, 0),
+        }));
+
+        let mut conn = pool.acquire().await.unwrap();
+        process_auto_topups(provider.as_ref(), &mut conn, None).await;
+
+        let count = sqlx::query!(
+            "SELECT COUNT(*) as count FROM credits_transactions WHERE user_id = $1 AND source_id LIKE 'auto_topup_%'",
+            user.id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count.count.unwrap(), 2, "Should have charged (total $50 = limit)");
+    }
+
+    #[sqlx::test]
+    async fn test_process_auto_topups_blocks_when_limit_exceeded(pool: PgPool) {
+        let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+
+        // Set up auto top-up with a $40 monthly limit
+        sqlx::query!(
+            r#"UPDATE users SET
+                auto_topup_amount = 25.0,
+                auto_topup_threshold = 10.0,
+                auto_topup_monthly_limit = 40.0,
+                payment_provider_id = 'cus_test_456'
+            WHERE id = $1"#,
+            user.id
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Seed an existing auto top-up transaction for $25 this month,
+        // then drain the balance below threshold so the charge would trigger
+        {
+            let mut conn = pool.acquire().await.unwrap();
+            let mut credits = Credits::new(&mut conn);
+            credits
+                .create_transaction(&CreditTransactionCreateDBRequest {
+                    user_id: user.id,
+                    transaction_type: CreditTransactionType::Purchase,
+                    amount: Decimal::new(2500, 2), // $25
+                    source_id: format!("auto_topup_{}_2026-03-01T00:00", user.id),
+                    description: Some("Auto top-up".to_string()),
+                    fusillade_batch_id: None,
+                    api_key_id: None,
+                })
+                .await
+                .unwrap();
+            // Drain balance below threshold via admin removal ($20 removed, leaving $5 < $10 threshold)
+            credits
+                .create_transaction(&CreditTransactionCreateDBRequest {
+                    user_id: user.id,
+                    transaction_type: CreditTransactionType::AdminRemoval,
+                    amount: Decimal::new(2000, 2), // $20 removal, leaving $5 balance
+                    source_id: "drain_2".to_string(),
+                    description: Some("Drain".to_string()),
+                    fusillade_batch_id: None,
+                    api_key_id: None,
+                })
+                .await
+                .unwrap();
+        }
+
+        // Monthly spend is $25, limit is $40, next charge is $25 -> $25 + $25 = $50 > $40 -> should skip
+        let provider = payment_providers::create_provider(crate::config::PaymentConfig::Dummy(DummyConfig {
+            amount: Decimal::new(100, 0),
+        }));
+
+        let mut conn = pool.acquire().await.unwrap();
+        process_auto_topups(provider.as_ref(), &mut conn, None).await;
+
+        let count = sqlx::query!(
+            "SELECT COUNT(*) as count FROM credits_transactions WHERE user_id = $1 AND source_id LIKE 'auto_topup_%'",
+            user.id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count.count.unwrap(), 1, "Should NOT have charged (would exceed limit)");
     }
 }
 

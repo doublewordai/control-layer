@@ -478,6 +478,25 @@ impl<'c> Credits<'c> {
         Ok(result.is_some())
     }
 
+    /// Get the total amount of auto top-up charges for a user in the current calendar month (UTC).
+    #[instrument(skip(self), err)]
+    pub async fn get_monthly_auto_topup_spend(&mut self, user_id: UserId) -> Result<rust_decimal::Decimal> {
+        let row = sqlx::query!(
+            r#"
+            SELECT COALESCE(SUM(amount), 0)::decimal(20, 9) as "total!"
+            FROM credits_transactions
+            WHERE user_id = $1
+              AND source_id LIKE 'auto_topup_%'
+              AND created_at >= date_trunc('month', now() AT TIME ZONE 'UTC')
+            "#,
+            user_id
+        )
+        .fetch_one(&mut *self.db)
+        .await?;
+
+        Ok(row.total)
+    }
+
     /// Count total transactions for a specific user with optional filters
     #[instrument(skip(self, filters), fields(user_id = %abbrev_uuid(&user_id)), err)]
     pub async fn count_user_transactions(&mut self, user_id: UserId, filters: &TransactionFilters) -> Result<i64> {

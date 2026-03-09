@@ -643,6 +643,7 @@ export const handlers = [
       auto_topup_amount: null,
       auto_topup_threshold: null,
       has_auto_topup_payment_method: false,
+      auto_topup_monthly_limit: null,
     };
     return HttpResponse.json(newUser, { status: 201 });
   }),

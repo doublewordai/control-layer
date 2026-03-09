@@ -17,6 +17,7 @@ struct EmailTemplates {
     low_balance: String,
     auto_topup_success: String,
     auto_topup_failed: String,
+    auto_topup_limit_reached: String,
     org_invite: String,
 }
 
@@ -29,6 +30,7 @@ impl EmailTemplates {
             low_balance: include_str!("../default_templates/low_balance.html").to_string(),
             auto_topup_success: include_str!("../default_templates/auto_topup_success.html").to_string(),
             auto_topup_failed: include_str!("../default_templates/auto_topup_failed.html").to_string(),
+            auto_topup_limit_reached: include_str!("../default_templates/auto_topup_limit_reached.html").to_string(),
             org_invite: include_str!("../default_templates/org_invite.html").to_string(),
         }
     }
@@ -48,6 +50,7 @@ impl EmailTemplates {
             low_balance: load("low_balance.html")?,
             auto_topup_success: load("auto_topup_success.html")?,
             auto_topup_failed: load("auto_topup_failed.html")?,
+            auto_topup_limit_reached: load("auto_topup_limit_reached.html")?,
             org_invite: load("org_invite.html")?,
         })
     }
@@ -359,6 +362,45 @@ impl EmailService {
                 operation: format!("render email template: {e}"),
             })?;
         self.send_email(to_email, to_name, subject, &body).await
+    }
+
+    pub async fn send_auto_topup_limit_reached_email(
+        &self,
+        to_email: &str,
+        to_name: Option<&str>,
+        monthly_limit: &rust_decimal::Decimal,
+        balance: &rust_decimal::Decimal,
+    ) -> Result<(), Error> {
+        let subject = format!("Auto top-up monthly limit of ${:.2} reached", monthly_limit);
+        let name = to_name.unwrap_or("User");
+
+        let mut env = Environment::new();
+        env.add_template("email", &self.templates.auto_topup_limit_reached)
+            .map_err(|e| Error::Internal {
+                operation: format!("add email template: {e}"),
+            })?;
+
+        let base = self.base_url.trim_end_matches('/');
+        let dashboard_link = format!("{base}/cost-management");
+        let profile_link = format!("{base}/profile");
+
+        let body = env
+            .get_template("email")
+            .map_err(|e| Error::Internal {
+                operation: format!("get email template: {e}"),
+            })?
+            .render(context! {
+                to_name => name,
+                monthly_limit => format!("{:.2}", monthly_limit),
+                balance => format!("{:.2}", balance),
+                dashboard_link,
+                profile_link,
+            })
+            .map_err(|e| Error::Internal {
+                operation: format!("render email template: {e}"),
+            })?;
+
+        self.send_email(to_email, to_name, &subject, &body).await
     }
 
     fn render_auto_topup_body(

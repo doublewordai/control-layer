@@ -105,7 +105,7 @@ impl<'c> Organizations<'c> {
                       is_admin, password_hash, external_user_id, payment_provider_id,
                       is_deleted, is_internal, batch_notifications_enabled, first_batch_email_sent,
                       low_balance_notification_sent, low_balance_threshold,
-                      auto_topup_amount, auto_topup_threshold, user_type
+                      auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, user_type
             "#,
             org_id,
             request.name,
@@ -147,6 +147,7 @@ impl<'c> Organizations<'c> {
             low_balance_threshold: row.low_balance_threshold,
             auto_topup_amount: row.auto_topup_amount,
             auto_topup_threshold: row.auto_topup_threshold,
+            auto_topup_monthly_limit: row.auto_topup_monthly_limit,
             user_type: row.user_type,
         })
     }
@@ -183,7 +184,7 @@ impl<'c> Organizations<'c> {
                       is_admin, password_hash, external_user_id, payment_provider_id,
                       batch_notifications_enabled, first_batch_email_sent,
                       low_balance_notification_sent, low_balance_threshold,
-                      auto_topup_amount, auto_topup_threshold, user_type
+                      auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, user_type
             "#,
             id,
             request.display_name,
@@ -214,6 +215,7 @@ impl<'c> Organizations<'c> {
             low_balance_threshold: row.low_balance_threshold,
             auto_topup_amount: row.auto_topup_amount,
             auto_topup_threshold: row.auto_topup_threshold,
+            auto_topup_monthly_limit: row.auto_topup_monthly_limit,
             user_type: row.user_type,
         })
     }
