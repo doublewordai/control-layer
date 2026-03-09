@@ -4,7 +4,7 @@ import { Play, ArrowLeft, GitCompare, X as XIcon } from "lucide-react";
 import { toast } from "sonner";
 import OpenAI from "openai";
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
-import { useModels } from "../../../../api/control-layer";
+import { useModels, useModel } from "../../../../api/control-layer";
 import { type ModelType } from "../../../../utils/modelType";
 import { isPlaygroundDenied } from "../../../../utils/modelAccess";
 import type {
@@ -77,23 +77,27 @@ const Playground: React.FC = () => {
     category: string;
   } | null>(null);
 
-  // Fetch all accessible models — used both for URL model lookup and as
-  // default candidates when no model is specified.
+  // Fetch accessible models for auto-selecting a default when no model is
+  // specified in the URL. The ModelCombobox has its own fetching for dropdown
+  // options, so this is only used for the initial auto-select.
   const { data: modelsData, error: modelsError } = useModels({
-    limit: 100,
     accessible: true,
   });
   const models = useMemo(() => modelsData?.data ?? [], [modelsData]);
 
-  // Handle URL model selection
+  // When a model ID is specified via URL, fetch it directly rather than
+  // hoping it appears in the first page of the list.
+  const { data: urlModel } = useModel(selectedModelId ?? "", {
+    enabled: !!selectedModelId && !selectedModel,
+  });
+
+  // Handle model selection: either from URL param or auto-select first available
   useEffect(() => {
-    // If already have a selected model, don't change it
     if (selectedModel) return;
-    if (models.length === 0) return;
 
     if (selectedModelId) {
-      // Find the exact model by ID from the URL
-      const model = models.find((m) => m.id === selectedModelId);
+      // Prefer the direct fetch; fall back to list match (e.g. cache hit)
+      const model = urlModel ?? models.find((m) => m.id === selectedModelId);
       if (model) {
         if (isPlaygroundDenied(model)) {
           setError(
@@ -104,19 +108,18 @@ const Playground: React.FC = () => {
         setSelectedModel(model);
         setModelType((model.model_type?.toLowerCase() as ModelType) || "chat");
       }
-    } else {
+    } else if (models.length > 0) {
       // No URL model specified, select the first accessible model that allows playground
       const model = models.find((m) => !isPlaygroundDenied(m));
       if (model) {
         setSelectedModel(model);
         setModelType((model.model_type?.toLowerCase() as ModelType) || "chat");
-        // Update URL to reflect the selected model
         navigate(`/playground?model=${encodeURIComponent(model.id)}`, {
           replace: true,
         });
       }
     }
-  }, [models, selectedModelId, selectedModel, navigate]);
+  }, [models, selectedModelId, selectedModel, urlModel, navigate]);
 
   // Handle models loading error
   useEffect(() => {

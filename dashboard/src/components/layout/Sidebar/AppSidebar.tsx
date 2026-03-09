@@ -154,7 +154,7 @@ export function AppSidebar() {
                 // Platform managers get collapsible Models section with sub-items
                 if (item.path === "/models" && canManageModels) {
                   const isManageModelsActive =
-                    location.pathname === "/models/manage";
+                    location.pathname.startsWith("/models/manage");
                   const isEndpointsActive =
                     location.pathname === "/endpoints";
                   return (

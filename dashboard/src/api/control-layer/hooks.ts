@@ -202,12 +202,17 @@ export function useModelsMetrics(
   };
 }
 
-export function useModel(id: string, options?: { include?: string }) {
+export function useModel(
+  id: string,
+  options?: { include?: string; enabled?: boolean },
+) {
   const queryClient = useQueryClient();
+  const { enabled, ...queryOptions } = options ?? {};
 
   return useQuery({
-    queryKey: queryKeys.models.byId(id, options?.include),
-    queryFn: () => dwctlApi.models.get(id, options),
+    queryKey: queryKeys.models.byId(id, queryOptions?.include),
+    queryFn: () => dwctlApi.models.get(id, queryOptions),
+    enabled,
     // Use cached list data as placeholder while fetching complete data
     placeholderData: () => {
       // Check if this exact model is cached

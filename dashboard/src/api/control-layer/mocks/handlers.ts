@@ -196,6 +196,11 @@ const initialModelComponents: Record<string, StoredComponent[]> = {
   "d7a8b9c0-e1f2-4a3b-4c5d-6e7f8a9b0c1d": [
     { componentModelId: "h1000001-aaaa-4bbb-8ccc-ddddeeee0011", weight: 1, enabled: true, sort_order: 0 },
   ],
+  // Qwen3.5-9B → 2 hosted models (primary + burst)
+  "d8b9c0d1-e2f3-4a4b-5c6d-7e8f9a0b1c2d": [
+    { componentModelId: "h1000001-aaaa-4bbb-8ccc-ddddeeee0012", weight: 70, enabled: true, sort_order: 0 },
+    { componentModelId: "h1000001-aaaa-4bbb-8ccc-ddddeeee0013", weight: 30, enabled: true, sort_order: 1 },
+  ],
 };
 
 // Resolve stored components to full ModelComponent objects for API responses
@@ -566,6 +571,45 @@ const modelTariffs: Record<string, ModelTariff[]> = {
       input_price_per_token: "0.00000004",
       output_price_per_token: "0",
       valid_from: "2025-07-10T00:00:00Z",
+      valid_until: null,
+      api_key_purpose: "playground" as const,
+      completion_window: null,
+      is_active: true,
+    },
+  ],
+  // Qwen3.5-9B — Realtime $0.10/$0.40 per M, Batch $0.05/$0.20 per M
+  "d8b9c0d1-e2f3-4a4b-5c6d-7e8f9a0b1c2d": [
+    {
+      id: "tariff-028",
+      deployed_model_id: "d8b9c0d1-e2f3-4a4b-5c6d-7e8f9a0b1c2d",
+      name: "Realtime",
+      input_price_per_token: "0.0000001",
+      output_price_per_token: "0.0000004",
+      valid_from: "2026-03-02T00:00:00Z",
+      valid_until: null,
+      api_key_purpose: "realtime" as const,
+      completion_window: null,
+      is_active: true,
+    },
+    {
+      id: "tariff-029",
+      deployed_model_id: "d8b9c0d1-e2f3-4a4b-5c6d-7e8f9a0b1c2d",
+      name: "Batch (24h)",
+      input_price_per_token: "0.00000005",
+      output_price_per_token: "0.0000002",
+      valid_from: "2026-03-02T00:00:00Z",
+      valid_until: null,
+      api_key_purpose: "batch" as const,
+      completion_window: "24h",
+      is_active: true,
+    },
+    {
+      id: "tariff-030",
+      deployed_model_id: "d8b9c0d1-e2f3-4a4b-5c6d-7e8f9a0b1c2d",
+      name: "Playground",
+      input_price_per_token: "0.0000001",
+      output_price_per_token: "0.0000004",
+      valid_from: "2026-03-02T00:00:00Z",
       valid_until: null,
       api_key_purpose: "playground" as const,
       completion_window: null,

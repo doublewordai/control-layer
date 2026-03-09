@@ -32,12 +32,14 @@
         "attribution": "artificial_analysis",
         "extra": {
           "evaluations": {
-            "mmlu_pro": 0.82,
-            "gpqa": 0.65,
-            "math_500": 0.91,
-            "aime_25": 0.58,
-            "livecodebench": 0.46,
-            "ifbench": 0.305
+            "artificial_analysis_coding_index": 41.3,
+            "gpqa": 0.893,
+            "hle": 0.273,
+            "ifbench": 0.788,
+            "lcr": 0.657,
+            "scicode": 0.42,
+            "tau2": 0.956,
+            "terminalbench_hard": 0.409
           },
           "summary": "Qwen's most powerful model, delivering performance similar to GPT-5.2 and Claude Opus 4.5 on challenging tasks.",
           "use_cases": [
@@ -81,11 +83,14 @@
         "attribution": "artificial_analysis",
         "extra": {
           "evaluations": {
-            "mmlu_pro": 0.72,
-            "gpqa": 0.51,
-            "math_500": 0.83,
-            "livecodebench": 0.38,
-            "ifbench": 0.245
+            "artificial_analysis_coding_index": 30.3,
+            "gpqa": 0.845,
+            "hle": 0.197,
+            "ifbench": 0.725,
+            "lcr": 0.627,
+            "scicode": 0.377,
+            "tau2": 0.892,
+            "terminalbench_hard": 0.265
           },
           "summary": "High-intelligence mid-sized model with a compelling price/performance point for async workloads.",
           "use_cases": [
@@ -127,11 +132,18 @@
         "attribution": "artificial_analysis",
         "extra": {
           "evaluations": {
-            "mmlu_pro": 0.58,
-            "gpqa": 0.35,
-            "math_500": 0.72,
-            "livecodebench": 0.28,
-            "ifbench": 0.165
+            "aime_25": 0.893,
+            "artificial_analysis_coding_index": 18.5,
+            "artificial_analysis_math_index": 89.3,
+            "gpqa": 0.688,
+            "hle": 0.098,
+            "ifbench": 0.651,
+            "lcr": 0.307,
+            "livecodebench": 0.777,
+            "mmlu_pro": 0.748,
+            "scicode": 0.344,
+            "tau2": 0.602,
+            "terminalbench_hard": 0.106
           },
           "summary": "Lower latency, smaller model for local or specialized use cases.",
           "use_cases": [
@@ -174,11 +186,18 @@
         "attribution": "artificial_analysis",
         "extra": {
           "evaluations": {
-            "mmlu_pro": 0.68,
-            "gpqa": 0.45,
-            "math_500": 0.78,
-            "livecodebench": 0.32,
-            "ifbench": 0.21
+            "aime_25": 0.707,
+            "artificial_analysis_coding_index": 16.5,
+            "artificial_analysis_math_index": 70.7,
+            "gpqa": 0.712,
+            "hle": 0.063,
+            "ifbench": 0.427,
+            "lcr": 0.317,
+            "livecodebench": 0.594,
+            "mmlu_pro": 0.823,
+            "scicode": 0.359,
+            "tau2": 0.351,
+            "terminalbench_hard": 0.068
           },
           "summary": "Frontier-level vision and text model, similar to GPT-5 Chat and Claude 4 Opus Thinking.",
           "use_cases": [
@@ -216,16 +235,23 @@
       "metadata": {
         "provider": "Alibaba",
         "intelligence_index": 16.1,
-        "context_window": 131072,
-        "released_at": "2025-10-04",
+        "context_window": 262144,
+        "released_at": "2025-10-03",
         "attribution": "artificial_analysis",
         "extra": {
           "evaluations": {
-            "mmlu_pro": 0.6,
-            "gpqa": 0.38,
-            "math_500": 0.7,
-            "livecodebench": 0.26,
-            "ifbench": 0.178
+            "aime_25": 0.723,
+            "artificial_analysis_coding_index": 14.3,
+            "artificial_analysis_math_index": 72.3,
+            "gpqa": 0.695,
+            "hle": 0.064,
+            "ifbench": 0.331,
+            "lcr": 0.237,
+            "livecodebench": 0.476,
+            "mmlu_pro": 0.764,
+            "scicode": 0.308,
+            "tau2": 0.19,
+            "terminalbench_hard": 0.061
           },
           "summary": "Capable mid-size vision model, similar to GPT-4.1-mini and Claude Sonnet 4.",
           "use_cases": [
@@ -260,16 +286,25 @@
       "metadata": {
         "provider": "Alibaba",
         "intelligence_index": 12.8,
-        "context_window": 262144,
-        "released_at": "2025-04-29",
+        "context_window": 32768,
+        "released_at": "2025-04-28",
         "attribution": "artificial_analysis",
         "extra": {
           "evaluations": {
-            "mmlu_pro": 0.55,
-            "gpqa": 0.32,
-            "math_500": 0.68,
-            "livecodebench": 0.22,
-            "ifbench": 0.152
+            "aime": 0.28,
+            "aime_25": 0.58,
+            "artificial_analysis_coding_index": 12.4,
+            "artificial_analysis_math_index": 58,
+            "gpqa": 0.47,
+            "hle": 0.042,
+            "ifbench": 0.239,
+            "lcr": 0,
+            "livecodebench": 0.28,
+            "math_500": 0.871,
+            "mmlu_pro": 0.675,
+            "scicode": 0.265,
+            "tau2": 0.322,
+            "terminalbench_hard": 0.053
           },
           "summary": "Small, fast text-only model for high volume tasks.",
           "use_cases": [
@@ -305,7 +340,7 @@
       "metadata": {
         "provider": "Alibaba",
         "context_window": 32768,
-        "released_at": "2025-06-06",
+        "released_at": "2025-06-05",
         "attribution": "mteb",
         "extra": {
           "evaluations": {
@@ -319,6 +354,77 @@
           ]
         }
       }
+    },
+    {
+      "id": "d8b9c0d1-e2f3-4a4b-5c6d-7e8f9a0b1c2d",
+      "alias": "Qwen/Qwen3.5-9B",
+      "model_name": "Qwen/Qwen3.5-9B",
+      "description": "Qwen3.5-9B is a small, highly efficient multimodal model from the Qwen3.5 Small Model Series. Despite having only 9B parameters, it matches or surpasses GPT-OSS-120B on GPQA Diamond (81.7 vs 71.5) and beats GPT-5-Nano on MMMU-Pro by 13 points. Uses a hybrid Gated DeltaNet + MoE architecture for fast inference.\n\n**Best for:**\n- On-device / edge deployment\n- High volume tasks requiring strong reasoning\n- Vision and video understanding at low cost\n- Scenarios where efficiency matters more than absolute peak performance",
+      "model_type": "CHAT",
+      "capabilities": [
+        "vision",
+        "reasoning"
+      ],
+      "hosted_on": null,
+      "is_composite": true,
+      "lb_strategy": "weighted_random",
+      "fallback": {
+        "enabled": true,
+        "on_rate_limit": true,
+        "on_status": [
+          502,
+          503
+        ],
+        "with_replacement": false,
+        "max_attempts": null
+      },
+      "sanitize_responses": false,
+      "metadata": {
+        "provider": "Alibaba",
+        "intelligence_index": 32,
+        "context_window": 262144,
+        "released_at": "2026-03-02",
+        "attribution": "artificial_analysis",
+        "extra": {
+          "summary": "Small, efficient multimodal model that punches far above its weight class.",
+          "use_cases": [
+            "Edge / on-device deployment",
+            "High volume reasoning",
+            "Vision and video understanding",
+            "Cost-efficient intelligence"
+          ]
+        }
+      }
+    },
+    {
+      "id": "h1000001-aaaa-4bbb-8ccc-ddddeeee0012",
+      "alias": "qwen3.5-9b-vllm-primary",
+      "model_name": "Qwen/Qwen3.5-9B",
+      "description": "Qwen3.5 9B on vLLM on-premise cluster (primary)",
+      "model_type": "CHAT",
+      "capabilities": [
+        "vision"
+      ],
+      "hosted_on": "a1b2c3d4-e5f6-7890-1234-567890abcdef",
+      "is_composite": false,
+      "sanitize_responses": false,
+      "requests_per_second": 120,
+      "capacity": 256
+    },
+    {
+      "id": "h1000001-aaaa-4bbb-8ccc-ddddeeee0013",
+      "alias": "qwen3.5-9b-vllm-burst",
+      "model_name": "Qwen/Qwen3.5-9B",
+      "description": "Qwen3.5 9B on GPU burst capacity (RunPod)",
+      "model_type": "CHAT",
+      "capabilities": [
+        "vision"
+      ],
+      "hosted_on": "f6a7b8c9-0123-4567-8901-bcdef0123456",
+      "is_composite": false,
+      "sanitize_responses": false,
+      "requests_per_second": 80,
+      "capacity": 128
     },
     {
       "id": "h1000001-aaaa-4bbb-8ccc-ddddeeee0001",

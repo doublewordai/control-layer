@@ -11,6 +11,9 @@ import {
   formatRelativeTime,
   formatTariffPrice,
   formatTariffPricing,
+  formatContextLength,
+  getTariffDisplayName,
+  getUserFacingTariffs,
 } from "./formatters";
 
 describe("formatters", () => {
@@ -284,6 +287,90 @@ describe("formatters", () => {
       expect(formatTariffPricing("0.0000005", "0.0000015")).toBe(
         "$0.50 / $1.50",
       );
+    });
+  });
+
+  describe("formatContextLength", () => {
+    it("should format large token counts with k suffix", () => {
+      expect(formatContextLength(262144)).toBe("256k");
+      expect(formatContextLength(32768)).toBe("32k");
+      expect(formatContextLength(131072)).toBe("128k");
+    });
+
+    it("should format small token counts as-is", () => {
+      expect(formatContextLength(512)).toBe("512");
+      expect(formatContextLength(1023)).toBe("1023");
+    });
+
+    it("should round to nearest k", () => {
+      expect(formatContextLength(1024)).toBe("1k");
+      expect(formatContextLength(2048)).toBe("2k");
+    });
+  });
+
+  describe("getTariffDisplayName", () => {
+    it("should return Realtime for realtime purpose", () => {
+      expect(getTariffDisplayName("realtime", null)).toBe("Realtime");
+    });
+
+    it("should return Priority for batch with 1h window", () => {
+      expect(getTariffDisplayName("batch", "1h")).toBe("Priority");
+    });
+
+    it("should return Standard for batch with 24h window", () => {
+      expect(getTariffDisplayName("batch", "24h")).toBe("Standard");
+    });
+
+    it("should return Standard for batch with other windows", () => {
+      expect(getTariffDisplayName("batch", "12h")).toBe("Standard");
+    });
+
+    it("should default to Realtime for null/undefined purpose", () => {
+      expect(getTariffDisplayName(null, null)).toBe("Realtime");
+      expect(getTariffDisplayName(undefined, undefined)).toBe("Realtime");
+    });
+  });
+
+  describe("getUserFacingTariffs", () => {
+    it("should filter out playground tariffs", () => {
+      const tariffs = [
+        { api_key_purpose: "realtime", completion_window: null, is_active: true },
+        { api_key_purpose: "playground", completion_window: null, is_active: true },
+        { api_key_purpose: "batch", completion_window: "24h", is_active: true },
+      ];
+      const result = getUserFacingTariffs(tariffs);
+      expect(result).toHaveLength(2);
+      expect(result.map((t) => t.api_key_purpose)).toEqual(["realtime", "batch"]);
+    });
+
+    it("should filter out inactive tariffs", () => {
+      const tariffs = [
+        { api_key_purpose: "realtime", completion_window: null, is_active: true },
+        { api_key_purpose: "batch", completion_window: "24h", is_active: false },
+      ];
+      const result = getUserFacingTariffs(tariffs);
+      expect(result).toHaveLength(1);
+      expect(result[0].api_key_purpose).toBe("realtime");
+    });
+
+    it("should sort: Realtime → Priority → Standard", () => {
+      const tariffs = [
+        { api_key_purpose: "batch", completion_window: "24h", is_active: true },
+        { api_key_purpose: "batch", completion_window: "1h", is_active: true },
+        { api_key_purpose: "realtime", completion_window: null, is_active: true },
+      ];
+      const result = getUserFacingTariffs(tariffs);
+      expect(result.map((t) => t.api_key_purpose)).toEqual([
+        "realtime",
+        "batch",
+        "batch",
+      ]);
+      expect(result[1].completion_window).toBe("1h");
+      expect(result[2].completion_window).toBe("24h");
+    });
+
+    it("should handle empty array", () => {
+      expect(getUserFacingTariffs([])).toEqual([]);
     });
   });
 });
