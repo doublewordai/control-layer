@@ -258,7 +258,7 @@ where
         }
 
         let batch_size = buffer.len();
-        let span = info_span!("flush_analytics_batch", batch_size = batch_size);
+        let span = info_span!("dwctl.flush_analytics_batch", batch_size = batch_size);
 
         async {
             let start = std::time::Instant::now();

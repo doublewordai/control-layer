@@ -1308,9 +1308,9 @@ pub async fn build_router(
                     .get::<axum::extract::MatchedPath>()
                     .map(|mp| mp.as_str().to_owned());
                 let span_name = if let Some(ref route) = route {
-                    format!("{} {}", request.method(), route)
+                    format!("dwctl {} {}", request.method(), route)
                 } else {
-                    format!("{} {}", request.method(), path)
+                    format!("dwctl {} {}", request.method(), path)
                 };
                 let api_type = if path.starts_with("/ai/") {
                     "ai_proxy"

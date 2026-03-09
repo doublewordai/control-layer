@@ -20,7 +20,7 @@
 
 services:
   jaeger:
-    image: jaegertracing/jaeger:2
+    image: jaegertracing/jaeger:latest
     ports:
       # OTLP gRPC
       - "4317:4317"
