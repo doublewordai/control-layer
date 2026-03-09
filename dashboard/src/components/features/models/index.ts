@@ -1,2 +1,2 @@
-export * from "./Models";
-export * from "./ModelInfo";
+export * from "./catalog";
+export * from "./manage";

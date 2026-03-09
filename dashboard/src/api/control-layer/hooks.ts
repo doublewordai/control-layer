@@ -1,5 +1,10 @@
 import { useEffect, useMemo } from "react";
-import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import {
+  useQuery,
+  useMutation,
+  useQueryClient,
+  keepPreviousData,
+} from "@tanstack/react-query";
 import { dwctlApi, setAiApiBaseUrl } from "./client";
 import { queryKeys } from "./keys";
 import type {
@@ -144,6 +149,7 @@ export function useModels(options?: ModelsQuery) {
   return useQuery({
     queryKey: queryKeys.models.query(options),
     queryFn: () => dwctlApi.models.list(options),
+    placeholderData: keepPreviousData,
     // Populate individual model caches when list is fetched
     select: (data) => {
       // Seed the cache with individual models

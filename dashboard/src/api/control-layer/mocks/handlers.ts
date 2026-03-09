@@ -22,6 +22,8 @@ import type {
   BatchCreateRequest,
   Transaction,
   AddFundsRequest,
+  Role,
+  ModelType,
 } from "../types";
 import usersDataRaw from "./users.json";
 import groupsDataRaw from "./groups.json";
@@ -53,6 +55,13 @@ import {
   removeModelFromGroup as removeModelFromGroupState,
   addUserToGroup as addUserToGroupState,
   removeUserFromGroup as removeUserFromGroupState,
+  setCurrentUserRoles,
+  getCurrentUserRoles,
+  getModelComponents as getModelComponentsState,
+  addModelComponent as addModelComponentState,
+  updateModelComponent as updateModelComponentState,
+  removeModelComponent as removeModelComponentState,
+  type StoredComponent,
 } from "./demoState";
 
 // Type for demo requests
@@ -153,175 +162,460 @@ const getGroupUsersData = (): Record<string, string[]> => {
   return groupUsersData;
 };
 
+// Initial component relationships: virtual model ID -> hosted model components
+const initialModelComponents: Record<string, StoredComponent[]> = {
+  // Qwen3.5-397B → 2 hosted models (primary + burst)
+  "d1a2b3c4-e5f6-4a7b-8c9d-0e1f2a3b4c5d": [
+    { componentModelId: "h1000001-aaaa-4bbb-8ccc-ddddeeee0001", weight: 80, enabled: true, sort_order: 0 },
+    { componentModelId: "h1000001-aaaa-4bbb-8ccc-ddddeeee0002", weight: 20, enabled: true, sort_order: 1 },
+  ],
+  // Qwen3.5-35B → 2 hosted models
+  "d2a3b4c5-e6f7-4a8b-9c0d-1e2f3a4b5c6d": [
+    { componentModelId: "h1000001-aaaa-4bbb-8ccc-ddddeeee0003", weight: 70, enabled: true, sort_order: 0 },
+    { componentModelId: "h1000001-aaaa-4bbb-8ccc-ddddeeee0004", weight: 30, enabled: true, sort_order: 1 },
+  ],
+  // gpt-oss-20b → 1 hosted model (priority mode)
+  "d3a4b5c6-e7f8-4a9b-0c1d-2e3f4a5b6c7d": [
+    { componentModelId: "h1000001-aaaa-4bbb-8ccc-ddddeeee0005", weight: 1, enabled: true, sort_order: 0 },
+  ],
+  // Qwen3-VL-235B → 1 hosted model
+  "d4a5b6c7-e8f9-4a0b-1c2d-3e4f5a6b7c8d": [
+    { componentModelId: "h1000001-aaaa-4bbb-8ccc-ddddeeee0006", weight: 1, enabled: true, sort_order: 0 },
+  ],
+  // Qwen3-VL-30B → 2 hosted models
+  "d5a6b7c8-e9f0-4a1b-2c3d-4e5f6a7b8c9d": [
+    { componentModelId: "h1000001-aaaa-4bbb-8ccc-ddddeeee0007", weight: 60, enabled: true, sort_order: 0 },
+    { componentModelId: "h1000001-aaaa-4bbb-8ccc-ddddeeee0008", weight: 40, enabled: true, sort_order: 1 },
+  ],
+  // Qwen3-14B → 2 hosted models
+  "d6a7b8c9-e0f1-4a2b-3c4d-5e6f7a8b9c0d": [
+    { componentModelId: "h1000001-aaaa-4bbb-8ccc-ddddeeee0009", weight: 70, enabled: true, sort_order: 0 },
+    { componentModelId: "h1000001-aaaa-4bbb-8ccc-ddddeeee0010", weight: 30, enabled: true, sort_order: 1 },
+  ],
+  // Qwen3-Embedding-8B → 1 hosted model
+  "d7a8b9c0-e1f2-4a3b-4c5d-6e7f8a9b0c1d": [
+    { componentModelId: "h1000001-aaaa-4bbb-8ccc-ddddeeee0011", weight: 1, enabled: true, sort_order: 0 },
+  ],
+  // Qwen3.5-9B → 2 hosted models (primary + burst)
+  "d8b9c0d1-e2f3-4a4b-5c6d-7e8f9a0b1c2d": [
+    { componentModelId: "h1000001-aaaa-4bbb-8ccc-ddddeeee0012", weight: 70, enabled: true, sort_order: 0 },
+    { componentModelId: "h1000001-aaaa-4bbb-8ccc-ddddeeee0013", weight: 30, enabled: true, sort_order: 1 },
+  ],
+};
+
+// Resolve stored components to full ModelComponent objects for API responses
+function resolveComponents(modelId: string): import("../types").ModelComponent[] {
+  const stored = getModelComponentsState(demoState, modelId, initialModelComponents);
+  return stored.map((sc) => {
+    const componentModel = modelsData.find((m) => m.id === sc.componentModelId);
+    const endpoint = componentModel?.hosted_on
+      ? endpointsData.find((e) => e.id === componentModel.hosted_on)
+      : undefined;
+    return {
+      weight: sc.weight,
+      enabled: sc.enabled,
+      sort_order: sc.sort_order,
+      created_at: "2025-09-15T00:00:00Z",
+      model: {
+        id: componentModel?.id ?? sc.componentModelId,
+        alias: componentModel?.alias ?? "unknown",
+        model_name: componentModel?.model_name ?? "unknown",
+        description: componentModel?.description ?? undefined,
+        model_type: componentModel?.model_type ?? undefined,
+        endpoint: endpoint ? { id: endpoint.id, name: endpoint.name } : undefined,
+        trusted: componentModel?.trusted,
+        open_responses_adapter: componentModel?.open_responses_adapter,
+      },
+    };
+  });
+}
+
 // Model tariff data - maps model ID to tariffs
 const modelTariffs: Record<string, ModelTariff[]> = {
-  // Claude Sonnet 4
-  "f914c573-4c00-4a37-a878-53318a6d5a5b": [
+  // Qwen3.5-397B-A17B-FP8 — Realtime $0.60/$3.60 per M
+  "d1a2b3c4-e5f6-4a7b-8c9d-0e1f2a3b4c5d": [
     {
       id: "tariff-001",
-      deployed_model_id: "f914c573-4c00-4a37-a878-53318a6d5a5b",
-      name: "Standard",
-      input_price_per_token: "0.000003",
-      output_price_per_token: "0.000015",
-      valid_from: "2025-06-01T00:00:00Z",
+      deployed_model_id: "d1a2b3c4-e5f6-4a7b-8c9d-0e1f2a3b4c5d",
+      name: "Realtime",
+      input_price_per_token: "0.0000006",
+      output_price_per_token: "0.0000036",
+      valid_from: "2025-09-15T00:00:00Z",
       valid_until: null,
-      api_key_purpose: null,
+      api_key_purpose: "realtime" as const,
       completion_window: null,
       is_active: true,
     },
     {
       id: "tariff-002",
-      deployed_model_id: "f914c573-4c00-4a37-a878-53318a6d5a5b",
-      name: "Batch",
-      input_price_per_token: "0.0000015",
-      output_price_per_token: "0.0000075",
-      valid_from: "2025-06-01T00:00:00Z",
+      deployed_model_id: "d1a2b3c4-e5f6-4a7b-8c9d-0e1f2a3b4c5d",
+      name: "Batch (24h)",
+      input_price_per_token: "0.0000003",
+      output_price_per_token: "0.0000018",
+      valid_from: "2025-09-15T00:00:00Z",
       valid_until: null,
       api_key_purpose: "batch" as const,
-      completion_window: "Standard (24h)",
+      completion_window: "24h",
       is_active: true,
     },
-  ],
-  // Claude Opus 4
-  "a1b2c3d4-0001-4a37-a878-53318a6d5001": [
     {
       id: "tariff-003",
-      deployed_model_id: "a1b2c3d4-0001-4a37-a878-53318a6d5001",
-      name: "Standard",
-      input_price_per_token: "0.000015",
-      output_price_per_token: "0.000075",
-      valid_from: "2025-06-01T00:00:00Z",
+      deployed_model_id: "d1a2b3c4-e5f6-4a7b-8c9d-0e1f2a3b4c5d",
+      name: "Batch (1h)",
+      input_price_per_token: "0.00000045",
+      output_price_per_token: "0.0000027",
+      valid_from: "2025-09-15T00:00:00Z",
       valid_until: null,
-      api_key_purpose: null,
-      completion_window: null,
+      api_key_purpose: "batch" as const,
+      completion_window: "1h",
       is_active: true,
     },
     {
       id: "tariff-004",
-      deployed_model_id: "a1b2c3d4-0001-4a37-a878-53318a6d5001",
-      name: "Batch",
-      input_price_per_token: "0.0000075",
-      output_price_per_token: "0.0000375",
-      valid_from: "2025-06-01T00:00:00Z",
+      deployed_model_id: "d1a2b3c4-e5f6-4a7b-8c9d-0e1f2a3b4c5d",
+      name: "Playground",
+      input_price_per_token: "0.0000006",
+      output_price_per_token: "0.0000036",
+      valid_from: "2025-09-15T00:00:00Z",
       valid_until: null,
-      api_key_purpose: "batch" as const,
-      completion_window: "Standard (24h)",
+      api_key_purpose: "playground" as const,
+      completion_window: null,
       is_active: true,
     },
   ],
-  // GPT-4o
-  "4c561f35-4823-4d25-aa70-72bbf314a6ba": [
+  // Qwen3.5-35B-A3B-FP8 — Realtime $0.25/$2.00 per M
+  "d2a3b4c5-e6f7-4a8b-9c0d-1e2f3a4b5c6d": [
     {
       id: "tariff-005",
-      deployed_model_id: "4c561f35-4823-4d25-aa70-72bbf314a6ba",
-      name: "Standard",
-      input_price_per_token: "0.0000025",
-      output_price_per_token: "0.00001",
-      valid_from: "2025-04-15T00:00:00Z",
+      deployed_model_id: "d2a3b4c5-e6f7-4a8b-9c0d-1e2f3a4b5c6d",
+      name: "Realtime",
+      input_price_per_token: "0.00000025",
+      output_price_per_token: "0.000002",
+      valid_from: "2025-09-15T00:00:00Z",
       valid_until: null,
-      api_key_purpose: null,
+      api_key_purpose: "realtime" as const,
       completion_window: null,
       is_active: true,
     },
     {
       id: "tariff-006",
-      deployed_model_id: "4c561f35-4823-4d25-aa70-72bbf314a6ba",
-      name: "Batch",
-      input_price_per_token: "0.00000125",
-      output_price_per_token: "0.000005",
-      valid_from: "2025-04-15T00:00:00Z",
+      deployed_model_id: "d2a3b4c5-e6f7-4a8b-9c0d-1e2f3a4b5c6d",
+      name: "Batch (24h)",
+      input_price_per_token: "0.000000125",
+      output_price_per_token: "0.000001",
+      valid_from: "2025-09-15T00:00:00Z",
       valid_until: null,
       api_key_purpose: "batch" as const,
-      completion_window: "Standard (24h)",
+      completion_window: "24h",
       is_active: true,
     },
     {
       id: "tariff-007",
-      deployed_model_id: "4c561f35-4823-4d25-aa70-72bbf314a6ba",
-      name: "Batch (High Priority)",
-      input_price_per_token: "0.0000025",
-      output_price_per_token: "0.00001",
-      valid_from: "2025-04-15T00:00:00Z",
+      deployed_model_id: "d2a3b4c5-e6f7-4a8b-9c0d-1e2f3a4b5c6d",
+      name: "Batch (1h)",
+      input_price_per_token: "0.0000001875",
+      output_price_per_token: "0.0000015",
+      valid_from: "2025-09-15T00:00:00Z",
       valid_until: null,
       api_key_purpose: "batch" as const,
-      completion_window: "High (1h)",
+      completion_window: "1h",
       is_active: true,
     },
-  ],
-  // GPT-4o Mini
-  "a1b2c3d4-0002-4a37-a878-53318a6d5002": [
     {
       id: "tariff-008",
-      deployed_model_id: "a1b2c3d4-0002-4a37-a878-53318a6d5002",
-      name: "Standard",
-      input_price_per_token: "0.00000015",
-      output_price_per_token: "0.0000006",
-      valid_from: "2025-05-20T00:00:00Z",
+      deployed_model_id: "d2a3b4c5-e6f7-4a8b-9c0d-1e2f3a4b5c6d",
+      name: "Playground",
+      input_price_per_token: "0.00000025",
+      output_price_per_token: "0.000002",
+      valid_from: "2025-09-15T00:00:00Z",
       valid_until: null,
-      api_key_purpose: null,
+      api_key_purpose: "playground" as const,
       completion_window: null,
       is_active: true,
     },
+  ],
+  // openai/gpt-oss-20b — Realtime $0.04/$0.30 per M
+  "d3a4b5c6-e7f8-4a9b-0c1d-2e3f4a5b6c7d": [
     {
       id: "tariff-009",
-      deployed_model_id: "a1b2c3d4-0002-4a37-a878-53318a6d5002",
-      name: "Batch",
-      input_price_per_token: "0.000000075",
+      deployed_model_id: "d3a4b5c6-e7f8-4a9b-0c1d-2e3f4a5b6c7d",
+      name: "Realtime",
+      input_price_per_token: "0.00000004",
       output_price_per_token: "0.0000003",
-      valid_from: "2025-05-20T00:00:00Z",
+      valid_from: "2025-11-01T00:00:00Z",
       valid_until: null,
-      api_key_purpose: "batch" as const,
-      completion_window: "Standard (24h)",
+      api_key_purpose: "realtime" as const,
+      completion_window: null,
       is_active: true,
     },
-  ],
-  // Gemini 2.0 Flash
-  "a1b2c3d4-0005-4a37-a878-53318a6d5005": [
     {
       id: "tariff-010",
-      deployed_model_id: "a1b2c3d4-0005-4a37-a878-53318a6d5005",
-      name: "Standard",
-      input_price_per_token: "0.0000001",
-      output_price_per_token: "0.0000004",
-      valid_from: "2025-10-05T00:00:00Z",
+      deployed_model_id: "d3a4b5c6-e7f8-4a9b-0c1d-2e3f4a5b6c7d",
+      name: "Batch (24h)",
+      input_price_per_token: "0.00000002",
+      output_price_per_token: "0.00000015",
+      valid_from: "2025-11-01T00:00:00Z",
       valid_until: null,
-      api_key_purpose: null,
-      completion_window: null,
+      api_key_purpose: "batch" as const,
+      completion_window: "24h",
       is_active: true,
     },
-  ],
-  // text-embedding-3-small
-  "c9d0e1f2-3456-7890-1234-cdef12345678": [
     {
       id: "tariff-011",
-      deployed_model_id: "c9d0e1f2-3456-7890-1234-cdef12345678",
-      name: "Standard",
-      input_price_per_token: "0.00000002",
-      output_price_per_token: "0.00000002",
-      valid_from: "2025-04-01T00:00:00Z",
+      deployed_model_id: "d3a4b5c6-e7f8-4a9b-0c1d-2e3f4a5b6c7d",
+      name: "Batch (1h)",
+      input_price_per_token: "0.00000003",
+      output_price_per_token: "0.000000225",
+      valid_from: "2025-11-01T00:00:00Z",
       valid_until: null,
-      api_key_purpose: null,
-      completion_window: null,
+      api_key_purpose: "batch" as const,
+      completion_window: "1h",
       is_active: true,
     },
-  ],
-  // text-embedding-3-large
-  "a1b2c3d4-0007-4a37-a878-53318a6d5007": [
     {
       id: "tariff-012",
-      deployed_model_id: "a1b2c3d4-0007-4a37-a878-53318a6d5007",
-      name: "Standard",
-      input_price_per_token: "0.00000013",
-      output_price_per_token: "0.00000013",
-      valid_from: "2025-04-01T00:00:00Z",
+      deployed_model_id: "d3a4b5c6-e7f8-4a9b-0c1d-2e3f4a5b6c7d",
+      name: "Playground",
+      input_price_per_token: "0.00000004",
+      output_price_per_token: "0.0000003",
+      valid_from: "2025-11-01T00:00:00Z",
       valid_until: null,
-      api_key_purpose: null,
+      api_key_purpose: "playground" as const,
       completion_window: null,
       is_active: true,
     },
   ],
-  // Self-hosted models (DeepSeek, Llama, Qwen, BGE reranker) have no tariffs
-  // since they run on-premise with no per-token cost
+  // Qwen3-VL-235B-A22B-Instruct-FP8 — Realtime $0.60/$1.20 per M
+  "d4a5b6c7-e8f9-4a0b-1c2d-3e4f5a6b7c8d": [
+    {
+      id: "tariff-013",
+      deployed_model_id: "d4a5b6c7-e8f9-4a0b-1c2d-3e4f5a6b7c8d",
+      name: "Realtime",
+      input_price_per_token: "0.0000006",
+      output_price_per_token: "0.0000012",
+      valid_from: "2025-08-20T00:00:00Z",
+      valid_until: null,
+      api_key_purpose: "realtime" as const,
+      completion_window: null,
+      is_active: true,
+    },
+    {
+      id: "tariff-014",
+      deployed_model_id: "d4a5b6c7-e8f9-4a0b-1c2d-3e4f5a6b7c8d",
+      name: "Batch (24h)",
+      input_price_per_token: "0.0000003",
+      output_price_per_token: "0.0000006",
+      valid_from: "2025-08-20T00:00:00Z",
+      valid_until: null,
+      api_key_purpose: "batch" as const,
+      completion_window: "24h",
+      is_active: true,
+    },
+    {
+      id: "tariff-015",
+      deployed_model_id: "d4a5b6c7-e8f9-4a0b-1c2d-3e4f5a6b7c8d",
+      name: "Batch (1h)",
+      input_price_per_token: "0.00000045",
+      output_price_per_token: "0.0000009",
+      valid_from: "2025-08-20T00:00:00Z",
+      valid_until: null,
+      api_key_purpose: "batch" as const,
+      completion_window: "1h",
+      is_active: true,
+    },
+    {
+      id: "tariff-016",
+      deployed_model_id: "d4a5b6c7-e8f9-4a0b-1c2d-3e4f5a6b7c8d",
+      name: "Playground",
+      input_price_per_token: "0.0000006",
+      output_price_per_token: "0.0000012",
+      valid_from: "2025-08-20T00:00:00Z",
+      valid_until: null,
+      api_key_purpose: "playground" as const,
+      completion_window: null,
+      is_active: true,
+    },
+  ],
+  // Qwen3-VL-30B-A3B-Instruct-FP8 — Realtime $0.16/$0.80 per M
+  "d5a6b7c8-e9f0-4a1b-2c3d-4e5f6a7b8c9d": [
+    {
+      id: "tariff-017",
+      deployed_model_id: "d5a6b7c8-e9f0-4a1b-2c3d-4e5f6a7b8c9d",
+      name: "Realtime",
+      input_price_per_token: "0.00000016",
+      output_price_per_token: "0.0000008",
+      valid_from: "2025-08-20T00:00:00Z",
+      valid_until: null,
+      api_key_purpose: "realtime" as const,
+      completion_window: null,
+      is_active: true,
+    },
+    {
+      id: "tariff-018",
+      deployed_model_id: "d5a6b7c8-e9f0-4a1b-2c3d-4e5f6a7b8c9d",
+      name: "Batch (24h)",
+      input_price_per_token: "0.00000008",
+      output_price_per_token: "0.0000004",
+      valid_from: "2025-08-20T00:00:00Z",
+      valid_until: null,
+      api_key_purpose: "batch" as const,
+      completion_window: "24h",
+      is_active: true,
+    },
+    {
+      id: "tariff-019",
+      deployed_model_id: "d5a6b7c8-e9f0-4a1b-2c3d-4e5f6a7b8c9d",
+      name: "Batch (1h)",
+      input_price_per_token: "0.00000012",
+      output_price_per_token: "0.0000006",
+      valid_from: "2025-08-20T00:00:00Z",
+      valid_until: null,
+      api_key_purpose: "batch" as const,
+      completion_window: "1h",
+      is_active: true,
+    },
+    {
+      id: "tariff-020",
+      deployed_model_id: "d5a6b7c8-e9f0-4a1b-2c3d-4e5f6a7b8c9d",
+      name: "Playground",
+      input_price_per_token: "0.00000016",
+      output_price_per_token: "0.0000008",
+      valid_from: "2025-08-20T00:00:00Z",
+      valid_until: null,
+      api_key_purpose: "playground" as const,
+      completion_window: null,
+      is_active: true,
+    },
+  ],
+  // Qwen3-14B-FP8 — Realtime $0.05/$0.60 per M
+  "d6a7b8c9-e0f1-4a2b-3c4d-5e6f7a8b9c0d": [
+    {
+      id: "tariff-021",
+      deployed_model_id: "d6a7b8c9-e0f1-4a2b-3c4d-5e6f7a8b9c0d",
+      name: "Realtime",
+      input_price_per_token: "0.00000005",
+      output_price_per_token: "0.0000006",
+      valid_from: "2025-07-10T00:00:00Z",
+      valid_until: null,
+      api_key_purpose: "realtime" as const,
+      completion_window: null,
+      is_active: true,
+    },
+    {
+      id: "tariff-022",
+      deployed_model_id: "d6a7b8c9-e0f1-4a2b-3c4d-5e6f7a8b9c0d",
+      name: "Batch (24h)",
+      input_price_per_token: "0.000000025",
+      output_price_per_token: "0.0000003",
+      valid_from: "2025-07-10T00:00:00Z",
+      valid_until: null,
+      api_key_purpose: "batch" as const,
+      completion_window: "24h",
+      is_active: true,
+    },
+    {
+      id: "tariff-023",
+      deployed_model_id: "d6a7b8c9-e0f1-4a2b-3c4d-5e6f7a8b9c0d",
+      name: "Batch (1h)",
+      input_price_per_token: "0.0000000375",
+      output_price_per_token: "0.00000045",
+      valid_from: "2025-07-10T00:00:00Z",
+      valid_until: null,
+      api_key_purpose: "batch" as const,
+      completion_window: "1h",
+      is_active: true,
+    },
+    {
+      id: "tariff-024",
+      deployed_model_id: "d6a7b8c9-e0f1-4a2b-3c4d-5e6f7a8b9c0d",
+      name: "Playground",
+      input_price_per_token: "0.00000005",
+      output_price_per_token: "0.0000006",
+      valid_from: "2025-07-10T00:00:00Z",
+      valid_until: null,
+      api_key_purpose: "playground" as const,
+      completion_window: null,
+      is_active: true,
+    },
+  ],
+  // Qwen3-Embedding-8B — Realtime $0.04/$0.00 per M
+  "d7a8b9c0-e1f2-4a3b-4c5d-6e7f8a9b0c1d": [
+    {
+      id: "tariff-025",
+      deployed_model_id: "d7a8b9c0-e1f2-4a3b-4c5d-6e7f8a9b0c1d",
+      name: "Realtime",
+      input_price_per_token: "0.00000004",
+      output_price_per_token: "0",
+      valid_from: "2025-07-10T00:00:00Z",
+      valid_until: null,
+      api_key_purpose: "realtime" as const,
+      completion_window: null,
+      is_active: true,
+    },
+    {
+      id: "tariff-026",
+      deployed_model_id: "d7a8b9c0-e1f2-4a3b-4c5d-6e7f8a9b0c1d",
+      name: "Batch (24h)",
+      input_price_per_token: "0.00000002",
+      output_price_per_token: "0",
+      valid_from: "2025-07-10T00:00:00Z",
+      valid_until: null,
+      api_key_purpose: "batch" as const,
+      completion_window: "24h",
+      is_active: true,
+    },
+    {
+      id: "tariff-027",
+      deployed_model_id: "d7a8b9c0-e1f2-4a3b-4c5d-6e7f8a9b0c1d",
+      name: "Playground",
+      input_price_per_token: "0.00000004",
+      output_price_per_token: "0",
+      valid_from: "2025-07-10T00:00:00Z",
+      valid_until: null,
+      api_key_purpose: "playground" as const,
+      completion_window: null,
+      is_active: true,
+    },
+  ],
+  // Qwen3.5-9B — Realtime $0.10/$0.40 per M, Batch $0.05/$0.20 per M
+  "d8b9c0d1-e2f3-4a4b-5c6d-7e8f9a0b1c2d": [
+    {
+      id: "tariff-028",
+      deployed_model_id: "d8b9c0d1-e2f3-4a4b-5c6d-7e8f9a0b1c2d",
+      name: "Realtime",
+      input_price_per_token: "0.0000001",
+      output_price_per_token: "0.0000004",
+      valid_from: "2026-03-02T00:00:00Z",
+      valid_until: null,
+      api_key_purpose: "realtime" as const,
+      completion_window: null,
+      is_active: true,
+    },
+    {
+      id: "tariff-029",
+      deployed_model_id: "d8b9c0d1-e2f3-4a4b-5c6d-7e8f9a0b1c2d",
+      name: "Batch (24h)",
+      input_price_per_token: "0.00000005",
+      output_price_per_token: "0.0000002",
+      valid_from: "2026-03-02T00:00:00Z",
+      valid_until: null,
+      api_key_purpose: "batch" as const,
+      completion_window: "24h",
+      is_active: true,
+    },
+    {
+      id: "tariff-030",
+      deployed_model_id: "d8b9c0d1-e2f3-4a4b-5c6d-7e8f9a0b1c2d",
+      name: "Playground",
+      input_price_per_token: "0.0000001",
+      output_price_per_token: "0.0000004",
+      valid_from: "2026-03-02T00:00:00Z",
+      valid_until: null,
+      api_key_purpose: "playground" as const,
+      completion_window: null,
+      is_active: true,
+    },
+  ],
 };
 
 // Compute user balance from transactions (sum of credits minus debits)
@@ -621,6 +915,14 @@ export const handlers = [
       result = { ...result, credit_balance: creditBalance };
     }
 
+    // Apply persisted role overrides for current user
+    if (params.id === "current") {
+      const persistedRoles = getCurrentUserRoles(demoState);
+      if (persistedRoles) {
+        result = { ...result, roles: persistedRoles as Role[] };
+      }
+    }
+
     return HttpResponse.json(result);
   }),
 
@@ -654,6 +956,12 @@ export const handlers = [
       return HttpResponse.json({ error: "User not found" }, { status: 404 });
     }
     const body = (await request.json()) as UserUpdateRequest;
+
+    // Persist role changes for the current user (first user in demo)
+    if (user.id === usersData[0].id && body.roles) {
+      demoState = setCurrentUserRoles(demoState, body.roles);
+    }
+
     const updatedUser = {
       ...user,
       ...body,
@@ -792,11 +1100,34 @@ export const handlers = [
     const skip = parseInt(url.searchParams.get("skip") || "0", 10);
     const limit = parseInt(url.searchParams.get("limit") || "10", 10);
     const search = url.searchParams.get("search");
+    const provider = url.searchParams.get("provider");
+    const modelType = url.searchParams.get("model_type");
+    const capability = url.searchParams.get("capability");
+    const sort = url.searchParams.get("sort");
+    const sortDirection = url.searchParams.get("sort_direction");
+    const isComposite = url.searchParams.get("is_composite");
+    const groupFilter = url.searchParams.get("group");
 
     let models: Model[] = [...modelsData];
 
     if (endpoint) {
       models = models.filter((m) => m.hosted_on === endpoint);
+    }
+
+    // Apply group filter (comma-separated group UUIDs)
+    if (groupFilter) {
+      const filterGroupIds = new Set(groupFilter.split(",").map((s) => s.trim()));
+      const modelsGroupsData = getModelsGroupsData();
+      models = models.filter((model) => {
+        const modelGroupIds = modelsGroupsData[model.id] ?? [];
+        return modelGroupIds.some((gid) => filterGroupIds.has(gid));
+      });
+    }
+
+    // Apply is_composite filter (virtual vs hosted)
+    if (isComposite !== null) {
+      const wantComposite = isComposite === "true";
+      models = models.filter((m) => !!m.is_composite === wantComposite);
     }
 
     // Apply search filter (case-insensitive substring match on alias or model_name)
@@ -809,24 +1140,71 @@ export const handlers = [
       );
     }
 
+    // Apply provider filter
+    if (provider) {
+      const providerLower = provider.toLowerCase();
+      models = models.filter(
+        (m) => m.metadata?.provider?.toLowerCase() === providerLower,
+      );
+    }
+
+    // Apply model_type filter
+    if (modelType) {
+      models = models.filter((m) => m.model_type === modelType);
+    }
+
+    // Apply capability filter
+    if (capability) {
+      models = models.filter((m) => m.capabilities?.includes(capability));
+    }
+
     // Filter models by accessibility if requested
     if (accessible === "true") {
-      // For now, use the first user as the "current user" for demo purposes
-      // In real implementation, this would get the actual current user
-      const currentUser = usersData[0]; // Use first user as demo
+      const currentUser = usersData[0];
 
       if (currentUser) {
         const userGroupsData = getUserGroupsData();
         const modelsGroupsData = getModelsGroupsData();
-        // Get user's group IDs
         const userGroupIds = new Set(userGroupsData[currentUser.id] || []);
 
-        // Filter models to only those with shared groups
         models = models.filter((model) => {
           const modelGroupIds = modelsGroupsData[model.id] ?? [];
           return modelGroupIds.some((groupId) => userGroupIds.has(groupId));
         });
       }
+    }
+
+    // Apply sorting
+    if (sort) {
+      const dir = sortDirection === "asc" ? 1 : sortDirection === "desc" ? -1 : 0;
+      models.sort((a, b) => {
+        let cmp = 0;
+        switch (sort) {
+          case "alias":
+            cmp = a.alias.localeCompare(b.alias);
+            return dir || cmp;
+          case "intelligence_index": {
+            const ai = a.metadata?.intelligence_index ?? -Infinity;
+            const bi = b.metadata?.intelligence_index ?? -Infinity;
+            cmp = bi - ai;
+            return dir ? (dir === 1 ? -cmp : cmp) : cmp;
+          }
+          case "released_at": {
+            const ad = a.metadata?.released_at ?? "";
+            const bd = b.metadata?.released_at ?? "";
+            cmp = bd.localeCompare(ad);
+            return dir ? (dir === 1 ? -cmp : cmp) : cmp;
+          }
+          case "provider": {
+            const ap = a.metadata?.provider ?? "\uffff";
+            const bp = b.metadata?.provider ?? "\uffff";
+            cmp = ap.localeCompare(bp);
+            return dir || cmp;
+          }
+          default:
+            return 0;
+        }
+      });
     }
 
     // Store total count before pagination
@@ -860,11 +1238,42 @@ export const handlers = [
       }));
     }
 
+    if (include?.includes("components")) {
+      models = models.map((model) => ({
+        ...model,
+        components: model.is_composite ? resolveComponents(model.id) : undefined,
+      }));
+    }
+
+    // Build facets from all models (unfiltered) if requested
+    const facets = include?.includes("facets")
+      ? {
+          providers: [
+            ...new Set(
+              modelsData
+                .map((m) => m.metadata?.provider)
+                .filter((p): p is string => !!p),
+            ),
+          ].sort(),
+          capabilities: [
+            ...new Set(modelsData.flatMap((m) => m.capabilities ?? [])),
+          ].sort(),
+          model_types: [
+            ...new Set(
+              modelsData
+                .map((m) => m.model_type)
+                .filter((t): t is ModelType => !!t),
+            ),
+          ].sort(),
+        }
+      : undefined;
+
     return HttpResponse.json({
       data: models,
       total_count,
       skip,
       limit,
+      ...(facets && { facets }),
     });
   }),
 
@@ -889,6 +1298,9 @@ export const handlers = [
             .filter((g): g is Group => g !== undefined) ?? [],
       };
     }
+    if (include?.includes("components") && model.is_composite) {
+      result = { ...result, components: resolveComponents(model.id) };
+    }
     return HttpResponse.json(result);
   }),
 
@@ -901,6 +1313,100 @@ export const handlers = [
     const updatedModel = { ...model, ...body };
     return HttpResponse.json(updatedModel);
   }),
+
+  // Virtual model components
+  http.get("/admin/api/v1/models/:id/components", ({ params }) => {
+    const model = modelsData.find((m) => m.id === params.id);
+    if (!model) {
+      return HttpResponse.json({ error: "Model not found" }, { status: 404 });
+    }
+    return HttpResponse.json(resolveComponents(model.id));
+  }),
+
+  http.post(
+    "/admin/api/v1/models/:id/components/:componentId",
+    async ({ params, request }) => {
+      const model = modelsData.find((m) => m.id === params.id);
+      if (!model) {
+        return HttpResponse.json({ error: "Model not found" }, { status: 404 });
+      }
+      const componentModel = modelsData.find((m) => m.id === params.componentId);
+      if (!componentModel) {
+        return HttpResponse.json({ error: "Component model not found" }, { status: 404 });
+      }
+      const body = (await request.json()) as { weight?: number; enabled?: boolean };
+      const component: StoredComponent = {
+        componentModelId: String(params.componentId),
+        weight: body.weight ?? 1,
+        enabled: body.enabled ?? true,
+        sort_order: getModelComponentsState(demoState, model.id, initialModelComponents).length,
+      };
+      demoState = addModelComponentState(demoState, model.id, component, initialModelComponents);
+
+      const endpoint = componentModel.hosted_on
+        ? endpointsData.find((e) => e.id === componentModel.hosted_on)
+        : undefined;
+      return HttpResponse.json(
+        {
+          weight: component.weight,
+          enabled: component.enabled,
+          sort_order: component.sort_order,
+          created_at: new Date().toISOString(),
+          model: {
+            id: componentModel.id,
+            alias: componentModel.alias,
+            model_name: componentModel.model_name,
+            description: componentModel.description,
+            model_type: componentModel.model_type,
+            endpoint: endpoint ? { id: endpoint.id, name: endpoint.name } : undefined,
+          },
+        },
+        { status: 201 },
+      );
+    },
+  ),
+
+  http.patch(
+    "/admin/api/v1/models/:id/components/:componentId",
+    async ({ params, request }) => {
+      const model = modelsData.find((m) => m.id === params.id);
+      if (!model) {
+        return HttpResponse.json({ error: "Model not found" }, { status: 404 });
+      }
+      const body = (await request.json()) as { weight?: number; enabled?: boolean; sort_order?: number };
+      demoState = updateModelComponentState(
+        demoState,
+        model.id,
+        String(params.componentId),
+        body,
+        initialModelComponents,
+      );
+      // Return the updated component list entry
+      const resolved = resolveComponents(model.id);
+      const updated = resolved.find((c) => c.model.id === params.componentId);
+      if (!updated) {
+        return HttpResponse.json({ error: "Component not found" }, { status: 404 });
+      }
+      return HttpResponse.json(updated);
+    },
+  ),
+
+  http.delete(
+    "/admin/api/v1/models/:id/components/:componentId",
+    ({ params }) => {
+      const model = modelsData.find((m) => m.id === params.id);
+      if (!model) {
+        return HttpResponse.json({ error: "Model not found" }, { status: 404 });
+      }
+      demoState = removeModelComponentState(
+        demoState,
+        model.id,
+        String(params.componentId),
+        initialModelComponents,
+      );
+      return new HttpResponse(null, { status: 204 });
+    },
+  ),
 
   // Endpoints API
   http.get("/admin/api/v1/endpoints", () => {
@@ -1806,9 +2312,9 @@ export const handlers = [
   http.get("/admin/api/v1/monitoring/pending-request-counts", () => {
     // Demo mode: static example data (real data comes from fusillade)
     return HttpResponse.json({
-      "claude-sonnet-4": { "1h": 12, "24h": 87 },
-      "gpt-4o": { "1h": 8, "24h": 45 },
-      "llama-3.3-70b": { "1h": 3, "24h": 22 },
+      "Qwen/Qwen3.5-397B-A17B-FP8": { "1h": 12, "24h": 87 },
+      "Qwen/Qwen3.5-35B-A3B-FP8": { "1h": 8, "24h": 45 },
+      "Qwen/Qwen3-14B-FP8": { "1h": 3, "24h": 22 },
     });
   }),
 
@@ -2281,5 +2787,153 @@ export const handlers = [
 
   http.post("/admin/api/v1/session/organization", () => {
     return HttpResponse.json({ active_organization_id: null });
+  }),
+
+  // Usage API
+  http.get("/admin/api/v1/usage", () => {
+    return HttpResponse.json({
+      total_input_tokens: 4_823_190,
+      total_output_tokens: 1_247_830,
+      total_request_count: 3842,
+      total_batch_count: 127,
+      avg_requests_per_batch: 30.2,
+      total_cost: "48.23",
+      estimated_realtime_cost: "96.46",
+      by_model: [
+        {
+          model: "Qwen/Qwen3.5-397B-A17B-FP8",
+          input_tokens: 2_100_000,
+          output_tokens: 580_000,
+          cost: "21.40",
+          request_count: 1420,
+        },
+        {
+          model: "Qwen/Qwen3.5-35B-A3B-FP8",
+          input_tokens: 1_350_000,
+          output_tokens: 390_000,
+          cost: "13.50",
+          request_count: 1180,
+        },
+        {
+          model: "openai/gpt-oss-20b",
+          input_tokens: 890_000,
+          output_tokens: 210_000,
+          cost: "8.90",
+          request_count: 742,
+        },
+        {
+          model: "Qwen/Qwen3-VL-235B-A22B-Instruct-FP8",
+          input_tokens: 483_190,
+          output_tokens: 67_830,
+          cost: "4.43",
+          request_count: 500,
+        },
+      ],
+    });
+  }),
+
+  // Daemons API
+  http.get("/ai/v1/daemons", () => {
+    const now = Math.floor(Date.now() / 1000);
+    return HttpResponse.json({
+      daemons: [
+        {
+          id: "d-1a2b3c4d",
+          status: "running",
+          hostname: "dwctl-prod-7f8d9a-xk4np",
+          pid: 1,
+          version: "8.13.0",
+          started_at: now - 86400 * 3,
+          last_heartbeat: now - 2,
+          stopped_at: null,
+          stats: {
+            requests_processed: 48210,
+            requests_failed: 23,
+            requests_in_flight: 7,
+          },
+          config: {
+            claim_batch_size: 50,
+            default_model_concurrency: 10,
+            model_concurrency_limits: {},
+            claim_interval_ms: 1000,
+            min_retries: 1,
+            stop_before_deadline_ms: null,
+            max_retries: 3,
+            backoff_ms: 1000,
+            backoff_factor: 2.0,
+            max_backoff_ms: 30000,
+            timeout_ms: 300000,
+            status_log_interval_ms: null,
+            heartbeat_interval_ms: 5000,
+            claim_timeout_ms: 60000,
+            processing_timeout_ms: 600000,
+          },
+        },
+        {
+          id: "d-5e6f7a8b",
+          status: "running",
+          hostname: "dwctl-prod-7f8d9a-rm2qz",
+          pid: 1,
+          version: "8.13.0",
+          started_at: now - 86400 * 3,
+          last_heartbeat: now - 4,
+          stopped_at: null,
+          stats: {
+            requests_processed: 45830,
+            requests_failed: 19,
+            requests_in_flight: 4,
+          },
+          config: {
+            claim_batch_size: 50,
+            default_model_concurrency: 10,
+            model_concurrency_limits: {},
+            claim_interval_ms: 1000,
+            min_retries: 1,
+            stop_before_deadline_ms: null,
+            max_retries: 3,
+            backoff_ms: 1000,
+            backoff_factor: 2.0,
+            max_backoff_ms: 30000,
+            timeout_ms: 300000,
+            status_log_interval_ms: null,
+            heartbeat_interval_ms: 5000,
+            claim_timeout_ms: 60000,
+            processing_timeout_ms: 600000,
+          },
+        },
+        {
+          id: "d-9c0d1e2f",
+          status: "dead",
+          hostname: "dwctl-prod-6e7c8b-jw5tp",
+          pid: 1,
+          version: "8.12.0",
+          started_at: now - 86400 * 7,
+          last_heartbeat: now - 86400 * 2,
+          stopped_at: now - 86400 * 2,
+          stats: {
+            requests_processed: 91204,
+            requests_failed: 41,
+            requests_in_flight: 0,
+          },
+          config: {
+            claim_batch_size: 50,
+            default_model_concurrency: 10,
+            model_concurrency_limits: {},
+            claim_interval_ms: 1000,
+            min_retries: 1,
+            stop_before_deadline_ms: null,
+            max_retries: 3,
+            backoff_ms: 1000,
+            backoff_factor: 2.0,
+            max_backoff_ms: 30000,
+            timeout_ms: 300000,
+            status_log_interval_ms: null,
+            heartbeat_interval_ms: 5000,
+            claim_timeout_ms: 60000,
+            processing_timeout_ms: 600000,
+          },
+        },
+      ],
+    });
   }),
 ];

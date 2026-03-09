@@ -127,7 +127,7 @@ describe("Playground Component - Functional Tests", () => {
     expect(modelSelect).toHaveAttribute("aria-expanded", "false");
     expect(modelSelect).toHaveAttribute("role", "combobox");
     // Placeholder text should indicate models can be searched
-    expect(modelSelect.textContent).toMatch(/search models|gpt-4o/i);
+    expect(modelSelect.textContent).toMatch(/search models|Qwen/i);
   });
 
   it("shows model selector ready for available models", async () => {
@@ -144,7 +144,7 @@ describe("Playground Component - Functional Tests", () => {
     // Should show placeholder or model name, not loading or error states
     expect(modelSelect).not.toHaveTextContent(/loading/i);
     expect(modelSelect).not.toHaveTextContent(/no models/i);
-    expect(modelSelect.textContent).toMatch(/search models|gpt-4o/i);
+    expect(modelSelect.textContent).toMatch(/search models|Qwen/i);
   });
 
   it("shows no error messages when models load successfully", async () => {
@@ -185,7 +185,7 @@ describe("Playground Component - Functional Tests", () => {
 
   it("loads chat playground when model parameter is provided", async () => {
     const { container } = render(<Playground />, {
-      wrapper: createWrapper(["/?model=gpt-4o"]),
+      wrapper: createWrapper(["/?model=d1a2b3c4-e5f6-4a7b-8c9d-0e1f2a3b4c5d"]),
     });
 
     // Wait for models to load and model to be selected
@@ -194,7 +194,7 @@ describe("Playground Component - Functional Tests", () => {
         name: /select model/i,
       });
       // First combobox should be the main model selector
-      expect(modelSelects[0]).toHaveTextContent("gpt-4o");
+      expect(modelSelects[0]).toHaveTextContent("Qwen/Qwen3.5-397B-A17B-FP8");
     });
 
     // Should successfully load chat playground (no welcome screen)
@@ -227,7 +227,7 @@ describe("Playground Component - Functional Tests", () => {
   it("sends message and displays conversation", async () => {
     const user = userEvent.setup();
     const { container } = render(<Playground />, {
-      wrapper: createWrapper(["/?model=gpt-4o"]),
+      wrapper: createWrapper(["/?model=d1a2b3c4-e5f6-4a7b-8c9d-0e1f2a3b4c5d"]),
     });
 
     // Wait for chat playground to load
@@ -268,7 +268,7 @@ describe("Playground Component - Functional Tests", () => {
   it("loads embedding playground and compares text similarity", async () => {
     const user = userEvent.setup();
     const { container } = render(<Playground />, {
-      wrapper: createWrapper(["/?model=text-embedding-3-small"]),
+      wrapper: createWrapper(["/?model=d7a8b9c0-e1f2-4a3b-4c5d-6e7f8a9b0c1d"]),
     });
 
     // Wait for embedding playground to load

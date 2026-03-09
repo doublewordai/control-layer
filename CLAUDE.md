@@ -78,7 +78,7 @@ just db-setup
 cargo run
 
 # Start frontend dev server (from dashboard/)
-npm run dev
+pnpm run dev
 ```
 
 ### Testing
@@ -262,7 +262,7 @@ TAGS=v1.0.0 PLATFORMS=linux/amd64,linux/arm64 docker buildx bake --push
 ## Testing Philosophy
 
 - **Backend**: `cargo test` provides comprehensive API integration tests using `axum-test` to spin up the full API server and make ~real HTTP requests
-- **Frontend**: `npm test` in `dashboard/` runs Vitest unit tests for React components and utilities. Always scope queries using `within(container)` instead of `screen` to avoid querying multiple test instances in the DOM (see TypeScript/React Testing section for details)
+- **Frontend**: `pnpm test` in `dashboard/` runs Vitest unit tests for React components and utilities. Always scope queries using `within(container)` instead of `screen` to avoid querying multiple test instances in the DOM (see TypeScript/React Testing section for details)
 - Hurl and Playwright E2E tests exist but are currently minimal (not the main test suite)
 - All Rust tests require a running PostgreSQL database due to SQLx integration
 - Test cleanup scripts in `scripts/` (drop-test-users.sh, drop-test-groups.sh) for Hurl tests

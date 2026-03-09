@@ -17,16 +17,19 @@ RUN apt-get update && apt-get install -y \
     curl \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y nodejs \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && npm install -g pnpm@10
 
 # Build dependencies (cached unless Cargo.toml/Cargo.lock change)
 COPY --from=planner /app/recipe.json recipe.json
 RUN cargo chef cook --release --recipe-path recipe.json
 
 # Build frontend
-COPY dashboard/ dashboard/
+COPY dashboard/package.json dashboard/pnpm-lock.yaml dashboard/
 WORKDIR /app/dashboard
-RUN npm ci && npm run build
+RUN pnpm install --frozen-lockfile
+COPY dashboard/ /app/dashboard/
+RUN pnpm run build
 WORKDIR /app
 
 # Copy source and build

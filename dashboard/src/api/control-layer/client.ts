@@ -77,6 +77,7 @@ import type {
   InviteDetailsResponse,
   UpdateMemberRoleRequest,
   SetActiveOrganizationResponse,
+  ModelListResponse,
 } from "./types";
 import { ApiError } from "./errors";
 
@@ -327,7 +328,7 @@ const userApi = {
 };
 
 const modelApi = {
-  async list(options?: ModelsQuery): Promise<PaginatedResponse<Model>> {
+  async list(options?: ModelsQuery): Promise<ModelListResponse> {
     const params = new URLSearchParams();
     if (options?.skip !== undefined)
       params.set("skip", options.skip.toString());
@@ -341,6 +342,12 @@ const modelApi = {
     if (options?.search) params.set("search", options.search);
     if (options?.is_composite !== undefined)
       params.set("is_composite", options.is_composite.toString());
+    if (options?.provider) params.set("provider", options.provider);
+    if (options?.model_type) params.set("model_type", options.model_type);
+    if (options?.capability) params.set("capability", options.capability);
+    if (options?.sort) params.set("sort", options.sort);
+    if (options?.sort_direction)
+      params.set("sort_direction", options.sort_direction);
 
     const url = `/admin/api/v1/models${params.toString() ? "?" + params.toString() : ""}`;
     const response = await fetch(url);
