@@ -2325,7 +2325,7 @@ const ModelInfo: React.FC = () => {
                     <Button
                       className="w-full justify-start"
                       onClick={() => {
-                        const currentUrl = `/models/${model.id}${fromUrl ? `?from=${encodeURIComponent(fromUrl)}` : ""}`;
+                        const currentUrl = `/models/manage/${model.id}${fromUrl ? `?from=${encodeURIComponent(fromUrl)}` : ""}`;
                         navigate(
                           `/playground?model=${encodeURIComponent(model.id)}&from=${encodeURIComponent(currentUrl)}`,
                         );
@@ -2341,7 +2341,7 @@ const ModelInfo: React.FC = () => {
                         variant="outline"
                         className="w-full justify-start"
                         onClick={() => {
-                          const currentUrl = `/models/${model.id}${fromUrl ? `?from=${encodeURIComponent(fromUrl)}` : ""}`;
+                          const currentUrl = `/models/manage/${model.id}${fromUrl ? `?from=${encodeURIComponent(fromUrl)}` : ""}`;
                           navigate(
                             `/analytics?model=${encodeURIComponent(model.alias)}&from=${encodeURIComponent(currentUrl)}`,
                           );
