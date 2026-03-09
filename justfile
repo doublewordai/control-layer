@@ -26,7 +26,7 @@ check:
     missing_tools=()
 
     # Required tools
-    required_tools=("docker" "hurl" "psql" "createdb" "cargo" "npm")
+    required_tools=("docker" "hurl" "psql" "createdb" "cargo" "pnpm")
     for tool in "${required_tools[@]}"; do
         if ! command -v "$tool" >/dev/null 2>&1; then
             missing_tools+=("$tool")
@@ -470,13 +470,13 @@ test target="" *args="":
             cd dashboard
             if [ -z "{{args}}" ]; then
                 # No args: run once
-                npm test -- --run
+                pnpm test -- --run
             elif [[ "{{args}}" == *"--watch"* ]]; then
                 # Watch mode: remove --watch and let vitest handle it
-                npm test -- $(echo "{{args}}" | sed 's/--watch//g')
+                pnpm test -- $(echo "{{args}}" | sed 's/--watch//g')
             else
                 # Has args but no watch: run once
-                npm test -- --run {{args}}
+                pnpm test -- --run {{args}}
             fi
             ;;
         *)
@@ -513,12 +513,12 @@ lint target *args="":
     case "{{target}}" in
         ts)
             cd dashboard
-            echo "Checking package-lock.json sync..."
-            npm ci --dry-run
+            echo "Checking pnpm-lock.yaml sync..."
+            pnpm install --frozen-lockfile --dry-run
             echo "Running TypeScript checks..."
-            npx tsc -b --noEmit
+            pnpm exec tsc -b --noEmit
             echo "Running ESLint..."
-            npm run lint -- --max-warnings 0 {{args}}
+            pnpm run lint -- --max-warnings 0 {{args}}
             ;;
         rust)
             echo "Checking Cargo.lock sync..."
@@ -561,7 +561,7 @@ fmt target *args="":
     set -euo pipefail
     case "{{target}}" in
         ts)
-            cd dashboard && npx prettier --write . {{args}}
+            cd dashboard && pnpm exec prettier --write . {{args}}
             ;;
         rust)
             echo "Running cargo fmt for dwctl..."
@@ -655,7 +655,7 @@ ci target *args="":
             echo "🧪 Step 2/3: Testing with coverage..."
             just test ts --coverage {{args}}
             echo "🏗️  Step 3/3: Building..."
-            cd dashboard && npm run build
+            cd dashboard && pnpm run build
             echo "✅ TypeScript CI pipeline completed successfully!"
             ;;
         *)
@@ -773,7 +773,7 @@ security-scan target="latest" *args="":
 #
 # Prerequisites:
 # - Authentication: Either run 'cargo login' or set CARGO_REGISTRY_TOKEN environment variable
-# - Node.js and npm installed (for building dwctl frontend)
+# - Node.js and pnpm installed (for building dwctl frontend)
 #
 # The release process:
 # 1. Attempts to publish fusillade (skips if version already exists)
@@ -826,8 +826,8 @@ release:
     echo "Building frontend and publishing dwctl..."
     echo "Building frontend..."
     cd dashboard
-    npm ci
-    npm run build
+    pnpm install --frozen-lockfile
+    pnpm run build
     cd ..
 
     echo "Copying frontend to dwctl/static..."

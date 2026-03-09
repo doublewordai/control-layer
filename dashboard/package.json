@@ -1,7 +1,7 @@
 {
   "name": "ai-model-dashboard",
   "private": true,
-  "version": "8.15.2",
+  "version": "8.13.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -96,9 +96,13 @@
       "public"
     ]
   },
-  "overrides": {
-    "vite": {
+  "pnpm": {
+    "overrides": {
       "rollup": "npm:@rollup/wasm-node"
-    }
+    },
+    "onlyBuiltDependencies": [
+      "esbuild",
+      "msw"
+    ]
   }
 }

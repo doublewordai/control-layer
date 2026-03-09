@@ -19,12 +19,17 @@ jobs:
         uses: actions/setup-node@v6
         with:
           node-version: "24"
-          cache: "npm"
-          cache-dependency-path: dashboard/package-lock.json
+          cache: "pnpm"
+          cache-dependency-path: dashboard/pnpm-lock.yaml
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
 
       - name: Install dependencies
         working-directory: ./dashboard
-        run: npm ci
+        run: pnpm install --frozen-lockfile
 
       - name: Install just
         uses: extractions/setup-just@v3
@@ -339,12 +344,17 @@ jobs:
         uses: actions/setup-node@v6
         with:
           node-version: "24"
-          cache: "npm"
-          cache-dependency-path: dashboard/package-lock.json
+          cache: "pnpm"
+          cache-dependency-path: dashboard/pnpm-lock.yaml
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
 
       - name: Install dashboard dependencies
         working-directory: ./dashboard
-        run: npm ci
+        run: pnpm install --frozen-lockfile
 
       - name: Install Playwright browsers
         working-directory: ./dashboard
