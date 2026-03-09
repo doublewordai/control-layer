@@ -353,7 +353,7 @@ function ModelRow({
                 e.stopPropagation();
                 onApiClick();
               }}
-              className="text-xs h-7 px-2 text-gray-500 hover:text-gray-700"
+              className="text-xs h-7 px-2 text-gray-500 hover:text-gray-700 hover:bg-gray-100"
             >
               <Code className="h-3.5 w-3.5" />
               <span className="hidden lg:inline ml-1">API</span>
