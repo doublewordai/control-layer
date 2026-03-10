@@ -256,19 +256,16 @@ pub async fn create_batch<P: PoolProvider>(
         })?;
 
     // Check file ownership if user doesn't have ReadAll permission
+    // In org context, files owned by the active org are also considered "own"
     use crate::types::Resource;
     let has_read_all = can_read_all_resources(&current_user, Resource::Files);
-    if !has_read_all {
-        // Verify user owns the file
-        let user_id_str = current_user.id.to_string();
-        if file.uploaded_by.as_deref() != Some(user_id_str.as_str()) {
-            use crate::types::{Operation, Permission};
-            return Err(Error::InsufficientPermissions {
-                required: Permission::Allow(Resource::Files, Operation::ReadAll),
-                action: Operation::CreateOwn,
-                resource: format!("batch using file {}", req.input_file_id),
-            });
-        }
+    if !has_read_all && !is_batch_owner(&current_user, file.uploaded_by.as_deref()) {
+        use crate::types::{Operation, Permission};
+        return Err(Error::InsufficientPermissions {
+            required: Permission::Allow(Resource::Files, Operation::ReadAll),
+            action: Operation::CreateOwn,
+            resource: format!("batch using file {}", req.input_file_id),
+        });
     }
 
     // Check that the file owner (whose API key is embedded in the request templates)
