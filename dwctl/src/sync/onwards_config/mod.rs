@@ -559,9 +559,68 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
     .fetch_all(db)
     .await?;
 
-    // Group components by composite model
-    let mut composite_map: HashMap<DeploymentId, OnwardsCompositeModel> = HashMap::new();
+    // Query all composite model metadata (regardless of component status).
+    // This ensures composites with zero enabled components still appear in the
+    // routing table so that auth and routing rules (e.g., redirects) can run.
+    let composite_metadata_rows = sqlx::query!(
+        r#"
+        SELECT
+            id as composite_model_id,
+            alias,
+            requests_per_second,
+            burst_size,
+            capacity,
+            lb_strategy,
+            fallback_enabled,
+            fallback_on_rate_limit,
+            fallback_on_status,
+            fallback_with_replacement,
+            fallback_max_attempts,
+            sanitize_responses,
+            trusted,
+            open_responses_adapter as "open_responses_adapter?"
+        FROM deployed_models
+        WHERE is_composite = TRUE
+          AND deleted = FALSE
+        "#
+    )
+    .fetch_all(db)
+    .await?;
 
+    // Seed the composite map with all composite models (even those with no enabled components)
+    let mut composite_map: HashMap<DeploymentId, OnwardsCompositeModel> = HashMap::new();
+    for row in composite_metadata_rows {
+        let lb_strategy = row
+            .lb_strategy
+            .as_deref()
+            .and_then(LoadBalancingStrategy::try_parse)
+            .unwrap_or_default();
+
+        composite_map.insert(
+            row.composite_model_id,
+            OnwardsCompositeModel {
+                id: row.composite_model_id,
+                alias: row.alias,
+                requests_per_second: row.requests_per_second,
+                burst_size: row.burst_size,
+                capacity: row.capacity,
+                lb_strategy,
+                fallback_enabled: row.fallback_enabled.unwrap_or(true),
+                fallback_on_rate_limit: row.fallback_on_rate_limit.unwrap_or(true),
+                fallback_on_status: row.fallback_on_status.unwrap_or_else(|| vec![429, 500, 502, 503, 504]),
+                fallback_with_replacement: row.fallback_with_replacement.unwrap_or(false),
+                fallback_max_attempts: row.fallback_max_attempts,
+                sanitize_responses: row.sanitize_responses,
+                trusted: row.trusted,
+                open_responses_adapter: row.open_responses_adapter.unwrap_or(true),
+                routing_rules: Vec::new(), // Populated from separate query below
+                components: Vec::new(),
+                api_keys: Vec::new(),
+            },
+        );
+    }
+
+    // Add enabled components to their composite models
     for row in component_rows {
         // Parse the endpoint URL, skipping this component if invalid
         let endpoint_url = match url::Url::parse(&row.endpoint_url) {
@@ -575,54 +634,27 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
             }
         };
 
-        let composite = composite_map.entry(row.composite_model_id).or_insert_with(|| {
-            // Parse lb_strategy from string, defaulting to WeightedRandom
-            let lb_strategy = row
-                .lb_strategy
-                .as_deref()
-                .and_then(LoadBalancingStrategy::try_parse)
-                .unwrap_or_default();
-
-            OnwardsCompositeModel {
-                id: row.composite_model_id,
-                alias: row.alias.clone(),
-                requests_per_second: row.requests_per_second,
-                burst_size: row.burst_size,
-                capacity: row.capacity,
-                lb_strategy,
-                fallback_enabled: row.fallback_enabled.unwrap_or(true),
-                fallback_on_rate_limit: row.fallback_on_rate_limit.unwrap_or(true),
-                fallback_on_status: row.fallback_on_status.clone().unwrap_or_else(|| vec![429, 500, 502, 503, 504]),
-                fallback_with_replacement: row.fallback_with_replacement.unwrap_or(false),
-                fallback_max_attempts: row.fallback_max_attempts,
-                sanitize_responses: row.composite_sanitize_responses,
-                trusted: row.composite_trusted,
-                open_responses_adapter: row.composite_open_responses_adapter.unwrap_or(true),
-                routing_rules: Vec::new(), // Populated from separate query below
-                components: Vec::new(),
-                api_keys: Vec::new(),
-            }
-        });
-
-        composite.components.push(CompositeModelComponent {
-            weight: row.weight,
-            target: OnwardsTarget {
-                model_name: row.model_name.clone(),
-                alias: row.deployment_alias.clone(),
-                requests_per_second: row.deployment_requests_per_second,
-                burst_size: row.deployment_burst_size,
-                capacity: row.deployment_capacity,
-                sanitize_responses: row.deployment_sanitize_responses,
-                trusted: row.deployment_trusted,
-                open_responses_adapter: row.deployment_open_responses_adapter.unwrap_or(true),
-                routing_rules: Vec::new(), // Components don't have their own routing rules
-                endpoint_url,
-                endpoint_api_key: row.endpoint_api_key.clone(),
-                auth_header_name: row.auth_header_name.clone(),
-                auth_header_prefix: row.auth_header_prefix.clone(),
-                api_keys: Vec::new(),
-            },
-        });
+        if let Some(composite) = composite_map.get_mut(&row.composite_model_id) {
+            composite.components.push(CompositeModelComponent {
+                weight: row.weight,
+                target: OnwardsTarget {
+                    model_name: row.model_name.clone(),
+                    alias: row.deployment_alias.clone(),
+                    requests_per_second: row.deployment_requests_per_second,
+                    burst_size: row.deployment_burst_size,
+                    capacity: row.deployment_capacity,
+                    sanitize_responses: row.deployment_sanitize_responses,
+                    trusted: row.deployment_trusted,
+                    open_responses_adapter: row.deployment_open_responses_adapter.unwrap_or(true),
+                    routing_rules: Vec::new(), // Components don't have their own routing rules
+                    endpoint_url,
+                    endpoint_api_key: row.endpoint_api_key.clone(),
+                    auth_header_name: row.auth_header_name.clone(),
+                    auth_header_prefix: row.auth_header_prefix.clone(),
+                    api_keys: Vec::new(),
+                },
+            });
+        }
     }
 
     // Add API keys to composite models
@@ -945,10 +977,13 @@ fn convert_to_config_file(targets: Vec<OnwardsTarget>, composites: Vec<OnwardsCo
         })
         .collect();
 
-    // Convert composite models (including those with no components - they'll return 502)
+    // Convert composite models (including those with no components - they'll return 503)
     for composite in composites {
         if composite.components.is_empty() {
-            debug!("Composite model '{}' has no enabled components - will return 502", composite.alias);
+            warn!(
+                "Composite model '{}' has no enabled components - requests will return 503",
+                composite.alias
+            );
         }
 
         let (alias, spec) = convert_composite_to_target_spec(&composite, &mut key_definitions);
