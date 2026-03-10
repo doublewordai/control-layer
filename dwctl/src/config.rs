@@ -1170,25 +1170,21 @@ impl DaemonConfig {
     ) -> fusillade::daemon::DaemonConfig {
         // If the deprecated timeout_ms is set and the granular fields are at their
         // defaults, split it: 90% header (connect + TTFT), 10% body.
-        let (header_timeout_ms, chunk_timeout_ms, body_timeout_ms) =
-            if let Some(timeout) = self.timeout_ms {
-                if self.header_timeout_ms == 86_400_000
-                    && self.chunk_timeout_ms == 86_400_000
-                    && self.body_timeout_ms == 86_400_000
-                {
-                    tracing::warn!(
-                        timeout_ms = timeout,
-                        "batch_daemon.timeout_ms is deprecated; \
+        let (header_timeout_ms, chunk_timeout_ms, body_timeout_ms) = if let Some(timeout) = self.timeout_ms {
+            if self.header_timeout_ms == 86_400_000 && self.chunk_timeout_ms == 86_400_000 && self.body_timeout_ms == 86_400_000 {
+                tracing::warn!(
+                    timeout_ms = timeout,
+                    "batch_daemon.timeout_ms is deprecated; \
                          use header_timeout_ms, chunk_timeout_ms, and body_timeout_ms instead"
-                    );
-                    (timeout * 9 / 10, 86_400_000, timeout / 10)
-                } else {
-                    // Granular fields were explicitly set — ignore deprecated field
-                    (self.header_timeout_ms, self.chunk_timeout_ms, self.body_timeout_ms)
-                }
+                );
+                (timeout * 9 / 10, 86_400_000, timeout / 10)
             } else {
+                // Granular fields were explicitly set — ignore deprecated field
                 (self.header_timeout_ms, self.chunk_timeout_ms, self.body_timeout_ms)
-            };
+            }
+        } else {
+            (self.header_timeout_ms, self.chunk_timeout_ms, self.body_timeout_ms)
+        };
 
         fusillade::daemon::DaemonConfig {
             claim_batch_size: self.claim_batch_size,

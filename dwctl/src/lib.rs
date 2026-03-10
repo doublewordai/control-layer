@@ -1698,16 +1698,16 @@ async fn setup_background_services(
     // Initialize the fusillade request manager (for batch processing)
     let request_manager = Arc::new(
         fusillade::PostgresRequestManager::new(
-                fusillade_pools,
-                config
-                    .background_services
-                    .batch_daemon
-                    .to_fusillade_config_with_limits(Some(model_capacity_limits.clone())),
-            )
-            .with_download_buffer_size(config.batches.files.download_buffer_size)
-            .with_batch_insert_strategy(BatchInsertStrategy::Batched {
-                batch_size: config.batches.files.batch_insert_size,
-            }),
+            fusillade_pools,
+            config
+                .background_services
+                .batch_daemon
+                .to_fusillade_config_with_limits(Some(model_capacity_limits.clone())),
+        )
+        .with_download_buffer_size(config.batches.files.download_buffer_size)
+        .with_batch_insert_strategy(BatchInsertStrategy::Batched {
+            batch_size: config.batches.files.batch_insert_size,
+        }),
     );
 
     let is_leader: bool;
