@@ -1233,7 +1233,11 @@ pub async fn load_targets_from_db(db: &PgPool, escalation_models: &[String], str
 /// Every non-deleted deployed model gets an entry: explicit `batch_capacity` if set,
 /// otherwise `default_capacity`. This ensures the daemon will claim requests for all
 /// deployed models, not just those with an explicit batch_capacity override.
-async fn update_daemon_capacity_limits(db: &PgPool, limits: &Arc<dashmap::DashMap<String, usize>>, default_capacity: usize) -> Result<(), anyhow::Error> {
+async fn update_daemon_capacity_limits(
+    db: &PgPool,
+    limits: &Arc<dashmap::DashMap<String, usize>>,
+    default_capacity: usize,
+) -> Result<(), anyhow::Error> {
     let models = sqlx::query!(
         r#"
         SELECT alias, batch_capacity
@@ -1247,9 +1251,18 @@ async fn update_daemon_capacity_limits(db: &PgPool, limits: &Arc<dashmap::DashMa
     let mut active_models = std::collections::HashSet::new();
 
     for model in &models {
-        let capacity = model.batch_capacity
-            .map(|c| c as usize)
-            .unwrap_or(default_capacity);
+        let capacity = match model.batch_capacity {
+            Some(c) if c > 0 => c as usize,
+            Some(c) => {
+                warn!(
+                    alias = %model.alias,
+                    batch_capacity = c,
+                    "Invalid non-positive batch_capacity; using default_capacity"
+                );
+                default_capacity
+            }
+            None => default_capacity,
+        };
         active_models.insert(model.alias.clone());
         limits.insert(model.alias.clone(), capacity);
         debug!("Updated daemon capacity limit for model '{}': {}", model.alias, capacity);
