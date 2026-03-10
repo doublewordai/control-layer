@@ -1,5 +1,17 @@
 # Changelog
 
+## [8.16.0](https://github.com/doublewordai/control-layer/compare/v8.15.6...v8.16.0) (2026-03-10)
+
+
+### Features
+
+* auto top-up monthly spending limit ([#815](https://github.com/doublewordai/control-layer/issues/815)) ([6a0ab3a](https://github.com/doublewordai/control-layer/commit/6a0ab3a9163f8d768acdd5c2e2a39cc0a2a0daac))
+
+
+### Bug Fixes
+
+* bump onwards to 0.18.6 — preserve error code in strict mode ([#830](https://github.com/doublewordai/control-layer/issues/830)) ([2c9e2b4](https://github.com/doublewordai/control-layer/commit/2c9e2b454d6f4fa2dfc5896f899fc4768809e468))
+
 ## [8.15.6](https://github.com/doublewordai/control-layer/compare/v8.15.5...v8.15.6) (2026-03-10)
 
 
