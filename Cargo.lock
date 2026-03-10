@@ -1782,8 +1782,6 @@ checksum = "e6d5a32815ae3f33302d95fdcb2ce17862f8c65363dcfd29360480ba1001fc9c"
 [[package]]
 name = "fusillade"
 version = "7.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5c174be71d9112ecb2b4c7e90989005ba00874c814f804094b60d8923f0b5225"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3108,9 +3106,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "onwards"
-version = "0.18.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b1d84fd56d9d978a3a4a1747fd78e12ffa0c897bc0e9cf6d3e276d4b47c271d"
+version = "0.18.1"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -3127,7 +3123,11 @@ dependencies = [
  "hyper",
  "hyper-tls",
  "hyper-util",
+ "metrics",
  "notify",
+ "opentelemetry",
+ "opentelemetry-otlp",
+ "opentelemetry_sdk",
  "rand 0.9.2",
  "serde",
  "serde_json",
@@ -3135,6 +3135,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tracing",
+ "tracing-opentelemetry",
  "tracing-subscriber",
  "url",
 ]
@@ -3271,8 +3272,6 @@ dependencies = [
 [[package]]
 name = "outlet"
 version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cbce3e5e96355b32b60f5490d75d53889c8446480eca3a16320030c8f3af703b"
 dependencies = [
  "anyhow",
  "axum",
@@ -3295,8 +3294,6 @@ dependencies = [
 [[package]]
 name = "outlet-postgres"
 version = "0.4.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8d8da161fb668ed72a6d1081b52a7315c6e0e707967315bfcac2bd2ff5b46fab"
 dependencies = [
  "base64",
  "bytes",

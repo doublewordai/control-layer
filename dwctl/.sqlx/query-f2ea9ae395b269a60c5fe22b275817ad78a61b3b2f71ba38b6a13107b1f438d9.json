@@ -1,0 +1,62 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT u.id as \"id!\", u.email as \"email!\", u.username as \"username!\", u.display_name,\n                   u.payment_provider_id as \"payment_provider_id!\",\n                   u.auto_topup_threshold::decimal(20, 9) as \"auto_topup_threshold!\",\n                   u.auto_topup_amount::decimal(20, 9) as \"auto_topup_amount!\",\n                   c.balance as \"checkpoint_balance?\"\n            FROM users u\n            LEFT JOIN user_balance_checkpoints c ON c.user_id = u.id\n            WHERE u.id != '00000000-0000-0000-0000-000000000000'\n              AND u.is_deleted = false\n              AND u.auto_topup_threshold IS NOT NULL\n              AND u.auto_topup_amount IS NOT NULL\n              AND u.payment_provider_id IS NOT NULL\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "email!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "username!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "display_name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 4,
+        "name": "payment_provider_id!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 5,
+        "name": "auto_topup_threshold!",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 6,
+        "name": "auto_topup_amount!",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 7,
+        "name": "checkpoint_balance?",
+        "type_info": "Numeric"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      null,
+      null,
+      false
+    ]
+  },
+  "hash": "f2ea9ae395b269a60c5fe22b275817ad78a61b3b2f71ba38b6a13107b1f438d9"
+}

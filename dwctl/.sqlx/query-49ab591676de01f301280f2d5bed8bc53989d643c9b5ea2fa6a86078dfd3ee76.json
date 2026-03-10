@@ -1,0 +1,56 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT u.id as \"id!\", u.email as \"email!\", u.username as \"username!\", u.display_name,\n                   u.low_balance_threshold::decimal(20, 9) as \"low_balance_threshold!\",\n                   u.low_balance_notification_sent as \"low_balance_notification_sent!\",\n                   c.balance as \"checkpoint_balance?\"\n            FROM users u\n            LEFT JOIN user_balance_checkpoints c ON c.user_id = u.id\n            WHERE u.id != '00000000-0000-0000-0000-000000000000'\n              AND u.is_deleted = false\n              AND u.low_balance_threshold IS NOT NULL\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "email!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "username!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "display_name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 4,
+        "name": "low_balance_threshold!",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 5,
+        "name": "low_balance_notification_sent!",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 6,
+        "name": "checkpoint_balance?",
+        "type_info": "Numeric"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      true,
+      true,
+      true,
+      true,
+      null,
+      true,
+      false
+    ]
+  },
+  "hash": "49ab591676de01f301280f2d5bed8bc53989d643c9b5ea2fa6a86078dfd3ee76"
+}
