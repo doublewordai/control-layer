@@ -464,7 +464,7 @@ pub async fn delete_user<P: PoolProvider>(
         .request_manager
         .list_batches(fusillade::ListBatchesFilter {
             created_by: Some(user_id_str.clone()),
-            limit: i64::MAX,
+            limit: Some(i64::MAX),
             ..Default::default()
         })
         .await

@@ -1350,7 +1350,7 @@ pub async fn list_batches<P: PoolProvider>(
             created_by,
             search: query.search.clone(),
             after,
-            limit: limit + 1,
+            limit: Some(limit + 1),
             api_key_id: api_key_id_filter,
             status: query.status.clone(),
             created_after: query.created_after,
