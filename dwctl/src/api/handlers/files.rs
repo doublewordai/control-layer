@@ -926,6 +926,9 @@ pub async fn upload_file<P: PoolProvider>(
             filename: file.name,
             purpose: api_purpose,
             expires_at: file.expires_at.map(|dt| dt.timestamp()),
+            created_by_email: None,
+            context_name: None,
+            context_type: None,
         }),
     ))
 }
@@ -969,6 +972,28 @@ pub async fn list_files<P: PoolProvider>(
         .as_ref()
         .and_then(|id_str| uuid::Uuid::parse_str(id_str).ok().map(fusillade::FileId::from));
 
+    // Determine if user should see enriched metadata (creator emails, context info)
+    let is_org_context = current_user.active_organization.is_some();
+    let should_enrich = can_read_all_files || is_org_context;
+
+    // Translate member_id to api_key_id for fusillade filtering
+    // Only allowed for platform managers or users in org context
+    let api_key_id_filter = if let Some(member_id) = query.member_id {
+        if !should_enrich {
+            return Err(Error::BadRequest {
+                message: "member_id filter is only available in organization context".to_string(),
+            });
+        }
+        let org_id = current_user.active_organization.unwrap_or(current_user.id);
+        let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+        ApiKeys::new(&mut conn)
+            .find_hidden_key_id(org_id, ApiKeyPurpose::Batch, member_id)
+            .await
+            .map_err(Error::Database)?
+    } else {
+        None
+    };
+
     // Build filter based on permissions
     let filter = fusillade::FileFilter {
         // Filter by ownership if user can't read all files, or if explicitly requested
@@ -985,7 +1010,7 @@ pub async fn list_files<P: PoolProvider>(
         search: query.search.clone(),
         after,
         limit: Some((limit + 1) as usize), // Fetch one extra to check has_more
-        api_key_id: query.api_key_id,
+        api_key_id: api_key_id_filter,
         ascending: query.order == "asc",
     };
 
@@ -1003,6 +1028,53 @@ pub async fn list_files<P: PoolProvider>(
     let first_id = files.first().map(|f| f.id.0.to_string());
     let last_id = files.last().map(|f| f.id.0.to_string());
 
+    // Only resolve creator/context metadata when user has appropriate permissions
+    use crate::db::handlers::users::Users;
+    use crate::db::models::users::UserDBResponse;
+    let (api_key_creator_map, user_map): (std::collections::HashMap<uuid::Uuid, uuid::Uuid>, std::collections::HashMap<uuid::Uuid, UserDBResponse>) = if should_enrich {
+        // Resolve individual creators via api_key_id → api_keys.created_by
+        let api_key_ids: Vec<uuid::Uuid> = files.iter().filter_map(|f| f.api_key_id).collect();
+        let creator_map: std::collections::HashMap<uuid::Uuid, uuid::Uuid> = if !api_key_ids.is_empty() {
+            let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+            ApiKeys::new(&mut conn)
+                .get_creators_by_key_ids(api_key_ids)
+                .await
+                .map_err(Error::Database)?
+        } else {
+            std::collections::HashMap::new()
+        };
+
+        // Collect all unique user IDs: owners (uploaded_by) + individual creators
+        let mut all_user_ids: std::collections::HashSet<uuid::Uuid> = std::collections::HashSet::new();
+        for f in &files {
+            if let Some(owner_id) = f.uploaded_by.as_ref().and_then(|id| uuid::Uuid::parse_str(id).ok()) {
+                all_user_ids.insert(owner_id);
+            }
+            if let Some(api_key_id) = f.api_key_id {
+                if let Some(&creator_id) = creator_map.get(&api_key_id) {
+                    all_user_ids.insert(creator_id);
+                }
+            }
+        }
+
+        // Bulk fetch all users for email + user_type + display_name
+        let users: std::collections::HashMap<uuid::Uuid, UserDBResponse> = if !all_user_ids.is_empty() {
+            let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+            Users::new(&mut conn)
+                .get_bulk(all_user_ids.into_iter().collect())
+                .await
+                .map_err(|e| Error::Internal {
+                    operation: format!("fetch users: {}", e),
+                })?
+        } else {
+            std::collections::HashMap::new()
+        };
+
+        (creator_map, users)
+    } else {
+        (std::collections::HashMap::new(), std::collections::HashMap::new())
+    };
+
     let data: Vec<FileResponse> = files
         .iter()
         .map(|f| {
@@ -1014,14 +1086,43 @@ pub async fn list_files<P: PoolProvider>(
                 None => Purpose::Batch, // Default to Batch for backwards compatibility
             };
 
+            // Only enrich with creator/context metadata for privileged contexts
+            let (created_by_email, context_name, context_type) = if should_enrich {
+                // Resolve individual creator email via api_key_id
+                let individual_creator_id = f
+                    .api_key_id
+                    .and_then(|key_id| api_key_creator_map.get(&key_id).copied());
+                let email = individual_creator_id
+                    .and_then(|uid| user_map.get(&uid))
+                    .map(|u| u.email.clone());
+
+                // Resolve context from file owner (uploaded_by field)
+                let owner_id = f.uploaded_by.as_ref().and_then(|id| uuid::Uuid::parse_str(id).ok());
+                let owner = owner_id.and_then(|id| user_map.get(&id));
+                let (ctx_name, ctx_type) = match owner {
+                    Some(u) if u.user_type == "organization" => {
+                        let name = u.display_name.clone().unwrap_or_else(|| u.email.clone());
+                        (Some(name), Some("organization".to_string()))
+                    }
+                    Some(_) => (Some("Personal".to_string()), Some("personal".to_string())),
+                    None => (None, None),
+                };
+                (email, ctx_name, ctx_type)
+            } else {
+                (None, None, None)
+            };
+
             FileResponse {
-                id: f.id.0.to_string(), // Use full UUID, not Display truncation
+                id: f.id.0.to_string(),
                 object_type: ObjectType::File,
                 bytes: f.size_bytes,
                 created_at: f.created_at.timestamp(),
                 filename: f.name.clone(),
                 purpose: api_purpose,
                 expires_at: f.expires_at.map(|dt| dt.timestamp()),
+                created_by_email,
+                context_name,
+                context_type,
             }
         })
         .collect();
@@ -1095,6 +1196,9 @@ pub async fn get_file<P: PoolProvider>(
         filename: file.name,
         purpose: api_purpose,
         expires_at: file.expires_at.map(|dt| dt.timestamp()),
+        created_by_email: None,
+        context_name: None,
+        context_type: None,
     }))
 }
 

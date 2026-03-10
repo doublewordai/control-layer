@@ -289,15 +289,26 @@ pub struct ListBatchesQuery {
     #[param(inline)]
     pub pagination: CursorPagination,
 
-    /// Search query to filter batches by endpoint or input filename (case-insensitive substring match)
+    /// Search query to filter batches by endpoint, input filename, or batch ID (case-insensitive substring match)
     pub search: Option<String>,
 
     /// Comma-separated list of related resources to include. Supported: "analytics"
     #[param(example = "analytics")]
     pub include: Option<String>,
 
-    /// Filter by API key UUID (for per-member filtering within orgs)
-    pub api_key_id: Option<uuid::Uuid>,
+    /// Filter by member user ID (resolves to api_key_id for per-member filtering within orgs)
+    pub member_id: Option<uuid::Uuid>,
+
+    /// Filter by batch status (e.g. "completed", "in_progress", "failed", "cancelled", "validating", "finalizing", "expired")
+    pub status: Option<String>,
+
+    /// Only return batches created after this ISO 8601 timestamp
+    #[param(example = "2025-01-01T00:00:00Z")]
+    pub created_after: Option<chrono::DateTime<chrono::Utc>>,
+
+    /// Only return batches created before this ISO 8601 timestamp
+    #[param(example = "2025-12-31T23:59:59Z")]
+    pub created_before: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Query parameters for batch results

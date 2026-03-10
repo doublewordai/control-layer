@@ -28,8 +28,8 @@ pub struct ListFilesQuery {
     #[serde(default)]
     pub own: bool,
 
-    /// Filter by API key UUID (for per-member filtering within orgs)
-    pub api_key_id: Option<uuid::Uuid>,
+    /// Filter by member user ID (resolves to api_key_id for per-member filtering within orgs)
+    pub member_id: Option<uuid::Uuid>,
 }
 
 fn default_order() -> String {
@@ -80,6 +80,18 @@ pub struct FileResponse {
     pub purpose: Purpose,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<i64>, // Unix timestamp
+
+    /// Email of the individual who created this file (resolved from api_key attribution)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_by_email: Option<String>,
+
+    /// Context name: "Personal" for individual files, or the organization name
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_name: Option<String>,
+
+    /// Context type: "personal" or "organization"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_type: Option<String>,
 }
 
 /// Object type - always "file"

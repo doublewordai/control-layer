@@ -10,6 +10,10 @@ import {
   FileCheck,
   AlertCircle,
   X,
+  Users,
+  ChevronsUpDown,
+  Check,
+  Filter,
 } from "lucide-react";
 import { Button } from "../../../ui/button";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "../../../ui/tabs";
@@ -20,17 +24,42 @@ import {
   SelectTrigger,
   SelectValue,
 } from "../../../ui/select";
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "../../../ui/popover";
+import {
+  Command,
+  CommandEmpty,
+  CommandGroup,
+  CommandInput,
+  CommandItem,
+  CommandList,
+} from "../../../ui/command";
+import { Switch } from "../../../ui/switch";
+import { DateTimeRangeSelector } from "../../../ui/date-time-range-selector";
 import { DataTable } from "../../../ui/data-table";
 import { createFileColumns } from "../FilesTable/columns";
 import { createBatchColumns } from "../BatchesTable/columns";
-import { useFiles, useBatches } from "../../../../api/control-layer/hooks";
+import {
+  useFiles,
+  useBatches,
+  useOrganizationMembers,
+  useUsers,
+} from "../../../../api/control-layer/hooks";
 import { dwctlApi } from "../../../../api/control-layer/client";
 import type { FileObject, Batch } from "../types";
-import type { BatchAnalytics } from "../../../../api/control-layer/types";
+import type {
+  BatchAnalytics,
+  BatchStatus,
+} from "../../../../api/control-layer/types";
 import { useServerCursorPagination } from "../../../../hooks/useServerCursorPagination";
 import { useDebounce } from "../../../../hooks/useDebounce";
 import { useAuthorization } from "../../../../utils/authorization";
+import { useOrganizationContext } from "../../../../contexts/organization/useOrganizationContext";
 import { useBootstrapContent } from "@/hooks/use-bootstrap-content";
+import { cn } from "@/lib/utils";
 
 /**
  * Props for the Batches component.
@@ -65,9 +94,52 @@ export function Batches({
   const [searchParams, setSearchParams] = useSearchParams();
   const queryClient = useQueryClient();
   const { userRoles } = useAuthorization();
+  const { isOrgContext } = useOrganizationContext();
 
-  // PlatformManagers can see all batches, so show the User column for them
+  // Show User column for PlatformManagers (see all batches) or in org context (see org members)
   const isPlatformManager = userRoles.includes("PlatformManager");
+  const showUserColumn = isPlatformManager || isOrgContext;
+  const showContextColumn = isPlatformManager;
+
+  // Member filter - available in org context or for platform managers
+  const { activeOrganizationId } = useOrganizationContext();
+  const showMemberFilter = isOrgContext || isPlatformManager;
+  // Org context: show org members. PM personal view: show all platform users.
+  const { data: orgMembers } = useOrganizationMembers(
+    activeOrganizationId || "",
+  );
+  const { data: allUsersResponse } = useUsers({
+    enabled: isPlatformManager && !isOrgContext,
+  });
+  const memberList = React.useMemo(() => {
+    if (isOrgContext && orgMembers) {
+      return orgMembers
+        .filter((m) => m.status === "active" && m.user)
+        .map((m) => ({ id: m.user!.id, email: m.user!.email }));
+    }
+    if (isPlatformManager && !isOrgContext && allUsersResponse?.data) {
+      return allUsersResponse.data.map((u) => ({ id: u.id, email: u.email }));
+    }
+    return [];
+  }, [isOrgContext, orgMembers, isPlatformManager, allUsersResponse]);
+
+  const [selectedMemberId, setSelectedMemberId] = useState<string | undefined>(
+    undefined,
+  );
+  const [memberPopoverOpen, setMemberPopoverOpen] = useState(false);
+
+  // Batch-specific filters
+  const [statusFilter, setStatusFilter] = useState<BatchStatus | "all">("all");
+  const [sortActiveFirst, setSortActiveFirst] = useState(true);
+  const [dateRange, setDateRange] = useState<
+    { from: Date; to: Date } | undefined
+  >(undefined);
+
+  // Clear filters when org context changes
+  useEffect(() => {
+    setSelectedMemberId(undefined);
+    setStatusFilter("all");
+  }, [activeOrganizationId]);
 
   // Drag and drop state (kept locally as it's UI-only)
   const [dragActive, setDragActive] = useState(false);
@@ -142,6 +214,7 @@ export function Batches({
   const { data: filesResponse, isLoading: filesLoading } = useFiles({
     purpose: filePurpose,
     search: debouncedFileSearch.trim() || undefined,
+    member_id: selectedMemberId,
     ...filesPagination.queryParams,
     enabled: activeTab === "files" || !!batchFileFilter,
   });
@@ -150,8 +223,11 @@ export function Batches({
   const { data: batchesResponse, isLoading: batchesLoading } = useBatches({
     search: debouncedBatchSearch.trim() || undefined,
     include: "analytics",
+    member_id: selectedMemberId,
+    status: statusFilter !== "all" ? statusFilter : undefined,
+    created_after: dateRange?.from.toISOString(),
+    created_before: dateRange?.to.toISOString(),
     ...batchesPagination.queryParams,
-    // Always fetch to populate tab counts, but refetch interval is lower when not active
   });
 
   // Process batches response - remove extra item used for hasMore detection
@@ -171,11 +247,32 @@ export function Batches({
   // Display files as returned by API (server-side filtered by purpose)
   const files = filesForDisplay;
 
-  // Filter batches by input file if filter is set
+  // Apply client-side filters and sorting to batches
   const filteredBatches = React.useMemo(() => {
-    if (!batchFileFilter) return batches;
-    return batches.filter((b) => b.input_file_id === batchFileFilter);
-  }, [batches, batchFileFilter]);
+    let result = batches;
+
+    // Filter by input file (client-side, from file detail view)
+    if (batchFileFilter) {
+      result = result.filter((b) => b.input_file_id === batchFileFilter);
+    }
+
+    // Sort active batches first if toggled
+    if (sortActiveFirst) {
+      const activeStatuses = new Set([
+        "validating",
+        "in_progress",
+        "finalizing",
+        "cancelling",
+      ]);
+      result = [...result].sort((a, b) => {
+        const aActive = activeStatuses.has(a.status) ? 0 : 1;
+        const bActive = activeStatuses.has(b.status) ? 0 : 1;
+        return aActive - bActive;
+      });
+    }
+
+    return result;
+  }, [batches, batchFileFilter, sortActiveFirst]);
 
   // Create a map of batch ID to analytics for easy lookup (analytics are now embedded in batch response)
   const batchAnalyticsMap = React.useMemo(() => {
@@ -381,6 +478,8 @@ export function Batches({
     onTriggerBatch: handleTriggerBatch,
     onViewBatches: handleFileClick,
     isFileInProgress,
+    showUserColumn,
+    showContextColumn,
   });
 
   const handleBatchClick = (batch: Batch) => {
@@ -399,11 +498,85 @@ export function Batches({
     getInputFile,
     onRowClick: handleBatchClick,
     batchAnalytics: batchAnalyticsMap,
-    showUserColumn: isPlatformManager,
+    showUserColumn,
+    showContextColumn,
   });
 
+  // Searchable member filter combobox - shared between batches and files tabs
+  const selectedMemberEmail = memberList.find(
+    (m) => m.id === selectedMemberId,
+  )?.email;
+  const memberFilterCombobox = showMemberFilter && memberList.length > 0 && (
+    <Popover open={memberPopoverOpen} onOpenChange={setMemberPopoverOpen}>
+      <PopoverTrigger asChild>
+        <Button
+          variant="outline"
+          role="combobox"
+          aria-expanded={memberPopoverOpen}
+          className="w-[220px] h-9 justify-between font-normal"
+        >
+          <div className="flex items-center gap-1.5 truncate">
+            <Users className="w-3.5 h-3.5 shrink-0 text-gray-500" />
+            <span className="truncate">
+              {selectedMemberEmail || "All members"}
+            </span>
+          </div>
+          <ChevronsUpDown className="ml-1 h-3.5 w-3.5 shrink-0 opacity-50" />
+        </Button>
+      </PopoverTrigger>
+      <PopoverContent className="w-[280px] p-0" align="start">
+        <Command>
+          <CommandInput placeholder="Search by email..." />
+          <CommandList>
+            <CommandEmpty>No members found.</CommandEmpty>
+            <CommandGroup>
+              <CommandItem
+                value="all-members"
+                onSelect={() => {
+                  setSelectedMemberId(undefined);
+                  setMemberPopoverOpen(false);
+                  batchesPagination.handleFirstPage();
+                  filesPagination.handleFirstPage();
+                }}
+              >
+                <Check
+                  className={cn(
+                    "mr-2 h-4 w-4",
+                    !selectedMemberId ? "opacity-100" : "opacity-0",
+                  )}
+                />
+                All members
+              </CommandItem>
+              {memberList.map((member) => (
+                <CommandItem
+                  key={member.id}
+                  value={member.email}
+                  onSelect={() => {
+                    setSelectedMemberId(member.id);
+                    setMemberPopoverOpen(false);
+                    batchesPagination.handleFirstPage();
+                    filesPagination.handleFirstPage();
+                  }}
+                >
+                  <Check
+                    className={cn(
+                      "mr-2 h-4 w-4",
+                      selectedMemberId === member.id
+                        ? "opacity-100"
+                        : "opacity-0",
+                    )}
+                  />
+                  <span className="truncate">{member.email}</span>
+                </CommandItem>
+              ))}
+            </CommandGroup>
+          </CommandList>
+        </Command>
+      </PopoverContent>
+    </Popover>
+  );
+
   const bootstrapBanner = useBootstrapContent();
-  console.log("bootstrapBanner", bootstrapBanner);
 
   return (
     <div
@@ -563,7 +736,52 @@ export function Batches({
               </div>
             }
             headerActions={
-              <div className="flex items-center gap-2">
+              <div className="flex items-center gap-2 flex-wrap">
+                <div className="flex items-center gap-1.5">
+                  <Switch
+                    id="active-first"
+                    checked={sortActiveFirst}
+                    onCheckedChange={setSortActiveFirst}
+                  />
+                  <label
+                    htmlFor="active-first"
+                    className="text-sm text-gray-600 cursor-pointer select-none"
+                  >
+                    Active first
+                  </label>
+                </div>
+                {memberFilterCombobox}
+                <Select
+                  value={statusFilter}
+                  onValueChange={(v) => {
+                    setStatusFilter(v as BatchStatus | "all");
+                    batchesPagination.handleFirstPage();
+                  }}
+                >
+                  <SelectTrigger className="w-[140px] h-9">
+                    <div className="flex items-center gap-1.5">
+                      <Filter className="w-3.5 h-3.5 text-gray-500" />
+                      <SelectValue />
+                    </div>
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="all">All statuses</SelectItem>
+                    <SelectItem value="in_progress">In Progress</SelectItem>
+                    <SelectItem value="completed">Completed</SelectItem>
+                    <SelectItem value="failed">Failed</SelectItem>
+                    <SelectItem value="cancelled">Cancelled</SelectItem>
+                    <SelectItem value="validating">Validating</SelectItem>
+                    <SelectItem value="finalizing">Finalizing</SelectItem>
+                    <SelectItem value="expired">Expired</SelectItem>
+                  </SelectContent>
+                </Select>
+                <DateTimeRangeSelector
+                  value={dateRange}
+                  onChange={(range) => {
+                    setDateRange(range);
+                    batchesPagination.handleFirstPage();
+                  }}
+                />
                 <span className="text-sm text-gray-600">Rows:</span>
                 <Select
                   value={batchesPagination.pageSize.toString()}
@@ -571,7 +789,7 @@ export function Batches({
                     batchesPagination.handlePageSizeChange(Number(value))
                   }
                 >
-                  <SelectTrigger className="w-20p h-9">
+                  <SelectTrigger className="w-20 h-9">
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
@@ -641,7 +859,8 @@ export function Batches({
               </div>
             }
             headerActions={
-              <div className="flex items-center gap-2">
+              <div className="flex items-center gap-2 flex-wrap">
+                {memberFilterCombobox}
                 <div className="inline-flex h-9 items-center justify-center rounded-md bg-muted p-1 text-muted-foreground">
                   {(["input", "output", "error"] as const).map((type) => {
                     const Icon =

@@ -1009,6 +1009,12 @@ export interface FileObject {
     | "vision"
     | "user_data"
     | "evals";
+  /** Email of the individual who created this file */
+  created_by_email?: string;
+  /** "Personal" or org name */
+  context_name?: string;
+  /** "personal" or "organization" */
+  context_type?: string;
 }
 
 export interface FileListResponse {
@@ -1042,6 +1048,8 @@ export interface FilesListQuery {
   purpose?: string;
   search?: string;
   own?: boolean;
+  /** Filter by member user ID (for per-member filtering within orgs) */
+  member_id?: string;
 }
 
 export interface ModelCostBreakdown {
@@ -1125,6 +1133,7 @@ export interface Batch {
   cancelling_at?: number | null;
   cancelled_at?: number | null;
   request_counts: BatchRequestCounts;
+  /** Metadata includes: created_by, created_by_email, request_source, context_name, context_type */
   metadata?: Record<string, string>;
   usage?: BatchUsage;
   /** Included when requesting with include=analytics */
@@ -1156,6 +1165,14 @@ export interface BatchesListQuery {
   search?: string;
   /** Comma-separated list of related resources to include. Supported: "analytics" */
   include?: string;
+  /** Filter by member user ID (for per-member filtering within orgs) */
+  member_id?: string;
+  /** Filter by batch status (e.g. "completed", "in_progress", "failed") */
+  status?: string;
+  /** Only return batches created after this ISO 8601 timestamp */
+  created_after?: string;
+  /** Only return batches created before this ISO 8601 timestamp */
+  created_before?: string;
 }
 
 // ===== BATCH REQUESTS (Custom endpoints beyond OpenAI spec) =====

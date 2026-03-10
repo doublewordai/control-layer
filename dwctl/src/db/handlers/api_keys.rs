@@ -441,6 +441,58 @@ impl<'c> ApiKeys<'c> {
         Ok((secret, id))
     }
 
+    /// Find the hidden API key ID for a given user, purpose, and creator.
+    /// Returns None if no matching key exists (member hasn't created any batches/files yet).
+    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
+    pub async fn find_hidden_key_id(&mut self, user_id: UserId, purpose: ApiKeyPurpose, created_by: UserId) -> Result<Option<ApiKeyId>> {
+        let purpose_str = match purpose {
+            ApiKeyPurpose::Platform => "platform",
+            ApiKeyPurpose::Realtime => "realtime",
+            ApiKeyPurpose::Batch => "batch",
+            ApiKeyPurpose::Playground => "playground",
+        };
+
+        let key_id = sqlx::query_scalar!(
+            r#"
+            SELECT id
+            FROM api_keys
+            WHERE user_id = $1 AND purpose = $2 AND hidden = true
+            AND created_by = $3
+            AND is_deleted = false
+            LIMIT 1
+            "#,
+            user_id,
+            purpose_str,
+            created_by
+        )
+        .fetch_optional(&mut *self.db)
+        .await?;
+
+        Ok(key_id)
+    }
+
+    /// Bulk lookup the `created_by` user IDs for a set of API key IDs.
+    /// Returns a map from api_key_id to the user who created that key.
+    #[instrument(skip(self, key_ids), err)]
+    pub async fn get_creators_by_key_ids(&mut self, key_ids: Vec<ApiKeyId>) -> Result<HashMap<ApiKeyId, UserId>> {
+        if key_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let rows = sqlx::query!(
+            r#"
+            SELECT id, created_by
+            FROM api_keys
+            WHERE id = ANY($1)
+            "#,
+            &key_ids
+        )
+        .fetch_all(&mut *self.db)
+        .await?;
+
+        Ok(rows.into_iter().map(|r| (r.id, r.created_by)).collect())
+    }
+
     /// Get specific deployment IDs that an API key has access to
     #[instrument(skip(self), fields(api_key_id = %abbrev_uuid(&api_key_id)), err)]
     async fn get_api_key_deployments(&mut self, api_key_id: ApiKeyId) -> Result<Vec<DeploymentId>> {
