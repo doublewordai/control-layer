@@ -50,7 +50,7 @@ pub async fn get_pending_request_counts<P: PoolProvider>(
         .iter()
         .map(|window| (window.clone(), parse_window_to_seconds(window)))
         .collect::<Vec<_>>();
-    let states = vec!["pending".to_string()];
+    let states = vec!["pending".to_string(), "claimed".to_string(), "processing".to_string()]; // Include claimed and processing to get a more complete picture of queue depth
     let model_filter: Vec<String> = Vec::new();
 
     let counts = state
