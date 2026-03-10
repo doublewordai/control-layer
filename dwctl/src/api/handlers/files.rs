@@ -981,19 +981,34 @@ pub async fn list_files<P: PoolProvider>(
     let should_enrich = can_read_all_files || is_org_context;
 
     // Translate member_id to api_key_id for fusillade filtering
-    // Only allowed for platform managers or users in org context
+    // Only allowed in org context (requires org-scoped hidden key lookup)
     let api_key_id_filter = if let Some(member_id) = query.member_id {
-        if !should_enrich {
-            return Err(Error::BadRequest {
-                message: "member_id filter is only available in organization context".to_string(),
-            });
-        }
-        let org_id = current_user.active_organization.unwrap_or(current_user.id);
+        let org_id = match current_user.active_organization {
+            Some(org_id) => org_id,
+            None => {
+                return Err(Error::BadRequest {
+                    message: "member_id filter is only available in organization context".to_string(),
+                });
+            }
+        };
         let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
-        ApiKeys::new(&mut conn)
+        let key_id = ApiKeys::new(&mut conn)
             .find_hidden_key_id(org_id, ApiKeyPurpose::Batch, member_id)
             .await
-            .map_err(Error::Database)?
+            .map_err(Error::Database)?;
+        match key_id {
+            Some(id) => Some(id),
+            None => {
+                // Member has no hidden key yet (never created batches/files) — return empty list
+                return Ok(Json(FileListResponse {
+                    object_type: ListObject::List,
+                    data: vec![],
+                    first_id: None,
+                    last_id: None,
+                    has_more: false,
+                }));
+            }
+        }
     } else {
         None
     };

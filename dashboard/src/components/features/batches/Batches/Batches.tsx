@@ -46,7 +46,6 @@ import {
   useFiles,
   useBatches,
   useOrganizationMembers,
-  useUsers,
 } from "../../../../api/control-layer/hooks";
 import { dwctlApi } from "../../../../api/control-layer/client";
 import type { FileObject, Batch } from "../types";
@@ -94,34 +93,26 @@ export function Batches({
   const [searchParams, setSearchParams] = useSearchParams();
   const queryClient = useQueryClient();
   const { userRoles } = useAuthorization();
-  const { isOrgContext } = useOrganizationContext();
+  const { isOrgContext, activeOrganizationId } = useOrganizationContext();
 
   // Show User column for PlatformManagers (see all batches) or in org context (see org members)
   const isPlatformManager = userRoles.includes("PlatformManager");
   const showUserColumn = isPlatformManager || isOrgContext;
   const showContextColumn = isPlatformManager;
 
-  // Member filter - available in org context or for platform managers
-  const { activeOrganizationId } = useOrganizationContext();
-  const showMemberFilter = isOrgContext || isPlatformManager;
-  // Org context: show org members. PM personal view: show all platform users.
+  // Member filter - only available in org context (backend requires org-scoped hidden key lookup)
+  const showMemberFilter = isOrgContext;
   const { data: orgMembers } = useOrganizationMembers(
     activeOrganizationId || "",
   );
-  const { data: allUsersResponse } = useUsers({
-    enabled: isPlatformManager && !isOrgContext,
-  });
   const memberList = React.useMemo(() => {
     if (isOrgContext && orgMembers) {
       return orgMembers
         .filter((m) => m.status === "active" && m.user)
         .map((m) => ({ id: m.user!.id, email: m.user!.email }));
     }
-    if (isPlatformManager && !isOrgContext && allUsersResponse?.data) {
-      return allUsersResponse.data.map((u) => ({ id: u.id, email: u.email }));
-    }
     return [];
-  }, [isOrgContext, orgMembers, isPlatformManager, allUsersResponse]);
+  }, [isOrgContext, orgMembers]);
 
   const [selectedMemberId, setSelectedMemberId] = useState<string | undefined>(
     undefined,
