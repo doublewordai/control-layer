@@ -980,7 +980,7 @@ fn convert_to_config_file(targets: Vec<OnwardsTarget>, composites: Vec<OnwardsCo
     // Convert composite models (including those with no components - they'll return 503)
     for composite in composites {
         if composite.components.is_empty() {
-            debug!("Composite model '{}' has no enabled components - will return 503", composite.alias);
+            warn!("Composite model '{}' has no enabled components - requests will return 503", composite.alias);
         }
 
         let (alias, spec) = convert_composite_to_target_spec(&composite, &mut key_definitions);
