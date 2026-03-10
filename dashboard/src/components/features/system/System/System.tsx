@@ -160,9 +160,9 @@ const createDaemonColumns = (): ColumnDef<Daemon>[] => [
     },
   },
   {
-    accessorKey: "config.header_timeout_ms",
+    accessorKey: "config.first_chunk_timeout_ms",
     header: "Header Timeout",
-    cell: ({ row }) => formatDuration(row.original.config.header_timeout_ms),
+    cell: ({ row }) => formatDuration(row.original.config.first_chunk_timeout_ms),
   },
   {
     accessorKey: "config.chunk_timeout_ms",
@@ -358,7 +358,7 @@ export function System() {
                   showColumnToggle={true}
                   initialColumnVisibility={{
                     id: false,
-                    "config.header_timeout_ms": false,
+                    "config.first_chunk_timeout_ms": false,
                     "config.chunk_timeout_ms": false,
                     "config.body_timeout_ms": false,
                   }}

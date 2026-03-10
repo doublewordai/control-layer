@@ -1283,7 +1283,7 @@ export interface DaemonConfig {
   backoff_ms: number;
   backoff_factor: number;
   max_backoff_ms: number;
-  header_timeout_ms: number;
+  first_chunk_timeout_ms: number;
   chunk_timeout_ms: number;
   body_timeout_ms: number;
   status_log_interval_ms?: number | null;

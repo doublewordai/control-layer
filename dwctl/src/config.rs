@@ -1049,15 +1049,15 @@ pub struct DaemonConfig {
     /// Maximum backoff time in milliseconds (default: 10000)
     pub max_backoff_ms: u64,
 
-    /// Deprecated: use header_timeout_ms, chunk_timeout_ms, and body_timeout_ms instead.
-    /// If set, splits into 90% header_timeout_ms and 10% body_timeout_ms.
+    /// Deprecated: use first_chunk_timeout_ms, chunk_timeout_ms, and body_timeout_ms instead.
+    /// If set, splits into 90% first_chunk_timeout_ms and 10% body_timeout_ms.
     /// Ignored when the granular timeout fields are explicitly set.
     pub timeout_ms: Option<u64>,
 
     /// Timeout for receiving response headers (connect + time-to-first-token) in milliseconds.
     /// This should be generous enough to cover slow model inference starts.
     /// Default: 86,400,000 (24 hours).
-    pub header_timeout_ms: u64,
+    pub first_chunk_timeout_ms: u64,
 
     /// Timeout for receiving the next chunk of response body in milliseconds.
     /// Once the server starts streaming, each inter-chunk gap must be shorter
@@ -1143,7 +1143,7 @@ impl Default for DaemonConfig {
             backoff_factor: 2,
             max_backoff_ms: 10000,
             timeout_ms: None,
-            header_timeout_ms: 86_400_000,
+            first_chunk_timeout_ms: 86_400_000,
             chunk_timeout_ms: 86_400_000,
             body_timeout_ms: 86_400_000,
             status_log_interval_ms: Some(2000),
@@ -1170,20 +1170,20 @@ impl DaemonConfig {
     ) -> fusillade::daemon::DaemonConfig {
         // If the deprecated timeout_ms is set and the granular fields are at their
         // defaults, split it: 90% header (connect + TTFT), 10% body.
-        let (header_timeout_ms, chunk_timeout_ms, body_timeout_ms) = if let Some(timeout) = self.timeout_ms {
-            if self.header_timeout_ms == 86_400_000 && self.chunk_timeout_ms == 86_400_000 && self.body_timeout_ms == 86_400_000 {
+        let (first_chunk_timeout_ms, chunk_timeout_ms, body_timeout_ms) = if let Some(timeout) = self.timeout_ms {
+            if self.first_chunk_timeout_ms == 86_400_000 && self.chunk_timeout_ms == 86_400_000 && self.body_timeout_ms == 86_400_000 {
                 tracing::warn!(
                     timeout_ms = timeout,
                     "batch_daemon.timeout_ms is deprecated; \
-                         use header_timeout_ms, chunk_timeout_ms, and body_timeout_ms instead"
+                         use first_chunk_timeout_ms, chunk_timeout_ms, and body_timeout_ms instead"
                 );
                 (timeout * 9 / 10, 86_400_000, timeout / 10)
             } else {
                 // Granular fields were explicitly set — ignore deprecated field
-                (self.header_timeout_ms, self.chunk_timeout_ms, self.body_timeout_ms)
+                (self.first_chunk_timeout_ms, self.chunk_timeout_ms, self.body_timeout_ms)
             }
         } else {
-            (self.header_timeout_ms, self.chunk_timeout_ms, self.body_timeout_ms)
+            (self.first_chunk_timeout_ms, self.chunk_timeout_ms, self.body_timeout_ms)
         };
 
         fusillade::daemon::DaemonConfig {
@@ -1197,7 +1197,7 @@ impl DaemonConfig {
             backoff_ms: self.backoff_ms,
             backoff_factor: self.backoff_factor,
             max_backoff_ms: self.max_backoff_ms,
-            header_timeout_ms,
+            first_chunk_timeout_ms,
             chunk_timeout_ms,
             body_timeout_ms,
             status_log_interval_ms: self.status_log_interval_ms,
