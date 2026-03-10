@@ -14,7 +14,8 @@ use crate::api::models::batches::{
 };
 use crate::api::models::users::CurrentUser;
 use crate::auth::permissions::{RequiresPermission, can_read_all_resources, has_permission, operation, resource};
-use crate::db::handlers::{Credits, Users, repository::Repository};
+use crate::db::handlers::{Credits, Users, api_keys::ApiKeys, repository::Repository};
+use crate::db::models::api_keys::ApiKeyPurpose;
 use crate::errors::{Error, Result};
 use crate::types::{Operation, Resource};
 use axum::{
@@ -370,6 +371,17 @@ pub async fn create_batch<P: PoolProvider>(
     // When in org context, attribute batch ownership to the org
     let target_user_id = current_user.active_organization.unwrap_or(current_user.id);
 
+    // Get the hidden API key ID for per-member attribution within orgs
+    let api_key_id = {
+        let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
+        let mut api_keys_repo = ApiKeys::new(&mut conn);
+        let (_secret, key_id) = api_keys_repo
+            .get_or_create_hidden_key_with_id(target_user_id, ApiKeyPurpose::Batch, current_user.id)
+            .await
+            .map_err(Error::Database)?;
+        key_id
+    };
+
     // Convert metadata to HashMap and inject request_source and user info
     // Note: created_by_email is NOT stored in metadata to avoid PII in denormalized storage.
     // The email is fetched via user lookup when building API responses.
@@ -386,6 +398,7 @@ pub async fn create_batch<P: PoolProvider>(
         completion_window: req.completion_window.clone(),
         metadata,
         created_by: Some(target_user_id.to_string()),
+        api_key_id: Some(api_key_id),
     };
 
     let reservation_ids = reserve_capacity_for_batch(
@@ -1299,7 +1312,7 @@ pub async fn list_batches<P: PoolProvider>(
     // Fetch batches with ownership filtering, search, and cursor-based pagination
     let batches = state
         .request_manager
-        .list_batches(created_by, query.search.clone(), after, limit + 1) // Fetch one extra to determine has_more
+        .list_batches(created_by, query.search.clone(), after, limit + 1, query.api_key_id) // Fetch one extra to determine has_more
         .await
         .map_err(|e| Error::Internal {
             operation: format!("list batches: {}", e),

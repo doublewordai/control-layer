@@ -375,6 +375,72 @@ impl<'c> ApiKeys<'c> {
         Ok(secret)
     }
 
+    /// Get or create a hidden API key, returning both the secret and the key's UUID.
+    /// Used when the caller needs to pass the key ID to fusillade for attribution.
+    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
+    pub async fn get_or_create_hidden_key_with_id(&mut self, user_id: UserId, purpose: ApiKeyPurpose, created_by: UserId) -> Result<(String, ApiKeyId)> {
+        let purpose_str = match purpose {
+            ApiKeyPurpose::Platform => "platform",
+            ApiKeyPurpose::Realtime => "realtime",
+            ApiKeyPurpose::Batch => "batch",
+            ApiKeyPurpose::Playground => "playground",
+        };
+
+        // Try to get existing hidden key for this user and purpose
+        let existing_key = sqlx::query!(
+            r#"
+            SELECT id, secret
+            FROM api_keys
+            WHERE user_id = $1 AND purpose = $2 AND hidden = true
+            AND created_by = $3
+            AND is_deleted = false
+            LIMIT 1
+            "#,
+            user_id,
+            purpose_str,
+            created_by
+        )
+        .fetch_optional(&mut *self.db)
+        .await?;
+
+        if let Some(row) = existing_key {
+            tracing::debug!("Using existing hidden API key for user");
+            return Ok((row.secret, row.id));
+        }
+
+        // No existing key found, create a new one
+        let secret = generate_api_key();
+        let name = if user_id == created_by {
+            format!("Internal {} Key", purpose_str)
+        } else {
+            format!("Internal {} Key ({})", purpose_str, &created_by.to_string()[..8])
+        };
+        let description = Some(format!(
+            "Automatically managed internal API key for {} operations. Not visible to users.",
+            purpose_str
+        ));
+
+        tracing::info!("Creating new hidden API key for user");
+
+        let id = sqlx::query_scalar!(
+            r#"
+            INSERT INTO api_keys (name, description, secret, purpose, user_id, created_by, hidden)
+            VALUES ($1, $2, $3, $4, $5, $6, true)
+            RETURNING id
+            "#,
+            name,
+            description,
+            secret,
+            purpose_str,
+            user_id,
+            created_by
+        )
+        .fetch_one(&mut *self.db)
+        .await?;
+
+        Ok((secret, id))
+    }
+
     /// Get specific deployment IDs that an API key has access to
     #[instrument(skip(self), fields(api_key_id = %abbrev_uuid(&api_key_id)), err)]
     async fn get_api_key_deployments(&mut self, api_key_id: ApiKeyId) -> Result<Vec<DeploymentId>> {

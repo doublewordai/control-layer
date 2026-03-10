@@ -27,6 +27,9 @@ pub struct ListFilesQuery {
     /// If true, only return files uploaded by the current user (even if the user has ReadAll permission)
     #[serde(default)]
     pub own: bool,
+
+    /// Filter by API key UUID (for per-member filtering within orgs)
+    pub api_key_id: Option<uuid::Uuid>,
 }
 
 fn default_order() -> String {

@@ -295,6 +295,9 @@ pub struct ListBatchesQuery {
     /// Comma-separated list of related resources to include. Supported: "analytics"
     #[param(example = "analytics")]
     pub include: Option<String>,
+
+    /// Filter by API key UUID (for per-member filtering within orgs)
+    pub api_key_id: Option<uuid::Uuid>,
 }
 
 /// Query parameters for batch results

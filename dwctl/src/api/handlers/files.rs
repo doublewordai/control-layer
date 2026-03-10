@@ -406,6 +406,7 @@ fn create_file_stream(
     api_key: String,
     accessible_models: HashMap<String, Option<ModelType>>,
     allowed_url_paths: Vec<String>,
+    api_key_id: Option<uuid::Uuid>,
 ) -> FileStreamResult {
     let (tx, rx) = mpsc::channel(config.buffer_size);
     // std::sync::Mutex is appropriate here because:
@@ -421,6 +422,7 @@ fn create_file_stream(
         let mut incomplete_utf8_bytes = Vec::with_capacity(4);
         let mut metadata = fusillade::FileMetadata {
             uploaded_by,
+            api_key_id,
             ..Default::default()
         };
         let mut file_processed = false;
@@ -824,12 +826,13 @@ pub async fn upload_file<P: PoolProvider>(
     let target_user_id = current_user.active_organization.unwrap_or(current_user.id);
     let uploaded_by = Some(target_user_id.to_string());
 
-    // Get or create user-specific hidden batch API key for batch request execution
+    // Get or create user-specific hidden batch API key for batch request execution.
+    // We need the key ID for per-member attribution within orgs.
     let target_user_id = current_user.active_organization.unwrap_or(current_user.id);
     let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut api_keys_repo = ApiKeys::new(&mut conn);
-    let user_api_key = api_keys_repo
-        .get_or_create_hidden_key(target_user_id, ApiKeyPurpose::Batch, current_user.id)
+    let (user_api_key, api_key_id) = api_keys_repo
+        .get_or_create_hidden_key_with_id(target_user_id, ApiKeyPurpose::Batch, current_user.id)
         .await
         .map_err(Error::Database)?;
 
@@ -858,6 +861,7 @@ pub async fn upload_file<P: PoolProvider>(
         user_api_key,
         accessible_models,
         state.config.batches.allowed_url_paths.clone(),
+        Some(api_key_id),
     );
 
     // Create file via request manager with streaming
@@ -981,6 +985,7 @@ pub async fn list_files<P: PoolProvider>(
         search: query.search.clone(),
         after,
         limit: Some((limit + 1) as usize), // Fetch one extra to check has_more
+        api_key_id: query.api_key_id,
         ascending: query.order == "asc",
     };
 
