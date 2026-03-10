@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.16.1](https://github.com/doublewordai/control-layer/compare/v8.16.0...v8.16.1) (2026-03-10)
+
+
+### Bug Fixes
+
+* allow users to trigger a batch within their org ([#831](https://github.com/doublewordai/control-layer/issues/831)) ([974534b](https://github.com/doublewordai/control-layer/commit/974534b2635037e779ba773f18ab1aad46a4b6fd))
+
 ## [8.16.0](https://github.com/doublewordai/control-layer/compare/v8.15.6...v8.16.0) (2026-03-10)
 
 
