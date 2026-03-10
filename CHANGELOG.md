@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.15.6](https://github.com/doublewordai/control-layer/compare/v8.15.5...v8.15.6) (2026-03-10)
+
+
+### Bug Fixes
+
+* warn when composite model has no enabled components (503) ([#827](https://github.com/doublewordai/control-layer/issues/827)) ([1253166](https://github.com/doublewordai/control-layer/commit/1253166aa34f410576e97d69bd2a5439ceb23953))
+
 ## [8.15.5](https://github.com/doublewordai/control-layer/compare/v8.15.4...v8.15.5) (2026-03-09)
 
 
