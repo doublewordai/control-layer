@@ -1642,6 +1642,7 @@ async fn setup_background_services(
         let (onwards_config_sync, initial_targets, onwards_stream) = sync::onwards_config::OnwardsConfigSync::new_with_daemon_limits(
             pool.clone(),
             Some(model_capacity_limits.clone()),
+            config.background_services.batch_daemon.default_model_concurrency,
             escalation_models,
             config.onwards.strict_mode,
         )

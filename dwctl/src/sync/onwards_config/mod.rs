@@ -87,6 +87,8 @@ pub struct OnwardsConfigSync {
     sender: watch::Sender<Targets>,
     /// Shared map of model batch capacity limits for the daemon
     daemon_capacity_limits: Option<Arc<dashmap::DashMap<String, usize>>>,
+    /// Default batch concurrency for models without explicit batch_capacity
+    default_batch_capacity: usize,
     /// Model aliases that batch API keys should have automatic access to (escalation targets)
     escalation_models: Vec<String>,
     /// Tracks previous-cycle gauge label sets for zeroing stale metrics
@@ -118,19 +120,20 @@ impl OnwardsConfigSync {
     #[cfg(test)]
     #[instrument(skip(db))]
     pub async fn new(db: PgPool) -> Result<(Self, Targets, WatchTargetsStream), anyhow::Error> {
-        Self::new_with_daemon_limits(db, None, Vec::new(), false).await
+        Self::new_with_daemon_limits(db, None, 10, Vec::new(), false).await
     }
 
     /// Creates a new OnwardsConfigSync with optional daemon capacity limits map and escalation models
     ///
+    /// `daemon_capacity_limits` - Shared map populated with per-model concurrency limits for the batch daemon.
+    /// `default_batch_capacity` - Default concurrency limit for models without explicit `batch_capacity`.
     /// `escalation_models` - Model aliases that batch API keys should have automatic access to.
-    /// This enables batch processing to route requests to escalation models without needing
-    /// separate API key configuration.
     /// `strict_mode` - Enable strict mode with schema validation (only known OpenAI API paths accepted)
     #[instrument(skip(db, daemon_capacity_limits, escalation_models))]
     pub async fn new_with_daemon_limits(
         db: PgPool,
         daemon_capacity_limits: Option<Arc<dashmap::DashMap<String, usize>>>,
+        default_batch_capacity: usize,
         escalation_models: Vec<String>,
         strict_mode: bool,
     ) -> Result<(Self, Targets, WatchTargetsStream), anyhow::Error> {
@@ -139,7 +142,7 @@ impl OnwardsConfigSync {
 
         // If daemon limits are provided, populate them
         if let Some(ref limits) = daemon_capacity_limits {
-            update_daemon_capacity_limits(&db, limits).await?;
+            update_daemon_capacity_limits(&db, limits, default_batch_capacity).await?;
         }
 
         // Populate cache info metrics on startup
@@ -155,6 +158,7 @@ impl OnwardsConfigSync {
             db,
             sender,
             daemon_capacity_limits,
+            default_batch_capacity,
             escalation_models,
             cache_info_state,
             strict_mode,
@@ -257,7 +261,7 @@ impl OnwardsConfigSync {
 
                                         // Update daemon capacity limits if configured
                                         if let Some(ref limits) = self.daemon_capacity_limits
-                                            && let Err(e) = update_daemon_capacity_limits(&self.db, limits).await {
+                                            && let Err(e) = update_daemon_capacity_limits(&self.db, limits, self.default_batch_capacity).await {
                                                 error!("Failed to update daemon capacity limits: {}", e);
                                             }
 
@@ -340,7 +344,7 @@ impl OnwardsConfigSync {
 
                                 // Update daemon capacity limits if configured
                                 if let Some(ref limits) = self.daemon_capacity_limits
-                                    && let Err(e) = update_daemon_capacity_limits(&self.db, limits).await {
+                                    && let Err(e) = update_daemon_capacity_limits(&self.db, limits, self.default_batch_capacity).await {
                                         error!("Failed to update daemon capacity limits: {}", e);
                                     }
 
@@ -1224,10 +1228,12 @@ pub async fn load_targets_from_db(db: &PgPool, escalation_models: &[String], str
     Targets::from_config(config)
 }
 
-/// Updates the daemon capacity limits DashMap with batch_capacity values from deployed_models
-/// Atomically updates the map without clearing it to avoid a window with no limits
-async fn update_daemon_capacity_limits(db: &PgPool, limits: &Arc<dashmap::DashMap<String, usize>>) -> Result<(), anyhow::Error> {
-    // Query all models with their batch_capacity (including nulls to know what to remove)
+/// Updates the daemon capacity limits DashMap from deployed_models.
+///
+/// Every non-deleted deployed model gets an entry: explicit `batch_capacity` if set,
+/// otherwise `default_capacity`. This ensures the daemon will claim requests for all
+/// deployed models, not just those with an explicit batch_capacity override.
+async fn update_daemon_capacity_limits(db: &PgPool, limits: &Arc<dashmap::DashMap<String, usize>>, default_capacity: usize) -> Result<(), anyhow::Error> {
     let models = sqlx::query!(
         r#"
         SELECT alias, batch_capacity
@@ -1238,20 +1244,19 @@ async fn update_daemon_capacity_limits(db: &PgPool, limits: &Arc<dashmap::DashMa
     .fetch_all(db)
     .await?;
 
-    // Build a set of models that should have limits
-    let mut models_with_limits = std::collections::HashSet::new();
+    let mut active_models = std::collections::HashSet::new();
 
-    // Insert/update limits for models with batch_capacity
     for model in &models {
-        if let Some(batch_capacity) = model.batch_capacity {
-            models_with_limits.insert(model.alias.clone());
-            limits.insert(model.alias.clone(), batch_capacity as usize);
-            debug!("Updated daemon capacity limit for model '{}': {}", model.alias, batch_capacity);
-        }
+        let capacity = model.batch_capacity
+            .map(|c| c as usize)
+            .unwrap_or(default_capacity);
+        active_models.insert(model.alias.clone());
+        limits.insert(model.alias.clone(), capacity);
+        debug!("Updated daemon capacity limit for model '{}': {}", model.alias, capacity);
     }
 
-    // Remove limits for models that no longer have batch_capacity or were deleted
-    limits.retain(|model_alias, _| models_with_limits.contains(model_alias));
+    // Remove limits for models that were deleted
+    limits.retain(|model_alias, _| active_models.contains(model_alias));
 
     debug!("Updated {} model capacity limits for daemon", limits.len());
     Ok(())
