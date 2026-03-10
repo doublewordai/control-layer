@@ -433,6 +433,8 @@ pub struct ProcessAutoTopupRequest {
     pub threshold: f32,
     /// Amount in dollars to top up when threshold is reached.
     pub amount: f32,
+    /// Optional monthly spending limit in dollars. Null or omitted means no limit.
+    pub monthly_limit: Option<f32>,
 }
 
 /// Enable auto top-up for the current user
@@ -474,6 +476,18 @@ pub async fn process_auto_topup<P: PoolProvider>(
             StatusCode::BAD_REQUEST,
             Json(json!({
                 "message": "Threshold must be non-negative and amount must be positive"
+            })),
+        )
+            .into_response());
+    }
+
+    if let Some(limit) = body.monthly_limit
+        && limit <= 0.0
+    {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "message": "Monthly limit must be positive"
             })),
         )
             .into_response());
@@ -547,6 +561,7 @@ pub async fn process_auto_topup<P: PoolProvider>(
         low_balance_threshold: None,
         auto_topup_amount: Some(Some(body.amount)),
         auto_topup_threshold: Some(Some(body.threshold)),
+        auto_topup_monthly_limit: Some(body.monthly_limit),
     };
 
     let mut conn = state.db.write().acquire().await.map_err(|e| {
@@ -573,7 +588,8 @@ pub async fn process_auto_topup<P: PoolProvider>(
     Ok(Json(json!({
         "message": "Auto top-up enabled successfully",
         "threshold": body.threshold,
-        "amount": body.amount
+        "amount": body.amount,
+        "monthly_limit": body.monthly_limit
     }))
     .into_response())
 }
@@ -613,6 +629,18 @@ pub async fn enable_auto_topup<P: PoolProvider>(
             StatusCode::BAD_REQUEST,
             Json(json!({
                 "message": "Threshold must be non-negative and amount must be positive"
+            })),
+        )
+            .into_response());
+    }
+
+    if let Some(limit) = body.monthly_limit
+        && limit <= 0.0
+    {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "message": "Monthly limit must be positive"
             })),
         )
             .into_response());
@@ -695,6 +723,7 @@ pub async fn enable_auto_topup<P: PoolProvider>(
                 low_balance_threshold: None,
                 auto_topup_amount: Some(Some(body.amount)),
                 auto_topup_threshold: Some(Some(body.threshold)),
+                auto_topup_monthly_limit: Some(body.monthly_limit),
             };
 
             let mut conn = state.db.write().acquire().await.map_err(|e| {
@@ -711,7 +740,8 @@ pub async fn enable_auto_topup<P: PoolProvider>(
             Ok(Json(json!({
                 "has_payment_method": true,
                 "threshold": body.threshold,
-                "amount": body.amount
+                "amount": body.amount,
+                "monthly_limit": body.monthly_limit
             }))
             .into_response())
         }

@@ -18,7 +18,8 @@
     "low_balance_threshold": 2.0,
     "auto_topup_amount": 50.0,
     "auto_topup_threshold": 5.0,
-    "has_auto_topup_payment_method": true
+    "has_auto_topup_payment_method": true,
+    "auto_topup_monthly_limit": 100.0
   },
   {
     "id": "550e8400-e29b-41d4-a716-446655440002",
@@ -39,7 +40,8 @@
     "low_balance_threshold": 2.0,
     "auto_topup_amount": null,
     "auto_topup_threshold": null,
-    "has_auto_topup_payment_method": false
+    "has_auto_topup_payment_method": false,
+    "auto_topup_monthly_limit": null
   },
   {
     "id": "550e8400-e29b-41d4-a716-446655440003",
@@ -60,7 +62,8 @@
     "low_balance_threshold": null,
     "auto_topup_amount": null,
     "auto_topup_threshold": null,
-    "has_auto_topup_payment_method": false
+    "has_auto_topup_payment_method": false,
+    "auto_topup_monthly_limit": null
   },
   {
     "id": "550e8400-e29b-41d4-a716-446655440004",
@@ -81,7 +84,8 @@
     "low_balance_threshold": 2.0,
     "auto_topup_amount": null,
     "auto_topup_threshold": null,
-    "has_auto_topup_payment_method": false
+    "has_auto_topup_payment_method": false,
+    "auto_topup_monthly_limit": null
   },
   {
     "id": "550e8400-e29b-41d4-a716-446655440005",
@@ -102,7 +106,8 @@
     "low_balance_threshold": 2.0,
     "auto_topup_amount": null,
     "auto_topup_threshold": null,
-    "has_auto_topup_payment_method": false
+    "has_auto_topup_payment_method": false,
+    "auto_topup_monthly_limit": null
   },
   {
     "id": "550e8400-e29b-41d4-a716-446655440006",
@@ -123,7 +128,8 @@
     "low_balance_threshold": null,
     "auto_topup_amount": null,
     "auto_topup_threshold": null,
-    "has_auto_topup_payment_method": false
+    "has_auto_topup_payment_method": false,
+    "auto_topup_monthly_limit": null
   },
   {
     "id": "550e8400-e29b-41d4-a716-446655440007",
@@ -144,7 +150,8 @@
     "low_balance_threshold": 2.0,
     "auto_topup_amount": null,
     "auto_topup_threshold": null,
-    "has_auto_topup_payment_method": false
+    "has_auto_topup_payment_method": false,
+    "auto_topup_monthly_limit": null
   },
   {
     "id": "550e8400-e29b-41d4-a716-446655440008",
@@ -165,7 +172,8 @@
     "low_balance_threshold": 2.0,
     "auto_topup_amount": null,
     "auto_topup_threshold": null,
-    "has_auto_topup_payment_method": false
+    "has_auto_topup_payment_method": false,
+    "auto_topup_monthly_limit": null
   },
   {
     "id": "550e8400-e29b-41d4-a716-446655440009",
@@ -186,7 +194,8 @@
     "low_balance_threshold": null,
     "auto_topup_amount": null,
     "auto_topup_threshold": null,
-    "has_auto_topup_payment_method": false
+    "has_auto_topup_payment_method": false,
+    "auto_topup_monthly_limit": null
   },
   {
     "id": "550e8400-e29b-41d4-a716-446655440010",
@@ -207,7 +216,8 @@
     "low_balance_threshold": 2.0,
     "auto_topup_amount": null,
     "auto_topup_threshold": null,
-    "has_auto_topup_payment_method": false
+    "has_auto_topup_payment_method": false,
+    "auto_topup_monthly_limit": null
   },
   {
     "id": "550e8400-e29b-41d4-a716-446655440011",
@@ -228,7 +238,8 @@
     "low_balance_threshold": null,
     "auto_topup_amount": null,
     "auto_topup_threshold": null,
-    "has_auto_topup_payment_method": false
+    "has_auto_topup_payment_method": false,
+    "auto_topup_monthly_limit": null
   },
   {
     "id": "550e8400-e29b-41d4-a716-446655440012",
@@ -249,7 +260,8 @@
     "low_balance_threshold": null,
     "auto_topup_amount": null,
     "auto_topup_threshold": null,
-    "has_auto_topup_payment_method": false
+    "has_auto_topup_payment_method": false,
+    "auto_topup_monthly_limit": null
   },
   {
     "id": "550e8400-e29b-41d4-a716-446655440013",
@@ -270,7 +282,8 @@
     "low_balance_threshold": 2.0,
     "auto_topup_amount": null,
     "auto_topup_threshold": null,
-    "has_auto_topup_payment_method": false
+    "has_auto_topup_payment_method": false,
+    "auto_topup_monthly_limit": null
   },
   {
     "id": "550e8400-e29b-41d4-a716-446655440014",
@@ -291,7 +304,8 @@
     "low_balance_threshold": null,
     "auto_topup_amount": null,
     "auto_topup_threshold": null,
-    "has_auto_topup_payment_method": false
+    "has_auto_topup_payment_method": false,
+    "auto_topup_monthly_limit": null
   },
   {
     "id": "550e8400-e29b-41d4-a716-446655440015",
@@ -312,6 +326,7 @@
     "low_balance_threshold": 2.0,
     "auto_topup_amount": null,
     "auto_topup_threshold": null,
-    "has_auto_topup_payment_method": false
+    "has_auto_topup_payment_method": false,
+    "auto_topup_monthly_limit": null
   }
 ]

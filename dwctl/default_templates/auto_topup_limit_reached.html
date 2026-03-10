@@ -1,0 +1,18 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"></head>
+<body style="font-family: system-ui, sans-serif; max-width: 600px; margin: 40px auto; padding: 20px; color: #333;">
+    <p>Hi {{ to_name }},</p>
+
+    <p>Your monthly auto top-up limit of <strong>${{ monthly_limit }}</strong> has been reached for this month.</p>
+
+    <p>Auto top-ups are paused until the start of next month. Your current balance is <strong>${{ balance }}</strong>.</p>
+
+    <p>You can <a href="{{ dashboard_link }}">add funds manually</a> or <a href="{{ profile_link }}">increase your monthly limit</a> if you'd like to continue using auto top-up this month.</p>
+
+    <p style="font-size: 12px; color: #888; margin-top: 30px; border-top: 1px solid #eee; padding-top: 15px;">
+        You're receiving this because you have auto top-up enabled on your account.
+        <a href="{{ profile_link }}">Manage notification preferences</a>
+    </p>
+</body>
+</html>

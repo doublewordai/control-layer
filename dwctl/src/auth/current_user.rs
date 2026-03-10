@@ -1193,6 +1193,7 @@ mod tests {
             low_balance_threshold: None,
             auto_topup_amount: None,
             auto_topup_threshold: None,
+            auto_topup_monthly_limit: None,
         };
         users_repo.update(user.id, &update).await.unwrap();
 
