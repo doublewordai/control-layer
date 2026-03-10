@@ -35,24 +35,30 @@ impl EmailTemplates {
         }
     }
 
-    fn load_from_dir(dir: &Path) -> Result<Self, Error> {
-        let load = |name: &str| -> Result<String, Error> {
+    fn load_from_dir(dir: &Path) -> Self {
+        let embedded = Self::embedded();
+
+        let load = |name: &str, fallback: String| -> String {
             let path = dir.join(name);
-            std::fs::read_to_string(&path).map_err(|e| Error::Internal {
-                operation: format!("load email template {}: {e}", path.display()),
-            })
+            match std::fs::read_to_string(&path) {
+                Ok(content) => content,
+                Err(_) => {
+                    tracing::debug!("Email template {name} not found in custom dir, using embedded default");
+                    fallback
+                }
+            }
         };
 
-        Ok(Self {
-            password_reset: load("password_reset.html")?,
-            batch_complete: load("batch_complete.html")?,
-            first_batch: load("first_batch.html")?,
-            low_balance: load("low_balance.html")?,
-            auto_topup_success: load("auto_topup_success.html")?,
-            auto_topup_failed: load("auto_topup_failed.html")?,
-            auto_topup_limit_reached: load("auto_topup_limit_reached.html")?,
-            org_invite: load("org_invite.html")?,
-        })
+        Self {
+            password_reset: load("password_reset.html", embedded.password_reset),
+            batch_complete: load("batch_complete.html", embedded.batch_complete),
+            first_batch: load("first_batch.html", embedded.first_batch),
+            low_balance: load("low_balance.html", embedded.low_balance),
+            auto_topup_success: load("auto_topup_success.html", embedded.auto_topup_success),
+            auto_topup_failed: load("auto_topup_failed.html", embedded.auto_topup_failed),
+            auto_topup_limit_reached: load("auto_topup_limit_reached.html", embedded.auto_topup_limit_reached),
+            org_invite: load("org_invite.html", embedded.org_invite),
+        }
     }
 }
 
@@ -114,7 +120,7 @@ impl EmailService {
         };
 
         let templates = match &email_config.templates_dir {
-            Some(dir) => EmailTemplates::load_from_dir(Path::new(dir))?,
+            Some(dir) => EmailTemplates::load_from_dir(Path::new(dir)),
             None => EmailTemplates::embedded(),
         };
 
