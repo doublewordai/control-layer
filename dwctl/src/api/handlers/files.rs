@@ -391,23 +391,25 @@ type FileStreamResult = (
     Arc<Mutex<Option<FileUploadError>>>,
 );
 
-/// Helper function to create a stream of FileStreamItem from multipart upload
-/// This handles the entire multipart parsing inside the stream
-///
-/// # Arguments
-/// * `endpoint` - Target endpoint for batch requests (e.g., "http://localhost:8080/ai")
-/// * `api_key` - API key to inject for request execution
-#[tracing::instrument(skip(multipart, api_key, accessible_models), fields(config.max_file_size, config.max_requests_per_file, uploaded_by = ?uploaded_by, endpoint = %endpoint, config.buffer_size))]
-fn create_file_stream(
-    mut multipart: Multipart,
-    config: FileStreamConfig,
-    uploaded_by: Option<String>,
+/// Context for validating and routing requests parsed from file uploads.
+struct FileRequestContext {
     endpoint: String,
     api_key: String,
     accessible_models: HashMap<String, Option<ModelType>>,
     allowed_url_paths: Vec<String>,
+}
+
+/// Helper function to create a stream of FileStreamItem from multipart upload
+/// This handles the entire multipart parsing inside the stream
+#[tracing::instrument(skip(multipart, req_ctx), fields(config.max_file_size, config.max_requests_per_file, uploaded_by = ?uploaded_by, endpoint = %req_ctx.endpoint, config.buffer_size))]
+fn create_file_stream(
+    mut multipart: Multipart,
+    config: FileStreamConfig,
+    uploaded_by: Option<String>,
+    req_ctx: FileRequestContext,
     api_key_id: Option<uuid::Uuid>,
 ) -> FileStreamResult {
+    let FileRequestContext { endpoint, api_key, accessible_models, allowed_url_paths } = req_ctx;
     let (tx, rx) = mpsc::channel(config.buffer_size);
     // std::sync::Mutex is appropriate here because:
     // 1. Lock is held only briefly (no await points while locked)
@@ -857,10 +859,12 @@ pub async fn upload_file<P: PoolProvider>(
         multipart,
         stream_config,
         uploaded_by,
-        endpoint,
-        user_api_key,
-        accessible_models,
-        state.config.batches.allowed_url_paths.clone(),
+        FileRequestContext {
+            endpoint,
+            api_key: user_api_key,
+            accessible_models,
+            allowed_url_paths: state.config.batches.allowed_url_paths.clone(),
+        },
         Some(api_key_id),
     );
 
@@ -1031,7 +1035,10 @@ pub async fn list_files<P: PoolProvider>(
     // Only resolve creator/context metadata when user has appropriate permissions
     use crate::db::handlers::users::Users;
     use crate::db::models::users::UserDBResponse;
-    let (api_key_creator_map, user_map): (std::collections::HashMap<uuid::Uuid, uuid::Uuid>, std::collections::HashMap<uuid::Uuid, UserDBResponse>) = if should_enrich {
+    let (api_key_creator_map, user_map): (
+        std::collections::HashMap<uuid::Uuid, uuid::Uuid>,
+        std::collections::HashMap<uuid::Uuid, UserDBResponse>,
+    ) = if should_enrich {
         // Resolve individual creators via api_key_id → api_keys.created_by
         let api_key_ids: Vec<uuid::Uuid> = files.iter().filter_map(|f| f.api_key_id).collect();
         let creator_map: std::collections::HashMap<uuid::Uuid, uuid::Uuid> = if !api_key_ids.is_empty() {
@@ -1050,10 +1057,9 @@ pub async fn list_files<P: PoolProvider>(
             if let Some(owner_id) = f.uploaded_by.as_ref().and_then(|id| uuid::Uuid::parse_str(id).ok()) {
                 all_user_ids.insert(owner_id);
             }
-            if let Some(api_key_id) = f.api_key_id {
-                if let Some(&creator_id) = creator_map.get(&api_key_id) {
+            if let Some(api_key_id) = f.api_key_id
+                && let Some(&creator_id) = creator_map.get(&api_key_id) {
                     all_user_ids.insert(creator_id);
-                }
             }
         }
 
@@ -1089,12 +1095,8 @@ pub async fn list_files<P: PoolProvider>(
             // Only enrich with creator/context metadata for privileged contexts
             let (created_by_email, context_name, context_type) = if should_enrich {
                 // Resolve individual creator email via api_key_id
-                let individual_creator_id = f
-                    .api_key_id
-                    .and_then(|key_id| api_key_creator_map.get(&key_id).copied());
-                let email = individual_creator_id
-                    .and_then(|uid| user_map.get(&uid))
-                    .map(|u| u.email.clone());
+                let individual_creator_id = f.api_key_id.and_then(|key_id| api_key_creator_map.get(&key_id).copied());
+                let email = individual_creator_id.and_then(|uid| user_map.get(&uid)).map(|u| u.email.clone());
 
                 // Resolve context from file owner (uploaded_by field)
                 let owner_id = f.uploaded_by.as_ref().and_then(|id| uuid::Uuid::parse_str(id).ok());

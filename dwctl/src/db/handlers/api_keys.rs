@@ -378,7 +378,12 @@ impl<'c> ApiKeys<'c> {
     /// Get or create a hidden API key, returning both the secret and the key's UUID.
     /// Used when the caller needs to pass the key ID to fusillade for attribution.
     #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
-    pub async fn get_or_create_hidden_key_with_id(&mut self, user_id: UserId, purpose: ApiKeyPurpose, created_by: UserId) -> Result<(String, ApiKeyId)> {
+    pub async fn get_or_create_hidden_key_with_id(
+        &mut self,
+        user_id: UserId,
+        purpose: ApiKeyPurpose,
+        created_by: UserId,
+    ) -> Result<(String, ApiKeyId)> {
         let purpose_str = match purpose {
             ApiKeyPurpose::Platform => "platform",
             ApiKeyPurpose::Realtime => "realtime",

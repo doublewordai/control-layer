@@ -1331,7 +1331,16 @@ pub async fn list_batches<P: PoolProvider>(
     // Fetch batches with ownership filtering, search, and cursor-based pagination
     let batches = state
         .request_manager
-        .list_batches(created_by, query.search.clone(), after, limit + 1, api_key_id_filter, query.status.clone(), query.created_after, query.created_before)
+        .list_batches(fusillade::ListBatchesFilter {
+            created_by,
+            search: query.search.clone(),
+            after,
+            limit: limit + 1,
+            api_key_id: api_key_id_filter,
+            status: query.status.clone(),
+            created_after: query.created_after,
+            created_before: query.created_before,
+        })
         .await
         .map_err(|e| Error::Internal {
             operation: format!("list batches: {}", e),
@@ -1369,10 +1378,9 @@ pub async fn list_batches<P: PoolProvider>(
             if let Some(owner_id) = batch.created_by.as_ref().and_then(|id| Uuid::parse_str(id).ok()) {
                 all_user_ids.insert(owner_id);
             }
-            if let Some(api_key_id) = batch.api_key_id {
-                if let Some(&creator_id) = creator_map.get(&api_key_id) {
+            if let Some(api_key_id) = batch.api_key_id
+                && let Some(&creator_id) = creator_map.get(&api_key_id) {
                     all_user_ids.insert(creator_id);
-                }
             }
         }
 
@@ -1426,12 +1434,8 @@ pub async fn list_batches<P: PoolProvider>(
 
             let mut response = if should_enrich {
                 // Resolve individual creator email via api_key_id
-                let individual_creator_id = batch
-                    .api_key_id
-                    .and_then(|key_id| api_key_creator_map.get(&key_id).copied());
-                let created_by_email = individual_creator_id
-                    .and_then(|uid| user_map.get(&uid))
-                    .map(|u| u.email.clone());
+                let individual_creator_id = batch.api_key_id.and_then(|key_id| api_key_creator_map.get(&key_id).copied());
+                let created_by_email = individual_creator_id.and_then(|uid| user_map.get(&uid)).map(|u| u.email.clone());
 
                 // Resolve context from batch owner (created_by field)
                 let owner_id = batch.created_by.as_ref().and_then(|id| Uuid::parse_str(id).ok());
