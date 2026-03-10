@@ -1697,8 +1697,8 @@ async fn setup_background_services(
 
     // Initialize the fusillade request manager (for batch processing)
     let request_manager = Arc::new(
-        fusillade::PostgresRequestManager::new(fusillade_pools)
-            .with_config(
+        fusillade::PostgresRequestManager::new(
+                fusillade_pools,
                 config
                     .background_services
                     .batch_daemon
