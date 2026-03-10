@@ -760,9 +760,9 @@ impl<'c> Users<'c> {
         let rows = sqlx::query_as!(
             LowBalanceUser,
             r#"
-            SELECT u.id, u.email, u.username, u.display_name,
+            SELECT u.id as "id!", u.email as "email!", u.username as "username!", u.display_name,
                    u.low_balance_threshold::decimal(20, 9) as "low_balance_threshold!",
-                   u.low_balance_notification_sent,
+                   u.low_balance_notification_sent as "low_balance_notification_sent!",
                    c.balance as "checkpoint_balance?"
             FROM users u
             LEFT JOIN user_balance_checkpoints c ON c.user_id = u.id
@@ -814,9 +814,9 @@ impl<'c> Users<'c> {
                   AND u.low_balance_threshold IS NOT NULL
                   AND c.balance >= u.low_balance_threshold
             )
-            SELECT u.id, u.email, u.username, u.display_name,
+            SELECT u.id as "id!", u.email as "email!", u.username as "username!", u.display_name,
                    u.low_balance_threshold::decimal(20, 9) as "low_balance_threshold!",
-                   u.low_balance_notification_sent,
+                   u.low_balance_notification_sent as "low_balance_notification_sent!",
                    c.balance as "checkpoint_balance?"
             FROM users u
             LEFT JOIN user_balance_checkpoints c ON u.id = c.user_id
@@ -839,7 +839,7 @@ impl<'c> Users<'c> {
         let rows = sqlx::query_as!(
             AutoTopupUser,
             r#"
-            SELECT u.id, u.email, u.username, u.display_name,
+            SELECT u.id as "id!", u.email as "email!", u.username as "username!", u.display_name,
                    u.payment_provider_id as "payment_provider_id!",
                    u.auto_topup_threshold::decimal(20, 9) as "auto_topup_threshold!",
                    u.auto_topup_amount::decimal(20, 9) as "auto_topup_amount!",
