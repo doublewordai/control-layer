@@ -256,19 +256,16 @@ pub async fn create_batch<P: PoolProvider>(
         })?;
 
     // Check file ownership if user doesn't have ReadAll permission
+    // In org context, files owned by the active org are also considered "own"
     use crate::types::Resource;
     let has_read_all = can_read_all_resources(&current_user, Resource::Files);
-    if !has_read_all {
-        // Verify user owns the file
-        let user_id_str = current_user.id.to_string();
-        if file.uploaded_by.as_deref() != Some(user_id_str.as_str()) {
-            use crate::types::{Operation, Permission};
-            return Err(Error::InsufficientPermissions {
-                required: Permission::Allow(Resource::Files, Operation::ReadAll),
-                action: Operation::CreateOwn,
-                resource: format!("batch using file {}", req.input_file_id),
-            });
-        }
+    if !has_read_all && !is_batch_owner(&current_user, file.uploaded_by.as_deref()) {
+        use crate::types::{Operation, Permission};
+        return Err(Error::InsufficientPermissions {
+            required: Permission::Allow(Resource::Files, Operation::ReadAll),
+            action: Operation::CreateOwn,
+            resource: format!("batch using file {}", req.input_file_id),
+        });
     }
 
     // Check that the file owner (whose API key is embedded in the request templates)
@@ -1435,6 +1432,59 @@ mod tests {
             .json(&create_req)
             .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
             .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        resp.assert_status(StatusCode::CREATED);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_create_batch_in_org_context(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+
+        // Create a user with batch permissions and an org they belong to
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let org = create_test_org(&pool, user.id).await;
+
+        // Create a group and give the org access to a model
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, org.id, group.id).await;
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        let auth = add_auth_headers(&user);
+        let org_cookie = format!("dw_active_org={}", org.id);
+
+        // Upload a file in org context (uploaded_by will be the org ID)
+        let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}"#;
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test-batch.jsonl");
+        let multipart = axum_test::multipart::MultipartForm::new()
+            .add_part("file", file_part)
+            .add_part("purpose", axum_test::multipart::Part::text("batch"));
+        let upload_resp = app
+            .post("/ai/v1/files")
+            .multipart(multipart)
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .add_header("cookie", &org_cookie)
+            .await;
+        upload_resp.assert_status(StatusCode::CREATED);
+        let file: serde_json::Value = upload_resp.json();
+        let file_id = file["id"].as_str().unwrap();
+
+        // Create batch in org context using the org-owned file
+        let create_req = CreateBatchRequest {
+            input_file_id: file_id.to_string(),
+            endpoint: "/v1/chat/completions".to_string(),
+            completion_window: "24h".to_string(),
+            metadata: None,
+        };
+
+        let resp = app
+            .post("/ai/v1/batches")
+            .json(&create_req)
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .add_header("cookie", &org_cookie)
             .await;
         resp.assert_status(StatusCode::CREATED);
     }
