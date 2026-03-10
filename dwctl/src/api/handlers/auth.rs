@@ -496,6 +496,7 @@ pub async fn confirm_password_reset<P: PoolProvider>(
         auto_topup_amount: None,
         auto_topup_threshold: None,
         auto_topup_monthly_limit: None,
+        acknowledge_login: None,
     };
 
     let mut tx = state.db.write().begin().await.unwrap();
@@ -631,6 +632,7 @@ pub async fn change_password<P: PoolProvider>(
         auto_topup_amount: None,
         auto_topup_threshold: None,
         auto_topup_monthly_limit: None,
+        acknowledge_login: None,
     };
 
     user_repo.update(current_user.id, &update_request).await?;

@@ -308,6 +308,8 @@ export interface User {
   user_type?: "individual" | "organization"; // User type
   organizations?: OrganizationSummary[]; // only present when include=organizations or for current user
   active_organization_id?: string; // only present for /users/current
+  last_login?: string | null; // ISO 8601 timestamp, null if user has never logged in
+  onboarding_redirect_url?: string; // only present for /users/current when last_login is null
 }
 
 export interface ApiKey {
@@ -437,6 +439,7 @@ export interface UserUpdateRequest {
   auto_topup_amount?: number | null; // Set an amount to enable, null to disable
   auto_topup_threshold?: number | null; // Set a threshold to enable, null to disable
   auto_topup_monthly_limit?: number | null; // Set a limit to cap, null to remove limit
+  acknowledge_login?: boolean; // Set to true to record current time as last login
 }
 
 export interface GroupUpdateRequest {

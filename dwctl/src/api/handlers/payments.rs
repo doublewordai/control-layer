@@ -562,6 +562,7 @@ pub async fn process_auto_topup<P: PoolProvider>(
         auto_topup_amount: Some(Some(body.amount)),
         auto_topup_threshold: Some(Some(body.threshold)),
         auto_topup_monthly_limit: Some(body.monthly_limit),
+        acknowledge_login: None,
     };
 
     let mut conn = state.db.write().acquire().await.map_err(|e| {
@@ -724,6 +725,7 @@ pub async fn enable_auto_topup<P: PoolProvider>(
                 auto_topup_amount: Some(Some(body.amount)),
                 auto_topup_threshold: Some(Some(body.threshold)),
                 auto_topup_monthly_limit: Some(body.monthly_limit),
+                acknowledge_login: None,
             };
 
             let mut conn = state.db.write().acquire().await.map_err(|e| {

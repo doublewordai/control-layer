@@ -1194,6 +1194,7 @@ mod tests {
             auto_topup_amount: None,
             auto_topup_threshold: None,
             auto_topup_monthly_limit: None,
+            acknowledge_login: None,
         };
         users_repo.update(user.id, &update).await.unwrap();
 

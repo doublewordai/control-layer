@@ -368,6 +368,7 @@ pub async fn get_system_user(pool: &mut PgConnection) -> UserResponse {
         user_type: "individual".to_string(),
         organizations: None,
         active_organization_id: None,
+        onboarding_redirect_url: None,
     }
 }
 
@@ -546,6 +547,7 @@ pub async fn create_test_org(pool: &PgPool, created_by: UserId) -> UserResponse 
         user_type: org.user_type,
         organizations: None,
         active_organization_id: None,
+        onboarding_redirect_url: None,
     }
 }
 
