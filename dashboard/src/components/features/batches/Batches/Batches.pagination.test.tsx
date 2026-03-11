@@ -30,6 +30,10 @@ vi.mock("../../../../api/control-layer/hooks", () => ({
     data: [],
     isLoading: false,
   })),
+  useUsers: vi.fn(() => ({
+    data: { data: [] },
+    isLoading: false,
+  })),
 }));
 
 // Mock authorization hook

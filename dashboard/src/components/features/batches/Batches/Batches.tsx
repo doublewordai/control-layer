@@ -46,6 +46,7 @@ import {
   useFiles,
   useBatches,
   useOrganizationMembers,
+  useUsers,
 } from "../../../../api/control-layer/hooks";
 import { dwctlApi } from "../../../../api/control-layer/client";
 import type { FileObject, Batch } from "../types";
@@ -100,19 +101,33 @@ export function Batches({
   const showUserColumn = isPlatformManager || isOrgContext;
   const showContextColumn = isPlatformManager;
 
-  // Member filter - only available in org context (backend requires org-scoped hidden key lookup)
-  const showMemberFilter = isOrgContext;
+  // Member filter:
+  // - Org context (all users): show org members dropdown
+  // - Personal context (PM only): show all users dropdown (PM has global view)
+  const showMemberFilter = isOrgContext || (isPlatformManager && !isOrgContext);
   const { data: orgMembers } = useOrganizationMembers(
     activeOrganizationId || "",
   );
+  const { data: allUsers } = useUsers({
+    enabled: isPlatformManager && !isOrgContext,
+    limit: 100,
+  });
   const memberList = React.useMemo(() => {
+    // Org context: show org members (same for PMs and standard users)
     if (isOrgContext && orgMembers) {
       return orgMembers
         .filter((m) => m.status === "active" && m.user)
         .map((m) => ({ id: m.user!.id, email: m.user!.email }));
     }
+    // Personal context + PM: show all individual users for global filtering
+    // (exclude organization pseudo-users which share the owner's email)
+    if (isPlatformManager && !isOrgContext && allUsers?.data) {
+      return allUsers.data
+        .filter((u) => u.user_type !== "organization")
+        .map((u) => ({ id: u.id, email: u.email }));
+    }
     return [];
-  }, [isOrgContext, orgMembers]);
+  }, [isPlatformManager, isOrgContext, orgMembers, allUsers]);
 
   const [selectedMemberId, setSelectedMemberId] = useState<string | undefined>(
     undefined,

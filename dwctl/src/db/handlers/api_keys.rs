@@ -458,6 +458,34 @@ impl<'c> ApiKeys<'c> {
         Ok(key_id)
     }
 
+    /// Find ALL hidden API key IDs created by a given user across all contexts (personal + orgs).
+    /// This is used when a PM filters by member in personal mode — need to find all keys
+    /// where `created_by = member_id` regardless of which user_id (org or personal) owns them.
+    #[instrument(skip(self), fields(created_by = %abbrev_uuid(&created_by)), err)]
+    pub async fn find_all_hidden_key_ids_by_creator(&mut self, purpose: ApiKeyPurpose, created_by: UserId) -> Result<Vec<ApiKeyId>> {
+        let purpose_str = match purpose {
+            ApiKeyPurpose::Platform => "platform",
+            ApiKeyPurpose::Realtime => "realtime",
+            ApiKeyPurpose::Batch => "batch",
+            ApiKeyPurpose::Playground => "playground",
+        };
+
+        let key_ids = sqlx::query_scalar!(
+            r#"
+            SELECT id
+            FROM api_keys
+            WHERE purpose = $1 AND created_by = $2
+            AND hidden = true AND is_deleted = false
+            "#,
+            purpose_str,
+            created_by
+        )
+        .fetch_all(&mut *self.db)
+        .await?;
+
+        Ok(key_ids)
+    }
+
     /// Bulk lookup the `created_by` user IDs for a set of API key IDs.
     /// Returns a map from api_key_id to the user who created that key.
     #[instrument(skip(self, key_ids), err)]
