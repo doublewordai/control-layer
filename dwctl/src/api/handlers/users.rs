@@ -287,10 +287,11 @@ pub async fn get_user<P: PoolProvider>(
     if is_current {
         response = response.with_active_organization(current_user.active_organization);
 
-        // Include onboarding redirect URL for first-time users.
-        // Check both null last_login and last_login within 10 seconds of created_at,
-        // because the auth extractor may have already set last_login via a background
-        // task before user's first /current call or before this handler reads the user from the database.
+        // Include onboarding redirect URL when the user is treated as "first login".
+        // A user is considered first login if last_login is null, or if last_login is
+        // within 10 seconds of created_at. The small time window accounts for cases
+        // where a background task updates last_login before the first /current call
+        // or before this handler reads the user from the database.
         let is_first_login = response.last_login.is_none()
             || response
                 .last_login
