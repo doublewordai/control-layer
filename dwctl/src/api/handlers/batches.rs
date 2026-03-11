@@ -1308,20 +1308,23 @@ pub async fn list_batches<P: PoolProvider>(
         Some(target_user_id.to_string())
     };
 
-    // Translate member_id to api_key_id for fusillade filtering
-    // Only allowed in org context (requires org-scoped hidden key lookup)
+    // Translate member_id to api_key_id for fusillade filtering.
+    // In org context: look up the member's hidden key scoped to the org user.
+    // In personal context: only PlatformManagers may use this filter, and the
+    // hidden key is scoped to the member themselves.
     let api_key_id_filter = if let Some(member_id) = query.member_id {
-        let org_id = match current_user.active_organization {
+        let hidden_key_user_id = match current_user.active_organization {
             Some(org_id) => org_id,
+            None if can_read_all => member_id,
             None => {
                 return Err(Error::BadRequest {
-                    message: "member_id filter is only available in organization context".to_string(),
+                    message: "member_id filter is only available in organization context or for platform managers".to_string(),
                 });
             }
         };
         let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
         let key_id = ApiKeys::new(&mut conn)
-            .find_hidden_key_id(org_id, ApiKeyPurpose::Batch, member_id)
+            .find_hidden_key_id(hidden_key_user_id, ApiKeyPurpose::Batch, member_id)
             .await
             .map_err(Error::Database)?;
         match key_id {

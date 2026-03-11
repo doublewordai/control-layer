@@ -296,7 +296,7 @@ pub struct ListBatchesQuery {
     #[param(example = "analytics")]
     pub include: Option<String>,
 
-    /// Filter by member user ID (resolves to api_key_id for per-member filtering within orgs)
+    /// Filter by member user ID (resolves to api_key_id). Available in org context for any member, or in personal context for platform managers.
     pub member_id: Option<uuid::Uuid>,
 
     /// Filter by batch status. Supported: "in_progress", "completed", "failed", "cancelled", "expired".
