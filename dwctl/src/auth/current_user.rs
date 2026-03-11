@@ -1564,4 +1564,80 @@ mod tests {
         // Should silently ignore the malformed header
         assert_eq!(current_user.active_organization, None);
     }
+
+    #[sqlx::test]
+    async fn test_last_login_updated_on_first_auth(pool: PgPool) {
+        let mut config = create_test_config();
+        config.auth.proxy_header.enabled = true;
+        config.auth.proxy_header.auto_create_users = true;
+
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
+
+        let email = "new-last-login@example.com";
+        let external_id = "auth0|lastlogin123";
+
+        // First auth creates the user — last_login should be null initially
+        let mut parts = create_test_parts_with_auth(external_id, email);
+        let user = CurrentUser::from_request_parts(&mut parts, &state).await.unwrap();
+
+        // Verify last_login was null at creation
+        let row = sqlx::query!("SELECT last_login, created_at FROM users WHERE id = $1", user.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(row.last_login.is_none() || {
+            // Background task may have already completed — if so, it should
+            // be within a few seconds of created_at
+            let ll = row.last_login.unwrap();
+            (ll - row.created_at).num_seconds().abs() < 10
+        }, "On first auth, last_login should be null or just set by background task");
+
+        // Poll until the background task updates last_login
+        let mut last_login = None;
+        for _ in 0..50 {
+            let row = sqlx::query!("SELECT last_login FROM users WHERE id = $1", user.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            if row.last_login.is_some() {
+                last_login = row.last_login;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(last_login.is_some(), "Background task should have set last_login");
+    }
+
+    #[sqlx::test]
+    async fn test_last_login_not_updated_when_recent(pool: PgPool) {
+        let mut config = create_test_config();
+        config.auth.proxy_header.enabled = true;
+
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
+
+        let test_user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+        let external_user_id = test_user.external_user_id.as_ref().unwrap();
+
+        // Set last_login to 1 minute ago (within the 5-minute threshold)
+        let recent = chrono::Utc::now() - chrono::Duration::minutes(1);
+        sqlx::query!("UPDATE users SET last_login = $1 WHERE id = $2", recent, test_user.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // Authenticate — should NOT update last_login since it's recent
+        let mut parts = create_test_parts_with_auth(external_user_id, &test_user.email);
+        let _ = CurrentUser::from_request_parts(&mut parts, &state).await.unwrap();
+
+        // Give the background task a chance to run (it shouldn't)
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let row = sqlx::query!("SELECT last_login FROM users WHERE id = $1", test_user.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let actual = row.last_login.unwrap();
+        let diff = (actual - recent).num_seconds().abs();
+        assert!(diff < 2, "last_login should not have been updated (diff: {diff}s)");
+    }
 }
