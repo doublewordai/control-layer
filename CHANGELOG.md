@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.18.1](https://github.com/doublewordai/control-layer/compare/v8.18.0...v8.18.1) (2026-03-11)
+
+
+### Bug Fixes
+
+* check recent last_login + store onboarded in browser ([#860](https://github.com/doublewordai/control-layer/issues/860)) ([af6d8d6](https://github.com/doublewordai/control-layer/commit/af6d8d6bea9cd96d2297929123807d650b6251b6))
+
 ## [8.18.0](https://github.com/doublewordai/control-layer/compare/v8.17.1...v8.18.0) (2026-03-11)
 
 
