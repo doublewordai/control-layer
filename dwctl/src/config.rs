@@ -1148,7 +1148,6 @@ impl DaemonConfig {
     ) -> fusillade::daemon::DaemonConfig {
         fusillade::daemon::DaemonConfig {
             claim_batch_size: self.claim_batch_size,
-            default_model_concurrency: self.default_model_concurrency,
             model_concurrency_limits: model_capacity_limits.unwrap_or_else(|| std::sync::Arc::new(dashmap::DashMap::new())),
             model_escalations: Arc::new(DashMap::from_iter(self.model_escalations.clone())),
             claim_interval_ms: self.claim_interval_ms,

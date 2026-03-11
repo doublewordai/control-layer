@@ -1,6 +1,6 @@
 [package]
 name = "dwctl"
-version = "8.16.1"
+version = "8.17.1"
 edition = "2024"
 description = "The Doubleword Control Layer - A self-hostable observability and analytics platform for LLM applications"
 license = "MIT OR Apache-2.0"
@@ -76,14 +76,14 @@ jsonwebtoken = "9.0"
 argon2 = "0.5"
 base64 = "0.22"
 bytes = "1.5"
-onwards = "0.18.6"
+onwards = "0.19.1"
 thiserror = "2.0.14"
 axum-prometheus = "0.10"
 # Metrics facade and exporter (same versions as axum-prometheus uses)
 metrics = "0.24"
 metrics-exporter-prometheus = "0.18"
-outlet = "0.6.0"
-outlet-postgres = "0.4.7"
+outlet = "0.6.1"
+outlet-postgres = "0.4.8"
 async-openai = { version = "0.33.0", default-features = false, features = [
   "chat-completion-types",
   "completion-types",
