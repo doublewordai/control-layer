@@ -381,11 +381,13 @@ pub async fn create_batch<P: PoolProvider>(
         key_id
     };
 
-    // Convert metadata to HashMap and inject request_source and user info
-    // Note: created_by_email is NOT stored in metadata to avoid PII in denormalized storage.
-    // The email is fetched via user lookup when building API responses.
-    // metadata.created_by tracks the individual user for audit trail
+    // Convert metadata to HashMap and inject request_source and user info.
+    // Strip reserved keys that are injected server-side during response enrichment
+    // to prevent user-supplied values from colliding with system fields.
     let mut metadata_map = req.metadata.unwrap_or_default();
+    for key in &["created_by_email", "context_name", "context_type", "request_source", "created_by"] {
+        metadata_map.remove(*key);
+    }
     metadata_map.insert("request_source".to_string(), request_source.to_string());
     metadata_map.insert("created_by".to_string(), current_user.id.to_string());
     let metadata = serde_json::to_value(metadata_map).ok();
@@ -1536,9 +1538,25 @@ pub async fn list_batches<P: PoolProvider>(
         .map(|batch| {
             let batch_id = batch.id;
 
-            // Resolve individual creator email via api_key_id
+            // Resolve individual creator email via api_key_id, with fallback
+            // to batch owner for legacy batches without api_key_id
             let individual_creator_id = batch.api_key_id.and_then(|key_id| api_key_creator_map.get(&key_id).copied());
-            let created_by_email = individual_creator_id.and_then(|uid| user_map.get(&uid)).map(|u| u.email.clone());
+            let created_by_email = individual_creator_id
+                .and_then(|uid| user_map.get(&uid))
+                .map(|u| u.email.clone())
+                .or_else(|| {
+                    // Legacy fallback: use batch owner (created_by) when api_key_id is NULL
+                    if batch.api_key_id.is_none() {
+                        batch
+                            .created_by
+                            .as_ref()
+                            .and_then(|id| Uuid::parse_str(id).ok())
+                            .and_then(|uid| user_map.get(&uid))
+                            .map(|u| u.email.clone())
+                    } else {
+                        None
+                    }
+                });
 
             // Resolve context from batch owner (created_by field)
             let owner_id = batch.created_by.as_ref().and_then(|id| Uuid::parse_str(id).ok());
