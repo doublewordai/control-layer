@@ -1,5 +1,19 @@
 # Changelog
 
+## [8.18.0](https://github.com/doublewordai/control-layer/compare/v8.17.1...v8.18.0) (2026-03-11)
+
+
+### Features
+
+* allow email reuse in orgs with updated unique indx on user emails ([#853](https://github.com/doublewordai/control-layer/issues/853)) ([f4ca358](https://github.com/doublewordai/control-layer/commit/f4ca358e7a2770fe27e7f1be960f82925b9e1949))
+* migration to allow org members to have the same api key name ([#857](https://github.com/doublewordai/control-layer/issues/857)) ([09b6001](https://github.com/doublewordai/control-layer/commit/09b600185dd2034189872f637b935154a304be8e))
+* use last_login column to detect first login and redirect onboarding ([#835](https://github.com/doublewordai/control-layer/issues/835)) ([45f5138](https://github.com/doublewordai/control-layer/commit/45f5138b4056abe4e357404cd19242dc498c0900))
+
+
+### Bug Fixes
+
+* make get_pending_request_counts count processing and claimed too ([#836](https://github.com/doublewordai/control-layer/issues/836)) ([ae6fbda](https://github.com/doublewordai/control-layer/commit/ae6fbdaccba01ac893abfc5baf8f4d8076be0ddc))
+
 ## [8.17.1](https://github.com/doublewordai/control-layer/compare/v8.17.0...v8.17.1) (2026-03-11)
 
 
