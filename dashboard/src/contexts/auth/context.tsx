@@ -42,12 +42,16 @@ export function AuthProvider({ children }: AuthProviderProps) {
         user,
       );
 
-      // Redirect first-time users to onboarding if configured (server sets
-      // onboarding_redirect_url only when last_login is null). Org invite
-      // redirect params take priority.
+      // Redirect first-time users to onboarding if configured. The server
+      // includes onboarding_redirect_url for recently-created accounts. We
+      // persist a localStorage flag after the first redirect so users aren't
+      // sent back to onboarding on every page load. Org invite redirect
+      // params take priority.
       if (user.onboarding_redirect_url) {
         const urlRedirect = new URLSearchParams(window.location.search).get("redirect");
-        if (!urlRedirect) {
+        const onboardingKey = `onboarding_completed_${user.id}`;
+        if (!urlRedirect && !localStorage.getItem(onboardingKey)) {
+          localStorage.setItem(onboardingKey, "true");
           window.location.href = user.onboarding_redirect_url;
           return;
         }

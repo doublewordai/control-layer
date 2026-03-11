@@ -13,7 +13,7 @@ dashboard_url: "http://localhost:5173"
 
 # Onboarding redirect URL for new users (first login)
 # When set, users who have never logged in will be redirected here after authentication.
-# onboarding_url: "https://onboarding.doubleword.ai"
+onboarding_url: "https://onboarding.doubleword.ai"
 
 # Database configuration
 database:
