@@ -3265,9 +3265,9 @@ dependencies = [
 
 [[package]]
 name = "outlet"
-version = "0.6.1"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "997f864199ba887393128a393f837cad1d33c5dec9de78175ffff65ed681018e"
+checksum = "912fa05ac7da27693b4ed09ddd23ab5500709ab0ccb8cfa4fe555ddcfed620ae"
 dependencies = [
  "anyhow",
  "axum",
@@ -3289,9 +3289,9 @@ dependencies = [
 
 [[package]]
 name = "outlet-postgres"
-version = "0.4.8"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "76f388d31319873a82438f84a38ddb82ab9e30f99b8342cf00b7aed173eccb40"
+checksum = "db3a719d22d42d479a0fa325eab9f2896bef59a119e7a82d58a655e16000c7f8"
 dependencies = [
  "base64",
  "bytes",
