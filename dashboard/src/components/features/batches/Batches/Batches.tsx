@@ -46,7 +46,7 @@ import {
   useFiles,
   useBatches,
   useOrganizationMembers,
-  useAllUsers,
+  useUsers,
 } from "../../../../api/control-layer/hooks";
 import { dwctlApi } from "../../../../api/control-layer/client";
 import type { FileObject, Batch } from "../types";
@@ -102,29 +102,37 @@ export function Batches({
   const showContextColumn = isPlatformManager;
 
   // Member filter:
-  // - Org context (all users): show org members dropdown
-  // - Personal context (PM only): show all users dropdown (PM has global view)
+  // - Org context (all users): show org members dropdown (client-side filtered)
+  // - Personal context (PM only): show users via server-side search
   const showMemberFilter = isOrgContext || (isPlatformManager && !isOrgContext);
+  const useServerSideMemberSearch = isPlatformManager && !isOrgContext;
   const { data: orgMembers } = useOrganizationMembers(
     activeOrganizationId || "",
   );
-  const { data: allUsers } = useAllUsers({
-    enabled: isPlatformManager && !isOrgContext,
+
+  // Server-side user search for PM personal mode
+  const [memberSearch, setMemberSearch] = useState("");
+  const debouncedMemberSearch = useDebounce(memberSearch, 300);
+  const { data: searchedUsers } = useUsers({
+    search: debouncedMemberSearch,
+    limit: 50,
+    enabled: useServerSideMemberSearch,
   });
+
   const memberList = React.useMemo(() => {
-    // Org context: show org members (same for PMs and standard users)
+    // Org context: show org members (client-side filtered by Command)
     if (isOrgContext && orgMembers) {
       return orgMembers
         .filter((m) => m.status === "active" && m.user)
         .map((m) => ({ id: m.user!.id, email: m.user!.email }));
     }
-    // Personal context + PM: show all individual users for global filtering.
+    // Personal context + PM: show server-side searched users.
     // Deduplicate by email (a user may appear twice if they have both personal
     // and org-created individual records). The personal member_id is used under
     // the hood — the backend expands it to cover both personal and org contexts.
-    if (isPlatformManager && !isOrgContext && allUsers) {
+    if (useServerSideMemberSearch && searchedUsers?.data) {
       const seen = new Set<string>();
-      return allUsers
+      return searchedUsers.data
         .filter((u) => u.user_type !== "organization")
         .filter((u) => {
           if (seen.has(u.email)) return false;
@@ -134,11 +142,15 @@ export function Batches({
         .map((u) => ({ id: u.id, email: u.email }));
     }
     return [];
-  }, [isPlatformManager, isOrgContext, orgMembers, allUsers]);
+  }, [isOrgContext, useServerSideMemberSearch, orgMembers, searchedUsers]);
 
   const [selectedMemberId, setSelectedMemberId] = useState<string | undefined>(
     undefined,
   );
+  // Track the selected member's email so it persists when search results change
+  const [selectedMemberEmail, setSelectedMemberEmail] = useState<
+    string | undefined
+  >(undefined);
   const [memberPopoverOpen, setMemberPopoverOpen] = useState(false);
 
   // Batch-specific filters
@@ -151,6 +163,8 @@ export function Batches({
   // Clear all filters when org context changes
   useEffect(() => {
     setSelectedMemberId(undefined);
+    setSelectedMemberEmail(undefined);
+    setMemberSearch("");
     setStatusFilter("all");
     setDateRange(undefined);
   }, [activeOrganizationId]);
@@ -529,10 +543,15 @@ export function Batches({
   });
 
   // Searchable member filter combobox - shared between batches and files tabs
-  const selectedMemberEmail = memberList.find(
-    (m) => m.id === selectedMemberId,
-  )?.email;
-  const memberFilterCombobox = showMemberFilter && memberList.length > 0 && (
+  const displayedMemberEmail =
+    selectedMemberEmail ||
+    memberList.find((m) => m.id === selectedMemberId)?.email;
+  // Show member filter: always for PM personal mode (server-side search),
+  // only when org members exist for org context (client-side filtered)
+  const showMemberCombobox =
+    showMemberFilter &&
+    (useServerSideMemberSearch || memberList.length > 0);
+  const memberFilterCombobox = showMemberCombobox && (
     <Popover open={memberPopoverOpen} onOpenChange={setMemberPopoverOpen}>
       <PopoverTrigger asChild>
         <Button
@@ -544,15 +563,21 @@ export function Batches({
           <div className="flex items-center gap-1.5 truncate">
             <Users className="w-3.5 h-3.5 shrink-0 text-gray-500" />
             <span className="truncate">
-              {selectedMemberEmail || "All members"}
+              {displayedMemberEmail || "All members"}
             </span>
           </div>
           <ChevronsUpDown className="ml-1 h-3.5 w-3.5 shrink-0 opacity-50" />
         </Button>
       </PopoverTrigger>
       <PopoverContent className="w-[280px] p-0" align="start">
-        <Command>
-          <CommandInput placeholder="Search by email..." />
+        <Command shouldFilter={!useServerSideMemberSearch}>
+          <CommandInput
+            placeholder="Search by email..."
+            value={useServerSideMemberSearch ? memberSearch : undefined}
+            onValueChange={
+              useServerSideMemberSearch ? setMemberSearch : undefined
+            }
+          />
           <CommandList>
             <CommandEmpty>No members found.</CommandEmpty>
             <CommandGroup>
@@ -560,6 +585,8 @@ export function Batches({
                 value="all-members"
                 onSelect={() => {
                   setSelectedMemberId(undefined);
+                  setSelectedMemberEmail(undefined);
+                  setMemberSearch("");
                   setMemberPopoverOpen(false);
                   batchesPagination.handleFirstPage();
                   filesPagination.handleFirstPage();
@@ -579,6 +606,8 @@ export function Batches({
                   value={member.email}
                   onSelect={() => {
                     setSelectedMemberId(member.id);
+                    setSelectedMemberEmail(member.email);
+                    setMemberSearch("");
                     setMemberPopoverOpen(false);
                     batchesPagination.handleFirstPage();
                     filesPagination.handleFirstPage();

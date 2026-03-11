@@ -30,8 +30,8 @@ vi.mock("../../../../api/control-layer/hooks", () => ({
     data: [],
     isLoading: false,
   })),
-  useAllUsers: vi.fn(() => ({
-    data: [],
+  useUsers: vi.fn(() => ({
+    data: { data: [], total_count: 0 },
     isLoading: false,
   })),
 }));

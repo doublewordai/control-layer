@@ -77,35 +77,6 @@ export function useUsers(options?: UsersQuery & { enabled?: boolean }) {
   });
 }
 
-/** Fetch all users by paginating through the API. Returns a flat array of all users. */
-export function useAllUsers(options?: { enabled?: boolean }) {
-  const { enabled = true } = options || {};
-  return useQuery({
-    queryKey: queryKeys.users.query({ _all: true }),
-    queryFn: async () => {
-      const PAGE_SIZE = 100;
-      const first = await dwctlApi.users.list({ limit: PAGE_SIZE, skip: 0 });
-      const allUsers = [...first.data];
-
-      // Fetch remaining pages in parallel
-      const remaining = first.total_count - PAGE_SIZE;
-      if (remaining > 0) {
-        const pageCount = Math.ceil(remaining / PAGE_SIZE);
-        const pages = await Promise.all(
-          Array.from({ length: pageCount }, (_, i) =>
-            dwctlApi.users.list({ limit: PAGE_SIZE, skip: PAGE_SIZE * (i + 1) }),
-          ),
-        );
-        for (const page of pages) {
-          allUsers.push(...page.data);
-        }
-      }
-
-      return allUsers;
-    },
-    enabled,
-  });
-}
 
 export function useUser(id: string, options?: { include?: string }) {
   return useQuery({
