@@ -332,13 +332,23 @@ impl<'c> ApiKeys<'c> {
             purpose_str
         );
 
+        // Use INSERT ... ON CONFLICT DO NOTHING + SELECT to avoid firing the
+        // api_keys_notify AFTER UPDATE trigger on the common "key already exists" path.
         let row_secret = sqlx::query_scalar!(
             r#"
-            INSERT INTO api_keys (name, description, secret, purpose, user_id, created_by, hidden)
-            VALUES ($1, $2, $3, $4, $5, $6, true)
-            ON CONFLICT (user_id, created_by, purpose) WHERE hidden = true AND is_deleted = false
-            DO UPDATE SET user_id = EXCLUDED.user_id
-            RETURNING secret
+            WITH ins AS (
+                INSERT INTO api_keys (name, description, secret, purpose, user_id, created_by, hidden)
+                VALUES ($1, $2, $3, $4, $5, $6, true)
+                ON CONFLICT (user_id, created_by, purpose) WHERE hidden = true AND is_deleted = false
+                DO NOTHING
+                RETURNING secret
+            )
+            SELECT secret FROM ins
+            UNION ALL
+            SELECT secret FROM api_keys
+            WHERE user_id = $5 AND created_by = $6 AND purpose = $4
+              AND hidden = true AND is_deleted = false
+            LIMIT 1
             "#,
             name,
             description,
@@ -348,7 +358,8 @@ impl<'c> ApiKeys<'c> {
             created_by
         )
         .fetch_one(&mut *self.db)
-        .await?;
+        .await?
+        .ok_or(DbError::NotFound)?;
 
         Ok(row_secret)
     }
@@ -383,13 +394,23 @@ impl<'c> ApiKeys<'c> {
             purpose_str
         );
 
+        // Use INSERT ... ON CONFLICT DO NOTHING + SELECT to avoid firing the
+        // api_keys_notify AFTER UPDATE trigger on the common "key already exists" path.
         let row = sqlx::query!(
             r#"
-            INSERT INTO api_keys (name, description, secret, purpose, user_id, created_by, hidden)
-            VALUES ($1, $2, $3, $4, $5, $6, true)
-            ON CONFLICT (user_id, created_by, purpose) WHERE hidden = true AND is_deleted = false
-            DO UPDATE SET user_id = EXCLUDED.user_id
-            RETURNING id, secret
+            WITH ins AS (
+                INSERT INTO api_keys (name, description, secret, purpose, user_id, created_by, hidden)
+                VALUES ($1, $2, $3, $4, $5, $6, true)
+                ON CONFLICT (user_id, created_by, purpose) WHERE hidden = true AND is_deleted = false
+                DO NOTHING
+                RETURNING id, secret
+            )
+            SELECT id, secret FROM ins
+            UNION ALL
+            SELECT id, secret FROM api_keys
+            WHERE user_id = $5 AND created_by = $6 AND purpose = $4
+              AND hidden = true AND is_deleted = false
+            LIMIT 1
             "#,
             name,
             description,
@@ -401,7 +422,10 @@ impl<'c> ApiKeys<'c> {
         .fetch_one(&mut *self.db)
         .await?;
 
-        Ok((row.secret, row.id))
+        let id = row.id.ok_or(DbError::NotFound)?;
+        let secret = row.secret.ok_or(DbError::NotFound)?;
+
+        Ok((secret, id))
     }
 
     /// Find the hidden API key ID for a given user, purpose, and creator.
