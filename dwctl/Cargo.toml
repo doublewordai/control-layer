@@ -82,8 +82,8 @@ axum-prometheus = "0.10"
 # Metrics facade and exporter (same versions as axum-prometheus uses)
 metrics = "0.24"
 metrics-exporter-prometheus = "0.18"
-outlet = "0.6.1"
-outlet-postgres = "0.4.8"
+outlet = "0.7.0"
+outlet-postgres = "0.5.0"
 async-openai = { version = "0.33.0", default-features = false, features = [
   "chat-completion-types",
   "completion-types",

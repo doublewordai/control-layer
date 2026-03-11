@@ -204,6 +204,8 @@ mod tests {
             uri: Uri::from_static("/ai/v1/chat/completions"),
             headers: HashMap::new(),
             body: None,
+            trace_id: None,
+            span_id: None,
         }
     }
 
