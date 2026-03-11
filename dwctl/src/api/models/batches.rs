@@ -289,7 +289,7 @@ pub struct ListBatchesQuery {
     #[param(inline)]
     pub pagination: CursorPagination,
 
-    /// Search query to filter batches by endpoint, input filename, or batch ID (case-insensitive substring match)
+    /// Search query to filter batches by metadata, input filename, or batch ID (case-insensitive substring match)
     pub search: Option<String>,
 
     /// Comma-separated list of related resources to include. Supported: "analytics"

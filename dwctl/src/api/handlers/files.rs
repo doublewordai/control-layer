@@ -20,8 +20,10 @@ use crate::db::{
     handlers::deployments::{DeploymentFilter, Deployments},
     handlers::repository::Repository,
     handlers::tariffs::Tariffs,
+    handlers::users::Users,
     models::api_keys::ApiKeyPurpose,
     models::deployments::{ModelStatus, ModelType},
+    models::users::UserDBResponse,
 };
 use crate::errors::{Error, Result};
 use crate::types::Resource;
@@ -35,6 +37,7 @@ use bytes::Bytes;
 use chrono::Utc;
 use fusillade::Storage;
 use futures::StreamExt;
+use rust_decimal::Decimal;
 use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -1034,7 +1037,6 @@ pub async fn list_files<P: PoolProvider>(
         ascending: query.order == "asc",
     };
 
-    use fusillade::Storage;
     let mut files = state.request_manager.list_files(filter).await.map_err(|e| Error::Internal {
         operation: format!("list files: {}", e),
     })?;
@@ -1051,8 +1053,6 @@ pub async fn list_files<P: PoolProvider>(
     // Resolve creator/context metadata for all returned files.
     // No conditional needed: the authorization layer already ensures users only see
     // resources they're permitted to access (own files, org files, or all for PMs).
-    use crate::db::handlers::users::Users;
-    use crate::db::models::users::UserDBResponse;
 
     // Resolve individual creators via api_key_id → api_keys.created_by
     let api_key_ids: Vec<uuid::Uuid> = files
@@ -1244,8 +1244,6 @@ pub async fn get_file_content<P: PoolProvider>(
     let file_id = Uuid::parse_str(&file_id_str).map_err(|_| Error::BadRequest {
         message: "Invalid file ID format".to_string(),
     })?;
-
-    use fusillade::Storage;
 
     // First, get the file to check ownership
     let file = state
@@ -1514,9 +1512,6 @@ pub async fn get_file_cost_estimate<P: PoolProvider>(
     Query(query): Query<FileCostEstimateQuery>,
     current_user: RequiresPermission<resource::Files, operation::ReadOwn>,
 ) -> Result<Json<crate::api::models::files::FileCostEstimate>> {
-    use rust_decimal::Decimal;
-    use std::collections::HashMap;
-
     let can_read_all_files = can_read_all_resources(&current_user, Resource::Files);
 
     let file_id = Uuid::parse_str(&file_id_str).map_err(|_| Error::BadRequest {
