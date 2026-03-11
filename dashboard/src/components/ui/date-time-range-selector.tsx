@@ -198,6 +198,10 @@ export function DateTimeRangeSelector({
   };
 
   const formatDateRange = () => {
+    // Show placeholder when parent hasn't applied a filter yet
+    if (!value) {
+      return "Date range";
+    }
     if (range?.from && range?.to) {
       if (range.from.toDateString() === range.to.toDateString()) {
         return `${format(range.from, "MMM d, yyyy")} ${startTime} - ${endTime}`;
@@ -207,7 +211,7 @@ export function DateTimeRangeSelector({
         "MMM d, yyyy",
       )} ${endTime}`;
     }
-    return "Select date & time";
+    return "Date range";
   };
 
   return (
@@ -217,7 +221,7 @@ export function DateTimeRangeSelector({
           variant="outline"
           className={cn(
             "justify-between font-normal",
-            !range && "text-muted-foreground",
+            !value && "text-muted-foreground",
             className,
           )}
         >
@@ -297,11 +301,12 @@ export function DateTimeRangeSelector({
                         .toString()
                         .padStart(2, "0")}`,
                     );
-                    onChange?.(defaultRange);
+                    onChange?.(undefined);
+                    setOpen(false);
                   }}
                   className="px-3"
                 >
-                  Reset
+                  Clear
                 </Button>
               </div>
             </div>

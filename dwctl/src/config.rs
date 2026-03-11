@@ -1054,7 +1054,7 @@ pub struct DaemonConfig {
     pub max_backoff_ms: u64,
 
     /// Deprecated: use first_chunk_timeout_ms, chunk_timeout_ms, and body_timeout_ms instead.
-    /// If set, splits into 90% first_chunk_timeout_ms and 10% body_timeout_ms.
+    /// If set, applies the same value uniformly to all three granular timeouts.
     /// Ignored when the granular timeout fields are explicitly set.
     pub timeout_ms: Option<u64>,
 
