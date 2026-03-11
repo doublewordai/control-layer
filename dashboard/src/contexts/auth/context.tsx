@@ -42,26 +42,14 @@ export function AuthProvider({ children }: AuthProviderProps) {
         user,
       );
 
-      // Session-based login acknowledgement
-      if (!sessionStorage.getItem("session_acknowledged")) {
-        const isFirstLogin = user.last_login == null;
-
-        // Always PATCH to update last_login timestamp
-        try {
-          await dwctlApi.users.update("current", { acknowledge_login: true });
-        } catch {
-          // Non-critical — don't block auth flow
-        }
-        sessionStorage.setItem("session_acknowledged", "true");
-
-        // Check for an existing redirect param in the URL (e.g., org invite link)
-        // If present, it takes priority — the AuthGuard will navigate there naturally
+      // Redirect first-time users to onboarding if configured (server sets
+      // onboarding_redirect_url only when last_login is null). Org invite
+      // redirect params take priority.
+      if (user.onboarding_redirect_url) {
         const urlRedirect = new URLSearchParams(window.location.search).get("redirect");
-
-        if (isFirstLogin && !urlRedirect && user.onboarding_redirect_url) {
-          // First-ever login with no pending redirect → send to onboarding
+        if (!urlRedirect) {
           window.location.href = user.onboarding_redirect_url;
-          return; // Stop auth flow, we're navigating away
+          return;
         }
       }
 

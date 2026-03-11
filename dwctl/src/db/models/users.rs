@@ -54,8 +54,6 @@ pub struct UserUpdateDBRequest {
     /// Monthly auto top-up spending limit.
     /// `None` = don't change, `Some(None)` = disable limit, `Some(Some(val))` = set limit.
     pub auto_topup_monthly_limit: Option<Option<f32>>,
-    /// When true, sets `last_login` to NOW().
-    pub acknowledge_login: Option<bool>,
 }
 
 impl UserUpdateDBRequest {
@@ -70,7 +68,6 @@ impl UserUpdateDBRequest {
             auto_topup_amount: update.auto_topup_amount,
             auto_topup_threshold: update.auto_topup_threshold,
             auto_topup_monthly_limit: update.auto_topup_monthly_limit,
-            acknowledge_login: update.acknowledge_login,
         }
     }
 }

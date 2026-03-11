@@ -78,8 +78,6 @@ pub struct UserUpdate {
     /// auto top-up charges, set to null to remove the limit. Omit entirely to leave unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
     pub auto_topup_monthly_limit: Option<Option<f32>>,
-    /// Set to true to record the current time as the user's last login.
-    pub acknowledge_login: Option<bool>,
 }
 
 /// Full user details returned by the API.

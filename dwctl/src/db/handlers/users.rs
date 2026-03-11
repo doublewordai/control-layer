@@ -485,10 +485,6 @@ impl<'c> Repository for Users<'c> {
                     WHEN $12::boolean THEN false
                     ELSE auto_topup_limit_notification_sent
                 END,
-                last_login = CASE
-                    WHEN $14::boolean THEN NOW()
-                    ELSE last_login
-                END,
                 updated_at = NOW()
             WHERE id = $1
             RETURNING *
@@ -506,7 +502,6 @@ impl<'c> Repository for Users<'c> {
                 request.auto_topup_threshold.flatten(),
                 request.auto_topup_monthly_limit.is_some() as bool,
                 request.auto_topup_monthly_limit.flatten(),
-                request.acknowledge_login.unwrap_or(false),
             )
             .fetch_optional(&mut *tx)
             .await?
@@ -1036,7 +1031,6 @@ mod tests {
             auto_topup_amount: None,
             auto_topup_threshold: None,
             auto_topup_monthly_limit: None,
-            acknowledge_login: None,
         };
 
         let updated_user = repo.update(created_user.id, &update_request).await.unwrap();
@@ -1058,7 +1052,6 @@ mod tests {
             auto_topup_amount: None,
             auto_topup_threshold: None,
             auto_topup_monthly_limit: None,
-            acknowledge_login: None,
         };
 
         let updated_user = repo.update(created_user.id, &update_request).await.unwrap();
@@ -1094,7 +1087,6 @@ mod tests {
                 auto_topup_amount: None,
                 auto_topup_threshold: None,
                 auto_topup_monthly_limit: None,
-                acknowledge_login: None,
             };
             repo.update(user.id, &update).await.unwrap();
         }
@@ -1348,7 +1340,6 @@ mod tests {
             auto_topup_amount: None,
             auto_topup_threshold: None,
             auto_topup_monthly_limit: None,
-            acknowledge_login: None,
         };
         let updated = users.update(user_id, &update).await.unwrap();
         assert!(!updated.low_balance_notification_sent);

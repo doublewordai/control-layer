@@ -439,7 +439,6 @@ export interface UserUpdateRequest {
   auto_topup_amount?: number | null; // Set an amount to enable, null to disable
   auto_topup_threshold?: number | null; // Set a threshold to enable, null to disable
   auto_topup_monthly_limit?: number | null; // Set a limit to cap, null to remove limit
-  acknowledge_login?: boolean; // Set to true to record current time as last login
 }
 
 export interface GroupUpdateRequest {
