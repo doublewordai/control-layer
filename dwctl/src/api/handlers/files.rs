@@ -1060,7 +1060,12 @@ pub async fn list_files<P: PoolProvider>(
         std::collections::HashMap<uuid::Uuid, UserDBResponse>,
     ) = if should_enrich {
         // Resolve individual creators via api_key_id → api_keys.created_by
-        let api_key_ids: Vec<uuid::Uuid> = files.iter().filter_map(|f| f.api_key_id).collect();
+        let api_key_ids: Vec<uuid::Uuid> = files
+            .iter()
+            .filter_map(|f| f.api_key_id)
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
         let creator_map: std::collections::HashMap<uuid::Uuid, uuid::Uuid> = if !api_key_ids.is_empty() {
             let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
             ApiKeys::new(&mut conn)
@@ -3591,5 +3596,56 @@ mod tests {
         resp.assert_status_ok();
         let body: serde_json::Value = resp.json();
         assert_eq!(body["data"].as_array().unwrap().len(), 0);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_list_files_enrichment_absent_in_personal_context(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+        let auth = add_auth_headers(&user);
+
+        // Upload a file in personal context
+        let jsonl_content = r#"{"custom_id":"req-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}"#;
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("personal-test.jsonl");
+        let multipart = axum_test::multipart::MultipartForm::new()
+            .add_part("file", file_part)
+            .add_part("purpose", axum_test::multipart::Part::text("batch"));
+        let upload_resp = app
+            .post("/ai/v1/files")
+            .multipart(multipart)
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+        upload_resp.assert_status(axum::http::StatusCode::CREATED);
+
+        // List in personal context → enrichment fields should be absent
+        let list_resp = app
+            .get("/ai/v1/files")
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+        list_resp.assert_status_ok();
+        let body: serde_json::Value = list_resp.json();
+        let files = body["data"].as_array().unwrap();
+        assert!(!files.is_empty(), "Expected at least one personal file");
+        for file in files {
+            assert!(
+                file.get("created_by_email").is_none() || file["created_by_email"].is_null(),
+                "created_by_email should not be present in personal context"
+            );
+            assert!(
+                file.get("context_name").is_none() || file["context_name"].is_null(),
+                "context_name should not be present in personal context"
+            );
+            assert!(
+                file.get("context_type").is_none() || file["context_type"].is_null(),
+                "context_type should not be present in personal context"
+            );
+        }
     }
 }

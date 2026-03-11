@@ -1376,7 +1376,12 @@ pub async fn list_batches<P: PoolProvider>(
     use crate::db::models::users::UserDBResponse;
     let (api_key_creator_map, user_map): (HashMap<Uuid, Uuid>, HashMap<Uuid, UserDBResponse>) = if should_enrich {
         // Resolve individual creators via api_key_id → api_keys.created_by
-        let api_key_ids: Vec<Uuid> = batches.iter().filter_map(|b| b.api_key_id).collect();
+        let api_key_ids: Vec<Uuid> = batches
+            .iter()
+            .filter_map(|b| b.api_key_id)
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
         let creator_map: HashMap<Uuid, Uuid> = if !api_key_ids.is_empty() {
             let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
             ApiKeys::new(&mut conn)
@@ -1467,8 +1472,9 @@ pub async fn list_batches<P: PoolProvider>(
                     None => (None, None),
                 };
 
-                let owner_email = owner.map(|u| u.email.as_str());
-                let mut response = to_batch_response_with_email(batch, owner_email);
+                // Don't pass owner email as created_by_email — only inject it when
+                // the individual creator is resolved via api_key_id (below)
+                let mut response = to_batch_response_with_email(batch, None);
 
                 // Inject enriched creator/context info into metadata
                 if let Some(email) = created_by_email {
@@ -3258,6 +3264,8 @@ mod tests {
 
         let group = create_test_group(&pool).await;
         add_user_to_group(&pool, org.id, group.id).await;
+        // Also add user directly so they have model access in personal context too
+        add_user_to_group(&pool, user.id, group.id).await;
         let deployment = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
         add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
 
@@ -3317,7 +3325,36 @@ mod tests {
             "Expected enriched context_name in org context"
         );
 
-        // List outside org context → enriched fields should be absent
+        // Create a personal batch (no org context) so we can verify scrubbing
+        let personal_file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("personal-test.jsonl");
+        let personal_multipart = axum_test::multipart::MultipartForm::new()
+            .add_part("file", personal_file_part)
+            .add_part("purpose", axum_test::multipart::Part::text("batch"));
+        let personal_upload_resp = app
+            .post("/ai/v1/files")
+            .multipart(personal_multipart)
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+        personal_upload_resp.assert_status(StatusCode::CREATED);
+        let personal_file: serde_json::Value = personal_upload_resp.json();
+        let personal_file_id = personal_file["id"].as_str().unwrap();
+
+        let personal_batch_req = CreateBatchRequest {
+            input_file_id: personal_file_id.to_string(),
+            endpoint: "/v1/chat/completions".to_string(),
+            completion_window: "24h".to_string(),
+            metadata: None,
+        };
+        let personal_create_resp = app
+            .post("/ai/v1/batches")
+            .json(&personal_batch_req)
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+        personal_create_resp.assert_status(StatusCode::CREATED);
+
+        // List outside org context → personal batch should exist but without enriched fields
         let list_resp_personal = app
             .get("/ai/v1/batches")
             .add_header(&auth[0].0, &auth[0].1)
@@ -3325,9 +3362,9 @@ mod tests {
             .await;
         list_resp_personal.assert_status_ok();
         let list_body_personal: serde_json::Value = list_resp_personal.json();
-        // User's personal batches won't include the org batch,
-        // but if any batches are returned, they should not have enriched fields
-        for batch in list_body_personal["data"].as_array().unwrap() {
+        let personal_batches = list_body_personal["data"].as_array().unwrap();
+        assert!(!personal_batches.is_empty(), "Expected at least one personal batch");
+        for batch in personal_batches {
             if let Some(meta) = batch["metadata"].as_object() {
                 assert!(
                     !meta.contains_key("created_by_email"),
@@ -3336,6 +3373,10 @@ mod tests {
                 assert!(
                     !meta.contains_key("context_name"),
                     "context_name should be scrubbed outside org context"
+                );
+                assert!(
+                    !meta.contains_key("context_type"),
+                    "context_type should be scrubbed outside org context"
                 );
             }
         }
