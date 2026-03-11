@@ -308,6 +308,8 @@ export interface User {
   user_type?: "individual" | "organization"; // User type
   organizations?: OrganizationSummary[]; // only present when include=organizations or for current user
   active_organization_id?: string; // only present for /users/current
+  last_login?: string | null; // ISO 8601 timestamp, null if user has never logged in
+  onboarding_redirect_url?: string; // only present for /users/current when last_login is null
 }
 
 export interface ApiKey {

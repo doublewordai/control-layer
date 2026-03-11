@@ -126,6 +126,7 @@ impl From<(Vec<Role>, User)> for UserDBResponse {
             avatar_url: user.avatar_url,
             created_at: user.created_at,
             updated_at: user.updated_at,
+            last_login: user.last_login,
             auth_source: user.auth_source,
             is_admin: user.is_admin,
             roles,

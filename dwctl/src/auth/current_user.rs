@@ -9,20 +9,24 @@ use crate::{
     errors::{Error, Result},
 };
 use axum::{extract::FromRequestParts, http::request::Parts};
+use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use tracing::{debug, instrument, trace};
+
+/// Result of a successful authentication: the user and their last login timestamp.
+type AuthSuccess = (CurrentUser, Option<DateTime<Utc>>);
 
 /// Extract user from JWT session cookie if present and valid
 /// Returns:
 /// - None: No JWT cookie present
-/// - Some(Ok(user)): Valid JWT found, user fetched from DB with current data
+/// - Some(Ok((user, last_login))): Valid JWT found, user fetched from DB with current data
 /// - Some(Err(error)): JWT cookie present but invalid/malformed, or user not found/deleted
 #[instrument(skip(parts, config, db))]
 async fn try_jwt_session_auth(
     parts: &axum::http::request::Parts,
     config: &crate::config::Config,
     db: &PgPool,
-) -> Option<Result<CurrentUser>> {
+) -> Option<Result<AuthSuccess>> {
     let cookie_header = parts.headers.get(axum::http::header::COOKIE)?;
 
     let cookie_str = match cookie_header.to_str() {
@@ -67,18 +71,22 @@ async fn try_jwt_session_auth(
                 Err(e) => return Some(Err(Error::Database(e))),
             };
 
-            return Some(Ok(CurrentUser {
-                id: user.id,
-                username: user.username,
-                email: user.email,
-                is_admin: user.is_admin,
-                roles: user.roles,
-                display_name: user.display_name,
-                avatar_url: user.avatar_url,
-                payment_provider_id: user.payment_provider_id,
-                organizations: vec![],
-                active_organization: None,
-            }));
+            let last_login = user.last_login;
+            return Some(Ok((
+                CurrentUser {
+                    id: user.id,
+                    username: user.username,
+                    email: user.email,
+                    is_admin: user.is_admin,
+                    roles: user.roles,
+                    display_name: user.display_name,
+                    avatar_url: user.avatar_url,
+                    payment_provider_id: user.payment_provider_id,
+                    organizations: vec![],
+                    active_organization: None,
+                },
+                last_login,
+            )));
         }
     }
     None
@@ -87,13 +95,13 @@ async fn try_jwt_session_auth(
 /// Extract user from proxy header if present and valid
 /// Returns:
 /// - None: No proxy header present
-/// - Some(Ok(user)): Valid proxy header found and user authenticated
+/// - Some(Ok((user, last_login))): Valid proxy header found and user authenticated
 /// - Some(Err(error)): Proxy header present but user lookup/creation failed
 #[instrument(skip(parts, state), level = "TRACE")]
 async fn try_proxy_header_auth<P: sqlx_pool_router::PoolProvider + Clone + Send + Sync + 'static>(
     parts: &axum::http::request::Parts,
     state: &crate::AppState<P>,
-) -> Option<Result<CurrentUser>> {
+) -> Option<Result<AuthSuccess>> {
     let config = &state.config;
     let db: &PgPool = state.db.write();
     tracing::trace!("Trying proxy header auth, config: {:?}", config.auth.proxy_header);
@@ -181,18 +189,22 @@ async fn try_proxy_header_auth<P: sqlx_pool_router::PoolProvider + Clone + Send 
                     }
                 }
 
-                Some(CurrentUser {
-                    id: user.id,
-                    username: user.username,
-                    email: user.email,
-                    is_admin: user.is_admin,
-                    roles: user.roles,
-                    display_name: user.display_name,
-                    avatar_url: user.avatar_url,
-                    payment_provider_id: user.payment_provider_id,
-                    organizations: vec![],
-                    active_organization: None,
-                })
+                let last_login = user.last_login;
+                Some((
+                    CurrentUser {
+                        id: user.id,
+                        username: user.username,
+                        email: user.email,
+                        is_admin: user.is_admin,
+                        roles: user.roles,
+                        display_name: user.display_name,
+                        avatar_url: user.avatar_url,
+                        payment_provider_id: user.payment_provider_id,
+                        organizations: vec![],
+                        active_organization: None,
+                    },
+                    last_login,
+                ))
             }
             Err(e) => return Some(Err(Error::Database(e))),
         }
@@ -202,18 +214,22 @@ async fn try_proxy_header_auth<P: sqlx_pool_router::PoolProvider + Clone + Send 
         match user_repo.get_user_by_external_user_id(external_user_id).await {
             Ok(Some(user)) => {
                 debug!("Found existing user");
-                Some(CurrentUser {
-                    id: user.id,
-                    username: user.username,
-                    email: user.email,
-                    is_admin: user.is_admin,
-                    roles: user.roles,
-                    display_name: user.display_name,
-                    avatar_url: user.avatar_url,
-                    payment_provider_id: user.payment_provider_id,
-                    organizations: vec![],
-                    active_organization: None,
-                })
+                let last_login = user.last_login;
+                Some((
+                    CurrentUser {
+                        id: user.id,
+                        username: user.username,
+                        email: user.email,
+                        is_admin: user.is_admin,
+                        roles: user.roles,
+                        display_name: user.display_name,
+                        avatar_url: user.avatar_url,
+                        payment_provider_id: user.payment_provider_id,
+                        organizations: vec![],
+                        active_organization: None,
+                    },
+                    last_login,
+                ))
             }
             Ok(None) => {
                 debug!("User not found and auto-create disabled");
@@ -233,7 +249,7 @@ async fn try_proxy_header_auth<P: sqlx_pool_router::PoolProvider + Clone + Send 
     if should_create_sample_files
         && config.sample_files.enabled
         && config.batches.enabled
-        && let Some(ref user) = user_result
+        && let Some((ref user, _)) = user_result
     {
         let state_clone = state.clone();
         let user_id = user.id;
@@ -250,10 +266,10 @@ async fn try_proxy_header_auth<P: sqlx_pool_router::PoolProvider + Clone + Send 
 /// Extract user from API key in Authorization header if present and valid
 /// Returns:
 /// - None: No Authorization header or not a Bearer token
-/// - Some(Ok(user)): Valid API key found and user authenticated
+/// - Some(Ok((user, last_login))): Valid API key found and user authenticated
 /// - Some(Err(error)): Bearer token present but invalid or insufficient permissions
 #[instrument(skip(parts, db))]
-async fn try_api_key_auth(parts: &axum::http::request::Parts, db: &PgPool) -> Option<Result<CurrentUser>> {
+async fn try_api_key_auth(parts: &axum::http::request::Parts, db: &PgPool) -> Option<Result<AuthSuccess>> {
     // Extract Authorization header
     let auth_header = match parts.headers.get(axum::http::header::AUTHORIZATION) {
         Some(header) => header,
@@ -282,7 +298,7 @@ async fn try_api_key_auth(parts: &axum::http::request::Parts, db: &PgPool) -> Op
     };
     let api_key_result = match sqlx::query!(
         r#"
-        SELECT ak.user_id, ak.purpose, u.username, u.email, u.is_admin, u.display_name, u.avatar_url, u.payment_provider_id
+        SELECT ak.user_id, ak.purpose, u.username, u.email, u.is_admin, u.display_name, u.avatar_url, u.payment_provider_id, u.last_login
         FROM api_keys ak
         INNER JOIN users u ON ak.user_id = u.id
         WHERE ak.secret = $1 AND ak.is_deleted = false
@@ -351,18 +367,21 @@ async fn try_api_key_auth(parts: &axum::http::request::Parts, db: &PgPool) -> Op
         Err(e) => return Some(Err(DbError::from(e).into())),
     };
 
-    Some(Ok(CurrentUser {
-        id: api_key_data.user_id,
-        username: api_key_data.username,
-        email: api_key_data.email,
-        is_admin: api_key_data.is_admin,
-        roles,
-        display_name: api_key_data.display_name,
-        avatar_url: api_key_data.avatar_url,
-        payment_provider_id: api_key_data.payment_provider_id,
-        organizations: vec![],
-        active_organization: None,
-    }))
+    Some(Ok((
+        CurrentUser {
+            id: api_key_data.user_id,
+            username: api_key_data.username,
+            email: api_key_data.email,
+            is_admin: api_key_data.is_admin,
+            roles,
+            display_name: api_key_data.display_name,
+            avatar_url: api_key_data.avatar_url,
+            payment_provider_id: api_key_data.payment_provider_id,
+            organizations: vec![],
+            active_organization: None,
+        },
+        api_key_data.last_login,
+    )))
 }
 
 /// Extractor that checks if the request contains an API key in the Authorization header.
@@ -481,15 +500,34 @@ async fn populate_org_context(user: &mut CurrentUser, parts: &Parts, db: &PgPool
     }
 }
 
+/// Spawn a background task to update `last_login` if it is null or older than 1 hour.
+fn maybe_update_last_login(user_id: crate::types::UserId, last_login: Option<DateTime<Utc>>, db: &PgPool) {
+    let should_update = match last_login {
+        None => true,
+        Some(ts) => Utc::now() - ts > chrono::Duration::hours(1),
+    };
+    if should_update {
+        let pool = db.clone();
+        tokio::spawn(async move {
+            if let Err(e) = sqlx::query!("UPDATE users SET last_login = NOW() WHERE id = $1", user_id)
+                .execute(&pool)
+                .await
+            {
+                tracing::warn!(user_id = %user_id, error = %e, "Failed to update last_login");
+            }
+        });
+    }
+}
+
 impl<P: sqlx_pool_router::PoolProvider + Clone + Send + Sync> FromRequestParts<crate::AppState<P>> for CurrentUser {
     type Rejection = Error;
 
     #[instrument(skip(parts, state))]
     async fn from_request_parts(parts: &mut Parts, state: &crate::AppState<P>) -> Result<Self> {
         // Try all authentication methods and accumulate results
-        // Each method returns Option<Result<CurrentUser>>:
+        // Each method returns Option<Result<AuthSuccess>>:
         // - None means the auth method is not applicable (no credentials present)
-        // - Some(Ok(user)) means successful authentication
+        // - Some(Ok((user, last_login))) means successful authentication
         // - Some(Err(error)) means auth credentials were present but invalid
         //
         // Strategy: Try ALL methods and return the first successful one.
@@ -501,10 +539,11 @@ impl<P: sqlx_pool_router::PoolProvider + Clone + Send + Sync> FromRequestParts<c
 
         // Try API key authentication first (most specific)
         match try_api_key_auth(parts, state.db.read()).await {
-            Some(Ok(mut user)) => {
+            Some(Ok((mut user, last_login))) => {
                 debug!("Authentication successful via API key");
                 trace!("Authenticated user: {}", user.id);
                 populate_org_context(&mut user, parts, state.db.read()).await;
+                maybe_update_last_login(user.id, last_login, state.db.write());
                 return Ok(user);
             }
             Some(Err(e)) => {
@@ -520,10 +559,11 @@ impl<P: sqlx_pool_router::PoolProvider + Clone + Send + Sync> FromRequestParts<c
         // Native authentication (JWT sessions)
         if state.config.auth.native.enabled {
             match try_jwt_session_auth(parts, &state.config, state.db.read()).await {
-                Some(Ok(mut user)) => {
+                Some(Ok((mut user, last_login))) => {
                     debug!("Authentication successful via JWT session");
                     trace!("Authenticated user: {}", user.id);
                     populate_org_context(&mut user, parts, state.db.read()).await;
+                    maybe_update_last_login(user.id, last_login, state.db.write());
                     return Ok(user);
                 }
                 Some(Err(e)) => {
@@ -540,10 +580,11 @@ impl<P: sqlx_pool_router::PoolProvider + Clone + Send + Sync> FromRequestParts<c
         // Fall back to proxy header authentication
         if state.config.auth.proxy_header.enabled {
             match try_proxy_header_auth(parts, state).await {
-                Some(Ok(mut user)) => {
+                Some(Ok((mut user, last_login))) => {
                     debug!("Authentication successful via proxy header");
                     trace!("Authenticated user: {}", user.id);
                     populate_org_context(&mut user, parts, state.db.read()).await;
+                    maybe_update_last_login(user.id, last_login, state.db.write());
                     return Ok(user);
                 }
                 Some(Err(e)) => {

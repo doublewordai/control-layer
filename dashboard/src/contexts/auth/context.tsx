@@ -42,6 +42,17 @@ export function AuthProvider({ children }: AuthProviderProps) {
         user,
       );
 
+      // Redirect first-time users to onboarding if configured (server sets
+      // onboarding_redirect_url only when last_login is null). Org invite
+      // redirect params take priority.
+      if (user.onboarding_redirect_url) {
+        const urlRedirect = new URLSearchParams(window.location.search).get("redirect");
+        if (!urlRedirect) {
+          window.location.href = user.onboarding_redirect_url;
+          return;
+        }
+      }
+
       // Determine auth method based on response headers or user data
       const authMethod = user.auth_source === "native" ? "native" : "proxy";
 
@@ -73,28 +84,20 @@ export function AuthProvider({ children }: AuthProviderProps) {
   }, [isDemoMode, isMswReady, checkAuthStatus]);
 
   const login = async (credentials: LoginCredentials) => {
-    const response = await dwctlApi.auth.login(credentials);
+    await dwctlApi.auth.login(credentials);
 
-    setAuthState({
-      user: response.user,
-      isAuthenticated: true,
-      isLoading: false,
-      authMethod: "native",
-    });
+    // Re-fetch current user to pick up onboarding redirect and full user data
+    await checkAuthStatus();
 
     // Invalidate user queries to refresh data
     queryClient.invalidateQueries({ queryKey: queryKeys.users.all });
   };
 
   const register = async (credentials: RegisterCredentials) => {
-    const response = await dwctlApi.auth.register(credentials);
+    await dwctlApi.auth.register(credentials);
 
-    setAuthState({
-      user: response.user,
-      isAuthenticated: true,
-      isLoading: false,
-      authMethod: "native",
-    });
+    // Re-fetch current user to pick up onboarding redirect and full user data
+    await checkAuthStatus();
 
     // Invalidate user queries to refresh data
     queryClient.invalidateQueries({ queryKey: queryKeys.users.all });

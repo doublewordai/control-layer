@@ -286,6 +286,13 @@ pub async fn get_user<P: PoolProvider>(
     // Include active organization for /users/current requests
     if is_current {
         response = response.with_active_organization(current_user.active_organization);
+
+        // Include onboarding redirect URL for first-time users (last_login is null)
+        if response.last_login.is_none()
+            && let Some(url) = &state.config.onboarding_url
+        {
+            response = response.with_onboarding_redirect_url(url.clone());
+        }
     }
 
     Ok(Json(response))
