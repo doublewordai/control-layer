@@ -366,7 +366,7 @@ pub async fn create_initial_admin_user(
         // User exists - update password if provided
         if let Some(password_hash) = password_hash {
             // Update password using raw SQL since we don't have a password update method
-            sqlx::query!("UPDATE users SET password_hash = $1 WHERE email = $2", password_hash, email)
+            sqlx::query!("UPDATE users SET password_hash = $1 WHERE id = $2", password_hash, existing_user.id)
                 .execute(&mut *tx)
                 .await?;
         }
