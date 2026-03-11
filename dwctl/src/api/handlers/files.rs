@@ -409,7 +409,12 @@ fn create_file_stream(
     req_ctx: FileRequestContext,
     api_key_id: Option<uuid::Uuid>,
 ) -> FileStreamResult {
-    let FileRequestContext { endpoint, api_key, accessible_models, allowed_url_paths } = req_ctx;
+    let FileRequestContext {
+        endpoint,
+        api_key,
+        accessible_models,
+        allowed_url_paths,
+    } = req_ctx;
     let (tx, rx) = mpsc::channel(config.buffer_size);
     // std::sync::Mutex is appropriate here because:
     // 1. Lock is held only briefly (no await points while locked)
@@ -1073,8 +1078,9 @@ pub async fn list_files<P: PoolProvider>(
                 all_user_ids.insert(owner_id);
             }
             if let Some(api_key_id) = f.api_key_id
-                && let Some(&creator_id) = creator_map.get(&api_key_id) {
-                    all_user_ids.insert(creator_id);
+                && let Some(&creator_id) = creator_map.get(&api_key_id)
+            {
+                all_user_ids.insert(creator_id);
             }
         }
 

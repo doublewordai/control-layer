@@ -1396,8 +1396,9 @@ pub async fn list_batches<P: PoolProvider>(
                 all_user_ids.insert(owner_id);
             }
             if let Some(api_key_id) = batch.api_key_id
-                && let Some(&creator_id) = creator_map.get(&api_key_id) {
-                    all_user_ids.insert(creator_id);
+                && let Some(&creator_id) = creator_map.get(&api_key_id)
+            {
+                all_user_ids.insert(creator_id);
             }
         }
 
