@@ -1781,9 +1781,9 @@ checksum = "e6d5a32815ae3f33302d95fdcb2ce17862f8c65363dcfd29360480ba1001fc9c"
 
 [[package]]
 name = "fusillade"
-version = "7.2.0"
+version = "8.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "46ce735b2d049109ac517271274d926754192221dd80317419f144ac33a0f057"
+checksum = "594006539e47b37dd7d2c0d8c28b9cb508d50ed84f09a7fa6841a9053b218c5b"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1802,7 +1802,6 @@ dependencies = [
  "serde_json",
  "sqlx",
  "sqlx-pool-router",
- "test-log",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
