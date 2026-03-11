@@ -82,6 +82,7 @@ pub struct UserDBResponse {
     pub avatar_url: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    pub last_login: Option<DateTime<Utc>>,
     pub auth_source: String,
     pub is_admin: bool,
     pub roles: Vec<Role>,
