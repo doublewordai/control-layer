@@ -82,7 +82,24 @@ export function DateTimeRangeSelector({
           .toString()
           .padStart(2, "0")}`,
       );
+    } else {
+      // Reset internal state to defaults when value is cleared
+      const defaultRange = getDefaultRange();
+      setRange(defaultRange);
+      setStartTime(
+        `${defaultRange.from.getHours().toString().padStart(2, "0")}:${defaultRange.from
+          .getMinutes()
+          .toString()
+          .padStart(2, "0")}`,
+      );
+      setEndTime(
+        `${defaultRange.to.getHours().toString().padStart(2, "0")}:${defaultRange.to
+          .getMinutes()
+          .toString()
+          .padStart(2, "0")}`,
+      );
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [value]);
 
   const handleQuickSelect = (preset: string) => {

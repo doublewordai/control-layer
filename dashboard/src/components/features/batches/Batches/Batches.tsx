@@ -160,13 +160,22 @@ export function Batches({
     { from: Date; to: Date } | undefined
   >(undefined);
 
-  // Clear all filters when org context changes
+  // Clear all filters and reset pagination when org context changes
   useEffect(() => {
     setSelectedMemberId(undefined);
     setSelectedMemberEmail(undefined);
     setMemberSearch("");
     setStatusFilter("all");
     setDateRange(undefined);
+    filesPagination.handleFirstPage();
+    batchesPagination.handleFirstPage();
+    // Also clear file filter from URL
+    setSearchParams((prev) => {
+      const params = new URLSearchParams(prev);
+      params.delete("fileFilter");
+      return params;
+    }, { replace: true });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeOrganizationId]);
 
   // Drag and drop state (kept locally as it's UI-only)
