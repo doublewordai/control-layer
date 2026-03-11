@@ -77,6 +77,7 @@ export function useUsers(options?: UsersQuery & { enabled?: boolean }) {
   });
 }
 
+
 export function useUser(id: string, options?: { include?: string }) {
   return useQuery({
     queryKey: queryKeys.users.byId(id, options?.include),

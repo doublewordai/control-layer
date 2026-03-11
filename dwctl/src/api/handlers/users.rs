@@ -475,7 +475,11 @@ pub async fn delete_user<P: PoolProvider>(
     let user_id_str = user_id.to_string();
     let batches = state
         .request_manager
-        .list_batches(Some(user_id_str.clone()), None, None, i64::MAX)
+        .list_batches(fusillade::ListBatchesFilter {
+            created_by: Some(user_id_str.clone()),
+            limit: Some(i64::MAX),
+            ..Default::default()
+        })
         .await
         .map_err(|_| Error::NotFound {
             resource: "Batch".to_string(),

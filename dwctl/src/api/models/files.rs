@@ -27,6 +27,9 @@ pub struct ListFilesQuery {
     /// If true, only return files uploaded by the current user (even if the user has ReadAll permission)
     #[serde(default)]
     pub own: bool,
+
+    /// Filter by member user ID (resolves to api_key_id). Available in org context for any member, or in personal context for platform managers.
+    pub member_id: Option<uuid::Uuid>,
 }
 
 fn default_order() -> String {
@@ -77,6 +80,18 @@ pub struct FileResponse {
     pub purpose: Purpose,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<i64>, // Unix timestamp
+
+    /// Email of the individual who created this file (resolved from api_key attribution)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_by_email: Option<String>,
+
+    /// Context name: "Personal" for individual files, or the organization name
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_name: Option<String>,
+
+    /// Context type: "personal" or "organization"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_type: Option<String>,
 }
 
 /// Object type - always "file"

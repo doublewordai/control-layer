@@ -21,6 +21,23 @@ import { Button } from "../../../ui/button";
 import type { Daemon, DaemonStatus } from "../../../../api/control-layer/types";
 import type { ColumnDef } from "@tanstack/react-table";
 
+// Helper to format milliseconds as a human-readable duration
+function formatDuration(ms: number): string {
+  if (ms >= 86_400_000) {
+    const days = ms / 86_400_000;
+    return `${Number.isInteger(days) ? days : days.toFixed(1)}d`;
+  }
+  if (ms >= 3_600_000) {
+    const hours = ms / 3_600_000;
+    return `${Number.isInteger(hours) ? hours : hours.toFixed(1)}h`;
+  }
+  if (ms >= 60_000) {
+    const minutes = ms / 60_000;
+    return `${Number.isInteger(minutes) ? minutes : minutes.toFixed(1)}m`;
+  }
+  return `${ms / 1000}s`;
+}
+
 // Helper to format timestamps
 function formatTimestamp(timestamp: number): string {
   const date = new Date(timestamp * 1000);
@@ -141,6 +158,21 @@ const createDaemonColumns = (): ColumnDef<Daemon>[] => [
       const intervalSecs = intervalMs / 1000;
       return <span>{intervalSecs}s</span>;
     },
+  },
+  {
+    accessorKey: "config.first_chunk_timeout_ms",
+    header: "Header Timeout",
+    cell: ({ row }) => formatDuration(row.original.config.first_chunk_timeout_ms),
+  },
+  {
+    accessorKey: "config.chunk_timeout_ms",
+    header: "Chunk Timeout",
+    cell: ({ row }) => formatDuration(row.original.config.chunk_timeout_ms),
+  },
+  {
+    accessorKey: "config.body_timeout_ms",
+    header: "Body Timeout",
+    cell: ({ row }) => formatDuration(row.original.config.body_timeout_ms),
   },
   {
     accessorKey: "started_at",
@@ -324,7 +356,12 @@ export function System() {
                   data={daemons}
                   searchPlaceholder="Search daemons..."
                   showColumnToggle={true}
-                  initialColumnVisibility={{ id: false }}
+                  initialColumnVisibility={{
+                    id: false,
+                    "config.first_chunk_timeout_ms": false,
+                    "config.chunk_timeout_ms": false,
+                    "config.body_timeout_ms": false,
+                  }}
                 />
               )}
             </div>

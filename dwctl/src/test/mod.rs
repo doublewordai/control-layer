@@ -881,7 +881,10 @@ async fn test_request_logging_disabled(pool: PgPool) {
     config.enable_analytics = false; // Disable to avoid spawning background batcher task
 
     // Build router with request logging disabled
-    let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(DbPools::new(pool.clone())));
+    let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(
+        DbPools::new(pool.clone()),
+        Default::default(),
+    ));
     let limiters = crate::limits::Limiters::new(&config.limits);
     let mut app_state = AppState::builder()
         .db(DbPools::new(pool.clone()))
@@ -1216,7 +1219,10 @@ async fn test_build_router_with_metrics_disabled(pool: PgPool) {
     config.enable_metrics = false;
     config.enable_analytics = false; // Disable to avoid spawning background batcher task
 
-    let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(DbPools::new(pool.clone())));
+    let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(
+        DbPools::new(pool.clone()),
+        Default::default(),
+    ));
     let limiters = crate::limits::Limiters::new(&config.limits);
     let mut app_state = AppState::builder()
         .db(DbPools::new(pool))
@@ -1244,7 +1250,10 @@ async fn test_build_router_with_metrics_enabled(pool: PgPool) {
     config.enable_metrics = true;
     config.enable_analytics = false; // Disable to avoid spawning background batcher task
 
-    let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(DbPools::new(pool.clone())));
+    let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(
+        DbPools::new(pool.clone()),
+        Default::default(),
+    ));
     let limiters = crate::limits::Limiters::new(&config.limits);
     let mut app_state = AppState::builder()
         .db(DbPools::new(pool))
