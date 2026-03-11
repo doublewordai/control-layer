@@ -984,34 +984,49 @@ pub async fn list_files<P: PoolProvider>(
         .as_ref()
         .and_then(|id_str| uuid::Uuid::parse_str(id_str).ok().map(fusillade::FileId::from));
 
-    // Acquire a single read connection for all DB lookups in this handler
-    let mut read_conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
-
-    // Translate member_id to api_key_ids for fusillade filtering.
-    // In org context: look up the member's hidden key scoped to the org user (single key).
-    // In PM personal context: find ALL hidden keys for that member across all contexts
-    // (personal + every org), so the filter returns both personal and org files.
-    let api_key_ids_filter = if let Some(member_id) = query.member_id {
-        let key_ids = match current_user.active_organization {
-            Some(org_id) => {
-                let key_id = ApiKeys::new(&mut read_conn)
-                    .find_hidden_key_id(org_id, ApiKeyPurpose::Batch, member_id)
+    // Translate member_id (or own flag in org context) to api_key_ids for fusillade filtering.
+    // Uses a short-lived connection so we don't hold it across the fusillade call.
+    let api_key_ids_filter = {
+        let filter = if let Some(member_id) = query.member_id {
+            // In org context: look up the member's hidden key scoped to the org (single key).
+            // In PM personal context: find ALL hidden keys for that member across all contexts
+            // (personal + every org), so the filter returns both personal and org files.
+            let mut read_conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+            let key_ids = match current_user.active_organization {
+                Some(org_id) => {
+                    let key_id = ApiKeys::new(&mut read_conn)
+                        .find_hidden_key_id(org_id, ApiKeyPurpose::Batch, member_id)
+                        .await
+                        .map_err(Error::Database)?;
+                    key_id.into_iter().collect::<Vec<_>>()
+                }
+                None if can_read_all_files => ApiKeys::new(&mut read_conn)
+                    .find_all_hidden_key_ids_by_creator(ApiKeyPurpose::Batch, member_id)
                     .await
-                    .map_err(Error::Database)?;
-                key_id.into_iter().collect::<Vec<_>>()
-            }
-            None if can_read_all_files => ApiKeys::new(&mut read_conn)
-                .find_all_hidden_key_ids_by_creator(ApiKeyPurpose::Batch, member_id)
+                    .map_err(Error::Database)?,
+                None => {
+                    return Err(Error::BadRequest {
+                        message: "member_id filter is only available in organization context or for platform managers".to_string(),
+                    });
+                }
+            };
+            Some(key_ids)
+        } else if let Some(org_id) = current_user.active_organization.filter(|_| query.own) {
+            // own=true in org context: filter to files created by the current user's hidden key
+            let mut read_conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+            let key_id = ApiKeys::new(&mut read_conn)
+                .find_hidden_key_id(org_id, ApiKeyPurpose::Batch, current_user.id)
                 .await
-                .map_err(Error::Database)?,
-            None => {
-                return Err(Error::BadRequest {
-                    message: "member_id filter is only available in organization context or for platform managers".to_string(),
-                });
-            }
+                .map_err(Error::Database)?;
+            Some(key_id.into_iter().collect::<Vec<_>>())
+        } else {
+            None
         };
-        if key_ids.is_empty() {
-            // Member has no hidden keys yet (never created batches/files) — return empty list
+
+        // If we resolved keys but found none, the member has never created files — return empty
+        if let Some(ref key_ids) = filter
+            && key_ids.is_empty()
+        {
             return Ok(Json(FileListResponse {
                 object_type: ListObject::List,
                 data: vec![],
@@ -1020,9 +1035,7 @@ pub async fn list_files<P: PoolProvider>(
                 has_more: false,
             }));
         }
-        Some(key_ids)
-    } else {
-        None
+        filter
     };
 
     // Build filter based on permissions
@@ -1062,8 +1075,8 @@ pub async fn list_files<P: PoolProvider>(
     let last_id = files.last().map(|f| f.id.0.to_string());
 
     // Resolve creator/context metadata for all returned files.
-    // No conditional needed: the authorization layer already ensures users only see
-    // resources they're permitted to access (own files, org files, or all for PMs).
+    // Uses a fresh connection (not held across the fusillade call above).
+    let mut read_conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
 
     // Resolve individual creators via api_key_id → api_keys.created_by
     let api_key_ids: Vec<uuid::Uuid> = files
@@ -1209,6 +1222,43 @@ pub async fn get_file<P: PoolProvider>(
         None => Purpose::Batch, // Default to Batch for backwards compatibility
     };
 
+    // Enrich with creator/context metadata (same as list_files)
+    let mut read_conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+
+    // Resolve individual creator email via api_key_id
+    let created_by_email = if let Some(api_key_id) = file.api_key_id {
+        let creator_map = ApiKeys::new(&mut read_conn)
+            .get_creators_by_key_ids(vec![api_key_id])
+            .await
+            .map_err(Error::Database)?;
+        if let Some(&creator_id) = creator_map.get(&api_key_id) {
+            Users::new(&mut read_conn)
+                .get_bulk(vec![creator_id])
+                .await
+                .ok()
+                .and_then(|map| map.get(&creator_id).map(|u| u.email.clone()))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // Resolve context from file owner (uploaded_by field)
+    let (context_name, context_type) = if let Some(owner_id) = file.uploaded_by.as_ref().and_then(|id| Uuid::parse_str(id).ok()) {
+        let user_map = Users::new(&mut read_conn).get_bulk(vec![owner_id]).await.ok().unwrap_or_default();
+        match user_map.get(&owner_id) {
+            Some(u) if u.user_type == "organization" => {
+                let name = u.display_name.clone().unwrap_or_else(|| u.email.clone());
+                (Some(name), Some("organization".to_string()))
+            }
+            Some(_) => (Some("Personal".to_string()), Some("personal".to_string())),
+            None => (None, None),
+        }
+    } else {
+        (None, None)
+    };
+
     Ok(Json(FileResponse {
         id: file.id.0.to_string(), // Use full UUID, not Display truncation
         object_type: ObjectType::File,
@@ -1217,9 +1267,9 @@ pub async fn get_file<P: PoolProvider>(
         filename: file.name,
         purpose: api_purpose,
         expires_at: file.expires_at.map(|dt| dt.timestamp()),
-        created_by_email: None,
-        context_name: None,
-        context_type: None,
+        created_by_email,
+        context_name,
+        context_type,
     }))
 }
 

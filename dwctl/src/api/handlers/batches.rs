@@ -1311,38 +1311,45 @@ pub async fn list_batches<P: PoolProvider>(
         Some(current_user.id.to_string())
     };
 
-    // Acquire a single read connection for all DB lookups in this handler
-    let mut read_conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
-
     // Translate member_id to api_key_ids for fusillade filtering.
-    // In org context: look up the member's hidden key scoped to the org user (single key).
-    // In PM personal context: find ALL hidden keys for that member across all contexts
-    // (personal + every org), so the filter returns both personal and org batches.
-    let api_key_ids_filter = if let Some(member_id) = query.member_id {
-        let key_ids = match current_user.active_organization {
-            Some(org_id) => {
-                // Org context: find the single hidden key for this member in this org
-                let key_id = ApiKeys::new(&mut read_conn)
-                    .find_hidden_key_id(org_id, ApiKeyPurpose::Batch, member_id)
-                    .await
-                    .map_err(Error::Database)?;
-                key_id.into_iter().collect::<Vec<_>>()
-            }
-            None if can_read_all => {
-                // PM personal context: find ALL hidden keys created by this member
-                ApiKeys::new(&mut read_conn)
-                    .find_all_hidden_key_ids_by_creator(ApiKeyPurpose::Batch, member_id)
-                    .await
-                    .map_err(Error::Database)?
-            }
-            None => {
-                return Err(Error::BadRequest {
-                    message: "member_id filter is only available in organization context or for platform managers".to_string(),
-                });
-            }
+    // Uses a short-lived connection so we don't hold it across the fusillade call.
+    let api_key_ids_filter = {
+        let filter = if let Some(member_id) = query.member_id {
+            // In org context: look up the member's hidden key scoped to the org (single key).
+            // In PM personal context: find ALL hidden keys for that member across all contexts
+            // (personal + every org), so the filter returns both personal and org batches.
+            let mut read_conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+            let key_ids = match current_user.active_organization {
+                Some(org_id) => {
+                    // Org context: find the single hidden key for this member in this org
+                    let key_id = ApiKeys::new(&mut read_conn)
+                        .find_hidden_key_id(org_id, ApiKeyPurpose::Batch, member_id)
+                        .await
+                        .map_err(Error::Database)?;
+                    key_id.into_iter().collect::<Vec<_>>()
+                }
+                None if can_read_all => {
+                    // PM personal context: find ALL hidden keys created by this member
+                    ApiKeys::new(&mut read_conn)
+                        .find_all_hidden_key_ids_by_creator(ApiKeyPurpose::Batch, member_id)
+                        .await
+                        .map_err(Error::Database)?
+                }
+                None => {
+                    return Err(Error::BadRequest {
+                        message: "member_id filter is only available in organization context or for platform managers".to_string(),
+                    });
+                }
+            };
+            Some(key_ids)
+        } else {
+            None
         };
-        if key_ids.is_empty() {
-            // Member has no hidden keys yet (never created batches/files) — return empty list
+
+        // If we resolved keys but found none, the member has never created batches — return empty
+        if let Some(ref key_ids) = filter
+            && key_ids.is_empty()
+        {
             return Ok(Json(BatchListResponse {
                 object_type: ListObjectType::List,
                 data: vec![],
@@ -1351,9 +1358,7 @@ pub async fn list_batches<P: PoolProvider>(
                 has_more: false,
             }));
         }
-        Some(key_ids)
-    } else {
-        None
+        filter
     };
 
     // Fetch batches with ownership filtering, search, and cursor-based pagination
@@ -1383,9 +1388,9 @@ pub async fn list_batches<P: PoolProvider>(
     let last_id = batches.last().map(|b| b.id.0.to_string());
 
     // Resolve creator/context metadata for all returned batches.
-    // No conditional needed: the authorization layer already ensures users only see
-    // resources they're permitted to access (own batches, org batches, or all for PMs).
+    // Uses a fresh connection (not held across the fusillade call above).
     use crate::db::models::users::UserDBResponse;
+    let mut read_conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
 
     // Resolve individual creators via api_key_id → api_keys.created_by
     let api_key_ids: Vec<Uuid> = batches
