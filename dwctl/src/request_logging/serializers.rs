@@ -590,6 +590,8 @@ mod tests {
             uri: "/test".parse::<Uri>().unwrap(),
             headers: HashMap::new(),
             body: None,
+            trace_id: None,
+            span_id: None,
         };
 
         let result = parse_ai_request(&request_data).unwrap();
@@ -609,6 +611,8 @@ mod tests {
             uri: "/test".parse::<Uri>().unwrap(),
             headers: HashMap::new(),
             body: Some(Bytes::new()), // Empty bytes
+            trace_id: None,
+            span_id: None,
         };
 
         let result = parse_ai_request(&request_data).unwrap();
@@ -628,6 +632,8 @@ mod tests {
             uri: "/test".parse::<Uri>().unwrap(),
             headers: HashMap::new(),
             body: Some(Bytes::from("invalid json")),
+            trace_id: None,
+            span_id: None,
         };
 
         let result = parse_ai_request(&request_data);
@@ -647,6 +653,8 @@ mod tests {
             uri: "/test".parse::<Uri>().unwrap(),
             headers: HashMap::new(),
             body: Some(Bytes::from(json_body)),
+            trace_id: None,
+            span_id: None,
         };
 
         let result = parse_ai_request(&request_data).unwrap();
@@ -670,6 +678,8 @@ mod tests {
             uri: "/test".parse::<Uri>().unwrap(),
             headers: HashMap::new(),
             body: Some(Bytes::from(json_body)),
+            trace_id: None,
+            span_id: None,
         };
 
         let result = parse_ai_request(&request_data).unwrap();
@@ -692,6 +702,8 @@ mod tests {
             uri: "/test".parse::<Uri>().unwrap(),
             headers: HashMap::new(),
             body: Some(Bytes::from(json_body)),
+            trace_id: None,
+            span_id: None,
         };
 
         let result = parse_ai_request(&request_data).unwrap();
@@ -713,6 +725,8 @@ mod tests {
             uri: "/test".parse::<Uri>().unwrap(),
             headers: HashMap::new(),
             body: None,
+            trace_id: None,
+            span_id: None,
         };
 
         let response_data = ResponseData {
@@ -742,6 +756,8 @@ mod tests {
             uri: "/test".parse::<Uri>().unwrap(),
             headers: HashMap::new(),
             body: None,
+            trace_id: None,
+            span_id: None,
         };
 
         let response_data = ResponseData {
@@ -771,6 +787,8 @@ mod tests {
             uri: "/test".parse::<Uri>().unwrap(),
             headers: HashMap::new(),
             body: None,
+            trace_id: None,
+            span_id: None,
         };
 
         let json_response = r#"{
@@ -814,6 +832,8 @@ mod tests {
             uri: "/test".parse::<Uri>().unwrap(),
             headers: HashMap::new(),
             body: Some(Bytes::from(request_json)),
+            trace_id: None,
+            span_id: None,
         };
 
         // SSE streaming response
@@ -848,6 +868,8 @@ mod tests {
             uri: "/test".parse::<Uri>().unwrap(),
             headers: HashMap::new(),
             body: None,
+            trace_id: None,
+            span_id: None,
         };
 
         let embeddings_response = r#"{
@@ -887,6 +909,8 @@ mod tests {
             uri: "/test".parse::<Uri>().unwrap(),
             headers: HashMap::new(),
             body: None,
+            trace_id: None,
+            span_id: None,
         };
 
         let response_data = ResponseData {
@@ -917,6 +941,8 @@ mod tests {
             uri: "/v1/chat/completions".parse::<Uri>().unwrap(),
             headers: HashMap::new(),
             body: None,
+            trace_id: None,
+            span_id: None,
         };
 
         let response_data = ResponseData {
@@ -967,6 +993,8 @@ mod tests {
             uri: "/v1/chat/completions".parse::<Uri>().unwrap(),
             headers: HashMap::new(),
             body: Some(Bytes::from(request_json)),
+            trace_id: None,
+            span_id: None,
         };
 
         let response_data = ResponseData {
@@ -1033,6 +1061,8 @@ mod tests {
             uri: "/v1/chat/completions".parse::<Uri>().unwrap(),
             headers: HashMap::new(),
             body: None,
+            trace_id: None,
+            span_id: None,
         };
 
         let response_data = ResponseData {
@@ -1092,6 +1122,8 @@ mod tests {
             uri: "/v1/embeddings".parse::<Uri>().unwrap(),
             headers: HashMap::new(),
             body: None,
+            trace_id: None,
+            span_id: None,
         };
 
         let response_data = ResponseData {
@@ -1141,6 +1173,8 @@ mod tests {
             uri: "/v1/completions".parse::<Uri>().unwrap(),
             headers: HashMap::new(),
             body: None,
+            trace_id: None,
+            span_id: None,
         };
 
         let response_data = ResponseData {
@@ -1197,6 +1231,8 @@ mod tests {
             uri: "/v1/embeddings".parse::<Uri>().unwrap(),
             headers: HashMap::new(),
             body: None,
+            trace_id: None,
+            span_id: None,
         };
 
         let response_data = ResponseData {
@@ -1261,6 +1297,8 @@ mod tests {
             uri: "/v1/responses".parse::<Uri>().unwrap(),
             headers: HashMap::new(),
             body: Some(Bytes::from(body)),
+            trace_id: None,
+            span_id: None,
         }
     }
 
