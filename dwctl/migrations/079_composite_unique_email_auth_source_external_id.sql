@@ -1,7 +1,7 @@
 -- Replace separate email uniqueness indexes with a single composite index
 -- on (email, auth_source, external_user_id). This allows organizations and
 -- individual users to share the same email address, since they have different
--- auth_source values ('organization' vs 'native'/'proxy_header'/etc).
+-- auth_source values ('organization' vs 'native'/'proxy-header'/etc).
 
 -- Drop the two partial indexes from migration 033
 DROP INDEX idx_users_email_native_auth;
