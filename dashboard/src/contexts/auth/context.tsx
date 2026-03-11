@@ -84,28 +84,20 @@ export function AuthProvider({ children }: AuthProviderProps) {
   }, [isDemoMode, isMswReady, checkAuthStatus]);
 
   const login = async (credentials: LoginCredentials) => {
-    const response = await dwctlApi.auth.login(credentials);
+    await dwctlApi.auth.login(credentials);
 
-    setAuthState({
-      user: response.user,
-      isAuthenticated: true,
-      isLoading: false,
-      authMethod: "native",
-    });
+    // Re-fetch current user to pick up onboarding redirect and full user data
+    await checkAuthStatus();
 
     // Invalidate user queries to refresh data
     queryClient.invalidateQueries({ queryKey: queryKeys.users.all });
   };
 
   const register = async (credentials: RegisterCredentials) => {
-    const response = await dwctlApi.auth.register(credentials);
+    await dwctlApi.auth.register(credentials);
 
-    setAuthState({
-      user: response.user,
-      isAuthenticated: true,
-      isLoading: false,
-      authMethod: "native",
-    });
+    // Re-fetch current user to pick up onboarding redirect and full user data
+    await checkAuthStatus();
 
     // Invalidate user queries to refresh data
     queryClient.invalidateQueries({ queryKey: queryKeys.users.all });
