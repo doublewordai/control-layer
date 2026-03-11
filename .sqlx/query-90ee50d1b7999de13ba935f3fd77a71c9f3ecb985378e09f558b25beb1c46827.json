@@ -1,0 +1,88 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE user_webhooks\n            SET\n                url = COALESCE($2, url),\n                enabled = COALESCE($3, enabled),\n                event_types = CASE\n                    WHEN $4::boolean THEN $5\n                    ELSE event_types\n                END,\n                description = CASE\n                    WHEN $6::boolean THEN $7\n                    ELSE description\n                END,\n                -- Clear disabled_at when re-enabling\n                disabled_at = CASE\n                    WHEN $3 = true THEN NULL\n                    ELSE disabled_at\n                END,\n                -- Reset consecutive failures when re-enabling\n                consecutive_failures = CASE\n                    WHEN $3 = true THEN 0\n                    ELSE consecutive_failures\n                END\n            WHERE id = $1\n            RETURNING *\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "user_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "url",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "secret",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "enabled",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 5,
+        "name": "event_types",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 6,
+        "name": "description",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 8,
+        "name": "updated_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 9,
+        "name": "consecutive_failures",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 10,
+        "name": "disabled_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Bool",
+        "Bool",
+        "Jsonb",
+        "Bool",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "90ee50d1b7999de13ba935f3fd77a71c9f3ecb985378e09f558b25beb1c46827"
+}

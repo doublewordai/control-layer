@@ -1,0 +1,88 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                    SELECT\n                        COUNT(*) as total,\n                        COUNT(*) FILTER (WHERE success = true) as successful,\n                        COUNT(*) FILTER (WHERE success = false) as failed,\n                        (AVG(response_time_ms) FILTER (WHERE success = true))::float8 as avg_time,\n                        MIN(response_time_ms) FILTER (WHERE success = true) as min_time,\n                        MAX(response_time_ms) FILTER (WHERE success = true) as max_time,\n                        (PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY response_time_ms) FILTER (WHERE success = true))::float8 as p50,\n                        (PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY response_time_ms) FILTER (WHERE success = true))::float8 as p95,\n                        (PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY response_time_ms) FILTER (WHERE success = true))::float8 as p99,\n                        MAX(executed_at) as last_execution,\n                        MAX(executed_at) FILTER (WHERE success = true) as last_success,\n                        MAX(executed_at) FILTER (WHERE success = false) as last_failure\n                    FROM probe_results\n                    WHERE probe_id = $1\n                    ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "total",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "successful",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "failed",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "avg_time",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 4,
+        "name": "min_time",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 5,
+        "name": "max_time",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 6,
+        "name": "p50",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 7,
+        "name": "p95",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 8,
+        "name": "p99",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 9,
+        "name": "last_execution",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 10,
+        "name": "last_success",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 11,
+        "name": "last_failure",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "c8ed5d322bab2d0a5c42ad48a5d0c8807774d772d9a2bccbec0d81ba147f5d93"
+}
