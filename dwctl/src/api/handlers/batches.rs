@@ -225,13 +225,15 @@ pub async fn create_batch<P: PoolProvider>(
         message: "Invalid input_file_id format".to_string(),
     })?;
 
-    // Reject batches from users with negative credit balance
+    // Reject batches from users/orgs with negative credit balance.
+    // In org context, check the org's balance rather than the user's personal balance.
+    let balance_check_id = current_user.active_organization.unwrap_or(current_user.id);
     {
         let mut conn = state.db.write().acquire().await.map_err(|e| Error::Internal {
             operation: format!("get db connection for credit check: {}", e),
         })?;
         let balance = Credits::new(&mut conn)
-            .get_user_balance(current_user.id)
+            .get_user_balance(balance_check_id)
             .await
             .map_err(|e| Error::Internal {
                 operation: format!("check credit balance: {}", e),
@@ -2971,6 +2973,94 @@ mod tests {
             .await;
 
         // Zero balance should be accepted (only negative is rejected)
+        resp.assert_status(StatusCode::CREATED);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_create_batch_in_org_context_checks_org_balance_not_user(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+
+        // Create a user with negative personal balance
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let org = create_test_org(&pool, user.id).await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut credits_repo = Credits::new(&mut conn);
+
+        // Give user negative balance
+        credits_repo
+            .create_transaction(&CreditTransactionCreateDBRequest {
+                user_id: user.id,
+                transaction_type: CreditTransactionType::Usage,
+                amount: Decimal::new(500, 2), // -$5.00
+                source_id: Uuid::new_v4().to_string(),
+                description: Some("Usage".to_string()),
+                fusillade_batch_id: None,
+                api_key_id: None,
+            })
+            .await
+            .unwrap();
+
+        // Give org positive balance
+        credits_repo
+            .create_transaction(&CreditTransactionCreateDBRequest {
+                user_id: org.id,
+                transaction_type: CreditTransactionType::AdminGrant,
+                amount: Decimal::new(1000, 2), // $10.00
+                source_id: Uuid::new_v4().to_string(),
+                description: Some("Org credits".to_string()),
+                fusillade_batch_id: None,
+                api_key_id: None,
+            })
+            .await
+            .unwrap();
+        drop(credits_repo);
+        drop(conn);
+
+        // Give org access to a model
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, org.id, group.id).await;
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        let auth = add_auth_headers(&user);
+        let org_cookie = format!("dw_active_org={}", org.id);
+
+        // Upload a file in org context
+        let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}"#;
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test-batch.jsonl");
+        let multipart = axum_test::multipart::MultipartForm::new()
+            .add_part("file", file_part)
+            .add_part("purpose", axum_test::multipart::Part::text("batch"));
+        let upload_resp = app
+            .post("/ai/v1/files")
+            .multipart(multipart)
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .add_header("cookie", &org_cookie)
+            .await;
+        upload_resp.assert_status(StatusCode::CREATED);
+        let file: serde_json::Value = upload_resp.json();
+        let file_id = file["id"].as_str().unwrap();
+
+        // Create batch in org context — should succeed despite user's negative balance
+        // because the org has positive balance
+        let create_req = CreateBatchRequest {
+            input_file_id: file_id.to_string(),
+            endpoint: "/v1/chat/completions".to_string(),
+            completion_window: "24h".to_string(),
+            metadata: None,
+        };
+
+        let resp = app
+            .post("/ai/v1/batches")
+            .json(&create_req)
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .add_header("cookie", &org_cookie)
+            .await;
+
         resp.assert_status(StatusCode::CREATED);
     }
 }
