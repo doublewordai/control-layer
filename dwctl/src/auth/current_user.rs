@@ -500,11 +500,11 @@ async fn populate_org_context(user: &mut CurrentUser, parts: &Parts, db: &PgPool
     }
 }
 
-/// Spawn a background task to update `last_login` if it is null or older than 1 hour.
+/// Spawn a background task to update `last_login` if it is null or older than 5 minutes.
 fn maybe_update_last_login(user_id: crate::types::UserId, last_login: Option<DateTime<Utc>>, db: &PgPool) {
     let should_update = match last_login {
         None => true,
-        Some(ts) => Utc::now() - ts > chrono::Duration::hours(1),
+        Some(ts) => Utc::now() - ts > chrono::Duration::minutes(5),
     };
     if should_update {
         let pool = db.clone();

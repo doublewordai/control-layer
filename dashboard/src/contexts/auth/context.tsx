@@ -49,11 +49,19 @@ export function AuthProvider({ children }: AuthProviderProps) {
       // params take priority.
       if (user.onboarding_redirect_url) {
         const urlRedirect = new URLSearchParams(window.location.search).get("redirect");
-        const onboardingKey = `onboarding_completed_${user.id}`;
-        if (!urlRedirect && !localStorage.getItem(onboardingKey)) {
-          localStorage.setItem(onboardingKey, "true");
-          window.location.href = user.onboarding_redirect_url;
-          return;
+        if (!urlRedirect) {
+          try {
+            const onboardingKey = `onboarding_completed_${user.id}`;
+            if (!localStorage.getItem(onboardingKey)) {
+              localStorage.setItem(onboardingKey, "true");
+              window.location.href = user.onboarding_redirect_url;
+              return;
+            }
+          } catch {
+            // localStorage unavailable (disabled, quota exceeded, etc.) —
+            // skip redirect to avoid an infinite loop since we can't
+            // persist the onboarding_completed guard.
+          }
         }
       }
 
