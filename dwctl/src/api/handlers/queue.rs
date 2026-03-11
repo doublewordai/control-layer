@@ -10,19 +10,18 @@ use std::collections::HashMap;
 use crate::api::handlers::sla_capacity::parse_window_to_seconds;
 
 use crate::{
-    AppState,
-    auth::permissions::{RequiresPermission, operation, resource},
+    auth::permissions::{operation, resource, RequiresPermission},
     errors::Error,
+    AppState,
 };
 
 /// Nested map of pending request counts: model -> completion_window -> count
 type PendingCountsByModelAndWindow = HashMap<String, HashMap<String, i64>>;
 
-/// Get pending request counts grouped by model and completion window
+/// Get pending, claimed, and processing request counts grouped by model and completion window
 ///
 /// Returns a nested map showing how many pending requests are queued for each
 /// model and completion window combination. This excludes:
-/// - Claimed requests (already being processed)
 /// - Escalated requests (racing duplicate requests)
 /// - Requests without a template_id
 /// - Requests in batches being cancelled
