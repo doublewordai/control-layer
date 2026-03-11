@@ -2,3 +2,6 @@
 members = ["dwctl"]
 resolver = "2"
 
+[patch.crates-io]
+fusillade = { path = "../fusillade" }
+
