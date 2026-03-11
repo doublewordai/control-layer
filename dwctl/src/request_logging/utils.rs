@@ -74,7 +74,7 @@ fn process_sse_chunks(chunks: Vec<String>) -> AiResponse {
 ///
 /// # Errors
 /// Returns error if both SSE parsing and JSON deserialization fail
-#[instrument(skip_all)]
+#[instrument(skip_all, name = "dwctl.parse_streaming_response")]
 pub(crate) fn parse_streaming_response(body_str: &str) -> Result<AiResponse, Box<dyn std::error::Error>> {
     // Streaming: expect SSE, fallback to JSON
     parse_sse_chunks(body_str)
@@ -87,7 +87,7 @@ pub(crate) fn parse_streaming_response(body_str: &str) -> Result<AiResponse, Box
 ///
 /// # Errors
 /// Returns error if JSON deserialization fails
-#[instrument(skip_all)]
+#[instrument(skip_all, name = "dwctl.parse_non_streaming_response")]
 pub(crate) fn parse_non_streaming_response(body_str: &str) -> Result<AiResponse, Box<dyn std::error::Error>> {
     serde_json::from_str(body_str).map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
 }
@@ -96,7 +96,7 @@ pub(crate) fn parse_non_streaming_response(body_str: &str) -> Result<AiResponse,
 ///
 /// # Errors
 /// Returns error if JSON deserialization into [`Response`] fails.
-#[instrument(skip_all)]
+#[instrument(skip_all, name = "dwctl.parse_responses_non_streaming")]
 pub(crate) fn parse_responses_non_streaming_response(body_str: &str) -> Result<AiResponse, Box<dyn std::error::Error>> {
     serde_json::from_str::<Response>(body_str)
         .map(AiResponse::Responses)
@@ -112,7 +112,7 @@ pub(crate) fn parse_responses_non_streaming_response(body_str: &str) -> Result<A
 ///
 /// # Errors
 /// Returns error if no valid SSE data fields are found or all chunks fail to parse.
-#[instrument(skip_all)]
+#[instrument(skip_all, name = "dwctl.parse_responses_streaming")]
 pub(crate) fn parse_responses_streaming_response(body_str: &str) -> Result<AiResponse, Box<dyn std::error::Error>> {
     let chunks = parse_sse_chunks(body_str).map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
 
@@ -132,7 +132,7 @@ pub(crate) fn parse_responses_streaming_response(body_str: &str) -> Result<AiRes
 ///
 /// # Errors
 /// Returns `SerializationError` if brotli decompression fails
-#[instrument(skip_all, name = "decompress_response")]
+#[instrument(skip_all, name = "dwctl.decompress_response")]
 pub(crate) fn decompress_response_if_needed(
     bytes: &[u8],
     headers: &std::collections::HashMap<String, Vec<bytes::Bytes>>,
