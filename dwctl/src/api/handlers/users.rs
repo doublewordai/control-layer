@@ -287,10 +287,16 @@ pub async fn get_user<P: PoolProvider>(
     if is_current {
         response = response.with_active_organization(current_user.active_organization);
 
-        // Include onboarding redirect URL for first-time users (last_login is null)
-        if response.last_login.is_none()
-            && let Some(url) = &state.config.onboarding_url
-        {
+        // Include onboarding redirect URL when the user is treated as "first login".
+        // A user is considered first login if last_login is null, or if last_login is
+        // within 10 seconds of created_at. The small time window accounts for cases
+        // where a background task updates last_login before the first /current call
+        // or before this handler reads the user from the database.
+        let is_first_login = response.last_login.is_none()
+            || response
+                .last_login
+                .is_some_and(|ll| (ll - response.created_at).num_seconds().abs() < 10);
+        if is_first_login && let Some(url) = &state.config.onboarding_url {
             response = response.with_onboarding_redirect_url(url.clone());
         }
     }
@@ -1803,5 +1809,113 @@ mod tests {
         let balance: UserResponse = response.json();
         assert_eq!(balance.id, user.id);
         assert_eq!(balance.credit_balance, Some(300.0));
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_onboarding_redirect_for_new_user_with_null_last_login(pool: PgPool) {
+        let mut config = create_test_config();
+        config.onboarding_url = Some("https://onboarding.example.com".to_string());
+        let (app, _bg_services) = create_test_app_with_config(pool.clone(), config, false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+
+        // New user has null last_login — should get onboarding redirect
+        let response = app
+            .get("/admin/api/v1/users/current")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+
+        response.assert_status_ok();
+        let current_user: UserResponse = response.json();
+        assert_eq!(
+            current_user.onboarding_redirect_url.as_deref(),
+            Some("https://onboarding.example.com"),
+        );
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_onboarding_redirect_for_recently_created_user_with_last_login_set(pool: PgPool) {
+        let mut config = create_test_config();
+        config.onboarding_url = Some("https://onboarding.example.com".to_string());
+        let (app, _bg_services) = create_test_app_with_config(pool.clone(), config, false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+
+        // Simulate the race: auth extractor's background task set last_login
+        // moments after account creation (within the 10-second window)
+        sqlx::query!(
+            "UPDATE users SET last_login = created_at + interval '1 second' WHERE id = $1",
+            user.id
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let response = app
+            .get("/admin/api/v1/users/current")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+
+        response.assert_status_ok();
+        let current_user: UserResponse = response.json();
+        assert_eq!(
+            current_user.onboarding_redirect_url.as_deref(),
+            Some("https://onboarding.example.com"),
+            "Should still redirect when last_login is within 10 seconds of created_at"
+        );
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_no_onboarding_redirect_for_returning_user(pool: PgPool) {
+        let mut config = create_test_config();
+        config.onboarding_url = Some("https://onboarding.example.com".to_string());
+        let (app, _bg_services) = create_test_app_with_config(pool.clone(), config, false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+
+        // Set last_login to well past the 10-second window (returning user)
+        sqlx::query!(
+            "UPDATE users SET last_login = created_at + interval '2 hours' WHERE id = $1",
+            user.id
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let response = app
+            .get("/admin/api/v1/users/current")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+
+        response.assert_status_ok();
+        let current_user: UserResponse = response.json();
+        assert!(
+            current_user.onboarding_redirect_url.is_none(),
+            "Returning user should not get onboarding redirect"
+        );
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_no_onboarding_redirect_when_not_configured(pool: PgPool) {
+        // Default test config has onboarding_url: None
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+
+        let response = app
+            .get("/admin/api/v1/users/current")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+
+        response.assert_status_ok();
+        let current_user: UserResponse = response.json();
+        assert!(
+            current_user.onboarding_redirect_url.is_none(),
+            "Should not include redirect when onboarding_url is not configured"
+        );
     }
 }
