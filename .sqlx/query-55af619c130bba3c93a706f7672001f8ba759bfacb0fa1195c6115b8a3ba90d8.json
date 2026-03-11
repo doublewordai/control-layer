@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            UPDATE users SET\n                display_name = COALESCE($2, display_name),\n                avatar_url = COALESCE($3, avatar_url),\n                password_hash = COALESCE($4, password_hash),\n                batch_notifications_enabled = COALESCE($5, batch_notifications_enabled),\n                low_balance_threshold = CASE\n                    WHEN $6::boolean THEN $7\n                    ELSE low_balance_threshold\n                END,\n                low_balance_notification_sent = CASE\n                    WHEN $6::boolean THEN false\n                    ELSE low_balance_notification_sent\n                END,\n                auto_topup_amount = CASE\n                    WHEN $8::boolean THEN $9\n                    ELSE auto_topup_amount\n                END,\n                auto_topup_threshold = CASE\n                    WHEN $10::boolean THEN $11\n                    ELSE auto_topup_threshold\n                END,\n                updated_at = NOW()\n            WHERE id = $1\n            RETURNING *\n            ",
+  "query": "\n            UPDATE users SET\n                display_name = COALESCE($2, display_name),\n                avatar_url = COALESCE($3, avatar_url),\n                password_hash = COALESCE($4, password_hash),\n                batch_notifications_enabled = COALESCE($5, batch_notifications_enabled),\n                low_balance_threshold = CASE\n                    WHEN $6::boolean THEN $7\n                    ELSE low_balance_threshold\n                END,\n                low_balance_notification_sent = CASE\n                    WHEN $6::boolean THEN false\n                    ELSE low_balance_notification_sent\n                END,\n                auto_topup_amount = CASE\n                    WHEN $8::boolean THEN $9\n                    ELSE auto_topup_amount\n                END,\n                auto_topup_threshold = CASE\n                    WHEN $10::boolean THEN $11\n                    ELSE auto_topup_threshold\n                END,\n                auto_topup_monthly_limit = CASE\n                    WHEN $12::boolean THEN $13\n                    ELSE auto_topup_monthly_limit\n                END,\n                auto_topup_limit_notification_sent = CASE\n                    WHEN $12::boolean THEN false\n                    ELSE auto_topup_limit_notification_sent\n                END,\n                updated_at = NOW()\n            WHERE id = $1\n            RETURNING *\n            ",
   "describe": {
     "columns": [
       {
@@ -112,6 +112,16 @@
         "ordinal": 21,
         "name": "auto_topup_threshold",
         "type_info": "Float4"
+      },
+      {
+        "ordinal": 22,
+        "name": "auto_topup_monthly_limit",
+        "type_info": "Float4"
+      },
+      {
+        "ordinal": 23,
+        "name": "auto_topup_limit_notification_sent",
+        "type_info": "Bool"
       }
     ],
     "parameters": {
@@ -121,6 +131,8 @@
         "Varchar",
         "Text",
         "Bool",
+        "Bool",
+        "Float4",
         "Bool",
         "Float4",
         "Bool",
@@ -151,8 +163,10 @@
       true,
       false,
       true,
-      true
+      true,
+      true,
+      false
     ]
   },
-  "hash": "01fc0f655fd63b1ef5ec5237c046acbb19bdc2fef194db4394ac7803939b0d6e"
+  "hash": "55af619c130bba3c93a706f7672001f8ba759bfacb0fa1195c6115b8a3ba90d8"
 }

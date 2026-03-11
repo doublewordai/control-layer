@@ -32,6 +32,9 @@ export function AutoTopupSection({
   const [amount, setAmount] = useState(
     user.auto_topup_amount?.toString() ?? "25.00",
   );
+  const [monthlyLimit, setMonthlyLimit] = useState(
+    user.auto_topup_monthly_limit?.toString() ?? "",
+  );
 
   const updateUserMutation = useUpdateUser();
   const enableAutoTopupMutation = useEnableAutoTopup();
@@ -47,7 +50,19 @@ export function AutoTopupSection({
       setThreshold(user.auto_topup_threshold.toString());
     if (user.auto_topup_amount != null)
       setAmount(user.auto_topup_amount.toString());
-  }, [user.auto_topup_threshold, user.auto_topup_amount]);
+    if (user.auto_topup_monthly_limit != null)
+      setMonthlyLimit(user.auto_topup_monthly_limit.toString());
+    else setMonthlyLimit("");
+  }, [
+    user.auto_topup_threshold,
+    user.auto_topup_amount,
+    user.auto_topup_monthly_limit,
+  ]);
+
+  const parseMonthlyLimit = (): number | null => {
+    const parsed = parseFloat(monthlyLimit);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+  };
 
   const handleToggle = async (checked: boolean) => {
     if (checked) {
@@ -62,6 +77,7 @@ export function AutoTopupSection({
         const result = await enableAutoTopupMutation.mutateAsync({
           threshold: thresholdNum,
           amount: amountNum,
+          monthlyLimit: parseMonthlyLimit(),
         });
 
         if (result.has_payment_method) {
@@ -80,7 +96,11 @@ export function AutoTopupSection({
       try {
         await updateUserMutation.mutateAsync({
           id: userId,
-          data: { auto_topup_threshold: null, auto_topup_amount: null },
+          data: {
+            auto_topup_threshold: null,
+            auto_topup_amount: null,
+            auto_topup_monthly_limit: null,
+          },
         });
         toast.success("Auto top-up disabled");
         setIsEditing(false);
@@ -103,12 +123,14 @@ export function AutoTopupSection({
       toast.error("Please enter a valid amount greater than $0");
       return;
     }
+    const limitNum = parseMonthlyLimit();
     try {
       await updateUserMutation.mutateAsync({
         id: userId,
         data: {
           auto_topup_threshold: thresholdNum,
           auto_topup_amount: amountNum,
+          auto_topup_monthly_limit: limitNum,
         },
       });
       toast.success(
@@ -147,6 +169,15 @@ export function AutoTopupSection({
           <span className="font-mono">
             {formatDollars(user.auto_topup_threshold!)}
           </span>
+          {user.auto_topup_monthly_limit != null && (
+            <>
+              {" · max "}
+              <span className="font-mono">
+                {formatDollars(user.auto_topup_monthly_limit)}
+              </span>
+              {"/mo"}
+            </>
+          )}
         </button>
       )}
 
@@ -177,12 +208,30 @@ export function AutoTopupSection({
               className="w-16 h-7 text-xs font-mono px-1.5 [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none"
             />
           </div>
+          <span className="text-xs text-doubleword-neutral-400">limit</span>
+          <div className="flex items-center gap-1">
+            <span className="text-xs text-doubleword-neutral-400">$</span>
+            <Input
+              type="number"
+              min="0"
+              step="10"
+              value={monthlyLimit}
+              onChange={(e) => setMonthlyLimit(e.target.value)}
+              placeholder="none"
+              aria-label="Monthly limit"
+              className="w-16 h-7 text-xs font-mono px-1.5 [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none"
+            />
+            <span className="text-xs text-doubleword-neutral-400">/mo</span>
+          </div>
           <Button
             variant="ghost"
             size="sm"
             onClick={() => {
               setThreshold(user.auto_topup_threshold?.toString() ?? "5.00");
               setAmount(user.auto_topup_amount?.toString() ?? "25.00");
+              setMonthlyLimit(
+                user.auto_topup_monthly_limit?.toString() ?? "",
+              );
               setIsEditing(false);
             }}
             className="h-7 px-1.5 text-xs text-doubleword-neutral-400"

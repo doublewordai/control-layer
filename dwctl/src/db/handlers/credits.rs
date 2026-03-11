@@ -478,6 +478,55 @@ impl<'c> Credits<'c> {
         Ok(result.is_some())
     }
 
+    /// Get the total amount of auto top-up charges for a user in the current calendar month (UTC).
+    #[instrument(skip(self), err)]
+    pub async fn get_monthly_auto_topup_spend(&mut self, user_id: UserId) -> Result<rust_decimal::Decimal> {
+        let row = sqlx::query!(
+            r#"
+            SELECT COALESCE(SUM(amount), 0)::decimal(20, 9) as "total!"
+            FROM credits_transactions
+            WHERE user_id = $1
+              AND source_id LIKE 'auto_topup_%'
+              AND created_at >= date_trunc('month', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
+            "#,
+            user_id
+        )
+        .fetch_one(&mut *self.db)
+        .await?;
+
+        Ok(row.total)
+    }
+
+    /// Get the total auto top-up spend for multiple users in the current calendar month (UTC).
+    /// Returns a map of user_id → total spend. Users with no auto-topup transactions this month
+    /// will be absent from the map; callers should treat missing entries as zero.
+    #[instrument(skip(self, user_ids), fields(count = user_ids.len()), err)]
+    pub async fn get_monthly_auto_topup_spend_bulk(&mut self, user_ids: &[UserId]) -> Result<HashMap<UserId, rust_decimal::Decimal>> {
+        if user_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let rows = sqlx::query!(
+            r#"
+            SELECT user_id, COALESCE(SUM(amount), 0)::decimal(20, 9) as "total!"
+            FROM credits_transactions
+            WHERE user_id = ANY($1)
+              AND source_id LIKE 'auto_topup_%'
+              AND created_at >= date_trunc('month', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
+            GROUP BY user_id
+            "#,
+            user_ids
+        )
+        .fetch_all(&mut *self.db)
+        .await?;
+
+        let mut map = HashMap::with_capacity(rows.len());
+        for row in rows {
+            map.insert(row.user_id, row.total);
+        }
+        Ok(map)
+    }
+
     /// Count total transactions for a specific user with optional filters
     #[instrument(skip(self, filters), fields(user_id = %abbrev_uuid(&user_id)), err)]
     pub async fn count_user_transactions(&mut self, user_id: UserId, filters: &TransactionFilters) -> Result<i64> {
@@ -2069,5 +2118,124 @@ mod tests {
             .expect("Failed to count transactions");
 
         assert_eq!(count, 0, "Count should be 0 for empty results");
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_get_monthly_auto_topup_spend_zero_for_new_user(pool: PgPool) {
+        let user_id = create_test_user(&pool).await;
+        let mut conn = pool.acquire().await.expect("Failed to acquire connection");
+        let mut credits = Credits::new(&mut conn);
+
+        let spend = credits.get_monthly_auto_topup_spend(user_id).await.expect("Failed to get spend");
+        assert_eq!(spend, Decimal::ZERO, "New user should have zero monthly auto-topup spend");
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_get_monthly_auto_topup_spend_sums_only_auto_topup(pool: PgPool) {
+        let user_id = create_test_user(&pool).await;
+        let mut conn = pool.acquire().await.expect("Failed to acquire connection");
+        let mut credits = Credits::new(&mut conn);
+
+        // Create an auto top-up transaction (source_id starts with "auto_topup_")
+        credits
+            .create_transaction(&CreditTransactionCreateDBRequest {
+                user_id,
+                transaction_type: CreditTransactionType::Purchase,
+                amount: Decimal::from_str("25.0").unwrap(),
+                source_id: format!("auto_topup_{}_2026-03-01T10:00", user_id),
+                description: Some("Auto top-up".to_string()),
+                fusillade_batch_id: None,
+                api_key_id: None,
+            })
+            .await
+            .unwrap();
+
+        // Create a non-auto-topup transaction (should be excluded)
+        credits
+            .create_transaction(&CreditTransactionCreateDBRequest {
+                user_id,
+                transaction_type: CreditTransactionType::Purchase,
+                amount: Decimal::from_str("100.0").unwrap(),
+                source_id: format!("manual_topup_{}", Uuid::new_v4()),
+                description: Some("Manual purchase".to_string()),
+                fusillade_batch_id: None,
+                api_key_id: None,
+            })
+            .await
+            .unwrap();
+
+        // Create a second auto top-up transaction
+        credits
+            .create_transaction(&CreditTransactionCreateDBRequest {
+                user_id,
+                transaction_type: CreditTransactionType::Purchase,
+                amount: Decimal::from_str("25.0").unwrap(),
+                source_id: format!("auto_topup_{}_2026-03-02T10:00", user_id),
+                description: Some("Auto top-up 2".to_string()),
+                fusillade_batch_id: None,
+                api_key_id: None,
+            })
+            .await
+            .unwrap();
+
+        let spend = credits.get_monthly_auto_topup_spend(user_id).await.expect("Failed to get spend");
+        assert_eq!(
+            spend,
+            Decimal::from_str("50.0").unwrap(),
+            "Should sum only auto_topup_ transactions"
+        );
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_get_monthly_auto_topup_spend_excludes_other_users(pool: PgPool) {
+        let user_a = create_test_user(&pool).await;
+        let user_b = create_test_user(&pool).await;
+        let mut conn = pool.acquire().await.expect("Failed to acquire connection");
+        let mut credits = Credits::new(&mut conn);
+
+        // Create auto top-up for user A
+        credits
+            .create_transaction(&CreditTransactionCreateDBRequest {
+                user_id: user_a,
+                transaction_type: CreditTransactionType::Purchase,
+                amount: Decimal::from_str("30.0").unwrap(),
+                source_id: format!("auto_topup_{}_2026-03-01T10:00", user_a),
+                description: None,
+                fusillade_batch_id: None,
+                api_key_id: None,
+            })
+            .await
+            .unwrap();
+
+        // Create auto top-up for user B
+        credits
+            .create_transaction(&CreditTransactionCreateDBRequest {
+                user_id: user_b,
+                transaction_type: CreditTransactionType::Purchase,
+                amount: Decimal::from_str("50.0").unwrap(),
+                source_id: format!("auto_topup_{}_2026-03-01T10:00", user_b),
+                description: None,
+                fusillade_batch_id: None,
+                api_key_id: None,
+            })
+            .await
+            .unwrap();
+
+        let spend_a = credits.get_monthly_auto_topup_spend(user_a).await.unwrap();
+        assert_eq!(
+            spend_a,
+            Decimal::from_str("30.0").unwrap(),
+            "User A should only see their own spend"
+        );
+
+        let spend_b = credits.get_monthly_auto_topup_spend(user_b).await.unwrap();
+        assert_eq!(
+            spend_b,
+            Decimal::from_str("50.0").unwrap(),
+            "User B should only see their own spend"
+        );
     }
 }

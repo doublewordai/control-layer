@@ -1116,16 +1116,18 @@ const paymentsApi = {
   async enableAutoTopup(
     threshold: number,
     amount: number,
+    monthlyLimit: number | null,
   ): Promise<{
     has_payment_method?: boolean;
     needs_billing_portal?: boolean;
     threshold?: number;
     amount?: number;
+    monthly_limit?: number | null;
   }> {
     const response = await fetch("/admin/api/v1/auto-topup/enable", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ threshold, amount }),
+      body: JSON.stringify({ threshold, amount, monthly_limit: monthlyLimit }),
     });
 
     if (!response.ok) {

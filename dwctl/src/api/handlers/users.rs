@@ -402,6 +402,13 @@ pub async fn update_user<P: PoolProvider>(
             message: "Auto top-up threshold must be non-negative".to_string(),
         });
     }
+    if let Some(Some(limit)) = &user_data.auto_topup_monthly_limit
+        && *limit <= 0.0
+    {
+        return Err(Error::BadRequest {
+            message: "Auto top-up monthly limit must be positive".to_string(),
+        });
+    }
 
     let mut conn = state.db.write().acquire().await.expect("Failed to acquire database connection");
 

@@ -51,6 +51,9 @@ pub struct UserUpdateDBRequest {
     /// Auto top-up threshold (balance level that triggers auto top-up).
     /// `None` = don't change, `Some(None)` = disable, `Some(Some(val))` = set threshold.
     pub auto_topup_threshold: Option<Option<f32>>,
+    /// Monthly auto top-up spending limit.
+    /// `None` = don't change, `Some(None)` = disable limit, `Some(Some(val))` = set limit.
+    pub auto_topup_monthly_limit: Option<Option<f32>>,
 }
 
 impl UserUpdateDBRequest {
@@ -64,6 +67,7 @@ impl UserUpdateDBRequest {
             low_balance_threshold: update.low_balance_threshold,
             auto_topup_amount: update.auto_topup_amount,
             auto_topup_threshold: update.auto_topup_threshold,
+            auto_topup_monthly_limit: update.auto_topup_monthly_limit,
         }
     }
 }
@@ -93,6 +97,8 @@ pub struct UserDBResponse {
     pub auto_topup_amount: Option<f32>,
     /// Auto top-up threshold. When balance drops below this, auto top-up triggers.
     pub auto_topup_threshold: Option<f32>,
+    /// Monthly auto top-up spending limit. NULL means no limit.
+    pub auto_topup_monthly_limit: Option<f32>,
     /// User type: 'individual' or 'organization'
     pub user_type: String,
 }

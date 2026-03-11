@@ -74,6 +74,10 @@ pub struct UserUpdate {
     /// auto top-up is triggered. Set to null to disable. Omit entirely to leave unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
     pub auto_topup_threshold: Option<Option<f32>>,
+    /// Monthly auto top-up spending limit in dollars. Set to a number to cap monthly
+    /// auto top-up charges, set to null to remove the limit. Omit entirely to leave unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
+    pub auto_topup_monthly_limit: Option<Option<f32>>,
 }
 
 /// Full user details returned by the API.
@@ -130,6 +134,8 @@ pub struct UserResponse {
     pub auto_topup_threshold: Option<f32>,
     /// Whether the user has a payment method set up for auto top-up.
     pub has_auto_topup_payment_method: bool,
+    /// Monthly auto top-up spending limit in dollars. Null means no limit.
+    pub auto_topup_monthly_limit: Option<f32>,
     /// User type: 'individual' or 'organization'
     pub user_type: String,
     /// Organizations this user belongs to (only included if `include=organizations` is specified)
@@ -224,6 +230,7 @@ impl From<UserDBResponse> for UserResponse {
             auto_topup_amount: db.auto_topup_amount,
             auto_topup_threshold: db.auto_topup_threshold,
             has_auto_topup_payment_method: db.payment_provider_id.as_ref().is_some_and(|s| !s.is_empty()),
+            auto_topup_monthly_limit: db.auto_topup_monthly_limit,
             user_type: db.user_type,
             organizations: None,
             active_organization_id: None,

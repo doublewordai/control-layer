@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            UPDATE users SET\n                display_name = COALESCE($2, display_name),\n                avatar_url = COALESCE($3, avatar_url),\n                email = COALESCE($4, email),\n                updated_at = NOW()\n            WHERE id = $1 AND user_type = 'organization' AND is_deleted = false\n            RETURNING id, username, email, display_name, avatar_url, auth_source, created_at, updated_at,\n                      is_admin, password_hash, external_user_id, payment_provider_id,\n                      batch_notifications_enabled, first_batch_email_sent,\n                      low_balance_notification_sent, low_balance_threshold,\n                      auto_topup_amount, auto_topup_threshold, user_type\n            ",
+  "query": "\n            INSERT INTO users (id, username, email, display_name, avatar_url, auth_source, user_type, is_admin)\n            VALUES ($1, $2, $3, $4, $5, 'organization', 'organization', false)\n            RETURNING id, username, email, display_name, avatar_url, auth_source, created_at, updated_at,\n                      is_admin, password_hash, external_user_id, payment_provider_id,\n                      is_deleted, is_internal, batch_notifications_enabled, first_batch_email_sent,\n                      low_balance_notification_sent, low_balance_threshold,\n                      auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, user_type\n            ",
   "describe": {
     "columns": [
       {
@@ -65,36 +65,51 @@
       },
       {
         "ordinal": 12,
-        "name": "batch_notifications_enabled",
+        "name": "is_deleted",
         "type_info": "Bool"
       },
       {
         "ordinal": 13,
-        "name": "first_batch_email_sent",
+        "name": "is_internal",
         "type_info": "Bool"
       },
       {
         "ordinal": 14,
-        "name": "low_balance_notification_sent",
+        "name": "batch_notifications_enabled",
         "type_info": "Bool"
       },
       {
         "ordinal": 15,
+        "name": "first_batch_email_sent",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 16,
+        "name": "low_balance_notification_sent",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 17,
         "name": "low_balance_threshold",
         "type_info": "Float4"
       },
       {
-        "ordinal": 16,
+        "ordinal": 18,
         "name": "auto_topup_amount",
         "type_info": "Float4"
       },
       {
-        "ordinal": 17,
+        "ordinal": 19,
         "name": "auto_topup_threshold",
         "type_info": "Float4"
       },
       {
-        "ordinal": 18,
+        "ordinal": 20,
+        "name": "auto_topup_monthly_limit",
+        "type_info": "Float4"
+      },
+      {
+        "ordinal": 21,
         "name": "user_type",
         "type_info": "Varchar"
       }
@@ -102,6 +117,7 @@
     "parameters": {
       "Left": [
         "Uuid",
+        "Varchar",
         "Varchar",
         "Varchar",
         "Varchar"
@@ -123,11 +139,14 @@
       false,
       false,
       false,
+      false,
+      false,
+      true,
       true,
       true,
       true,
       false
     ]
   },
-  "hash": "f24d340416535a0da0d0c762f160148d467d9fea15fabe440672bece7c5376db"
+  "hash": "03e0c337d97837e45b72d89da1aa809c57ae8ce3abc410124645581acb5243ec"
 }

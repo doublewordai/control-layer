@@ -1,5 +1,66 @@
 # Changelog
 
+## [8.17.1](https://github.com/doublewordai/control-layer/compare/v8.17.0...v8.17.1) (2026-03-11)
+
+
+### Bug Fixes
+
+* validate org balance at batch creation when in org context ([#848](https://github.com/doublewordai/control-layer/issues/848)) ([97884f9](https://github.com/doublewordai/control-layer/commit/97884f945349da75b09bcb26d66a746b3f9b4ebc))
+
+## [8.17.0](https://github.com/doublewordai/control-layer/compare/v8.16.4...v8.17.0) (2026-03-11)
+
+
+### Features
+
+* tracing enrichment — span prefixes, dep bumps, stack size fix ([#842](https://github.com/doublewordai/control-layer/issues/842)) ([1b19a32](https://github.com/doublewordai/control-layer/commit/1b19a32a586c9a34e22b20253941eb2d7beff9f3))
+
+## [8.16.4](https://github.com/doublewordai/control-layer/compare/v8.16.3...v8.16.4) (2026-03-11)
+
+
+### Bug Fixes
+
+* bump fusillade to 8.1.1 for claim query orphaned batch fix ([#846](https://github.com/doublewordai/control-layer/issues/846)) ([92976ef](https://github.com/doublewordai/control-layer/commit/92976ef00a05845ae76bd906c96b385271649be8))
+
+## [8.16.3](https://github.com/doublewordai/control-layer/compare/v8.16.2...v8.16.3) (2026-03-11)
+
+
+### Bug Fixes
+
+* trigger release for fusillade 8.1.0 claim performance fix ([#844](https://github.com/doublewordai/control-layer/issues/844)) ([b04a194](https://github.com/doublewordai/control-layer/commit/b04a19406c0af84f8080367da7829623b279b785))
+
+## [8.16.2](https://github.com/doublewordai/control-layer/compare/v8.16.1...v8.16.2) (2026-03-11)
+
+
+### Bug Fixes
+
+* populate all deployed models in daemon capacity limits ([#837](https://github.com/doublewordai/control-layer/issues/837)) ([b2a0f87](https://github.com/doublewordai/control-layer/commit/b2a0f87d8b5ccb58c73f4bafae4438141ecaef39))
+
+## [8.16.1](https://github.com/doublewordai/control-layer/compare/v8.16.0...v8.16.1) (2026-03-10)
+
+
+### Bug Fixes
+
+* allow users to trigger a batch within their org ([#831](https://github.com/doublewordai/control-layer/issues/831)) ([974534b](https://github.com/doublewordai/control-layer/commit/974534b2635037e779ba773f18ab1aad46a4b6fd))
+
+## [8.16.0](https://github.com/doublewordai/control-layer/compare/v8.15.6...v8.16.0) (2026-03-10)
+
+
+### Features
+
+* auto top-up monthly spending limit ([#815](https://github.com/doublewordai/control-layer/issues/815)) ([6a0ab3a](https://github.com/doublewordai/control-layer/commit/6a0ab3a9163f8d768acdd5c2e2a39cc0a2a0daac))
+
+
+### Bug Fixes
+
+* bump onwards to 0.18.6 — preserve error code in strict mode ([#830](https://github.com/doublewordai/control-layer/issues/830)) ([2c9e2b4](https://github.com/doublewordai/control-layer/commit/2c9e2b454d6f4fa2dfc5896f899fc4768809e468))
+
+## [8.15.6](https://github.com/doublewordai/control-layer/compare/v8.15.5...v8.15.6) (2026-03-10)
+
+
+### Bug Fixes
+
+* warn when composite model has no enabled components (503) ([#827](https://github.com/doublewordai/control-layer/issues/827)) ([1253166](https://github.com/doublewordai/control-layer/commit/1253166aa34f410576e97d69bd2a5439ceb23953))
+
 ## [8.15.5](https://github.com/doublewordai/control-layer/compare/v8.15.4...v8.15.5) (2026-03-09)
 
 

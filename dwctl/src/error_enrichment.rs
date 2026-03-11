@@ -48,7 +48,7 @@ struct ChatRequest {
 /// Currently handles:
 /// - 403 Forbidden errors (likely insufficient credits) → enriched with balance
 /// - 403 Forbidden errors (likely model access denied) → enriched with model name
-#[instrument(skip_all, fields(http.request.method = %request.method(), url.path = %request.uri().path(), url.query = request.uri().query().unwrap_or("")))]
+#[instrument(name = "dwctl.error_enrichment", skip_all, fields(http.request.method = %request.method(), url.path = %request.uri().path(), url.query = request.uri().query().unwrap_or("")))]
 pub async fn error_enrichment_middleware(State(pool): State<PgPool>, request: Request<Body>, next: Next) -> Response<Body> {
     // Extract API key from request headers before passing to onwards
     let api_key = request
@@ -116,7 +116,7 @@ pub async fn error_enrichment_middleware(State(pool): State<PgPool>, request: Re
     response
 }
 
-#[instrument(skip_all)]
+#[instrument(skip_all, name = "dwctl.get_user_id_of_api_key")]
 pub async fn get_user_id_of_api_key(pool: PgPool, api_key: &str) -> Result<UserId, DbError> {
     let mut conn = pool.acquire().await?;
     let mut api_keys_repo = ApiKeys::new(&mut conn);
@@ -126,7 +126,7 @@ pub async fn get_user_id_of_api_key(pool: PgPool, api_key: &str) -> Result<UserI
         .ok_or_else(|| anyhow::anyhow!("API key not found or associated user doesn't exist").into())
 }
 
-#[instrument(skip_all)]
+#[instrument(skip_all, name = "dwctl.get_balance_of_api_key")]
 pub async fn get_balance_of_api_key(pool: PgPool, api_key: &str) -> Result<Decimal, DbError> {
     // Look up user_id from API key
     let user_id = get_user_id_of_api_key(pool.clone(), api_key).await?;
@@ -139,7 +139,7 @@ pub async fn get_balance_of_api_key(pool: PgPool, api_key: &str) -> Result<Decim
     credits_repo.get_user_balance(user_id).await
 }
 
-#[instrument(skip_all)]
+#[instrument(skip_all, name = "dwctl.check_user_has_model_access")]
 pub async fn check_user_has_model_access(pool: PgPool, user_id: UserId, model_alias: &str) -> Result<bool, DbError> {
     let mut conn = pool.acquire().await?;
 
