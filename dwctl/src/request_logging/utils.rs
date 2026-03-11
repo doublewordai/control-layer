@@ -430,6 +430,8 @@ mod tests {
             uri: "/test".parse::<Uri>().unwrap(),
             headers,
             body: None,
+            trace_id: None,
+            span_id: None,
         };
 
         let result = extract_header_as_string(&request_data, "x-fusillade-request-id").and_then(|s| uuid::Uuid::parse_str(&s).ok());
@@ -450,6 +452,8 @@ mod tests {
             uri: "/test".parse::<Uri>().unwrap(),
             headers,
             body: None,
+            trace_id: None,
+            span_id: None,
         };
 
         let result = extract_header_as_string(&request_data, "x-fusillade-request-id");
@@ -470,6 +474,8 @@ mod tests {
             uri: "/test".parse::<Uri>().unwrap(),
             headers,
             body: None,
+            trace_id: None,
+            span_id: None,
         };
 
         let result = extract_header_as_string(&request_data, "x-fusillade-request-id");
@@ -490,6 +496,8 @@ mod tests {
             uri: "/test".parse::<Uri>().unwrap(),
             headers,
             body: None,
+            trace_id: None,
+            span_id: None,
         };
 
         // String extraction succeeds
@@ -514,6 +522,8 @@ mod tests {
             uri: "/test".parse::<Uri>().unwrap(),
             headers,
             body: None,
+            trace_id: None,
+            span_id: None,
         };
 
         let result = extract_header_as_string(&request_data, "x-fusillade-request-id");
@@ -537,6 +547,8 @@ mod tests {
             uri: "/test".parse::<Uri>().unwrap(),
             headers,
             body: None,
+            trace_id: None,
+            span_id: None,
         };
 
         let result = extract_header_as_string(&request_data, "x-fusillade-request-id").and_then(|s| uuid::Uuid::parse_str(&s).ok());
