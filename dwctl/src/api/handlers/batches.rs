@@ -3202,4 +3202,142 @@ mod tests {
 
         resp.assert_status(StatusCode::CREATED);
     }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_list_batches_member_id_rejected_outside_org_context(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let auth = add_auth_headers(&user);
+
+        // Attempt member_id filter without org context → should return 400
+        let resp = app
+            .get(&format!("/ai/v1/batches?member_id={}", Uuid::new_v4()))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+        resp.assert_status(StatusCode::BAD_REQUEST);
+        let body = resp.text();
+        assert!(
+            body.contains("organization context"),
+            "Expected error about org context, got: {}",
+            body
+        );
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_list_batches_member_id_no_key_returns_empty(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let org = create_test_org(&pool, user.id).await;
+        let auth = add_auth_headers(&user);
+        let org_cookie = format!("dw_active_org={}", org.id);
+
+        // Filter by a member who has never created batches (no hidden key) → empty list
+        let unknown_member = Uuid::new_v4();
+        let resp = app
+            .get(&format!("/ai/v1/batches?member_id={}", unknown_member))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .add_header("cookie", &org_cookie)
+            .await;
+        resp.assert_status_ok();
+        let body: serde_json::Value = resp.json();
+        assert_eq!(body["data"].as_array().unwrap().len(), 0);
+        assert_eq!(body["has_more"], false);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_list_batches_enrichment_in_org_context(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let org = create_test_org(&pool, user.id).await;
+
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, org.id, group.id).await;
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        let auth = add_auth_headers(&user);
+        let org_cookie = format!("dw_active_org={}", org.id);
+
+        // Upload file and create batch in org context
+        let jsonl_content = r#"{"custom_id":"req-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}"#;
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("enrich-test.jsonl");
+        let multipart = axum_test::multipart::MultipartForm::new()
+            .add_part("file", file_part)
+            .add_part("purpose", axum_test::multipart::Part::text("batch"));
+        let upload_resp = app
+            .post("/ai/v1/files")
+            .multipart(multipart)
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .add_header("cookie", &org_cookie)
+            .await;
+        upload_resp.assert_status(StatusCode::CREATED);
+        let file: serde_json::Value = upload_resp.json();
+        let file_id = file["id"].as_str().unwrap();
+
+        let create_req = CreateBatchRequest {
+            input_file_id: file_id.to_string(),
+            endpoint: "/v1/chat/completions".to_string(),
+            completion_window: "24h".to_string(),
+            metadata: None,
+        };
+        let create_resp = app
+            .post("/ai/v1/batches")
+            .json(&create_req)
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .add_header("cookie", &org_cookie)
+            .await;
+        create_resp.assert_status(StatusCode::CREATED);
+
+        // List in org context → should have enriched metadata
+        let list_resp = app
+            .get("/ai/v1/batches")
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .add_header("cookie", &org_cookie)
+            .await;
+        list_resp.assert_status_ok();
+        let list_body: serde_json::Value = list_resp.json();
+        let batch = &list_body["data"][0];
+        let metadata = &batch["metadata"];
+        // Org context should see enriched fields
+        assert!(
+            metadata["created_by_email"].is_string(),
+            "Expected enriched created_by_email in org context"
+        );
+        assert!(
+            metadata["context_name"].is_string(),
+            "Expected enriched context_name in org context"
+        );
+
+        // List outside org context → enriched fields should be absent
+        let list_resp_personal = app
+            .get("/ai/v1/batches")
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+        list_resp_personal.assert_status_ok();
+        let list_body_personal: serde_json::Value = list_resp_personal.json();
+        // User's personal batches won't include the org batch,
+        // but if any batches are returned, they should not have enriched fields
+        for batch in list_body_personal["data"].as_array().unwrap() {
+            if let Some(meta) = batch["metadata"].as_object() {
+                assert!(
+                    !meta.contains_key("created_by_email"),
+                    "created_by_email should be scrubbed outside org context"
+                );
+                assert!(
+                    !meta.contains_key("context_name"),
+                    "context_name should be scrubbed outside org context"
+                );
+            }
+        }
+    }
 }

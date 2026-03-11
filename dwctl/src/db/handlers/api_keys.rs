@@ -318,49 +318,27 @@ impl<'c> ApiKeys<'c> {
             ApiKeyPurpose::Playground => "playground",
         };
 
-        // Try to get existing hidden key for this user and purpose
-        let existing_key = sqlx::query_scalar!(
-            r#"
-            SELECT secret
-            FROM api_keys
-            WHERE user_id = $1 AND purpose = $2 AND hidden = true
-            AND created_by = $3
-            AND is_deleted = false
-            LIMIT 1
-            "#,
-            user_id,
-            purpose_str,
-            created_by
-        )
-        .fetch_optional(&mut *self.db)
-        .await?;
-
-        if let Some(secret) = existing_key {
-            tracing::debug!("Using existing hidden API key for user");
-            return Ok(secret);
-        }
-
-        // No existing key found, create a new one
+        // Upsert: insert a hidden key or return the existing one.
+        // Uses ON CONFLICT on the unique index (user_id, created_by, purpose)
+        // WHERE hidden = true AND is_deleted = false to handle concurrent requests.
         let secret = generate_api_key();
-        // Include created_by in name for per-member uniqueness within orgs.
-        // For individuals (created_by == user_id), this is cosmetic; for orgs,
-        // it avoids (user_id, name) unique constraint collisions.
         let name = if user_id == created_by {
             format!("Internal {} Key", purpose_str)
         } else {
             format!("Internal {} Key ({})", purpose_str, &created_by.to_string()[..8])
         };
-        let description = Some(format!(
+        let description = format!(
             "Automatically managed internal API key for {} operations. Not visible to users.",
             purpose_str
-        ));
+        );
 
-        tracing::info!("Creating new hidden API key for user");
-
-        sqlx::query!(
+        let row_secret = sqlx::query_scalar!(
             r#"
             INSERT INTO api_keys (name, description, secret, purpose, user_id, created_by, hidden)
             VALUES ($1, $2, $3, $4, $5, $6, true)
+            ON CONFLICT (user_id, created_by, purpose) WHERE hidden = true AND is_deleted = false
+            DO UPDATE SET user_id = EXCLUDED.user_id
+            RETURNING secret
             "#,
             name,
             description,
@@ -369,10 +347,10 @@ impl<'c> ApiKeys<'c> {
             user_id,
             created_by
         )
-        .execute(&mut *self.db)
+        .fetch_one(&mut *self.db)
         .await?;
 
-        Ok(secret)
+        Ok(row_secret)
     }
 
     /// Get or create a hidden API key, returning both the secret and the key's UUID.
@@ -391,47 +369,27 @@ impl<'c> ApiKeys<'c> {
             ApiKeyPurpose::Playground => "playground",
         };
 
-        // Try to get existing hidden key for this user and purpose
-        let existing_key = sqlx::query!(
-            r#"
-            SELECT id, secret
-            FROM api_keys
-            WHERE user_id = $1 AND purpose = $2 AND hidden = true
-            AND created_by = $3
-            AND is_deleted = false
-            LIMIT 1
-            "#,
-            user_id,
-            purpose_str,
-            created_by
-        )
-        .fetch_optional(&mut *self.db)
-        .await?;
-
-        if let Some(row) = existing_key {
-            tracing::debug!("Using existing hidden API key for user");
-            return Ok((row.secret, row.id));
-        }
-
-        // No existing key found, create a new one
+        // Upsert: insert a hidden key or return the existing one.
+        // Uses ON CONFLICT on the unique index (user_id, created_by, purpose)
+        // WHERE hidden = true AND is_deleted = false to handle concurrent requests.
         let secret = generate_api_key();
         let name = if user_id == created_by {
             format!("Internal {} Key", purpose_str)
         } else {
             format!("Internal {} Key ({})", purpose_str, &created_by.to_string()[..8])
         };
-        let description = Some(format!(
+        let description = format!(
             "Automatically managed internal API key for {} operations. Not visible to users.",
             purpose_str
-        ));
+        );
 
-        tracing::info!("Creating new hidden API key for user");
-
-        let id = sqlx::query_scalar!(
+        let row = sqlx::query!(
             r#"
             INSERT INTO api_keys (name, description, secret, purpose, user_id, created_by, hidden)
             VALUES ($1, $2, $3, $4, $5, $6, true)
-            RETURNING id
+            ON CONFLICT (user_id, created_by, purpose) WHERE hidden = true AND is_deleted = false
+            DO UPDATE SET user_id = EXCLUDED.user_id
+            RETURNING id, secret
             "#,
             name,
             description,
@@ -443,7 +401,7 @@ impl<'c> ApiKeys<'c> {
         .fetch_one(&mut *self.db)
         .await?;
 
-        Ok((secret, id))
+        Ok((row.secret, row.id))
     }
 
     /// Find the hidden API key ID for a given user, purpose, and creator.

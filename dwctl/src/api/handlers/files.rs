@@ -3549,4 +3549,47 @@ mod tests {
 
         upload_response.assert_status(axum::http::StatusCode::CREATED);
     }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_list_files_member_id_rejected_outside_org_context(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let auth = add_auth_headers(&user);
+
+        // Attempt member_id filter without org context → should return 400
+        let resp = app
+            .get(&format!("/ai/v1/files?member_id={}", Uuid::new_v4()))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+        resp.assert_status(axum::http::StatusCode::BAD_REQUEST);
+        let body = resp.text();
+        assert!(
+            body.contains("organization context"),
+            "Expected error about org context, got: {}",
+            body
+        );
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_list_files_member_id_no_key_returns_empty(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let org = create_test_org(&pool, user.id).await;
+        let auth = add_auth_headers(&user);
+        let org_cookie = format!("dw_active_org={}", org.id);
+
+        // Filter by a member who has never uploaded files → empty list
+        let resp = app
+            .get(&format!("/ai/v1/files?member_id={}", Uuid::new_v4()))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .add_header("cookie", &org_cookie)
+            .await;
+        resp.assert_status_ok();
+        let body: serde_json::Value = resp.json();
+        assert_eq!(body["data"].as_array().unwrap().len(), 0);
+    }
 }

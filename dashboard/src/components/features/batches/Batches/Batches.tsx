@@ -126,10 +126,11 @@ export function Batches({
     { from: Date; to: Date } | undefined
   >(undefined);
 
-  // Clear filters when org context changes
+  // Clear all filters when org context changes
   useEffect(() => {
     setSelectedMemberId(undefined);
     setStatusFilter("all");
+    setDateRange(undefined);
   }, [activeOrganizationId]);
 
   // Drag and drop state (kept locally as it's UI-only)
@@ -761,9 +762,9 @@ export function Batches({
                     <SelectItem value="completed">Completed</SelectItem>
                     <SelectItem value="failed">Failed</SelectItem>
                     <SelectItem value="cancelled">Cancelled</SelectItem>
-                    <SelectItem value="validating">Validating</SelectItem>
-                    <SelectItem value="finalizing">Finalizing</SelectItem>
-                    <SelectItem value="expired">Expired</SelectItem>
+                    {isPlatformManager && (
+                      <SelectItem value="expired">Expired (SLA)</SelectItem>
+                    )}
                   </SelectContent>
                 </Select>
                 <DateTimeRangeSelector

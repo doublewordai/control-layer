@@ -1,0 +1,27 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO api_keys (name, description, secret, purpose, user_id, created_by, hidden)\n            VALUES ($1, $2, $3, $4, $5, $6, true)\n            ON CONFLICT (user_id, created_by, purpose) WHERE hidden = true AND is_deleted = false\n            DO UPDATE SET user_id = EXCLUDED.user_id\n            RETURNING secret\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "secret",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Varchar",
+        "Text",
+        "Varchar",
+        "Varchar",
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "612a2fa704177c4c30241d2b52aae6e2adf781469a9ee15b57a1f0e53caf6425"
+}

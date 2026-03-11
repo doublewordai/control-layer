@@ -299,7 +299,9 @@ pub struct ListBatchesQuery {
     /// Filter by member user ID (resolves to api_key_id for per-member filtering within orgs)
     pub member_id: Option<uuid::Uuid>,
 
-    /// Filter by batch status (e.g. "completed", "in_progress", "failed", "cancelled", "validating", "finalizing", "expired")
+    /// Filter by batch status. Supported: "in_progress", "completed", "failed", "cancelled", "expired".
+    /// "in_progress" includes validating and finalizing sub-states. "cancelled" includes cancelling.
+    /// "expired" matches batches with SLA issues (overdue or finished past deadline).
     pub status: Option<String>,
 
     /// Only return batches created after this ISO 8601 timestamp
