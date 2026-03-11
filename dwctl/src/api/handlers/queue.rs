@@ -10,9 +10,9 @@ use std::collections::HashMap;
 use crate::api::handlers::sla_capacity::parse_window_to_seconds;
 
 use crate::{
-    auth::permissions::{operation, resource, RequiresPermission},
-    errors::Error,
     AppState,
+    auth::permissions::{RequiresPermission, operation, resource},
+    errors::Error,
 };
 
 /// Nested map of pending request counts: model -> completion_window -> count
