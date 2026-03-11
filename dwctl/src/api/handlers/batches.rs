@@ -717,9 +717,89 @@ pub async fn get_batch<P: PoolProvider>(
         });
     }
 
-    // Fetch creator email for the response
-    let creator_email = fetch_creator_email(state.db.read(), &batch).await;
-    Ok(Json(to_batch_response_with_email(batch, creator_email.as_deref())))
+    // Enrich with creator/context metadata (same as list_batches)
+    let mut read_conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+
+    // Resolve individual creator email via api_key_id
+    let created_by_email = if let Some(api_key_id) = batch.api_key_id {
+        let creator_map = ApiKeys::new(&mut read_conn)
+            .get_creators_by_key_ids(vec![api_key_id])
+            .await
+            .map_err(Error::Database)?;
+        if let Some(&creator_id) = creator_map.get(&api_key_id) {
+            Users::new(&mut read_conn)
+                .get_bulk(vec![creator_id])
+                .await
+                .map_err(|e| Error::Internal {
+                    operation: format!("fetch creator user: {}", e),
+                })?
+                .get(&creator_id)
+                .map(|u| u.email.clone())
+        } else {
+            None
+        }
+    } else {
+        // Fall back to owner email (legacy batches without api_key_id)
+        if let Some(created_by) = batch.created_by.as_ref() {
+            if let Ok(user_id) = Uuid::parse_str(created_by) {
+                Users::new(&mut read_conn)
+                    .get_bulk(vec![user_id])
+                    .await
+                    .map_err(|e| Error::Internal {
+                        operation: format!("fetch owner user: {}", e),
+                    })?
+                    .get(&user_id)
+                    .map(|u| u.email.clone())
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+
+    // Resolve context from batch owner (created_by field)
+    let (context_name, context_type) = if let Some(owner_id) = batch.created_by.as_ref().and_then(|id| Uuid::parse_str(id).ok()) {
+        let user_map = Users::new(&mut read_conn)
+            .get_bulk(vec![owner_id])
+            .await
+            .map_err(|e| Error::Internal {
+                operation: format!("fetch owner user: {}", e),
+            })?;
+        match user_map.get(&owner_id) {
+            Some(u) if u.user_type == "organization" => {
+                let name = u.display_name.clone().unwrap_or_else(|| u.email.clone());
+                (Some(name), Some("organization".to_string()))
+            }
+            Some(_) => (Some("Personal".to_string()), Some("personal".to_string())),
+            None => (None, None),
+        }
+    } else {
+        (None, None)
+    };
+
+    let mut response = to_batch_response_with_email(batch, None);
+
+    if let Some(email) = created_by_email {
+        response
+            .metadata
+            .get_or_insert_with(HashMap::new)
+            .insert("created_by_email".to_string(), email);
+    }
+    if let Some(name) = context_name {
+        response
+            .metadata
+            .get_or_insert_with(HashMap::new)
+            .insert("context_name".to_string(), name);
+    }
+    if let Some(ctype) = context_type {
+        response
+            .metadata
+            .get_or_insert_with(HashMap::new)
+            .insert("context_type".to_string(), ctype);
+    }
+
+    Ok(Json(response))
 }
 
 #[utoipa::path(
@@ -1313,43 +1393,34 @@ pub async fn list_batches<P: PoolProvider>(
 
     // Translate member_id to api_key_ids for fusillade filtering.
     // Uses a short-lived connection so we don't hold it across the fusillade call.
-    let api_key_ids_filter = {
-        let filter = if let Some(member_id) = query.member_id {
-            // In org context: look up the member's hidden key scoped to the org (single key).
-            // In PM personal context: find ALL hidden keys for that member across all contexts
-            // (personal + every org), so the filter returns both personal and org batches.
-            let mut read_conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
-            let key_ids = match current_user.active_organization {
-                Some(org_id) => {
-                    // Org context: find the single hidden key for this member in this org
-                    let key_id = ApiKeys::new(&mut read_conn)
-                        .find_hidden_key_id(org_id, ApiKeyPurpose::Batch, member_id)
-                        .await
-                        .map_err(Error::Database)?;
-                    key_id.into_iter().collect::<Vec<_>>()
-                }
-                None if can_read_all => {
-                    // PM personal context: find ALL hidden keys created by this member
-                    ApiKeys::new(&mut read_conn)
-                        .find_all_hidden_key_ids_by_creator(ApiKeyPurpose::Batch, member_id)
-                        .await
-                        .map_err(Error::Database)?
-                }
-                None => {
-                    return Err(Error::BadRequest {
-                        message: "member_id filter is only available in organization context or for platform managers".to_string(),
-                    });
-                }
-            };
-            Some(key_ids)
-        } else {
-            None
+    //
+    // Note: this only matches batches created after hidden key attribution was deployed.
+    // Legacy batches with api_key_id = NULL won't match the filter.
+    let api_key_ids_filter = if let Some(member_id) = query.member_id {
+        let mut read_conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+        let key_ids = match current_user.active_organization {
+            Some(org_id) => {
+                // Org context: find the single hidden key for this member in this org
+                let key_id = ApiKeys::new(&mut read_conn)
+                    .find_hidden_key_id(org_id, ApiKeyPurpose::Batch, member_id)
+                    .await
+                    .map_err(Error::Database)?;
+                key_id.into_iter().collect::<Vec<_>>()
+            }
+            None if can_read_all => {
+                // PM personal context: find ALL hidden keys created by this member
+                ApiKeys::new(&mut read_conn)
+                    .find_all_hidden_key_ids_by_creator(ApiKeyPurpose::Batch, member_id)
+                    .await
+                    .map_err(Error::Database)?
+            }
+            None => {
+                return Err(Error::BadRequest {
+                    message: "member_id filter is only available in organization context or for platform managers".to_string(),
+                });
+            }
         };
-
-        // If we resolved keys but found none, the member has never created batches — return empty
-        if let Some(ref key_ids) = filter
-            && key_ids.is_empty()
-        {
+        if key_ids.is_empty() {
             return Ok(Json(BatchListResponse {
                 object_type: ListObjectType::List,
                 data: vec![],
@@ -1358,7 +1429,9 @@ pub async fn list_batches<P: PoolProvider>(
                 has_more: false,
             }));
         }
-        filter
+        Some(key_ids)
+    } else {
+        None
     };
 
     // Fetch batches with ownership filtering, search, and cursor-based pagination

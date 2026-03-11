@@ -46,7 +46,7 @@ import {
   useFiles,
   useBatches,
   useOrganizationMembers,
-  useUsers,
+  useAllUsers,
 } from "../../../../api/control-layer/hooks";
 import { dwctlApi } from "../../../../api/control-layer/client";
 import type { FileObject, Batch } from "../types";
@@ -108,9 +108,8 @@ export function Batches({
   const { data: orgMembers } = useOrganizationMembers(
     activeOrganizationId || "",
   );
-  const { data: allUsers } = useUsers({
+  const { data: allUsers } = useAllUsers({
     enabled: isPlatformManager && !isOrgContext,
-    limit: 100,
   });
   const memberList = React.useMemo(() => {
     // Org context: show org members (same for PMs and standard users)
@@ -119,11 +118,19 @@ export function Batches({
         .filter((m) => m.status === "active" && m.user)
         .map((m) => ({ id: m.user!.id, email: m.user!.email }));
     }
-    // Personal context + PM: show all individual users for global filtering
-    // (exclude organization pseudo-users which share the owner's email)
-    if (isPlatformManager && !isOrgContext && allUsers?.data) {
-      return allUsers.data
+    // Personal context + PM: show all individual users for global filtering.
+    // Deduplicate by email (a user may appear twice if they have both personal
+    // and org-created individual records). The personal member_id is used under
+    // the hood — the backend expands it to cover both personal and org contexts.
+    if (isPlatformManager && !isOrgContext && allUsers) {
+      const seen = new Set<string>();
+      return allUsers
         .filter((u) => u.user_type !== "organization")
+        .filter((u) => {
+          if (seen.has(u.email)) return false;
+          seen.add(u.email);
+          return true;
+        })
         .map((u) => ({ id: u.id, email: u.email }));
     }
     return [];
@@ -300,6 +307,8 @@ export function Batches({
 
       const prefetchOptions = {
         purpose: filePurpose,
+        search: debouncedFileSearch.trim() || undefined,
+        member_id: selectedMemberId,
         limit: filesPagination.pageSize + 1,
         after: nextCursor,
       };
@@ -315,6 +324,8 @@ export function Batches({
     filesPagination.page,
     filesPagination.pageSize,
     filePurpose,
+    debouncedFileSearch,
+    selectedMemberId,
     queryClient,
   ]);
 
@@ -324,17 +335,21 @@ export function Batches({
       const lastBatch = batches[batches.length - 1];
       const nextCursor = lastBatch.id;
 
+      const prefetchOptions = {
+        search: debouncedBatchSearch.trim() || undefined,
+        include: "analytics" as const,
+        member_id: selectedMemberId,
+        status:
+          statusFilter !== "all" ? statusFilter : undefined,
+        created_after: dateRange?.from.toISOString(),
+        created_before: dateRange?.to.toISOString(),
+        limit: batchesPagination.pageSize + 1,
+        after: nextCursor,
+      };
+
       queryClient.prefetchQuery({
-        queryKey: [
-          "batches",
-          "list",
-          { limit: batchesPagination.pageSize + 1, after: nextCursor },
-        ],
-        queryFn: () =>
-          dwctlApi.batches.list({
-            limit: batchesPagination.pageSize + 1,
-            after: nextCursor,
-          }),
+        queryKey: ["batches", "list", prefetchOptions],
+        queryFn: () => dwctlApi.batches.list(prefetchOptions),
       });
     }
   }, [
@@ -342,6 +357,10 @@ export function Batches({
     batchesHasMore,
     batchesPagination.page,
     batchesPagination.pageSize,
+    debouncedBatchSearch,
+    selectedMemberId,
+    statusFilter,
+    dateRange,
     queryClient,
   ]);
 

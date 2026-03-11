@@ -29,10 +29,10 @@ export function DateTimeRangeSelector({
   onChange,
   className,
 }: DateTimeRangeSelectorProps) {
-  // Default to last 24 hours
+  // Default to last 30 days
   const getDefaultRange = () => {
     const now = new Date();
-    const from = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+    const from = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
     return { from, to: now };
   };
 

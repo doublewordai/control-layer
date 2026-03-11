@@ -25,7 +25,7 @@ import type { ColumnDef } from "@tanstack/react-table";
 function formatDuration(ms: number): string {
   if (ms >= 86_400_000) {
     const days = ms / 86_400_000;
-    return days === 1 ? "1d" : `${days}d`;
+    return `${Number.isInteger(days) ? days : days.toFixed(1)}d`;
   }
   if (ms >= 3_600_000) {
     const hours = ms / 3_600_000;
