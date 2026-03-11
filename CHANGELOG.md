@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.16.2](https://github.com/doublewordai/control-layer/compare/v8.16.1...v8.16.2) (2026-03-11)
+
+
+### Bug Fixes
+
+* populate all deployed models in daemon capacity limits ([#837](https://github.com/doublewordai/control-layer/issues/837)) ([b2a0f87](https://github.com/doublewordai/control-layer/commit/b2a0f87d8b5ccb58c73f4bafae4438141ecaef39))
+
 ## [8.16.1](https://github.com/doublewordai/control-layer/compare/v8.16.0...v8.16.1) (2026-03-10)
 
 
