@@ -1308,10 +1308,6 @@ pub async fn list_batches<P: PoolProvider>(
         Some(target_user_id.to_string())
     };
 
-    // Determine if user should see enriched metadata (creator emails, context info)
-    let is_org_context = current_user.active_organization.is_some();
-    let should_enrich = can_read_all || is_org_context;
-
     // Translate member_id to api_key_id for fusillade filtering
     // Only allowed in org context (requires org-scoped hidden key lookup)
     let api_key_id_filter = if let Some(member_id) = query.member_id {
@@ -1371,60 +1367,56 @@ pub async fn list_batches<P: PoolProvider>(
     let first_id = batches.first().map(|b| b.id.0.to_string());
     let last_id = batches.last().map(|b| b.id.0.to_string());
 
-    // Only resolve creator/context metadata when user has appropriate permissions
-    // (platform managers or users viewing their own org's data)
+    // Resolve creator/context metadata for all returned batches.
+    // No conditional needed: the authorization layer already ensures users only see
+    // resources they're permitted to access (own batches, org batches, or all for PMs).
     use crate::db::models::users::UserDBResponse;
-    let (api_key_creator_map, user_map): (HashMap<Uuid, Uuid>, HashMap<Uuid, UserDBResponse>) = if should_enrich {
-        // Resolve individual creators via api_key_id → api_keys.created_by
-        let api_key_ids: Vec<Uuid> = batches
-            .iter()
-            .filter_map(|b| b.api_key_id)
-            .collect::<std::collections::HashSet<_>>()
-            .into_iter()
-            .collect();
-        let creator_map: HashMap<Uuid, Uuid> = if !api_key_ids.is_empty() {
-            let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
-            ApiKeys::new(&mut conn)
-                .get_creators_by_key_ids(api_key_ids)
-                .await
-                .map_err(Error::Database)?
-        } else {
-            HashMap::new()
-        };
 
-        // Collect all unique user IDs we need to resolve:
-        // - Owner IDs from batch.created_by (could be org or personal user)
-        // - Individual creator IDs from api_key resolution
-        let mut all_user_ids: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
-        for batch in &batches {
-            if let Some(owner_id) = batch.created_by.as_ref().and_then(|id| Uuid::parse_str(id).ok()) {
-                all_user_ids.insert(owner_id);
-            }
-            if let Some(api_key_id) = batch.api_key_id
-                && let Some(&creator_id) = creator_map.get(&api_key_id)
-            {
-                all_user_ids.insert(creator_id);
-            }
-        }
-
-        // Bulk fetch all users (emails, user_type, display_name)
-        let users: HashMap<Uuid, UserDBResponse> = if !all_user_ids.is_empty() {
-            let mut conn = state.db.read().acquire().await.map_err(|e| Error::Internal {
-                operation: format!("acquire db connection: {}", e),
-            })?;
-            Users::new(&mut conn)
-                .get_bulk(all_user_ids.into_iter().collect())
-                .await
-                .map_err(|e| Error::Internal {
-                    operation: format!("fetch users: {}", e),
-                })?
-        } else {
-            HashMap::new()
-        };
-
-        (creator_map, users)
+    // Resolve individual creators via api_key_id → api_keys.created_by
+    let api_key_ids: Vec<Uuid> = batches
+        .iter()
+        .filter_map(|b| b.api_key_id)
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    let api_key_creator_map: HashMap<Uuid, Uuid> = if !api_key_ids.is_empty() {
+        let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+        ApiKeys::new(&mut conn)
+            .get_creators_by_key_ids(api_key_ids)
+            .await
+            .map_err(Error::Database)?
     } else {
-        (HashMap::new(), HashMap::new())
+        HashMap::new()
+    };
+
+    // Collect all unique user IDs we need to resolve:
+    // - Owner IDs from batch.created_by (could be org or personal user)
+    // - Individual creator IDs from api_key resolution
+    let mut all_user_ids: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+    for batch in &batches {
+        if let Some(owner_id) = batch.created_by.as_ref().and_then(|id| Uuid::parse_str(id).ok()) {
+            all_user_ids.insert(owner_id);
+        }
+        if let Some(api_key_id) = batch.api_key_id
+            && let Some(&creator_id) = api_key_creator_map.get(&api_key_id)
+        {
+            all_user_ids.insert(creator_id);
+        }
+    }
+
+    // Bulk fetch all users (emails, user_type, display_name)
+    let user_map: HashMap<Uuid, UserDBResponse> = if !all_user_ids.is_empty() {
+        let mut conn = state.db.read().acquire().await.map_err(|e| Error::Internal {
+            operation: format!("acquire db connection: {}", e),
+        })?;
+        Users::new(&mut conn)
+            .get_bulk(all_user_ids.into_iter().collect())
+            .await
+            .map_err(|e| Error::Internal {
+                operation: format!("fetch users: {}", e),
+            })?
+    } else {
+        HashMap::new()
     };
 
     // Parse include parameter
@@ -1449,64 +1441,49 @@ pub async fn list_batches<P: PoolProvider>(
         HashMap::new()
     };
 
-    // Convert batches to responses, only enriching metadata for privileged contexts
+    // Convert batches to responses with enriched creator/context metadata
     let data: Vec<_> = batches
         .into_iter()
         .map(|batch| {
             let batch_id = batch.id;
 
-            let mut response = if should_enrich {
-                // Resolve individual creator email via api_key_id
-                let individual_creator_id = batch.api_key_id.and_then(|key_id| api_key_creator_map.get(&key_id).copied());
-                let created_by_email = individual_creator_id.and_then(|uid| user_map.get(&uid)).map(|u| u.email.clone());
+            // Resolve individual creator email via api_key_id
+            let individual_creator_id = batch.api_key_id.and_then(|key_id| api_key_creator_map.get(&key_id).copied());
+            let created_by_email = individual_creator_id.and_then(|uid| user_map.get(&uid)).map(|u| u.email.clone());
 
-                // Resolve context from batch owner (created_by field)
-                let owner_id = batch.created_by.as_ref().and_then(|id| Uuid::parse_str(id).ok());
-                let owner = owner_id.and_then(|id| user_map.get(&id));
-                let (context_name, context_type) = match owner {
-                    Some(u) if u.user_type == "organization" => {
-                        let name = u.display_name.clone().unwrap_or_else(|| u.email.clone());
-                        (Some(name), Some("organization".to_string()))
-                    }
-                    Some(_) => (Some("Personal".to_string()), Some("personal".to_string())),
-                    None => (None, None),
-                };
-
-                // Don't pass owner email as created_by_email — only inject it when
-                // the individual creator is resolved via api_key_id (below)
-                let mut response = to_batch_response_with_email(batch, None);
-
-                // Inject enriched creator/context info into metadata
-                if let Some(email) = created_by_email {
-                    response
-                        .metadata
-                        .get_or_insert_with(HashMap::new)
-                        .insert("created_by_email".to_string(), email);
+            // Resolve context from batch owner (created_by field)
+            let owner_id = batch.created_by.as_ref().and_then(|id| Uuid::parse_str(id).ok());
+            let owner = owner_id.and_then(|id| user_map.get(&id));
+            let (context_name, context_type) = match owner {
+                Some(u) if u.user_type == "organization" => {
+                    let name = u.display_name.clone().unwrap_or_else(|| u.email.clone());
+                    (Some(name), Some("organization".to_string()))
                 }
-                if let Some(name) = context_name {
-                    response
-                        .metadata
-                        .get_or_insert_with(HashMap::new)
-                        .insert("context_name".to_string(), name);
-                }
-                if let Some(ctype) = context_type {
-                    response
-                        .metadata
-                        .get_or_insert_with(HashMap::new)
-                        .insert("context_type".to_string(), ctype);
-                }
-                response
-            } else {
-                // Non-privileged users: no enrichment, scrub any sensitive metadata
-                let mut response = to_batch_response_with_email(batch, None);
-                // Remove any sensitive fields that may have been set in user-provided metadata
-                if let Some(ref mut meta) = response.metadata {
-                    meta.remove("created_by_email");
-                    meta.remove("context_name");
-                    meta.remove("context_type");
-                }
-                response
+                Some(_) => (Some("Personal".to_string()), Some("personal".to_string())),
+                None => (None, None),
             };
+
+            let mut response = to_batch_response_with_email(batch, None);
+
+            // Inject enriched creator/context info into metadata
+            if let Some(email) = created_by_email {
+                response
+                    .metadata
+                    .get_or_insert_with(HashMap::new)
+                    .insert("created_by_email".to_string(), email);
+            }
+            if let Some(name) = context_name {
+                response
+                    .metadata
+                    .get_or_insert_with(HashMap::new)
+                    .insert("context_name".to_string(), name);
+            }
+            if let Some(ctype) = context_type {
+                response
+                    .metadata
+                    .get_or_insert_with(HashMap::new)
+                    .insert("context_type".to_string(), ctype);
+            }
 
             if include_analytics {
                 response.analytics = analytics_map.get(&batch_id).cloned();
@@ -3354,7 +3331,8 @@ mod tests {
             .await;
         personal_create_resp.assert_status(StatusCode::CREATED);
 
-        // List outside org context → personal batch should exist but without enriched fields
+        // List outside org context → personal batch should also have enrichment
+        // (enrichment is always applied since authorization already controls visibility)
         let list_resp_personal = app
             .get("/ai/v1/batches")
             .add_header(&auth[0].0, &auth[0].1)
@@ -3365,20 +3343,20 @@ mod tests {
         let personal_batches = list_body_personal["data"].as_array().unwrap();
         assert!(!personal_batches.is_empty(), "Expected at least one personal batch");
         for batch in personal_batches {
-            if let Some(meta) = batch["metadata"].as_object() {
-                assert!(
-                    !meta.contains_key("created_by_email"),
-                    "created_by_email should be scrubbed outside org context"
-                );
-                assert!(
-                    !meta.contains_key("context_name"),
-                    "context_name should be scrubbed outside org context"
-                );
-                assert!(
-                    !meta.contains_key("context_type"),
-                    "context_type should be scrubbed outside org context"
-                );
-            }
+            let meta = batch["metadata"].as_object().expect("metadata should exist");
+            assert!(
+                meta.contains_key("created_by_email"),
+                "created_by_email should be present even in personal context"
+            );
+            assert!(
+                meta.contains_key("context_name"),
+                "context_name should be present even in personal context"
+            );
+            assert_eq!(
+                meta.get("context_type").and_then(|v| v.as_str()),
+                Some("personal"),
+                "personal batch should have context_type=personal"
+            );
         }
     }
 }

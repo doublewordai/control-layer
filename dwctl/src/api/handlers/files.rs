@@ -981,10 +981,6 @@ pub async fn list_files<P: PoolProvider>(
         .as_ref()
         .and_then(|id_str| uuid::Uuid::parse_str(id_str).ok().map(fusillade::FileId::from));
 
-    // Determine if user should see enriched metadata (creator emails, context info)
-    let is_org_context = current_user.active_organization.is_some();
-    let should_enrich = can_read_all_files || is_org_context;
-
     // Translate member_id to api_key_id for fusillade filtering
     // Only allowed in org context (requires org-scoped hidden key lookup)
     let api_key_id_filter = if let Some(member_id) = query.member_id {
@@ -1052,59 +1048,53 @@ pub async fn list_files<P: PoolProvider>(
     let first_id = files.first().map(|f| f.id.0.to_string());
     let last_id = files.last().map(|f| f.id.0.to_string());
 
-    // Only resolve creator/context metadata when user has appropriate permissions
+    // Resolve creator/context metadata for all returned files.
+    // No conditional needed: the authorization layer already ensures users only see
+    // resources they're permitted to access (own files, org files, or all for PMs).
     use crate::db::handlers::users::Users;
     use crate::db::models::users::UserDBResponse;
-    let (api_key_creator_map, user_map): (
-        std::collections::HashMap<uuid::Uuid, uuid::Uuid>,
-        std::collections::HashMap<uuid::Uuid, UserDBResponse>,
-    ) = if should_enrich {
-        // Resolve individual creators via api_key_id → api_keys.created_by
-        let api_key_ids: Vec<uuid::Uuid> = files
-            .iter()
-            .filter_map(|f| f.api_key_id)
-            .collect::<std::collections::HashSet<_>>()
-            .into_iter()
-            .collect();
-        let creator_map: std::collections::HashMap<uuid::Uuid, uuid::Uuid> = if !api_key_ids.is_empty() {
-            let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
-            ApiKeys::new(&mut conn)
-                .get_creators_by_key_ids(api_key_ids)
-                .await
-                .map_err(Error::Database)?
-        } else {
-            std::collections::HashMap::new()
-        };
 
-        // Collect all unique user IDs: owners (uploaded_by) + individual creators
-        let mut all_user_ids: std::collections::HashSet<uuid::Uuid> = std::collections::HashSet::new();
-        for f in &files {
-            if let Some(owner_id) = f.uploaded_by.as_ref().and_then(|id| uuid::Uuid::parse_str(id).ok()) {
-                all_user_ids.insert(owner_id);
-            }
-            if let Some(api_key_id) = f.api_key_id
-                && let Some(&creator_id) = creator_map.get(&api_key_id)
-            {
-                all_user_ids.insert(creator_id);
-            }
-        }
-
-        // Bulk fetch all users for email + user_type + display_name
-        let users: std::collections::HashMap<uuid::Uuid, UserDBResponse> = if !all_user_ids.is_empty() {
-            let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
-            Users::new(&mut conn)
-                .get_bulk(all_user_ids.into_iter().collect())
-                .await
-                .map_err(|e| Error::Internal {
-                    operation: format!("fetch users: {}", e),
-                })?
-        } else {
-            std::collections::HashMap::new()
-        };
-
-        (creator_map, users)
+    // Resolve individual creators via api_key_id → api_keys.created_by
+    let api_key_ids: Vec<uuid::Uuid> = files
+        .iter()
+        .filter_map(|f| f.api_key_id)
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    let api_key_creator_map: std::collections::HashMap<uuid::Uuid, uuid::Uuid> = if !api_key_ids.is_empty() {
+        let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+        ApiKeys::new(&mut conn)
+            .get_creators_by_key_ids(api_key_ids)
+            .await
+            .map_err(Error::Database)?
     } else {
-        (std::collections::HashMap::new(), std::collections::HashMap::new())
+        std::collections::HashMap::new()
+    };
+
+    // Collect all unique user IDs: owners (uploaded_by) + individual creators
+    let mut all_user_ids: std::collections::HashSet<uuid::Uuid> = std::collections::HashSet::new();
+    for f in &files {
+        if let Some(owner_id) = f.uploaded_by.as_ref().and_then(|id| uuid::Uuid::parse_str(id).ok()) {
+            all_user_ids.insert(owner_id);
+        }
+        if let Some(api_key_id) = f.api_key_id
+            && let Some(&creator_id) = api_key_creator_map.get(&api_key_id)
+        {
+            all_user_ids.insert(creator_id);
+        }
+    }
+
+    // Bulk fetch all users for email + user_type + display_name
+    let user_map: std::collections::HashMap<uuid::Uuid, UserDBResponse> = if !all_user_ids.is_empty() {
+        let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+        Users::new(&mut conn)
+            .get_bulk(all_user_ids.into_iter().collect())
+            .await
+            .map_err(|e| Error::Internal {
+                operation: format!("fetch users: {}", e),
+            })?
+    } else {
+        std::collections::HashMap::new()
     };
 
     let data: Vec<FileResponse> = files
@@ -1118,26 +1108,20 @@ pub async fn list_files<P: PoolProvider>(
                 None => Purpose::Batch, // Default to Batch for backwards compatibility
             };
 
-            // Only enrich with creator/context metadata for privileged contexts
-            let (created_by_email, context_name, context_type) = if should_enrich {
-                // Resolve individual creator email via api_key_id
-                let individual_creator_id = f.api_key_id.and_then(|key_id| api_key_creator_map.get(&key_id).copied());
-                let email = individual_creator_id.and_then(|uid| user_map.get(&uid)).map(|u| u.email.clone());
+            // Resolve individual creator email via api_key_id
+            let individual_creator_id = f.api_key_id.and_then(|key_id| api_key_creator_map.get(&key_id).copied());
+            let created_by_email = individual_creator_id.and_then(|uid| user_map.get(&uid)).map(|u| u.email.clone());
 
-                // Resolve context from file owner (uploaded_by field)
-                let owner_id = f.uploaded_by.as_ref().and_then(|id| uuid::Uuid::parse_str(id).ok());
-                let owner = owner_id.and_then(|id| user_map.get(&id));
-                let (ctx_name, ctx_type) = match owner {
-                    Some(u) if u.user_type == "organization" => {
-                        let name = u.display_name.clone().unwrap_or_else(|| u.email.clone());
-                        (Some(name), Some("organization".to_string()))
-                    }
-                    Some(_) => (Some("Personal".to_string()), Some("personal".to_string())),
-                    None => (None, None),
-                };
-                (email, ctx_name, ctx_type)
-            } else {
-                (None, None, None)
+            // Resolve context from file owner (uploaded_by field)
+            let owner_id = f.uploaded_by.as_ref().and_then(|id| uuid::Uuid::parse_str(id).ok());
+            let owner = owner_id.and_then(|id| user_map.get(&id));
+            let (context_name, context_type) = match owner {
+                Some(u) if u.user_type == "organization" => {
+                    let name = u.display_name.clone().unwrap_or_else(|| u.email.clone());
+                    (Some(name), Some("organization".to_string()))
+                }
+                Some(_) => (Some("Personal".to_string()), Some("personal".to_string())),
+                None => (None, None),
             };
 
             FileResponse {
@@ -3600,7 +3584,7 @@ mod tests {
 
     #[sqlx::test]
     #[test_log::test]
-    async fn test_list_files_enrichment_absent_in_personal_context(pool: PgPool) {
+    async fn test_list_files_enrichment_in_personal_context(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
         let group = create_test_group(&pool).await;
@@ -3623,7 +3607,8 @@ mod tests {
             .await;
         upload_resp.assert_status(axum::http::StatusCode::CREATED);
 
-        // List in personal context → enrichment fields should be absent
+        // List in personal context → enrichment fields should be present
+        // (enrichment is always applied since authorization already controls visibility)
         let list_resp = app
             .get("/ai/v1/files")
             .add_header(&auth[0].0, &auth[0].1)
@@ -3635,16 +3620,13 @@ mod tests {
         assert!(!files.is_empty(), "Expected at least one personal file");
         for file in files {
             assert!(
-                file.get("created_by_email").is_none() || file["created_by_email"].is_null(),
-                "created_by_email should not be present in personal context"
+                file.get("context_name").is_some() && !file["context_name"].is_null(),
+                "context_name should be present even in personal context"
             );
-            assert!(
-                file.get("context_name").is_none() || file["context_name"].is_null(),
-                "context_name should not be present in personal context"
-            );
-            assert!(
-                file.get("context_type").is_none() || file["context_type"].is_null(),
-                "context_type should not be present in personal context"
+            assert_eq!(
+                file["context_type"].as_str(),
+                Some("personal"),
+                "personal file should have context_type=personal"
             );
         }
     }
