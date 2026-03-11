@@ -1844,10 +1844,13 @@ mod tests {
 
         // Simulate the race: auth extractor's background task set last_login
         // moments after account creation (within the 10-second window)
-        sqlx::query!("UPDATE users SET last_login = created_at + interval '1 second' WHERE id = $1", user.id)
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query!(
+            "UPDATE users SET last_login = created_at + interval '1 second' WHERE id = $1",
+            user.id
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
 
         let response = app
             .get("/admin/api/v1/users/current")
@@ -1873,10 +1876,13 @@ mod tests {
         let user = create_test_user(&pool, Role::StandardUser).await;
 
         // Set last_login to well past the 10-second window (returning user)
-        sqlx::query!("UPDATE users SET last_login = created_at + interval '2 hours' WHERE id = $1", user.id)
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query!(
+            "UPDATE users SET last_login = created_at + interval '2 hours' WHERE id = $1",
+            user.id
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
 
         let response = app
             .get("/admin/api/v1/users/current")

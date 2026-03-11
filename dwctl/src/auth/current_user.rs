@@ -1585,12 +1585,15 @@ mod tests {
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert!(row.last_login.is_none() || {
-            // Background task may have already completed — if so, it should
-            // be within a few seconds of created_at
-            let ll = row.last_login.unwrap();
-            (ll - row.created_at).num_seconds().abs() < 10
-        }, "On first auth, last_login should be null or just set by background task");
+        assert!(
+            row.last_login.is_none() || {
+                // Background task may have already completed — if so, it should
+                // be within a few seconds of created_at
+                let ll = row.last_login.unwrap();
+                (ll - row.created_at).num_seconds().abs() < 10
+            },
+            "On first auth, last_login should be null or just set by background task"
+        );
 
         // Poll until the background task updates last_login
         let mut last_login = None;
