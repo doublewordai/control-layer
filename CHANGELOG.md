@@ -1,5 +1,19 @@
 # Changelog
 
+## [8.17.1](https://github.com/doublewordai/control-layer/compare/v8.17.0...v8.17.1) (2026-03-11)
+
+
+### Bug Fixes
+
+* validate org balance at batch creation when in org context ([#848](https://github.com/doublewordai/control-layer/issues/848)) ([97884f9](https://github.com/doublewordai/control-layer/commit/97884f945349da75b09bcb26d66a746b3f9b4ebc))
+
+## [8.17.0](https://github.com/doublewordai/control-layer/compare/v8.16.4...v8.17.0) (2026-03-11)
+
+
+### Features
+
+* tracing enrichment — span prefixes, dep bumps, stack size fix ([#842](https://github.com/doublewordai/control-layer/issues/842)) ([1b19a32](https://github.com/doublewordai/control-layer/commit/1b19a32a586c9a34e22b20253941eb2d7beff9f3))
+
 ## [8.16.4](https://github.com/doublewordai/control-layer/compare/v8.16.3...v8.16.4) (2026-03-11)
 
 
