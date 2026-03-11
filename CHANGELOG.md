@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.16.4](https://github.com/doublewordai/control-layer/compare/v8.16.3...v8.16.4) (2026-03-11)
+
+
+### Bug Fixes
+
+* bump fusillade to 8.1.1 for claim query orphaned batch fix ([#846](https://github.com/doublewordai/control-layer/issues/846)) ([92976ef](https://github.com/doublewordai/control-layer/commit/92976ef00a05845ae76bd906c96b385271649be8))
+
 ## [8.16.3](https://github.com/doublewordai/control-layer/compare/v8.16.2...v8.16.3) (2026-03-11)
 
 
