@@ -659,6 +659,8 @@ pub struct SessionConfig {
     pub cookie_secure: bool,
     /// SameSite cookie attribute ("strict", "lax", or "none")
     pub cookie_same_site: String,
+    /// Optional Domain attribute for cookies (e.g. ".doubleword.ai" for cross-subdomain)
+    pub cookie_domain: Option<String>,
 }
 
 /// Password validation rules.
@@ -1579,6 +1581,7 @@ impl Default for SessionConfig {
             cookie_name: "dwctl_session".to_string(),
             cookie_secure: true,
             cookie_same_site: "strict".to_string(),
+            cookie_domain: None,
         }
     }
 }

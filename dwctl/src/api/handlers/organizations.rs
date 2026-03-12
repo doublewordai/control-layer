@@ -819,20 +819,26 @@ pub async fn set_active_organization<P: PoolProvider>(
     // Build the dw_active_org cookie using the same security settings as the session cookie
     let session_config = &state.config.auth.native.session;
     let secure = if session_config.cookie_secure { "; Secure" } else { "" };
+    let domain = session_config
+        .cookie_domain
+        .as_ref()
+        .map(|d| format!("; Domain={d}"))
+        .unwrap_or_default();
     let cookie = if let Some(org_id) = data.organization_id {
         // Set cookie with long max-age (30 days) — cleared explicitly when switching back
         format!(
-            "dw_active_org={}; Path=/; HttpOnly{}; SameSite={}; Max-Age={}",
+            "dw_active_org={}; Path=/; HttpOnly{}{}; SameSite={}; Max-Age={}",
             org_id,
             secure,
+            domain,
             session_config.cookie_same_site,
             30 * 24 * 60 * 60
         )
     } else {
         // Clear cookie
         format!(
-            "dw_active_org=; Path=/; HttpOnly{}; SameSite={}; Max-Age=0",
-            secure, session_config.cookie_same_site
+            "dw_active_org=; Path=/; HttpOnly{}{}; SameSite={}; Max-Age=0",
+            secure, domain, session_config.cookie_same_site
         )
     };
 

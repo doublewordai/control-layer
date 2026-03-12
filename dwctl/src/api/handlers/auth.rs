@@ -350,16 +350,23 @@ pub async fn logout<P: PoolProvider>(State(state): State<AppState<P>>) -> Result
     let session_config = &state.config.auth.native.session;
     let secure = if session_config.cookie_secure { "; Secure" } else { "" };
 
+    // Domain attribute for cross-subdomain cookies
+    let domain = session_config
+        .cookie_domain
+        .as_ref()
+        .map(|d| format!("; Domain={d}"))
+        .unwrap_or_default();
+
     // Clear session cookie
     let cookie = format!(
-        "{}=; Path=/; HttpOnly{}; SameSite={}; Max-Age=0",
-        session_config.cookie_name, secure, session_config.cookie_same_site
+        "{}=; Path=/; HttpOnly{}{}; SameSite={}; Max-Age=0",
+        session_config.cookie_name, secure, domain, session_config.cookie_same_site
     );
 
     // Also clear the active organization cookie
     let org_cookie = format!(
-        "dw_active_org=; Path=/; HttpOnly{}; SameSite={}; Max-Age=0",
-        secure, session_config.cookie_same_site
+        "dw_active_org=; Path=/; HttpOnly{}{}; SameSite={}; Max-Age=0",
+        secure, domain, session_config.cookie_same_site
     );
 
     let auth_response = AuthSuccessResponse {
@@ -646,9 +653,14 @@ fn create_session_cookie(token: &str, config: &crate::config::Config) -> String 
     let max_age = session_config.timeout.as_secs();
 
     let secure = if session_config.cookie_secure { "; Secure" } else { "" };
+    let domain = session_config
+        .cookie_domain
+        .as_ref()
+        .map(|d| format!("; Domain={d}"))
+        .unwrap_or_default();
     format!(
-        "{}={}; Path=/; HttpOnly{}; SameSite={}; Max-Age={}",
-        session_config.cookie_name, token, secure, session_config.cookie_same_site, max_age
+        "{}={}; Path=/; HttpOnly{}{}; SameSite={}; Max-Age={}",
+        session_config.cookie_name, token, secure, domain, session_config.cookie_same_site, max_age
     )
 }
 
