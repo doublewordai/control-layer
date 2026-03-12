@@ -1690,6 +1690,11 @@ impl Config {
             }
         }
 
+        // Normalize empty cookie_domain to None (allows env var override with "" to clear it)
+        if config.auth.native.session.cookie_domain.as_deref() == Some("") {
+            config.auth.native.session.cookie_domain = None;
+        }
+
         config.validate().map_err(|e| figment::Error::from(e.to_string()))?;
         Ok(config)
     }
