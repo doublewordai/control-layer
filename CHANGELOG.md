@@ -1,5 +1,18 @@
 # Changelog
 
+## [8.19.0](https://github.com/doublewordai/control-layer/compare/v8.18.1...v8.19.0) (2026-03-12)
+
+
+### Features
+
+* add trace_id to http_analytics ([#865](https://github.com/doublewordai/control-layer/issues/865)) ([fb56e2f](https://github.com/doublewordai/control-layer/commit/fb56e2fe8454045578874d7feff6532c204e678b))
+* org-scoped batch/file filtering with metadata enrichment ([#839](https://github.com/doublewordai/control-layer/issues/839)) ([000fcef](https://github.com/doublewordai/control-layer/commit/000fcef23d353c29122722d0a99a1d51d46f17bf))
+
+
+### Bug Fixes
+
+* Split timeouts ([#833](https://github.com/doublewordai/control-layer/issues/833)) ([7b5d78f](https://github.com/doublewordai/control-layer/commit/7b5d78f5e5c752c2fd92d89cfe9c719a3570b41e))
+
 ## [8.18.1](https://github.com/doublewordai/control-layer/compare/v8.18.0...v8.18.1) (2026-03-11)
 
 
