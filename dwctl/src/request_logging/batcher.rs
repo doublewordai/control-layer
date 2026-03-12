@@ -612,7 +612,10 @@ where
     ) -> (Option<String>, String) {
         // Only apply waterfall to batch requests with a known submission window and creation time
         let (Some(submitted), Some(created_at)) = (submitted_window, batch_created_at) else {
-            return (submitted_window.map(|s| s.to_string()), submitted_window.unwrap_or_default().to_string());
+            return (
+                submitted_window.map(|s| s.to_string()),
+                submitted_window.unwrap_or_default().to_string(),
+            );
         };
 
         let purpose = api_key_purpose.unwrap_or(&ApiKeyPurpose::Realtime);
@@ -1588,8 +1591,22 @@ mod tests {
         let created = Utc::now() - chrono::Duration::hours(2);
         let completed = created + chrono::Duration::minutes(30);
         let tariffs = vec![
-            make_tariff(ApiKeyPurpose::Batch, created - chrono::Duration::days(1), None, "0.00030", "0.00060", Some("1h")),
-            make_tariff(ApiKeyPurpose::Batch, created - chrono::Duration::days(1), None, "0.00010", "0.00020", Some("24h")),
+            make_tariff(
+                ApiKeyPurpose::Batch,
+                created - chrono::Duration::days(1),
+                None,
+                "0.00030",
+                "0.00060",
+                Some("1h"),
+            ),
+            make_tariff(
+                ApiKeyPurpose::Batch,
+                created - chrono::Duration::days(1),
+                None,
+                "0.00010",
+                "0.00020",
+                Some("24h"),
+            ),
         ];
 
         let (window, sla) = resolve_sla(&tariffs, Some(&ApiKeyPurpose::Batch), Some("1h"), Some(created), completed, created);
@@ -1603,8 +1620,22 @@ mod tests {
         let created = Utc::now() - chrono::Duration::hours(4);
         let completed = created + chrono::Duration::hours(3);
         let tariffs = vec![
-            make_tariff(ApiKeyPurpose::Batch, created - chrono::Duration::days(1), None, "0.00030", "0.00060", Some("1h")),
-            make_tariff(ApiKeyPurpose::Batch, created - chrono::Duration::days(1), None, "0.00010", "0.00020", Some("24h")),
+            make_tariff(
+                ApiKeyPurpose::Batch,
+                created - chrono::Duration::days(1),
+                None,
+                "0.00030",
+                "0.00060",
+                Some("1h"),
+            ),
+            make_tariff(
+                ApiKeyPurpose::Batch,
+                created - chrono::Duration::days(1),
+                None,
+                "0.00010",
+                "0.00020",
+                Some("24h"),
+            ),
         ];
 
         let (window, sla) = resolve_sla(&tariffs, Some(&ApiKeyPurpose::Batch), Some("1h"), Some(created), completed, created);
@@ -1618,8 +1649,22 @@ mod tests {
         let created = Utc::now() - chrono::Duration::hours(26);
         let completed = created + chrono::Duration::hours(25);
         let tariffs = vec![
-            make_tariff(ApiKeyPurpose::Batch, created - chrono::Duration::days(1), None, "0.00030", "0.00060", Some("1h")),
-            make_tariff(ApiKeyPurpose::Batch, created - chrono::Duration::days(1), None, "0.00010", "0.00020", Some("24h")),
+            make_tariff(
+                ApiKeyPurpose::Batch,
+                created - chrono::Duration::days(1),
+                None,
+                "0.00030",
+                "0.00060",
+                Some("1h"),
+            ),
+            make_tariff(
+                ApiKeyPurpose::Batch,
+                created - chrono::Duration::days(1),
+                None,
+                "0.00010",
+                "0.00020",
+                Some("24h"),
+            ),
         ];
 
         let (window, sla) = resolve_sla(&tariffs, Some(&ApiKeyPurpose::Batch), Some("1h"), Some(created), completed, created);
@@ -1633,11 +1678,32 @@ mod tests {
         let created = Utc::now() - chrono::Duration::hours(1);
         let completed = created + chrono::Duration::minutes(20);
         let tariffs = vec![
-            make_tariff(ApiKeyPurpose::Batch, created - chrono::Duration::days(1), None, "0.00030", "0.00060", Some("1h")),
-            make_tariff(ApiKeyPurpose::Batch, created - chrono::Duration::days(1), None, "0.00010", "0.00020", Some("24h")),
+            make_tariff(
+                ApiKeyPurpose::Batch,
+                created - chrono::Duration::days(1),
+                None,
+                "0.00030",
+                "0.00060",
+                Some("1h"),
+            ),
+            make_tariff(
+                ApiKeyPurpose::Batch,
+                created - chrono::Duration::days(1),
+                None,
+                "0.00010",
+                "0.00020",
+                Some("24h"),
+            ),
         ];
 
-        let (window, sla) = resolve_sla(&tariffs, Some(&ApiKeyPurpose::Batch), Some("24h"), Some(created), completed, created);
+        let (window, sla) = resolve_sla(
+            &tariffs,
+            Some(&ApiKeyPurpose::Batch),
+            Some("24h"),
+            Some(created),
+            completed,
+            created,
+        );
         assert_eq!(window, Some("24h".to_string()));
         assert_eq!(sla, "24h");
     }
@@ -1648,11 +1714,32 @@ mod tests {
         let created = Utc::now() - chrono::Duration::hours(26);
         let completed = created + chrono::Duration::hours(25);
         let tariffs = vec![
-            make_tariff(ApiKeyPurpose::Batch, created - chrono::Duration::days(1), None, "0.00030", "0.00060", Some("1h")),
-            make_tariff(ApiKeyPurpose::Batch, created - chrono::Duration::days(1), None, "0.00010", "0.00020", Some("24h")),
+            make_tariff(
+                ApiKeyPurpose::Batch,
+                created - chrono::Duration::days(1),
+                None,
+                "0.00030",
+                "0.00060",
+                Some("1h"),
+            ),
+            make_tariff(
+                ApiKeyPurpose::Batch,
+                created - chrono::Duration::days(1),
+                None,
+                "0.00010",
+                "0.00020",
+                Some("24h"),
+            ),
         ];
 
-        let (window, sla) = resolve_sla(&tariffs, Some(&ApiKeyPurpose::Batch), Some("24h"), Some(created), completed, created);
+        let (window, sla) = resolve_sla(
+            &tariffs,
+            Some(&ApiKeyPurpose::Batch),
+            Some("24h"),
+            Some(created),
+            completed,
+            created,
+        );
         assert_eq!(window, None);
         assert_eq!(sla, "free");
     }
@@ -1661,9 +1748,14 @@ mod tests {
     fn test_sla_waterfall_non_batch_request_passthrough() {
         // Non-batch request (no completion window) → passes through unchanged
         let now = Utc::now();
-        let tariffs = vec![
-            make_tariff(ApiKeyPurpose::Realtime, now - chrono::Duration::days(1), None, "0.00020", "0.00040", None),
-        ];
+        let tariffs = vec![make_tariff(
+            ApiKeyPurpose::Realtime,
+            now - chrono::Duration::days(1),
+            None,
+            "0.00020",
+            "0.00040",
+            None,
+        )];
 
         let (window, sla) = resolve_sla(&tariffs, Some(&ApiKeyPurpose::Realtime), None, None, now, now);
         assert_eq!(window, None);
@@ -1676,8 +1768,22 @@ mod tests {
         let created = Utc::now() - chrono::Duration::hours(2);
         let completed = created + chrono::Duration::hours(1);
         let tariffs = vec![
-            make_tariff(ApiKeyPurpose::Batch, created - chrono::Duration::days(1), None, "0.00030", "0.00060", Some("1h")),
-            make_tariff(ApiKeyPurpose::Batch, created - chrono::Duration::days(1), None, "0.00010", "0.00020", Some("24h")),
+            make_tariff(
+                ApiKeyPurpose::Batch,
+                created - chrono::Duration::days(1),
+                None,
+                "0.00030",
+                "0.00060",
+                Some("1h"),
+            ),
+            make_tariff(
+                ApiKeyPurpose::Batch,
+                created - chrono::Duration::days(1),
+                None,
+                "0.00010",
+                "0.00020",
+                Some("24h"),
+            ),
         ];
 
         let (window, sla) = resolve_sla(&tariffs, Some(&ApiKeyPurpose::Batch), Some("1h"), Some(created), completed, created);
@@ -1691,12 +1797,40 @@ mod tests {
         let created = Utc::now() - chrono::Duration::hours(8);
         let completed = created + chrono::Duration::hours(2); // past 30min, within 6h
         let tariffs = vec![
-            make_tariff(ApiKeyPurpose::Batch, created - chrono::Duration::days(1), None, "0.00050", "0.00100", Some("30m")),
-            make_tariff(ApiKeyPurpose::Batch, created - chrono::Duration::days(1), None, "0.00030", "0.00060", Some("6h")),
-            make_tariff(ApiKeyPurpose::Batch, created - chrono::Duration::days(1), None, "0.00010", "0.00020", Some("48h")),
+            make_tariff(
+                ApiKeyPurpose::Batch,
+                created - chrono::Duration::days(1),
+                None,
+                "0.00050",
+                "0.00100",
+                Some("30m"),
+            ),
+            make_tariff(
+                ApiKeyPurpose::Batch,
+                created - chrono::Duration::days(1),
+                None,
+                "0.00030",
+                "0.00060",
+                Some("6h"),
+            ),
+            make_tariff(
+                ApiKeyPurpose::Batch,
+                created - chrono::Duration::days(1),
+                None,
+                "0.00010",
+                "0.00020",
+                Some("48h"),
+            ),
         ];
 
-        let (window, sla) = resolve_sla(&tariffs, Some(&ApiKeyPurpose::Batch), Some("30m"), Some(created), completed, created);
+        let (window, sla) = resolve_sla(
+            &tariffs,
+            Some(&ApiKeyPurpose::Batch),
+            Some("30m"),
+            Some(created),
+            completed,
+            created,
+        );
         assert_eq!(window, Some("6h".to_string()));
         assert_eq!(sla, "6h");
     }
