@@ -93,6 +93,10 @@ pub struct RawAnalyticsRecord {
     pub batch_created_at: Option<DateTime<Utc>>,
     /// The request_source from batch metadata
     pub batch_request_source: String,
+
+    // === Tracing ===
+    /// OpenTelemetry trace ID for correlation with Tempo
+    pub trace_id: Option<String>,
 }
 
 /// Enriched data resolved during batch processing
@@ -671,6 +675,7 @@ where
         let mut batch_slas: Vec<String> = Vec::with_capacity(records.len());
         let mut batch_request_sources: Vec<String> = Vec::with_capacity(records.len());
         let mut api_key_ids: Vec<Option<Uuid>> = Vec::with_capacity(records.len());
+        let mut trace_ids: Vec<Option<String>> = Vec::with_capacity(records.len());
 
         for record in records {
             instance_ids.push(record.raw.instance_id);
@@ -700,6 +705,7 @@ where
             batch_slas.push(record.raw.batch_completion_window.clone().unwrap_or_default());
             batch_request_sources.push(record.raw.batch_request_source.clone());
             api_key_ids.push(record.api_key_id);
+            trace_ids.push(record.raw.trace_id.clone());
         }
 
         let rows = sqlx::query!(
@@ -709,14 +715,14 @@ where
                 status_code, duration_ms, duration_to_first_byte_ms, prompt_tokens, completion_tokens,
                 total_tokens, response_type, user_id, access_source,
                 input_price_per_token, output_price_per_token, fusillade_batch_id, fusillade_request_id, custom_id,
-                request_origin, batch_sla, batch_request_source, api_key_id
+                request_origin, batch_sla, batch_request_source, api_key_id, trace_id
             )
             SELECT * FROM UNNEST(
                 $1::uuid[], $2::bigint[], $3::timestamptz[], $4::text[], $5::text[], $6::text[],
                 $7::int[], $8::bigint[], $9::bigint[], $10::bigint[], $11::bigint[],
                 $12::bigint[], $13::text[], $14::uuid[], $15::text[],
                 $16::numeric[], $17::numeric[], $18::uuid[], $19::uuid[], $20::text[],
-                $21::text[], $22::text[], $23::text[], $24::uuid[]
+                $21::text[], $22::text[], $23::text[], $24::uuid[], $25::text[]
             )
             ON CONFLICT (instance_id, correlation_id)
             DO UPDATE SET
@@ -737,7 +743,8 @@ where
                 request_origin = EXCLUDED.request_origin,
                 batch_sla = EXCLUDED.batch_sla,
                 batch_request_source = EXCLUDED.batch_request_source,
-                api_key_id = EXCLUDED.api_key_id
+                api_key_id = EXCLUDED.api_key_id,
+                trace_id = EXCLUDED.trace_id
             RETURNING id, instance_id, correlation_id
             "#,
             &instance_ids,
@@ -764,6 +771,7 @@ where
             &batch_slas,
             &batch_request_sources,
             &api_key_ids as &[Option<Uuid>],
+            &trace_ids as &[Option<String>],
         )
         .fetch_all(&mut **tx)
         .await?;
@@ -1092,6 +1100,7 @@ mod tests {
             batch_completion_window: None,
             batch_created_at: None,
             batch_request_source: "".to_string(),
+            trace_id: None,
         };
 
         assert_eq!(record.correlation_id, 123);
@@ -1619,6 +1628,7 @@ mod integration_tests {
             batch_completion_window: None,
             batch_created_at: None,
             batch_request_source: String::new(),
+            trace_id: None,
         }
     }
 
