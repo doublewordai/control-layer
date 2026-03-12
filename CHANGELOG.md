@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.19.1](https://github.com/doublewordai/control-layer/compare/v8.19.0...v8.19.1) (2026-03-12)
+
+
+### Bug Fixes
+
+* optional domain for active org cookie ([#868](https://github.com/doublewordai/control-layer/issues/868)) ([36dd297](https://github.com/doublewordai/control-layer/commit/36dd297f346a351a339081d0ae68305775ed476e))
+
 ## [8.19.0](https://github.com/doublewordai/control-layer/compare/v8.18.1...v8.19.0) (2026-03-12)
 
 
