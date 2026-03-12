@@ -264,6 +264,7 @@ export function Batches({
     status: statusFilter !== "all" ? statusFilter : undefined,
     created_after: dateRange?.from.toISOString(),
     created_before: dateRange?.to.toISOString(),
+    active_first: sortActiveFirst || undefined,
     ...batchesPagination.queryParams,
   });
 
@@ -284,7 +285,7 @@ export function Batches({
   // Display files as returned by API (server-side filtered by purpose)
   const files = filesForDisplay;
 
-  // Apply client-side filters and sorting to batches
+  // Apply client-side filters to batches (sorting is now server-side via active_first param)
   const filteredBatches = React.useMemo(() => {
     let result = batches;
 
@@ -293,23 +294,8 @@ export function Batches({
       result = result.filter((b) => b.input_file_id === batchFileFilter);
     }
 
-    // Sort active batches first if toggled
-    if (sortActiveFirst) {
-      const activeStatuses = new Set([
-        "validating",
-        "in_progress",
-        "finalizing",
-        "cancelling",
-      ]);
-      result = [...result].sort((a, b) => {
-        const aActive = activeStatuses.has(a.status) ? 0 : 1;
-        const bActive = activeStatuses.has(b.status) ? 0 : 1;
-        return aActive - bActive;
-      });
-    }
-
     return result;
-  }, [batches, batchFileFilter, sortActiveFirst]);
+  }, [batches, batchFileFilter]);
 
   // Create a map of batch ID to analytics for easy lookup (analytics are now embedded in batch response)
   const batchAnalyticsMap = React.useMemo(() => {
@@ -805,7 +791,10 @@ export function Batches({
                   <Switch
                     id="active-first"
                     checked={sortActiveFirst}
-                    onCheckedChange={setSortActiveFirst}
+                    onCheckedChange={(checked) => {
+                      setSortActiveFirst(checked);
+                      batchesPagination.handleFirstPage();
+                    }}
                   />
                   <label
                     htmlFor="active-first"
