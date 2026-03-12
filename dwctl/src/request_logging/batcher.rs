@@ -1,33 +1,31 @@
-//! Analytics batching system for efficient database writes.
+//! Analytics writer for efficient batched database writes.
 //!
-//! This module provides [`AnalyticsBatcher`] which accumulates analytics records
-//! and writes them to the database in batches, significantly reducing per-request
-//! database overhead.
+//! This module provides [`AnalyticsWriter`] which enriches and writes analytics records
+//! to the database in batches, significantly reducing per-request database overhead.
 //!
 //! # Architecture
 //!
 //! ```text
-//! Request → AnalyticsHandler (extract only) → Channel → AnalyticsBatcher
-//!                                                            ↓
-//!                                                 [Accumulate in buffer]
-//!                                                            ↓
-//!                                              [Flush immediately (write-through)]
-//!                                                            ↓
-//!                                              Phase 1: Batch enrich
-//!                                                - Token → user_id lookup
-//!                                                - Model → pricing lookup
-//!                                                            ↓
-//!                                              Phase 2: Batch write (transaction)
-//!                                                - INSERT http_analytics
-//!                                                - INSERT credit_transactions
-//!                                                            ↓
-//!                                              Phase 3: Record metrics
+//! outlet background task
+//!   → accumulates responses into batch
+//!   → calls AnalyticsHandler.handle_response_batch()
+//!       → extracts RawAnalyticsRecords from batch
+//!       → calls AnalyticsWriter.flush()
+//!           Phase 1: Batch enrich
+//!             - Token → user_id lookup
+//!             - Model → pricing lookup
+//!           Phase 2: Batch write (transaction)
+//!             - INSERT http_analytics
+//!             - INSERT credit_transactions
+//!           Phase 3: Record metrics
 //! ```
 //!
 //! # Key Design Decisions
 //!
-//! - **All DB work in batcher**: The handler sends unenriched `RawAnalyticsRecord`s.
-//!   Enrichment (user lookup, pricing lookup) happens in the batcher via batch queries.
+//! - **Outlet handles batching**: The outlet middleware accumulates request/response
+//!   pairs and dispatches them as batches. No separate channel or accumulation loop.
+//! - **All DB work in writer**: The handler extracts unenriched `RawAnalyticsRecord`s.
+//!   Enrichment (user lookup, pricing lookup) happens in the writer via batch queries.
 //! - **Transactional writes**: Analytics and credit inserts happen in a single transaction.
 //!   Either both succeed or both roll back.
 //! - **Batch enrichment**: User and pricing lookups are batched using `IN` clauses,
@@ -46,13 +44,9 @@ use sqlx::PgPool;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{RwLock, mpsc};
-use tokio_util::sync::CancellationToken;
-use tracing::{Instrument, debug, error, info, info_span, trace, warn};
+use tokio::sync::RwLock;
+use tracing::{Instrument, debug, error, info_span, trace, warn};
 use uuid::Uuid;
-
-/// Channel buffer size - how many records can be queued before backpressure
-const CHANNEL_BUFFER_SIZE: usize = 10_000;
 
 /// Raw analytics record sent through the channel (unenriched).
 ///
@@ -112,24 +106,19 @@ struct EnrichedRecord {
     output_price_per_token: Option<Decimal>,
 }
 
-/// Sender handle for submitting analytics records to the batcher
-pub type AnalyticsSender = mpsc::Sender<RawAnalyticsRecord>;
-
-/// Analytics batcher that accumulates records and writes them in batches.
+/// Analytics writer that enriches and writes batches of records to the database.
 ///
 /// This significantly reduces database overhead by:
 /// 1. Batching enrichment queries (user lookup, pricing lookup)
 /// 2. Batching INSERT operations (analytics, credits)
 /// 3. Using a single transaction for consistency
 /// 4. Retrying failed batches with exponential backoff
-pub struct AnalyticsBatcher<M = crate::metrics::GenAiMetrics>
+pub struct AnalyticsWriter<M = crate::metrics::GenAiMetrics>
 where
     M: MetricsRecorder + Clone + Send + Sync + 'static,
 {
     pool: PgPool,
     metrics_recorder: Option<M>,
-    receiver: mpsc::Receiver<RawAnalyticsRecord>,
-    batch_size: usize,
     max_retries: u32,
     retry_base_delay: std::time::Duration,
     /// Global rate limiter for onwards sync notifications.
@@ -139,35 +128,25 @@ where
     onwards_sync_notification_interval: Duration,
 }
 
-impl<M> AnalyticsBatcher<M>
+impl<M> AnalyticsWriter<M>
 where
     M: MetricsRecorder + Clone + Send + Sync + 'static,
 {
-    /// Creates a new analytics batcher and returns the batcher along with a sender.
+    /// Creates a new analytics writer.
     ///
     /// # Arguments
     ///
     /// * `pool` - Database connection pool for batch writes
     /// * `config` - Application configuration (includes batch settings)
     /// * `metrics_recorder` - Optional metrics recorder for Prometheus metrics
-    ///
-    /// # Returns
-    ///
-    /// A tuple of (batcher, sender) where the sender is used by AnalyticsHandler
-    /// to submit records.
-    pub fn new(pool: PgPool, config: Config, metrics_recorder: Option<M>) -> (Self, AnalyticsSender) {
-        let (sender, receiver) = mpsc::channel(CHANNEL_BUFFER_SIZE);
-
-        let batch_size = config.analytics.batch_size;
+    pub fn new(pool: PgPool, config: Config, metrics_recorder: Option<M>) -> Self {
         let max_retries = config.analytics.max_retries;
         let retry_base_delay = std::time::Duration::from_millis(config.analytics.retry_base_delay_ms);
         let onwards_sync_notification_interval = Duration::from_millis(config.analytics.balance_notification_interval_milliseconds);
 
-        let batcher = Self {
+        Self {
             pool,
             metrics_recorder,
-            receiver,
-            batch_size,
             max_retries,
             retry_base_delay,
             last_onwards_sync_notification: Arc::new(RwLock::new(
@@ -176,108 +155,35 @@ where
                     .unwrap_or_else(Instant::now),
             )),
             onwards_sync_notification_interval,
-        };
-
-        (batcher, sender)
-    }
-
-    /// Runs the batcher's background write loop.
-    ///
-    /// This should be spawned as a tokio task. The strategy is:
-    /// 1. Block until at least one record arrives
-    /// 2. Non-blocking drain of all available records in the channel
-    /// 3. Write the batch immediately
-    /// 4. Repeat
-    ///
-    /// This minimizes latency at low load (single record → immediate write) while
-    /// getting batching efficiency at high load (records queue while writing → bigger batch).
-    pub async fn run(mut self, shutdown_token: CancellationToken) {
-        info!(
-            max_batch_size = self.batch_size,
-            max_retries = self.max_retries,
-            retry_base_delay_ms = self.retry_base_delay.as_millis() as u64,
-            "Analytics batcher started (write-through mode with retry)"
-        );
-
-        let mut buffer: Vec<RawAnalyticsRecord> = Vec::with_capacity(self.batch_size);
-
-        loop {
-            // Step 1: Wait for at least one record OR shutdown
-            tokio::select! {
-                biased; // Check shutdown first
-
-                _ = shutdown_token.cancelled() => {
-                    info!("Shutdown signal received, draining analytics channel");
-                    self.receiver.close();
-                    // Drain remaining records in batches to avoid OOM with large backlogs
-                    while let Some(record) = self.receiver.recv().await {
-                        buffer.push(record);
-                        if buffer.len() >= self.batch_size {
-                            self.flush_batch(&mut buffer).await;
-                        }
-                    }
-                    if !buffer.is_empty() {
-                        self.flush_batch(&mut buffer).await;
-                    }
-                    info!("Analytics batcher shutdown complete");
-                    break;
-                }
-
-                maybe_record = self.receiver.recv() => {
-                    match maybe_record {
-                        Some(record) => buffer.push(record),
-                        None => {
-                            // Channel closed (all senders dropped)
-                            info!("Analytics channel closed, shutting down batcher");
-                            if !buffer.is_empty() {
-                                self.flush_batch(&mut buffer).await;
-                            }
-                            break;
-                        }
-                    }
-                }
-            }
-
-            // Step 2: Non-blocking drain of all available records (up to batch_size)
-            while buffer.len() < self.batch_size {
-                match self.receiver.try_recv() {
-                    Ok(record) => buffer.push(record),
-                    Err(_) => break, // Channel empty or closed
-                }
-            }
-
-            // Step 3: Write immediately
-            self.flush_batch(&mut buffer).await;
         }
     }
 
-    /// Flushes the buffer to the database with retry on failure.
+    /// Flushes records to the database with retry on failure.
     ///
     /// This performs:
     /// 1. Batch enrichment (user lookup, pricing lookup) - no retry, data issues won't fix themselves
     /// 2. Transactional write (analytics + credits) - retried with exponential backoff
     /// 3. Metrics recording
-    async fn flush_batch(&self, buffer: &mut Vec<RawAnalyticsRecord>) {
-        if buffer.is_empty() {
+    pub async fn flush(&self, records: &[RawAnalyticsRecord]) {
+        if records.is_empty() {
             return;
         }
 
-        let batch_size = buffer.len();
+        let batch_size = records.len();
         let span = info_span!("dwctl.flush_analytics_batch", batch_size = batch_size);
 
         async {
             let start = std::time::Instant::now();
 
             // Collect correlation IDs for log correlation
-            let correlation_ids: Vec<i64> = buffer.iter().map(|r| r.correlation_id).collect();
+            let correlation_ids: Vec<i64> = records.iter().map(|r| r.correlation_id).collect();
 
             // Phase 1: Batch enrich (no retry - enrichment failures are usually data issues)
-            let enriched = match self.enrich_batch(buffer).await {
+            let enriched = match self.enrich_batch(records).await {
                 Ok(enriched) => enriched,
                 Err(e) => {
                     error!(error = %e, batch_size = batch_size, ?correlation_ids, "Failed to enrich analytics batch");
                     counter!("dwctl_analytics_batch_errors_total", "phase" => "enrich").increment(1);
-                    buffer.clear();
                     return;
                 }
             };
@@ -328,7 +234,6 @@ where
                     "Failed to write analytics batch after all retries, dropping batch"
                 );
                 counter!("dwctl_analytics_batch_errors_total", "phase" => "write").increment(1);
-                buffer.clear();
                 return;
             }
 
@@ -357,8 +262,6 @@ where
                 ?correlation_ids,
                 "Flushed analytics batch"
             );
-
-            buffer.clear();
         }
         .instrument(span)
         .await;
@@ -1159,7 +1062,7 @@ mod tests {
         }
     }
 
-    /// Helper to call find_best_tariff without needing a full batcher
+    /// Helper to call find_best_tariff without needing a full writer
     fn find_tariff(
         tariffs: &[TariffInfo],
         api_key_purpose: Option<&ApiKeyPurpose>,
@@ -1632,22 +1535,11 @@ mod integration_tests {
         }
     }
 
-    /// Run the batcher with given records and wait for completion
-    async fn run_batcher_with_records(pool: &PgPool, records: Vec<RawAnalyticsRecord>) {
+    /// Flush records through the analytics writer
+    async fn flush_records(pool: &PgPool, records: &[RawAnalyticsRecord]) {
         let config = crate::test::utils::create_test_config();
-        let (batcher, sender) = AnalyticsBatcher::<crate::metrics::GenAiMetrics>::new(pool.clone(), config, None);
-
-        // Send all records
-        for record in records {
-            sender.send(record).await.unwrap();
-        }
-
-        // Drop sender to close channel
-        drop(sender);
-
-        // Run batcher until channel is drained
-        let shutdown = CancellationToken::new();
-        batcher.run(shutdown).await;
+        let writer = AnalyticsWriter::<crate::metrics::GenAiMetrics>::new(pool.clone(), config, None);
+        writer.flush(records).await;
     }
 
     #[sqlx::test]
@@ -1669,7 +1561,7 @@ mod integration_tests {
         let record = create_raw_record("gpt-4-test", Some(api_key), 1000, 500);
 
         // Run batcher
-        run_batcher_with_records(&pool, vec![record]).await;
+        flush_records(&pool, &[record]).await;
 
         // Verify: Balance should be deducted
         let mut conn = pool.acquire().await.unwrap();
@@ -1728,7 +1620,7 @@ mod integration_tests {
         let realtime_record = create_raw_record("gpt-4-turbo-test", Some(realtime_key), 1000, 500);
 
         // Run batcher
-        run_batcher_with_records(&pool, vec![batch_record, realtime_record]).await;
+        flush_records(&pool, &[batch_record, realtime_record]).await;
 
         // Expected costs:
         // Batch: (1000 * 0.00005) + (500 * 0.00010) = 0.05 + 0.05 = 0.10
@@ -1778,7 +1670,7 @@ mod integration_tests {
         let record = create_raw_record("gpt-4-fallback-test", Some(batch_key), 1000, 500);
 
         // Run batcher
-        run_batcher_with_records(&pool, vec![record]).await;
+        flush_records(&pool, &[record]).await;
 
         // Expected: Should fall back to realtime pricing
         // Cost: (1000 * 0.00015) + (500 * 0.00030) = 0.15 + 0.15 = 0.30
@@ -1810,7 +1702,7 @@ mod integration_tests {
         let record = create_raw_record("gpt-4-no-tariff", Some(api_key), 1000, 500);
 
         // Run batcher
-        run_batcher_with_records(&pool, vec![record]).await;
+        flush_records(&pool, &[record]).await;
 
         // Verify: Balance should NOT be deducted (no pricing)
         let mut conn = pool.acquire().await.unwrap();
@@ -1851,7 +1743,7 @@ mod integration_tests {
         let record = create_raw_record("gpt-4-unauth-test", None, 1000, 500);
 
         // Run batcher - should not panic or create transactions
-        run_batcher_with_records(&pool, vec![record]).await;
+        flush_records(&pool, &[record]).await;
 
         // Verify: Analytics record was created
         let count = sqlx::query_scalar!("SELECT COUNT(*) FROM http_analytics WHERE model = 'gpt-4-unauth-test'")
@@ -1901,7 +1793,7 @@ mod integration_tests {
         let record = create_raw_record("gpt-4-depletion-test", Some(api_key), 1000, 500);
 
         // Run batcher - this should trigger balance depletion notification
-        run_batcher_with_records(&pool, vec![record]).await;
+        flush_records(&pool, &[record]).await;
 
         // Should receive notification for balance depletion
         let notification = timeout(Duration::from_secs(2), listener.recv())
@@ -1971,15 +1863,10 @@ mod integration_tests {
         let mut config = crate::test::utils::create_test_config();
         config.analytics.balance_notification_interval_milliseconds = 100;
 
-        // Run batcher with all 3 records - should trigger 3 depletions but only 1 notification
+        // Flush all 3 records - should trigger 3 depletions but only 1 notification
         // due to rate limiting (interval is 100ms)
-        let (batcher, sender) = AnalyticsBatcher::<crate::metrics::GenAiMetrics>::new(pool.clone(), config, None);
-        for record in [record1, record2, record3] {
-            sender.send(record).await.unwrap();
-        }
-        drop(sender);
-        let shutdown = tokio_util::sync::CancellationToken::new();
-        batcher.run(shutdown).await;
+        let writer = AnalyticsWriter::<crate::metrics::GenAiMetrics>::new(pool.clone(), config, None);
+        writer.flush(&[record1, record2, record3]).await;
 
         // Should receive ONLY ONE notification despite 3 balance depletions
         let first_notification = timeout(Duration::from_secs(2), listener.recv())

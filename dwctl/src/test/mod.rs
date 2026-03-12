@@ -893,7 +893,7 @@ async fn test_request_logging_disabled(pool: PgPool) {
         .limiters(limiters)
         .build();
     let onwards_router = axum::Router::new(); // Empty onwards router for testing
-    let router = super::build_router(&mut app_state, onwards_router, None, None, false)
+    let router = super::build_router(&mut app_state, onwards_router, false, None, false)
         .await
         .expect("Failed to build router");
 
@@ -1232,7 +1232,7 @@ async fn test_build_router_with_metrics_disabled(pool: PgPool) {
         .build();
 
     let onwards_router = axum::Router::new();
-    let router = super::build_router(&mut app_state, onwards_router, None, None, false)
+    let router = super::build_router(&mut app_state, onwards_router, false, None, false)
         .await
         .expect("Failed to build router");
     let server = axum_test::TestServer::new(router).expect("Failed to create test server");
@@ -1263,7 +1263,7 @@ async fn test_build_router_with_metrics_enabled(pool: PgPool) {
         .build();
 
     let onwards_router = axum::Router::new();
-    let router = super::build_router(&mut app_state, onwards_router, None, None, false)
+    let router = super::build_router(&mut app_state, onwards_router, false, None, false)
         .await
         .expect("Failed to build router");
     let server = axum_test::TestServer::new(router).expect("Failed to create test server");
