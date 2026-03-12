@@ -2124,4 +2124,64 @@ mod tests {
         assert!(body.user.roles.contains(&Role::StandardUser));
         assert!(body.user.roles.contains(&Role::RequestViewer));
     }
+
+    #[sqlx::test]
+    async fn test_session_cookie_includes_domain_when_configured(pool: PgPool) {
+        let mut config = create_test_config();
+        config.auth.native.enabled = true;
+        config.auth.native.allow_registration = true;
+        config.auth.native.session.cookie_domain = Some(".example.com".to_string());
+
+        let state = crate::test::utils::create_test_app_state_with_config(pool, config).await;
+
+        let app = axum::Router::new()
+            .route("/auth/register", axum::routing::post(register))
+            .with_state(state);
+
+        let server = TestServer::new(app).unwrap();
+
+        let response = server
+            .post("/auth/register")
+            .json(&RegisterRequest {
+                username: "domaintest".to_string(),
+                email: "domain@example.com".to_string(),
+                password: "password123".to_string(),
+                display_name: None,
+            })
+            .await;
+
+        response.assert_status(axum::http::StatusCode::CREATED);
+        let cookie = response.headers().get("set-cookie").unwrap().to_str().unwrap();
+        assert!(cookie.contains("Domain=.example.com"), "cookie should include Domain: {cookie}");
+    }
+
+    #[sqlx::test]
+    async fn test_session_cookie_omits_domain_when_not_configured(pool: PgPool) {
+        let mut config = create_test_config();
+        config.auth.native.enabled = true;
+        config.auth.native.allow_registration = true;
+        config.auth.native.session.cookie_domain = None;
+
+        let state = crate::test::utils::create_test_app_state_with_config(pool, config).await;
+
+        let app = axum::Router::new()
+            .route("/auth/register", axum::routing::post(register))
+            .with_state(state);
+
+        let server = TestServer::new(app).unwrap();
+
+        let response = server
+            .post("/auth/register")
+            .json(&RegisterRequest {
+                username: "nodomaintest".to_string(),
+                email: "nodomain@example.com".to_string(),
+                password: "password123".to_string(),
+                display_name: None,
+            })
+            .await;
+
+        response.assert_status(axum::http::StatusCode::CREATED);
+        let cookie = response.headers().get("set-cookie").unwrap().to_str().unwrap();
+        assert!(!cookie.contains("Domain="), "cookie should not include Domain: {cookie}");
+    }
 }

@@ -1753,6 +1753,20 @@ impl Config {
             });
         }
 
+        // Validate cookie_domain if set
+        if let Some(ref domain) = self.auth.native.session.cookie_domain {
+            let invalid =
+                domain.is_empty() || domain.contains(';') || domain.contains('\r') || domain.contains('\n') || domain.contains(' ');
+            if invalid {
+                return Err(Error::Internal {
+                    operation: format!(
+                        "Config validation: Invalid cookie_domain '{domain}'. \
+                         Must not be empty or contain semicolons, whitespace, or control characters."
+                    ),
+                });
+            }
+        }
+
         // Validate CORS configuration
         if self.auth.security.cors.allowed_origins.is_empty() {
             return Err(Error::Internal {
