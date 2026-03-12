@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.19.2](https://github.com/doublewordai/control-layer/compare/v8.19.1...v8.19.2) (2026-03-12)
+
+
+### Bug Fixes
+
+* allow emoty string cookie domain, which is transformed to none ([#873](https://github.com/doublewordai/control-layer/issues/873)) ([599606d](https://github.com/doublewordai/control-layer/commit/599606d876026817c5ee82ab9d5729288aaaaa68))
+
 ## [8.19.1](https://github.com/doublewordai/control-layer/compare/v8.19.0...v8.19.1) (2026-03-12)
 
 
