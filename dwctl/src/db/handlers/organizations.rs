@@ -116,6 +116,15 @@ impl<'c> Organizations<'c> {
         .fetch_one(&mut *tx)
         .await?;
 
+        // Assign roles to the org user entity so API keys linked to the org have
+        // the necessary permissions (e.g. BatchAPIUser for file/batch operations)
+        let org_roles = [Role::StandardUser, Role::BatchAPIUser];
+        for role in &org_roles {
+            sqlx::query!("INSERT INTO user_roles (user_id, role) VALUES ($1, $2)", org_id, role as &Role)
+                .execute(&mut *tx)
+                .await?;
+        }
+
         // Add creator as owner
         sqlx::query!(
             "INSERT INTO user_organizations (user_id, organization_id, role, status) VALUES ($1, $2, 'owner', 'active')",
@@ -138,7 +147,7 @@ impl<'c> Organizations<'c> {
             last_login: None,
             auth_source: row.auth_source,
             is_admin: row.is_admin,
-            roles: vec![Role::StandardUser],
+            roles: vec![Role::StandardUser, Role::BatchAPIUser],
             password_hash: row.password_hash,
             external_user_id: row.external_user_id,
             payment_provider_id: row.payment_provider_id,
@@ -207,7 +216,7 @@ impl<'c> Organizations<'c> {
             last_login: None,
             auth_source: row.auth_source,
             is_admin: row.is_admin,
-            roles: vec![Role::StandardUser],
+            roles: vec![Role::StandardUser, Role::BatchAPIUser],
             password_hash: row.password_hash,
             external_user_id: row.external_user_id,
             payment_provider_id: row.payment_provider_id,
