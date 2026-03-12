@@ -1690,6 +1690,11 @@ impl Config {
             }
         }
 
+        // Normalize empty cookie_domain to None (allows env var override with "" to clear it)
+        if config.auth.native.session.cookie_domain.as_deref() == Some("") {
+            config.auth.native.session.cookie_domain = None;
+        }
+
         config.validate().map_err(|e| figment::Error::from(e.to_string()))?;
         Ok(config)
     }
@@ -2679,6 +2684,35 @@ batches:
             // No relaxation_factors key — all windows default to 1.0
             assert_eq!(config.batches.relaxation_factor("1h"), 1.0);
             assert_eq!(config.batches.relaxation_factor("24h"), 1.0);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_empty_cookie_domain_env_override_normalized_to_none() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+auth:
+  native:
+    session:
+      cookie_domain: ".doubleword.ai"
+"#,
+            )?;
+
+            // Staging overrides cookie_domain with empty string to clear it
+            jail.set_env("DWCTL_AUTH__NATIVE__SESSION__COOKIE_DOMAIN", "");
+
+            let args = Args {
+                config: "test.yaml".to_string(),
+                validate: false,
+            };
+
+            let config = Config::load(&args)?;
+            assert_eq!(config.auth.native.session.cookie_domain, None);
+
             Ok(())
         });
     }
