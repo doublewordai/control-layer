@@ -659,6 +659,8 @@ pub struct SessionConfig {
     pub cookie_secure: bool,
     /// SameSite cookie attribute ("strict", "lax", or "none")
     pub cookie_same_site: String,
+    /// Optional Domain attribute for cookies (e.g. ".doubleword.ai" for cross-subdomain)
+    pub cookie_domain: Option<String>,
 }
 
 /// Password validation rules.
@@ -1579,6 +1581,7 @@ impl Default for SessionConfig {
             cookie_name: "dwctl_session".to_string(),
             cookie_secure: true,
             cookie_same_site: "strict".to_string(),
+            cookie_domain: None,
         }
     }
 }
@@ -1748,6 +1751,26 @@ impl Config {
                     "Config validation: No authentication methods are enabled. Please enable either native or proxy_header authentication."
                         .to_string(),
             });
+        }
+
+        // Validate cookie_domain if set — must produce a valid Set-Cookie header fragment
+        if let Some(ref domain) = self.auth.native.session.cookie_domain {
+            let invalid = domain.is_empty() || domain.chars().any(|c| c.is_whitespace() || c.is_control()) || domain.contains(';');
+            if invalid {
+                return Err(Error::Internal {
+                    operation: format!(
+                        "Config validation: Invalid cookie_domain '{domain}'. \
+                         Must not be empty or contain semicolons, whitespace, or control characters."
+                    ),
+                });
+            }
+            // Verify the resulting fragment is a valid HTTP header value
+            let fragment = format!("; Domain={domain}");
+            if axum::http::HeaderValue::from_str(&fragment).is_err() {
+                return Err(Error::Internal {
+                    operation: format!("Config validation: cookie_domain '{domain}' produces an invalid HTTP header value."),
+                });
+            }
         }
 
         // Validate CORS configuration
