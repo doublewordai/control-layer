@@ -2687,4 +2687,33 @@ batches:
             Ok(())
         });
     }
+
+    #[test]
+    fn test_empty_cookie_domain_env_override_normalized_to_none() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+auth:
+  native:
+    session:
+      cookie_domain: ".doubleword.ai"
+"#,
+            )?;
+
+            // Staging overrides cookie_domain with empty string to clear it
+            jail.set_env("DWCTL_AUTH__NATIVE__SESSION__COOKIE_DOMAIN", "");
+
+            let args = Args {
+                config: "test.yaml".to_string(),
+                validate: false,
+            };
+
+            let config = Config::load(&args)?;
+            assert_eq!(config.auth.native.session.cookie_domain, None);
+
+            Ok(())
+        });
+    }
 }
