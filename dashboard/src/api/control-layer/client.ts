@@ -1309,6 +1309,7 @@ const filesApi = {
     if (options?.purpose) params.set("purpose", options.purpose);
     if (options?.search) params.set("search", options.search);
     if (options?.own) params.set("own", "true");
+    if (options?.member_id) params.set("member_id", options.member_id);
 
     const response = await fetchAiApi(
       `/ai/v1/files${params.toString() ? "?" + params.toString() : ""}`,
@@ -1468,6 +1469,10 @@ const batchesApi = {
     if (options?.limit) params.set("limit", options.limit.toString());
     if (options?.search) params.set("search", options.search);
     if (options?.include) params.set("include", options.include);
+    if (options?.member_id) params.set("member_id", options.member_id);
+    if (options?.status) params.set("status", options.status);
+    if (options?.created_after) params.set("created_after", options.created_after);
+    if (options?.created_before) params.set("created_before", options.created_before);
 
     const response = await fetchAiApi(
       `/ai/v1/batches${params.toString() ? "?" + params.toString() : ""}`,

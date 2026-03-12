@@ -29,10 +29,10 @@ export function DateTimeRangeSelector({
   onChange,
   className,
 }: DateTimeRangeSelectorProps) {
-  // Default to last 24 hours
+  // Default to last 30 days
   const getDefaultRange = () => {
     const now = new Date();
-    const from = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+    const from = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
     return { from, to: now };
   };
 
@@ -78,6 +78,22 @@ export function DateTimeRangeSelector({
       );
       setEndTime(
         `${value.to.getHours().toString().padStart(2, "0")}:${value.to
+          .getMinutes()
+          .toString()
+          .padStart(2, "0")}`,
+      );
+    } else {
+      // Reset internal state to defaults when value is cleared
+      const defaultRange = getDefaultRange();
+      setRange(defaultRange);
+      setStartTime(
+        `${defaultRange.from.getHours().toString().padStart(2, "0")}:${defaultRange.from
+          .getMinutes()
+          .toString()
+          .padStart(2, "0")}`,
+      );
+      setEndTime(
+        `${defaultRange.to.getHours().toString().padStart(2, "0")}:${defaultRange.to
           .getMinutes()
           .toString()
           .padStart(2, "0")}`,
@@ -198,6 +214,10 @@ export function DateTimeRangeSelector({
   };
 
   const formatDateRange = () => {
+    // Show placeholder when parent hasn't applied a filter yet
+    if (!value) {
+      return "Date range";
+    }
     if (range?.from && range?.to) {
       if (range.from.toDateString() === range.to.toDateString()) {
         return `${format(range.from, "MMM d, yyyy")} ${startTime} - ${endTime}`;
@@ -207,7 +227,7 @@ export function DateTimeRangeSelector({
         "MMM d, yyyy",
       )} ${endTime}`;
     }
-    return "Select date & time";
+    return "Date range";
   };
 
   return (
@@ -217,7 +237,7 @@ export function DateTimeRangeSelector({
           variant="outline"
           className={cn(
             "justify-between font-normal",
-            !range && "text-muted-foreground",
+            !value && "text-muted-foreground",
             className,
           )}
         >
@@ -297,11 +317,12 @@ export function DateTimeRangeSelector({
                         .toString()
                         .padStart(2, "0")}`,
                     );
-                    onChange?.(defaultRange);
+                    onChange?.(undefined);
+                    setOpen(false);
                   }}
                   className="px-3"
                 >
-                  Reset
+                  Clear
                 </Button>
               </div>
             </div>

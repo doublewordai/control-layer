@@ -26,6 +26,14 @@ vi.mock("../../../../api/control-layer/hooks", () => ({
     data: { roles: ["PlatformManager"] },
     isLoading: false,
   })),
+  useOrganizationMembers: vi.fn(() => ({
+    data: [],
+    isLoading: false,
+  })),
+  useUsers: vi.fn(() => ({
+    data: { data: [], total_count: 0 },
+    isLoading: false,
+  })),
 }));
 
 // Mock authorization hook
@@ -36,6 +44,16 @@ vi.mock("../../../../utils/authorization", () => ({
     hasPermission: () => true,
     canAccessRoute: () => true,
     getFirstAccessibleRoute: () => "/batches",
+  })),
+}));
+
+// Mock organization context
+vi.mock("../../../../contexts/organization/useOrganizationContext", () => ({
+  useOrganizationContext: vi.fn(() => ({
+    activeOrganizationId: null,
+    activeOrganization: null,
+    isOrgContext: false,
+    setActiveOrganization: vi.fn(),
   })),
 }));
 
@@ -696,8 +714,11 @@ describe("Batches - Pagination", () => {
         expect(activePage2).toHaveTextContent("2");
       });
 
-      // Change page size by clicking the combobox trigger
-      const pageSizeSelect = within(container).getByRole("combobox");
+      // Change page size by clicking the combobox trigger (find the one showing "10")
+      const comboboxes = within(container).getAllByRole("combobox");
+      const pageSizeSelect = comboboxes.find((el) =>
+        el.textContent?.includes("10"),
+      )!;
       await user.click(pageSizeSelect);
 
       // Wait for the dropdown to open and find the option by text

@@ -318,10 +318,130 @@ impl<'c> ApiKeys<'c> {
             ApiKeyPurpose::Playground => "playground",
         };
 
-        // Try to get existing hidden key for this user and purpose
-        let existing_key = sqlx::query_scalar!(
+        // Upsert: insert a hidden key or return the existing one.
+        // Uses ON CONFLICT on the unique index (user_id, created_by, purpose)
+        // WHERE hidden = true AND is_deleted = false to handle concurrent requests.
+        let secret = generate_api_key();
+        let name = if user_id == created_by {
+            format!("Internal {} Key", purpose_str)
+        } else {
+            format!("Internal {} Key ({})", purpose_str, &created_by.to_string()[..8])
+        };
+        let description = format!(
+            "Automatically managed internal API key for {} operations. Not visible to users.",
+            purpose_str
+        );
+
+        // Use INSERT ... ON CONFLICT DO NOTHING + SELECT to avoid firing the
+        // api_keys_notify AFTER UPDATE trigger on the common "key already exists" path.
+        let row_secret = sqlx::query_scalar!(
             r#"
-            SELECT secret
+            WITH ins AS (
+                INSERT INTO api_keys (name, description, secret, purpose, user_id, created_by, hidden)
+                VALUES ($1, $2, $3, $4, $5, $6, true)
+                ON CONFLICT (user_id, created_by, purpose) WHERE hidden = true AND is_deleted = false
+                DO NOTHING
+                RETURNING secret
+            )
+            SELECT secret FROM ins
+            UNION ALL
+            SELECT secret FROM api_keys
+            WHERE user_id = $5 AND created_by = $6 AND purpose = $4
+              AND hidden = true AND is_deleted = false
+            LIMIT 1
+            "#,
+            name,
+            description,
+            secret,
+            purpose_str,
+            user_id,
+            created_by
+        )
+        .fetch_one(&mut *self.db)
+        .await?
+        .ok_or(DbError::NotFound)?;
+
+        Ok(row_secret)
+    }
+
+    /// Get or create a hidden API key, returning both the secret and the key's UUID.
+    /// Used when the caller needs to pass the key ID to fusillade for attribution.
+    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
+    pub async fn get_or_create_hidden_key_with_id(
+        &mut self,
+        user_id: UserId,
+        purpose: ApiKeyPurpose,
+        created_by: UserId,
+    ) -> Result<(String, ApiKeyId)> {
+        let purpose_str = match purpose {
+            ApiKeyPurpose::Platform => "platform",
+            ApiKeyPurpose::Realtime => "realtime",
+            ApiKeyPurpose::Batch => "batch",
+            ApiKeyPurpose::Playground => "playground",
+        };
+
+        // Upsert: insert a hidden key or return the existing one.
+        // Uses ON CONFLICT on the unique index (user_id, created_by, purpose)
+        // WHERE hidden = true AND is_deleted = false to handle concurrent requests.
+        let secret = generate_api_key();
+        let name = if user_id == created_by {
+            format!("Internal {} Key", purpose_str)
+        } else {
+            format!("Internal {} Key ({})", purpose_str, &created_by.to_string()[..8])
+        };
+        let description = format!(
+            "Automatically managed internal API key for {} operations. Not visible to users.",
+            purpose_str
+        );
+
+        // Use INSERT ... ON CONFLICT DO NOTHING + SELECT to avoid firing the
+        // api_keys_notify AFTER UPDATE trigger on the common "key already exists" path.
+        let row = sqlx::query!(
+            r#"
+            WITH ins AS (
+                INSERT INTO api_keys (name, description, secret, purpose, user_id, created_by, hidden)
+                VALUES ($1, $2, $3, $4, $5, $6, true)
+                ON CONFLICT (user_id, created_by, purpose) WHERE hidden = true AND is_deleted = false
+                DO NOTHING
+                RETURNING id, secret
+            )
+            SELECT id, secret FROM ins
+            UNION ALL
+            SELECT id, secret FROM api_keys
+            WHERE user_id = $5 AND created_by = $6 AND purpose = $4
+              AND hidden = true AND is_deleted = false
+            LIMIT 1
+            "#,
+            name,
+            description,
+            secret,
+            purpose_str,
+            user_id,
+            created_by
+        )
+        .fetch_one(&mut *self.db)
+        .await?;
+
+        let id = row.id.ok_or(DbError::NotFound)?;
+        let secret = row.secret.ok_or(DbError::NotFound)?;
+
+        Ok((secret, id))
+    }
+
+    /// Find the hidden API key ID for a given user, purpose, and creator.
+    /// Returns None if no matching key exists (member hasn't created any batches/files yet).
+    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
+    pub async fn find_hidden_key_id(&mut self, user_id: UserId, purpose: ApiKeyPurpose, created_by: UserId) -> Result<Option<ApiKeyId>> {
+        let purpose_str = match purpose {
+            ApiKeyPurpose::Platform => "platform",
+            ApiKeyPurpose::Realtime => "realtime",
+            ApiKeyPurpose::Batch => "batch",
+            ApiKeyPurpose::Playground => "playground",
+        };
+
+        let key_id = sqlx::query_scalar!(
+            r#"
+            SELECT id
             FROM api_keys
             WHERE user_id = $1 AND purpose = $2 AND hidden = true
             AND created_by = $3
@@ -335,44 +455,57 @@ impl<'c> ApiKeys<'c> {
         .fetch_optional(&mut *self.db)
         .await?;
 
-        if let Some(secret) = existing_key {
-            tracing::debug!("Using existing hidden API key for user");
-            return Ok(secret);
-        }
+        Ok(key_id)
+    }
 
-        // No existing key found, create a new one
-        let secret = generate_api_key();
-        // Include created_by in name for per-member uniqueness within orgs.
-        // For individuals (created_by == user_id), this is cosmetic; for orgs,
-        // it avoids (user_id, name) unique constraint collisions.
-        let name = if user_id == created_by {
-            format!("Internal {} Key", purpose_str)
-        } else {
-            format!("Internal {} Key ({})", purpose_str, &created_by.to_string()[..8])
+    /// Find ALL hidden API key IDs created by a given user across all contexts (personal + orgs).
+    /// This is used when a PM filters by member in personal mode — need to find all keys
+    /// where `created_by = member_id` regardless of which user_id (org or personal) owns them.
+    #[instrument(skip(self), fields(created_by = %abbrev_uuid(&created_by)), err)]
+    pub async fn find_all_hidden_key_ids_by_creator(&mut self, purpose: ApiKeyPurpose, created_by: UserId) -> Result<Vec<ApiKeyId>> {
+        let purpose_str = match purpose {
+            ApiKeyPurpose::Platform => "platform",
+            ApiKeyPurpose::Realtime => "realtime",
+            ApiKeyPurpose::Batch => "batch",
+            ApiKeyPurpose::Playground => "playground",
         };
-        let description = Some(format!(
-            "Automatically managed internal API key for {} operations. Not visible to users.",
-            purpose_str
-        ));
 
-        tracing::info!("Creating new hidden API key for user");
-
-        sqlx::query!(
+        let key_ids = sqlx::query_scalar!(
             r#"
-            INSERT INTO api_keys (name, description, secret, purpose, user_id, created_by, hidden)
-            VALUES ($1, $2, $3, $4, $5, $6, true)
+            SELECT id
+            FROM api_keys
+            WHERE purpose = $1 AND created_by = $2
+            AND hidden = true AND is_deleted = false
             "#,
-            name,
-            description,
-            secret,
             purpose_str,
-            user_id,
             created_by
         )
-        .execute(&mut *self.db)
+        .fetch_all(&mut *self.db)
         .await?;
 
-        Ok(secret)
+        Ok(key_ids)
+    }
+
+    /// Bulk lookup the `created_by` user IDs for a set of API key IDs.
+    /// Returns a map from api_key_id to the user who created that key.
+    #[instrument(skip(self, key_ids), err)]
+    pub async fn get_creators_by_key_ids(&mut self, key_ids: Vec<ApiKeyId>) -> Result<HashMap<ApiKeyId, UserId>> {
+        if key_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let rows = sqlx::query!(
+            r#"
+            SELECT id, created_by
+            FROM api_keys
+            WHERE id = ANY($1)
+            "#,
+            &key_ids
+        )
+        .fetch_all(&mut *self.db)
+        .await?;
+
+        Ok(rows.into_iter().map(|r| (r.id, r.created_by)).collect())
     }
 
     /// Get specific deployment IDs that an API key has access to
@@ -1914,6 +2047,7 @@ mod tests {
             limits: Default::default(),
             email: Default::default(),
             onwards: Default::default(),
+            onboarding_url: None,
         };
         crate::seed_database(&config.model_sources, &pool).await.unwrap();
 

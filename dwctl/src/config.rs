@@ -170,6 +170,10 @@ pub struct Config {
     pub email: EmailConfig,
     /// Onwards proxy configuration
     pub onwards: OnwardsConfig,
+    /// Optional URL to redirect new users to for onboarding (e.g., "https://onboarding.doubleword.ai")
+    /// When set, users with a null `last_login` will receive this URL in the `/users/current` response.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub onboarding_url: Option<String>,
 }
 
 /// Individual pool configuration with all SQLx parameters.
@@ -1524,6 +1528,7 @@ impl Default for Config {
             limits: LimitsConfig::default(),
             email: EmailConfig::default(),
             onwards: OnwardsConfig::default(),
+            onboarding_url: None,
         }
     }
 }

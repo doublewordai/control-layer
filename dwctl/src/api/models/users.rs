@@ -145,6 +145,9 @@ pub struct UserResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<String>, format = "uuid")]
     pub active_organization_id: Option<UserId>,
+    /// Onboarding redirect URL (only present for /users/current when last_login is null and onboarding_url is configured)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub onboarding_redirect_url: Option<String>,
 }
 
 /// Query parameters for listing users
@@ -221,7 +224,7 @@ impl From<UserDBResponse> for UserResponse {
             updated_at: db.updated_at,
             auth_source: db.auth_source,
             external_user_id: db.external_user_id,
-            last_login: None,     // UserDBResponse doesn't have last_login
+            last_login: db.last_login,
             groups: None,         // By default, relationships are not included
             credit_balance: None, // By default, credit balances are not included
             has_payment_provider_id: db.payment_provider_id.as_ref().is_some_and(|s| !s.is_empty()),
@@ -234,6 +237,7 @@ impl From<UserDBResponse> for UserResponse {
             user_type: db.user_type,
             organizations: None,
             active_organization_id: None,
+            onboarding_redirect_url: None,
         }
     }
 }
@@ -260,6 +264,12 @@ impl UserResponse {
     /// Set the active organization ID (from session cookie)
     pub fn with_active_organization(mut self, id: Option<UserId>) -> Self {
         self.active_organization_id = id;
+        self
+    }
+
+    /// Set the onboarding redirect URL (for first-time users)
+    pub fn with_onboarding_redirect_url(mut self, url: String) -> Self {
+        self.onboarding_redirect_url = Some(url);
         self
     }
 }

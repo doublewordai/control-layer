@@ -14,7 +14,8 @@ use crate::api::models::batches::{
 };
 use crate::api::models::users::CurrentUser;
 use crate::auth::permissions::{RequiresPermission, can_read_all_resources, has_permission, operation, resource};
-use crate::db::handlers::{Credits, Users, repository::Repository};
+use crate::db::handlers::{Credits, Users, api_keys::ApiKeys, repository::Repository};
+use crate::db::models::api_keys::ApiKeyPurpose;
 use crate::errors::{Error, Result};
 use crate::types::{Operation, Resource};
 use axum::{
@@ -369,11 +370,24 @@ pub async fn create_batch<P: PoolProvider>(
     // When in org context, attribute batch ownership to the org
     let target_user_id = current_user.active_organization.unwrap_or(current_user.id);
 
-    // Convert metadata to HashMap and inject request_source and user info
-    // Note: created_by_email is NOT stored in metadata to avoid PII in denormalized storage.
-    // The email is fetched via user lookup when building API responses.
-    // metadata.created_by tracks the individual user for audit trail
+    // Get the hidden API key ID for per-member attribution within orgs
+    let api_key_id = {
+        let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
+        let mut api_keys_repo = ApiKeys::new(&mut conn);
+        let (_secret, key_id) = api_keys_repo
+            .get_or_create_hidden_key_with_id(target_user_id, ApiKeyPurpose::Batch, current_user.id)
+            .await
+            .map_err(Error::Database)?;
+        key_id
+    };
+
+    // Convert metadata to HashMap and inject request_source and user info.
+    // Strip reserved keys that are injected server-side during response enrichment
+    // to prevent user-supplied values from colliding with system fields.
     let mut metadata_map = req.metadata.unwrap_or_default();
+    for key in &["created_by_email", "context_name", "context_type", "request_source", "created_by"] {
+        metadata_map.remove(*key);
+    }
     metadata_map.insert("request_source".to_string(), request_source.to_string());
     metadata_map.insert("created_by".to_string(), current_user.id.to_string());
     let metadata = serde_json::to_value(metadata_map).ok();
@@ -385,6 +399,7 @@ pub async fn create_batch<P: PoolProvider>(
         completion_window: req.completion_window.clone(),
         metadata,
         created_by: Some(target_user_id.to_string()),
+        api_key_id: Some(api_key_id),
     };
 
     let reservation_ids = reserve_capacity_for_batch(
@@ -704,9 +719,89 @@ pub async fn get_batch<P: PoolProvider>(
         });
     }
 
-    // Fetch creator email for the response
-    let creator_email = fetch_creator_email(state.db.read(), &batch).await;
-    Ok(Json(to_batch_response_with_email(batch, creator_email.as_deref())))
+    // Enrich with creator/context metadata (same as list_batches)
+    let mut read_conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+
+    // Resolve individual creator email via api_key_id
+    let created_by_email = if let Some(api_key_id) = batch.api_key_id {
+        let creator_map = ApiKeys::new(&mut read_conn)
+            .get_creators_by_key_ids(vec![api_key_id])
+            .await
+            .map_err(Error::Database)?;
+        if let Some(&creator_id) = creator_map.get(&api_key_id) {
+            Users::new(&mut read_conn)
+                .get_bulk(vec![creator_id])
+                .await
+                .map_err(|e| Error::Internal {
+                    operation: format!("fetch creator user: {}", e),
+                })?
+                .get(&creator_id)
+                .map(|u| u.email.clone())
+        } else {
+            None
+        }
+    } else {
+        // Fall back to owner email (legacy batches without api_key_id)
+        if let Some(created_by) = batch.created_by.as_ref() {
+            if let Ok(user_id) = Uuid::parse_str(created_by) {
+                Users::new(&mut read_conn)
+                    .get_bulk(vec![user_id])
+                    .await
+                    .map_err(|e| Error::Internal {
+                        operation: format!("fetch owner user: {}", e),
+                    })?
+                    .get(&user_id)
+                    .map(|u| u.email.clone())
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+
+    // Resolve context from batch owner (created_by field)
+    let (context_name, context_type) = if let Some(owner_id) = batch.created_by.as_ref().and_then(|id| Uuid::parse_str(id).ok()) {
+        let user_map = Users::new(&mut read_conn)
+            .get_bulk(vec![owner_id])
+            .await
+            .map_err(|e| Error::Internal {
+                operation: format!("fetch owner user: {}", e),
+            })?;
+        match user_map.get(&owner_id) {
+            Some(u) if u.user_type == "organization" => {
+                let name = u.display_name.clone().unwrap_or_else(|| u.email.clone());
+                (Some(name), Some("organization".to_string()))
+            }
+            Some(_) => (Some("Personal".to_string()), Some("personal".to_string())),
+            None => (None, None),
+        }
+    } else {
+        (None, None)
+    };
+
+    let mut response = to_batch_response_with_email(batch, None);
+
+    if let Some(email) = created_by_email {
+        response
+            .metadata
+            .get_or_insert_with(HashMap::new)
+            .insert("created_by_email".to_string(), email);
+    }
+    if let Some(name) = context_name {
+        response
+            .metadata
+            .get_or_insert_with(HashMap::new)
+            .insert("context_name".to_string(), name);
+    }
+    if let Some(ctype) = context_type {
+        response
+            .metadata
+            .get_or_insert_with(HashMap::new)
+            .insert("context_type".to_string(), ctype);
+    }
+
+    Ok(Json(response))
 }
 
 #[utoipa::path(
@@ -1285,20 +1380,75 @@ pub async fn list_batches<P: PoolProvider>(
         .as_ref()
         .and_then(|after_str| Uuid::parse_str(after_str).ok().map(fusillade::BatchId));
 
-    // Determine if user can read all batches or just their own
-    // In org context, show batches owned by the org instead of the individual user
+    // Determine ownership scoping:
+    // - Org context: always scope to org (unified view for both PMs and standard users)
+    // - Personal context + PM: no filter (sees all batches across all users)
+    // - Personal context + standard user: scope to own batches only
     let can_read_all = can_read_all_resources(&current_user, Resource::Batches);
-    let created_by = if can_read_all {
+    let created_by = if let Some(org_id) = current_user.active_organization {
+        Some(org_id.to_string())
+    } else if can_read_all {
         None
     } else {
-        let target_user_id = current_user.active_organization.unwrap_or(current_user.id);
-        Some(target_user_id.to_string())
+        Some(current_user.id.to_string())
+    };
+
+    // Translate member_id to api_key_ids for fusillade filtering.
+    // Uses a short-lived connection so we don't hold it across the fusillade call.
+    //
+    // Note: this only matches batches created after hidden key attribution was deployed.
+    // Legacy batches with api_key_id = NULL won't match the filter.
+    let api_key_ids_filter = if let Some(member_id) = query.member_id {
+        let mut read_conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+        let key_ids = match current_user.active_organization {
+            Some(org_id) => {
+                // Org context: find the single hidden key for this member in this org
+                let key_id = ApiKeys::new(&mut read_conn)
+                    .find_hidden_key_id(org_id, ApiKeyPurpose::Batch, member_id)
+                    .await
+                    .map_err(Error::Database)?;
+                key_id.into_iter().collect::<Vec<_>>()
+            }
+            None if can_read_all => {
+                // PM personal context: find ALL hidden keys created by this member
+                ApiKeys::new(&mut read_conn)
+                    .find_all_hidden_key_ids_by_creator(ApiKeyPurpose::Batch, member_id)
+                    .await
+                    .map_err(Error::Database)?
+            }
+            None => {
+                return Err(Error::BadRequest {
+                    message: "member_id filter is only available in organization context or for platform managers".to_string(),
+                });
+            }
+        };
+        if key_ids.is_empty() {
+            return Ok(Json(BatchListResponse {
+                object_type: ListObjectType::List,
+                data: vec![],
+                first_id: None,
+                last_id: None,
+                has_more: false,
+            }));
+        }
+        Some(key_ids)
+    } else {
+        None
     };
 
     // Fetch batches with ownership filtering, search, and cursor-based pagination
     let batches = state
         .request_manager
-        .list_batches(created_by, query.search.clone(), after, limit + 1) // Fetch one extra to determine has_more
+        .list_batches(fusillade::ListBatchesFilter {
+            created_by,
+            search: query.search.clone(),
+            after,
+            limit: Some(limit + 1),
+            api_key_ids: api_key_ids_filter,
+            status: query.status.clone(),
+            created_after: query.created_after,
+            created_before: query.created_before,
+        })
         .await
         .map_err(|e| Error::Internal {
             operation: format!("list batches: {}", e),
@@ -1312,24 +1462,50 @@ pub async fn list_batches<P: PoolProvider>(
     let first_id = batches.first().map(|b| b.id.0.to_string());
     let last_id = batches.last().map(|b| b.id.0.to_string());
 
-    // Collect unique created_by user IDs from batches
-    let user_ids: Vec<Uuid> = batches
+    // Resolve creator/context metadata for all returned batches.
+    // Uses a fresh connection (not held across the fusillade call above).
+    use crate::db::models::users::UserDBResponse;
+    let mut read_conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+
+    // Resolve individual creators via api_key_id → api_keys.created_by
+    let api_key_ids: Vec<Uuid> = batches
         .iter()
-        .filter_map(|b| b.created_by.as_ref())
-        .filter_map(|id| Uuid::parse_str(id).ok())
+        .filter_map(|b| b.api_key_id)
         .collect::<std::collections::HashSet<_>>()
         .into_iter()
         .collect();
+    let api_key_creator_map: HashMap<Uuid, Uuid> = if !api_key_ids.is_empty() {
+        ApiKeys::new(&mut read_conn)
+            .get_creators_by_key_ids(api_key_ids)
+            .await
+            .map_err(Error::Database)?
+    } else {
+        HashMap::new()
+    };
 
-    // Bulk fetch user emails
-    let email_map: HashMap<String, String> = if !user_ids.is_empty() {
-        let mut conn = state.db.read().acquire().await.map_err(|e| Error::Internal {
-            operation: format!("acquire db connection: {}", e),
-        })?;
-        let users = Users::new(&mut conn).get_bulk(user_ids).await.map_err(|e| Error::Internal {
-            operation: format!("fetch users: {}", e),
-        })?;
-        users.into_iter().map(|(id, user)| (id.to_string(), user.email)).collect()
+    // Collect all unique user IDs we need to resolve:
+    // - Owner IDs from batch.created_by (could be org or personal user)
+    // - Individual creator IDs from api_key resolution
+    let mut all_user_ids: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+    for batch in &batches {
+        if let Some(owner_id) = batch.created_by.as_ref().and_then(|id| Uuid::parse_str(id).ok()) {
+            all_user_ids.insert(owner_id);
+        }
+        if let Some(api_key_id) = batch.api_key_id
+            && let Some(&creator_id) = api_key_creator_map.get(&api_key_id)
+        {
+            all_user_ids.insert(creator_id);
+        }
+    }
+
+    // Bulk fetch all users (emails, user_type, display_name)
+    let user_map: HashMap<Uuid, UserDBResponse> = if !all_user_ids.is_empty() {
+        Users::new(&mut read_conn)
+            .get_bulk(all_user_ids.into_iter().collect())
+            .await
+            .map_err(|e| Error::Internal {
+                operation: format!("fetch users: {}", e),
+            })?
     } else {
         HashMap::new()
     };
@@ -1356,13 +1532,66 @@ pub async fn list_batches<P: PoolProvider>(
         HashMap::new()
     };
 
-    // Convert batches to responses with email injection and optional analytics
+    // Convert batches to responses with enriched creator/context metadata
     let data: Vec<_> = batches
         .into_iter()
         .map(|batch| {
-            let batch_id = batch.id; // Capture UUID before the move
-            let email = batch.created_by.as_ref().and_then(|id| email_map.get(id)).map(|s| s.as_str());
-            let mut response = to_batch_response_with_email(batch, email);
+            let batch_id = batch.id;
+
+            // Resolve individual creator email via api_key_id, with fallback
+            // to batch owner for legacy batches without api_key_id
+            let individual_creator_id = batch.api_key_id.and_then(|key_id| api_key_creator_map.get(&key_id).copied());
+            let created_by_email = individual_creator_id
+                .and_then(|uid| user_map.get(&uid))
+                .map(|u| u.email.clone())
+                .or_else(|| {
+                    // Legacy fallback: use batch owner (created_by) when api_key_id is NULL
+                    if batch.api_key_id.is_none() {
+                        batch
+                            .created_by
+                            .as_ref()
+                            .and_then(|id| Uuid::parse_str(id).ok())
+                            .and_then(|uid| user_map.get(&uid))
+                            .map(|u| u.email.clone())
+                    } else {
+                        None
+                    }
+                });
+
+            // Resolve context from batch owner (created_by field)
+            let owner_id = batch.created_by.as_ref().and_then(|id| Uuid::parse_str(id).ok());
+            let owner = owner_id.and_then(|id| user_map.get(&id));
+            let (context_name, context_type) = match owner {
+                Some(u) if u.user_type == "organization" => {
+                    let name = u.display_name.clone().unwrap_or_else(|| u.email.clone());
+                    (Some(name), Some("organization".to_string()))
+                }
+                Some(_) => (Some("Personal".to_string()), Some("personal".to_string())),
+                None => (None, None),
+            };
+
+            let mut response = to_batch_response_with_email(batch, None);
+
+            // Inject enriched creator/context info into metadata
+            if let Some(email) = created_by_email {
+                response
+                    .metadata
+                    .get_or_insert_with(HashMap::new)
+                    .insert("created_by_email".to_string(), email);
+            }
+            if let Some(name) = context_name {
+                response
+                    .metadata
+                    .get_or_insert_with(HashMap::new)
+                    .insert("context_name".to_string(), name);
+            }
+            if let Some(ctype) = context_type {
+                response
+                    .metadata
+                    .get_or_insert_with(HashMap::new)
+                    .insert("context_type".to_string(), ctype);
+            }
+
             if include_analytics {
                 response.analytics = analytics_map.get(&batch_id).cloned();
             }
@@ -3062,5 +3291,179 @@ mod tests {
             .await;
 
         resp.assert_status(StatusCode::CREATED);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_list_batches_member_id_rejected_outside_org_context(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let auth = add_auth_headers(&user);
+
+        // Attempt member_id filter without org context → should return 400
+        let resp = app
+            .get(&format!("/ai/v1/batches?member_id={}", Uuid::new_v4()))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+        resp.assert_status(StatusCode::BAD_REQUEST);
+        let body = resp.text();
+        assert!(
+            body.contains("organization context"),
+            "Expected error about org context, got: {}",
+            body
+        );
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_list_batches_member_id_no_key_returns_empty(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let org = create_test_org(&pool, user.id).await;
+        let auth = add_auth_headers(&user);
+        let org_cookie = format!("dw_active_org={}", org.id);
+
+        // Filter by a member who has never created batches (no hidden key) → empty list
+        let unknown_member = Uuid::new_v4();
+        let resp = app
+            .get(&format!("/ai/v1/batches?member_id={}", unknown_member))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .add_header("cookie", &org_cookie)
+            .await;
+        resp.assert_status_ok();
+        let body: serde_json::Value = resp.json();
+        assert_eq!(body["data"].as_array().unwrap().len(), 0);
+        assert_eq!(body["has_more"], false);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_list_batches_enrichment_in_org_context(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let org = create_test_org(&pool, user.id).await;
+
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, org.id, group.id).await;
+        // Also add user directly so they have model access in personal context too
+        add_user_to_group(&pool, user.id, group.id).await;
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        let auth = add_auth_headers(&user);
+        let org_cookie = format!("dw_active_org={}", org.id);
+
+        // Upload file and create batch in org context
+        let jsonl_content = r#"{"custom_id":"req-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}"#;
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("enrich-test.jsonl");
+        let multipart = axum_test::multipart::MultipartForm::new()
+            .add_part("file", file_part)
+            .add_part("purpose", axum_test::multipart::Part::text("batch"));
+        let upload_resp = app
+            .post("/ai/v1/files")
+            .multipart(multipart)
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .add_header("cookie", &org_cookie)
+            .await;
+        upload_resp.assert_status(StatusCode::CREATED);
+        let file: serde_json::Value = upload_resp.json();
+        let file_id = file["id"].as_str().unwrap();
+
+        let create_req = CreateBatchRequest {
+            input_file_id: file_id.to_string(),
+            endpoint: "/v1/chat/completions".to_string(),
+            completion_window: "24h".to_string(),
+            metadata: None,
+        };
+        let create_resp = app
+            .post("/ai/v1/batches")
+            .json(&create_req)
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .add_header("cookie", &org_cookie)
+            .await;
+        create_resp.assert_status(StatusCode::CREATED);
+
+        // List in org context → should have enriched metadata
+        let list_resp = app
+            .get("/ai/v1/batches")
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .add_header("cookie", &org_cookie)
+            .await;
+        list_resp.assert_status_ok();
+        let list_body: serde_json::Value = list_resp.json();
+        let batch = &list_body["data"][0];
+        let metadata = &batch["metadata"];
+        // Org context should see enriched fields
+        assert!(
+            metadata["created_by_email"].is_string(),
+            "Expected enriched created_by_email in org context"
+        );
+        assert!(
+            metadata["context_name"].is_string(),
+            "Expected enriched context_name in org context"
+        );
+
+        // Create a personal batch (no org context) so we can verify scrubbing
+        let personal_file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("personal-test.jsonl");
+        let personal_multipart = axum_test::multipart::MultipartForm::new()
+            .add_part("file", personal_file_part)
+            .add_part("purpose", axum_test::multipart::Part::text("batch"));
+        let personal_upload_resp = app
+            .post("/ai/v1/files")
+            .multipart(personal_multipart)
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+        personal_upload_resp.assert_status(StatusCode::CREATED);
+        let personal_file: serde_json::Value = personal_upload_resp.json();
+        let personal_file_id = personal_file["id"].as_str().unwrap();
+
+        let personal_batch_req = CreateBatchRequest {
+            input_file_id: personal_file_id.to_string(),
+            endpoint: "/v1/chat/completions".to_string(),
+            completion_window: "24h".to_string(),
+            metadata: None,
+        };
+        let personal_create_resp = app
+            .post("/ai/v1/batches")
+            .json(&personal_batch_req)
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+        personal_create_resp.assert_status(StatusCode::CREATED);
+
+        // List outside org context → personal batch should also have enrichment
+        // (enrichment is always applied since authorization already controls visibility)
+        let list_resp_personal = app
+            .get("/ai/v1/batches")
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+        list_resp_personal.assert_status_ok();
+        let list_body_personal: serde_json::Value = list_resp_personal.json();
+        let personal_batches = list_body_personal["data"].as_array().unwrap();
+        assert!(!personal_batches.is_empty(), "Expected at least one personal batch");
+        for batch in personal_batches {
+            let meta = batch["metadata"].as_object().expect("metadata should exist");
+            assert!(
+                meta.contains_key("created_by_email"),
+                "created_by_email should be present even in personal context"
+            );
+            assert!(
+                meta.contains_key("context_name"),
+                "context_name should be present even in personal context"
+            );
+            assert_eq!(
+                meta.get("context_type").and_then(|v| v.as_str()),
+                Some("personal"),
+                "personal batch should have context_type=personal"
+            );
+        }
     }
 }
