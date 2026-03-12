@@ -1,5 +1,32 @@
 # Changelog
 
+## [8.19.2](https://github.com/doublewordai/control-layer/compare/v8.19.1...v8.19.2) (2026-03-12)
+
+
+### Bug Fixes
+
+* allow emoty string cookie domain, which is transformed to none ([#873](https://github.com/doublewordai/control-layer/issues/873)) ([599606d](https://github.com/doublewordai/control-layer/commit/599606d876026817c5ee82ab9d5729288aaaaa68))
+
+## [8.19.1](https://github.com/doublewordai/control-layer/compare/v8.19.0...v8.19.1) (2026-03-12)
+
+
+### Bug Fixes
+
+* optional domain for active org cookie ([#868](https://github.com/doublewordai/control-layer/issues/868)) ([36dd297](https://github.com/doublewordai/control-layer/commit/36dd297f346a351a339081d0ae68305775ed476e))
+
+## [8.19.0](https://github.com/doublewordai/control-layer/compare/v8.18.1...v8.19.0) (2026-03-12)
+
+
+### Features
+
+* add trace_id to http_analytics ([#865](https://github.com/doublewordai/control-layer/issues/865)) ([fb56e2f](https://github.com/doublewordai/control-layer/commit/fb56e2fe8454045578874d7feff6532c204e678b))
+* org-scoped batch/file filtering with metadata enrichment ([#839](https://github.com/doublewordai/control-layer/issues/839)) ([000fcef](https://github.com/doublewordai/control-layer/commit/000fcef23d353c29122722d0a99a1d51d46f17bf))
+
+
+### Bug Fixes
+
+* Split timeouts ([#833](https://github.com/doublewordai/control-layer/issues/833)) ([7b5d78f](https://github.com/doublewordai/control-layer/commit/7b5d78f5e5c752c2fd92d89cfe9c719a3570b41e))
+
 ## [8.18.1](https://github.com/doublewordai/control-layer/compare/v8.18.0...v8.18.1) (2026-03-11)
 
 

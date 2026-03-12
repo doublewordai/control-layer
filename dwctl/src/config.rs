@@ -659,6 +659,8 @@ pub struct SessionConfig {
     pub cookie_secure: bool,
     /// SameSite cookie attribute ("strict", "lax", or "none")
     pub cookie_same_site: String,
+    /// Optional Domain attribute for cookies (e.g. ".doubleword.ai" for cross-subdomain)
+    pub cookie_domain: Option<String>,
 }
 
 /// Password validation rules.
@@ -1054,7 +1056,7 @@ pub struct DaemonConfig {
     pub max_backoff_ms: u64,
 
     /// Deprecated: use first_chunk_timeout_ms, chunk_timeout_ms, and body_timeout_ms instead.
-    /// If set, applies the same value uniformly to all three granular timeouts.
+    /// If set, splits into 90% first_chunk_timeout_ms and 10% body_timeout_ms.
     /// Ignored when the granular timeout fields are explicitly set.
     pub timeout_ms: Option<u64>,
 
@@ -1173,10 +1175,7 @@ impl DaemonConfig {
         model_capacity_limits: Option<std::sync::Arc<dashmap::DashMap<String, usize>>>,
     ) -> fusillade::daemon::DaemonConfig {
         // If the deprecated timeout_ms is set and the granular fields are at their
-        // defaults, apply it uniformly to all three granular timeouts. This is
-        // conservative: existing deployments using e.g. timeout_ms=600000 keep
-        // the same 10-minute budget for every phase instead of getting a
-        // surprising 60-second body_timeout_ms from a 90/10 split.
+        // defaults, split it: 90% header (connect + TTFT), 10% body.
         let (first_chunk_timeout_ms, chunk_timeout_ms, body_timeout_ms) = if let Some(timeout) = self.timeout_ms {
             if self.first_chunk_timeout_ms == 86_400_000 && self.chunk_timeout_ms == 86_400_000 && self.body_timeout_ms == 86_400_000 {
                 tracing::warn!(
@@ -1184,7 +1183,7 @@ impl DaemonConfig {
                     "batch_daemon.timeout_ms is deprecated; \
                          use first_chunk_timeout_ms, chunk_timeout_ms, and body_timeout_ms instead"
                 );
-                (timeout, timeout, timeout)
+                (timeout * 9 / 10, 86_400_000, timeout / 10)
             } else {
                 // Granular fields were explicitly set — ignore deprecated field
                 (self.first_chunk_timeout_ms, self.chunk_timeout_ms, self.body_timeout_ms)
@@ -1582,6 +1581,7 @@ impl Default for SessionConfig {
             cookie_name: "dwctl_session".to_string(),
             cookie_secure: true,
             cookie_same_site: "strict".to_string(),
+            cookie_domain: None,
         }
     }
 }
@@ -1690,6 +1690,11 @@ impl Config {
             }
         }
 
+        // Normalize empty cookie_domain to None (allows env var override with "" to clear it)
+        if config.auth.native.session.cookie_domain.as_deref() == Some("") {
+            config.auth.native.session.cookie_domain = None;
+        }
+
         config.validate().map_err(|e| figment::Error::from(e.to_string()))?;
         Ok(config)
     }
@@ -1751,6 +1756,26 @@ impl Config {
                     "Config validation: No authentication methods are enabled. Please enable either native or proxy_header authentication."
                         .to_string(),
             });
+        }
+
+        // Validate cookie_domain if set — must produce a valid Set-Cookie header fragment
+        if let Some(ref domain) = self.auth.native.session.cookie_domain {
+            let invalid = domain.is_empty() || domain.chars().any(|c| c.is_whitespace() || c.is_control()) || domain.contains(';');
+            if invalid {
+                return Err(Error::Internal {
+                    operation: format!(
+                        "Config validation: Invalid cookie_domain '{domain}'. \
+                         Must not be empty or contain semicolons, whitespace, or control characters."
+                    ),
+                });
+            }
+            // Verify the resulting fragment is a valid HTTP header value
+            let fragment = format!("; Domain={domain}");
+            if axum::http::HeaderValue::from_str(&fragment).is_err() {
+                return Err(Error::Internal {
+                    operation: format!("Config validation: cookie_domain '{domain}' produces an invalid HTTP header value."),
+                });
+            }
         }
 
         // Validate CORS configuration
@@ -2659,6 +2684,35 @@ batches:
             // No relaxation_factors key — all windows default to 1.0
             assert_eq!(config.batches.relaxation_factor("1h"), 1.0);
             assert_eq!(config.batches.relaxation_factor("24h"), 1.0);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_empty_cookie_domain_env_override_normalized_to_none() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+auth:
+  native:
+    session:
+      cookie_domain: ".doubleword.ai"
+"#,
+            )?;
+
+            // Staging overrides cookie_domain with empty string to clear it
+            jail.set_env("DWCTL_AUTH__NATIVE__SESSION__COOKIE_DOMAIN", "");
+
+            let args = Args {
+                config: "test.yaml".to_string(),
+                validate: false,
+            };
+
+            let config = Config::load(&args)?;
+            assert_eq!(config.auth.native.session.cookie_domain, None);
+
             Ok(())
         });
     }
