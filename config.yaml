@@ -353,7 +353,7 @@ background_services:
     max_backoff_ms: 10000 # Maximum backoff duration in milliseconds
 
     # Timeout Settings
-    # timeout_ms: 600000 # DEPRECATED: applies uniformly to all three granular timeouts below
+    # timeout_ms: 600000 # DEPRECATED: splits into 90% first_chunk_timeout_ms, 10% body_timeout_ms
     first_chunk_timeout_ms: 86400000 # Max time waiting for response headers (24 hours)
     chunk_timeout_ms: 86400000 # Max idle time between response body chunks (24 hours)
     body_timeout_ms: 86400000 # Max total time for entire response body (24 hours)

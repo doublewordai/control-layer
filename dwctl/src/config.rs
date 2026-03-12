@@ -1054,7 +1054,7 @@ pub struct DaemonConfig {
     pub max_backoff_ms: u64,
 
     /// Deprecated: use first_chunk_timeout_ms, chunk_timeout_ms, and body_timeout_ms instead.
-    /// If set, applies the same value uniformly to all three granular timeouts.
+    /// If set, splits into 90% first_chunk_timeout_ms and 10% body_timeout_ms.
     /// Ignored when the granular timeout fields are explicitly set.
     pub timeout_ms: Option<u64>,
 
@@ -1173,10 +1173,7 @@ impl DaemonConfig {
         model_capacity_limits: Option<std::sync::Arc<dashmap::DashMap<String, usize>>>,
     ) -> fusillade::daemon::DaemonConfig {
         // If the deprecated timeout_ms is set and the granular fields are at their
-        // defaults, apply it uniformly to all three granular timeouts. This is
-        // conservative: existing deployments using e.g. timeout_ms=600000 keep
-        // the same 10-minute budget for every phase instead of getting a
-        // surprising 60-second body_timeout_ms from a 90/10 split.
+        // defaults, split it: 90% header (connect + TTFT), 10% body.
         let (first_chunk_timeout_ms, chunk_timeout_ms, body_timeout_ms) = if let Some(timeout) = self.timeout_ms {
             if self.first_chunk_timeout_ms == 86_400_000 && self.chunk_timeout_ms == 86_400_000 && self.body_timeout_ms == 86_400_000 {
                 tracing::warn!(
@@ -1184,7 +1181,7 @@ impl DaemonConfig {
                     "batch_daemon.timeout_ms is deprecated; \
                          use first_chunk_timeout_ms, chunk_timeout_ms, and body_timeout_ms instead"
                 );
-                (timeout, timeout, timeout)
+                (timeout * 9 / 10, 86_400_000, timeout / 10)
             } else {
                 // Granular fields were explicitly set — ignore deprecated field
                 (self.first_chunk_timeout_ms, self.chunk_timeout_ms, self.body_timeout_ms)
