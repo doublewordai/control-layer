@@ -1753,16 +1753,22 @@ impl Config {
             });
         }
 
-        // Validate cookie_domain if set
+        // Validate cookie_domain if set — must produce a valid Set-Cookie header fragment
         if let Some(ref domain) = self.auth.native.session.cookie_domain {
-            let invalid =
-                domain.is_empty() || domain.contains(';') || domain.contains('\r') || domain.contains('\n') || domain.contains(' ');
+            let invalid = domain.is_empty() || domain.chars().any(|c| c.is_whitespace() || c.is_control()) || domain.contains(';');
             if invalid {
                 return Err(Error::Internal {
                     operation: format!(
                         "Config validation: Invalid cookie_domain '{domain}'. \
                          Must not be empty or contain semicolons, whitespace, or control characters."
                     ),
+                });
+            }
+            // Verify the resulting fragment is a valid HTTP header value
+            let fragment = format!("; Domain={domain}");
+            if axum::http::HeaderValue::from_str(&fragment).is_err() {
+                return Err(Error::Internal {
+                    operation: format!("Config validation: cookie_domain '{domain}' produces an invalid HTTP header value."),
                 });
             }
         }
