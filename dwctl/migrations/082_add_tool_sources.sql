@@ -4,12 +4,12 @@
 CREATE TABLE tool_sources (
     id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     kind           TEXT NOT NULL DEFAULT 'http',
-    name           TEXT NOT NULL,
+    name           TEXT NOT NULL UNIQUE,
     description    TEXT,
     parameters     JSONB,
     url            TEXT NOT NULL,
     api_key        TEXT,
-    timeout_secs   INT NOT NULL DEFAULT 30,
+    timeout_secs   INT NOT NULL DEFAULT 30 CHECK (timeout_secs > 0),
     created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -60,16 +60,3 @@ CREATE TRIGGER tool_sources_updated_at
     BEFORE UPDATE ON tool_sources
     FOR EACH ROW
     EXECUTE FUNCTION update_updated_at_column();
-
--- LISTEN/NOTIFY triggers so the onwards cache picks up tool source changes.
-CREATE TRIGGER tool_sources_notify
-    AFTER INSERT OR UPDATE OR DELETE ON tool_sources
-    EXECUTE FUNCTION notify_config_change();
-
-CREATE TRIGGER deployment_tool_sources_notify
-    AFTER INSERT OR DELETE ON deployment_tool_sources
-    EXECUTE FUNCTION notify_config_change();
-
-CREATE TRIGGER group_tool_sources_notify
-    AFTER INSERT OR DELETE ON group_tool_sources
-    EXECUTE FUNCTION notify_config_change();

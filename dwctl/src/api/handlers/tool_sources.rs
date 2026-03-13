@@ -74,7 +74,7 @@ pub async fn list_tool_sources<P: PoolProvider>(
     summary = "Create tool source",
     request_body = ToolSourceCreate,
     responses(
-        (status = 200, description = "Tool source created", body = ToolSourceResponse),
+        (status = 201, description = "Tool source created", body = ToolSourceResponse),
         (status = 400, description = "Bad request"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden"),
@@ -92,7 +92,7 @@ pub async fn create_tool_source<P: PoolProvider>(
     State(state): State<AppState<P>>,
     _: RequiresPermission<resource::ToolSources, operation::CreateAll>,
     Json(body): Json<ToolSourceCreate>,
-) -> Result<Json<ToolSourceResponse>> {
+) -> Result<(StatusCode, Json<ToolSourceResponse>)> {
     if let Some(ref params) = body.parameters {
         validate_parameters(params)?;
     }
@@ -117,7 +117,7 @@ pub async fn create_tool_source<P: PoolProvider>(
     };
 
     let source = repo.create(&request).await?;
-    Ok(Json(ToolSourceResponse::from(source)))
+    Ok((StatusCode::CREATED, Json(ToolSourceResponse::from(source))))
 }
 
 #[utoipa::path(
