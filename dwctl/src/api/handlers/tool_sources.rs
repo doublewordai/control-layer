@@ -191,12 +191,12 @@ pub async fn update_tool_source<P: PoolProvider>(
         validate_parameters(params)?;
     }
 
-    if let Some(timeout) = body.timeout_secs {
-        if timeout <= 0 {
-            return Err(Error::BadRequest {
-                message: "timeout_secs must be positive".to_string(),
-            });
-        }
+    if let Some(timeout) = body.timeout_secs
+        && timeout <= 0
+    {
+        return Err(Error::BadRequest {
+            message: "timeout_secs must be positive".to_string(),
+        });
     }
 
     let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;

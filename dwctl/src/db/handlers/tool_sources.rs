@@ -263,6 +263,7 @@ impl<'c> ToolSources<'c> {
     }
 
     /// Record a tool_call_analytics row.
+    #[allow(clippy::too_many_arguments)]
     #[instrument(skip(self), err)]
     pub async fn record_tool_call(
         &mut self,
