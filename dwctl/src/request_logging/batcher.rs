@@ -407,7 +407,9 @@ where
 
         // Cache parsed tariff windows by (model_alias, purpose, pricing_timestamp) to avoid
         // re-parsing humantime durations for every record sharing the same model+purpose+batch.
-        let mut windows_cache: HashMap<(String, String, i64), Vec<(String, chrono::Duration)>> = HashMap::new();
+        type WindowsCacheKey = (String, String, DateTime<Utc>);
+        type ParsedWindows = Vec<(String, chrono::Duration)>;
+        let mut windows_cache: HashMap<WindowsCacheKey, ParsedWindows> = HashMap::new();
 
         // Enrich each record
         let mut enriched = Vec::with_capacity(buffer.len());
@@ -450,7 +452,7 @@ where
                         // Cache parsed tariff windows by (model, purpose, pricing_timestamp)
                         // to avoid re-parsing humantime durations for every record in the same batch
                         let purpose = api_key_purpose.as_ref().unwrap_or(&ApiKeyPurpose::Realtime);
-                        let cache_key = (model_alias.clone(), format!("{:?}", purpose), pricing_timestamp.timestamp());
+                        let cache_key = (model_alias.clone(), format!("{:?}", purpose), pricing_timestamp);
                         let sorted_windows = windows_cache
                             .entry(cache_key)
                             .or_insert_with(|| parse_tariff_windows(&model_info.tariffs, purpose, pricing_timestamp));
