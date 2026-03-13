@@ -405,6 +405,10 @@ where
             HashMap::new()
         };
 
+        // Cache parsed tariff windows by (model_alias, purpose, pricing_timestamp) to avoid
+        // re-parsing humantime durations for every record sharing the same model+purpose+batch.
+        let mut windows_cache: HashMap<(String, String, i64), Vec<(String, chrono::Duration)>> = HashMap::new();
+
         // Enrich each record
         let mut enriched = Vec::with_capacity(buffer.len());
         for raw in buffer.iter().cloned() {
@@ -435,21 +439,29 @@ where
                     // This ensures batch requests are priced as of batch creation, not processing time
                     let pricing_timestamp = raw.batch_created_at.unwrap_or(raw.timestamp);
 
-                    // Pre-parse tariff windows for this model+purpose (avoids re-parsing per record
-                    // when many records in a flush share the same model)
+                    // Actual request completion time = request start + duration
+                    let completed_at = raw.timestamp + chrono::Duration::milliseconds(raw.duration_ms);
+
+                    // Cache parsed tariff windows by (model, purpose, pricing_timestamp) to avoid
+                    // re-parsing humantime durations for every record in the same batch
                     let purpose = api_key_purpose.as_ref().unwrap_or(&ApiKeyPurpose::Realtime);
-                    let sorted_windows = parse_tariff_windows(&model_info.tariffs, purpose, pricing_timestamp);
+                    let cache_key = (model_alias.clone(), format!("{:?}", purpose), pricing_timestamp.timestamp());
+                    let sorted_windows = windows_cache
+                        .entry(cache_key)
+                        .or_insert_with(|| parse_tariff_windows(&model_info.tariffs, purpose, pricing_timestamp));
 
                     // For batch requests, apply SLA waterfall: if a request completed after its
-                    // submitted SLA window, charge at the next tier down. If it exceeded all
-                    // configured windows, it's free. Billing only goes down, never up.
+                    // submitted SLA window, it falls through to the next larger (cheaper) tier.
+                    // If it exceeded all configured windows, it's free.
+                    // Tiers only move toward longer windows (costs only decrease, never increase).
                     let (effective_window, effective_sla) = resolve_effective_batch_sla(
                         &model_info.tariffs,
                         api_key_purpose.as_ref(),
                         raw.batch_completion_window.as_deref(),
                         raw.batch_created_at,
-                        raw.timestamp,
-                        Some(&sorted_windows),
+                        completed_at,
+                        pricing_timestamp,
+                        Some(sorted_windows),
                     );
 
                     // Find best matching tariff using the effective (possibly downgraded) window
@@ -1114,25 +1126,31 @@ fn parse_tariff_windows(
 /// Determine the effective SLA tier for a batch request based on actual completion time.
 ///
 /// Implements a billing waterfall: if a request completed after its submitted SLA
-/// window, it falls through to the next cheaper tier. If it exceeded all configured
-/// windows, it's free. Billing only goes down, never up.
+/// window, it falls through to the next longer (cheaper) tier. Tariff prices decrease
+/// as the completion window gets longer (e.g. 1h costs more than 24h), so the waterfall
+/// only ever moves toward cheaper pricing, never more expensive. If the request exceeded
+/// all configured windows, it's free.
+///
+/// The elapsed time is measured from batch creation (`batch_created_at`) to request
+/// completion (`completed_at`), not from when the individual request was picked up.
 ///
 /// Returns (effective_completion_window, effective_sla_label):
 /// - Insufficient batch metadata (missing window or created_at): passthrough —
 ///   returns the submitted window as both the effective window and label.
-///   The label may be non-empty without waterfall logic being applied.
 /// - Within submitted window: (submitted window, submitted window) e.g. ("1h", "1h")
 /// - Fell through to cheaper tier: (cheaper window, cheaper window) e.g. ("24h", "24h")
 /// - Exceeded all windows: (None, "free")
 ///
-/// If `sorted_windows` is provided, uses them directly (avoids re-parsing per record).
-/// Otherwise, falls back to parsing from `tariffs`.
+/// `pricing_timestamp` controls which tariffs are considered valid (typically
+/// `batch_created_at`). If `sorted_windows` is provided, uses them directly
+/// (avoids re-parsing per record). Otherwise, falls back to parsing from `tariffs`.
 fn resolve_effective_batch_sla(
     tariffs: &[TariffInfo],
     api_key_purpose: Option<&ApiKeyPurpose>,
     submitted_window: Option<&str>,
     batch_created_at: Option<DateTime<Utc>>,
     completed_at: DateTime<Utc>,
+    pricing_timestamp: DateTime<Utc>,
     sorted_windows: Option<&[(String, chrono::Duration)]>,
 ) -> (Option<String>, String) {
     // Only apply waterfall to batch requests with a known submission window and creation time
@@ -1145,12 +1163,14 @@ fn resolve_effective_batch_sla(
 
     let purpose = api_key_purpose.unwrap_or(&ApiKeyPurpose::Realtime);
 
-    // Use pre-parsed windows if available, otherwise parse from tariffs
+    // Use pre-parsed windows if available, otherwise parse from tariffs.
+    // Uses pricing_timestamp (batch_created_at) to filter valid tariffs, ensuring
+    // the SLA tiers match the tariffs active when the batch was created.
     let owned_windows;
     let windows = match sorted_windows {
         Some(w) => w,
         None => {
-            owned_windows = parse_tariff_windows(tariffs, purpose, completed_at);
+            owned_windows = parse_tariff_windows(tariffs, purpose, pricing_timestamp);
             &owned_windows
         }
     };
@@ -1164,7 +1184,7 @@ fn resolve_effective_batch_sla(
 
     let elapsed = completed_at - created_at;
 
-    // Walk from the submitted window onwards (same or larger windows only — billing only goes down)
+    // Walk from the submitted window toward longer (cheaper) windows only — costs only decrease
     for (cw, dur) in &windows[submitted_idx..] {
         if elapsed <= *dur {
             return (Some(cw.clone()), cw.clone());
@@ -1570,12 +1590,14 @@ mod tests {
         batch_created_at: Option<DateTime<Utc>>,
         completed_at: DateTime<Utc>,
     ) -> (Option<String>, String) {
+        let pricing_timestamp = batch_created_at.unwrap_or(completed_at);
         resolve_effective_batch_sla(
             tariffs,
             api_key_purpose,
             submitted_window,
             batch_created_at,
             completed_at,
+            pricing_timestamp,
             None, // let the function parse windows from tariffs
         )
     }
@@ -1669,7 +1691,7 @@ mod tests {
 
     #[test]
     fn test_sla_waterfall_24h_submission_completed_fast_stays_24h() {
-        // Request submitted at 24h, completed in 20min → still charge at 24h (billing only goes down)
+        // Request submitted at 24h, completed in 20min → still charge at 24h (costs only decrease)
         let created = Utc::now() - chrono::Duration::hours(1);
         let completed = created + chrono::Duration::minutes(20);
         let tariffs = vec![

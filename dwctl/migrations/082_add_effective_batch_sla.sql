@@ -1,3 +1,4 @@
+-- no-transaction
 -- Add effective_batch_sla to track the actual SLA tier a batch request was charged at.
 --
 -- When a request submitted at a higher SLA (e.g. "1h") completes after that window,
