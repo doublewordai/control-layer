@@ -115,10 +115,12 @@ pub struct HttpAnalyticsRow {
     /// Empty string for non-batch requests or when not provided.
     pub batch_request_source: String,
     /// The SLA window the batch request was charged at after waterfall resolution.
-    /// Only populated for batch requests (has batch_completion_window); "" otherwise.
+    ///
     /// Values: completion_window string (e.g. "1h", "24h"),
     ///         "free" if the request exceeded all configured windows,
-    ///         or "" for non-batch requests.
+    ///         or "" for non-batch requests, or for batch requests where an
+    ///         effective SLA could not be determined (e.g., missing/unknown
+    ///         model alias).
     pub effective_batch_sla: String,
 }
 
