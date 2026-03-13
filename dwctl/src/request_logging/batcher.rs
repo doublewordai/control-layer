@@ -460,7 +460,7 @@ where
                         // Apply SLA waterfall: if a request completed after its submitted SLA
                         // window, it falls through to the next longer (cheaper) tier.
                         // If it exceeded all configured windows, it's free.
-                        // Tiers only move toward longer windows (costs only decrease, never increase).
+                        // Tiers only move toward longer windows — e.g. 1h → 24h → free.
                         resolve_effective_batch_sla(
                             &model_info.tariffs,
                             api_key_purpose.as_ref(),
@@ -489,7 +489,17 @@ where
                             pricing_timestamp,
                         )
                     };
-                    (Some(model_info.provider_name.clone()), input, output, effective_sla)
+
+                    // Only record effective_batch_sla when a tariff was actually matched
+                    // (or waterfall resolved to "free"). If no tariff matched, blank it
+                    // so the column reflects what was actually applied for pricing.
+                    let final_sla = if effective_sla == "free" || input.is_some() || output.is_some() {
+                        effective_sla
+                    } else {
+                        String::new()
+                    };
+
+                    (Some(model_info.provider_name.clone()), input, output, final_sla)
                 } else {
                     (None, None, None, String::new())
                 }
@@ -1224,7 +1234,7 @@ fn resolve_effective_batch_sla(
 
     let elapsed = completed_at - created_at;
 
-    // Walk from the submitted window toward longer (cheaper) windows only — costs only decrease
+    // Walk from the submitted window toward longer (cheaper) windows — e.g. 1h → 24h → free
     for (cw, dur) in &windows[submitted_idx..] {
         if elapsed <= *dur {
             return (Some(cw.clone()), cw.clone());

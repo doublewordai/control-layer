@@ -2169,10 +2169,6 @@ impl Application {
         (server, self.bg_services)
     }
 
-    /// Convert application into a test server with HTTP transport (binds a real TCP port).
-    ///
-    /// Use this when external clients (e.g. fusillade batch daemon) need to make real HTTP
-    /// requests to the test server. Call `server.server_address()` to get the bound address.
     /// Start serving the application
     pub async fn serve<F>(mut self, shutdown: F) -> anyhow::Result<()>
     where

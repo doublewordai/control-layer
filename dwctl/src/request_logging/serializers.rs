@@ -114,9 +114,12 @@ pub struct HttpAnalyticsRow {
     /// The request_source from batch metadata (e.g., "api", "frontend").
     /// Empty string for non-batch requests or when not provided.
     pub batch_request_source: String,
-    /// The effective SLA tier actually charged after waterfall logic.
-    /// May differ from `batch_sla` when a request completed after its submitted window.
-    /// Values: completion_window string (e.g. "1h", "24h"), "free", or "" for non-batch.
+    /// The SLA tier used for pricing after waterfall resolution.
+    /// Derived from the tariff actually matched: if no batch tariff was found,
+    /// this is empty regardless of what the waterfall resolved.
+    /// Values: completion_window of the matched tariff (e.g. "1h", "24h"),
+    ///         "free" if the request exceeded all configured windows,
+    ///         or "" for non-batch requests / when no tariff matched.
     pub effective_batch_sla: String,
 }
 
