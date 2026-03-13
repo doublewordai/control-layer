@@ -7,10 +7,7 @@ use crate::auth::permissions::{RequiresPermission, operation, resource};
 use crate::db::handlers::ToolSources;
 use crate::db::models::tool_sources::{ToolSourceCreateDBRequest, ToolSourceUpdateDBRequest};
 use crate::errors::{Error, Result};
-use crate::{
-    AppState,
-    types::DeploymentId,
-};
+use crate::{AppState, types::DeploymentId};
 use axum::{
     Json,
     extract::{Path, State},
@@ -150,10 +147,10 @@ pub async fn get_tool_source<P: PoolProvider>(
     let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut repo = ToolSources::new(&mut conn);
 
-    let source = repo
-        .get_by_id(id)
-        .await?
-        .ok_or_else(|| Error::NotFound { resource: "ToolSource".to_string(), id: id.to_string() })?;
+    let source = repo.get_by_id(id).await?.ok_or_else(|| Error::NotFound {
+        resource: "ToolSource".to_string(),
+        id: id.to_string(),
+    })?;
 
     Ok(Json(ToolSourceResponse::from(source)))
 }
@@ -252,7 +249,10 @@ pub async fn delete_tool_source<P: PoolProvider>(
     if deleted {
         Ok(StatusCode::NO_CONTENT)
     } else {
-        Err(Error::NotFound { resource: "ToolSource".to_string(), id: id.to_string() })
+        Err(Error::NotFound {
+            resource: "ToolSource".to_string(),
+            id: id.to_string(),
+        })
     }
 }
 

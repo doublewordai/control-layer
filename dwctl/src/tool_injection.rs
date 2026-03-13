@@ -16,13 +16,7 @@
 //! than `/v1/responses`.
 
 use crate::tool_executor::{ResolvedToolSet, ResolvedTools, ToolDefinition};
-use axum::{
-    body::Body,
-    extract::State,
-    http::Request,
-    middleware::Next,
-    response::Response,
-};
+use axum::{body::Body, extract::State, http::Request, middleware::Next, response::Response};
 use serde_json::Value;
 use sqlx::PgPool;
 use std::collections::HashMap;
@@ -39,11 +33,7 @@ pub struct ToolInjectionState {
 ///
 /// Resolves the effective tool set from the database and inserts it into the
 /// request extensions as [`ResolvedTools`].
-pub async fn tool_injection_middleware(
-    State(state): State<ToolInjectionState>,
-    mut request: Request<Body>,
-    next: Next,
-) -> Response {
+pub async fn tool_injection_middleware(State(state): State<ToolInjectionState>, mut request: Request<Body>, next: Next) -> Response {
     // Only act on the Responses API path.
     if !is_responses_path(request.uri().path()) {
         return next.run(request).await;
@@ -72,13 +62,8 @@ pub async fn tool_injection_middleware(
     // Resolve deployment and group tool sets from the DB.
     match resolve_tools_for_request(&state.db, &bearer_token, model_alias.as_deref()).await {
         Ok(Some(resolved)) if !resolved.is_empty() => {
-            debug!(
-                tool_count = resolved.tools.len(),
-                "Resolved server-side tools for request"
-            );
-            request
-                .extensions_mut()
-                .insert(ResolvedTools(Arc::new(resolved)));
+            debug!(tool_count = resolved.tools.len(), "Resolved server-side tools for request");
+            request.extensions_mut().insert(ResolvedTools(Arc::new(resolved)));
         }
         Ok(_) => {
             debug!("No server-side tools for this request");
@@ -102,11 +87,7 @@ fn is_responses_path(path: &str) -> bool {
 
 /// Extract the Bearer token from the request, case-insensitive.
 fn extract_bearer_token(request: &Request<Body>) -> Option<String> {
-    let auth = request
-        .headers()
-        .get(axum::http::header::AUTHORIZATION)?
-        .to_str()
-        .ok()?;
+    let auth = request.headers().get(axum::http::header::AUTHORIZATION)?.to_str().ok()?;
     let auth = auth.trim();
     if auth.len() > 7 && auth[..7].eq_ignore_ascii_case("bearer ") {
         Some(auth[7..].to_string())
@@ -118,11 +99,7 @@ fn extract_bearer_token(request: &Request<Body>) -> Option<String> {
 /// Resolve the effective tool set for a request identified by its API key secret and model alias.
 ///
 /// Returns `None` if no tools are configured for this deployment/group combination.
-async fn resolve_tools_for_request(
-    db: &PgPool,
-    bearer_token: &str,
-    model_alias: Option<&str>,
-) -> anyhow::Result<Option<ResolvedToolSet>> {
+async fn resolve_tools_for_request(db: &PgPool, bearer_token: &str, model_alias: Option<&str>) -> anyhow::Result<Option<ResolvedToolSet>> {
     let rows = sqlx::query!(
         r#"
         SELECT DISTINCT

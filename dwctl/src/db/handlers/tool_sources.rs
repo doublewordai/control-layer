@@ -241,11 +241,7 @@ impl<'c> ToolSources<'c> {
     /// Returns tool sources that appear in BOTH the deployment's tool set AND the group's tool set.
     /// If the deployment has no tools attached the result is empty (no tools authorised).
     #[instrument(skip(self), fields(deployment_id = %deployment_id, group_id = %group_id), err)]
-    pub async fn resolve_effective_tools(
-        &mut self,
-        deployment_id: Uuid,
-        group_id: Uuid,
-    ) -> Result<Vec<ToolSourceDBResponse>> {
+    pub async fn resolve_effective_tools(&mut self, deployment_id: Uuid, group_id: Uuid) -> Result<Vec<ToolSourceDBResponse>> {
         let rows = sqlx::query_as!(
             ToolSourceRow,
             r#"

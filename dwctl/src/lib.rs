@@ -2158,10 +2158,7 @@ impl Application {
 
         // Create the HTTP tool executor.
         let reqwest_client = reqwest::Client::new();
-        let tool_executor = crate::tool_executor::HttpToolExecutor::new(
-            reqwest_client,
-            Some(Arc::new(db_pools.write().clone())),
-        );
+        let tool_executor = crate::tool_executor::HttpToolExecutor::new(reqwest_client, Some(Arc::new(db_pools.write().clone())));
 
         // Build onwards router from targets with body transform, response sanitization, and tool executor.
         let onwards_app_state = onwards::AppState::with_transform(bg_services.onwards_targets.clone(), body_transform)

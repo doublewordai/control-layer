@@ -17,7 +17,7 @@ use sqlx::PgPool;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
-use tracing::{debug, info_span, instrument, Instrument};
+use tracing::{Instrument, debug, info_span, instrument};
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -47,10 +47,7 @@ pub struct ResolvedToolSet {
 }
 
 impl ResolvedToolSet {
-    pub fn new(
-        tools: HashMap<String, ToolDefinition>,
-        metadata: HashMap<String, (Option<String>, Option<Value>)>,
-    ) -> Self {
+    pub fn new(tools: HashMap<String, ToolDefinition>, metadata: HashMap<String, (Option<String>, Option<Value>)>) -> Self {
         Self { tools, metadata }
     }
 
@@ -125,18 +122,17 @@ impl ToolExecutor for HttpToolExecutor {
     }
 
     #[instrument(skip(self, arguments, ctx), fields(tool.name = %tool_name), err)]
-    async fn execute(
-        &self,
-        tool_name: &str,
-        _tool_call_id: &str,
-        arguments: &Value,
-        ctx: &RequestContext,
-    ) -> Result<Value, ToolError> {
-        let resolved = ctx.extensions.get::<ResolvedTools>().ok_or_else(|| {
-            ToolError::ExecutionError("no tool set available for this request".to_string())
-        })?;
+    async fn execute(&self, tool_name: &str, _tool_call_id: &str, arguments: &Value, ctx: &RequestContext) -> Result<Value, ToolError> {
+        let resolved = ctx
+            .extensions
+            .get::<ResolvedTools>()
+            .ok_or_else(|| ToolError::ExecutionError("no tool set available for this request".to_string()))?;
 
-        let definition = resolved.0.tools.get(tool_name).ok_or_else(|| ToolError::NotFound(tool_name.to_string()))?;
+        let definition = resolved
+            .0
+            .tools
+            .get(tool_name)
+            .ok_or_else(|| ToolError::NotFound(tool_name.to_string()))?;
 
         let started_at = Utc::now();
         let wall_start = Instant::now();
@@ -246,11 +242,7 @@ mod tests {
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    fn make_executor_and_ctx(
-        tool_name: &str,
-        server_url: &str,
-        api_key: Option<String>,
-    ) -> (HttpToolExecutor, RequestContext) {
+    fn make_executor_and_ctx(tool_name: &str, server_url: &str, api_key: Option<String>) -> (HttpToolExecutor, RequestContext) {
         let client = reqwest::Client::new();
         let executor = HttpToolExecutor::new(client, None);
 
@@ -265,8 +257,7 @@ mod tests {
             },
         );
         let resolved = ResolvedToolSet::new(tools, HashMap::new());
-        let ctx = RequestContext::new()
-            .with_extension(ResolvedTools(Arc::new(resolved)));
+        let ctx = RequestContext::new().with_extension(ResolvedTools(Arc::new(resolved)));
 
         (executor, ctx)
     }
@@ -365,8 +356,7 @@ mod tests {
         let mut metadata = HashMap::new();
         metadata.insert("my_tool".to_string(), (Some("Does stuff".to_string()), None));
         let resolved = ResolvedToolSet::new(tools, metadata);
-        let ctx = RequestContext::new()
-            .with_extension(ResolvedTools(Arc::new(resolved)));
+        let ctx = RequestContext::new().with_extension(ResolvedTools(Arc::new(resolved)));
 
         let schemas = executor.tools(&ctx).await;
         assert_eq!(schemas.len(), 1);
