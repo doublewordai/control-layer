@@ -114,6 +114,10 @@ pub struct HttpAnalyticsRow {
     /// The request_source from batch metadata (e.g., "api", "frontend").
     /// Empty string for non-batch requests or when not provided.
     pub batch_request_source: String,
+    /// The effective SLA tier actually charged after waterfall logic.
+    /// May differ from `batch_sla` when a request completed after its submitted window.
+    /// Values: completion_window string (e.g. "1h", "24h"), "free", or "" for non-batch.
+    pub effective_batch_sla: String,
 }
 
 /// Usage metrics extracted from AI responses (subset of HttpAnalyticsRow)

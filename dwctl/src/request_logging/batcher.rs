@@ -435,16 +435,21 @@ where
                     // This ensures batch requests are priced as of batch creation, not processing time
                     let pricing_timestamp = raw.batch_created_at.unwrap_or(raw.timestamp);
 
+                    // Pre-parse tariff windows for this model+purpose (avoids re-parsing per record
+                    // when many records in a flush share the same model)
+                    let purpose = api_key_purpose.as_ref().unwrap_or(&ApiKeyPurpose::Realtime);
+                    let sorted_windows = parse_tariff_windows(&model_info.tariffs, purpose, pricing_timestamp);
+
                     // For batch requests, apply SLA waterfall: if a request completed after its
                     // submitted SLA window, charge at the next tier down. If it exceeded all
                     // configured windows, it's free. Billing only goes down, never up.
-                    let (effective_window, effective_sla) = self.resolve_effective_batch_sla(
+                    let (effective_window, effective_sla) = resolve_effective_batch_sla(
                         &model_info.tariffs,
                         api_key_purpose.as_ref(),
                         raw.batch_completion_window.as_deref(),
                         raw.batch_created_at,
                         raw.timestamp,
-                        pricing_timestamp,
+                        Some(&sorted_windows),
                     );
 
                     // Find best matching tariff using the effective (possibly downgraded) window
@@ -588,76 +593,6 @@ where
 
         trace!(count = map.len(), "Batch lookup models completed");
         Ok(map)
-    }
-
-    /// Determine the effective SLA tier for a batch request based on actual completion time.
-    ///
-    /// Implements a billing waterfall: if a request completed after its submitted SLA
-    /// window, it falls through to the next cheaper tier. If it exceeded all configured
-    /// windows, it's free. Billing only goes down, never up.
-    ///
-    /// Returns (effective_completion_window, effective_sla_label):
-    /// - For non-batch requests: (original window, "")
-    /// - Within submitted window: (submitted window, submitted window) e.g. ("1h", "1h")
-    /// - Fell through to cheaper tier: (cheaper window, cheaper window) e.g. ("24h", "24h")
-    /// - Exceeded all windows: (None, "free")
-    fn resolve_effective_batch_sla(
-        &self,
-        tariffs: &[TariffInfo],
-        api_key_purpose: Option<&ApiKeyPurpose>,
-        submitted_window: Option<&str>,
-        batch_created_at: Option<DateTime<Utc>>,
-        completed_at: DateTime<Utc>,
-        pricing_timestamp: DateTime<Utc>,
-    ) -> (Option<String>, String) {
-        // Only apply waterfall to batch requests with a known submission window and creation time
-        let (Some(submitted), Some(created_at)) = (submitted_window, batch_created_at) else {
-            return (
-                submitted_window.map(|s| s.to_string()),
-                submitted_window.unwrap_or_default().to_string(),
-            );
-        };
-
-        let purpose = api_key_purpose.unwrap_or(&ApiKeyPurpose::Realtime);
-
-        // Collect all batch tariff windows valid at pricing_timestamp, with their parsed durations
-        let mut windows: Vec<(String, chrono::Duration)> = tariffs
-            .iter()
-            .filter(|t| {
-                &t.purpose == purpose
-                    && t.completion_window.is_some()
-                    && t.effective_from <= pricing_timestamp
-                    && t.valid_until.is_none_or(|vu| vu > pricing_timestamp)
-            })
-            .filter_map(|t| {
-                let cw = t.completion_window.as_deref()?;
-                let std_dur = humantime::parse_duration(cw).ok()?;
-                let chrono_dur = chrono::Duration::from_std(std_dur).ok()?;
-                Some((cw.to_string(), chrono_dur))
-            })
-            .collect();
-
-        // Sort by duration ascending (cheapest/longest window last)
-        windows.sort_by_key(|(_, dur)| *dur);
-
-        // Find where the submitted window sits in the sorted list
-        let submitted_idx = windows.iter().position(|(cw, _)| cw == submitted);
-        let Some(submitted_idx) = submitted_idx else {
-            // Submitted window not found in current tariffs — use it as-is
-            return (Some(submitted.to_string()), submitted.to_string());
-        };
-
-        let elapsed = completed_at - created_at;
-
-        // Walk from the submitted window onwards (same or larger windows only — billing only goes down)
-        for (cw, dur) in &windows[submitted_idx..] {
-            if elapsed <= *dur {
-                return (Some(cw.clone()), cw.clone());
-            }
-        }
-
-        // Exceeded all configured windows — free
-        (None, "free".to_string())
     }
 
     /// Find the best matching tariff for a record.
@@ -1114,6 +1049,7 @@ where
             request_origin: compute_request_origin(record.api_key_purpose.as_ref(), record.raw.fusillade_batch_id).to_string(),
             batch_sla: record.raw.batch_completion_window.clone().unwrap_or_default(),
             batch_request_source: record.raw.batch_request_source.clone(),
+            effective_batch_sla: record.effective_batch_sla.clone(),
         }
     }
 }
@@ -1144,6 +1080,99 @@ fn parse_api_key_purpose(s: &str) -> ApiKeyPurpose {
         "playground" => ApiKeyPurpose::Playground,
         _ => ApiKeyPurpose::Realtime,
     }
+}
+
+/// Parse and sort tariff windows for a given purpose, valid at a given timestamp.
+///
+/// Returns windows sorted by duration ascending (shortest/most expensive first).
+/// Used to precompute once per model+purpose before iterating over records.
+fn parse_tariff_windows(
+    tariffs: &[TariffInfo],
+    purpose: &ApiKeyPurpose,
+    pricing_timestamp: DateTime<Utc>,
+) -> Vec<(String, chrono::Duration)> {
+    let mut windows: Vec<(String, chrono::Duration)> = tariffs
+        .iter()
+        .filter(|t| {
+            &t.purpose == purpose
+                && t.completion_window.is_some()
+                && t.effective_from <= pricing_timestamp
+                && t.valid_until.is_none_or(|vu| vu > pricing_timestamp)
+        })
+        .filter_map(|t| {
+            let cw = t.completion_window.as_deref()?;
+            let std_dur = humantime::parse_duration(cw).ok()?;
+            let chrono_dur = chrono::Duration::from_std(std_dur).ok()?;
+            Some((cw.to_string(), chrono_dur))
+        })
+        .collect();
+
+    windows.sort_by_key(|(_, dur)| *dur);
+    windows
+}
+
+/// Determine the effective SLA tier for a batch request based on actual completion time.
+///
+/// Implements a billing waterfall: if a request completed after its submitted SLA
+/// window, it falls through to the next cheaper tier. If it exceeded all configured
+/// windows, it's free. Billing only goes down, never up.
+///
+/// Returns (effective_completion_window, effective_sla_label):
+/// - Insufficient batch metadata (missing window or created_at): passthrough —
+///   returns the submitted window as both the effective window and label.
+///   The label may be non-empty without waterfall logic being applied.
+/// - Within submitted window: (submitted window, submitted window) e.g. ("1h", "1h")
+/// - Fell through to cheaper tier: (cheaper window, cheaper window) e.g. ("24h", "24h")
+/// - Exceeded all windows: (None, "free")
+///
+/// If `sorted_windows` is provided, uses them directly (avoids re-parsing per record).
+/// Otherwise, falls back to parsing from `tariffs`.
+fn resolve_effective_batch_sla(
+    tariffs: &[TariffInfo],
+    api_key_purpose: Option<&ApiKeyPurpose>,
+    submitted_window: Option<&str>,
+    batch_created_at: Option<DateTime<Utc>>,
+    completed_at: DateTime<Utc>,
+    sorted_windows: Option<&[(String, chrono::Duration)]>,
+) -> (Option<String>, String) {
+    // Only apply waterfall to batch requests with a known submission window and creation time
+    let (Some(submitted), Some(created_at)) = (submitted_window, batch_created_at) else {
+        return (
+            submitted_window.map(|s| s.to_string()),
+            submitted_window.unwrap_or_default().to_string(),
+        );
+    };
+
+    let purpose = api_key_purpose.unwrap_or(&ApiKeyPurpose::Realtime);
+
+    // Use pre-parsed windows if available, otherwise parse from tariffs
+    let owned_windows;
+    let windows = match sorted_windows {
+        Some(w) => w,
+        None => {
+            owned_windows = parse_tariff_windows(tariffs, purpose, completed_at);
+            &owned_windows
+        }
+    };
+
+    // Find where the submitted window sits in the sorted list
+    let submitted_idx = windows.iter().position(|(cw, _)| cw == submitted);
+    let Some(submitted_idx) = submitted_idx else {
+        // Submitted window not found in current tariffs — use it as-is
+        return (Some(submitted.to_string()), submitted.to_string());
+    };
+
+    let elapsed = completed_at - created_at;
+
+    // Walk from the submitted window onwards (same or larger windows only — billing only goes down)
+    for (cw, dur) in &windows[submitted_idx..] {
+        if elapsed <= *dur {
+            return (Some(cw.clone()), cw.clone());
+        }
+    }
+
+    // Exceeded all configured windows — free
+    (None, "free".to_string())
 }
 
 /// Compute request origin from API key purpose and fusillade batch ID.
@@ -1533,56 +1562,22 @@ mod tests {
         assert_eq!(output, None);
     }
 
-    /// Helper to call resolve_effective_batch_sla without needing a full batcher
+    /// Helper to call the standalone resolve_effective_batch_sla without pre-parsed windows
     fn resolve_sla(
         tariffs: &[TariffInfo],
         api_key_purpose: Option<&ApiKeyPurpose>,
         submitted_window: Option<&str>,
         batch_created_at: Option<DateTime<Utc>>,
         completed_at: DateTime<Utc>,
-        pricing_timestamp: DateTime<Utc>,
     ) -> (Option<String>, String) {
-        let (Some(submitted), Some(created_at)) = (submitted_window, batch_created_at) else {
-            return (
-                submitted_window.map(|s| s.to_string()),
-                submitted_window.unwrap_or_default().to_string(),
-            );
-        };
-
-        let purpose = api_key_purpose.unwrap_or(&ApiKeyPurpose::Realtime);
-
-        let mut windows: Vec<(String, chrono::Duration)> = tariffs
-            .iter()
-            .filter(|t| {
-                &t.purpose == purpose
-                    && t.completion_window.is_some()
-                    && t.effective_from <= pricing_timestamp
-                    && t.valid_until.is_none_or(|vu| vu > pricing_timestamp)
-            })
-            .filter_map(|t| {
-                let cw = t.completion_window.as_deref()?;
-                let std_dur = humantime::parse_duration(cw).ok()?;
-                let chrono_dur = chrono::Duration::from_std(std_dur).ok()?;
-                Some((cw.to_string(), chrono_dur))
-            })
-            .collect();
-
-        windows.sort_by_key(|(_, dur)| *dur);
-
-        let submitted_idx = windows.iter().position(|(cw, _)| cw == submitted);
-        let Some(submitted_idx) = submitted_idx else {
-            return (Some(submitted.to_string()), submitted.to_string());
-        };
-
-        let elapsed = completed_at - created_at;
-
-        for (cw, dur) in &windows[submitted_idx..] {
-            if elapsed <= *dur {
-                return (Some(cw.clone()), cw.clone());
-            }
-        }
-
-        (None, "free".to_string())
+        resolve_effective_batch_sla(
+            tariffs,
+            api_key_purpose,
+            submitted_window,
+            batch_created_at,
+            completed_at,
+            None, // let the function parse windows from tariffs
+        )
     }
 
     #[test]
@@ -1609,7 +1604,7 @@ mod tests {
             ),
         ];
 
-        let (window, sla) = resolve_sla(&tariffs, Some(&ApiKeyPurpose::Batch), Some("1h"), Some(created), completed, created);
+        let (window, sla) = resolve_sla(&tariffs, Some(&ApiKeyPurpose::Batch), Some("1h"), Some(created), completed);
         assert_eq!(window, Some("1h".to_string()));
         assert_eq!(sla, "1h");
     }
@@ -1638,7 +1633,7 @@ mod tests {
             ),
         ];
 
-        let (window, sla) = resolve_sla(&tariffs, Some(&ApiKeyPurpose::Batch), Some("1h"), Some(created), completed, created);
+        let (window, sla) = resolve_sla(&tariffs, Some(&ApiKeyPurpose::Batch), Some("1h"), Some(created), completed);
         assert_eq!(window, Some("24h".to_string()));
         assert_eq!(sla, "24h");
     }
@@ -1667,7 +1662,7 @@ mod tests {
             ),
         ];
 
-        let (window, sla) = resolve_sla(&tariffs, Some(&ApiKeyPurpose::Batch), Some("1h"), Some(created), completed, created);
+        let (window, sla) = resolve_sla(&tariffs, Some(&ApiKeyPurpose::Batch), Some("1h"), Some(created), completed);
         assert_eq!(window, None);
         assert_eq!(sla, "free");
     }
@@ -1696,14 +1691,7 @@ mod tests {
             ),
         ];
 
-        let (window, sla) = resolve_sla(
-            &tariffs,
-            Some(&ApiKeyPurpose::Batch),
-            Some("24h"),
-            Some(created),
-            completed,
-            created,
-        );
+        let (window, sla) = resolve_sla(&tariffs, Some(&ApiKeyPurpose::Batch), Some("24h"), Some(created), completed);
         assert_eq!(window, Some("24h".to_string()));
         assert_eq!(sla, "24h");
     }
@@ -1732,14 +1720,7 @@ mod tests {
             ),
         ];
 
-        let (window, sla) = resolve_sla(
-            &tariffs,
-            Some(&ApiKeyPurpose::Batch),
-            Some("24h"),
-            Some(created),
-            completed,
-            created,
-        );
+        let (window, sla) = resolve_sla(&tariffs, Some(&ApiKeyPurpose::Batch), Some("24h"), Some(created), completed);
         assert_eq!(window, None);
         assert_eq!(sla, "free");
     }
@@ -1757,7 +1738,7 @@ mod tests {
             None,
         )];
 
-        let (window, sla) = resolve_sla(&tariffs, Some(&ApiKeyPurpose::Realtime), None, None, now, now);
+        let (window, sla) = resolve_sla(&tariffs, Some(&ApiKeyPurpose::Realtime), None, None, now);
         assert_eq!(window, None);
         assert_eq!(sla, "");
     }
@@ -1786,7 +1767,7 @@ mod tests {
             ),
         ];
 
-        let (window, sla) = resolve_sla(&tariffs, Some(&ApiKeyPurpose::Batch), Some("1h"), Some(created), completed, created);
+        let (window, sla) = resolve_sla(&tariffs, Some(&ApiKeyPurpose::Batch), Some("1h"), Some(created), completed);
         assert_eq!(window, Some("1h".to_string()));
         assert_eq!(sla, "1h");
     }
@@ -1823,14 +1804,7 @@ mod tests {
             ),
         ];
 
-        let (window, sla) = resolve_sla(
-            &tariffs,
-            Some(&ApiKeyPurpose::Batch),
-            Some("30m"),
-            Some(created),
-            completed,
-            created,
-        );
+        let (window, sla) = resolve_sla(&tariffs, Some(&ApiKeyPurpose::Batch), Some("30m"), Some(created), completed);
         assert_eq!(window, Some("6h".to_string()));
         assert_eq!(sla, "6h");
     }
