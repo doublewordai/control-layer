@@ -271,7 +271,8 @@ pub async fn execute_probe(
     _: RequiresPermission<resource::Probes, operation::UpdateAll>,
     Path(id): Path<Uuid>,
 ) -> Result<(StatusCode, Json<ProbeResult>), Error> {
-    let result = ProbeManager::execute_probe(&state.db, id, &state.config).await?;
+    let config = state.current_config();
+    let result = ProbeManager::execute_probe(&state.db, id, &config).await?;
     Ok((StatusCode::CREATED, Json(result)))
 }
 
@@ -304,13 +305,14 @@ pub async fn test_probe(
     Path(deployment_id): Path<Uuid>,
     Json(request): Json<Option<TestProbeRequest>>,
 ) -> Result<(StatusCode, Json<ProbeResult>), Error> {
+    let config = state.current_config();
     let (http_method, request_path, request_body) = if let Some(req) = request {
         (req.http_method, req.request_path, req.request_body)
     } else {
         (None, None, None)
     };
 
-    let result = ProbeManager::test_probe(&state.db, deployment_id, &state.config, http_method, request_path, request_body).await?;
+    let result = ProbeManager::test_probe(&state.db, deployment_id, &config, http_method, request_path, request_body).await?;
     Ok((StatusCode::OK, Json(result)))
 }
 

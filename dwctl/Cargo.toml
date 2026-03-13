@@ -23,6 +23,7 @@ fusillade = { version = "11.0.1" }
 tokio = { version = "1.0", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = "0.7"
+notify = "8.2.0"
 sqlx = { version = "0.8", features = [
   "runtime-tokio-rustls",
   "postgres",

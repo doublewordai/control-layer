@@ -68,13 +68,14 @@ pub struct ConfigResponse {
 )]
 #[tracing::instrument(skip_all)]
 pub async fn get_config(State(state): State<AppState>, _user: CurrentUser) -> impl IntoResponse {
-    let metadata = &state.config.metadata;
+    let config = state.current_config();
+    let metadata = &config.metadata;
 
-    let batches_config = if state.config.batches.enabled {
+    let batches_config = if config.batches.enabled {
         Some(BatchConfigResponse {
-            enabled: state.config.batches.enabled,
-            allowed_completion_windows: state.config.batches.allowed_completion_windows.clone(),
-            allowed_url_paths: state.config.batches.allowed_url_paths.clone(),
+            enabled: config.batches.enabled,
+            allowed_completion_windows: config.batches.allowed_completion_windows.clone(),
+            allowed_url_paths: config.batches.allowed_url_paths.clone(),
         })
     } else {
         None
@@ -84,13 +85,13 @@ pub async fn get_config(State(state): State<AppState>, _user: CurrentUser) -> im
         region: metadata.region.clone(),
         organization: metadata.organization.clone(),
         // Compute payment_enabled based on whether payment_processor is configured
-        payment_enabled: state.config.payment.is_some(),
+        payment_enabled: config.payment.is_some(),
         docs_url: metadata.docs_url.clone(),
         docs_jsonl_url: metadata.docs_jsonl_url.clone(),
         batches: batches_config,
         ai_api_base_url: metadata.ai_api_base_url.clone(),
         onwards: OnwardsConfigResponse {
-            strict_mode: state.config.onwards.strict_mode,
+            strict_mode: config.onwards.strict_mode,
         },
     };
 

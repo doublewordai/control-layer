@@ -817,7 +817,8 @@ pub async fn set_active_organization<P: PoolProvider>(
     }
 
     // Build the dw_active_org cookie using the same security settings as the session cookie
-    let session_config = &state.config.auth.native.session;
+    let config = state.current_config();
+    let session_config = &config.auth.native.session;
     let secure = if session_config.cookie_secure { "; Secure" } else { "" };
     let domain = session_config
         .cookie_domain
@@ -954,8 +955,9 @@ pub async fn invite_member<P: PoolProvider>(
         .unwrap_or_else(|| inviter.as_ref().map(|u| u.username.clone()).unwrap_or_default());
 
     // Send invite email
-    let invite_link = format!("{}/org-invite?token={}", state.config.dashboard_url.trim_end_matches('/'), token);
-    let email_service = EmailService::new(&state.config)?;
+    let config = state.current_config();
+    let invite_link = format!("{}/org-invite?token={}", config.dashboard_url.trim_end_matches('/'), token);
+    let email_service = EmailService::new(&config)?;
     if let Err(e) = email_service
         .send_org_invite_email(&email, &org_name, &inviter_name, role, &invite_link)
         .await

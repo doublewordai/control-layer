@@ -296,7 +296,8 @@ pub async fn get_user<P: PoolProvider>(
             || response
                 .last_login
                 .is_some_and(|ll| (ll - response.created_at).num_seconds().abs() < 10);
-        if is_first_login && let Some(url) = &state.config.onboarding_url {
+        let config = state.current_config();
+        if is_first_login && let Some(url) = &config.onboarding_url {
             response = response.with_onboarding_redirect_url(url.clone());
         }
     }

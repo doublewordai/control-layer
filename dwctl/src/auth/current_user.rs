@@ -102,7 +102,7 @@ async fn try_proxy_header_auth<P: sqlx_pool_router::PoolProvider + Clone + Send 
     parts: &axum::http::request::Parts,
     state: &crate::AppState<P>,
 ) -> Option<Result<AuthSuccess>> {
-    let config = &state.config;
+    let config = state.current_config();
     let db: &PgPool = state.db.write();
     tracing::trace!("Trying proxy header auth, config: {:?}", config.auth.proxy_header);
     // Extract external_user_id from header_name (required)
@@ -557,8 +557,9 @@ impl<P: sqlx_pool_router::PoolProvider + Clone + Send + Sync> FromRequestParts<c
         }
 
         // Native authentication (JWT sessions)
-        if state.config.auth.native.enabled {
-            match try_jwt_session_auth(parts, &state.config, state.db.read()).await {
+        let config = state.current_config();
+        if config.auth.native.enabled {
+            match try_jwt_session_auth(parts, &config, state.db.read()).await {
                 Some(Ok((mut user, last_login))) => {
                     debug!("Authentication successful via JWT session");
                     trace!("Authenticated user: {}", user.id);
@@ -578,7 +579,7 @@ impl<P: sqlx_pool_router::PoolProvider + Clone + Send + Sync> FromRequestParts<c
         }
 
         // Fall back to proxy header authentication
-        if state.config.auth.proxy_header.enabled {
+        if config.auth.proxy_header.enabled {
             match try_proxy_header_auth(parts, state).await {
                 Some(Ok((mut user, last_login))) => {
                     debug!("Authentication successful via proxy header");
