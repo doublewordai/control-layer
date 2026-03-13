@@ -19,7 +19,7 @@ use crate::tool_executor::{ResolvedToolSet, ResolvedTools, ToolDefinition};
 use axum::{
     body::Body,
     extract::State,
-    http::{HeaderMap, Request},
+    http::Request,
     middleware::Next,
     response::Response,
 };
@@ -50,23 +50,21 @@ pub async fn tool_injection_middleware(
     }
 
     // Extract bearer token from the Authorization header.
-    let bearer_token = match extract_bearer_token(request.headers()) {
+    let bearer_token = match extract_bearer_token(&request) {
         Some(t) => t,
         None => return next.run(request).await,
     };
 
     // Peek at the body to extract the model name for per-deployment resolution.
-    let body_bytes = match axum::body::to_bytes(std::mem::take(request.body_mut()), 10 * 1024 * 1024).await {
+    let body_bytes = match axum::body::to_bytes(std::mem::take(request.body_mut()), usize::MAX).await {
         Ok(b) => b,
-        Err(_) => {
-            *request.body_mut() = Body::empty();
+        Err(e) => {
+            warn!(error = %e, "Failed to read request body in tool injection middleware");
             return next.run(request).await;
         }
     };
 
-    let model_alias = serde_json::from_slice::<Value>(&body_bytes)
-        .ok()
-        .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(|s| s.to_string()));
+    let model_alias = onwards::extract_model_from_request(request.headers(), &body_bytes);
 
     // Restore the body before proceeding.
     *request.body_mut() = Body::from(body_bytes);
@@ -102,10 +100,19 @@ fn is_responses_path(path: &str) -> bool {
     path.ends_with("/responses")
 }
 
-/// Extract the Bearer token from the `Authorization` header, stripping the prefix.
-fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
-    let auth = headers.get(axum::http::header::AUTHORIZATION)?.to_str().ok()?;
-    auth.strip_prefix("Bearer ").map(|s| s.to_string())
+/// Extract the Bearer token from the request, case-insensitive.
+fn extract_bearer_token(request: &Request<Body>) -> Option<String> {
+    let auth = request
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?;
+    let auth = auth.trim();
+    if auth.len() > 7 && auth[..7].eq_ignore_ascii_case("bearer ") {
+        Some(auth[7..].to_string())
+    } else {
+        None
+    }
 }
 
 /// Resolve the effective tool set for a request identified by its API key secret and model alias.
@@ -185,26 +192,40 @@ mod tests {
         assert!(!is_responses_path("/v1/responsesX"));
     }
 
+    fn make_request_with_auth(auth_value: &str) -> Request<Body> {
+        Request::builder()
+            .header(axum::http::header::AUTHORIZATION, auth_value)
+            .body(Body::empty())
+            .unwrap()
+    }
+
     #[test]
-    fn test_extract_bearer_token() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            axum::http::header::AUTHORIZATION,
-            "Bearer sk-abc123".parse().unwrap(),
-        );
-        assert_eq!(extract_bearer_token(&headers), Some("sk-abc123".to_string()));
+    fn test_extract_bearer_token_standard() {
+        let req = make_request_with_auth("Bearer sk-abc123");
+        assert_eq!(extract_bearer_token(&req), Some("sk-abc123".to_string()));
+    }
+
+    #[test]
+    fn test_extract_bearer_token_lowercase() {
+        let req = make_request_with_auth("bearer sk-abc123");
+        assert_eq!(extract_bearer_token(&req), Some("sk-abc123".to_string()));
+    }
+
+    #[test]
+    fn test_extract_bearer_token_mixed_case() {
+        let req = make_request_with_auth("BEARER sk-abc123");
+        assert_eq!(extract_bearer_token(&req), Some("sk-abc123".to_string()));
     }
 
     #[test]
     fn test_extract_bearer_token_missing() {
-        let headers = HeaderMap::new();
-        assert_eq!(extract_bearer_token(&headers), None);
+        let req = Request::builder().body(Body::empty()).unwrap();
+        assert_eq!(extract_bearer_token(&req), None);
     }
 
     #[test]
     fn test_extract_bearer_token_no_prefix() {
-        let mut headers = HeaderMap::new();
-        headers.insert(axum::http::header::AUTHORIZATION, "sk-abc123".parse().unwrap());
-        assert_eq!(extract_bearer_token(&headers), None);
+        let req = make_request_with_auth("sk-abc123");
+        assert_eq!(extract_bearer_token(&req), None);
     }
 }
