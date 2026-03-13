@@ -531,6 +531,16 @@ mod tests {
         assert_eq!(org.user_type, "organization");
         assert_eq!(org.auth_source, "organization");
         assert!(!org.is_admin);
+
+        // Verify roles are persisted in user_roles (org needs BatchAPIUser for file/batch operations)
+        let persisted_roles: Vec<String> = sqlx::query_scalar!(
+            r#"SELECT role::text as "role!" FROM user_roles WHERE user_id = $1 ORDER BY role"#,
+            org.id
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(persisted_roles, vec!["BATCHAPIUSER", "STANDARDUSER"]);
     }
 
     #[sqlx::test]

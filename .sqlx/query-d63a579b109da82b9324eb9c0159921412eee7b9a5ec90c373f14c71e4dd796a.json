@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT ak.user_id, ak.purpose, u.username, u.email, u.is_admin, u.display_name, u.avatar_url, u.payment_provider_id, u.last_login\n        FROM api_keys ak\n        INNER JOIN users u ON ak.user_id = u.id\n        WHERE ak.secret = $1 AND ak.is_deleted = false\n        ",
+  "query": "\n        SELECT ak.user_id, ak.created_by, ak.purpose, u.username, u.email, u.is_admin, u.display_name, u.avatar_url, u.payment_provider_id, u.last_login\n        FROM api_keys ak\n        INNER JOIN users u ON ak.user_id = u.id\n        WHERE ak.secret = $1 AND ak.is_deleted = false\n        ",
   "describe": {
     "columns": [
       {
@@ -10,41 +10,46 @@
       },
       {
         "ordinal": 1,
+        "name": "created_by",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
         "name": "purpose",
         "type_info": "Varchar"
       },
       {
-        "ordinal": 2,
+        "ordinal": 3,
         "name": "username",
         "type_info": "Varchar"
       },
       {
-        "ordinal": 3,
+        "ordinal": 4,
         "name": "email",
         "type_info": "Varchar"
       },
       {
-        "ordinal": 4,
+        "ordinal": 5,
         "name": "is_admin",
         "type_info": "Bool"
       },
       {
-        "ordinal": 5,
+        "ordinal": 6,
         "name": "display_name",
         "type_info": "Varchar"
       },
       {
-        "ordinal": 6,
+        "ordinal": 7,
         "name": "avatar_url",
         "type_info": "Varchar"
       },
       {
-        "ordinal": 7,
+        "ordinal": 8,
         "name": "payment_provider_id",
         "type_info": "Varchar"
       },
       {
-        "ordinal": 8,
+        "ordinal": 9,
         "name": "last_login",
         "type_info": "Timestamptz"
       }
@@ -60,11 +65,12 @@
       false,
       false,
       false,
+      false,
       true,
       true,
       true,
       true
     ]
   },
-  "hash": "6f2e03719de9331ab561e9fcaa98087fa0550e1ab7ea52a9bead73180e4e3931"
+  "hash": "d63a579b109da82b9324eb9c0159921412eee7b9a5ec90c373f14c71e4dd796a"
 }
