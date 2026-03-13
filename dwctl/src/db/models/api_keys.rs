@@ -21,6 +21,18 @@ pub enum ApiKeyPurpose {
     Playground,
 }
 
+impl ApiKeyPurpose {
+    /// Stable lowercase string representation matching the database/serde format.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Platform => "platform",
+            Self::Realtime => "realtime",
+            Self::Batch => "batch",
+            Self::Playground => "playground",
+        }
+    }
+}
+
 /// Database request for creating a new API key
 #[derive(Debug, Clone)]
 pub struct ApiKeyCreateDBRequest {
