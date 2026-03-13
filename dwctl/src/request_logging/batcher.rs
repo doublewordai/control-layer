@@ -439,30 +439,42 @@ where
                     // This ensures batch requests are priced as of batch creation, not processing time
                     let pricing_timestamp = raw.batch_created_at.unwrap_or(raw.timestamp);
 
-                    // Actual request completion time = request start + duration
-                    let completed_at = raw.timestamp + chrono::Duration::milliseconds(raw.duration_ms);
+                    // Only run waterfall logic for batch requests with both a completion window
+                    // and a batch creation time — skip cache/parsing for non-batch records
+                    let is_batch_request = raw.batch_completion_window.is_some() && raw.batch_created_at.is_some();
 
-                    // Cache parsed tariff windows by (model, purpose, pricing_timestamp) to avoid
-                    // re-parsing humantime durations for every record in the same batch
-                    let purpose = api_key_purpose.as_ref().unwrap_or(&ApiKeyPurpose::Realtime);
-                    let cache_key = (model_alias.clone(), format!("{:?}", purpose), pricing_timestamp.timestamp());
-                    let sorted_windows = windows_cache
-                        .entry(cache_key)
-                        .or_insert_with(|| parse_tariff_windows(&model_info.tariffs, purpose, pricing_timestamp));
+                    let (effective_window, effective_sla) = if is_batch_request {
+                        // Actual request completion time = request start + duration
+                        let completed_at = raw.timestamp + chrono::Duration::milliseconds(raw.duration_ms);
 
-                    // For batch requests, apply SLA waterfall: if a request completed after its
-                    // submitted SLA window, it falls through to the next larger (cheaper) tier.
-                    // If it exceeded all configured windows, it's free.
-                    // Tiers only move toward longer windows (costs only decrease, never increase).
-                    let (effective_window, effective_sla) = resolve_effective_batch_sla(
-                        &model_info.tariffs,
-                        api_key_purpose.as_ref(),
-                        raw.batch_completion_window.as_deref(),
-                        raw.batch_created_at,
-                        completed_at,
-                        pricing_timestamp,
-                        Some(sorted_windows),
-                    );
+                        // Cache parsed tariff windows by (model, purpose, pricing_timestamp)
+                        // to avoid re-parsing humantime durations for every record in the same batch
+                        let purpose = api_key_purpose.as_ref().unwrap_or(&ApiKeyPurpose::Realtime);
+                        let cache_key = (model_alias.clone(), format!("{:?}", purpose), pricing_timestamp.timestamp());
+                        let sorted_windows = windows_cache
+                            .entry(cache_key)
+                            .or_insert_with(|| parse_tariff_windows(&model_info.tariffs, purpose, pricing_timestamp));
+
+                        // Apply SLA waterfall: if a request completed after its submitted SLA
+                        // window, it falls through to the next longer (cheaper) tier.
+                        // If it exceeded all configured windows, it's free.
+                        // Tiers only move toward longer windows (costs only decrease, never increase).
+                        resolve_effective_batch_sla(
+                            &model_info.tariffs,
+                            api_key_purpose.as_ref(),
+                            raw.batch_completion_window.as_deref(),
+                            raw.batch_created_at,
+                            completed_at,
+                            pricing_timestamp,
+                            Some(sorted_windows),
+                        )
+                    } else {
+                        // Non-batch request: no waterfall, pass through the submitted window as-is
+                        (
+                            raw.batch_completion_window.clone(),
+                            raw.batch_completion_window.as_deref().unwrap_or_default().to_string(),
+                        )
+                    };
 
                     // Find best matching tariff using the effective (possibly downgraded) window
                     let (input, output) = if effective_sla == "free" {
@@ -1098,6 +1110,12 @@ fn parse_api_key_purpose(s: &str) -> ApiKeyPurpose {
 ///
 /// Returns windows sorted by duration ascending (shortest/most expensive first).
 /// Used to precompute once per model+purpose before iterating over records.
+///
+/// Logs a warning for any tariff whose `completion_window` cannot be parsed as a
+/// duration. Unparseable windows are excluded from the waterfall, which means they
+/// won't be considered as fall-through targets. If the *submitted* window is the
+/// unparseable one, `resolve_effective_batch_sla` will fail to find it in the list
+/// and fall back to charging at the submitted window (fail closed — no free ride).
 fn parse_tariff_windows(
     tariffs: &[TariffInfo],
     purpose: &ApiKeyPurpose,
@@ -1113,9 +1131,29 @@ fn parse_tariff_windows(
         })
         .filter_map(|t| {
             let cw = t.completion_window.as_deref()?;
-            let std_dur = humantime::parse_duration(cw).ok()?;
-            let chrono_dur = chrono::Duration::from_std(std_dur).ok()?;
-            Some((cw.to_string(), chrono_dur))
+            match humantime::parse_duration(cw) {
+                Ok(std_dur) => match chrono::Duration::from_std(std_dur) {
+                    Ok(chrono_dur) => Some((cw.to_string(), chrono_dur)),
+                    Err(e) => {
+                        warn!(
+                            completion_window = cw,
+                            error = %e,
+                            "tariff completion_window overflows chrono::Duration — \
+                             excluded from SLA waterfall (will charge at submitted window)"
+                        );
+                        None
+                    }
+                },
+                Err(e) => {
+                    warn!(
+                        completion_window = cw,
+                        error = %e,
+                        "tariff completion_window is not a valid duration — \
+                         excluded from SLA waterfall (will charge at submitted window)"
+                    );
+                    None
+                }
+            }
         })
         .collect();
 
