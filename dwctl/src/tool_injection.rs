@@ -4,10 +4,10 @@
 //! For each request it:
 //!
 //! 1. Extracts the API key secret from the `Authorization: Bearer` header.
-//! 2. Queries the database to map the secret → user_id → group_ids and
-//!    secret → deployment_id.
-//! 3. Computes the *effective tool set* as the intersection of:
-//!    - tools attached to the deployment (`deployment_tool_sources`)
+//! 2. Parses the request body to extract the `model` field.
+//! 3. Queries the database to resolve the specific deployment from the model alias, then
+//!    computes the *effective tool set* as the intersection of:
+//!    - tools attached to that deployment (`deployment_tool_sources`)
 //!    - tools attached to at least one group the user belongs to (`group_tool_sources`)
 //! 4. If client-requested tools are present in the request body, further restricts to those.
 //! 5. Injects the authorised tool schemas into the request body (adds/merges the `tools` array).
@@ -27,6 +27,7 @@ use axum::{
     middleware::Next,
     response::Response,
 };
+use bytes::Bytes;
 use serde_json::Value;
 use sqlx::PgPool;
 use std::collections::HashMap;
@@ -53,10 +54,7 @@ pub async fn tool_injection_middleware(
 ) -> Response {
     // Only act on the Responses API path — chat/completions etc. don't go through the
     // tool loop orchestration in onwards' OpenResponsesAdapter.
-    let path = request.uri().path();
-    let is_responses_path = path.ends_with("/responses") || path.contains("/responses?");
-
-    if !is_responses_path {
+    if !is_responses_path(request.uri().path()) {
         return next.run(request).await;
     }
 
@@ -66,33 +64,50 @@ pub async fn tool_injection_middleware(
         None => return next.run(request).await,
     };
 
+    // Parse the body early so we can extract the model name for per-deployment resolution.
+    let body_bytes = match axum::body::to_bytes(std::mem::take(request.body_mut()), 10 * 1024 * 1024).await {
+        Ok(b) => b,
+        Err(_) => {
+            *request.body_mut() = Body::empty();
+            return next.run(request).await;
+        }
+    };
+
+    let mut json: Value = match serde_json::from_slice(&body_bytes) {
+        Ok(v) => v,
+        Err(_) => {
+            *request.body_mut() = Body::from(body_bytes);
+            return next.run(request).await;
+        }
+    };
+
+    let model_alias = json.get("model").and_then(|m| m.as_str()).map(|s| s.to_string());
+
     // Resolve deployment and group tool sets from the DB.
-    let resolved = match resolve_tools_for_request(&state.db, &bearer_token).await {
+    let resolved = match resolve_tools_for_request(&state.db, &bearer_token, model_alias.as_deref()).await {
         Ok(Some(r)) => r,
         Ok(None) => {
-            // No tool sources configured for this deployment/group combination — pass through.
+            *request.body_mut() = Body::from(body_bytes);
             return CURRENT_TOOL_REQUEST_ID.scope(None, next.run(request)).await;
         }
         Err(e) => {
             warn!(error = %e, "Failed to resolve tool sources for request; proceeding without tools");
+            *request.body_mut() = Body::from(body_bytes);
             return CURRENT_TOOL_REQUEST_ID.scope(None, next.run(request)).await;
         }
     };
 
     // If no effective tools, skip injection.
     if resolved.is_empty() {
+        *request.body_mut() = Body::from(body_bytes);
         return CURRENT_TOOL_REQUEST_ID.scope(None, next.run(request)).await;
     }
 
-    // Read and potentially modify the request body to inject tool schemas.
-    let (modified, resolved) = match inject_tool_schemas(request, resolved).await {
-        Ok((req, r)) => {
-            request = req;
-            (true, r)
-        }
-        Err((req, r)) => {
-            // Injection failed (e.g., body not parseable as JSON) — proceed without injection.
-            request = req;
+    // Inject tool schemas into the already-parsed body.
+    let (modified, resolved) = match inject_tool_schemas(&mut request, &mut json, &body_bytes, resolved) {
+        Ok(r) => (true, r),
+        Err(r) => {
+            *request.body_mut() = Body::from(body_bytes);
             (false, r)
         }
     };
@@ -120,31 +135,31 @@ pub async fn tool_injection_middleware(
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Check whether the request path targets the Responses API.
+fn is_responses_path(path: &str) -> bool {
+    // Match `/v1/responses` (possibly nested under `/ai/v1/responses`).
+    // The path component never contains query parameters, so a simple suffix check suffices.
+    path.ends_with("/responses")
+}
+
 /// Extract the Bearer token from the `Authorization` header, stripping the prefix.
 fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
     let auth = headers.get(axum::http::header::AUTHORIZATION)?.to_str().ok()?;
     auth.strip_prefix("Bearer ").map(|s| s.to_string())
 }
 
-/// Resolve the effective tool set for a request identified by its API key secret.
+/// Resolve the effective tool set for a request identified by its API key secret and model alias.
+///
+/// When `model_alias` is provided, the query scopes to the specific deployment matching that
+/// alias, giving a precise deployment ∩ group intersection. When `None`, falls back to the
+/// union of all deployments the key can access (less precise but still safe).
 ///
 /// Returns `None` if no tools are configured for this deployment/group combination.
 async fn resolve_tools_for_request(
     db: &PgPool,
     bearer_token: &str,
+    model_alias: Option<&str>,
 ) -> anyhow::Result<Option<ResolvedToolSet>> {
-    // Query the intersection of deployment tools and group tools in one shot.
-    //
-    // The API key identifies:
-    //  - a user (via api_keys.user_id)
-    //  - we do NOT restrict to a specific deployment here because the model name is in the body,
-    //    not easily available at middleware time. Instead we take the union of all deployments the
-    //    key can access and intersect with the group tools.
-    //
-    // For a tighter intersection (per-deployment), the middleware would need to parse the body to
-    // extract the model name and then join against deployed_models — that is left as a future
-    // enhancement. For now we resolve tools that are attached to ANY deployment this key can
-    // access AND to ANY group the user belongs to.
     let rows = sqlx::query!(
         r#"
         SELECT DISTINCT
@@ -160,6 +175,8 @@ async fn resolve_tools_for_request(
         INNER JOIN user_groups ug ON ug.user_id = ak.user_id
         -- Find deployments accessible via those groups
         INNER JOIN deployment_groups dg ON dg.group_id = ug.group_id
+        -- Scope to the specific deployment when model_alias is provided
+        INNER JOIN deployed_models dm ON dm.id = dg.deployment_id
         -- Tools attached to those deployments
         INNER JOIN deployment_tool_sources dts ON dts.deployment_id = dg.deployment_id
         -- Same tool must also be attached to one of the user's groups
@@ -168,9 +185,11 @@ async fn resolve_tools_for_request(
         INNER JOIN tool_sources ts ON ts.id = dts.tool_source_id
         WHERE ak.secret = $1
           AND ak.is_deleted = FALSE
+          AND ($2::TEXT IS NULL OR dm.alias = $2)
         ORDER BY ts.name
         "#,
         bearer_token,
+        model_alias,
     )
     .fetch_all(db)
     .await?;
@@ -199,34 +218,17 @@ async fn resolve_tools_for_request(
     Ok(Some(ResolvedToolSet::new(tools, metadata)))
 }
 
-/// Inject tool schemas into the request body.
+/// Inject tool schemas into the already-parsed request body.
 ///
-/// Returns `Ok((modified_request, tool_set))` on success or `Err((original_request, tool_set))`
-/// if the body cannot be parsed as JSON.
-async fn inject_tool_schemas(
-    mut request: Request<Body>,
+/// On success, writes the modified body back into the request and returns the resolved tool set.
+/// On failure (e.g., no tools after client intersection), returns the tool set via `Err` and the
+/// caller is responsible for restoring the original body bytes.
+fn inject_tool_schemas(
+    request: &mut Request<Body>,
+    json: &mut Value,
+    original_bytes: &Bytes,
     resolved: ResolvedToolSet,
-) -> Result<(Request<Body>, ResolvedToolSet), (Request<Body>, ResolvedToolSet)> {
-    // Read the body.
-    let body_bytes = match axum::body::to_bytes(std::mem::take(request.body_mut()), 10 * 1024 * 1024).await {
-        Ok(b) => b,
-        Err(_) => {
-            // Restore empty body and bail.
-            *request.body_mut() = Body::empty();
-            return Err((request, resolved));
-        }
-    };
-
-    // Parse as JSON.
-    let mut json: Value = match serde_json::from_slice(&body_bytes) {
-        Ok(v) => v,
-        Err(_) => {
-            // Restore original body.
-            *request.body_mut() = Body::from(body_bytes);
-            return Err((request, resolved));
-        }
-    };
-
+) -> Result<ResolvedToolSet, ResolvedToolSet> {
     // Get the client-requested tool names from the body, if any.
     let client_requested: Option<std::collections::HashSet<String>> = json
         .get("tools")
@@ -256,9 +258,7 @@ async fn inject_tool_schemas(
     };
 
     if resolved.is_empty() {
-        // No tools left after intersection; restore the original body.
-        *request.body_mut() = Body::from(body_bytes);
-        return Err((request, resolved));
+        return Err(resolved);
     }
 
     // Inject the authorised tool schemas, replacing any client-provided ones.
@@ -272,8 +272,8 @@ async fn inject_tool_schemas(
     let new_body = match serde_json::to_vec(&json) {
         Ok(b) => b,
         Err(_) => {
-            *request.body_mut() = Body::from(body_bytes);
-            return Err((request, resolved));
+            *request.body_mut() = Body::from(original_bytes.clone());
+            return Err(resolved);
         }
     };
 
@@ -284,7 +284,7 @@ async fn inject_tool_schemas(
     }
 
     *request.body_mut() = Body::from(new_body);
-    Ok((request, resolved))
+    Ok(resolved)
 }
 
 // ---------------------------------------------------------------------------
@@ -294,6 +294,15 @@ async fn inject_tool_schemas(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_is_responses_path() {
+        assert!(is_responses_path("/v1/responses"));
+        assert!(is_responses_path("/ai/v1/responses"));
+        assert!(!is_responses_path("/v1/responses/resp_abc123"));
+        assert!(!is_responses_path("/v1/chat/completions"));
+        assert!(!is_responses_path("/v1/responsesX"));
+    }
 
     #[test]
     fn test_extract_bearer_token() {

@@ -103,8 +103,7 @@ impl<'c> ToolSources<'c> {
                 parameters    = CASE WHEN $5 THEN $6 ELSE parameters END,
                 url           = COALESCE($7, url),
                 api_key       = CASE WHEN $8 THEN $9 ELSE api_key END,
-                timeout_secs  = COALESCE($10, timeout_secs),
-                updated_at    = NOW()
+                timeout_secs  = COALESCE($10, timeout_secs)
             WHERE id = $1
             RETURNING *
             "#,

@@ -500,15 +500,4 @@ mod tests {
         assert_eq!(schemas[0]["function"]["description"], "Get the weather");
     }
 
-    #[test]
-    fn test_tool_set_intersection_logic() {
-        // Simulate intersection: deployment has {A, B}, group has {B, C}, result is {B}
-        let deployment_tools: std::collections::HashSet<&str> = ["A", "B"].iter().copied().collect();
-        let group_tools: std::collections::HashSet<&str> = ["B", "C"].iter().copied().collect();
-        let intersection: std::collections::HashSet<&str> =
-            deployment_tools.intersection(&group_tools).copied().collect();
-
-        assert_eq!(intersection.len(), 1);
-        assert!(intersection.contains("B"));
-    }
 }

@@ -55,6 +55,12 @@ CREATE INDEX idx_group_tool_sources_tool_source_id ON group_tool_sources(tool_so
 CREATE INDEX idx_tool_call_analytics_analytics_id ON tool_call_analytics(analytics_id);
 CREATE INDEX idx_tool_call_analytics_tool_source_id ON tool_call_analytics(tool_source_id);
 
+-- Auto-update updated_at on tool_sources changes.
+CREATE TRIGGER tool_sources_updated_at
+    BEFORE UPDATE ON tool_sources
+    FOR EACH ROW
+    EXECUTE FUNCTION update_updated_at_column();
+
 -- LISTEN/NOTIFY triggers so the onwards cache picks up tool source changes.
 CREATE TRIGGER tool_sources_notify
     AFTER INSERT OR UPDATE OR DELETE ON tool_sources
