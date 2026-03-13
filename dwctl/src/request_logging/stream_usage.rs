@@ -144,8 +144,7 @@ mod tests {
             "model": "gpt-4",
             "messages": [{"role": "user", "content": "hi"}]
         });
-        let result = call_with_headers("/chat/completions", &fusillade_stream_headers(), &body)
-            .expect("should transform");
+        let result = call_with_headers("/chat/completions", &fusillade_stream_headers(), &body).expect("should transform");
         assert_eq!(result["stream"], true);
         assert_eq!(result["stream_options"]["include_usage"], true);
     }
@@ -157,8 +156,7 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}],
             "stream": false
         });
-        let result = call_with_headers("/chat/completions", &fusillade_stream_headers(), &body)
-            .expect("should transform");
+        let result = call_with_headers("/chat/completions", &fusillade_stream_headers(), &body).expect("should transform");
         assert_eq!(result["stream"], true);
         assert_eq!(result["stream_options"]["include_usage"], true);
     }
