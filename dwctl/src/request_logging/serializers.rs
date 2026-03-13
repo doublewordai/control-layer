@@ -115,6 +115,7 @@ pub struct HttpAnalyticsRow {
     /// Empty string for non-batch requests or when not provided.
     pub batch_request_source: String,
     /// Identifies which tariff was actually used for pricing after waterfall resolution.
+    /// Only populated for batch requests; non-batch requests always get "".
     /// Values: completion_window of the matched tariff (e.g. "1h", "24h"),
     ///         "free" if the request exceeded all configured windows,
     ///         purpose name (e.g. "batch") if a generic tariff was used,

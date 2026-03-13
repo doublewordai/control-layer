@@ -492,7 +492,9 @@ where
                         )
                     };
 
-                    let final_sla = matched_label;
+                    // Only record effective_batch_sla for batch requests — non-batch
+                    // requests always get "" to keep the column batch-focused.
+                    let final_sla = if is_batch_request { matched_label } else { String::new() };
 
                     (Some(model_info.provider_name.clone()), input, output, final_sla)
                 } else {
