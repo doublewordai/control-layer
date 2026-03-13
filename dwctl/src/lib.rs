@@ -258,9 +258,6 @@ where
     pub request_manager: Arc<fusillade::PostgresRequestManager<P, fusillade::ReqwestHttpClient>>,
     /// Resource limiters for protecting system capacity.
     pub limiters: limits::Limiters,
-    /// Per-request tool registry shared with the HttpToolExecutor.
-    #[builder(default = Arc::new(crate::tool_executor::PerRequestToolRegistry::new()))]
-    pub tool_registry: Arc<crate::tool_executor::PerRequestToolRegistry>,
 }
 
 /// Get the dwctl database migrator
@@ -1262,7 +1259,6 @@ pub async fn build_router(
     // schemas are resolved and injected into the request body before onwards processes it.
     let tool_injection_state = crate::tool_injection::ToolInjectionState {
         db: state.db.write().clone(),
-        registry: state.tool_registry.clone(),
     };
     let onwards_router = onwards_router.layer(middleware::from_fn_with_state(
         tool_injection_state,
@@ -2160,11 +2156,9 @@ impl Application {
         // Embeddings don't support streaming.
         let body_transform: onwards::BodyTransformFn = Arc::new(request_logging::stream_usage::stream_usage_transform);
 
-        // Create the per-request tool registry and HTTP tool executor.
-        let tool_registry = Arc::new(crate::tool_executor::PerRequestToolRegistry::new());
+        // Create the HTTP tool executor.
         let reqwest_client = reqwest::Client::new();
         let tool_executor = crate::tool_executor::HttpToolExecutor::new(
-            tool_registry.clone(),
             reqwest_client,
             Some(Arc::new(db_pools.write().clone())),
         );
@@ -2191,7 +2185,6 @@ impl Application {
             .request_manager(bg_services.request_manager.clone())
             .maybe_outlet_db(outlet_pools.clone())
             .limiters(limiters)
-            .tool_registry(tool_registry)
             .build();
 
         let router = build_router(
