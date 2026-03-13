@@ -160,6 +160,8 @@ pub mod sample_files;
 mod static_assets;
 mod sync;
 pub mod telemetry;
+pub mod tool_executor;
+pub mod tool_injection;
 mod types;
 pub mod webhooks;
 
@@ -256,6 +258,9 @@ where
     pub request_manager: Arc<fusillade::PostgresRequestManager<P, fusillade::ReqwestHttpClient>>,
     /// Resource limiters for protecting system capacity.
     pub limiters: limits::Limiters,
+    /// Per-request tool registry shared with the HttpToolExecutor.
+    #[builder(default = Arc::new(crate::tool_executor::PerRequestToolRegistry::new()))]
+    pub tool_registry: Arc<crate::tool_executor::PerRequestToolRegistry>,
 }
 
 /// Get the dwctl database migrator
@@ -1165,6 +1170,38 @@ pub async fn build_router(
         .route(
             "/monitoring/pending-request-counts",
             get(api::handlers::queue::get_pending_request_counts),
+        )
+        // Tool sources CRUD
+        .route("/tool-sources", get(api::handlers::tool_sources::list_tool_sources))
+        .route("/tool-sources", post(api::handlers::tool_sources::create_tool_source))
+        .route("/tool-sources/{id}", get(api::handlers::tool_sources::get_tool_source))
+        .route("/tool-sources/{id}", patch(api::handlers::tool_sources::update_tool_source))
+        .route("/tool-sources/{id}", delete(api::handlers::tool_sources::delete_tool_source))
+        // Tool sources ↔ deployment attachment
+        .route(
+            "/deployments/{id}/tool-sources",
+            get(api::handlers::tool_sources::list_deployment_tool_sources),
+        )
+        .route(
+            "/deployments/{id}/tool-sources/{source_id}",
+            axum::routing::put(api::handlers::tool_sources::attach_tool_source_to_deployment),
+        )
+        .route(
+            "/deployments/{id}/tool-sources/{source_id}",
+            delete(api::handlers::tool_sources::detach_tool_source_from_deployment),
+        )
+        // Tool sources ↔ group attachment
+        .route(
+            "/groups/{id}/tool-sources",
+            get(api::handlers::tool_sources::list_group_tool_sources),
+        )
+        .route(
+            "/groups/{id}/tool-sources/{source_id}",
+            axum::routing::put(api::handlers::tool_sources::attach_tool_source_to_group),
+        )
+        .route(
+            "/groups/{id}/tool-sources/{source_id}",
+            delete(api::handlers::tool_sources::detach_tool_source_from_group),
         );
 
     let api_routes_with_state = api_routes.with_state(state.clone());
@@ -1220,6 +1257,17 @@ pub async fn build_router(
 
     // Serve embedded static assets, falling back to SPA for unmatched routes
     let fallback = get(api::handlers::static_assets::serve_embedded_asset).fallback(get(api::handlers::static_assets::spa_fallback));
+
+    // Apply tool injection middleware to the onwards router so that per-request tool
+    // schemas are resolved and injected into the request body before onwards processes it.
+    let tool_injection_state = crate::tool_injection::ToolInjectionState {
+        db: state.db.write().clone(),
+        registry: state.tool_registry.clone(),
+    };
+    let onwards_router = onwards_router.layer(middleware::from_fn_with_state(
+        tool_injection_state,
+        crate::tool_injection::tool_injection_middleware,
+    ));
 
     // Apply error enrichment middleware to onwards router (before outlet logging)
     let onwards_router = onwards_router.layer(middleware::from_fn_with_state(
@@ -2112,9 +2160,19 @@ impl Application {
         // Embeddings don't support streaming.
         let body_transform: onwards::BodyTransformFn = Arc::new(request_logging::stream_usage::stream_usage_transform);
 
-        // Build onwards router from targets with body transform and response sanitization
+        // Create the per-request tool registry and HTTP tool executor.
+        let tool_registry = Arc::new(crate::tool_executor::PerRequestToolRegistry::new());
+        let reqwest_client = reqwest::Client::new();
+        let tool_executor = crate::tool_executor::HttpToolExecutor::new(
+            tool_registry.clone(),
+            reqwest_client,
+            Some(Arc::new(db_pools.write().clone())),
+        );
+
+        // Build onwards router from targets with body transform, response sanitization, and tool executor.
         let onwards_app_state = onwards::AppState::with_transform(bg_services.onwards_targets.clone(), body_transform)
-            .with_response_transform(onwards::create_openai_sanitizer());
+            .with_response_transform(onwards::create_openai_sanitizer())
+            .with_tool_executor(Arc::new(tool_executor));
         let onwards_router = if bg_services.onwards_targets.strict_mode {
             tracing::info!("Strict mode enabled - using typed request validation");
             onwards::strict::build_strict_router(onwards_app_state)
@@ -2133,6 +2191,7 @@ impl Application {
             .request_manager(bg_services.request_manager.clone())
             .maybe_outlet_db(outlet_pools.clone())
             .limiters(limiters)
+            .tool_registry(tool_registry)
             .build();
 
         let router = build_router(

@@ -118,6 +118,7 @@ pub enum Resource {
     Webhooks,
     System,
     Organizations,
+    ToolSources,
 }
 
 // Permission types for authorization
