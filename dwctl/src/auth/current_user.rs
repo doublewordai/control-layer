@@ -298,7 +298,7 @@ async fn try_api_key_auth(parts: &axum::http::request::Parts, db: &PgPool) -> Op
     };
     let api_key_result = match sqlx::query!(
         r#"
-        SELECT ak.user_id, ak.purpose, u.username, u.email, u.is_admin, u.display_name, u.avatar_url, u.payment_provider_id, u.last_login
+        SELECT ak.user_id, ak.created_by, ak.purpose, u.username, u.email, u.is_admin, u.display_name, u.avatar_url, u.payment_provider_id, u.last_login
         FROM api_keys ak
         INNER JOIN users u ON ak.user_id = u.id
         WHERE ak.secret = $1 AND ak.is_deleted = false
@@ -367,9 +367,20 @@ async fn try_api_key_auth(parts: &axum::http::request::Parts, db: &PgPool) -> Op
         Err(e) => return Some(Err(DbError::from(e).into())),
     };
 
+    // When the API key was created by a different user (org member creating a key
+    // scoped to the org), set id to the individual creator and active_organization
+    // to the org. This mirrors the cookie auth shape so downstream code correctly
+    // attributes resources to the individual while scoping billing to the org.
+    let is_org_key = api_key_data.created_by != api_key_data.user_id;
+    let (effective_id, active_organization) = if is_org_key {
+        (api_key_data.created_by, Some(api_key_data.user_id))
+    } else {
+        (api_key_data.user_id, None)
+    };
+
     Some(Ok((
         CurrentUser {
-            id: api_key_data.user_id,
+            id: effective_id,
             username: api_key_data.username,
             email: api_key_data.email,
             is_admin: api_key_data.is_admin,
@@ -378,7 +389,7 @@ async fn try_api_key_auth(parts: &axum::http::request::Parts, db: &PgPool) -> Op
             avatar_url: api_key_data.avatar_url,
             payment_provider_id: api_key_data.payment_provider_id,
             organizations: vec![],
-            active_organization: None,
+            active_organization,
         },
         api_key_data.last_login,
     )))
