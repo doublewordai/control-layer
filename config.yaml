@@ -373,6 +373,14 @@ background_services:
     #     escalation_model: o1-preview  # Route to this model when near expiry
     #     escalation_threshold_seconds: 900  # Default: 900 (15 minutes before expiry)
 
+    # Endpoints that should use SSE streaming for usage tracking.
+    # Batch requests to these paths are sent with X-Fusillade-Stream: true,
+    # causing the upstream proxy to inject stream: true and stream_options.include_usage.
+    # The streamed response is reassembled into non-streaming JSON before storage.
+    streamable_endpoints:
+      - /v1/chat/completions
+      - /v1/completions
+
   # Batch completion notifications (emails + webhooks)
   # notifications:
   #   poll_interval: 30s                # How often to poll for completed batches
