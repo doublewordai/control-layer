@@ -40,6 +40,7 @@ BEGIN
     UPDATE http_analytics
        SET effective_batch_sla = batch_sla
      WHERE batch_sla <> ''
+       AND effective_batch_sla = ''
        AND id > _last_id
        AND id <= _batch_max;
 
