@@ -1420,7 +1420,7 @@ checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
 name = "dwctl"
-version = "8.18.1"
+version = "8.19.2"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -1781,7 +1781,9 @@ checksum = "e6d5a32815ae3f33302d95fdcb2ce17862f8c65363dcfd29360480ba1001fc9c"
 
 [[package]]
 name = "fusillade"
-version = "11.0.0"
+version = "11.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "171af1e15ec9e926d5e5b69f6e203c2e8a63f5536f3a214c4ca606bccbd0188f"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3263,9 +3265,9 @@ dependencies = [
 
 [[package]]
 name = "outlet"
-version = "0.7.0"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "912fa05ac7da27693b4ed09ddd23ab5500709ab0ccb8cfa4fe555ddcfed620ae"
+checksum = "bc2267a2dcdc06dc06dc701bd768ee9b6ca9f12567094477898c1d8108e9b407"
 dependencies = [
  "anyhow",
  "axum",
@@ -3287,9 +3289,9 @@ dependencies = [
 
 [[package]]
 name = "outlet-postgres"
-version = "0.5.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "db3a719d22d42d479a0fa325eab9f2896bef59a119e7a82d58a655e16000c7f8"
+checksum = "bbad5c8c879e6f2450ccd8bc02a7ad6003c43c00159ca77ad00d7df86c67ada6"
 dependencies = [
  "base64",
  "bytes",

@@ -964,6 +964,7 @@ pub async fn build_router(
                 capture_request_body: true,
                 capture_response_body: true,
                 path_filter: None, // No path filter needed - applied directly to ai_router
+                ..Default::default()
             };
             Some(RequestLoggerLayer::new(outlet_config, multi_handler))
         }
