@@ -279,7 +279,7 @@ async fn test_sla_waterfall_all_tiers(pool: PgPool) {
             onwards_ready = true;
             break;
         }
-        tokio::task::yield_now().await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
     }
     assert!(onwards_ready, "Onwards sync did not pick up model config");
 
