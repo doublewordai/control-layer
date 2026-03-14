@@ -143,6 +143,19 @@ where
     onwards_sync_notification_interval: Duration,
 }
 
+/// Which fallback path `find_best_tariff` used to resolve pricing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TariffMatch {
+    /// Matched a tariff with the exact purpose + completion_window.
+    ExactWindow,
+    /// Matched a generic tariff for the purpose (completion_window IS NULL).
+    GenericPurpose,
+    /// Fell back to a generic realtime tariff (purpose was not realtime).
+    RealtimeFallback,
+    /// No valid tariff found.
+    NoMatch,
+}
+
 impl<M> AnalyticsBatcher<M>
 where
     M: MetricsRecorder + Clone + Send + Sync + 'static,
@@ -479,8 +492,8 @@ where
                     };
 
                     // Find best matching tariff using the effective (possibly downgraded) window
-                    let (input, output) = if effective_sla == "free" {
-                        (Some(Decimal::ZERO), Some(Decimal::ZERO))
+                    let (input, output, tariff_match) = if effective_sla == "free" {
+                        (Some(Decimal::ZERO), Some(Decimal::ZERO), TariffMatch::ExactWindow)
                     } else {
                         self.find_best_tariff(
                             &model_info.tariffs,
@@ -495,17 +508,17 @@ where
                     // missing batch_created_at still get the submitted window recorded
                     // via resolve_effective_batch_sla's passthrough.
                     //
-                    // Tie the recorded SLA to the window actually used for tariff selection:
-                    // - "free" remains explicit (no tariff lookup happened).
-                    // - If a concrete window was passed to find_best_tariff, record that.
-                    // - If no window was used (generic completion_window IS NULL fallback
-                    //   inside find_best_tariff), mark as "generic_fallback" so we can
-                    //   distinguish it from a real window match in analytics.
+                    // Tie the recorded SLA to the tariff actually matched:
+                    // - "free": exceeded all windows, no tariff lookup happened.
+                    // - ExactWindow: tariff matched the effective window — record that window.
+                    // - GenericPurpose/RealtimeFallback/NoMatch: no window-specific tariff
+                    //   existed, so record "generic_fallback" to avoid falsely suggesting
+                    //   a window-tier match in analytics.
                     let final_sla = if raw.batch_completion_window.is_some() {
                         if effective_sla == "free" {
                             "free".to_string()
-                        } else if let Some(ref window) = effective_window {
-                            window.clone()
+                        } else if tariff_match == TariffMatch::ExactWindow {
+                            effective_sla
                         } else {
                             "generic_fallback".to_string()
                         }
@@ -651,13 +664,16 @@ where
     /// 1. Try exact match (purpose + completion_window + timestamp)
     /// 2. Fall back to generic tariff for that purpose (completion_window = None)
     /// 3. Fall back to realtime purpose (generic)
+    ///
+    /// Returns prices and which fallback path was used, so callers can
+    /// distinguish an exact window match from a generic fallback in analytics.
     fn find_best_tariff(
         &self,
         tariffs: &[TariffInfo],
         api_key_purpose: Option<&ApiKeyPurpose>,
         completion_window: Option<&str>,
         timestamp: DateTime<Utc>,
-    ) -> (Option<Decimal>, Option<Decimal>) {
+    ) -> (Option<Decimal>, Option<Decimal>, TariffMatch) {
         let purpose = api_key_purpose.unwrap_or(&ApiKeyPurpose::Realtime);
 
         // Filter tariffs valid at timestamp:
@@ -673,7 +689,11 @@ where
                 .iter()
                 .find(|t| &t.purpose == purpose && t.completion_window.as_deref() == Some(cw))
         {
-            return (Some(tariff.input_price_per_token), Some(tariff.output_price_per_token));
+            return (
+                Some(tariff.input_price_per_token),
+                Some(tariff.output_price_per_token),
+                TariffMatch::ExactWindow,
+            );
         }
 
         // Try generic tariff for this purpose (completion_window = None)
@@ -682,7 +702,11 @@ where
             .iter()
             .find(|t| &t.purpose == purpose && t.completion_window.is_none())
         {
-            return (Some(tariff.input_price_per_token), Some(tariff.output_price_per_token));
+            return (
+                Some(tariff.input_price_per_token),
+                Some(tariff.output_price_per_token),
+                TariffMatch::GenericPurpose,
+            );
         }
 
         // Fall back to generic realtime tariff
@@ -691,10 +715,14 @@ where
                 .iter()
                 .find(|t| t.purpose == ApiKeyPurpose::Realtime && t.completion_window.is_none())
         {
-            return (Some(tariff.input_price_per_token), Some(tariff.output_price_per_token));
+            return (
+                Some(tariff.input_price_per_token),
+                Some(tariff.output_price_per_token),
+                TariffMatch::RealtimeFallback,
+            );
         }
 
-        (None, None)
+        (None, None, TariffMatch::NoMatch)
     }
 
     /// Write enriched records to the database in a single transaction.
@@ -1373,7 +1401,7 @@ mod tests {
         api_key_purpose: Option<&ApiKeyPurpose>,
         completion_window: Option<&str>,
         timestamp: DateTime<Utc>,
-    ) -> (Option<Decimal>, Option<Decimal>) {
+    ) -> (Option<Decimal>, Option<Decimal>, TariffMatch) {
         let purpose = api_key_purpose.unwrap_or(&ApiKeyPurpose::Realtime);
 
         let valid_tariffs: Vec<_> = tariffs
@@ -1386,14 +1414,22 @@ mod tests {
                 .iter()
                 .find(|t| &t.purpose == purpose && t.completion_window.as_deref() == Some(cw))
         {
-            return (Some(tariff.input_price_per_token), Some(tariff.output_price_per_token));
+            return (
+                Some(tariff.input_price_per_token),
+                Some(tariff.output_price_per_token),
+                TariffMatch::ExactWindow,
+            );
         }
 
         if let Some(tariff) = valid_tariffs
             .iter()
             .find(|t| &t.purpose == purpose && t.completion_window.is_none())
         {
-            return (Some(tariff.input_price_per_token), Some(tariff.output_price_per_token));
+            return (
+                Some(tariff.input_price_per_token),
+                Some(tariff.output_price_per_token),
+                TariffMatch::GenericPurpose,
+            );
         }
 
         if purpose != &ApiKeyPurpose::Realtime
@@ -1401,10 +1437,14 @@ mod tests {
                 .iter()
                 .find(|t| t.purpose == ApiKeyPurpose::Realtime && t.completion_window.is_none())
         {
-            return (Some(tariff.input_price_per_token), Some(tariff.output_price_per_token));
+            return (
+                Some(tariff.input_price_per_token),
+                Some(tariff.output_price_per_token),
+                TariffMatch::RealtimeFallback,
+            );
         }
 
-        (None, None)
+        (None, None, TariffMatch::NoMatch)
     }
 
     #[test]
@@ -1419,9 +1459,10 @@ mod tests {
             None,
         )];
 
-        let (input, output) = find_tariff(&tariffs, Some(&ApiKeyPurpose::Realtime), None, now);
+        let (input, output, tariff_match) = find_tariff(&tariffs, Some(&ApiKeyPurpose::Realtime), None, now);
         assert_eq!(input, Some(Decimal::from_str("0.00010").unwrap()));
         assert_eq!(output, Some(Decimal::from_str("0.00020").unwrap()));
+        assert_eq!(tariff_match, TariffMatch::GenericPurpose);
     }
 
     #[test]
@@ -1447,14 +1488,16 @@ mod tests {
         ];
 
         // Batch purpose should get batch pricing
-        let (input, output) = find_tariff(&tariffs, Some(&ApiKeyPurpose::Batch), None, now);
+        let (input, output, tariff_match) = find_tariff(&tariffs, Some(&ApiKeyPurpose::Batch), None, now);
         assert_eq!(input, Some(Decimal::from_str("0.00005").unwrap()));
         assert_eq!(output, Some(Decimal::from_str("0.00010").unwrap()));
+        assert_eq!(tariff_match, TariffMatch::GenericPurpose);
 
         // Realtime purpose should get realtime pricing
-        let (input, output) = find_tariff(&tariffs, Some(&ApiKeyPurpose::Realtime), None, now);
+        let (input, output, tariff_match) = find_tariff(&tariffs, Some(&ApiKeyPurpose::Realtime), None, now);
         assert_eq!(input, Some(Decimal::from_str("0.00010").unwrap()));
         assert_eq!(output, Some(Decimal::from_str("0.00020").unwrap()));
+        assert_eq!(tariff_match, TariffMatch::GenericPurpose);
     }
 
     #[test]
@@ -1471,9 +1514,10 @@ mod tests {
         )];
 
         // Batch purpose with no batch tariff should fall back to realtime
-        let (input, output) = find_tariff(&tariffs, Some(&ApiKeyPurpose::Batch), None, now);
+        let (input, output, tariff_match) = find_tariff(&tariffs, Some(&ApiKeyPurpose::Batch), None, now);
         assert_eq!(input, Some(Decimal::from_str("0.00015").unwrap()));
         assert_eq!(output, Some(Decimal::from_str("0.00030").unwrap()));
+        assert_eq!(tariff_match, TariffMatch::RealtimeFallback);
     }
 
     #[test]
@@ -1507,7 +1551,7 @@ mod tests {
         ];
 
         // Current request should use new pricing
-        let (input, output) = find_tariff(&tariffs, Some(&ApiKeyPurpose::Realtime), None, now);
+        let (input, output, _) = find_tariff(&tariffs, Some(&ApiKeyPurpose::Realtime), None, now);
         assert_eq!(
             input,
             Some(Decimal::from_str("0.00010").unwrap()),
@@ -1517,7 +1561,7 @@ mod tests {
 
         // Historical request (20 days ago) should use old pricing
         let historical_time = now - chrono::Duration::days(20);
-        let (input, output) = find_tariff(&tariffs, Some(&ApiKeyPurpose::Realtime), None, historical_time);
+        let (input, output, _) = find_tariff(&tariffs, Some(&ApiKeyPurpose::Realtime), None, historical_time);
         assert_eq!(
             input,
             Some(Decimal::from_str("0.00020").unwrap()),
@@ -1552,22 +1596,24 @@ mod tests {
         ];
 
         // Request with 24h completion window should get the priority-specific pricing
-        let (input, output) = find_tariff(&tariffs, Some(&ApiKeyPurpose::Batch), Some("24h"), now);
+        let (input, output, tariff_match) = find_tariff(&tariffs, Some(&ApiKeyPurpose::Batch), Some("24h"), now);
         assert_eq!(
             input,
             Some(Decimal::from_str("0.00005").unwrap()),
             "24h priority should get specific pricing"
         );
         assert_eq!(output, Some(Decimal::from_str("0.00010").unwrap()));
+        assert_eq!(tariff_match, TariffMatch::ExactWindow);
 
         // Request without completion window should get generic batch pricing
-        let (input, output) = find_tariff(&tariffs, Some(&ApiKeyPurpose::Batch), None, now);
+        let (input, output, tariff_match) = find_tariff(&tariffs, Some(&ApiKeyPurpose::Batch), None, now);
         assert_eq!(
             input,
             Some(Decimal::from_str("0.00010").unwrap()),
             "No priority should get generic pricing"
         );
         assert_eq!(output, Some(Decimal::from_str("0.00020").unwrap()));
+        assert_eq!(tariff_match, TariffMatch::GenericPurpose);
     }
 
     #[test]
@@ -1605,13 +1651,14 @@ mod tests {
         ];
 
         // Request with unknown "1h" priority should fall back to generic, NOT to 24h or 7d
-        let (input, output) = find_tariff(&tariffs, Some(&ApiKeyPurpose::Batch), Some("1h"), now);
+        let (input, output, tariff_match) = find_tariff(&tariffs, Some(&ApiKeyPurpose::Batch), Some("1h"), now);
         assert_eq!(
             input,
             Some(Decimal::from_str("0.00010").unwrap()),
             "Unknown priority should fall back to generic, not another priority"
         );
         assert_eq!(output, Some(Decimal::from_str("0.00020").unwrap()));
+        assert_eq!(tariff_match, TariffMatch::GenericPurpose);
     }
 
     #[test]
@@ -1619,9 +1666,10 @@ mod tests {
         let now = chrono::Utc::now();
         let tariffs = vec![];
 
-        let (input, output) = find_tariff(&tariffs, Some(&ApiKeyPurpose::Realtime), None, now);
+        let (input, output, tariff_match) = find_tariff(&tariffs, Some(&ApiKeyPurpose::Realtime), None, now);
         assert_eq!(input, None);
         assert_eq!(output, None);
+        assert_eq!(tariff_match, TariffMatch::NoMatch);
     }
 
     #[test]
@@ -1637,9 +1685,10 @@ mod tests {
             None,
         )];
 
-        let (input, output) = find_tariff(&tariffs, Some(&ApiKeyPurpose::Realtime), None, now);
+        let (input, output, tariff_match) = find_tariff(&tariffs, Some(&ApiKeyPurpose::Realtime), None, now);
         assert_eq!(input, None, "Future tariff should not be selected");
         assert_eq!(output, None);
+        assert_eq!(tariff_match, TariffMatch::NoMatch);
     }
 
     /// Helper to call the standalone resolve_effective_batch_sla without pre-parsed windows
