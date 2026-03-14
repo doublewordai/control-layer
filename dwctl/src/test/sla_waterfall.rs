@@ -8,8 +8,10 @@
 //!   through to cheaper pricing (e.g. "24h")
 //! - Requests completing after all configured windows → free
 //!
-//! The waterfall is implemented in `batcher.rs` and records the effective tier
-//! in the `effective_batch_sla` column of `http_analytics`.
+//! The waterfall is implemented in `batcher.rs`. The effective tier is not stored
+//! in the database — it can be derived from the request timestamps and tariffs.
+//! This test verifies the correct pricing was applied by grouping on
+//! `input_price_per_token`.
 //!
 //! Instead of running the fusillade daemon, this test sends requests directly to
 //! the onwards proxy with the batch headers that the analytics handler extracts.
@@ -36,43 +38,35 @@ const OUTPUT_1H: &str = "0.00002000";
 const INPUT_24H: &str = "0.00000100";
 const OUTPUT_24H: &str = "0.00000200";
 
-/// SLA tier breakdown from http_analytics
+/// Pricing tier breakdown from http_analytics
 #[derive(Debug)]
-struct SlaTierResult {
-    effective_batch_sla: String,
+struct PricingTierResult {
+    input_price: Decimal,
+    output_price: Decimal,
     count: i64,
-    min_input_price: Decimal,
-    min_output_price: Decimal,
-    max_input_price: Decimal,
-    max_output_price: Decimal,
 }
 
-/// Query the SLA breakdown for a batch from http_analytics.
-/// Selects both MIN and MAX prices to detect inconsistent pricing within a tier.
-async fn get_sla_breakdown(pool: &PgPool, batch_id: Uuid) -> Vec<SlaTierResult> {
-    sqlx::query_as::<_, (String, i64, Decimal, Decimal, Decimal, Decimal)>(
+/// Query the pricing breakdown for a batch from http_analytics.
+/// Groups by price to verify each tier has the expected number of requests.
+async fn get_pricing_breakdown(pool: &PgPool, batch_id: Uuid) -> Vec<PricingTierResult> {
+    sqlx::query_as::<_, (Decimal, Decimal, i64)>(
         r#"
-        SELECT effective_batch_sla, COUNT(*),
-               MIN(input_price_per_token), MIN(output_price_per_token),
-               MAX(input_price_per_token), MAX(output_price_per_token)
+        SELECT input_price_per_token, output_price_per_token, COUNT(*)
         FROM http_analytics
         WHERE fusillade_batch_id = $1 AND status_code BETWEEN 200 AND 299
-        GROUP BY effective_batch_sla
-        ORDER BY effective_batch_sla
+        GROUP BY input_price_per_token, output_price_per_token
+        ORDER BY input_price_per_token DESC
         "#,
     )
     .bind(batch_id)
     .fetch_all(pool)
     .await
-    .expect("Failed to query SLA breakdown")
+    .expect("Failed to query pricing breakdown")
     .into_iter()
-    .map(|(sla, count, min_in, min_out, max_in, max_out)| SlaTierResult {
-        effective_batch_sla: sla,
+    .map(|(input, output, count)| PricingTierResult {
+        input_price: input,
+        output_price: output,
         count,
-        min_input_price: min_in,
-        min_output_price: min_out,
-        max_input_price: max_in,
-        max_output_price: max_out,
     })
     .collect()
 }
@@ -347,56 +341,36 @@ async fn test_sla_waterfall_all_tiers(pool: PgPool) {
     // Wait for all 6 analytics rows to be flushed by the batcher
     wait_for_analytics(&pool, batch_id, 6, 30).await;
 
-    let breakdown = get_sla_breakdown(&pool, batch_id).await;
-    tracing::info!(?breakdown, "SLA waterfall breakdown");
+    let breakdown = get_pricing_breakdown(&pool, batch_id).await;
+    tracing::info!(?breakdown, "SLA waterfall pricing breakdown");
 
-    assert_eq!(breakdown.len(), 3, "Expected exactly 3 tiers, got: {:?}", breakdown);
+    assert_eq!(breakdown.len(), 3, "Expected exactly 3 pricing tiers, got: {:?}", breakdown);
 
-    let tier_1h = breakdown.iter().find(|t| t.effective_batch_sla == "1h").expect("Missing 1h tier");
-    let tier_24h = breakdown.iter().find(|t| t.effective_batch_sla == "24h").expect("Missing 24h tier");
+    // Sorted by input_price DESC: 1h (highest) → 24h → free (zero)
+    let tier_1h = breakdown
+        .iter()
+        .find(|t| t.input_price == Decimal::from_str(INPUT_1H).unwrap())
+        .expect("Missing 1h pricing tier");
+    let tier_24h = breakdown
+        .iter()
+        .find(|t| t.input_price == Decimal::from_str(INPUT_24H).unwrap())
+        .expect("Missing 24h pricing tier");
     let tier_free = breakdown
         .iter()
-        .find(|t| t.effective_batch_sla == "free")
-        .expect("Missing free tier");
+        .find(|t| t.input_price == Decimal::ZERO)
+        .expect("Missing free pricing tier");
 
-    // 1h tier: 2 requests at 1h pricing, all consistently priced
+    // 1h tier: 2 requests at 1h pricing
     assert_eq!(tier_1h.count, 2);
-    assert_eq!(tier_1h.min_input_price, Decimal::from_str(INPUT_1H).unwrap());
-    assert_eq!(tier_1h.min_output_price, Decimal::from_str(OUTPUT_1H).unwrap());
-    assert_eq!(
-        tier_1h.min_input_price, tier_1h.max_input_price,
-        "1h tier has inconsistent input pricing"
-    );
-    assert_eq!(
-        tier_1h.min_output_price, tier_1h.max_output_price,
-        "1h tier has inconsistent output pricing"
-    );
+    assert_eq!(tier_1h.output_price, Decimal::from_str(OUTPUT_1H).unwrap());
 
-    // 24h tier: 2 requests at 24h pricing, all consistently priced
+    // 24h tier: 2 requests at 24h pricing (waterfall from 1h)
     assert_eq!(tier_24h.count, 2);
-    assert_eq!(tier_24h.min_input_price, Decimal::from_str(INPUT_24H).unwrap());
-    assert_eq!(tier_24h.min_output_price, Decimal::from_str(OUTPUT_24H).unwrap());
-    assert_eq!(
-        tier_24h.min_input_price, tier_24h.max_input_price,
-        "24h tier has inconsistent input pricing"
-    );
-    assert_eq!(
-        tier_24h.min_output_price, tier_24h.max_output_price,
-        "24h tier has inconsistent output pricing"
-    );
+    assert_eq!(tier_24h.output_price, Decimal::from_str(OUTPUT_24H).unwrap());
 
-    // free tier: 2 requests at zero pricing, all consistently priced
+    // free tier: 2 requests at zero pricing (exceeded all windows)
     assert_eq!(tier_free.count, 2);
-    assert_eq!(tier_free.min_input_price, Decimal::ZERO);
-    assert_eq!(tier_free.min_output_price, Decimal::ZERO);
-    assert_eq!(
-        tier_free.min_input_price, tier_free.max_input_price,
-        "free tier has inconsistent input pricing"
-    );
-    assert_eq!(
-        tier_free.min_output_price, tier_free.max_output_price,
-        "free tier has inconsistent output pricing"
-    );
+    assert_eq!(tier_free.output_price, Decimal::ZERO);
 
     drop(bg_services);
 }

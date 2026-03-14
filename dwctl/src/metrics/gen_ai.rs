@@ -314,7 +314,6 @@ mod tests {
             request_origin: "api".to_string(),
             batch_sla: String::new(),
             batch_request_source: String::new(),
-            effective_batch_sla: String::new(),
         };
 
         // Call the function under test
@@ -430,7 +429,6 @@ mod tests {
             request_origin: "api".to_string(),
             batch_sla: String::new(),
             batch_request_source: String::new(),
-            effective_batch_sla: String::new(),
         };
 
         metrics.record_from_analytics(&row).await;
@@ -494,7 +492,6 @@ mod tests {
             request_origin: "api".to_string(),
             batch_sla: String::new(),
             batch_request_source: String::new(),
-            effective_batch_sla: String::new(),
         };
 
         metrics.record_from_analytics(&row).await;
@@ -569,7 +566,6 @@ mod tests {
             request_origin: "api".to_string(),
             batch_sla: String::new(),
             batch_request_source: String::new(),
-            effective_batch_sla: String::new(),
         };
 
         metrics.record_from_analytics(&row).await;
@@ -630,7 +626,6 @@ mod tests {
             request_origin: "api".to_string(),
             batch_sla: String::new(),
             batch_request_source: String::new(),
-            effective_batch_sla: String::new(),
         };
 
         metrics.record_from_analytics(&row).await;
@@ -694,7 +689,6 @@ mod tests {
             request_origin: "api".to_string(),
             batch_sla: String::new(),
             batch_request_source: String::new(),
-            effective_batch_sla: String::new(),
         };
 
         metrics.record_from_analytics(&row).await;
@@ -755,7 +749,6 @@ mod tests {
             request_origin: "api".to_string(),
             batch_sla: String::new(),
             batch_request_source: String::new(),
-            effective_batch_sla: String::new(),
         };
 
         metrics.record_from_analytics(&row).await;
@@ -811,7 +804,6 @@ mod tests {
                 request_origin: "api".to_string(),
                 batch_sla: String::new(),
                 batch_request_source: String::new(),
-                effective_batch_sla: String::new(),
             };
 
             metrics.record_from_analytics(&row).await;
@@ -865,7 +857,6 @@ mod tests {
             request_origin: "api".to_string(),
             batch_sla: String::new(),
             batch_request_source: String::new(),
-            effective_batch_sla: String::new(),
         };
 
         metrics.record_from_analytics(&row).await;
