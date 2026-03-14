@@ -118,6 +118,7 @@ pub struct HttpAnalyticsRow {
     /// Only populated for batch requests (has batch_completion_window); "" otherwise.
     /// Values: completion_window string (e.g. "1h", "24h"),
     ///         "free" if the request exceeded all configured windows,
+    ///         "generic_fallback" if no exact window tariff matched,
     ///         or "" for non-batch requests.
     pub effective_batch_sla: String,
 }

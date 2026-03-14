@@ -494,8 +494,21 @@ where
                     // Use batch_completion_window (not is_batch_request) so requests
                     // missing batch_created_at still get the submitted window recorded
                     // via resolve_effective_batch_sla's passthrough.
+                    //
+                    // Tie the recorded SLA to the window actually used for tariff selection:
+                    // - "free" remains explicit (no tariff lookup happened).
+                    // - If a concrete window was passed to find_best_tariff, record that.
+                    // - If no window was used (generic completion_window IS NULL fallback
+                    //   inside find_best_tariff), mark as "generic_fallback" so we can
+                    //   distinguish it from a real window match in analytics.
                     let final_sla = if raw.batch_completion_window.is_some() {
-                        effective_sla
+                        if effective_sla == "free" {
+                            "free".to_string()
+                        } else if let Some(ref window) = effective_window {
+                            window.clone()
+                        } else {
+                            "generic_fallback".to_string()
+                        }
                     } else {
                         String::new()
                     };
