@@ -454,11 +454,12 @@ where
                     // This ensures batch requests are priced as of batch creation, not processing time
                     let pricing_timestamp = raw.batch_created_at.unwrap_or(raw.timestamp);
 
-                    // Only run waterfall logic for batch requests with both a completion window
-                    // and a batch creation time — skip cache/parsing for non-batch records
-                    let is_batch_request = raw.batch_completion_window.is_some() && raw.batch_created_at.is_some();
+                    // Waterfall requires both a completion window and batch creation time to
+                    // compute elapsed time. Batch requests missing either field skip the
+                    // waterfall and are priced at the submitted window as-is.
+                    let can_apply_waterfall = raw.batch_completion_window.is_some() && raw.batch_created_at.is_some();
 
-                    let (effective_window, effective_sla) = if is_batch_request {
+                    let (effective_window, effective_sla) = if can_apply_waterfall {
                         // Actual request completion time = request start + duration
                         let completed_at = raw.timestamp + chrono::Duration::milliseconds(raw.duration_ms);
 
@@ -484,7 +485,8 @@ where
                             Some(sorted_windows),
                         )
                     } else {
-                        // Non-batch request: no waterfall, pass through the submitted window as-is
+                        // No waterfall: either a non-batch request or a batch request missing
+                        // metadata (e.g. batch_created_at). Pass through the submitted window as-is.
                         (
                             raw.batch_completion_window.clone(),
                             raw.batch_completion_window.as_deref().unwrap_or_default().to_string(),
@@ -493,7 +495,7 @@ where
 
                     // Find best matching tariff using the effective (possibly downgraded) window
                     let (input, output, tariff_match) = if effective_sla == "free" {
-                        (Some(Decimal::ZERO), Some(Decimal::ZERO), TariffMatch::ExactWindow)
+                        (Some(Decimal::ZERO), Some(Decimal::ZERO), TariffMatch::NoMatch)
                     } else {
                         self.find_best_tariff(
                             &model_info.tariffs,
