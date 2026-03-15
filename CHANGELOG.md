@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.20.0](https://github.com/doublewordai/control-layer/compare/v8.19.2...v8.20.0) (2026-03-15)
+
+
+### Features
+
+* bill based on completion time ([#876](https://github.com/doublewordai/control-layer/issues/876)) ([88e923d](https://github.com/doublewordai/control-layer/commit/88e923dc7af2238f61b3f58dcb42c4ec147bacb4))
+
 ## [8.19.2](https://github.com/doublewordai/control-layer/compare/v8.19.1...v8.19.2) (2026-03-12)
 
 
