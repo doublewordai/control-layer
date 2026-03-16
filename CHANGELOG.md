@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.21.0](https://github.com/doublewordai/control-layer/compare/v8.20.0...v8.21.0) (2026-03-16)
+
+
+### Features
+
+* server side active first sorting ([#864](https://github.com/doublewordai/control-layer/issues/864)) ([5b6dfd7](https://github.com/doublewordai/control-layer/commit/5b6dfd75562cd3ee066ec23d84dbc625c8753f31))
+
 ## [8.20.0](https://github.com/doublewordai/control-layer/compare/v8.19.2...v8.20.0) (2026-03-15)
 
 
