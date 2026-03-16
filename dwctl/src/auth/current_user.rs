@@ -296,11 +296,15 @@ async fn try_api_key_auth(parts: &axum::http::request::Parts, db: &PgPool) -> Op
         Ok(conn) => conn,
         Err(e) => return Some(Err(DbError::from(e).into())),
     };
+    // Join on created_by so CurrentUser always represents the actual human.
+    // user_id may be an org (for org-scoped keys) — we only use it for active_organization.
     let api_key_result = match sqlx::query!(
         r#"
-        SELECT ak.user_id, ak.created_by, ak.purpose, u.username, u.email, u.is_admin, u.display_name, u.avatar_url, u.payment_provider_id, u.last_login
+        SELECT ak.user_id, ak.created_by, ak.purpose,
+               u.username, u.email, u.is_admin, u.display_name, u.avatar_url,
+               u.payment_provider_id, u.last_login
         FROM api_keys ak
-        INNER JOIN users u ON ak.user_id = u.id
+        INNER JOIN users u ON ak.created_by = u.id
         WHERE ak.secret = $1 AND ak.is_deleted = false
         "#,
         api_key
@@ -351,14 +355,14 @@ async fn try_api_key_auth(parts: &axum::http::request::Parts, db: &PgPool) -> Op
         }));
     }
 
-    // Get user roles
+    // Get the creator's roles (not the org's)
     let roles = match sqlx::query_scalar!(
         r#"
         SELECT role as "role!: Role"
         FROM user_roles
         WHERE user_id = $1
         "#,
-        api_key_data.user_id
+        api_key_data.created_by
     )
     .fetch_all(&mut *conn)
     .await
@@ -367,9 +371,8 @@ async fn try_api_key_auth(parts: &axum::http::request::Parts, db: &PgPool) -> Op
         Err(e) => return Some(Err(DbError::from(e).into())),
     };
 
-    // created_by is always the individual user's account ID. For org-scoped keys,
-    // user_id is the org — set it as active_organization so downstream code
-    // attributes resources to the individual while scoping billing to the org.
+    // For org-scoped keys (created_by != user_id), user_id is the org.
+    // For personal keys, created_by == user_id so no org context.
     let active_organization = if api_key_data.created_by != api_key_data.user_id {
         Some(api_key_data.user_id)
     } else {
