@@ -121,9 +121,10 @@ pub async fn create_organization<P: PoolProvider>(
         created_by: owner_id,
     };
 
+    let config = state.current_config();
     let mut pool_conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut repo = Organizations::new(&mut pool_conn);
-    let org = repo.create(&db_request, &state.config.auth.default_user_roles).await?;
+    let org = repo.create(&db_request, &config.auth.default_user_roles).await?;
 
     let response = OrganizationResponse::from_user(UserResponse::from(org)).with_member_count(1);
 
