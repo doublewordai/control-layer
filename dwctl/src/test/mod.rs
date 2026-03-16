@@ -1,5 +1,6 @@
 pub mod databases;
 pub mod sla;
+pub mod sla_waterfall;
 pub mod strict_mode;
 pub mod utils;
 

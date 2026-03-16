@@ -1,5 +1,47 @@
 # Changelog
 
+## [8.22.3](https://github.com/doublewordai/control-layer/compare/v8.22.2...v8.22.3) (2026-03-16)
+
+
+### Bug Fixes
+
+* bump onwards ([#892](https://github.com/doublewordai/control-layer/issues/892)) ([861ca70](https://github.com/doublewordai/control-layer/commit/861ca70a1dda9076cf8d1025073717f6685c9c92))
+
+## [8.22.2](https://github.com/doublewordai/control-layer/compare/v8.22.1...v8.22.2) (2026-03-16)
+
+
+### Bug Fixes
+
+* **dwctl:** pick up onwards 0.21.0 opt-in server-side tool calling ([#888](https://github.com/doublewordai/control-layer/issues/888)) ([49494d3](https://github.com/doublewordai/control-layer/commit/49494d338166f562f528f6b59465dab71d46db69))
+
+## [8.22.1](https://github.com/doublewordai/control-layer/compare/v8.22.0...v8.22.1) (2026-03-16)
+
+
+### Bug Fixes
+
+* orgs need batch permissions so we can make batches as an org via the api ([#872](https://github.com/doublewordai/control-layer/issues/872)) ([efc8ae0](https://github.com/doublewordai/control-layer/commit/efc8ae0d429e20a67dd9d2f8aa6a1f2f94bd6e47))
+
+## [8.22.0](https://github.com/doublewordai/control-layer/compare/v8.21.0...v8.22.0) (2026-03-16)
+
+
+### Features
+
+* **dwctl:** server-side tool calling backend ([#878](https://github.com/doublewordai/control-layer/issues/878)) ([1ff4c56](https://github.com/doublewordai/control-layer/commit/1ff4c5665ff6000f73b54d76581038829de44458))
+
+## [8.21.0](https://github.com/doublewordai/control-layer/compare/v8.20.0...v8.21.0) (2026-03-16)
+
+
+### Features
+
+* server side active first sorting ([#864](https://github.com/doublewordai/control-layer/issues/864)) ([5b6dfd7](https://github.com/doublewordai/control-layer/commit/5b6dfd75562cd3ee066ec23d84dbc625c8753f31))
+
+## [8.20.0](https://github.com/doublewordai/control-layer/compare/v8.19.2...v8.20.0) (2026-03-15)
+
+
+### Features
+
+* bill based on completion time ([#876](https://github.com/doublewordai/control-layer/issues/876)) ([88e923d](https://github.com/doublewordai/control-layer/commit/88e923dc7af2238f61b3f58dcb42c4ec147bacb4))
+
 ## [8.19.2](https://github.com/doublewordai/control-layer/compare/v8.19.1...v8.19.2) (2026-03-12)
 
 

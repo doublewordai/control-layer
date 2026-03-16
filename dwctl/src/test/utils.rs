@@ -514,13 +514,19 @@ pub async fn create_test_org(pool: &PgPool, created_by: UserId) -> UserResponse 
     let mut conn = pool.acquire().await.expect("Failed to acquire connection");
     let mut orgs = Organizations::new(&mut conn);
     let org = orgs
-        .create(&OrganizationCreateDBRequest {
-            name: org_name.clone(),
-            email: format!("{org_name}@example.com"),
-            display_name: Some("Test Organization".to_string()),
-            avatar_url: None,
-            created_by,
-        })
+        .create(
+            &OrganizationCreateDBRequest {
+                name: org_name.clone(),
+                email: format!("{org_name}@example.com"),
+                display_name: Some("Test Organization".to_string()),
+                avatar_url: None,
+                created_by,
+            },
+            &[
+                crate::api::models::users::Role::StandardUser,
+                crate::api::models::users::Role::BatchAPIUser,
+            ],
+        )
         .await
         .expect("Failed to create test organization");
     UserResponse {
