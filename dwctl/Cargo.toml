@@ -76,7 +76,7 @@ jsonwebtoken = "9.0"
 argon2 = "0.5"
 base64 = "0.22"
 bytes = "1.5"
-onwards = "0.21.0"
+onwards = "0.21.1"
 thiserror = "2.0.14"
 axum-prometheus = "0.10"
 # Metrics facade and exporter (same versions as axum-prometheus uses)
@@ -132,9 +132,7 @@ async-stripe-core = { version = "1.0.0-rc.0", features = [
   "payment_intent",
   "customer",
 ] }
-async-stripe-misc = { version = "1.0.0-rc.0", features = [
-  "tax_calculation",
-] }
+async-stripe-misc = { version = "1.0.0-rc.0", features = ["tax_calculation"] }
 rustls = { version = "0.23", features = ["aws-lc-rs"] }
 async-stripe-billing = { version = "1.0.0-rc.0", features = [
   "billing_portal_session",
