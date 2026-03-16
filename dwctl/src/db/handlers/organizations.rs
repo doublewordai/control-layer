@@ -210,6 +210,13 @@ impl<'c> Organizations<'c> {
         .await?
         .ok_or(DbError::NotFound)?;
 
+        let roles: Vec<Role> = sqlx::query_scalar!(
+            r#"SELECT role as "role: Role" FROM user_roles WHERE user_id = $1"#,
+            id
+        )
+        .fetch_all(&mut *self.db)
+        .await?;
+
         Ok(UserDBResponse {
             id: row.id,
             username: row.username,
@@ -221,7 +228,7 @@ impl<'c> Organizations<'c> {
             last_login: None,
             auth_source: row.auth_source,
             is_admin: row.is_admin,
-            roles: vec![Role::StandardUser, Role::BatchAPIUser],
+            roles,
             password_hash: row.password_hash,
             external_user_id: row.external_user_id,
             payment_provider_id: row.payment_provider_id,

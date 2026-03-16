@@ -367,20 +367,18 @@ async fn try_api_key_auth(parts: &axum::http::request::Parts, db: &PgPool) -> Op
         Err(e) => return Some(Err(DbError::from(e).into())),
     };
 
-    // When the API key was created by a different user (org member creating a key
-    // scoped to the org), set id to the individual creator and active_organization
-    // to the org. This mirrors the cookie auth shape so downstream code correctly
+    // created_by is always the individual user's account ID. For org-scoped keys,
+    // user_id is the org — set it as active_organization so downstream code
     // attributes resources to the individual while scoping billing to the org.
-    let is_org_key = api_key_data.created_by != api_key_data.user_id;
-    let (effective_id, active_organization) = if is_org_key {
-        (api_key_data.created_by, Some(api_key_data.user_id))
+    let active_organization = if api_key_data.created_by != api_key_data.user_id {
+        Some(api_key_data.user_id)
     } else {
-        (api_key_data.user_id, None)
+        None
     };
 
     Some(Ok((
         CurrentUser {
-            id: effective_id,
+            id: api_key_data.created_by,
             username: api_key_data.username,
             email: api_key_data.email,
             is_admin: api_key_data.is_admin,
