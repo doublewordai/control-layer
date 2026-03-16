@@ -122,9 +122,9 @@ impl<'c> Organizations<'c> {
         // Assign roles to the org user entity so API keys linked to the org have
         // the necessary permissions (e.g. BatchAPIUser for file/batch operations).
         // Ensure StandardUser is always present.
-        let mut org_roles: Vec<&Role> = default_roles.iter().collect();
+        let mut org_roles: Vec<Role> = default_roles.to_vec();
         if !org_roles.iter().any(|r| matches!(r, Role::StandardUser)) {
-            org_roles.push(&Role::StandardUser);
+            org_roles.push(Role::StandardUser);
         }
         for role in &org_roles {
             sqlx::query!("INSERT INTO user_roles (user_id, role) VALUES ($1, $2)", org_id, role as &Role)
@@ -154,7 +154,7 @@ impl<'c> Organizations<'c> {
             last_login: None,
             auth_source: row.auth_source,
             is_admin: row.is_admin,
-            roles: org_roles.into_iter().cloned().collect(),
+            roles: org_roles,
             password_hash: row.password_hash,
             external_user_id: row.external_user_id,
             payment_provider_id: row.payment_provider_id,
