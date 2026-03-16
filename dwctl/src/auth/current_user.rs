@@ -1455,7 +1455,7 @@ mod tests {
                 display_name: Some("Test Org".to_string()),
                 avatar_url: None,
                 created_by: test_user.id,
-            })
+            }, &[crate::api::models::users::Role::StandardUser, crate::api::models::users::Role::BatchAPIUser])
             .await
             .unwrap();
         drop(conn);
@@ -1526,7 +1526,7 @@ mod tests {
             display_name: None,
             avatar_url: None,
             created_by: test_user.id,
-        })
+        }, &[crate::api::models::users::Role::StandardUser, crate::api::models::users::Role::BatchAPIUser])
         .await
         .unwrap();
         drop(conn);

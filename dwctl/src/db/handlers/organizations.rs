@@ -5,6 +5,7 @@
 //! Only `user_organizations`-specific logic (membership CRUD) and org-specific mutations
 //! (create/update/delete with different column sets or safety guards) live here.
 
+use crate::api::models::users::Role;
 use crate::db::{
     errors::{DbError, Result},
     handlers::users::{UserFilter, Users},
@@ -89,10 +90,12 @@ impl<'c> Organizations<'c> {
     }
 
     /// Create a new organization. The creator is automatically added as owner.
-    #[instrument(skip(self, request), fields(name = %request.name), err)]
-    pub async fn create(&mut self, request: &OrganizationCreateDBRequest) -> Result<UserDBResponse> {
-        use crate::api::models::users::Role;
-
+    ///
+    /// `default_roles` specifies which roles to assign to the org user entity.
+    /// These roles determine what API keys scoped to the org can do (e.g. BatchAPIUser
+    /// for file/batch operations). StandardUser is always included.
+    #[instrument(skip(self, request, default_roles), fields(name = %request.name), err)]
+    pub async fn create(&mut self, request: &OrganizationCreateDBRequest, default_roles: &[Role]) -> Result<UserDBResponse> {
         let org_id = Uuid::new_v4();
         let mut tx = self.db.begin().await?;
 
@@ -117,8 +120,12 @@ impl<'c> Organizations<'c> {
         .await?;
 
         // Assign roles to the org user entity so API keys linked to the org have
-        // the necessary permissions (e.g. BatchAPIUser for file/batch operations)
-        let org_roles = [Role::StandardUser, Role::BatchAPIUser];
+        // the necessary permissions (e.g. BatchAPIUser for file/batch operations).
+        // Ensure StandardUser is always present.
+        let mut org_roles: Vec<&Role> = default_roles.iter().collect();
+        if !org_roles.iter().any(|r| matches!(r, Role::StandardUser)) {
+            org_roles.push(&Role::StandardUser);
+        }
         for role in &org_roles {
             sqlx::query!("INSERT INTO user_roles (user_id, role) VALUES ($1, $2)", org_id, role as &Role)
                 .execute(&mut *tx)
@@ -147,7 +154,7 @@ impl<'c> Organizations<'c> {
             last_login: None,
             auth_source: row.auth_source,
             is_admin: row.is_admin,
-            roles: vec![Role::StandardUser, Role::BatchAPIUser],
+            roles: org_roles.into_iter().cloned().collect(),
             password_hash: row.password_hash,
             external_user_id: row.external_user_id,
             payment_provider_id: row.payment_provider_id,
@@ -180,8 +187,6 @@ impl<'c> Organizations<'c> {
     /// Update an organization's details
     #[instrument(skip(self, request), fields(org_id = %abbrev_uuid(&id)), err)]
     pub async fn update(&mut self, id: UserId, request: &OrganizationUpdateDBRequest) -> Result<UserDBResponse> {
-        use crate::api::models::users::Role;
-
         let row = sqlx::query!(
             r#"
             UPDATE users SET
@@ -487,6 +492,9 @@ mod tests {
     use crate::db::models::users::UserCreateDBRequest;
     use sqlx::PgPool;
 
+    /// Default roles used in tests — mirrors the default config.yaml
+    const TEST_DEFAULT_ROLES: &[Role] = &[Role::StandardUser, Role::BatchAPIUser];
+
     /// Helper: create a regular individual user and return their id
     async fn create_individual(pool: &PgPool, username: &str, email: &str) -> UserId {
         let mut conn = pool.acquire().await.unwrap();
@@ -521,7 +529,7 @@ mod tests {
                 display_name: Some("Acme Corporation".to_string()),
                 avatar_url: None,
                 created_by: creator,
-            })
+            }, TEST_DEFAULT_ROLES)
             .await
             .unwrap();
 
@@ -532,14 +540,15 @@ mod tests {
         assert_eq!(org.auth_source, "organization");
         assert!(!org.is_admin);
 
-        // Verify roles are persisted in user_roles (org needs BatchAPIUser for file/batch operations)
-        let persisted_roles: Vec<String> = sqlx::query_scalar!(
-            r#"SELECT role::text as "role!" FROM user_roles WHERE user_id = $1 ORDER BY role"#,
+        // Verify roles are persisted in user_roles (org gets the configured default roles)
+        let mut persisted_roles: Vec<String> = sqlx::query_scalar!(
+            r#"SELECT role::text as "role!" FROM user_roles WHERE user_id = $1"#,
             org.id
         )
         .fetch_all(&pool)
         .await
         .unwrap();
+        persisted_roles.sort();
         assert_eq!(persisted_roles, vec!["BATCHAPIUSER", "STANDARDUSER"]);
     }
 
@@ -558,7 +567,7 @@ mod tests {
                 display_name: None,
                 avatar_url: None,
                 created_by: creator,
-            })
+            }, TEST_DEFAULT_ROLES)
             .await
             .unwrap();
 
@@ -587,7 +596,7 @@ mod tests {
             display_name: Some("Acme Corporation".to_string()),
             avatar_url: None,
             created_by: creator,
-        })
+        }, TEST_DEFAULT_ROLES)
         .await
         .unwrap();
 
@@ -597,7 +606,7 @@ mod tests {
             display_name: Some("Globex Inc".to_string()),
             avatar_url: None,
             created_by: creator,
-        })
+        }, TEST_DEFAULT_ROLES)
         .await
         .unwrap();
 
@@ -623,7 +632,7 @@ mod tests {
             display_name: Some("Acme Corporation".to_string()),
             avatar_url: None,
             created_by: creator,
-        })
+        }, TEST_DEFAULT_ROLES)
         .await
         .unwrap();
 
@@ -633,7 +642,7 @@ mod tests {
             display_name: Some("Globex Inc".to_string()),
             avatar_url: None,
             created_by: creator,
-        })
+        }, TEST_DEFAULT_ROLES)
         .await
         .unwrap();
 
@@ -672,7 +681,7 @@ mod tests {
             display_name: None,
             avatar_url: None,
             created_by: creator,
-        })
+        }, TEST_DEFAULT_ROLES)
         .await
         .unwrap();
 
@@ -694,7 +703,7 @@ mod tests {
                 display_name: Some("Old Name".to_string()),
                 avatar_url: None,
                 created_by: creator,
-            })
+            }, TEST_DEFAULT_ROLES)
             .await
             .unwrap();
 
@@ -730,7 +739,7 @@ mod tests {
                 display_name: Some("Acme Corporation".to_string()),
                 avatar_url: None,
                 created_by: creator,
-            })
+            }, TEST_DEFAULT_ROLES)
             .await
             .unwrap();
 
@@ -766,7 +775,7 @@ mod tests {
                 display_name: Some("Acme Corporation".to_string()),
                 avatar_url: None,
                 created_by: creator,
-            })
+            }, TEST_DEFAULT_ROLES)
             .await
             .unwrap();
 
@@ -798,7 +807,7 @@ mod tests {
                 display_name: Some("Acme Corporation".to_string()),
                 avatar_url: None,
                 created_by: creator,
-            })
+            }, TEST_DEFAULT_ROLES)
             .await
             .unwrap();
 
@@ -834,7 +843,7 @@ mod tests {
                 display_name: None,
                 avatar_url: None,
                 created_by: creator,
-            })
+            }, TEST_DEFAULT_ROLES)
             .await
             .unwrap();
 
@@ -865,7 +874,7 @@ mod tests {
                 display_name: None,
                 avatar_url: None,
                 created_by: creator,
-            })
+            }, TEST_DEFAULT_ROLES)
             .await
             .unwrap();
 
@@ -892,7 +901,7 @@ mod tests {
                 display_name: None,
                 avatar_url: None,
                 created_by: creator,
-            })
+            }, TEST_DEFAULT_ROLES)
             .await
             .unwrap();
 
@@ -927,7 +936,7 @@ mod tests {
                 display_name: None,
                 avatar_url: None,
                 created_by: creator,
-            })
+            }, TEST_DEFAULT_ROLES)
             .await
             .unwrap();
 
@@ -956,7 +965,7 @@ mod tests {
                 display_name: None,
                 avatar_url: None,
                 created_by: creator,
-            })
+            }, TEST_DEFAULT_ROLES)
             .await
             .unwrap();
 
@@ -981,7 +990,7 @@ mod tests {
                 display_name: None,
                 avatar_url: None,
                 created_by: alice,
-            })
+            }, TEST_DEFAULT_ROLES)
             .await
             .unwrap();
 
@@ -991,7 +1000,7 @@ mod tests {
             display_name: None,
             avatar_url: None,
             created_by: alice,
-        })
+        }, TEST_DEFAULT_ROLES)
         .await
         .unwrap();
 
@@ -1024,7 +1033,7 @@ mod tests {
                 display_name: None,
                 avatar_url: None,
                 created_by: alice,
-            })
+            }, TEST_DEFAULT_ROLES)
             .await
             .unwrap();
 
@@ -1063,7 +1072,7 @@ mod tests {
                 display_name: None,
                 avatar_url: None,
                 created_by: alice,
-            })
+            }, TEST_DEFAULT_ROLES)
             .await
             .unwrap();
 
@@ -1088,7 +1097,7 @@ mod tests {
                 display_name: None,
                 avatar_url: None,
                 created_by: creator,
-            })
+            }, TEST_DEFAULT_ROLES)
             .await
             .unwrap();
         }
