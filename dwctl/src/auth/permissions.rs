@@ -151,6 +151,15 @@ pub mod resource {
             Resource::Organizations
         }
     }
+
+    #[derive(Default)]
+    pub struct ToolSources;
+
+    impl From<ToolSources> for Resource {
+        fn from(_: ToolSources) -> Resource {
+            Resource::ToolSources
+        }
+    }
 }
 
 pub mod operation {

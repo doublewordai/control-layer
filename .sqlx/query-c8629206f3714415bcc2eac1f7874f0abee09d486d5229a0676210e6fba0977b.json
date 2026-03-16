@@ -1,0 +1,59 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT DISTINCT\n            ts.id           AS \"tool_source_id!\",\n            ts.name         AS \"name!\",\n            ts.description,\n            ts.parameters,\n            ts.url          AS \"url!\",\n            ts.api_key,\n            ts.timeout_secs AS \"timeout_secs!\"\n        FROM api_keys ak\n        INNER JOIN user_groups ug ON ug.user_id = ak.user_id\n        INNER JOIN deployment_groups dg ON dg.group_id = ug.group_id\n        INNER JOIN deployed_models dm ON dm.id = dg.deployment_id\n        INNER JOIN deployment_tool_sources dts ON dts.deployment_id = dg.deployment_id\n        INNER JOIN group_tool_sources gts ON gts.tool_source_id = dts.tool_source_id AND gts.group_id = ug.group_id\n        INNER JOIN tool_sources ts ON ts.id = dts.tool_source_id\n        WHERE ak.secret = $1\n          AND ak.is_deleted = FALSE\n          AND ($2::TEXT IS NULL OR dm.alias = $2)\n        ORDER BY ts.name\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "tool_source_id!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "name!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "description",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "parameters",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 4,
+        "name": "url!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "api_key",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "timeout_secs!",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      true,
+      false,
+      true,
+      false
+    ]
+  },
+  "hash": "c8629206f3714415bcc2eac1f7874f0abee09d486d5229a0676210e6fba0977b"
+}
