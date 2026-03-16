@@ -352,6 +352,7 @@ export function Batches({
           statusFilter !== "all" ? statusFilter : undefined,
         created_after: dateRange?.from.toISOString(),
         created_before: dateRange?.to.toISOString(),
+        active_first: sortActiveFirst || undefined,
         limit: batchesPagination.pageSize + 1,
         after: nextCursor,
       };
@@ -370,6 +371,7 @@ export function Batches({
     selectedMemberId,
     statusFilter,
     dateRange,
+    sortActiveFirst,
     queryClient,
   ]);
 
