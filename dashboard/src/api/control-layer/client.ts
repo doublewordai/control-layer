@@ -1473,6 +1473,7 @@ const batchesApi = {
     if (options?.status) params.set("status", options.status);
     if (options?.created_after) params.set("created_after", options.created_after);
     if (options?.created_before) params.set("created_before", options.created_before);
+    if (options?.active_first) params.set("active_first", "true");
 
     const response = await fetchAiApi(
       `/ai/v1/batches${params.toString() ? "?" + params.toString() : ""}`,
