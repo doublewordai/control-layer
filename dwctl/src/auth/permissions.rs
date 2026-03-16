@@ -705,13 +705,19 @@ mod tests {
         let mut conn = pool.acquire().await.unwrap();
         let mut orgs = Organizations::new(&mut conn);
         let org = orgs
-            .create(&OrganizationCreateDBRequest {
-                name: "acme".to_string(),
-                email: "org@acme.com".to_string(),
-                display_name: None,
-                avatar_url: None,
-                created_by: alice.id,
-            }, &[crate::api::models::users::Role::StandardUser, crate::api::models::users::Role::BatchAPIUser])
+            .create(
+                &OrganizationCreateDBRequest {
+                    name: "acme".to_string(),
+                    email: "org@acme.com".to_string(),
+                    display_name: None,
+                    avatar_url: None,
+                    created_by: alice.id,
+                },
+                &[
+                    crate::api::models::users::Role::StandardUser,
+                    crate::api::models::users::Role::BatchAPIUser,
+                ],
+            )
             .await
             .unwrap();
 
@@ -729,13 +735,19 @@ mod tests {
         let mut conn = pool.acquire().await.unwrap();
         let mut orgs = Organizations::new(&mut conn);
         let org = orgs
-            .create(&OrganizationCreateDBRequest {
-                name: "acme".to_string(),
-                email: "org@acme.com".to_string(),
-                display_name: None,
-                avatar_url: None,
-                created_by: alice.id,
-            }, &[crate::api::models::users::Role::StandardUser, crate::api::models::users::Role::BatchAPIUser])
+            .create(
+                &OrganizationCreateDBRequest {
+                    name: "acme".to_string(),
+                    email: "org@acme.com".to_string(),
+                    display_name: None,
+                    avatar_url: None,
+                    created_by: alice.id,
+                },
+                &[
+                    crate::api::models::users::Role::StandardUser,
+                    crate::api::models::users::Role::BatchAPIUser,
+                ],
+            )
             .await
             .unwrap();
         orgs.add_member(org.id, bob.id, "member").await.unwrap();
@@ -754,13 +766,19 @@ mod tests {
         let mut conn = pool.acquire().await.unwrap();
         let mut orgs = Organizations::new(&mut conn);
         let org = orgs
-            .create(&OrganizationCreateDBRequest {
-                name: "acme".to_string(),
-                email: "org@acme.com".to_string(),
-                display_name: None,
-                avatar_url: None,
-                created_by: alice.id,
-            }, &[crate::api::models::users::Role::StandardUser, crate::api::models::users::Role::BatchAPIUser])
+            .create(
+                &OrganizationCreateDBRequest {
+                    name: "acme".to_string(),
+                    email: "org@acme.com".to_string(),
+                    display_name: None,
+                    avatar_url: None,
+                    created_by: alice.id,
+                },
+                &[
+                    crate::api::models::users::Role::StandardUser,
+                    crate::api::models::users::Role::BatchAPIUser,
+                ],
+            )
             .await
             .unwrap();
         orgs.add_member(org.id, charlie.id, "admin").await.unwrap();
@@ -779,13 +797,19 @@ mod tests {
         let mut conn = pool.acquire().await.unwrap();
         let mut orgs = Organizations::new(&mut conn);
         let org = orgs
-            .create(&OrganizationCreateDBRequest {
-                name: "acme".to_string(),
-                email: "org@acme.com".to_string(),
-                display_name: None,
-                avatar_url: None,
-                created_by: alice.id,
-            }, &[crate::api::models::users::Role::StandardUser, crate::api::models::users::Role::BatchAPIUser])
+            .create(
+                &OrganizationCreateDBRequest {
+                    name: "acme".to_string(),
+                    email: "org@acme.com".to_string(),
+                    display_name: None,
+                    avatar_url: None,
+                    created_by: alice.id,
+                },
+                &[
+                    crate::api::models::users::Role::StandardUser,
+                    crate::api::models::users::Role::BatchAPIUser,
+                ],
+            )
             .await
             .unwrap();
 
@@ -804,13 +828,19 @@ mod tests {
         let mut conn = pool.acquire().await.unwrap();
         let mut orgs = Organizations::new(&mut conn);
         let org = orgs
-            .create(&OrganizationCreateDBRequest {
-                name: "acme".to_string(),
-                email: "org@acme.com".to_string(),
-                display_name: None,
-                avatar_url: None,
-                created_by: alice.id, // alice = owner
-            }, &[crate::api::models::users::Role::StandardUser, crate::api::models::users::Role::BatchAPIUser])
+            .create(
+                &OrganizationCreateDBRequest {
+                    name: "acme".to_string(),
+                    email: "org@acme.com".to_string(),
+                    display_name: None,
+                    avatar_url: None,
+                    created_by: alice.id, // alice = owner
+                },
+                &[
+                    crate::api::models::users::Role::StandardUser,
+                    crate::api::models::users::Role::BatchAPIUser,
+                ],
+            )
             .await
             .unwrap();
         orgs.add_member(org.id, bob.id, "member").await.unwrap();

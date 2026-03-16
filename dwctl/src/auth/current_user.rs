@@ -1450,13 +1450,19 @@ mod tests {
         let mut conn = pool.acquire().await.unwrap();
         let mut orgs = Organizations::new(&mut conn);
         let org = orgs
-            .create(&OrganizationCreateDBRequest {
-                name: "test-org-header".to_string(),
-                email: "org@example.com".to_string(),
-                display_name: Some("Test Org".to_string()),
-                avatar_url: None,
-                created_by: test_user.id,
-            }, &[crate::api::models::users::Role::StandardUser, crate::api::models::users::Role::BatchAPIUser])
+            .create(
+                &OrganizationCreateDBRequest {
+                    name: "test-org-header".to_string(),
+                    email: "org@example.com".to_string(),
+                    display_name: Some("Test Org".to_string()),
+                    avatar_url: None,
+                    created_by: test_user.id,
+                },
+                &[
+                    crate::api::models::users::Role::StandardUser,
+                    crate::api::models::users::Role::BatchAPIUser,
+                ],
+            )
             .await
             .unwrap();
         drop(conn);
@@ -1521,13 +1527,19 @@ mod tests {
         // Create an org (user is a member)
         let mut conn = pool.acquire().await.unwrap();
         let mut orgs = Organizations::new(&mut conn);
-        orgs.create(&OrganizationCreateDBRequest {
-            name: "test-org-no-header".to_string(),
-            email: "org@example.com".to_string(),
-            display_name: None,
-            avatar_url: None,
-            created_by: test_user.id,
-        }, &[crate::api::models::users::Role::StandardUser, crate::api::models::users::Role::BatchAPIUser])
+        orgs.create(
+            &OrganizationCreateDBRequest {
+                name: "test-org-no-header".to_string(),
+                email: "org@example.com".to_string(),
+                display_name: None,
+                avatar_url: None,
+                created_by: test_user.id,
+            },
+            &[
+                crate::api::models::users::Role::StandardUser,
+                crate::api::models::users::Role::BatchAPIUser,
+            ],
+        )
         .await
         .unwrap();
         drop(conn);

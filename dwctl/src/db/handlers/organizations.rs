@@ -210,12 +210,9 @@ impl<'c> Organizations<'c> {
         .await?
         .ok_or(DbError::NotFound)?;
 
-        let roles: Vec<Role> = sqlx::query_scalar!(
-            r#"SELECT role as "role: Role" FROM user_roles WHERE user_id = $1"#,
-            id
-        )
-        .fetch_all(&mut *self.db)
-        .await?;
+        let roles: Vec<Role> = sqlx::query_scalar!(r#"SELECT role as "role: Role" FROM user_roles WHERE user_id = $1"#, id)
+            .fetch_all(&mut *self.db)
+            .await?;
 
         Ok(UserDBResponse {
             id: row.id,
@@ -530,13 +527,16 @@ mod tests {
         let mut orgs = Organizations::new(&mut conn);
 
         let org = orgs
-            .create(&OrganizationCreateDBRequest {
-                name: "acme-corp".to_string(),
-                email: "billing@acme.example.com".to_string(),
-                display_name: Some("Acme Corporation".to_string()),
-                avatar_url: None,
-                created_by: creator,
-            }, TEST_DEFAULT_ROLES)
+            .create(
+                &OrganizationCreateDBRequest {
+                    name: "acme-corp".to_string(),
+                    email: "billing@acme.example.com".to_string(),
+                    display_name: Some("Acme Corporation".to_string()),
+                    avatar_url: None,
+                    created_by: creator,
+                },
+                TEST_DEFAULT_ROLES,
+            )
             .await
             .unwrap();
 
@@ -548,13 +548,11 @@ mod tests {
         assert!(!org.is_admin);
 
         // Verify roles are persisted in user_roles (org gets the configured default roles)
-        let mut persisted_roles: Vec<String> = sqlx::query_scalar!(
-            r#"SELECT role::text as "role!" FROM user_roles WHERE user_id = $1"#,
-            org.id
-        )
-        .fetch_all(&pool)
-        .await
-        .unwrap();
+        let mut persisted_roles: Vec<String> =
+            sqlx::query_scalar!(r#"SELECT role::text as "role!" FROM user_roles WHERE user_id = $1"#, org.id)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
         persisted_roles.sort();
         assert_eq!(persisted_roles, vec!["BATCHAPIUSER", "STANDARDUSER"]);
     }
@@ -568,13 +566,16 @@ mod tests {
         let mut orgs = Organizations::new(&mut conn);
 
         let org = orgs
-            .create(&OrganizationCreateDBRequest {
-                name: "acme-corp".to_string(),
-                email: "billing@acme.example.com".to_string(),
-                display_name: None,
-                avatar_url: None,
-                created_by: creator,
-            }, TEST_DEFAULT_ROLES)
+            .create(
+                &OrganizationCreateDBRequest {
+                    name: "acme-corp".to_string(),
+                    email: "billing@acme.example.com".to_string(),
+                    display_name: None,
+                    avatar_url: None,
+                    created_by: creator,
+                },
+                TEST_DEFAULT_ROLES,
+            )
             .await
             .unwrap();
 
@@ -597,23 +598,29 @@ mod tests {
         let mut conn = pool.acquire().await.unwrap();
         let mut orgs = Organizations::new(&mut conn);
 
-        orgs.create(&OrganizationCreateDBRequest {
-            name: "acme-corp".to_string(),
-            email: "billing@acme.example.com".to_string(),
-            display_name: Some("Acme Corporation".to_string()),
-            avatar_url: None,
-            created_by: creator,
-        }, TEST_DEFAULT_ROLES)
+        orgs.create(
+            &OrganizationCreateDBRequest {
+                name: "acme-corp".to_string(),
+                email: "billing@acme.example.com".to_string(),
+                display_name: Some("Acme Corporation".to_string()),
+                avatar_url: None,
+                created_by: creator,
+            },
+            TEST_DEFAULT_ROLES,
+        )
         .await
         .unwrap();
 
-        orgs.create(&OrganizationCreateDBRequest {
-            name: "globex-inc".to_string(),
-            email: "info@globex.example.com".to_string(),
-            display_name: Some("Globex Inc".to_string()),
-            avatar_url: None,
-            created_by: creator,
-        }, TEST_DEFAULT_ROLES)
+        orgs.create(
+            &OrganizationCreateDBRequest {
+                name: "globex-inc".to_string(),
+                email: "info@globex.example.com".to_string(),
+                display_name: Some("Globex Inc".to_string()),
+                avatar_url: None,
+                created_by: creator,
+            },
+            TEST_DEFAULT_ROLES,
+        )
         .await
         .unwrap();
 
@@ -633,23 +640,29 @@ mod tests {
         let mut conn = pool.acquire().await.unwrap();
         let mut orgs = Organizations::new(&mut conn);
 
-        orgs.create(&OrganizationCreateDBRequest {
-            name: "acme-corp".to_string(),
-            email: "billing@acme.example.com".to_string(),
-            display_name: Some("Acme Corporation".to_string()),
-            avatar_url: None,
-            created_by: creator,
-        }, TEST_DEFAULT_ROLES)
+        orgs.create(
+            &OrganizationCreateDBRequest {
+                name: "acme-corp".to_string(),
+                email: "billing@acme.example.com".to_string(),
+                display_name: Some("Acme Corporation".to_string()),
+                avatar_url: None,
+                created_by: creator,
+            },
+            TEST_DEFAULT_ROLES,
+        )
         .await
         .unwrap();
 
-        orgs.create(&OrganizationCreateDBRequest {
-            name: "globex-inc".to_string(),
-            email: "info@globex.example.com".to_string(),
-            display_name: Some("Globex Inc".to_string()),
-            avatar_url: None,
-            created_by: creator,
-        }, TEST_DEFAULT_ROLES)
+        orgs.create(
+            &OrganizationCreateDBRequest {
+                name: "globex-inc".to_string(),
+                email: "info@globex.example.com".to_string(),
+                display_name: Some("Globex Inc".to_string()),
+                avatar_url: None,
+                created_by: creator,
+            },
+            TEST_DEFAULT_ROLES,
+        )
         .await
         .unwrap();
 
@@ -682,13 +695,16 @@ mod tests {
         let filter = OrganizationFilter::new(0, 100);
         assert_eq!(orgs.count(&filter).await.unwrap(), 0);
 
-        orgs.create(&OrganizationCreateDBRequest {
-            name: "acme-corp".to_string(),
-            email: "billing@acme.example.com".to_string(),
-            display_name: None,
-            avatar_url: None,
-            created_by: creator,
-        }, TEST_DEFAULT_ROLES)
+        orgs.create(
+            &OrganizationCreateDBRequest {
+                name: "acme-corp".to_string(),
+                email: "billing@acme.example.com".to_string(),
+                display_name: None,
+                avatar_url: None,
+                created_by: creator,
+            },
+            TEST_DEFAULT_ROLES,
+        )
         .await
         .unwrap();
 
@@ -704,13 +720,16 @@ mod tests {
         let mut orgs = Organizations::new(&mut conn);
 
         let org = orgs
-            .create(&OrganizationCreateDBRequest {
-                name: "acme-corp".to_string(),
-                email: "old@acme.example.com".to_string(),
-                display_name: Some("Old Name".to_string()),
-                avatar_url: None,
-                created_by: creator,
-            }, TEST_DEFAULT_ROLES)
+            .create(
+                &OrganizationCreateDBRequest {
+                    name: "acme-corp".to_string(),
+                    email: "old@acme.example.com".to_string(),
+                    display_name: Some("Old Name".to_string()),
+                    avatar_url: None,
+                    created_by: creator,
+                },
+                TEST_DEFAULT_ROLES,
+            )
             .await
             .unwrap();
 
@@ -740,13 +759,16 @@ mod tests {
         let mut orgs = Organizations::new(&mut conn);
 
         let org = orgs
-            .create(&OrganizationCreateDBRequest {
-                name: "acme-corp".to_string(),
-                email: "billing@acme.example.com".to_string(),
-                display_name: Some("Acme Corporation".to_string()),
-                avatar_url: None,
-                created_by: creator,
-            }, TEST_DEFAULT_ROLES)
+            .create(
+                &OrganizationCreateDBRequest {
+                    name: "acme-corp".to_string(),
+                    email: "billing@acme.example.com".to_string(),
+                    display_name: Some("Acme Corporation".to_string()),
+                    avatar_url: None,
+                    created_by: creator,
+                },
+                TEST_DEFAULT_ROLES,
+            )
             .await
             .unwrap();
 
@@ -776,13 +798,16 @@ mod tests {
         let mut orgs = Organizations::new(&mut conn);
 
         let org = orgs
-            .create(&OrganizationCreateDBRequest {
-                name: "acme-corp".to_string(),
-                email: "billing@acme.example.com".to_string(),
-                display_name: Some("Acme Corporation".to_string()),
-                avatar_url: None,
-                created_by: creator,
-            }, TEST_DEFAULT_ROLES)
+            .create(
+                &OrganizationCreateDBRequest {
+                    name: "acme-corp".to_string(),
+                    email: "billing@acme.example.com".to_string(),
+                    display_name: Some("Acme Corporation".to_string()),
+                    avatar_url: None,
+                    created_by: creator,
+                },
+                TEST_DEFAULT_ROLES,
+            )
             .await
             .unwrap();
 
@@ -808,13 +833,16 @@ mod tests {
         let mut orgs = Organizations::new(&mut conn);
 
         let org = orgs
-            .create(&OrganizationCreateDBRequest {
-                name: "acme-corp".to_string(),
-                email: "billing@acme.example.com".to_string(),
-                display_name: Some("Acme Corporation".to_string()),
-                avatar_url: None,
-                created_by: creator,
-            }, TEST_DEFAULT_ROLES)
+            .create(
+                &OrganizationCreateDBRequest {
+                    name: "acme-corp".to_string(),
+                    email: "billing@acme.example.com".to_string(),
+                    display_name: Some("Acme Corporation".to_string()),
+                    avatar_url: None,
+                    created_by: creator,
+                },
+                TEST_DEFAULT_ROLES,
+            )
             .await
             .unwrap();
 
@@ -844,13 +872,16 @@ mod tests {
         let mut orgs = Organizations::new(&mut conn);
 
         let org = orgs
-            .create(&OrganizationCreateDBRequest {
-                name: "acme-corp".to_string(),
-                email: "billing@acme.example.com".to_string(),
-                display_name: None,
-                avatar_url: None,
-                created_by: creator,
-            }, TEST_DEFAULT_ROLES)
+            .create(
+                &OrganizationCreateDBRequest {
+                    name: "acme-corp".to_string(),
+                    email: "billing@acme.example.com".to_string(),
+                    display_name: None,
+                    avatar_url: None,
+                    created_by: creator,
+                },
+                TEST_DEFAULT_ROLES,
+            )
             .await
             .unwrap();
 
@@ -875,13 +906,16 @@ mod tests {
         let mut orgs = Organizations::new(&mut conn);
 
         let org = orgs
-            .create(&OrganizationCreateDBRequest {
-                name: "acme-corp".to_string(),
-                email: "billing@acme.example.com".to_string(),
-                display_name: None,
-                avatar_url: None,
-                created_by: creator,
-            }, TEST_DEFAULT_ROLES)
+            .create(
+                &OrganizationCreateDBRequest {
+                    name: "acme-corp".to_string(),
+                    email: "billing@acme.example.com".to_string(),
+                    display_name: None,
+                    avatar_url: None,
+                    created_by: creator,
+                },
+                TEST_DEFAULT_ROLES,
+            )
             .await
             .unwrap();
 
@@ -902,13 +936,16 @@ mod tests {
         let mut orgs = Organizations::new(&mut conn);
 
         let org = orgs
-            .create(&OrganizationCreateDBRequest {
-                name: "acme-corp".to_string(),
-                email: "billing@acme.example.com".to_string(),
-                display_name: None,
-                avatar_url: None,
-                created_by: creator,
-            }, TEST_DEFAULT_ROLES)
+            .create(
+                &OrganizationCreateDBRequest {
+                    name: "acme-corp".to_string(),
+                    email: "billing@acme.example.com".to_string(),
+                    display_name: None,
+                    avatar_url: None,
+                    created_by: creator,
+                },
+                TEST_DEFAULT_ROLES,
+            )
             .await
             .unwrap();
 
@@ -937,13 +974,16 @@ mod tests {
         let mut orgs = Organizations::new(&mut conn);
 
         let org = orgs
-            .create(&OrganizationCreateDBRequest {
-                name: "acme-corp".to_string(),
-                email: "billing@acme.example.com".to_string(),
-                display_name: None,
-                avatar_url: None,
-                created_by: creator,
-            }, TEST_DEFAULT_ROLES)
+            .create(
+                &OrganizationCreateDBRequest {
+                    name: "acme-corp".to_string(),
+                    email: "billing@acme.example.com".to_string(),
+                    display_name: None,
+                    avatar_url: None,
+                    created_by: creator,
+                },
+                TEST_DEFAULT_ROLES,
+            )
             .await
             .unwrap();
 
@@ -966,13 +1006,16 @@ mod tests {
         let mut orgs = Organizations::new(&mut conn);
 
         let org = orgs
-            .create(&OrganizationCreateDBRequest {
-                name: "acme-corp".to_string(),
-                email: "billing@acme.example.com".to_string(),
-                display_name: None,
-                avatar_url: None,
-                created_by: creator,
-            }, TEST_DEFAULT_ROLES)
+            .create(
+                &OrganizationCreateDBRequest {
+                    name: "acme-corp".to_string(),
+                    email: "billing@acme.example.com".to_string(),
+                    display_name: None,
+                    avatar_url: None,
+                    created_by: creator,
+                },
+                TEST_DEFAULT_ROLES,
+            )
             .await
             .unwrap();
 
@@ -991,23 +1034,29 @@ mod tests {
         let mut orgs = Organizations::new(&mut conn);
 
         let org1 = orgs
-            .create(&OrganizationCreateDBRequest {
-                name: "acme-corp".to_string(),
-                email: "billing@acme.example.com".to_string(),
-                display_name: None,
-                avatar_url: None,
-                created_by: alice,
-            }, TEST_DEFAULT_ROLES)
+            .create(
+                &OrganizationCreateDBRequest {
+                    name: "acme-corp".to_string(),
+                    email: "billing@acme.example.com".to_string(),
+                    display_name: None,
+                    avatar_url: None,
+                    created_by: alice,
+                },
+                TEST_DEFAULT_ROLES,
+            )
             .await
             .unwrap();
 
-        orgs.create(&OrganizationCreateDBRequest {
-            name: "globex-inc".to_string(),
-            email: "info@globex.example.com".to_string(),
-            display_name: None,
-            avatar_url: None,
-            created_by: alice,
-        }, TEST_DEFAULT_ROLES)
+        orgs.create(
+            &OrganizationCreateDBRequest {
+                name: "globex-inc".to_string(),
+                email: "info@globex.example.com".to_string(),
+                display_name: None,
+                avatar_url: None,
+                created_by: alice,
+            },
+            TEST_DEFAULT_ROLES,
+        )
         .await
         .unwrap();
 
@@ -1034,13 +1083,16 @@ mod tests {
         let mut orgs = Organizations::new(&mut conn);
 
         let org = orgs
-            .create(&OrganizationCreateDBRequest {
-                name: "acme-corp".to_string(),
-                email: "billing@acme.example.com".to_string(),
-                display_name: None,
-                avatar_url: None,
-                created_by: alice,
-            }, TEST_DEFAULT_ROLES)
+            .create(
+                &OrganizationCreateDBRequest {
+                    name: "acme-corp".to_string(),
+                    email: "billing@acme.example.com".to_string(),
+                    display_name: None,
+                    avatar_url: None,
+                    created_by: alice,
+                },
+                TEST_DEFAULT_ROLES,
+            )
             .await
             .unwrap();
 
@@ -1073,13 +1125,16 @@ mod tests {
         let mut orgs = Organizations::new(&mut conn);
 
         let org = orgs
-            .create(&OrganizationCreateDBRequest {
-                name: "acme-corp".to_string(),
-                email: "billing@acme.example.com".to_string(),
-                display_name: None,
-                avatar_url: None,
-                created_by: alice,
-            }, TEST_DEFAULT_ROLES)
+            .create(
+                &OrganizationCreateDBRequest {
+                    name: "acme-corp".to_string(),
+                    email: "billing@acme.example.com".to_string(),
+                    display_name: None,
+                    avatar_url: None,
+                    created_by: alice,
+                },
+                TEST_DEFAULT_ROLES,
+            )
             .await
             .unwrap();
 
@@ -1098,13 +1153,16 @@ mod tests {
         let mut orgs = Organizations::new(&mut conn);
 
         for i in 0..5 {
-            orgs.create(&OrganizationCreateDBRequest {
-                name: format!("org-{i}"),
-                email: format!("org-{i}@example.com"),
-                display_name: None,
-                avatar_url: None,
-                created_by: creator,
-            }, TEST_DEFAULT_ROLES)
+            orgs.create(
+                &OrganizationCreateDBRequest {
+                    name: format!("org-{i}"),
+                    email: format!("org-{i}@example.com"),
+                    display_name: None,
+                    avatar_url: None,
+                    created_by: creator,
+                },
+                TEST_DEFAULT_ROLES,
+            )
             .await
             .unwrap();
         }

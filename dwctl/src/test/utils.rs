@@ -522,7 +522,10 @@ pub async fn create_test_org(pool: &PgPool, created_by: UserId) -> UserResponse 
                 avatar_url: None,
                 created_by,
             },
-            &[crate::api::models::users::Role::StandardUser, crate::api::models::users::Role::BatchAPIUser],
+            &[
+                crate::api::models::users::Role::StandardUser,
+                crate::api::models::users::Role::BatchAPIUser,
+            ],
         )
         .await
         .expect("Failed to create test organization");
