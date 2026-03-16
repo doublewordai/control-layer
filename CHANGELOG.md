@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.22.0](https://github.com/doublewordai/control-layer/compare/v8.21.0...v8.22.0) (2026-03-16)
+
+
+### Features
+
+* **dwctl:** server-side tool calling backend ([#878](https://github.com/doublewordai/control-layer/issues/878)) ([1ff4c56](https://github.com/doublewordai/control-layer/commit/1ff4c5665ff6000f73b54d76581038829de44458))
+
 ## [8.21.0](https://github.com/doublewordai/control-layer/compare/v8.20.0...v8.21.0) (2026-03-16)
 
 
