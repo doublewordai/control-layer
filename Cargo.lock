@@ -1461,6 +1461,7 @@ dependencies = [
  "minijinja",
  "moka",
  "multer",
+ "notify",
  "once_cell",
  "onwards",
  "opentelemetry",

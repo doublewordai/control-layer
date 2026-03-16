@@ -143,12 +143,12 @@ fn install_crypto_provider() {
 pub mod api;
 pub mod auth;
 pub mod config;
+mod config_watcher;
 mod crypto;
 pub mod db;
 mod email;
 mod error_enrichment;
 pub mod errors;
-mod config_watcher;
 mod leader_election;
 pub mod limits;
 mod metrics;
@@ -1531,6 +1531,14 @@ pub struct BackgroundServices {
 }
 
 impl BackgroundServices {
+    fn spawn<F>(&mut self, name: &'static str, future: F)
+    where
+        F: std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
+    {
+        let abort_handle = self.background_tasks.spawn(future);
+        self.task_names.insert(abort_handle.id(), name);
+    }
+
     /// Wait for any background task to complete (indicating a failure)
     /// This method is cancel-safe - can be used in tokio::select! without losing tasks
     /// Returns an error with details about which task failed
@@ -2190,12 +2198,10 @@ impl Application {
             .build();
 
         if let Some(config_path) = config_path {
-            let task_id = bg_services.background_tasks.spawn(config_watcher::watch_config_file(
-                config_path,
-                shared_config,
-                bg_services.shutdown_token(),
-            ));
-            bg_services.task_names.insert(task_id, "config-watcher");
+            bg_services.spawn(
+                "config-watcher",
+                config_watcher::watch_config_file(config_path, shared_config, bg_services.shutdown_token()),
+            );
         }
 
         let router = build_router(

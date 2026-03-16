@@ -1,6 +1,6 @@
 use clap::Parser;
-use std::path::PathBuf;
 use dwctl::{Application, Config, telemetry};
+use std::path::PathBuf;
 
 /// Wait for shutdown signal (SIGTERM or Ctrl+C)
 async fn shutdown_signal() {
