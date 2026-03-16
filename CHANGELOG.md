@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.22.2](https://github.com/doublewordai/control-layer/compare/v8.22.1...v8.22.2) (2026-03-16)
+
+
+### Bug Fixes
+
+* **dwctl:** pick up onwards 0.21.0 opt-in server-side tool calling ([#888](https://github.com/doublewordai/control-layer/issues/888)) ([49494d3](https://github.com/doublewordai/control-layer/commit/49494d338166f562f528f6b59465dab71d46db69))
+
 ## [8.22.1](https://github.com/doublewordai/control-layer/compare/v8.22.0...v8.22.1) (2026-03-16)
 
 
