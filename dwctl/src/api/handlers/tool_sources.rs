@@ -16,23 +16,6 @@ use axum::{
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Validate a `parameters` value as a JSON Schema object.
-///
-/// We accept any JSON object (or null) as a schema. The only hard constraint is
-/// that if a value is provided it must be a JSON object (not a primitive).
-fn validate_parameters(value: &serde_json::Value) -> Result<()> {
-    if !value.is_object() {
-        return Err(Error::BadRequest {
-            message: "parameters must be a JSON Schema object".to_string(),
-        });
-    }
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
 // Tool source CRUD
 // ---------------------------------------------------------------------------
 
@@ -75,7 +58,6 @@ pub async fn list_tool_sources<P: PoolProvider>(
         (status = 400, description = "Bad request"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden"),
-        (status = 422, description = "Unprocessable entity - invalid JSON Schema"),
         (status = 500, description = "Internal server error"),
     ),
     security(
@@ -90,10 +72,6 @@ pub async fn create_tool_source<P: PoolProvider>(
     _: RequiresPermission<resource::ToolSources, operation::CreateAll>,
     Json(body): Json<ToolSourceCreate>,
 ) -> Result<(StatusCode, Json<ToolSourceResponse>)> {
-    if let Some(ref params) = body.parameters {
-        validate_parameters(params)?;
-    }
-
     if body.timeout_secs <= 0 {
         return Err(Error::BadRequest {
             message: "timeout_secs must be positive".to_string(),
@@ -170,7 +148,6 @@ pub async fn get_tool_source<P: PoolProvider>(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden"),
         (status = 404, description = "Not found"),
-        (status = 422, description = "Unprocessable entity - invalid JSON Schema"),
         (status = 500, description = "Internal server error"),
     ),
     security(
@@ -186,11 +163,6 @@ pub async fn update_tool_source<P: PoolProvider>(
     _: RequiresPermission<resource::ToolSources, operation::UpdateAll>,
     Json(body): Json<ToolSourceUpdate>,
 ) -> Result<Json<ToolSourceResponse>> {
-    // Validate parameters JSON Schema if provided
-    if let Some(Some(ref params)) = body.parameters {
-        validate_parameters(params)?;
-    }
-
     if let Some(timeout) = body.timeout_secs
         && timeout <= 0
     {
@@ -305,6 +277,7 @@ pub async fn list_deployment_tool_sources<P: PoolProvider>(
         (status = 204, description = "Attached"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden"),
+        (status = 404, description = "Deployment or tool source not found"),
         (status = 500, description = "Internal server error"),
     ),
     security(
@@ -415,6 +388,7 @@ pub async fn list_group_tool_sources<P: PoolProvider>(
         (status = 204, description = "Attached"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden"),
+        (status = 404, description = "Group or tool source not found"),
         (status = 500, description = "Internal server error"),
     ),
     security(
@@ -473,32 +447,5 @@ pub async fn detach_tool_source_from_group<P: PoolProvider>(
             resource: "GroupToolSource".to_string(),
             id: format!("{group_id}/{tool_source_id}"),
         })
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Unit tests
-// ---------------------------------------------------------------------------
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_validate_parameters_accepts_object() {
-        let v = serde_json::json!({"type": "object", "properties": {}});
-        assert!(validate_parameters(&v).is_ok());
-    }
-
-    #[test]
-    fn test_validate_parameters_rejects_non_object() {
-        let v = serde_json::json!("not an object");
-        assert!(validate_parameters(&v).is_err());
-
-        let v = serde_json::json!(42);
-        assert!(validate_parameters(&v).is_err());
-
-        let v = serde_json::json!([1, 2, 3]);
-        assert!(validate_parameters(&v).is_err());
     }
 }

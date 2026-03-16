@@ -381,6 +381,46 @@ mod tests {
         assert!(matches!(result, Err(ToolError::NotFound(_))));
     }
 
+    #[tokio::test]
+    async fn test_execute_returns_timeout_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/tool"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"ok": true}))
+                    .set_delay(std::time::Duration::from_secs(3)),
+            )
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let executor = HttpToolExecutor::new(client, None);
+
+        let mut tools = HashMap::new();
+        tools.insert(
+            "test_tool".to_string(),
+            ToolDefinition {
+                url: format!("{}/tool", server.uri()),
+                api_key: None,
+                timeout_secs: 1,
+                tool_source_id: Uuid::nil(),
+            },
+        );
+        let resolved = ResolvedToolSet::new(tools, HashMap::new());
+        let ctx = RequestContext::new().with_extension(ResolvedTools(Arc::new(resolved)));
+
+        let result = executor.execute("test_tool", "id1", &serde_json::json!({}), &ctx).await;
+        assert!(matches!(result, Err(ToolError::Timeout(_))));
+    }
+
+    #[tokio::test]
+    async fn test_execute_returns_connection_error() {
+        let (executor, ctx) = make_executor_and_ctx("test_tool", "http://127.0.0.1:1", None);
+        let result = executor.execute("test_tool", "id1", &serde_json::json!({}), &ctx).await;
+        assert!(matches!(result, Err(ToolError::ExecutionError(_))));
+    }
+
     #[test]
     fn test_resolved_tool_set_to_tool_schemas() {
         let mut tools = HashMap::new();

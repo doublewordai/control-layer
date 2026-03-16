@@ -50,7 +50,7 @@ pub async fn tool_injection_middleware(State(state): State<ToolInjectionState>, 
         Ok(b) => b,
         Err(e) => {
             warn!(error = %e, "Failed to read request body in tool injection middleware");
-            return next.run(request).await;
+            return axum::response::IntoResponse::into_response((axum::http::StatusCode::BAD_REQUEST, "Failed to read request body"));
         }
     };
 
