@@ -1175,6 +1175,8 @@ export interface BatchesListQuery {
   created_after?: string;
   /** Only return batches created before this ISO 8601 timestamp */
   created_before?: string;
+  /** When true, sort active (non-terminal) batches before terminal ones */
+  active_first?: boolean;
 }
 
 // ===== BATCH REQUESTS (Custom endpoints beyond OpenAI spec) =====

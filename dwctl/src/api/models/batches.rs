@@ -311,6 +311,11 @@ pub struct ListBatchesQuery {
     /// Only return batches created before this ISO 8601 timestamp
     #[param(example = "2025-12-31T23:59:59Z")]
     pub created_before: Option<chrono::DateTime<chrono::Utc>>,
+
+    /// When true, sort active (non-terminal) batches before completed/failed/cancelled ones.
+    /// Each group is sorted by creation time (newest first). Default: false.
+    #[serde(default)]
+    pub active_first: bool,
 }
 
 /// Query parameters for batch results
