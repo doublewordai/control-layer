@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.22.1](https://github.com/doublewordai/control-layer/compare/v8.22.0...v8.22.1) (2026-03-16)
+
+
+### Bug Fixes
+
+* orgs need batch permissions so we can make batches as an org via the api ([#872](https://github.com/doublewordai/control-layer/issues/872)) ([efc8ae0](https://github.com/doublewordai/control-layer/commit/efc8ae0d429e20a67dd9d2f8aa6a1f2f94bd6e47))
+
 ## [8.22.0](https://github.com/doublewordai/control-layer/compare/v8.21.0...v8.22.0) (2026-03-16)
 
 
