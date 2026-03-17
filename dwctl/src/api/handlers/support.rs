@@ -29,13 +29,13 @@ pub struct SupportResponse {
 /// Submit a support request via email
 #[utoipa::path(
     post,
-    path = "/admin/api/v1/support/requests",
+    path = "/support/requests",
     request_body = SupportRequest,
     responses(
         (status = 200, description = "Support request sent", body = SupportResponse),
         (status = 500, description = "Failed to send support request"),
     ),
-    security(("session" = []), ("api_key" = [])),
+    security(("BearerAuth" = []), ("CookieAuth" = []), ("X-Doubleword-User" = [])),
 )]
 #[tracing::instrument(skip_all)]
 pub async fn submit_support_request<P: PoolProvider>(
