@@ -370,15 +370,17 @@ pub async fn create_batch<P: PoolProvider>(
     // When in org context, attribute batch ownership to the org
     let target_user_id = current_user.active_organization.unwrap_or(current_user.id);
 
-    // Get the hidden API key ID for per-member attribution within orgs
-    let api_key_id = {
+    // Get the hidden API key for batch execution and per-member attribution.
+    // The secret is stored on the batch so the daemon uses the batch creator's
+    // credentials, not the file uploader's key from request_templates.
+    let (batch_api_key, api_key_id) = {
         let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
         let mut api_keys_repo = ApiKeys::new(&mut conn);
-        let (_secret, key_id) = api_keys_repo
+        let (secret, key_id) = api_keys_repo
             .get_or_create_hidden_key_with_id(target_user_id, ApiKeyPurpose::Batch, current_user.id)
             .await
             .map_err(Error::Database)?;
-        key_id
+        (secret, key_id)
     };
 
     // Convert metadata to HashMap and inject request_source and user info.
@@ -400,6 +402,7 @@ pub async fn create_batch<P: PoolProvider>(
         metadata,
         created_by: Some(target_user_id.to_string()),
         api_key_id: Some(api_key_id),
+        api_key: Some(batch_api_key),
     };
 
     let reservation_ids = reserve_capacity_for_batch(
