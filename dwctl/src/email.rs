@@ -179,7 +179,11 @@ impl EmailService {
             operation: format!("build email message: {e}"),
         })?;
 
-        // Send based on transport type
+        self.dispatch(message).await
+    }
+
+    /// Send a pre-built message via the configured transport.
+    async fn dispatch(&self, message: Message) -> Result<(), Error> {
         match &self.transport {
             EmailTransport::Smtp(smtp) => {
                 smtp.send(message).await.map_err(|e| Error::Internal {
@@ -496,20 +500,7 @@ impl EmailService {
                 operation: format!("build support email message: {e}"),
             })?;
 
-        match &self.transport {
-            EmailTransport::Smtp(smtp) => {
-                smtp.send(msg).await.map_err(|e| Error::Internal {
-                    operation: format!("send SMTP email: {e}"),
-                })?;
-            }
-            EmailTransport::File(file) => {
-                file.send(msg).await.map_err(|e| Error::Internal {
-                    operation: format!("send file email: {e}"),
-                })?;
-            }
-        }
-
-        Ok(())
+        self.dispatch(msg).await
     }
 
     fn render_org_invite_body(
@@ -750,5 +741,41 @@ mod tests {
         assert!(body.contains("25.00"), "Should contain amount");
         assert!(body.contains("5.00"), "Should contain threshold");
         assert!(body.contains("cost-management"), "Should contain dashboard link");
+    }
+
+    #[tokio::test]
+    async fn test_send_support_request() {
+        let config = create_test_config();
+        let email_service = EmailService::new(&config).unwrap();
+
+        let result = email_service
+            .send_support_request(
+                "support@doubleword.ai",
+                "alice@example.com",
+                Some("Alice Smith"),
+                "Help with API keys",
+                "I can't generate a new API key from the dashboard.",
+            )
+            .await;
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_send_support_request_no_name() {
+        let config = create_test_config();
+        let email_service = EmailService::new(&config).unwrap();
+
+        let result = email_service
+            .send_support_request(
+                "support@doubleword.ai",
+                "alice@example.com",
+                None,
+                "Help with API keys",
+                "I can't generate a new API key from the dashboard.",
+            )
+            .await;
+
+        assert!(result.is_ok());
     }
 }
