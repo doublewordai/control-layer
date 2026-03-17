@@ -179,7 +179,11 @@ impl EmailService {
             operation: format!("build email message: {e}"),
         })?;
 
-        // Send based on transport type
+        self.dispatch(message).await
+    }
+
+    /// Send a pre-built message via the configured transport.
+    async fn dispatch(&self, message: Message) -> Result<(), Error> {
         match &self.transport {
             EmailTransport::Smtp(smtp) => {
                 smtp.send(message).await.map_err(|e| Error::Internal {
@@ -452,6 +456,50 @@ impl EmailService {
         self.send_email(to_email, None, &subject, &body).await
     }
 
+    /// Send a support request email to the configured support address, with reply-to set to the user's email.
+    pub async fn send_support_request(
+        &self,
+        support_email: &str,
+        user_email: &str,
+        user_name: Option<&str>,
+        subject: &str,
+        message: &str,
+    ) -> Result<(), Error> {
+        // Build from mailbox
+        let from_address = self.from_email.parse().map_err(|e| Error::Internal {
+            operation: format!("Failed to parse from email: {e}"),
+        })?;
+        let from = Mailbox::new(Some(self.from_name.clone()), from_address);
+
+        // Build to mailbox (support address)
+        let to_address = support_email.parse().map_err(|e| Error::Internal {
+            operation: format!("Failed to parse support email: {e}"),
+        })?;
+        let to = Mailbox::new(Some("Doubleword Support".to_string()), to_address);
+
+        // Reply-to is the user's email
+        let reply_to_address = user_email.parse().map_err(|e| Error::Internal {
+            operation: format!("Failed to parse user email for reply-to: {e}"),
+        })?;
+        let reply_to = Mailbox::new(user_name.map(|n| n.to_string()), reply_to_address);
+
+        let display_name = user_name.unwrap_or(user_email);
+        let body = format!("Support request from {} ({}):\n\n{}", display_name, user_email, message,);
+
+        let msg = Message::builder()
+            .from(from)
+            .to(to)
+            .reply_to(reply_to)
+            .subject(subject)
+            .header(ContentType::TEXT_PLAIN)
+            .body(body)
+            .map_err(|e| Error::Internal {
+                operation: format!("build support email message: {e}"),
+            })?;
+
+        self.dispatch(msg).await
+    }
+
     fn render_org_invite_body(
         &self,
         org_name: &str,
@@ -690,5 +738,41 @@ mod tests {
         assert!(body.contains("25.00"), "Should contain amount");
         assert!(body.contains("5.00"), "Should contain threshold");
         assert!(body.contains("cost-management"), "Should contain dashboard link");
+    }
+
+    #[tokio::test]
+    async fn test_send_support_request() {
+        let config = create_test_config();
+        let email_service = EmailService::new(&config).unwrap();
+
+        let result = email_service
+            .send_support_request(
+                "support@doubleword.ai",
+                "alice@example.com",
+                Some("Alice Smith"),
+                "Help with API keys",
+                "I can't generate a new API key from the dashboard.",
+            )
+            .await;
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_send_support_request_no_name() {
+        let config = create_test_config();
+        let email_service = EmailService::new(&config).unwrap();
+
+        let result = email_service
+            .send_support_request(
+                "support@doubleword.ai",
+                "alice@example.com",
+                None,
+                "Help with API keys",
+                "I can't generate a new API key from the dashboard.",
+            )
+            .await;
+
+        assert!(result.is_ok());
     }
 }

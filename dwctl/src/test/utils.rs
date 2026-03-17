@@ -220,6 +220,7 @@ pub fn create_test_config() -> crate::config::Config {
         },
         onwards: crate::config::OnwardsConfig::default(),
         onboarding_url: None,
+        support_email: "support@test.com".to_string(),
     }
 }
 
@@ -394,6 +395,7 @@ pub async fn create_test_api_key_for_user(pool: &PgPool, user_id: UserId) -> Api
             purpose: ApiKeyPurpose::Realtime,
             requests_per_second: None,
             burst_size: None,
+            member_id: None,
         },
     );
 
@@ -514,13 +516,19 @@ pub async fn create_test_org(pool: &PgPool, created_by: UserId) -> UserResponse 
     let mut conn = pool.acquire().await.expect("Failed to acquire connection");
     let mut orgs = Organizations::new(&mut conn);
     let org = orgs
-        .create(&OrganizationCreateDBRequest {
-            name: org_name.clone(),
-            email: format!("{org_name}@example.com"),
-            display_name: Some("Test Organization".to_string()),
-            avatar_url: None,
-            created_by,
-        })
+        .create(
+            &OrganizationCreateDBRequest {
+                name: org_name.clone(),
+                email: format!("{org_name}@example.com"),
+                display_name: Some("Test Organization".to_string()),
+                avatar_url: None,
+                created_by,
+            },
+            &[
+                crate::api::models::users::Role::StandardUser,
+                crate::api::models::users::Role::BatchAPIUser,
+            ],
+        )
         .await
         .expect("Failed to create test organization");
     UserResponse {

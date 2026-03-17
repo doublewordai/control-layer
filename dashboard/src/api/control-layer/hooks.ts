@@ -1613,3 +1613,12 @@ export function useRemoveMember() {
     },
   });
 }
+
+// Support
+export function useSubmitSupportRequest() {
+  return useMutation({
+    mutationKey: ["support", "submit"],
+    mutationFn: (data: { subject: string; message: string }) =>
+      dwctlApi.support.submitRequest(data),
+  });
+}
