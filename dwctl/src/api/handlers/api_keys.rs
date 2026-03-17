@@ -95,7 +95,7 @@ pub async fn create_user_api_key<P: PoolProvider>(
     // Only PlatformManagers can specify member_id to attribute a key to another org member
     if data.member_id.is_some() && !can_create_all {
         return Err(Error::InsufficientPermissions {
-            required: Permission::Granted,
+            required: Permission::Allow(Resource::ApiKeys, Operation::CreateAll),
             action: Operation::CreateAll,
             resource: "API keys with member_id (requires PlatformManager)".to_string(),
         });
