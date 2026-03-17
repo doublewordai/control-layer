@@ -25,6 +25,11 @@ pub struct ApiKeyCreate {
     pub requests_per_second: Option<f32>,
     /// Per-API-key rate limit: maximum burst size (null = no limit)
     pub burst_size: Option<i32>,
+    /// Organization member to attribute this key to. Only usable when the caller has
+    /// permission to create keys for any member of the organization (e.g. PlatformManagers
+    /// or admins). The specified user must be a member of the org.
+    #[schema(value_type = Option<String>, format = "uuid")]
+    pub member_id: Option<UserId>,
 }
 
 // API Key update.
