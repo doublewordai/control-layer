@@ -484,10 +484,7 @@ impl EmailService {
         let reply_to = Mailbox::new(user_name.map(|n| n.to_string()), reply_to_address);
 
         let display_name = user_name.unwrap_or(user_email);
-        let body = format!(
-            "Support request from {} ({}):\n\n{}",
-            display_name, user_email, message,
-        );
+        let body = format!("Support request from {} ({}):\n\n{}", display_name, user_email, message,);
 
         let msg = Message::builder()
             .from(from)
