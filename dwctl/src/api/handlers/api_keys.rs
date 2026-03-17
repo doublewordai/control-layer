@@ -115,14 +115,14 @@ pub async fn create_user_api_key<P: PoolProvider>(
 
     let mut pool_conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
 
-    // Check if target is an organization by looking at user_type
+    // Check if target is an organization using Organizations repository
     let target_is_org = {
-        let mut user_repo = crate::db::handlers::Users::new(&mut pool_conn);
-        user_repo
+        let mut org_repo = crate::db::handlers::Organizations::new(&mut pool_conn);
+        org_repo
             .get_by_id(target_user_id)
-            .await?
-            .map(|u| u.user_type == "organization")
-            .unwrap_or(false)
+            .await
+            .map_err(Error::Database)?
+            .is_some()
     };
 
     // Validate member_id: must be a member of the target org
