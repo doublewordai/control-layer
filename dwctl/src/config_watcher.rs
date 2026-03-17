@@ -58,11 +58,21 @@ fn event_touches_config_file(event: &Event, watch_dir: &Path, config_path: &Path
 pub async fn watch_config_file(config_path: PathBuf, shared_config: SharedConfig, shutdown_token: CancellationToken) -> anyhow::Result<()> {
     let current_dir = std::env::current_dir().context("failed to determine current directory for config watcher")?;
     let (config_path, watch_dir) = resolve_watch_paths(&config_path, &current_dir)?;
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let callback_config_path = config_path.clone();
+    let callback_watch_dir = watch_dir.clone();
+    let (tx, mut rx) = mpsc::channel(1);
 
     let mut watcher = RecommendedWatcher::new(
-        move |event| {
-            let _ = tx.send(event);
+        move |event: notify::Result<Event>| match event {
+            Ok(event) if event.kind.is_modify() || event.kind.is_create() => {
+                if event_touches_config_file(&event, &callback_watch_dir, &callback_config_path) {
+                    let _ = tx.try_send(());
+                }
+            }
+            Ok(_) => {}
+            Err(error) => {
+                error!(path = %callback_config_path.display(), error = %error, "Config watch error");
+            }
         },
         NotifyConfig::default(),
     )?;
@@ -76,31 +86,23 @@ pub async fn watch_config_file(config_path: PathBuf, shared_config: SharedConfig
                 info!(path = %config_path.display(), "Stopping config watcher");
                 break;
             }
-            maybe_event = rx.recv() => {
-                let Some(event) = maybe_event else {
+            maybe_reload = rx.recv() => {
+                let Some(()) = maybe_reload else {
                     break;
                 };
 
-                match event {
-                    Ok(event) if event.kind.is_modify() || event.kind.is_create() => {
-                        if !event_touches_config_file(&event, &watch_dir, &config_path) {
-                            continue;
-                        }
-
-                        info!(path = %config_path.display(), kind = ?event.kind, "Config file changed, reloading");
-                        match Config::load_from_path(config_path.to_string_lossy().into_owned()) {
-                            Ok(config) => {
-                                shared_config.store(config);
-                                info!(path = %config_path.display(), "Reloaded config from disk");
-                            }
-                            Err(error) => {
-                                warn!(path = %config_path.display(), error = %error, "Config reload failed; continuing with previous config");
-                            }
-                        }
+                info!(path = %config_path.display(), "Config file changed, reloading");
+                let load_path = config_path.clone();
+                match tokio::task::spawn_blocking(move || Config::load_from_path(load_path.to_string_lossy().into_owned())).await {
+                    Ok(Ok(config)) => {
+                        shared_config.store(config);
+                        info!(path = %config_path.display(), "Reloaded config from disk");
                     }
-                    Ok(_) => {}
+                    Ok(Err(error)) => {
+                        warn!(path = %config_path.display(), error = %error, "Config reload failed; continuing with previous config");
+                    }
                     Err(error) => {
-                        error!(path = %config_path.display(), error = %error, "Config watch error");
+                        error!(path = %config_path.display(), error = %error, "Config reload task failed");
                     }
                 }
             }

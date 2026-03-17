@@ -204,7 +204,7 @@ use request_logging::{AiResponse, ParsedAIRequest};
 use sqlx::{ConnectOptions, Executor, PgPool, postgres::PgConnectOptions};
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, OnceLock};
 use tokio::net::TcpListener;
 use tower::Layer;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
@@ -216,20 +216,20 @@ use uuid::Uuid;
 
 pub use types::{ApiKeyId, DeploymentId, GroupId, InferenceEndpointId, UserId};
 
-#[derive(Clone, Debug)]
-pub struct SharedConfig(Arc<RwLock<Config>>);
+#[derive(Clone)]
+pub struct SharedConfig(Arc<arc_swap::ArcSwap<Config>>);
 
 impl SharedConfig {
     pub fn new(config: Config) -> Self {
-        Self(Arc::new(RwLock::new(config)))
+        Self(Arc::new(arc_swap::ArcSwap::from_pointee(config)))
     }
 
-    pub fn snapshot(&self) -> Config {
-        self.0.read().expect("shared config lock poisoned").clone()
+    pub fn snapshot(&self) -> Arc<Config> {
+        self.0.load_full()
     }
 
     pub fn store(&self, config: Config) {
-        *self.0.write().expect("shared config lock poisoned") = config;
+        self.0.store(Arc::new(config));
     }
 }
 
@@ -260,7 +260,7 @@ impl From<Config> for SharedConfig {
 /// let limiters = limits::Limiters::new(&config.limits);
 /// let state = AppState::builder()
 ///     .db(db_pools)
-///     .config(config)
+///     .config(config.into())
 ///     .request_manager(request_manager)
 ///     .limiters(limiters)
 ///     .build();
@@ -289,7 +289,7 @@ impl<P> AppState<P>
 where
     P: PoolProvider + Clone,
 {
-    pub fn current_config(&self) -> Config {
+    pub fn current_config(&self) -> Arc<Config> {
         self.config.snapshot()
     }
 }
@@ -990,7 +990,7 @@ pub async fn build_router(
         // Add AnalyticsHandler for analytics/billing if enabled
         // The batcher is spawned in setup_background_services and managed by BackgroundServices
         if let Some(sender) = analytics_sender {
-            let analytics_handler = request_logging::AnalyticsHandler::new(sender, uuid::Uuid::new_v4(), config.clone());
+            let analytics_handler = request_logging::AnalyticsHandler::new(sender, uuid::Uuid::new_v4(), config.as_ref().clone());
             multi_handler = multi_handler.with(analytics_handler);
         }
 
