@@ -220,6 +220,7 @@ pub fn create_test_config() -> crate::config::Config {
         },
         onwards: crate::config::OnwardsConfig::default(),
         onboarding_url: None,
+        support_email: "support@test.com".to_string(),
     }
 }
 
