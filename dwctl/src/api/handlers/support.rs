@@ -43,7 +43,10 @@ pub async fn submit_support_request<P: PoolProvider>(
     current_user: CurrentUser,
     Json(request): Json<SupportRequest>,
 ) -> Result<Json<SupportResponse>> {
-    if request.subject.is_empty() || request.message.trim().is_empty() {
+    let subject = request.subject.trim();
+    let message = request.message.trim();
+
+    if subject.is_empty() || message.is_empty() {
         return Err(Error::BadRequest {
             message: "Subject and message are required".to_string(),
         });
@@ -55,8 +58,8 @@ pub async fn submit_support_request<P: PoolProvider>(
             &state.config.support_email,
             &current_user.email,
             current_user.display_name.as_deref(),
-            &request.subject,
-            &request.message,
+            subject,
+            message,
         )
         .await?;
 
