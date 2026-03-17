@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.22.3](https://github.com/doublewordai/control-layer/compare/v8.22.2...v8.22.3) (2026-03-16)
+
+
+### Bug Fixes
+
+* bump onwards ([#892](https://github.com/doublewordai/control-layer/issues/892)) ([861ca70](https://github.com/doublewordai/control-layer/commit/861ca70a1dda9076cf8d1025073717f6685c9c92))
+
 ## [8.22.2](https://github.com/doublewordai/control-layer/compare/v8.22.1...v8.22.2) (2026-03-16)
 
 
