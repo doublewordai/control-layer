@@ -89,6 +89,18 @@ impl<'c> Organizations<'c> {
         Self { db }
     }
 
+    /// Returns `true` if a non-deleted organization with the given ID exists.
+    #[instrument(skip(self), fields(org_id = %abbrev_uuid(&id)), err)]
+    pub async fn exists(&mut self, id: UserId) -> Result<bool> {
+        let exists = sqlx::query_scalar!(
+            "SELECT EXISTS(SELECT 1 FROM users WHERE id = $1 AND user_type = 'organization' AND is_deleted = false) as \"exists!\"",
+            id
+        )
+        .fetch_one(&mut *self.db)
+        .await?;
+        Ok(exists)
+    }
+
     /// Create a new organization. The creator is automatically added as owner.
     ///
     /// `default_roles` specifies which roles to assign to the org user entity.
