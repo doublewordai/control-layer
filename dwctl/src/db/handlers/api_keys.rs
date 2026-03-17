@@ -2019,6 +2019,7 @@ mod tests {
             },
             slow_statement_threshold_ms: 1000,
             admin_email: "admin@example.org".to_string(),
+            support_email: "support@example.org".to_string(),
             admin_password: None,
             secret_key: None,
             model_sources: vec![crate::config::ModelSource {
