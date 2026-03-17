@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from "react";
 import { Send } from "lucide-react";
+import { toast } from "sonner";
 import {
   Dialog,
   DialogContent,
@@ -67,6 +68,7 @@ export const SupportRequestModal: React.FC<SupportRequestModalProps> = ({
 
     try {
       await submitSupport.mutateAsync({ subject, message });
+      toast.success("Support request sent. We'll get back to you soon.");
       onClose();
     } catch {
       // Error is handled by the mutation's error state
