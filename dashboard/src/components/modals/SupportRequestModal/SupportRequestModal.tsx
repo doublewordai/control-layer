@@ -48,15 +48,16 @@ export const SupportRequestModal: React.FC<SupportRequestModalProps> = ({
   const [subject, setSubject] = useState<SupportSubject | "">("");
   const [message, setMessage] = useState("");
   const submitSupport = useSubmitSupportRequest();
+  const { reset } = submitSupport;
 
   // Reset form, mutation state, and apply default subject when modal opens
   useEffect(() => {
     if (isOpen) {
-      submitSupport.reset();
+      reset();
       setSubject(defaultSubject ?? "");
       setMessage("");
     }
-  }, [isOpen, defaultSubject, submitSupport]);
+  }, [isOpen, defaultSubject, reset]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
