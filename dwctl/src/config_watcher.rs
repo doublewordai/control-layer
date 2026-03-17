@@ -93,7 +93,11 @@ pub async fn watch_config_file(config_path: PathBuf, shared_config: SharedConfig
 
                 info!(path = %config_path.display(), "Config file changed, reloading");
                 let load_path = config_path.clone();
-                match tokio::task::spawn_blocking(move || Config::load_from_path(load_path.to_string_lossy().into_owned())).await {
+                match tokio::task::spawn_blocking(move || {
+                    Config::load_from_path(load_path.to_string_lossy().into_owned()).map_err(anyhow::Error::from)
+                })
+                .await
+                {
                     Ok(Ok(config)) => {
                         shared_config.store(config);
                         info!(path = %config_path.display(), "Reloaded config from disk");
