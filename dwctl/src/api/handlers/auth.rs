@@ -709,10 +709,14 @@ pub async fn cli_callback<P: PoolProvider>(
     // Reject API key authentication — this endpoint must only be used via SSO
     // cookie/proxy-header auth. Allowing API keys would let a realtime key holder
     // mint a platform key, bypassing the purpose restriction model.
-    if headers.get(axum::http::header::AUTHORIZATION).is_some() {
-        return Err(Error::Unauthenticated {
-            message: Some("CLI callback must be accessed via browser SSO, not API keys.".to_string()),
-        });
+    // Only reject Bearer tokens (API keys), not other Authorization schemes that
+    // SSO/proxy setups might forward (e.g., ID tokens, Basic auth).
+    if let Some(auth_header) = headers.get(axum::http::header::AUTHORIZATION) {
+        if auth_header.to_str().is_ok_and(|s| s.starts_with("Bearer ")) {
+            return Err(Error::Unauthenticated {
+                message: Some("CLI callback must be accessed via browser SSO, not API keys.".to_string()),
+            });
+        }
     }
 
     // Validate port: reject 0 and privileged ports
@@ -728,8 +732,11 @@ pub async fn cli_callback<P: PoolProvider>(
 
     // Determine target user for key creation (personal or org-scoped)
     let (target_user_id, account_name, org_id_param) = if let Some(ref org_slug) = query.org {
-        // Look up user's org memberships and find the one matching the slug
-        let mut pool_conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+        // Look up user's org memberships and find the one matching the slug.
+        // Use primary pool (write) for strongly consistent reads — org membership
+        // is security-sensitive (gates minting org-scoped keys), so we can't risk
+        // a revoked member passing due to replication lag on a read replica.
+        let mut pool_conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
         let mut org_repo = Organizations::new(&mut pool_conn);
         let memberships = org_repo.list_user_organizations(user_id).await.map_err(Error::Database)?;
 
@@ -816,36 +823,16 @@ pub async fn cli_callback<P: PoolProvider>(
         }
     }
 
-    let redirect_str = redirect_url.as_str();
-
-    // Return an HTML page that redirects to localhost with security headers
-    let html = format!(
-        r#"<!DOCTYPE html>
-<html>
-<head>
-    <title>DW CLI — Authentication</title>
-    <meta http-equiv="refresh" content="0;url={redirect_str}">
-</head>
-<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; background: #fafafa;">
-    <div style="text-align: center; max-width: 400px;">
-        <h2 style="color: #333;">Authentication successful</h2>
-        <p style="color: #666;">Redirecting to your terminal...</p>
-        <p style="color: #999; font-size: 0.9em;">If nothing happens, <a href="{redirect_str}">click here</a>.</p>
-    </div>
-    <script>window.location.href = "{redirect_str}";</script>
-</body>
-</html>"#,
-    );
-
+    // Use a 302 redirect to localhost — keeps secrets out of the HTML body entirely.
+    // Security headers prevent caching and referrer leakage of the redirect URL.
     Ok((
-        axum::http::StatusCode::OK,
+        axum::http::StatusCode::FOUND,
         [
-            ("content-type", "text/html"),
+            ("location", redirect_url.as_str()),
             ("cache-control", "no-store"),
             ("pragma", "no-cache"),
             ("referrer-policy", "no-referrer"),
         ],
-        html,
     )
         .into_response())
 }
@@ -2369,5 +2356,181 @@ mod tests {
         response.assert_status(axum::http::StatusCode::CREATED);
         let cookie = response.headers().get("set-cookie").unwrap().to_str().unwrap();
         assert!(!cookie.contains("Domain="), "cookie should not include Domain: {cookie}");
+    }
+
+    // -----------------------------------------------------------------------
+    // CLI callback tests
+    // -----------------------------------------------------------------------
+
+    #[sqlx::test]
+    async fn test_cli_callback_personal_success(pool: PgPool) {
+        let (server, _bg) = crate::test::utils::create_test_app(pool.clone(), false).await;
+        let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+        let external_id = user.external_user_id.unwrap();
+
+        let response = server
+            .get(&format!("/authentication/cli-callback?port=12345&state=test-state-abc"))
+            .add_header("x-doubleword-user", &external_id)
+            .add_header("x-doubleword-email", &user.email)
+            .await;
+
+        response.assert_status(axum::http::StatusCode::FOUND);
+
+        let location = response
+            .headers()
+            .get("location")
+            .expect("missing Location header")
+            .to_str()
+            .unwrap();
+
+        // Should redirect to localhost with the correct port
+        assert!(
+            location.starts_with("http://127.0.0.1:12345/callback?"),
+            "unexpected redirect: {location}"
+        );
+
+        // Should contain the CSRF state
+        assert!(location.contains("state=test-state-abc"), "missing state in redirect: {location}");
+
+        // Should contain both keys
+        assert!(location.contains("inference_key="), "missing inference_key in redirect: {location}");
+        assert!(location.contains("platform_key="), "missing platform_key in redirect: {location}");
+        assert!(
+            location.contains("inference_key_id="),
+            "missing inference_key_id in redirect: {location}"
+        );
+        assert!(
+            location.contains("platform_key_id="),
+            "missing platform_key_id in redirect: {location}"
+        );
+
+        // Should contain user info
+        assert!(
+            location.contains(&format!("user_id={}", user.id)),
+            "missing user_id in redirect: {location}"
+        );
+        assert!(
+            location.contains("account_name=personal"),
+            "missing account_name in redirect: {location}"
+        );
+
+        // Security headers
+        assert_eq!(response.headers().get("cache-control").unwrap(), "no-store");
+        assert_eq!(response.headers().get("pragma").unwrap(), "no-cache");
+        assert_eq!(response.headers().get("referrer-policy").unwrap(), "no-referrer");
+    }
+
+    #[sqlx::test]
+    async fn test_cli_callback_org_success(pool: PgPool) {
+        let (server, _bg) = crate::test::utils::create_test_app(pool.clone(), false).await;
+        let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+        let external_id = user.external_user_id.clone().unwrap();
+        let org = crate::test::utils::create_test_org(&pool, user.id).await;
+
+        let response = server
+            .get(&format!(
+                "/authentication/cli-callback?port=54321&state=org-state&org={}",
+                urlencoding::encode(&org.username)
+            ))
+            .add_header("x-doubleword-user", &external_id)
+            .add_header("x-doubleword-email", &user.email)
+            .await;
+
+        response.assert_status(axum::http::StatusCode::FOUND);
+
+        let location = response.headers().get("location").unwrap().to_str().unwrap();
+        assert!(
+            location.starts_with("http://127.0.0.1:54321/callback?"),
+            "unexpected redirect: {location}"
+        );
+        assert!(
+            location.contains(&format!("user_id={}", org.id)),
+            "should use org_id as user_id: {location}"
+        );
+        assert!(
+            location.contains(&format!("org_id={}", org.id)),
+            "missing org_id in redirect: {location}"
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_cli_callback_unknown_org(pool: PgPool) {
+        let (server, _bg) = crate::test::utils::create_test_app(pool.clone(), false).await;
+        let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+        let external_id = user.external_user_id.unwrap();
+
+        let response = server
+            .get("/authentication/cli-callback?port=12345&state=s&org=nonexistent-org")
+            .add_header("x-doubleword-user", &external_id)
+            .add_header("x-doubleword-email", &user.email)
+            .await;
+
+        response.assert_status(axum::http::StatusCode::BAD_REQUEST);
+
+        // Verify no keys were created for this user
+        let mut conn = pool.acquire().await.unwrap();
+        let key_count = sqlx::query_scalar!(
+            "SELECT COUNT(*) FROM api_keys WHERE created_by = $1 AND name LIKE 'DW CLI%' AND is_deleted = false",
+            user.id
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap()
+        .unwrap_or(0);
+
+        assert_eq!(key_count, 0, "no CLI keys should be created when org lookup fails");
+    }
+
+    #[sqlx::test]
+    async fn test_cli_callback_rejects_api_key_auth(pool: PgPool) {
+        let (server, _bg) = crate::test::utils::create_test_app(pool.clone(), false).await;
+        let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+
+        // Create an API key for the user
+        let mut conn = pool.acquire().await.unwrap();
+        let mut repo = crate::db::handlers::api_keys::ApiKeys::new(&mut conn);
+        let key = repo
+            .create(&crate::db::models::api_keys::ApiKeyCreateDBRequest {
+                user_id: user.id,
+                name: "test-key".to_string(),
+                description: None,
+                purpose: ApiKeyPurpose::Realtime,
+                requests_per_second: None,
+                burst_size: None,
+                created_by: user.id,
+            })
+            .await
+            .unwrap();
+        drop(conn);
+
+        let response = server
+            .get("/authentication/cli-callback?port=12345&state=s")
+            .add_header("authorization", &format!("Bearer {}", key.secret))
+            .await;
+
+        response.assert_status(axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    #[sqlx::test]
+    async fn test_cli_callback_rejects_invalid_port(pool: PgPool) {
+        let (server, _bg) = crate::test::utils::create_test_app(pool.clone(), false).await;
+        let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+        let external_id = user.external_user_id.unwrap();
+
+        // Port 0
+        let response = server
+            .get("/authentication/cli-callback?port=0&state=s")
+            .add_header("x-doubleword-user", &external_id)
+            .add_header("x-doubleword-email", &user.email)
+            .await;
+        response.assert_status(axum::http::StatusCode::BAD_REQUEST);
+
+        // Privileged port
+        let response = server
+            .get("/authentication/cli-callback?port=80&state=s")
+            .add_header("x-doubleword-user", &external_id)
+            .add_header("x-doubleword-email", &user.email)
+            .await;
+        response.assert_status(axum::http::StatusCode::BAD_REQUEST);
     }
 }
