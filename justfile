@@ -460,7 +460,7 @@ test target="" *args="":
                     echo "  cargo binstall cargo-llvm-cov"
                     exit 1
                 fi
-                cargo llvm-cov --fail-under-lines 60 --lcov --output-path lcov.info
+                CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}" CARGO_PROFILE_TEST_DEBUG="${CARGO_PROFILE_TEST_DEBUG:-0}" cargo llvm-cov --fail-under-lines 60 --lcov --output-path lcov.info
             else
                 cargo test {{args}}
             fi
@@ -526,7 +526,7 @@ lint target *args="":
             echo "Running cargo fmt --check..."
             cargo fmt --check
             echo "Running cargo clippy..."
-            cargo clippy {{args}}
+            CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}" cargo clippy {{args}}
             echo "Checking SQLx prepared queries..."
             cargo sqlx prepare --check --workspace
             ;;

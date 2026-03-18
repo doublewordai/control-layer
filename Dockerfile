@@ -37,8 +37,9 @@ COPY .sqlx/ .sqlx/
 COPY Cargo.toml Cargo.lock ./
 COPY dwctl/ dwctl/
 RUN rm -rf dwctl/static && cp -r dashboard/dist dwctl/static
+ARG CARGO_BUILD_JOBS=1
 ENV SQLX_OFFLINE=true
-RUN cargo build --release -p dwctl
+RUN CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS} cargo build --release -p dwctl
 
 # Runtime stage
 FROM ubuntu:24.04
