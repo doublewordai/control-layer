@@ -669,7 +669,7 @@ fn create_session_cookie(token: &str, config: &crate::config::Config) -> String 
 // ---------------------------------------------------------------------------
 
 /// Query params for the CLI callback.
-#[derive(Debug, serde::Deserialize, utoipa::IntoParams)]
+#[derive(Debug, serde::Deserialize)]
 pub struct CliCallbackQuery {
     /// Localhost port where the CLI is listening (1024–65535).
     pub port: u16,
@@ -694,23 +694,8 @@ pub struct CliCallbackQuery {
 ///   2. This handler authenticates the user from the SSO cookie
 ///   3. Creates two external API keys in a single transaction
 ///   4. Redirects to http://localhost:{port}/callback?keys=...&user=...
-#[utoipa::path(
-    get,
-    path = "/authentication/cli-callback",
-    tag = "authentication",
-    summary = "CLI login callback",
-    description = "Callback endpoint for CLI browser login flow. Creates inference + platform API keys and redirects to the CLI's localhost server. Only accessible via SSO/cookie auth, not API keys.",
-    params(CliCallbackQuery),
-    responses(
-        (status = 200, description = "HTML page that redirects to localhost with API keys"),
-        (status = 400, description = "Invalid port or unknown organization"),
-        (status = 401, description = "Not authenticated or authenticated via API key"),
-    ),
-    security(
-        ("CookieAuth" = []),
-        ("X-Doubleword-User" = [])
-    )
-)]
+// Not included in OpenAPI spec — this is an internal endpoint for the CLI login flow,
+// not a public API for third-party consumers.
 #[tracing::instrument(skip_all)]
 pub async fn cli_callback<P: PoolProvider>(
     State(state): State<AppState<P>>,
