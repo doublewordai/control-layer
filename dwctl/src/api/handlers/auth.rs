@@ -703,8 +703,8 @@ pub async fn cli_callback<P: PoolProvider>(
     axum::extract::Query(query): axum::extract::Query<CliCallbackQuery>,
     current_user: CurrentUser,
 ) -> Result<axum::response::Response, Error> {
-    use axum::response::IntoResponse;
     use crate::db::handlers::organizations::Organizations;
+    use axum::response::IntoResponse;
 
     // Reject API key authentication — this endpoint must only be used via SSO
     // cookie/proxy-header auth. Allowing API keys would let a realtime key holder
@@ -718,19 +718,13 @@ pub async fn cli_callback<P: PoolProvider>(
     // Validate port: reject 0 and privileged ports
     if query.port == 0 || query.port < 1024 {
         return Err(Error::BadRequest {
-            message: format!(
-                "Invalid port: {}. Must be between 1024 and 65535.",
-                query.port
-            ),
+            message: format!("Invalid port: {}. Must be between 1024 and 65535.", query.port),
         });
     }
 
     let user_id = current_user.id;
     let user_email = current_user.email.clone();
-    let user_display_name = current_user
-        .display_name
-        .clone()
-        .unwrap_or_else(|| current_user.username.clone());
+    let user_display_name = current_user.display_name.clone().unwrap_or_else(|| current_user.username.clone());
 
     // Determine target user for key creation (personal or org-scoped)
     let (target_user_id, account_name, org_id_param) = if let Some(ref org_slug) = query.org {
@@ -747,10 +741,7 @@ pub async fn cli_callback<P: PoolProvider>(
         let matched_org = memberships.iter().find_map(|m| {
             org_map.get(&m.organization_id).and_then(|org| {
                 let matches = org.username.eq_ignore_ascii_case(org_slug)
-                    || org
-                        .display_name
-                        .as_deref()
-                        .is_some_and(|dn| dn.eq_ignore_ascii_case(org_slug));
+                    || org.display_name.as_deref().is_some_and(|dn| dn.eq_ignore_ascii_case(org_slug));
                 if matches {
                     Some((m.organization_id, org.display_name.clone().unwrap_or_else(|| org.username.clone())))
                 } else {
@@ -763,10 +754,7 @@ pub async fn cli_callback<P: PoolProvider>(
             Some((org_id, org_name)) => (org_id, org_name.clone(), Some(org_id.to_string())),
             None => {
                 return Err(Error::BadRequest {
-                    message: format!(
-                        "Organization '{}' not found or you are not a member.",
-                        org_slug
-                    ),
+                    message: format!("Organization '{}' not found or you are not a member.", org_slug),
                 });
             }
         }
@@ -808,8 +796,9 @@ pub async fn cli_callback<P: PoolProvider>(
     tx.commit().await.map_err(|e| Error::Database(e.into()))?;
 
     // Build redirect URL using the url crate for safe encoding
-    let mut redirect_url = url::Url::parse(&format!("http://127.0.0.1:{}/callback", query.port))
-        .map_err(|e| Error::Internal { operation: format!("build redirect URL: {e}") })?;
+    let mut redirect_url = url::Url::parse(&format!("http://127.0.0.1:{}/callback", query.port)).map_err(|e| Error::Internal {
+        operation: format!("build redirect URL: {e}"),
+    })?;
 
     {
         let mut params = redirect_url.query_pairs_mut();
@@ -857,7 +846,8 @@ pub async fn cli_callback<P: PoolProvider>(
             ("referrer-policy", "no-referrer"),
         ],
         html,
-    ).into_response())
+    )
+        .into_response())
 }
 
 #[cfg(test)]
