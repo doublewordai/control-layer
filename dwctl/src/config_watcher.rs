@@ -8,6 +8,13 @@ use tracing::{error, info, warn};
 
 use crate::{Config, SharedConfig};
 
+struct WatcherState {
+    config_path: PathBuf,
+    watch_dir: PathBuf,
+    rx: mpsc::Receiver<()>,
+    _watcher: RecommendedWatcher,
+}
+
 fn normalize_path(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
 
@@ -55,12 +62,12 @@ fn event_touches_config_file(event: &Event, watch_dir: &Path, config_path: &Path
     })
 }
 
-pub async fn watch_config_file(config_path: PathBuf, shared_config: SharedConfig, shutdown_token: CancellationToken) -> anyhow::Result<()> {
+fn initialize_watcher(config_path: PathBuf) -> anyhow::Result<WatcherState> {
     let current_dir = std::env::current_dir().context("failed to determine current directory for config watcher")?;
     let (config_path, watch_dir) = resolve_watch_paths(&config_path, &current_dir)?;
     let callback_config_path = config_path.clone();
     let callback_watch_dir = watch_dir.clone();
-    let (tx, mut rx) = mpsc::channel(1);
+    let (tx, rx) = mpsc::channel(1);
 
     let mut watcher = RecommendedWatcher::new(
         move |event: notify::Result<Event>| match event {
@@ -78,6 +85,34 @@ pub async fn watch_config_file(config_path: PathBuf, shared_config: SharedConfig
     )?;
 
     watcher.watch(&watch_dir, RecursiveMode::NonRecursive)?;
+
+    Ok(WatcherState {
+        config_path,
+        watch_dir,
+        rx,
+        _watcher: watcher,
+    })
+}
+
+pub async fn watch_config_file(config_path: PathBuf, shared_config: SharedConfig, shutdown_token: CancellationToken) -> anyhow::Result<()> {
+    let Some(WatcherState {
+        config_path,
+        watch_dir,
+        mut rx,
+        _watcher,
+    }) = initialize_watcher(config_path.clone()).map(Some).unwrap_or_else(|error| {
+        warn!(
+            path = %config_path.display(),
+            error = %error,
+            "Config watcher setup failed; live config reload disabled"
+        );
+        None
+    })
+    else {
+        shutdown_token.cancelled().await;
+        return Ok(());
+    };
+
     info!(path = %config_path.display(), watch_dir = %watch_dir.display(), "Watching config file for changes");
 
     loop {
@@ -118,10 +153,13 @@ pub async fn watch_config_file(config_path: PathBuf, shared_config: SharedConfig
 
 #[cfg(test)]
 mod tests {
-    use super::{event_touches_config_file, resolve_watch_paths};
+    use super::{event_touches_config_file, resolve_watch_paths, watch_config_file};
     use notify::{Event, EventKind, event::CreateKind};
     use std::path::{Path, PathBuf};
     use tempfile::tempdir;
+    use tokio_util::sync::CancellationToken;
+
+    use crate::{Config, SharedConfig};
 
     #[test]
     fn resolve_watch_paths_canonicalizes_relative_path_and_parent_directory() {
@@ -178,5 +216,20 @@ mod tests {
         };
 
         assert!(!event_touches_config_file(&event, &config_dir, &config_path));
+    }
+
+    #[tokio::test]
+    async fn watch_config_file_ignores_setup_errors_and_returns_on_shutdown() {
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+
+        let result = watch_config_file(
+            PathBuf::from("/definitely/missing/dwctl.toml"),
+            SharedConfig::new(Config::default()),
+            shutdown,
+        )
+        .await;
+
+        assert!(result.is_ok());
     }
 }
