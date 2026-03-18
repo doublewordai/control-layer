@@ -990,6 +990,7 @@ pub async fn build_router(
             post(api::handlers::auth::confirm_password_reset),
         )
         .route("/authentication/password-change", post(api::handlers::auth::change_password))
+        .route("/authentication/cli-callback", get(api::handlers::auth::cli_callback))
         .with_state(state.clone());
 
     // API routes
