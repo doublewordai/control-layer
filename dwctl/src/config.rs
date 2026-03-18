@@ -174,6 +174,8 @@ pub struct Config {
     /// When set, users with a null `last_login` will receive this URL in the `/users/current` response.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub onboarding_url: Option<String>,
+    /// Email address where support requests are sent (default: "support@doubleword.ai")
+    pub support_email: String,
 }
 
 /// Individual pool configuration with all SQLx parameters.
@@ -1531,6 +1533,7 @@ impl Default for Config {
             email: EmailConfig::default(),
             onwards: OnwardsConfig::default(),
             onboarding_url: None,
+            support_email: "support@doubleword.ai".to_string(),
         }
     }
 }

@@ -1183,6 +1183,8 @@ pub async fn build_router(
         )
         // Organization session context (validates membership, client stores org ID for X-Organization-Id header)
         .route("/session/organization", post(api::handlers::organizations::set_active_organization))
+        // Support requests
+        .route("/support/requests", post(api::handlers::support::submit_support_request))
         .route("/requests", get(api::handlers::requests::list_requests))
         .route("/requests/aggregate", get(api::handlers::requests::aggregate_requests))
         .route("/requests/aggregate-by-user", get(api::handlers::requests::aggregate_by_user))
