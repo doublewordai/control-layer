@@ -2101,4 +2101,139 @@ mod tests {
         assert_eq!(analytics_3.total_completion_tokens, 0);
         assert!(analytics_3.avg_duration_ms.is_none());
     }
+
+    /// Insert an http_analytics row with user_id and optional batch_id for usage tests.
+    async fn insert_usage_analytics(
+        pool: &PgPool,
+        user_id: Uuid,
+        model: &str,
+        prompt_tokens: i64,
+        completion_tokens: i64,
+        total_cost: f64,
+        timestamp: DateTime<Utc>,
+        fusillade_batch_id: Option<Uuid>,
+    ) {
+        use rust_decimal::Decimal;
+
+        sqlx::query!(
+            r#"
+            INSERT INTO http_analytics (
+                instance_id, correlation_id, timestamp, uri, method, status_code,
+                duration_ms, model, prompt_tokens, completion_tokens, total_tokens,
+                user_id, fusillade_batch_id,
+                input_price_per_token, output_price_per_token
+            ) VALUES (
+                $1, $2, $3, '/ai/chat/completions', 'POST', 200,
+                100, $4, $5, $6, $7,
+                $8, $9,
+                $10, $11
+            )
+            "#,
+            Uuid::new_v4(),
+            1i64,
+            timestamp,
+            model,
+            prompt_tokens,
+            completion_tokens,
+            prompt_tokens + completion_tokens,
+            user_id,
+            fusillade_batch_id,
+            // Set prices so total_cost is computed; use simple 1-per-token pricing
+            // total_cost = prompt_tokens * input_price + completion_tokens * output_price
+            Decimal::from_f64_retain(total_cost / (prompt_tokens + completion_tokens) as f64),
+            Decimal::from_f64_retain(total_cost / (prompt_tokens + completion_tokens) as f64),
+        )
+        .execute(pool)
+        .await
+        .expect("Failed to insert usage analytics data");
+    }
+
+    /// Create a minimal user row and return its id.
+    async fn create_usage_test_user(pool: &PgPool) -> Uuid {
+        let user_id = Uuid::new_v4();
+        sqlx::query!(
+            r#"
+            INSERT INTO users (id, email, auth_source, display_name)
+            VALUES ($1, $2, 'native', 'Test User')
+            "#,
+            user_id,
+            format!("{}@test.com", user_id),
+        )
+        .execute(pool)
+        .await
+        .expect("Failed to create test user");
+        user_id
+    }
+
+    #[sqlx::test]
+    async fn test_refresh_user_model_usage_includes_realtime_requests(pool: PgPool) {
+        let user_id = create_usage_test_user(&pool).await;
+        let now = Utc::now();
+
+        // Insert a realtime request (no batch id)
+        insert_usage_analytics(&pool, user_id, "gpt-4", 100, 50, 0.0, now, None).await;
+        // Insert a batch request
+        insert_usage_analytics(&pool, user_id, "gpt-4", 200, 100, 0.0, now, Some(Uuid::new_v4()))
+            .await;
+
+        refresh_user_model_usage(&pool).await.unwrap();
+
+        let breakdown = get_user_model_breakdown(&pool, user_id).await.unwrap();
+        assert_eq!(breakdown.len(), 1);
+        assert_eq!(breakdown[0].model, "gpt-4");
+        // Both realtime and batch requests should be counted
+        assert_eq!(breakdown[0].request_count, 2);
+        assert_eq!(breakdown[0].input_tokens, 300); // 100 + 200
+        assert_eq!(breakdown[0].output_tokens, 150); // 50 + 100
+    }
+
+    #[sqlx::test]
+    async fn test_get_user_model_breakdown_for_range_includes_realtime_requests(pool: PgPool) {
+        let user_id = create_usage_test_user(&pool).await;
+        let now = Utc::now();
+        let one_hour_ago = now - Duration::hours(1);
+
+        // Insert a realtime request (no batch id)
+        insert_usage_analytics(&pool, user_id, "claude-3", 80, 40, 0.0, now, None).await;
+        // Insert a batch request
+        insert_usage_analytics(
+            &pool,
+            user_id,
+            "claude-3",
+            120,
+            60,
+            0.0,
+            now,
+            Some(Uuid::new_v4()),
+        )
+        .await;
+
+        let breakdown =
+            get_user_model_breakdown_for_range(&pool, user_id, one_hour_ago, now).await.unwrap();
+        assert_eq!(breakdown.len(), 1);
+        assert_eq!(breakdown[0].model, "claude-3");
+        assert_eq!(breakdown[0].request_count, 2);
+        assert_eq!(breakdown[0].input_tokens, 200); // 80 + 120
+        assert_eq!(breakdown[0].output_tokens, 100); // 40 + 60
+    }
+
+    #[sqlx::test]
+    async fn test_batch_count_excludes_realtime_requests(pool: PgPool) {
+        let user_id = create_usage_test_user(&pool).await;
+        let now = Utc::now();
+        let one_hour_ago = now - Duration::hours(1);
+        let batch_id = Uuid::new_v4();
+
+        // Insert a realtime request (no batch id)
+        insert_usage_analytics(&pool, user_id, "gpt-4", 100, 50, 0.0, now, None).await;
+        // Insert two requests from the same batch
+        insert_usage_analytics(&pool, user_id, "gpt-4", 200, 100, 0.0, now, Some(batch_id))
+            .await;
+        insert_usage_analytics(&pool, user_id, "gpt-4", 150, 75, 0.0, now, Some(batch_id)).await;
+
+        let count =
+            get_user_batch_count_for_range(&pool, user_id, one_hour_ago, now).await.unwrap();
+        // Only 1 distinct batch, realtime requests not counted
+        assert_eq!(count, 1);
+    }
 }
