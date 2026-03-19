@@ -1183,7 +1183,6 @@ pub async fn get_user_model_breakdown_for_range(
         FROM http_analytics
         WHERE user_id = $1
           AND timestamp >= $2 AND timestamp <= $3
-          AND model IS NOT NULL
         GROUP BY model
         ORDER BY request_count DESC
         "#,
