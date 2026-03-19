@@ -700,7 +700,7 @@ pub struct CliExchangeRequest {
 }
 
 /// Response from the CLI code exchange (step 2).
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct CliExchangeResponse {
     pub inference_key: String,
     pub inference_key_id: String,
@@ -709,7 +709,14 @@ pub struct CliExchangeResponse {
     pub user_id: String,
     pub email: String,
     pub display_name: String,
+    /// Unique account identifier for the CLI context switcher.
+    /// Format: "username" for personal, "username@org-slug" for org.
     pub account_name: String,
+    /// "personal" or "organization"
+    pub account_type: String,
+    /// Org display name (only present for org accounts).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub org_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub org_id: Option<String>,
 }
@@ -753,9 +760,17 @@ pub async fn cli_callback<P: PoolProvider>(
     }
 
     let user_id = current_user.id;
+    let user_username = current_user.username.clone();
+
+    // Resolved account context for key creation
+    struct AccountContext {
+        target_user_id: crate::types::UserId,
+        account_name: String,
+        org_id: Option<String>,
+    }
 
     // Determine target user for key creation (personal or org-scoped)
-    let (target_user_id, account_name, org_id_param) = if let Some(ref org_slug) = query.org {
+    let ctx = if let Some(ref org_slug) = query.org {
         // Use primary pool for strongly consistent reads — org membership is
         // security-sensitive, so we can't risk stale replica data.
         let mut pool_conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
@@ -771,7 +786,7 @@ pub async fn cli_callback<P: PoolProvider>(
                 let matches = org.username.eq_ignore_ascii_case(org_slug)
                     || org.display_name.as_deref().is_some_and(|dn| dn.eq_ignore_ascii_case(org_slug));
                 if matches {
-                    Some((m.organization_id, org.display_name.clone().unwrap_or_else(|| org.username.clone())))
+                    Some((m.organization_id, org.username.clone(), org.display_name.clone()))
                 } else {
                     None
                 }
@@ -779,7 +794,12 @@ pub async fn cli_callback<P: PoolProvider>(
         });
 
         match matched_org {
-            Some((org_id, org_name)) => (org_id, org_name.clone(), Some(org_id.to_string())),
+            Some((org_id, org_username, _org_display_name)) => AccountContext {
+                target_user_id: org_id,
+                // "hamish@acme-corp" — unique, human-readable
+                account_name: format!("{}@{}", user_username, org_username),
+                org_id: Some(org_id.to_string()),
+            },
             None => {
                 return Err(Error::BadRequest {
                     message: format!("Organization '{}' not found or you are not a member.", org_slug),
@@ -787,7 +807,11 @@ pub async fn cli_callback<P: PoolProvider>(
             }
         }
     } else {
-        (user_id, "personal".to_string(), None)
+        AccountContext {
+            target_user_id: user_id,
+            account_name: user_username.clone(),
+            org_id: None,
+        }
     };
 
     // Create API keys + auth code in a single transaction
@@ -796,7 +820,7 @@ pub async fn cli_callback<P: PoolProvider>(
     let inference_key = {
         let mut repo = ApiKeys::new(&mut tx);
         repo.create(&crate::db::models::api_keys::ApiKeyCreateDBRequest {
-            user_id: target_user_id,
+            user_id: ctx.target_user_id,
             name: "DW CLI (inference)".to_string(),
             description: Some("Created by dw login".to_string()),
             purpose: ApiKeyPurpose::Realtime,
@@ -811,7 +835,7 @@ pub async fn cli_callback<P: PoolProvider>(
     let platform_key = {
         let mut repo = ApiKeys::new(&mut tx);
         repo.create(&crate::db::models::api_keys::ApiKeyCreateDBRequest {
-            user_id: target_user_id,
+            user_id: ctx.target_user_id,
             name: "DW CLI (platform)".to_string(),
             description: Some("Created by dw login".to_string()),
             purpose: ApiKeyPurpose::Platform,
@@ -830,7 +854,7 @@ pub async fn cli_callback<P: PoolProvider>(
     // user_id = target_user_id (org id in org context, personal id otherwise).
     // This matches the api_keys.user_id — the account that owns the keys and
     // gets billed. The individual creator is tracked via api_keys.created_by.
-    let org_uuid = org_id_param.as_ref().and_then(|id| Uuid::parse_str(id).ok());
+    let org_uuid = ctx.org_id.as_ref().and_then(|id| Uuid::parse_str(id).ok());
     sqlx::query(
         "INSERT INTO cli_auth_codes (code, inference_key_id, platform_key_id, user_id, account_name, org_id, expires_at) \
          VALUES ($1, $2, $3, $4, $5, $6, NOW() + INTERVAL '60 seconds')",
@@ -838,8 +862,8 @@ pub async fn cli_callback<P: PoolProvider>(
     .bind(&code)
     .bind(inference_key.id)
     .bind(platform_key.id)
-    .bind(target_user_id)
-    .bind(&account_name)
+    .bind(ctx.target_user_id)
+    .bind(&ctx.account_name)
     .bind(org_uuid)
     .execute(&mut *tx)
     .await
@@ -896,12 +920,18 @@ pub async fn cli_exchange<P: PoolProvider>(
         .await
         .map_err(|e| Error::Database(e.into()))?;
 
-    // Look up and delete the valid code (single-use)
+    // Look up and delete the valid code (single-use).
+    // Type overrides needed because sqlx infers RETURNING columns from DELETE as nullable.
     let row = sqlx::query!(
         r#"
         DELETE FROM cli_auth_codes
         WHERE code = $1 AND expires_at > NOW()
-        RETURNING inference_key_id, platform_key_id, user_id, account_name, org_id
+        RETURNING
+            inference_key_id as "inference_key_id!",
+            platform_key_id as "platform_key_id!",
+            user_id as "user_id!",
+            account_name as "account_name!",
+            org_id
         "#,
         request.code,
     )
@@ -929,16 +959,57 @@ pub async fn cli_exchange<P: PoolProvider>(
     .await
     .map_err(|e| Error::Database(e.into()))?;
 
-    // Fetch user info for the response.
+    // Fetch user/org info for the response.
     // row.user_id = target_user_id (org id in org context, personal id otherwise).
-    let mut users_repo = crate::db::handlers::Users::new(&mut tx);
-    let user = users_repo
-        .get_by_id(row.user_id)
-        .await
-        .map_err(Error::Database)?
-        .ok_or_else(|| Error::Internal {
-            operation: "CLI exchange: user not found after code lookup".to_string(),
-        })?;
+    // Scope each repo usage in a block to avoid borrow conflicts on tx.
+    let is_org = row.org_id.is_some();
+    let (email, display_name, org_name) = if is_org {
+        // Org context: get the individual's info (from api_keys.created_by)
+        // and the org's display name
+        let key_row = sqlx::query!("SELECT created_by FROM api_keys WHERE id = $1", row.inference_key_id,)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| Error::Database(e.into()))?;
+
+        let individual = {
+            let mut repo = crate::db::handlers::Users::new(&mut tx);
+            repo.get_by_id(key_row.created_by)
+                .await
+                .map_err(Error::Database)?
+                .ok_or_else(|| Error::Internal {
+                    operation: "CLI exchange: creator not found".to_string(),
+                })?
+        };
+
+        let org = {
+            let mut repo = crate::db::handlers::Users::new(&mut tx);
+            repo.get_by_id(row.user_id)
+                .await
+                .map_err(Error::Database)?
+                .ok_or_else(|| Error::Internal {
+                    operation: "CLI exchange: org not found".to_string(),
+                })?
+        };
+
+        let org_display = org.display_name.unwrap_or(org.username);
+        (
+            individual.email,
+            individual.display_name.unwrap_or(individual.username),
+            Some(org_display),
+        )
+    } else {
+        // Personal context: user_id is the individual
+        let user = {
+            let mut repo = crate::db::handlers::Users::new(&mut tx);
+            repo.get_by_id(row.user_id)
+                .await
+                .map_err(Error::Database)?
+                .ok_or_else(|| Error::Internal {
+                    operation: "CLI exchange: user not found".to_string(),
+                })?
+        };
+        (user.email, user.display_name.unwrap_or(user.username), None)
+    };
 
     tx.commit().await.map_err(|e| Error::Database(e.into()))?;
 
@@ -948,9 +1019,15 @@ pub async fn cli_exchange<P: PoolProvider>(
         platform_key: platform_key.secret,
         platform_key_id: platform_key.id.to_string(),
         user_id: row.user_id.to_string(),
-        email: user.email,
-        display_name: user.display_name.unwrap_or(user.username),
+        email,
+        display_name,
         account_name: row.account_name,
+        account_type: if is_org {
+            "organization".to_string()
+        } else {
+            "personal".to_string()
+        },
+        org_name,
         org_id: row.org_id.map(|id| id.to_string()),
     };
 
