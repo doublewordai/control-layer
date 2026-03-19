@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from "react";
-import { Mail } from "lucide-react";
+import { Send } from "lucide-react";
+import { toast } from "sonner";
 import {
   Dialog,
   DialogContent,
@@ -17,21 +18,22 @@ import {
   SelectTrigger,
   SelectValue,
 } from "../../ui/select";
+import { useSubmitSupportRequest } from "../../../api/control-layer/hooks";
 
 export type SupportSubject =
   | "Model/Feature Request"
   | "Help Running Batches"
+  | "Create Organization Request"
   | "General Feedback"
   | "Other";
 
 const SUPPORT_SUBJECTS: SupportSubject[] = [
   "Model/Feature Request",
   "Help Running Batches",
+  "Create Organization Request",
   "General Feedback",
   "Other",
 ];
-
-const SUPPORT_EMAIL = "support@doubleword.ai";
 
 interface SupportRequestModalProps {
   isOpen: boolean;
@@ -46,27 +48,35 @@ export const SupportRequestModal: React.FC<SupportRequestModalProps> = ({
 }) => {
   const [subject, setSubject] = useState<SupportSubject | "">("");
   const [message, setMessage] = useState("");
+  const submitSupport = useSubmitSupportRequest();
+  const { reset } = submitSupport;
 
-  // Reset form and apply default subject when modal opens
+  // Reset form, mutation state, and apply default subject when modal opens
   useEffect(() => {
     if (isOpen) {
+      reset();
       setSubject(defaultSubject ?? "");
       setMessage("");
     }
-  }, [isOpen, defaultSubject]);
+  }, [isOpen, defaultSubject, reset]);
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!subject || !message.trim()) {
       return;
     }
 
-    const mailtoLink = `mailto:${SUPPORT_EMAIL}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(message)}`;
-    window.location.href = mailtoLink;
-    onClose();
+    try {
+      await submitSupport.mutateAsync({ subject, message });
+      toast.success("Support request sent. We'll get back to you soon.");
+      onClose();
+    } catch {
+      // Error is handled by the mutation's error state
+    }
   };
 
-  const isValid = subject !== "" && message.trim().length > 0;
+  const isValid =
+    subject !== "" && message.trim().length > 0 && !submitSupport.isPending;
 
   return (
     <Dialog open={isOpen} onOpenChange={onClose}>
@@ -74,8 +84,7 @@ export const SupportRequestModal: React.FC<SupportRequestModalProps> = ({
         <DialogHeader>
           <DialogTitle>Contact Support</DialogTitle>
           <DialogDescription>
-            Send us a support message at support@doubleword.ai and we'll get
-            back to you as soon as possible.
+            Send us a message and we'll get back to you as soon as possible.
           </DialogDescription>
         </DialogHeader>
 
@@ -124,15 +133,25 @@ export const SupportRequestModal: React.FC<SupportRequestModalProps> = ({
               placeholder="Describe your request or feedback..."
             />
           </div>
+
+          {submitSupport.isError && (
+            <p className="text-sm text-red-600">
+              Failed to send your message. Please try again.
+            </p>
+          )}
         </form>
 
         <DialogFooter>
           <Button type="button" variant="outline" onClick={onClose}>
             Cancel
           </Button>
-          <Button type="submit" form="support-request-form" disabled={!isValid}>
-            <Mail className="w-4 h-4 mr-2" />
-            Open in Email
+          <Button
+            type="submit"
+            form="support-request-form"
+            disabled={!isValid}
+          >
+            <Send className="w-4 h-4 mr-2" />
+            {submitSupport.isPending ? "Sending..." : "Send"}
           </Button>
         </DialogFooter>
       </DialogContent>

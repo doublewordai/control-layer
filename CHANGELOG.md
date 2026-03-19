@@ -1,5 +1,25 @@
 # Changelog
 
+## [8.23.0](https://github.com/doublewordai/control-layer/compare/v8.22.3...v8.23.0) (2026-03-18)
+
+
+### Features
+
+* member_id in create key for PMs + attribute PM keys to PM when not specified ([#890](https://github.com/doublewordai/control-layer/issues/890)) ([6b543c2](https://github.com/doublewordai/control-layer/commit/6b543c2a123bb7ece7d4c9aff399ed7625dd3463))
+* removed mailto and added create organization request to support ([#891](https://github.com/doublewordai/control-layer/issues/891)) ([9d82115](https://github.com/doublewordai/control-layer/commit/9d8211508b9041cd2cc8adf18327663ff9963f5b))
+
+
+### Bug Fixes
+
+* pass the api key to create batch, for which it should use for all of its requests ([#885](https://github.com/doublewordai/control-layer/issues/885)) ([35e04b7](https://github.com/doublewordai/control-layer/commit/35e04b77b6a2b5ba6c1950ab7b70d90701278d7d))
+
+## [8.22.3](https://github.com/doublewordai/control-layer/compare/v8.22.2...v8.22.3) (2026-03-16)
+
+
+### Bug Fixes
+
+* bump onwards ([#892](https://github.com/doublewordai/control-layer/issues/892)) ([861ca70](https://github.com/doublewordai/control-layer/commit/861ca70a1dda9076cf8d1025073717f6685c9c92))
+
 ## [8.22.2](https://github.com/doublewordai/control-layer/compare/v8.22.1...v8.22.2) (2026-03-16)
 
 

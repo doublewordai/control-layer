@@ -92,9 +92,14 @@ pub async fn create_user_api_key<P: PoolProvider>(
         }
     }
 
-    // Track whether a PM is creating on behalf of another user.
-    // Org members reach here via is_org_member — they are NOT PMs creating on behalf.
-    let pm_creating_for_other = can_create_all && target_user_id != current_user.id;
+    // Only PlatformManagers can specify member_id to attribute a key to another org member
+    if data.member_id.is_some() && !can_create_all {
+        return Err(Error::InsufficientPermissions {
+            required: Permission::Allow(Resource::ApiKeys, Operation::CreateAll),
+            action: Operation::CreateAll,
+            resource: "API keys with member_id (requires PlatformManager)".to_string(),
+        });
+    }
 
     // Validate purpose: restrict batch/playground to system use only (purpose defaults to Realtime via serde)
     match &data.purpose {
@@ -109,13 +114,47 @@ pub async fn create_user_api_key<P: PoolProvider>(
     }
 
     let mut pool_conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
-    let mut repo = ApiKeys::new(&mut pool_conn);
 
-    // When a PlatformManager creates a key on behalf of another user, set created_by
-    // to the target user so the key is visible to them. For org members creating keys
-    // for their org, created_by stays as current_user.id so the member can see their
-    // own keys. PlatformManagers bypass the created_by filter in list/get/delete.
-    let created_by = if pm_creating_for_other { target_user_id } else { current_user.id };
+    // Check if target is an organization
+    let target_is_org = {
+        let mut org_repo = crate::db::handlers::Organizations::new(&mut pool_conn);
+        org_repo.exists(target_user_id).await.map_err(Error::Database)?
+    };
+
+    // Validate member_id: must be a member of the target org
+    if let Some(member_id) = data.member_id {
+        if !target_is_org {
+            return Err(Error::BadRequest {
+                message: "member_id can only be used when creating keys for an organization".to_string(),
+            });
+        }
+        let mut org_repo = crate::db::handlers::Organizations::new(&mut pool_conn);
+        let role = org_repo
+            .get_user_org_role(member_id, target_user_id)
+            .await
+            .map_err(Error::Database)?;
+        if role.is_none() {
+            return Err(Error::BadRequest {
+                message: format!("User {member_id} is not a member of organization {target_user_id}"),
+            });
+        }
+    }
+
+    // Determine created_by based on target type:
+    // - Organization target: attribute to specified member_id, or current user
+    // - Individual target (PM creating on behalf): attribute to the target user
+    //   so the key is visible to them
+    // - Self: attribute to current user
+    let pm_creating_for_other = can_create_all && target_user_id != current_user.id;
+    let created_by = if target_is_org {
+        data.member_id.unwrap_or(current_user.id)
+    } else if pm_creating_for_other {
+        target_user_id
+    } else {
+        current_user.id
+    };
+
+    let mut repo = ApiKeys::new(&mut pool_conn);
     let db_request = ApiKeyCreateDBRequest::new(target_user_id, created_by, data);
 
     let api_key = repo.create(&db_request).await?;
@@ -1323,5 +1362,155 @@ mod tests {
         response.assert_status_ok();
         let paginated: PaginatedResponse<ApiKeyInfoResponse> = response.json();
         assert_eq!(paginated.data.len(), 2);
+    }
+
+    // ── created_by attribution tests ──────────────────────────────────────
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_org_member_key_created_by_is_member_not_org(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let alice = create_test_user(&pool, Role::StandardUser).await;
+        let org = create_test_org(&pool, alice.id).await;
+
+        // Alice (org owner) creates a key for the org
+        let response = app
+            .post(&format!("/admin/api/v1/users/{}/api-keys", org.id))
+            .add_header(&add_auth_headers(&alice)[0].0, &add_auth_headers(&alice)[0].1)
+            .add_header(&add_auth_headers(&alice)[1].0, &add_auth_headers(&alice)[1].1)
+            .json(&json!({"name": "Alice Org Key", "purpose": "realtime"}))
+            .await;
+        response.assert_status(axum::http::StatusCode::CREATED);
+        let key: ApiKeyResponse = response.json();
+
+        // created_by should be Alice, not the org
+        assert_eq!(key.created_by, alice.id, "created_by should be the member, not the org");
+        assert_eq!(key.user_id, org.id, "user_id should be the org");
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_pm_org_member_key_created_by_is_pm_not_org(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let pm = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let org = create_test_org(&pool, pm.id).await;
+
+        // PM who is also an org owner creates a key for the org
+        let response = app
+            .post(&format!("/admin/api/v1/users/{}/api-keys", org.id))
+            .add_header(&add_auth_headers(&pm)[0].0, &add_auth_headers(&pm)[0].1)
+            .add_header(&add_auth_headers(&pm)[1].0, &add_auth_headers(&pm)[1].1)
+            .json(&json!({"name": "PM Org Key", "purpose": "realtime"}))
+            .await;
+        response.assert_status(axum::http::StatusCode::CREATED);
+        let key: ApiKeyResponse = response.json();
+
+        // created_by should be the PM, not the org — this is the original bug regression test
+        assert_eq!(key.created_by, pm.id, "created_by should be the PM, not the org");
+        assert_eq!(key.user_id, org.id, "user_id should be the org");
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_pm_creates_org_key_with_member_id(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let pm = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let alice = create_test_user(&pool, Role::StandardUser).await;
+        let org = create_test_org(&pool, alice.id).await;
+
+        // PM creates a key for the org attributed to Alice via member_id
+        let response = app
+            .post(&format!("/admin/api/v1/users/{}/api-keys", org.id))
+            .add_header(&add_auth_headers(&pm)[0].0, &add_auth_headers(&pm)[0].1)
+            .add_header(&add_auth_headers(&pm)[1].0, &add_auth_headers(&pm)[1].1)
+            .json(&json!({"name": "Attributed Key", "purpose": "realtime", "member_id": alice.id}))
+            .await;
+        response.assert_status(axum::http::StatusCode::CREATED);
+        let key: ApiKeyResponse = response.json();
+
+        // created_by should be Alice (the specified member), not the PM
+        assert_eq!(key.created_by, alice.id, "created_by should be the specified member_id");
+        assert_eq!(key.user_id, org.id, "user_id should be the org");
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_pm_member_id_rejected_for_non_org_target(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let pm = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let alice = create_test_user(&pool, Role::StandardUser).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, alice.id, group.id).await;
+
+        // PM tries to use member_id when creating a key for an individual user
+        let response = app
+            .post(&format!("/admin/api/v1/users/{}/api-keys", alice.id))
+            .add_header(&add_auth_headers(&pm)[0].0, &add_auth_headers(&pm)[0].1)
+            .add_header(&add_auth_headers(&pm)[1].0, &add_auth_headers(&pm)[1].1)
+            .json(&json!({"name": "Bad Key", "purpose": "realtime", "member_id": pm.id}))
+            .await;
+        response.assert_status_bad_request();
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_pm_member_id_rejected_for_non_member(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let pm = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let alice = create_test_user(&pool, Role::StandardUser).await;
+        let outsider = create_test_user(&pool, Role::StandardUser).await;
+        let org = create_test_org(&pool, alice.id).await;
+
+        // PM tries to attribute key to a user who is not an org member
+        let response = app
+            .post(&format!("/admin/api/v1/users/{}/api-keys", org.id))
+            .add_header(&add_auth_headers(&pm)[0].0, &add_auth_headers(&pm)[0].1)
+            .add_header(&add_auth_headers(&pm)[1].0, &add_auth_headers(&pm)[1].1)
+            .json(&json!({"name": "Bad Key", "purpose": "realtime", "member_id": outsider.id}))
+            .await;
+        response.assert_status_bad_request();
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_non_pm_cannot_use_member_id(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let alice = create_test_user(&pool, Role::StandardUser).await;
+        let bob = create_test_user(&pool, Role::StandardUser).await;
+        let org = create_test_org(&pool, alice.id).await;
+        add_org_member(&pool, org.id, bob.id, "member").await;
+
+        // Alice (org owner, not a PM) tries to use member_id
+        let response = app
+            .post(&format!("/admin/api/v1/users/{}/api-keys", org.id))
+            .add_header(&add_auth_headers(&alice)[0].0, &add_auth_headers(&alice)[0].1)
+            .add_header(&add_auth_headers(&alice)[1].0, &add_auth_headers(&alice)[1].1)
+            .json(&json!({"name": "Bad Key", "purpose": "realtime", "member_id": bob.id}))
+            .await;
+        response.assert_status_forbidden();
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_pm_creates_key_for_individual_user_created_by_is_target(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let pm = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let alice = create_test_user(&pool, Role::StandardUser).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, alice.id, group.id).await;
+
+        // PM creates a personal key for Alice (not an org)
+        let response = app
+            .post(&format!("/admin/api/v1/users/{}/api-keys", alice.id))
+            .add_header(&add_auth_headers(&pm)[0].0, &add_auth_headers(&pm)[0].1)
+            .add_header(&add_auth_headers(&pm)[1].0, &add_auth_headers(&pm)[1].1)
+            .json(&json!({"name": "PM For Alice", "purpose": "realtime"}))
+            .await;
+        response.assert_status(axum::http::StatusCode::CREATED);
+        let key: ApiKeyResponse = response.json();
+
+        // created_by should be Alice (the target individual) so she can see it
+        assert_eq!(key.created_by, alice.id, "created_by should be the target user for individual keys");
+        assert_eq!(key.user_id, alice.id, "user_id should be the target user");
     }
 }

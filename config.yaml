@@ -15,6 +15,9 @@ dashboard_url: "http://localhost:5173"
 # When set, users who have never logged in will be redirected here after authentication.
 # onboarding_url: "https://onboarding.doubleword.ai"
 
+# Email address where support requests are sent
+# support_email: "support@doubleword.ai"
+
 # Database configuration
 database:
   # Configure connectivity to an external postgres database here

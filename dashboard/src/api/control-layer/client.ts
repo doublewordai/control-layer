@@ -1874,6 +1874,27 @@ const organizationsApi = {
   },
 };
 
+const supportApi = {
+  async submitRequest(data: {
+    subject: string;
+    message: string;
+  }): Promise<{ sent: boolean }> {
+    const response = await fetch("/admin/api/v1/support/requests", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data),
+    });
+    if (!response.ok) {
+      const error = await response.text();
+      throw new ApiError(
+        response.status,
+        `Failed to submit support request: ${error}`,
+      );
+    }
+    return response.json();
+  },
+};
+
 // Main nested API object
 export const dwctlApi = {
   users: userApi,
@@ -1892,4 +1913,5 @@ export const dwctlApi = {
   daemons: daemonsApi,
   usage: usageApi,
   organizations: organizationsApi,
+  support: supportApi,
 };

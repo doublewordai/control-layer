@@ -2942,4 +2942,9 @@ export const handlers = [
       ],
     });
   }),
+
+  // Support request (mock)
+  http.post("/admin/api/v1/support/requests", () => {
+    return HttpResponse.json({ sent: true });
+  }),
 ];
