@@ -68,14 +68,13 @@ pub fn emit_platform_event(
                 resource_id,
                 next_attempt_at: None,
             };
-            match repo.create_delivery(&delivery).await {
-                Ok(_) => {}
-                Err(e) => tracing::warn!(
+            if let Err(e) = repo.create_delivery(&delivery).await {
+                tracing::warn!(
                     error = %e,
                     webhook_id = %webhook.id,
                     event_type = %event_type,
                     "Failed to create platform webhook delivery"
-                ),
+                );
             }
         }
     });
