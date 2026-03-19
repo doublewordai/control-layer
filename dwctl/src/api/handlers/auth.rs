@@ -668,12 +668,12 @@ fn create_session_cookie(token: &str, config: &crate::config::Config) -> String 
 // CLI login endpoints (two-step code exchange)
 // ---------------------------------------------------------------------------
 //
-// Step 1: GET /authentication/cli-callback
+// Step 1: GET /admin/api/v1/auth/cli-callback
 //   - Browser redirects here after SSO authentication
 //   - Creates API keys + a short-lived one-time code
 //   - Redirects to localhost with the code (no secrets in URL)
 //
-// Step 2: POST /authentication/cli-exchange
+// Step 2: POST /admin/api/v1/auth/cli-exchange
 //   - CLI sends the code from step 1
 //   - Server returns the API key secrets in the response body
 //   - Code is deleted (single-use)
@@ -2582,7 +2582,7 @@ mod tests {
         state: &str,
         org: Option<&str>,
     ) -> (axum_test::TestResponse, Option<String>) {
-        let mut url_builder = url::Url::parse("http://localhost/authentication/cli-callback").unwrap();
+        let mut url_builder = url::Url::parse("http://localhost/admin/api/v1/auth/cli-callback").unwrap();
         url_builder
             .query_pairs_mut()
             .append_pair("port", &port.to_string())
@@ -2643,7 +2643,7 @@ mod tests {
         // Step 2: exchange — should return keys in response body
         let code = code.expect("code should be present in redirect");
         let exchange_response = server
-            .post("/authentication/cli-exchange")
+            .post("/admin/api/v1/auth/cli-exchange")
             .json(&serde_json::json!({ "code": code }))
             .await;
         exchange_response.assert_status(axum::http::StatusCode::OK);
@@ -2659,7 +2659,7 @@ mod tests {
 
         // Step 3: code should be single-use — second exchange fails
         let replay_response = server
-            .post("/authentication/cli-exchange")
+            .post("/admin/api/v1/auth/cli-exchange")
             .json(&serde_json::json!({ "code": code }))
             .await;
         replay_response.assert_status(axum::http::StatusCode::BAD_REQUEST);
@@ -2678,7 +2678,7 @@ mod tests {
         let code = code.expect("code should be present");
 
         let exchange_response = server
-            .post("/authentication/cli-exchange")
+            .post("/admin/api/v1/auth/cli-exchange")
             .json(&serde_json::json!({ "code": code }))
             .await;
         exchange_response.assert_status(axum::http::StatusCode::OK);
@@ -2743,7 +2743,7 @@ mod tests {
         drop(conn);
 
         let response = server
-            .get("/authentication/cli-callback?port=12345&state=s")
+            .get("/admin/api/v1/auth/cli-callback?port=12345&state=s")
             .add_header("authorization", &format!("Bearer {}", key.secret))
             .await;
 
@@ -2768,7 +2768,7 @@ mod tests {
 
         // Try to exchange a code that doesn't exist
         let response = server
-            .post("/authentication/cli-exchange")
+            .post("/admin/api/v1/auth/cli-exchange")
             .json(&serde_json::json!({ "code": "nonexistent-code" }))
             .await;
 
