@@ -1,26 +1,26 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        DELETE FROM cli_auth_codes\n        WHERE code = $1 AND expires_at > NOW()\n        RETURNING inference_key_id, platform_key_id, user_id, account_name, org_id\n        ",
+  "query": "\n        DELETE FROM cli_auth_codes\n        WHERE code = $1 AND expires_at > NOW()\n        RETURNING\n            inference_key_id as \"inference_key_id!\",\n            platform_key_id as \"platform_key_id!\",\n            user_id as \"user_id!\",\n            account_name as \"account_name!\",\n            org_id\n        ",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
-        "name": "inference_key_id",
+        "name": "inference_key_id!",
         "type_info": "Uuid"
       },
       {
         "ordinal": 1,
-        "name": "platform_key_id",
+        "name": "platform_key_id!",
         "type_info": "Uuid"
       },
       {
         "ordinal": 2,
-        "name": "user_id",
+        "name": "user_id!",
         "type_info": "Uuid"
       },
       {
         "ordinal": 3,
-        "name": "account_name",
+        "name": "account_name!",
         "type_info": "Text"
       },
       {
@@ -42,5 +42,5 @@
       true
     ]
   },
-  "hash": "d125ff58d704d959e03a4046426b1665689125e389e226d1c39a620960a30271"
+  "hash": "5432a364b1bd646cb40de5b37757a19f8f991843c5d3e03ea5928e2c5c1eb342"
 }
