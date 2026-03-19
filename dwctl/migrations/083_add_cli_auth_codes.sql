@@ -14,8 +14,6 @@ CREATE TABLE cli_auth_codes (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Index for code lookup during exchange
-CREATE INDEX idx_cli_auth_codes_code ON cli_auth_codes(code);
-
--- Index for cleanup of expired codes
+-- The UNIQUE constraint on code already creates an index for lookups.
+-- Index for cleanup of expired codes.
 CREATE INDEX idx_cli_auth_codes_expires_at ON cli_auth_codes(expires_at);

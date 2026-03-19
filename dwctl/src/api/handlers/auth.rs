@@ -737,12 +737,12 @@ pub async fn cli_callback<P: PoolProvider>(
     // Reject Bearer token authentication — only SSO cookie/proxy-header allowed.
     // This prevents a realtime key holder from minting a platform key.
     // Other Authorization schemes (e.g., ID tokens from SSO proxies) are allowed.
-    if let Some(auth_header) = headers.get(axum::http::header::AUTHORIZATION) {
-        if auth_header.to_str().is_ok_and(|s| s.starts_with("Bearer ")) {
-            return Err(Error::Unauthenticated {
-                message: Some("CLI callback must be accessed via browser SSO, not API keys.".to_string()),
-            });
-        }
+    if let Some(auth_header) = headers.get(axum::http::header::AUTHORIZATION)
+        && auth_header.to_str().is_ok_and(|s| s.starts_with("Bearer "))
+    {
+        return Err(Error::Unauthenticated {
+            message: Some("CLI callback must be accessed via browser SSO, not API keys.".to_string()),
+        });
     }
 
     // Validate port: reject 0 and privileged ports
@@ -826,7 +826,10 @@ pub async fn cli_callback<P: PoolProvider>(
     // Generate a cryptographically random one-time code
     let code = crate::crypto::generate_api_key();
 
-    // Store the code with 60-second expiry
+    // Store the code with 60-second expiry.
+    // user_id = target_user_id (org id in org context, personal id otherwise).
+    // This matches the api_keys.user_id — the account that owns the keys and
+    // gets billed. The individual creator is tracked via api_keys.created_by.
     let org_uuid = org_id_param.as_ref().and_then(|id| Uuid::parse_str(id).ok());
     sqlx::query(
         "INSERT INTO cli_auth_codes (code, inference_key_id, platform_key_id, user_id, account_name, org_id, expires_at) \
@@ -835,7 +838,7 @@ pub async fn cli_callback<P: PoolProvider>(
     .bind(&code)
     .bind(inference_key.id)
     .bind(platform_key.id)
-    .bind(user_id)
+    .bind(target_user_id)
     .bind(&account_name)
     .bind(org_uuid)
     .execute(&mut *tx)
@@ -871,13 +874,29 @@ pub async fn cli_callback<P: PoolProvider>(
 /// The CLI sends the one-time code received in the callback redirect.
 /// Server looks up the code, returns the API key secrets in the response body,
 /// and deletes the code (single-use). Codes expire after 60 seconds.
+///
+/// The entire operation (code lookup, key fetch, code delete) runs in a
+/// single transaction so that if any step fails, the code is not consumed
+/// and the CLI can retry.
 // Not included in OpenAPI spec — internal endpoint for CLI login flow.
 #[tracing::instrument(skip_all)]
 pub async fn cli_exchange<P: PoolProvider>(
     State(state): State<AppState<P>>,
     Json(request): Json<CliExchangeRequest>,
-) -> Result<Json<CliExchangeResponse>, Error> {
-    // Look up and delete the code atomically (single-use)
+) -> Result<axum::response::Response, Error> {
+    use axum::response::IntoResponse;
+
+    // Run everything in a transaction — if any read fails after we find the
+    // code, the delete rolls back and the CLI can retry.
+    let mut tx = state.db.write().begin().await.map_err(|e| Error::Database(e.into()))?;
+
+    // Opportunistically clean up expired codes to prevent unbounded table growth
+    sqlx::query("DELETE FROM cli_auth_codes WHERE expires_at <= NOW()")
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| Error::Database(e.into()))?;
+
+    // Look up and delete the valid code (single-use)
     let row = sqlx::query!(
         r#"
         DELETE FROM cli_auth_codes
@@ -886,7 +905,7 @@ pub async fn cli_exchange<P: PoolProvider>(
         "#,
         request.code,
     )
-    .fetch_optional(state.db.write())
+    .fetch_optional(&mut *tx)
     .await
     .map_err(|e| Error::Database(e.into()))?
     .ok_or_else(|| Error::BadRequest {
@@ -894,13 +913,11 @@ pub async fn cli_exchange<P: PoolProvider>(
     })?;
 
     // Fetch the API key secrets
-    let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
-
     let inference_key = sqlx::query!(
         "SELECT id, secret FROM api_keys WHERE id = $1 AND is_deleted = false",
         row.inference_key_id,
     )
-    .fetch_one(&mut *conn)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|e| Error::Database(e.into()))?;
 
@@ -908,12 +925,13 @@ pub async fn cli_exchange<P: PoolProvider>(
         "SELECT id, secret FROM api_keys WHERE id = $1 AND is_deleted = false",
         row.platform_key_id,
     )
-    .fetch_one(&mut *conn)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|e| Error::Database(e.into()))?;
 
-    // Fetch user info for the response
-    let mut users_repo = crate::db::handlers::Users::new(&mut conn);
+    // Fetch user info for the response.
+    // row.user_id = target_user_id (org id in org context, personal id otherwise).
+    let mut users_repo = crate::db::handlers::Users::new(&mut tx);
     let user = users_repo
         .get_by_id(row.user_id)
         .await
@@ -922,7 +940,9 @@ pub async fn cli_exchange<P: PoolProvider>(
             operation: "CLI exchange: user not found after code lookup".to_string(),
         })?;
 
-    Ok(Json(CliExchangeResponse {
+    tx.commit().await.map_err(|e| Error::Database(e.into()))?;
+
+    let body = CliExchangeResponse {
         inference_key: inference_key.secret,
         inference_key_id: inference_key.id.to_string(),
         platform_key: platform_key.secret,
@@ -932,7 +952,19 @@ pub async fn cli_exchange<P: PoolProvider>(
         display_name: user.display_name.unwrap_or(user.username),
         account_name: row.account_name,
         org_id: row.org_id.map(|id| id.to_string()),
-    }))
+    };
+
+    // Return with anti-caching headers — response contains long-lived secrets
+    Ok((
+        axum::http::StatusCode::OK,
+        [
+            ("content-type", "application/json"),
+            ("cache-control", "no-store"),
+            ("pragma", "no-cache"),
+        ],
+        axum::Json(body),
+    )
+        .into_response())
 }
 
 #[cfg(test)]
