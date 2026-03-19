@@ -2578,13 +2578,16 @@ mod tests {
         state: &str,
         org: Option<&str>,
     ) -> (axum_test::TestResponse, Option<String>) {
-        let mut url = format!("/authentication/cli-callback?port={port}&state={state}");
+        let mut url_builder = url::Url::parse("http://localhost/authentication/cli-callback").unwrap();
+        url_builder
+            .query_pairs_mut()
+            .append_pair("port", &port.to_string())
+            .append_pair("state", state);
         if let Some(org_slug) = org {
-            url.push_str(&format!(
-                "&org={}",
-                url::form_urlencoded::byte_serialize(org_slug.as_bytes()).collect::<String>()
-            ));
+            url_builder.query_pairs_mut().append_pair("org", org_slug);
         }
+        // axum_test expects a path+query, not a full URL
+        let url = format!("{}?{}", url_builder.path(), url_builder.query().unwrap_or(""));
 
         let response = server
             .get(&url)
@@ -2645,8 +2648,10 @@ mod tests {
         assert!(!body.inference_key.is_empty(), "inference_key should not be empty");
         assert!(!body.platform_key.is_empty(), "platform_key should not be empty");
         assert_eq!(body.user_id, user.id.to_string());
-        assert_eq!(body.account_name, "personal");
+        assert_eq!(body.account_name, user.username, "personal account_name should be the username");
+        assert_eq!(body.account_type, "personal");
         assert!(body.org_id.is_none());
+        assert!(body.org_name.is_none());
 
         // Step 3: code should be single-use — second exchange fails
         let replay_response = server
@@ -2675,8 +2680,17 @@ mod tests {
         exchange_response.assert_status(axum::http::StatusCode::OK);
 
         let body: CliExchangeResponse = exchange_response.json();
-        assert_eq!(body.user_id, org.id.to_string(), "user_id should be org id");
-        assert_eq!(body.org_id.as_deref(), Some(org.id.to_string().as_str()));
+        let org_id_str = org.id.to_string();
+        assert_eq!(body.user_id, org_id_str, "user_id should be org id");
+        assert_eq!(body.org_id.as_deref(), Some(org_id_str.as_str()));
+        assert_eq!(body.account_type, "organization");
+        assert!(body.org_name.is_some(), "org_name should be present");
+        // account_name should be "username@org-slug"
+        assert!(
+            body.account_name.contains('@'),
+            "org account_name should be username@org-slug, got: {}",
+            body.account_name
+        );
     }
 
     #[sqlx::test]

@@ -8,7 +8,7 @@ CREATE TABLE cli_auth_codes (
     inference_key_id UUID NOT NULL REFERENCES api_keys(id) ON DELETE CASCADE,
     platform_key_id UUID NOT NULL REFERENCES api_keys(id) ON DELETE CASCADE,
     user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    account_name TEXT NOT NULL DEFAULT 'personal',
+    account_name TEXT NOT NULL,
     org_id UUID,
     expires_at TIMESTAMPTZ NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
