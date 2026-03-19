@@ -1,5 +1,17 @@
 # Changelog
 
+## [8.25.0](https://github.com/doublewordai/control-layer/compare/v8.24.0...v8.25.0) (2026-03-19)
+
+
+### Features
+
+* Add CLI login callback endpoint for browser-based authentication ([#897](https://github.com/doublewordai/control-layer/issues/897)) ([cc07cc1](https://github.com/doublewordai/control-layer/commit/cc07cc135906ad93f23e78f06ffb2f964200907d))
+
+
+### Bug Fixes
+
+* bump onwards ([#901](https://github.com/doublewordai/control-layer/issues/901)) ([b561664](https://github.com/doublewordai/control-layer/commit/b561664757973302d569d698fa11a758cb87a56d))
+
 ## [8.24.0](https://github.com/doublewordai/control-layer/compare/v8.23.0...v8.24.0) (2026-03-19)
 
 
