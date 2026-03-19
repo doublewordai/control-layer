@@ -671,7 +671,7 @@ fn create_session_cookie(token: &str, config: &crate::config::Config) -> String 
 // GET /admin/api/v1/auth/cli-callback
 //   - Browser redirects here after SSO authentication
 //   - Creates inference + platform API keys in a single transaction
-//   - Redirects to http://localhost:{port}/callback with keys in query params
+//   - Redirects to http://127.0.0.1:{port}/callback with keys in query params
 //   - Keys only go to 127.0.0.1 — same pattern as GitHub CLI, gcloud, etc.
 //   - Security headers prevent caching and referrer leakage
 
@@ -2425,7 +2425,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // CLI login (callback + exchange) tests
+    // CLI login callback tests (single-step localhost redirect)
     // -----------------------------------------------------------------------
 
     /// Helper: call the CLI callback and parse the redirect Location.
