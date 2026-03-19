@@ -2151,12 +2151,14 @@ mod tests {
     /// Create a minimal user row and return its id.
     async fn create_usage_test_user(pool: &PgPool) -> Uuid {
         let user_id = Uuid::new_v4();
+        let username = format!("test-{}", &user_id.to_string()[..8]);
         sqlx::query!(
             r#"
-            INSERT INTO users (id, email, auth_source, display_name)
-            VALUES ($1, $2, 'native', 'Test User')
+            INSERT INTO users (id, username, email, auth_source, display_name)
+            VALUES ($1, $2, $3, 'native', 'Test User')
             "#,
             user_id,
+            username,
             format!("{}@test.com", user_id),
         )
         .execute(pool)
