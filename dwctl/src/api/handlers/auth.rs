@@ -665,23 +665,17 @@ fn create_session_cookie(token: &str, config: &crate::config::Config) -> String 
 }
 
 // ---------------------------------------------------------------------------
-// CLI login endpoints (two-step code exchange)
+// CLI login callback (localhost redirect)
 // ---------------------------------------------------------------------------
 //
-// Step 1: GET /admin/api/v1/auth/cli-callback
+// GET /admin/api/v1/auth/cli-callback
 //   - Browser redirects here after SSO authentication
-//   - Creates API keys + a short-lived one-time code
-//   - Redirects to localhost with the code (no secrets in URL)
-//
-// Step 2: POST /admin/api/v1/auth/cli-exchange
-//   - CLI sends the code from step 1
-//   - Server returns the API key secrets in the response body
-//   - Code is deleted (single-use)
-//
-// This two-step pattern keeps API key secrets out of browser history,
-// server logs, and referrer headers.
+//   - Creates inference + platform API keys in a single transaction
+//   - Redirects to http://localhost:{port}/callback with keys in query params
+//   - Keys only go to 127.0.0.1 — same pattern as GitHub CLI, gcloud, etc.
+//   - Security headers prevent caching and referrer leakage
 
-/// Query params for the CLI callback (step 1).
+/// Query params for the CLI callback.
 #[derive(Debug, serde::Deserialize)]
 pub struct CliCallbackQuery {
     /// Localhost port where the CLI is listening (1024–65535).
@@ -692,36 +686,7 @@ pub struct CliCallbackQuery {
     pub org: Option<String>,
 }
 
-/// Request body for the CLI code exchange (step 2).
-#[derive(Debug, serde::Deserialize)]
-pub struct CliExchangeRequest {
-    /// The one-time code received in the callback redirect.
-    pub code: String,
-}
-
-/// Response from the CLI code exchange (step 2).
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub struct CliExchangeResponse {
-    pub inference_key: String,
-    pub inference_key_id: String,
-    pub platform_key: String,
-    pub platform_key_id: String,
-    pub user_id: String,
-    pub email: String,
-    pub display_name: String,
-    /// Unique account identifier for the CLI context switcher.
-    /// Format: "username" for personal, "username@org-slug" for org.
-    pub account_name: String,
-    /// "personal" or "organization"
-    pub account_type: String,
-    /// Org display name (only present for org accounts).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub org_name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub org_id: Option<String>,
-}
-
-/// CLI login callback (step 1).
+/// CLI login callback.
 ///
 /// Called after the user authenticates via SSO. Creates a pair of API keys
 /// and a short-lived one-time authorization code. Redirects to the CLI's
@@ -851,126 +816,10 @@ pub async fn cli_callback<P: PoolProvider>(
         .map_err(Error::Database)?
     };
 
-    // Generate a cryptographically random one-time code
-    let code = crate::crypto::generate_api_key();
-
-    // Store the code with 60-second expiry.
-    // user_id = target_user_id (org id in org context, personal id otherwise).
-    // This matches the api_keys.user_id — the account that owns the keys and
-    // gets billed. The individual creator is tracked via api_keys.created_by.
-    let org_uuid = ctx.org_id.as_ref().and_then(|id| Uuid::parse_str(id).ok());
-    sqlx::query(
-        "INSERT INTO cli_auth_codes (code, inference_key_id, platform_key_id, user_id, account_name, org_id, expires_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, NOW() + INTERVAL '60 seconds')",
-    )
-    .bind(&code)
-    .bind(inference_key.id)
-    .bind(platform_key.id)
-    .bind(ctx.target_user_id)
-    .bind(&ctx.account_name)
-    .bind(org_uuid)
-    .execute(&mut *tx)
-    .await
-    .map_err(|e| Error::Database(e.into()))?;
-
-    tx.commit().await.map_err(|e| Error::Database(e.into()))?;
-
-    // Redirect to localhost with only the code and state — no secrets in URL
-    let mut redirect_url = url::Url::parse(&format!("http://127.0.0.1:{}/callback", query.port)).map_err(|e| Error::Internal {
-        operation: format!("build redirect URL: {e}"),
-    })?;
-
-    redirect_url
-        .query_pairs_mut()
-        .append_pair("code", &code)
-        .append_pair("state", &query.state);
-
-    Ok((
-        axum::http::StatusCode::FOUND,
-        [
-            ("location", redirect_url.as_str()),
-            ("cache-control", "no-store"),
-            ("pragma", "no-cache"),
-            ("referrer-policy", "no-referrer"),
-        ],
-    )
-        .into_response())
-}
-
-/// CLI code exchange (step 2).
-///
-/// The CLI sends the one-time code received in the callback redirect.
-/// Server looks up the code, returns the API key secrets in the response body,
-/// and deletes the code (single-use). Codes expire after 60 seconds.
-///
-/// The entire operation (code lookup, key fetch, code delete) runs in a
-/// single transaction so that if any step fails, the code is not consumed
-/// and the CLI can retry.
-// Not included in OpenAPI spec — internal endpoint for CLI login flow.
-#[tracing::instrument(skip_all)]
-pub async fn cli_exchange<P: PoolProvider>(
-    State(state): State<AppState<P>>,
-    Json(request): Json<CliExchangeRequest>,
-) -> Result<axum::response::Response, Error> {
-    use axum::response::IntoResponse;
-
-    // Run everything in a transaction — if any read fails after we find the
-    // code, the delete rolls back and the CLI can retry.
-    let mut tx = state.db.write().begin().await.map_err(|e| Error::Database(e.into()))?;
-
-    // Opportunistically clean up expired codes to prevent unbounded table growth
-    sqlx::query("DELETE FROM cli_auth_codes WHERE expires_at <= NOW()")
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| Error::Database(e.into()))?;
-
-    // Look up and delete the valid code (single-use).
-    // Type overrides needed because sqlx infers RETURNING columns from DELETE as nullable.
-    let row = sqlx::query!(
-        r#"
-        DELETE FROM cli_auth_codes
-        WHERE code = $1 AND expires_at > NOW()
-        RETURNING
-            inference_key_id as "inference_key_id!",
-            platform_key_id as "platform_key_id!",
-            user_id as "user_id!",
-            account_name as "account_name!",
-            org_id
-        "#,
-        request.code,
-    )
-    .fetch_optional(&mut *tx)
-    .await
-    .map_err(|e| Error::Database(e.into()))?
-    .ok_or_else(|| Error::BadRequest {
-        message: "Invalid or expired code.".to_string(),
-    })?;
-
-    // Fetch the API key secrets
-    let inference_key = sqlx::query!(
-        "SELECT id, secret FROM api_keys WHERE id = $1 AND is_deleted = false",
-        row.inference_key_id,
-    )
-    .fetch_one(&mut *tx)
-    .await
-    .map_err(|e| Error::Database(e.into()))?;
-
-    let platform_key = sqlx::query!(
-        "SELECT id, secret FROM api_keys WHERE id = $1 AND is_deleted = false",
-        row.platform_key_id,
-    )
-    .fetch_one(&mut *tx)
-    .await
-    .map_err(|e| Error::Database(e.into()))?;
-
-    // Fetch user/org info for the response.
-    // row.user_id = target_user_id (org id in org context, personal id otherwise).
-    // Scope each repo usage in a block to avoid borrow conflicts on tx.
-    let is_org = row.org_id.is_some();
-    let (email, display_name, org_name) = if is_org {
-        // Org context: get the individual's info (from api_keys.created_by)
-        // and the org's display name
-        let key_row = sqlx::query!("SELECT created_by FROM api_keys WHERE id = $1", row.inference_key_id,)
+    // Fetch user info for the response
+    let (email, display_name, org_name) = if ctx.org_id.is_some() {
+        // Org context: get the individual's info from api_keys.created_by
+        let key_row = sqlx::query!("SELECT created_by FROM api_keys WHERE id = $1", inference_key.id,)
             .fetch_one(&mut *tx)
             .await
             .map_err(|e| Error::Database(e.into()))?;
@@ -981,35 +830,33 @@ pub async fn cli_exchange<P: PoolProvider>(
                 .await
                 .map_err(Error::Database)?
                 .ok_or_else(|| Error::Internal {
-                    operation: "CLI exchange: creator not found".to_string(),
+                    operation: "CLI callback: creator not found".to_string(),
                 })?
         };
 
         let org = {
             let mut repo = crate::db::handlers::Users::new(&mut tx);
-            repo.get_by_id(row.user_id)
+            repo.get_by_id(ctx.target_user_id)
                 .await
                 .map_err(Error::Database)?
                 .ok_or_else(|| Error::Internal {
-                    operation: "CLI exchange: org not found".to_string(),
+                    operation: "CLI callback: org not found".to_string(),
                 })?
         };
 
-        let org_display = org.display_name.unwrap_or(org.username);
         (
             individual.email,
             individual.display_name.unwrap_or(individual.username),
-            Some(org_display),
+            Some(org.display_name.unwrap_or(org.username)),
         )
     } else {
-        // Personal context: user_id is the individual
         let user = {
             let mut repo = crate::db::handlers::Users::new(&mut tx);
-            repo.get_by_id(row.user_id)
+            repo.get_by_id(ctx.target_user_id)
                 .await
                 .map_err(Error::Database)?
                 .ok_or_else(|| Error::Internal {
-                    operation: "CLI exchange: user not found".to_string(),
+                    operation: "CLI callback: user not found".to_string(),
                 })?
         };
         (user.email, user.display_name.unwrap_or(user.username), None)
@@ -1017,33 +864,41 @@ pub async fn cli_exchange<P: PoolProvider>(
 
     tx.commit().await.map_err(|e| Error::Database(e.into()))?;
 
-    let body = CliExchangeResponse {
-        inference_key: inference_key.secret,
-        inference_key_id: inference_key.id.to_string(),
-        platform_key: platform_key.secret,
-        platform_key_id: platform_key.id.to_string(),
-        user_id: row.user_id.to_string(),
-        email,
-        display_name,
-        account_name: row.account_name,
-        account_type: if is_org {
-            "organization".to_string()
-        } else {
-            "personal".to_string()
-        },
-        org_name,
-        org_id: row.org_id.map(|id| id.to_string()),
-    };
+    // Redirect to localhost with keys and user info.
+    // Secrets are in the URL but only sent to 127.0.0.1 — they never leave the
+    // machine. This is the same pattern used by GitHub CLI, gcloud, etc.
+    let mut redirect_url = url::Url::parse(&format!("http://127.0.0.1:{}/callback", query.port)).map_err(|e| Error::Internal {
+        operation: format!("build redirect URL: {e}"),
+    })?;
 
-    // Return with anti-caching headers — response contains long-lived secrets
+    {
+        let mut params = redirect_url.query_pairs_mut();
+        params.append_pair("state", &query.state);
+        params.append_pair("inference_key", &inference_key.secret);
+        params.append_pair("inference_key_id", &inference_key.id.to_string());
+        params.append_pair("platform_key", &platform_key.secret);
+        params.append_pair("platform_key_id", &platform_key.id.to_string());
+        params.append_pair("user_id", &ctx.target_user_id.to_string());
+        params.append_pair("email", &email);
+        params.append_pair("display_name", &display_name);
+        params.append_pair("account_name", &ctx.account_name);
+        params.append_pair("account_type", if ctx.org_id.is_some() { "organization" } else { "personal" });
+        if let Some(ref org_name) = org_name {
+            params.append_pair("org_name", org_name);
+        }
+        if let Some(ref org_id) = ctx.org_id {
+            params.append_pair("org_id", org_id);
+        }
+    }
+
     Ok((
-        axum::http::StatusCode::OK,
+        axum::http::StatusCode::FOUND,
         [
-            ("content-type", "application/json"),
+            ("location", redirect_url.as_str()),
             ("cache-control", "no-store"),
             ("pragma", "no-cache"),
+            ("referrer-policy", "no-referrer"),
         ],
-        axum::Json(body),
     )
         .into_response())
 }
@@ -2573,15 +2428,15 @@ mod tests {
     // CLI login (callback + exchange) tests
     // -----------------------------------------------------------------------
 
-    /// Helper: perform step 1 (callback) and extract the code from the redirect.
-    async fn cli_callback_get_code(
+    /// Helper: call the CLI callback and parse the redirect Location.
+    async fn cli_callback_request(
         server: &TestServer,
         external_id: &str,
         email: &str,
         port: u16,
         state: &str,
         org: Option<&str>,
-    ) -> (axum_test::TestResponse, Option<String>) {
+    ) -> axum_test::TestResponse {
         let mut url_builder = url::Url::parse("http://localhost/admin/api/v1/auth/cli-callback").unwrap();
         url_builder
             .query_pairs_mut()
@@ -2590,28 +2445,23 @@ mod tests {
         if let Some(org_slug) = org {
             url_builder.query_pairs_mut().append_pair("org", org_slug);
         }
-        // axum_test expects a path+query, not a full URL
         let url = format!("{}?{}", url_builder.path(), url_builder.query().unwrap_or(""));
 
-        let response = server
+        server
             .get(&url)
             .add_header("x-doubleword-user", external_id)
             .add_header("x-doubleword-email", email)
-            .await;
+            .await
+    }
 
-        let code = response
-            .headers()
-            .get("location")
-            .and_then(|loc| loc.to_str().ok())
-            .and_then(|loc| {
-                url::Url::parse(loc)
-                    .ok()?
-                    .query_pairs()
-                    .find(|(k, _)| k == "code")
-                    .map(|(_, v)| v.into_owned())
-            });
-
-        (response, code)
+    /// Parse query params from a redirect Location header.
+    fn parse_redirect_params(response: &axum_test::TestResponse) -> std::collections::HashMap<String, String> {
+        let location = response.headers().get("location").unwrap().to_str().unwrap();
+        url::Url::parse(location)
+            .unwrap()
+            .query_pairs()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect()
     }
 
     #[sqlx::test]
@@ -2620,8 +2470,7 @@ mod tests {
         let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
         let external_id = user.external_user_id.unwrap();
 
-        // Step 1: callback — should redirect with code (no secrets)
-        let (response, code) = cli_callback_get_code(&server, &external_id, &user.email, 12345, "test-state", None).await;
+        let response = cli_callback_request(&server, &external_id, &user.email, 12345, "test-state", None).await;
 
         response.assert_status(axum::http::StatusCode::FOUND);
 
@@ -2630,39 +2479,33 @@ mod tests {
             location.starts_with("http://127.0.0.1:12345/callback?"),
             "unexpected redirect: {location}"
         );
-        assert!(location.contains("state=test-state"), "missing state: {location}");
-        assert!(location.contains("code="), "missing code: {location}");
-        // Secrets must NOT be in the redirect URL
-        assert!(!location.contains("inference_key="), "secrets should not be in URL: {location}");
-        assert!(!location.contains("platform_key="), "secrets should not be in URL: {location}");
+
+        let params = parse_redirect_params(&response);
+
+        // State preserved
+        assert_eq!(params.get("state").unwrap(), "test-state");
+
+        // Keys present
+        assert!(params.contains_key("inference_key"), "missing inference_key");
+        assert!(params.contains_key("platform_key"), "missing platform_key");
+        assert!(params.contains_key("inference_key_id"), "missing inference_key_id");
+        assert!(params.contains_key("platform_key_id"), "missing platform_key_id");
+
+        // User info
+        assert_eq!(params.get("user_id").unwrap(), &user.id.to_string());
+        assert_eq!(
+            params.get("account_name").unwrap(),
+            &user.username,
+            "personal account_name should be the username"
+        );
+        assert_eq!(params.get("account_type").unwrap(), "personal");
+        assert!(!params.contains_key("org_id"));
+        assert!(!params.contains_key("org_name"));
+
         // Security headers
         assert_eq!(response.headers().get("cache-control").unwrap(), "no-store");
         assert_eq!(response.headers().get("pragma").unwrap(), "no-cache");
         assert_eq!(response.headers().get("referrer-policy").unwrap(), "no-referrer");
-
-        // Step 2: exchange — should return keys in response body
-        let code = code.expect("code should be present in redirect");
-        let exchange_response = server
-            .post("/admin/api/v1/auth/cli-exchange")
-            .json(&serde_json::json!({ "code": code }))
-            .await;
-        exchange_response.assert_status(axum::http::StatusCode::OK);
-
-        let body: CliExchangeResponse = exchange_response.json();
-        assert!(!body.inference_key.is_empty(), "inference_key should not be empty");
-        assert!(!body.platform_key.is_empty(), "platform_key should not be empty");
-        assert_eq!(body.user_id, user.id.to_string());
-        assert_eq!(body.account_name, user.username, "personal account_name should be the username");
-        assert_eq!(body.account_type, "personal");
-        assert!(body.org_id.is_none());
-        assert!(body.org_name.is_none());
-
-        // Step 3: code should be single-use — second exchange fails
-        let replay_response = server
-            .post("/admin/api/v1/auth/cli-exchange")
-            .json(&serde_json::json!({ "code": code }))
-            .await;
-        replay_response.assert_status(axum::http::StatusCode::BAD_REQUEST);
     }
 
     #[sqlx::test]
@@ -2672,28 +2515,21 @@ mod tests {
         let external_id = user.external_user_id.clone().unwrap();
         let org = crate::test::utils::create_test_org(&pool, user.id).await;
 
-        let (response, code) = cli_callback_get_code(&server, &external_id, &user.email, 54321, "org-state", Some(&org.username)).await;
+        let response = cli_callback_request(&server, &external_id, &user.email, 54321, "org-state", Some(&org.username)).await;
 
         response.assert_status(axum::http::StatusCode::FOUND);
-        let code = code.expect("code should be present");
 
-        let exchange_response = server
-            .post("/admin/api/v1/auth/cli-exchange")
-            .json(&serde_json::json!({ "code": code }))
-            .await;
-        exchange_response.assert_status(axum::http::StatusCode::OK);
-
-        let body: CliExchangeResponse = exchange_response.json();
+        let params = parse_redirect_params(&response);
         let org_id_str = org.id.to_string();
-        assert_eq!(body.user_id, org_id_str, "user_id should be org id");
-        assert_eq!(body.org_id.as_deref(), Some(org_id_str.as_str()));
-        assert_eq!(body.account_type, "organization");
-        assert!(body.org_name.is_some(), "org_name should be present");
-        // account_name should be "username@org-slug"
+
+        assert_eq!(params.get("user_id").unwrap(), &org_id_str, "user_id should be org id");
+        assert_eq!(params.get("org_id").unwrap(), &org_id_str);
+        assert_eq!(params.get("account_type").unwrap(), "organization");
+        assert!(params.contains_key("org_name"), "org_name should be present");
         assert!(
-            body.account_name.contains('@'),
+            params.get("account_name").unwrap().contains('@'),
             "org account_name should be username@org-slug, got: {}",
-            body.account_name
+            params.get("account_name").unwrap()
         );
     }
 
@@ -2703,7 +2539,7 @@ mod tests {
         let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
         let external_id = user.external_user_id.unwrap();
 
-        let (response, _) = cli_callback_get_code(&server, &external_id, &user.email, 12345, "s", Some("nonexistent-org")).await;
+        let response = cli_callback_request(&server, &external_id, &user.email, 12345, "s", Some("nonexistent-org")).await;
 
         response.assert_status(axum::http::StatusCode::BAD_REQUEST);
 
@@ -2757,21 +2593,8 @@ mod tests {
         let external_id = user.external_user_id.unwrap();
 
         for port in [0, 80, 443, 1023] {
-            let (response, _) = cli_callback_get_code(&server, &external_id, &user.email, port, "s", None).await;
+            let response = cli_callback_request(&server, &external_id, &user.email, port, "s", None).await;
             response.assert_status(axum::http::StatusCode::BAD_REQUEST);
         }
-    }
-
-    #[sqlx::test]
-    async fn test_cli_exchange_expired_code(pool: PgPool) {
-        let (server, _bg) = crate::test::utils::create_test_app(pool.clone(), false).await;
-
-        // Try to exchange a code that doesn't exist
-        let response = server
-            .post("/admin/api/v1/auth/cli-exchange")
-            .json(&serde_json::json!({ "code": "nonexistent-code" }))
-            .await;
-
-        response.assert_status(axum::http::StatusCode::BAD_REQUEST);
     }
 }

@@ -998,7 +998,6 @@ pub async fn build_router(
         // CLI login endpoints — under /admin/api/v1/ so they route through the app,
         // not through oauth2-proxy (which intercepts all /authentication/* paths).
         .route("/auth/cli-callback", get(api::handlers::auth::cli_callback))
-        .route("/auth/cli-exchange", post(api::handlers::auth::cli_exchange))
         // User management (admin only for collection operations)
         .route("/users", get(api::handlers::users::list_users))
         .route("/users", post(api::handlers::users::create_user))
