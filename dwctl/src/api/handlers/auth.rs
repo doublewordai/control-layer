@@ -159,6 +159,13 @@ pub async fn register<P: PoolProvider>(
 
     tx.commit().await.map_err(|e| Error::Database(e.into()))?;
 
+    crate::webhooks::emit::emit_platform_event(
+        state.db.write(),
+        crate::webhooks::WebhookEvent::user_created(created_user.id, &created_user.email, &created_user.auth_source),
+        crate::webhooks::WebhookEventType::UserCreated,
+        Some(created_user.id),
+    );
+
     // Create sample files for new user if enabled (non-blocking, failures are logged)
     if state.config.sample_files.enabled && state.config.batches.enabled {
         let user_id = created_user.id;
