@@ -668,12 +668,12 @@ fn create_session_cookie(token: &str, config: &crate::config::Config) -> String 
 // CLI login endpoints (two-step code exchange)
 // ---------------------------------------------------------------------------
 //
-// Step 1: GET /authentication/cli-callback
+// Step 1: GET /admin/api/v1/auth/cli-callback
 //   - Browser redirects here after SSO authentication
 //   - Creates API keys + a short-lived one-time code
 //   - Redirects to localhost with the code (no secrets in URL)
 //
-// Step 2: POST /authentication/cli-exchange
+// Step 2: POST /admin/api/v1/auth/cli-exchange
 //   - CLI sends the code from step 1
 //   - Server returns the API key secrets in the response body
 //   - Code is deleted (single-use)
@@ -817,11 +817,15 @@ pub async fn cli_callback<P: PoolProvider>(
     // Create API keys + auth code in a single transaction
     let mut tx = state.db.write().begin().await.map_err(|e| Error::Database(e.into()))?;
 
+    // Include a timestamp in key names to avoid unique constraint conflicts
+    // when a user logs in from multiple machines or re-logs on the same machine.
+    let timestamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+
     let inference_key = {
         let mut repo = ApiKeys::new(&mut tx);
         repo.create(&crate::db::models::api_keys::ApiKeyCreateDBRequest {
             user_id: ctx.target_user_id,
-            name: "DW CLI (inference)".to_string(),
+            name: format!("DW CLI inference ({})", timestamp),
             description: Some("Created by dw login".to_string()),
             purpose: ApiKeyPurpose::Realtime,
             requests_per_second: None,
@@ -836,7 +840,7 @@ pub async fn cli_callback<P: PoolProvider>(
         let mut repo = ApiKeys::new(&mut tx);
         repo.create(&crate::db::models::api_keys::ApiKeyCreateDBRequest {
             user_id: ctx.target_user_id,
-            name: "DW CLI (platform)".to_string(),
+            name: format!("DW CLI platform ({})", timestamp),
             description: Some("Created by dw login".to_string()),
             purpose: ApiKeyPurpose::Platform,
             requests_per_second: None,
@@ -2578,7 +2582,7 @@ mod tests {
         state: &str,
         org: Option<&str>,
     ) -> (axum_test::TestResponse, Option<String>) {
-        let mut url_builder = url::Url::parse("http://localhost/authentication/cli-callback").unwrap();
+        let mut url_builder = url::Url::parse("http://localhost/admin/api/v1/auth/cli-callback").unwrap();
         url_builder
             .query_pairs_mut()
             .append_pair("port", &port.to_string())
@@ -2639,7 +2643,7 @@ mod tests {
         // Step 2: exchange — should return keys in response body
         let code = code.expect("code should be present in redirect");
         let exchange_response = server
-            .post("/authentication/cli-exchange")
+            .post("/admin/api/v1/auth/cli-exchange")
             .json(&serde_json::json!({ "code": code }))
             .await;
         exchange_response.assert_status(axum::http::StatusCode::OK);
@@ -2655,7 +2659,7 @@ mod tests {
 
         // Step 3: code should be single-use — second exchange fails
         let replay_response = server
-            .post("/authentication/cli-exchange")
+            .post("/admin/api/v1/auth/cli-exchange")
             .json(&serde_json::json!({ "code": code }))
             .await;
         replay_response.assert_status(axum::http::StatusCode::BAD_REQUEST);
@@ -2674,7 +2678,7 @@ mod tests {
         let code = code.expect("code should be present");
 
         let exchange_response = server
-            .post("/authentication/cli-exchange")
+            .post("/admin/api/v1/auth/cli-exchange")
             .json(&serde_json::json!({ "code": code }))
             .await;
         exchange_response.assert_status(axum::http::StatusCode::OK);
@@ -2739,7 +2743,7 @@ mod tests {
         drop(conn);
 
         let response = server
-            .get("/authentication/cli-callback?port=12345&state=s")
+            .get("/admin/api/v1/auth/cli-callback?port=12345&state=s")
             .add_header("authorization", &format!("Bearer {}", key.secret))
             .await;
 
@@ -2764,7 +2768,7 @@ mod tests {
 
         // Try to exchange a code that doesn't exist
         let response = server
-            .post("/authentication/cli-exchange")
+            .post("/admin/api/v1/auth/cli-exchange")
             .json(&serde_json::json!({ "code": "nonexistent-code" }))
             .await;
 

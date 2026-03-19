@@ -990,13 +990,15 @@ pub async fn build_router(
             post(api::handlers::auth::confirm_password_reset),
         )
         .route("/authentication/password-change", post(api::handlers::auth::change_password))
-        .route("/authentication/cli-callback", get(api::handlers::auth::cli_callback))
-        .route("/authentication/cli-exchange", post(api::handlers::auth::cli_exchange))
         .with_state(state.clone());
 
     // API routes
     let api_routes = Router::new()
         .route("/config", get(api::handlers::config::get_config))
+        // CLI login endpoints — under /admin/api/v1/ so they route through the app,
+        // not through oauth2-proxy (which intercepts all /authentication/* paths).
+        .route("/auth/cli-callback", get(api::handlers::auth::cli_callback))
+        .route("/auth/cli-exchange", post(api::handlers::auth::cli_exchange))
         // User management (admin only for collection operations)
         .route("/users", get(api::handlers::users::list_users))
         .route("/users", post(api::handlers::users::create_user))
