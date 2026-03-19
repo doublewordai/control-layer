@@ -991,6 +991,7 @@ pub async fn build_router(
         )
         .route("/authentication/password-change", post(api::handlers::auth::change_password))
         .route("/authentication/cli-callback", get(api::handlers::auth::cli_callback))
+        .route("/authentication/cli-exchange", post(api::handlers::auth::cli_exchange))
         .with_state(state.clone());
 
     // API routes
