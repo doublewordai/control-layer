@@ -158,6 +158,14 @@ pub async fn create_user_api_key<P: PoolProvider>(
     let db_request = ApiKeyCreateDBRequest::new(target_user_id, created_by, data);
 
     let api_key = repo.create(&db_request).await?;
+
+    crate::webhooks::emit::emit_platform_event(
+        state.db.write(),
+        crate::webhooks::WebhookEvent::api_key_created(api_key.id, current_user.id, &api_key.name),
+        crate::webhooks::WebhookEventType::ApiKeyCreated,
+        Some(api_key.id),
+    );
+
     Ok((StatusCode::CREATED, Json(ApiKeyResponse::from(api_key))))
 }
 
