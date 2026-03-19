@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.24.0](https://github.com/doublewordai/control-layer/compare/v8.23.0...v8.24.0) (2026-03-19)
+
+
+### Features
+
+* Enable requests to be streamed for specific endpoints ([#877](https://github.com/doublewordai/control-layer/issues/877)) ([93dbb75](https://github.com/doublewordai/control-layer/commit/93dbb759c6b792842d8748e01ad47e03e5f81032))
+
 ## [8.23.0](https://github.com/doublewordai/control-layer/compare/v8.22.3...v8.23.0) (2026-03-18)
 
 
