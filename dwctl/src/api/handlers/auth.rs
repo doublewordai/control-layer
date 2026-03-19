@@ -817,11 +817,15 @@ pub async fn cli_callback<P: PoolProvider>(
     // Create API keys + auth code in a single transaction
     let mut tx = state.db.write().begin().await.map_err(|e| Error::Database(e.into()))?;
 
+    // Include a timestamp in key names to avoid unique constraint conflicts
+    // when a user logs in from multiple machines or re-logs on the same machine.
+    let timestamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+
     let inference_key = {
         let mut repo = ApiKeys::new(&mut tx);
         repo.create(&crate::db::models::api_keys::ApiKeyCreateDBRequest {
             user_id: ctx.target_user_id,
-            name: "DW CLI (inference)".to_string(),
+            name: format!("DW CLI inference ({})", timestamp),
             description: Some("Created by dw login".to_string()),
             purpose: ApiKeyPurpose::Realtime,
             requests_per_second: None,
@@ -836,7 +840,7 @@ pub async fn cli_callback<P: PoolProvider>(
         let mut repo = ApiKeys::new(&mut tx);
         repo.create(&crate::db::models::api_keys::ApiKeyCreateDBRequest {
             user_id: ctx.target_user_id,
-            name: "DW CLI (platform)".to_string(),
+            name: format!("DW CLI platform ({})", timestamp),
             description: Some("Created by dw login".to_string()),
             purpose: ApiKeyPurpose::Platform,
             requests_per_second: None,
