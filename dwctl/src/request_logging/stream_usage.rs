@@ -1,12 +1,22 @@
 /// Body transform that injects `stream_options.include_usage = true` into streaming
 /// completion requests. This ensures upstream providers report token usage in the final
 /// SSE chunk, which is required for accurate billing and analytics.
-pub fn stream_usage_transform(path: &str, _headers: &axum::http::HeaderMap, body_bytes: &[u8]) -> Option<axum::body::Bytes> {
+///
+/// Also handles the `X-Fusillade-Stream: true` header: when present, sets `stream: true`
+/// and `stream_options.include_usage = true` so fusillade batch requests are executed as
+/// streaming requests to capture usage data.
+pub fn stream_usage_transform(path: &str, headers: &axum::http::HeaderMap, body_bytes: &[u8]) -> Option<axum::body::Bytes> {
+    let fusillade_stream = headers.get("x-fusillade-stream").and_then(|v| v.to_str().ok()) == Some("true");
+
     if path.ends_with("/completions")
         && let Ok(mut json_body) = serde_json::from_slice::<serde_json::Value>(body_bytes)
         && let Some(obj) = json_body.as_object_mut()
-        && obj.get("stream").and_then(|v| v.as_bool()) == Some(true)
+        && (obj.get("stream").and_then(|v| v.as_bool()) == Some(true) || fusillade_stream)
     {
+        if fusillade_stream {
+            obj.insert("stream".to_string(), serde_json::Value::Bool(true));
+        }
+
         obj.entry("stream_options")
             .or_insert_with(|| serde_json::json!({}))
             .as_object_mut()?
@@ -115,5 +125,48 @@ mod tests {
         });
         // stream_options is null, as_object_mut() returns None, ? returns None
         assert!(call("/chat/completions", &body).is_none());
+    }
+
+    fn call_with_headers(path: &str, headers: &HeaderMap, body: &serde_json::Value) -> Option<serde_json::Value> {
+        let bytes = serde_json::to_vec(body).unwrap();
+        stream_usage_transform(path, headers, &bytes).map(|b| serde_json::from_slice(&b).unwrap())
+    }
+
+    fn fusillade_stream_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-fusillade-stream", "true".parse().unwrap());
+        headers
+    }
+
+    #[test]
+    fn fusillade_stream_injects_stream_and_usage() {
+        let body = serde_json::json!({
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let result = call_with_headers("/chat/completions", &fusillade_stream_headers(), &body).expect("should transform");
+        assert_eq!(result["stream"], true);
+        assert_eq!(result["stream_options"]["include_usage"], true);
+    }
+
+    #[test]
+    fn fusillade_stream_overrides_stream_false() {
+        let body = serde_json::json!({
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": false
+        });
+        let result = call_with_headers("/chat/completions", &fusillade_stream_headers(), &body).expect("should transform");
+        assert_eq!(result["stream"], true);
+        assert_eq!(result["stream_options"]["include_usage"], true);
+    }
+
+    #[test]
+    fn fusillade_stream_skips_non_completions() {
+        let body = serde_json::json!({
+            "model": "gpt-4",
+            "input": "hello"
+        });
+        assert!(call_with_headers("/embeddings", &fusillade_stream_headers(), &body).is_none());
     }
 }
