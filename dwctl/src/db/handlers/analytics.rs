@@ -1055,7 +1055,7 @@ pub async fn refresh_user_model_usage(pool: &PgPool) -> Result<()> {
     let new_max: Option<i64> = sqlx::query_scalar!(
         r#"
         SELECT MAX(id) FROM http_analytics
-        WHERE id > $1 AND user_id IS NOT NULL AND model IS NOT NULL AND fusillade_batch_id IS NOT NULL
+        WHERE id > $1 AND user_id IS NOT NULL AND model IS NOT NULL
         "#,
         cursor
     )
@@ -1077,7 +1077,7 @@ pub async fn refresh_user_model_usage(pool: &PgPool) -> Result<()> {
                COUNT(*)
         FROM http_analytics
         WHERE id > $1 AND id <= $2
-              AND user_id IS NOT NULL AND model IS NOT NULL AND fusillade_batch_id IS NOT NULL
+              AND user_id IS NOT NULL AND model IS NOT NULL
         GROUP BY user_id, model
         ON CONFLICT (user_id, model)
         DO UPDATE SET
@@ -1183,7 +1183,6 @@ pub async fn get_user_model_breakdown_for_range(
         FROM http_analytics
         WHERE user_id = $1
           AND timestamp >= $2 AND timestamp <= $3
-          AND fusillade_batch_id IS NOT NULL
         GROUP BY model
         ORDER BY request_count DESC
         "#,
