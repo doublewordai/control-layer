@@ -210,6 +210,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "arc-swap"
+version = "1.8.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f9f3647c145568cec02c42054e07bdf9a5a698e15b466fb2341bfc393cd24aa5"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "argon2"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1447,6 +1456,7 @@ version = "8.23.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
+ "arc-swap",
  "argon2",
  "async-openai",
  "async-stripe",
@@ -1484,6 +1494,7 @@ dependencies = [
  "minijinja",
  "moka",
  "multer",
+ "notify",
  "once_cell",
  "onwards",
  "opentelemetry",

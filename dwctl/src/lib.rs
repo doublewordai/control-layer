@@ -143,6 +143,7 @@ fn install_crypto_provider() {
 pub mod api;
 pub mod auth;
 pub mod config;
+mod config_watcher;
 mod crypto;
 pub mod db;
 mod email;
@@ -201,6 +202,7 @@ use outlet::{MultiHandler, RequestLoggerConfig, RequestLoggerLayer};
 use outlet_postgres::PostgresHandler;
 use request_logging::{AiResponse, ParsedAIRequest};
 use sqlx::{ConnectOptions, Executor, PgPool, postgres::PgConnectOptions};
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::{Arc, OnceLock};
 use tokio::net::TcpListener;
@@ -213,6 +215,29 @@ use utoipa_scalar::{Scalar, Servable};
 use uuid::Uuid;
 
 pub use types::{ApiKeyId, DeploymentId, GroupId, InferenceEndpointId, UserId};
+
+#[derive(Clone)]
+pub struct SharedConfig(Arc<arc_swap::ArcSwap<Config>>);
+
+impl SharedConfig {
+    pub fn new(config: Config) -> Self {
+        Self(Arc::new(arc_swap::ArcSwap::from_pointee(config)))
+    }
+
+    pub fn snapshot(&self) -> Arc<Config> {
+        self.0.load_full()
+    }
+
+    pub fn store(&self, config: Config) {
+        self.0.store(Arc::new(config));
+    }
+}
+
+impl From<Config> for SharedConfig {
+    fn from(config: Config) -> Self {
+        Self::new(config)
+    }
+}
 
 /// Application state shared across all request handlers.
 ///
@@ -235,7 +260,7 @@ pub use types::{ApiKeyId, DeploymentId, GroupId, InferenceEndpointId, UserId};
 /// let limiters = limits::Limiters::new(&config.limits);
 /// let state = AppState::builder()
 ///     .db(db_pools)
-///     .config(config)
+///     .config(config.into())
 ///     .request_manager(request_manager)
 ///     .limiters(limiters)
 ///     .build();
@@ -248,7 +273,7 @@ where
     /// Database pools (primary + optional replica).
     /// Use `.read()` for read-only queries, `.write()` for writes.
     pub db: P,
-    pub config: Config,
+    pub config: SharedConfig,
     /// Outlet database pools for request logging. Always uses DbPools (production type).
     /// In tests, this uses DbPools without read-only enforcement (outlet is write-heavy).
     pub outlet_db: Option<DbPools>,
@@ -258,6 +283,15 @@ where
     pub request_manager: Arc<fusillade::PostgresRequestManager<P, fusillade::ReqwestHttpClient>>,
     /// Resource limiters for protecting system capacity.
     pub limiters: limits::Limiters,
+}
+
+impl<P> AppState<P>
+where
+    P: PoolProvider + Clone,
+{
+    pub fn current_config(&self) -> Arc<Config> {
+        self.config.snapshot()
+    }
 }
 
 /// Get the dwctl database migrator
@@ -922,6 +956,8 @@ pub async fn build_router(
     metrics_recorder: Option<GenAiMetrics>,
     strict_mode: bool,
 ) -> anyhow::Result<Router> {
+    let config = state.current_config();
+
     // Setup request logging and/or analytics based on config flags
     //
     // These can be enabled independently:
@@ -930,8 +966,8 @@ pub async fn build_router(
     //
     // Both require the RequestLoggerLayer to capture request/response data, but use
     // different handlers to process that data.
-    let request_logging_enabled = state.outlet_db.is_some() && state.config.enable_request_logging;
-    let analytics_enabled = state.config.enable_analytics;
+    let request_logging_enabled = state.outlet_db.is_some() && config.enable_request_logging;
+    let analytics_enabled = config.enable_analytics;
 
     let outlet_layer = if request_logging_enabled || analytics_enabled {
         // Store the metrics recorder in state (created earlier in Application::new)
@@ -954,7 +990,7 @@ pub async fn build_router(
         // Add AnalyticsHandler for analytics/billing if enabled
         // The batcher is spawned in setup_background_services and managed by BackgroundServices
         if let Some(sender) = analytics_sender {
-            let analytics_handler = request_logging::AnalyticsHandler::new(sender, uuid::Uuid::new_v4(), state.config.clone());
+            let analytics_handler = request_logging::AnalyticsHandler::new(sender, uuid::Uuid::new_v4(), config.as_ref().clone());
             multi_handler = multi_handler.with(analytics_handler);
         }
 
@@ -1206,10 +1242,10 @@ pub async fn build_router(
     let api_routes_with_state = api_routes.with_state(state.clone());
 
     // Batches API routes (files + batches) - conditionally enabled under /ai/v1
-    let batches_routes = if state.config.batches.enabled {
+    let batches_routes = if config.batches.enabled {
         // File upload route with custom body limit (other routes use default)
         // 0 = unlimited (disable body limit), otherwise set max size
-        let file_upload_limit = state.config.limits.files.max_file_size;
+        let file_upload_limit = config.limits.files.max_file_size;
         let body_limit_layer = if file_upload_limit == 0 {
             DefaultBodyLimit::disable()
         } else {
@@ -1334,13 +1370,13 @@ pub async fn build_router(
         .fallback_service(fallback.with_state(state.clone()));
 
     // Create CORS layer from config
-    let cors_layer = create_cors_layer(&state.config)?;
+    let cors_layer = create_cors_layer(&config)?;
 
     // Apply CORS to main router (request logging already applied to onwards_router above)
     let mut router = router.layer(cors_layer);
 
     // Add Prometheus metrics if enabled
-    if state.config.enable_metrics {
+    if config.enable_metrics {
         let metric_handle = get_or_install_prometheus_handle();
 
         let prometheus_layer = PrometheusMetricLayerBuilder::new()
@@ -1541,6 +1577,14 @@ pub struct BackgroundServices {
 }
 
 impl BackgroundServices {
+    fn spawn<F>(&mut self, name: &'static str, future: F)
+    where
+        F: std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
+    {
+        let abort_handle = self.background_tasks.spawn(future);
+        self.task_names.insert(abort_handle.id(), name);
+    }
+
     /// Wait for any background task to complete (indicating a failure)
     /// This method is cancel-safe - can be used in tokio::select! without losing tasks
     /// Returns an error with details about which task failed
@@ -2096,7 +2140,15 @@ impl Application {
     /// If `pool` is provided, it will be used directly instead of creating a new connection.
     /// This is useful for tests where sqlx::test provides a pool.
     pub async fn new(config: Config, tracer_provider: Option<telemetry::SdkTracerProvider>) -> anyhow::Result<Self> {
-        Self::new_with_pool(config, None, tracer_provider).await
+        Self::new_with_pool_and_config_path(config, None, None, tracer_provider).await
+    }
+
+    pub async fn new_with_config_path(
+        config: Config,
+        config_path: Option<PathBuf>,
+        tracer_provider: Option<telemetry::SdkTracerProvider>,
+    ) -> anyhow::Result<Self> {
+        Self::new_with_pool_and_config_path(config, config_path, None, tracer_provider).await
     }
 
     /// Create a new application instance with an existing database pool
@@ -2105,6 +2157,15 @@ impl Application {
     /// For production use, prefer [`Application::new`] which will create its own pool.
     pub async fn new_with_pool(
         config: Config,
+        pool: Option<PgPool>,
+        tracer_provider: Option<telemetry::SdkTracerProvider>,
+    ) -> anyhow::Result<Self> {
+        Self::new_with_pool_and_config_path(config, None, pool, tracer_provider).await
+    }
+
+    pub async fn new_with_pool_and_config_path(
+        config: Config,
+        config_path: Option<PathBuf>,
         pool: Option<PgPool>,
         tracer_provider: Option<telemetry::SdkTracerProvider>,
     ) -> anyhow::Result<Self> {
@@ -2134,7 +2195,7 @@ impl Application {
         // Setup background services (onwards integration, probe scheduler, batch daemon, leader election)
         // Note: Must use primary pool (via Deref) because onwards sync uses LISTEN/NOTIFY
         // which requires direct database connection to primary (not through PgBouncer transaction pooling)
-        let bg_services = setup_background_services(
+        let mut bg_services = setup_background_services(
             (*db_pools).clone(),
             fusillade_pools.clone(),
             outlet_pools.as_ref().map(|p| (**p).clone()),
@@ -2175,16 +2236,24 @@ impl Application {
 
         // Build resource limiters
         let limiters = limits::Limiters::new(&config.limits);
+        let shared_config = SharedConfig::new(config.clone());
 
         // Build app state and router
         let mut app_state = AppState::builder()
             .db(db_pools.clone())
-            .config(config.clone())
+            .config(shared_config.clone())
             .is_leader(bg_services.is_leader)
             .request_manager(bg_services.request_manager.clone())
             .maybe_outlet_db(outlet_pools.clone())
             .limiters(limiters)
             .build();
+
+        if let Some(config_path) = config_path {
+            bg_services.spawn(
+                "config-watcher",
+                config_watcher::watch_config_file(config_path, shared_config, bg_services.shutdown_token()),
+            );
+        }
 
         let router = build_router(
             &mut app_state,

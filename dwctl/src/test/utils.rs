@@ -41,7 +41,7 @@ pub async fn create_test_app_state_with_config(pool: PgPool, config: crate::conf
 
     crate::AppState::builder()
         .db(test_pools)
-        .config(config.clone())
+        .config(crate::SharedConfig::new(config.clone()))
         .request_manager(request_manager)
         .limiters(limiters)
         .build()
@@ -79,7 +79,7 @@ pub async fn create_test_app_state_with_fusillade(pool: PgPool, config: crate::c
 
     crate::AppState::builder()
         .db(test_pools)
-        .config(config)
+        .config(crate::SharedConfig::new(config))
         .request_manager(request_manager)
         .limiters(limiters)
         .build()

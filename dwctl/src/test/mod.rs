@@ -889,7 +889,7 @@ async fn test_request_logging_disabled(pool: PgPool) {
     let limiters = crate::limits::Limiters::new(&config.limits);
     let mut app_state = AppState::builder()
         .db(DbPools::new(pool.clone()))
-        .config(config)
+        .config(crate::SharedConfig::new(config))
         .request_manager(request_manager)
         .limiters(limiters)
         .build();
@@ -1227,7 +1227,7 @@ async fn test_build_router_with_metrics_disabled(pool: PgPool) {
     let limiters = crate::limits::Limiters::new(&config.limits);
     let mut app_state = AppState::builder()
         .db(DbPools::new(pool))
-        .config(config)
+        .config(crate::SharedConfig::new(config))
         .request_manager(request_manager)
         .limiters(limiters)
         .build();
@@ -1258,7 +1258,7 @@ async fn test_build_router_with_metrics_enabled(pool: PgPool) {
     let limiters = crate::limits::Limiters::new(&config.limits);
     let mut app_state = AppState::builder()
         .db(DbPools::new(pool))
-        .config(config)
+        .config(crate::SharedConfig::new(config))
         .request_manager(request_manager)
         .limiters(limiters)
         .build();

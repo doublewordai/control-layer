@@ -111,8 +111,9 @@ pub async fn create_payment<P: PoolProvider>(
     user: CurrentUser,
     axum::extract::Query(query): axum::extract::Query<PaymentQuery>,
 ) -> Result<Response, StatusCode> {
+    let config = state.current_config();
     // Get payment provider from config (generic - works for any provider)
-    let payment_config = match state.config.payment.clone() {
+    let payment_config = match config.payment.clone() {
         Some(config) => config,
         None => {
             tracing::warn!("Checkout requested but no payment provider is configured");
@@ -123,7 +124,7 @@ pub async fn create_payment<P: PoolProvider>(
         }
     };
 
-    let origin = state.config.dashboard_url.clone();
+    let origin = config.dashboard_url.clone();
 
     // Build success/cancel URLs, preserving the user query parameter if present
     let base_path = if let Some(creditee_id) = &query.creditee_id {
@@ -196,8 +197,9 @@ pub async fn process_payment<P: PoolProvider>(
     axum::extract::Path(id): axum::extract::Path<String>,
     _user: CurrentUser,
 ) -> Result<Response, StatusCode> {
+    let config = state.current_config();
     // Get payment provider from config (generic - works for any provider)
-    let provider = match state.config.payment.clone() {
+    let provider = match config.payment.clone() {
         Some(payment_config) => payment_providers::create_provider(payment_config),
         None => {
             tracing::warn!("Payment processing requested but no payment provider is configured");
@@ -268,8 +270,9 @@ pub async fn webhook_handler<P: PoolProvider>(
     headers: axum::http::HeaderMap,
     body: String,
 ) -> StatusCode {
+    let config = state.current_config();
     // Get payment provider from config
-    let provider = match state.config.payment.clone() {
+    let provider = match config.payment.clone() {
         Some(payment_config) => payment_providers::create_provider(payment_config),
         None => {
             tracing::warn!("Webhook received but no payment provider configured");
@@ -341,8 +344,9 @@ pub async fn create_billing_portal_session<P: PoolProvider>(
     State(state): State<AppState<P>>,
     user: CurrentUser,
 ) -> Result<Response, StatusCode> {
+    let config = state.current_config();
     // Get payment provider from config
-    let payment_config = match state.config.payment.clone() {
+    let payment_config = match config.payment.clone() {
         Some(config) => config,
         None => {
             tracing::warn!("Billing portal requested but no payment provider is configured");
@@ -353,7 +357,7 @@ pub async fn create_billing_portal_session<P: PoolProvider>(
         }
     };
 
-    let return_url = format!("{}/cost-management", state.config.dashboard_url);
+    let return_url = format!("{}/cost-management", config.dashboard_url);
 
     let provider = payment_providers::create_provider(payment_config);
 
@@ -396,7 +400,8 @@ pub async fn create_auto_topup_checkout<P: PoolProvider>(
     State(state): State<AppState<P>>,
     user: CurrentUser,
 ) -> Result<Response, StatusCode> {
-    let payment_config = match state.config.payment.clone() {
+    let config = state.current_config();
+    let payment_config = match config.payment.clone() {
         Some(config) => config,
         None => {
             tracing::warn!("Auto top-up checkout requested but no payment provider is configured");
@@ -407,7 +412,7 @@ pub async fn create_auto_topup_checkout<P: PoolProvider>(
         }
     };
 
-    let origin = state.config.dashboard_url.clone();
+    let origin = config.dashboard_url.clone();
     let success_url = format!("{}/cost-management?autoTopupId={{CHECKOUT_SESSION_ID}}&autoTopup=true", origin);
     let cancel_url = format!("{}/cost-management?autoTopup=true&autoTopupId=fail", origin);
 
@@ -494,7 +499,8 @@ pub async fn process_auto_topup<P: PoolProvider>(
     }
 
     // Validate the session with the payment provider
-    let provider = match state.config.payment.clone() {
+    let config = state.current_config();
+    let provider = match config.payment.clone() {
         Some(payment_config) => payment_providers::create_provider(payment_config),
         None => {
             tracing::warn!("Auto top-up requested but no payment provider is configured");
@@ -646,7 +652,8 @@ pub async fn enable_auto_topup<P: PoolProvider>(
             .into_response());
     }
 
-    let provider = match state.config.payment.clone() {
+    let config = state.current_config();
+    let provider = match config.payment.clone() {
         Some(payment_config) => payment_providers::create_provider(payment_config),
         None => {
             tracing::warn!("Auto top-up enable requested but no payment provider is configured");

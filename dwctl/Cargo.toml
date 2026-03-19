@@ -23,6 +23,7 @@ fusillade = { version = "13.0.0" }
 tokio = { version = "1.0", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = "0.7"
+notify = "8.2.0"
 sqlx = { version = "0.8", features = [
   "runtime-tokio-rustls",
   "postgres",
@@ -37,6 +38,7 @@ serde_json = "1.0"
 uuid = { version = "1.0", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 anyhow = "1.0"
+arc-swap = "1.7"
 log = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

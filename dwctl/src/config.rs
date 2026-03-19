@@ -1661,6 +1661,14 @@ impl ModelSource {
 
 impl Config {
     #[allow(clippy::result_large_err)]
+    pub fn load_from_path(path: impl Into<String>) -> Result<Self, figment::Error> {
+        Self::load(&Args {
+            config: path.into(),
+            validate: false,
+        })
+    }
+
+    #[allow(clippy::result_large_err)]
     pub fn load(args: &Args) -> Result<Self, figment::Error> {
         let mut config: Self = Self::figment(args).extract()?;
 

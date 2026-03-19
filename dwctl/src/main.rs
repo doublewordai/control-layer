@@ -1,5 +1,6 @@
 use clap::Parser;
 use dwctl::{Application, Config, telemetry};
+use std::path::PathBuf;
 
 /// Wait for shutdown signal (SIGTERM or Ctrl+C)
 async fn shutdown_signal() {
@@ -60,5 +61,8 @@ async fn async_main() -> anyhow::Result<()> {
 
     // Run the application with graceful shutdown on SIGTERM/Ctrl+C
     let shutdown = shutdown_signal();
-    Application::new(config, tracer_provider).await?.serve(shutdown).await
+    Application::new_with_config_path(config, Some(PathBuf::from(&args.config)), tracer_provider)
+        .await?
+        .serve(shutdown)
+        .await
 }
