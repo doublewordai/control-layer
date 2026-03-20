@@ -1183,6 +1183,7 @@ pub async fn get_user_model_breakdown_for_range(
         FROM http_analytics
         WHERE user_id = $1
           AND timestamp >= $2 AND timestamp <= $3
+          AND model IS NOT NULL
         GROUP BY model
         ORDER BY request_count DESC
         "#,
@@ -2138,8 +2139,8 @@ mod tests {
             prompt_tokens + completion_tokens,
             user_id,
             fusillade_batch_id,
-            // Set prices so total_cost is computed; use simple 1-per-token pricing
-            // total_cost = prompt_tokens * input_price + completion_tokens * output_price
+            // Derive a uniform per-token rate so that total_cost = (prompt + completion) * rate
+            // This makes the stored total_cost equal the requested total_cost value
             Decimal::from_f64_retain(total_cost / (prompt_tokens + completion_tokens) as f64),
             Decimal::from_f64_retain(total_cost / (prompt_tokens + completion_tokens) as f64),
         )
