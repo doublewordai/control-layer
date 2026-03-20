@@ -2143,11 +2143,19 @@ mod tests {
             // This makes the stored total_cost equal the requested total_cost value
             {
                 let total_tokens = (prompt_tokens + completion_tokens) as f64;
-                if total_tokens > 0.0 { Decimal::from_f64_retain(total_cost / total_tokens) } else { Some(Decimal::ZERO) }
+                if total_tokens > 0.0 {
+                    Decimal::from_f64_retain(total_cost / total_tokens)
+                } else {
+                    Some(Decimal::ZERO)
+                }
             },
             {
                 let total_tokens = (prompt_tokens + completion_tokens) as f64;
-                if total_tokens > 0.0 { Decimal::from_f64_retain(total_cost / total_tokens) } else { Some(Decimal::ZERO) }
+                if total_tokens > 0.0 {
+                    Decimal::from_f64_retain(total_cost / total_tokens)
+                } else {
+                    Some(Decimal::ZERO)
+                }
             },
         )
         .execute(pool)
