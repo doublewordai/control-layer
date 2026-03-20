@@ -32,8 +32,8 @@ impl<'c> Webhooks<'c> {
         let webhook = sqlx::query_as!(
             Webhook,
             r#"
-            INSERT INTO user_webhooks (user_id, url, secret, event_types, description)
-            VALUES ($1, $2, $3, $4, $5)
+            INSERT INTO user_webhooks (user_id, url, secret, event_types, description, scope)
+            VALUES ($1, $2, $3, $4, $5, $6)
             RETURNING *
             "#,
             request.user_id,
@@ -41,6 +41,7 @@ impl<'c> Webhooks<'c> {
             request.secret,
             event_types_json,
             request.description,
+            request.scope,
         )
         .fetch_one(&mut *self.db)
         .await?;
@@ -184,6 +185,31 @@ impl<'c> Webhooks<'c> {
         Ok(by_user)
     }
 
+    /// Get all enabled platform-scoped webhooks owned by PlatformManagers.
+    ///
+    /// The `scope = 'platform'` constraint is enforced by a DB trigger at write time,
+    /// but the `role = 'PlatformManager'` check at read time handles the demotion case —
+    /// if a PM loses their role, their existing platform webhooks stop firing immediately.
+    #[instrument(skip(self), err)]
+    pub async fn get_enabled_platform_webhooks(&mut self) -> Result<Vec<Webhook>> {
+        let webhooks = sqlx::query_as!(
+            Webhook,
+            r#"
+            SELECT w.*
+            FROM user_webhooks w
+            INNER JOIN user_roles ur ON ur.user_id = w.user_id
+            WHERE w.enabled = true
+              AND w.scope = 'platform'
+              AND w.disabled_at IS NULL
+              AND ur.role = 'PLATFORMMANAGER'
+            "#,
+        )
+        .fetch_all(&mut *self.db)
+        .await?;
+
+        Ok(webhooks)
+    }
+
     /// Increment consecutive failures and potentially trip circuit breaker.
     ///
     /// Returns `None` if the webhook was deleted (e.g. CASCADE from user or
@@ -241,7 +267,7 @@ impl<'c> Webhooks<'c> {
         let delivery = sqlx::query_as!(
             WebhookDelivery,
             r#"
-            INSERT INTO webhook_deliveries (webhook_id, event_id, event_type, payload, batch_id, next_attempt_at)
+            INSERT INTO webhook_deliveries (webhook_id, event_id, event_type, payload, resource_id, next_attempt_at)
             VALUES ($1, $2, $3, $4, $5, COALESCE($6, now()))
             RETURNING *
             "#,
@@ -249,7 +275,7 @@ impl<'c> Webhooks<'c> {
             request.event_id,
             request.event_type,
             request.payload,
-            request.batch_id,
+            request.resource_id,
             request.next_attempt_at,
         )
         .fetch_one(&mut *self.db)
@@ -424,6 +450,7 @@ mod tests {
                 secret: generate_secret(),
                 event_types: None,
                 description: None,
+                scope: "own".to_string(),
             })
             .await
             .unwrap();
@@ -441,7 +468,7 @@ mod tests {
             event_id: uuid::Uuid::new_v4(),
             event_type: "batch.completed".to_string(),
             payload: serde_json::json!({"type": "batch.completed", "data": {}}),
-            batch_id: uuid::Uuid::new_v4(),
+            resource_id: Some(uuid::Uuid::new_v4()),
             next_attempt_at,
         })
         .await

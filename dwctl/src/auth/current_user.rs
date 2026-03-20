@@ -159,7 +159,7 @@ async fn try_proxy_header_auth<P: sqlx_pool_router::PoolProvider + Clone + Send 
         Err(e) => return Some(Err(DbError::from(e).into())),
     };
     let mut user_repo = Users::new(&mut tx);
-    let mut should_create_sample_files = false;
+    let mut is_new_user = false;
 
     // Get or create user with group sync (only if auto_create is enabled)
     let user_result = if config.auth.proxy_header.auto_create_users {
@@ -170,7 +170,7 @@ async fn try_proxy_header_auth<P: sqlx_pool_router::PoolProvider + Clone + Send 
             Ok((user, was_created)) => {
                 // Grant initial credits for newly created users
                 if was_created {
-                    should_create_sample_files = true;
+                    is_new_user = true;
                     let initial_credits = config.credits.initial_credits_for_standard_users;
                     if initial_credits > rust_decimal::Decimal::ZERO && user.roles.contains(&Role::StandardUser) {
                         use crate::db::handlers::credits::Credits;
@@ -245,8 +245,20 @@ async fn try_proxy_header_auth<P: sqlx_pool_router::PoolProvider + Clone + Send 
         Err(e) => return Some(Err(DbError::from(e).into())),
     }
 
+    // Emit platform event for newly created users
+    if is_new_user {
+        if let Some((ref user, _)) = user_result {
+            crate::webhooks::emit::emit_platform_event(
+                state.db.write(),
+                crate::webhooks::WebhookEvent::user_created(user.id, &user.email, "proxy-header"),
+                crate::webhooks::WebhookEventType::UserCreated,
+                Some(user.id),
+            );
+        }
+    }
+
     // Create sample files after commit so the user and API keys are persisted
-    if should_create_sample_files
+    if is_new_user
         && config.sample_files.enabled
         && config.batches.enabled
         && let Some((ref user, _)) = user_result

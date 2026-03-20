@@ -323,7 +323,7 @@ async fn create_batch_deliveries(
                 event_id,
                 event_type: webhook_status.to_string(),
                 payload: payload_json.clone(),
-                batch_id: info.batch_uuid,
+                resource_id: Some(info.batch_uuid),
                 next_attempt_at: None, // defaults to now() — claimed immediately
             };
 

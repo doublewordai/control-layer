@@ -342,6 +342,14 @@ pub async fn create_user<P: PoolProvider>(
     // explicitly via API and can tolerate activation delay.
 
     tx.commit().await.map_err(|e| Error::Database(e.into()))?;
+
+    crate::webhooks::emit::emit_platform_event(
+        state.db.write(),
+        crate::webhooks::WebhookEvent::user_created(user.id, &user.email, &user.auth_source),
+        crate::webhooks::WebhookEventType::UserCreated,
+        Some(user.id),
+    );
+
     Ok((StatusCode::CREATED, Json(UserResponse::from(user))))
 }
 
