@@ -2175,8 +2175,7 @@ mod tests {
         // Insert a realtime request (no batch id)
         insert_usage_analytics(&pool, user_id, "gpt-4", 100, 50, 0.0, now, None).await;
         // Insert a batch request
-        insert_usage_analytics(&pool, user_id, "gpt-4", 200, 100, 0.0, now, Some(Uuid::new_v4()))
-            .await;
+        insert_usage_analytics(&pool, user_id, "gpt-4", 200, 100, 0.0, now, Some(Uuid::new_v4())).await;
 
         refresh_user_model_usage(&pool).await.unwrap();
 
@@ -2198,20 +2197,9 @@ mod tests {
         // Insert a realtime request (no batch id)
         insert_usage_analytics(&pool, user_id, "claude-3", 80, 40, 0.0, now, None).await;
         // Insert a batch request
-        insert_usage_analytics(
-            &pool,
-            user_id,
-            "claude-3",
-            120,
-            60,
-            0.0,
-            now,
-            Some(Uuid::new_v4()),
-        )
-        .await;
+        insert_usage_analytics(&pool, user_id, "claude-3", 120, 60, 0.0, now, Some(Uuid::new_v4())).await;
 
-        let breakdown =
-            get_user_model_breakdown_for_range(&pool, user_id, one_hour_ago, now).await.unwrap();
+        let breakdown = get_user_model_breakdown_for_range(&pool, user_id, one_hour_ago, now).await.unwrap();
         assert_eq!(breakdown.len(), 1);
         assert_eq!(breakdown[0].model, "claude-3");
         assert_eq!(breakdown[0].request_count, 2);
@@ -2229,12 +2217,10 @@ mod tests {
         // Insert a realtime request (no batch id)
         insert_usage_analytics(&pool, user_id, "gpt-4", 100, 50, 0.0, now, None).await;
         // Insert two requests from the same batch
-        insert_usage_analytics(&pool, user_id, "gpt-4", 200, 100, 0.0, now, Some(batch_id))
-            .await;
+        insert_usage_analytics(&pool, user_id, "gpt-4", 200, 100, 0.0, now, Some(batch_id)).await;
         insert_usage_analytics(&pool, user_id, "gpt-4", 150, 75, 0.0, now, Some(batch_id)).await;
 
-        let count =
-            get_user_batch_count_for_range(&pool, user_id, one_hour_ago, now).await.unwrap();
+        let count = get_user_batch_count_for_range(&pool, user_id, one_hour_ago, now).await.unwrap();
         // Only 1 distinct batch, realtime requests not counted
         assert_eq!(count, 1);
     }
