@@ -2141,8 +2141,14 @@ mod tests {
             fusillade_batch_id,
             // Derive a uniform per-token rate so that total_cost = (prompt + completion) * rate
             // This makes the stored total_cost equal the requested total_cost value
-            Decimal::from_f64_retain(total_cost / (prompt_tokens + completion_tokens) as f64),
-            Decimal::from_f64_retain(total_cost / (prompt_tokens + completion_tokens) as f64),
+            {
+                let total_tokens = (prompt_tokens + completion_tokens) as f64;
+                if total_tokens > 0.0 { Decimal::from_f64_retain(total_cost / total_tokens) } else { Some(Decimal::ZERO) }
+            },
+            {
+                let total_tokens = (prompt_tokens + completion_tokens) as f64;
+                if total_tokens > 0.0 { Decimal::from_f64_retain(total_cost / total_tokens) } else { Some(Decimal::ZERO) }
+            },
         )
         .execute(pool)
         .await
