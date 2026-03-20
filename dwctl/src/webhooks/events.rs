@@ -191,14 +191,8 @@ mod tests {
             "batch.completed".parse::<WebhookEventType>().unwrap(),
             WebhookEventType::BatchCompleted
         );
-        assert_eq!(
-            "user.created".parse::<WebhookEventType>().unwrap(),
-            WebhookEventType::UserCreated
-        );
-        assert_eq!(
-            "batch.created".parse::<WebhookEventType>().unwrap(),
-            WebhookEventType::BatchCreated
-        );
+        assert_eq!("user.created".parse::<WebhookEventType>().unwrap(), WebhookEventType::UserCreated);
+        assert_eq!("batch.created".parse::<WebhookEventType>().unwrap(), WebhookEventType::BatchCreated);
         assert_eq!(
             "api_key.created".parse::<WebhookEventType>().unwrap(),
             WebhookEventType::ApiKeyCreated

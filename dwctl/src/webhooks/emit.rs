@@ -22,12 +22,7 @@ use super::events::{WebhookEvent, WebhookEventType};
 ///
 /// The delivery records are processed by the existing dispatcher on its
 /// next tick (~30s polling interval).
-pub fn emit_platform_event(
-    pool: &PgPool,
-    event: WebhookEvent,
-    event_type: WebhookEventType,
-    resource_id: Option<Uuid>,
-) {
+pub fn emit_platform_event(pool: &PgPool, event: WebhookEvent, event_type: WebhookEventType, resource_id: Option<Uuid>) {
     let pool = pool.clone();
     tokio::spawn(async move {
         let mut conn = match pool.acquire().await {
