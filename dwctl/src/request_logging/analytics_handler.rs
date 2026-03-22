@@ -118,7 +118,17 @@ impl RequestHandler for AnalyticsHandler {
             // Use parsed response for metrics, or fallback to Other for error responses
             let metrics_response = match &parse_result {
                 Ok(response) => response.clone(),
-                Err(_) => AiResponse::Other(Value::Null),
+                Err(e) => {
+                    if response_data.status.is_success() {
+                        tracing::warn!(
+                            correlation_id = correlation_id,
+                            uri = %request_data.uri,
+                            error = %e.error,
+                            "Failed to parse successful AI response — tokens will be zero"
+                        );
+                    }
+                    AiResponse::Other(Value::Null)
+                }
             };
 
             // Extract basic metrics - captures status_code, duration, model from request, etc.
