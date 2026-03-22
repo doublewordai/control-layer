@@ -28,6 +28,7 @@ pub enum ApiAiResponse {
     ChatCompletions(serde_json::Value),
     ChatCompletionsStream(serde_json::Value),
     Completions(serde_json::Value),
+    CompletionsStream(serde_json::Value),
     Embeddings(serde_json::Value),
     Responses(serde_json::Value),
     ResponsesStream(serde_json::Value),
@@ -53,6 +54,9 @@ impl From<&AiResponse> for ApiAiResponse {
                 ApiAiResponse::ChatCompletionsStream(serde_json::to_value(chunks).unwrap_or_default())
             }
             AiResponse::Completions(resp) => ApiAiResponse::Completions(serde_json::to_value(resp).unwrap_or_default()),
+            AiResponse::CompletionsStream(chunks) => {
+                ApiAiResponse::CompletionsStream(serde_json::to_value(chunks).unwrap_or_default())
+            }
             AiResponse::Embeddings(resp) => ApiAiResponse::Embeddings(serde_json::to_value(resp).unwrap_or_default()),
             AiResponse::Base64Embeddings(resp) => ApiAiResponse::Embeddings(serde_json::to_value(resp).unwrap_or_default()),
             AiResponse::Responses(resp) => ApiAiResponse::Responses(serde_json::to_value(resp).unwrap_or_default()),

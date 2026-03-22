@@ -54,6 +54,14 @@ pub enum ChatCompletionChunk {
     Done,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum CompletionChunk {
+    Normal(CreateCompletionResponse), //async-openai reuses this type for streaming
+    #[serde(rename = "[DONE]")]
+    Done,
+}
+
 /// AI response types with special handling for streaming
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -62,6 +70,7 @@ pub enum AiResponse {
     ChatCompletions(CreateChatCompletionResponse),
     ChatCompletionsStream(Vec<ChatCompletionChunk>),
     Completions(CreateCompletionResponse),
+    CompletionsStream(Vec<CompletionChunk>),
     Embeddings(CreateEmbeddingResponse),
     Base64Embeddings(CreateBase64EmbeddingResponse),
     /// Non-streaming /v1/responses response object.

@@ -40,7 +40,7 @@
 //! [outlet]: https://github.com/doublewordai/outlet
 
 use crate::config::Config;
-use crate::request_logging::models::{AiRequest, AiResponse, ChatCompletionChunk, ParsedAIRequest, ResponsesRequest};
+use crate::request_logging::models::{AiRequest, AiResponse, ChatCompletionChunk, CompletionChunk, ParsedAIRequest, ResponsesRequest};
 use async_openai::types::responses::ResponseStreamEvent;
 use outlet::{RequestData, ResponseData};
 use outlet_postgres::SerializationError;
@@ -273,6 +273,7 @@ pub fn parse_ai_response(request_data: &RequestData, response_data: &ResponseDat
                     AiRequest::ChatCompletions(chat_req) if chat_req.stream.unwrap_or(false) => utils::parse_streaming_response(&body_str),
                     AiRequest::Completions(completion_req) if completion_req.stream.unwrap_or(false) => {
                         utils::parse_streaming_response(&body_str)
+                        utils::parse_completions_streaming_response(&body_str)
                     }
                     _ => utils::parse_non_streaming_response(&body_str),
                 }
@@ -462,6 +463,45 @@ impl From<&AiResponse> for TokenMetrics {
                         completion_tokens: 0,
                         total_tokens: 0,
                         response_type: "chat_completion_stream".to_string(),
+                        response_model: model,
+                    }
+                }
+            }
+            AiResponse::CompletionsStream(chunks) => {
+                let last_normal_with_usage = chunks.iter().rev().find_map(|chunk| match chunk {
+                    CompletionChunk::Normal(normal_chunk) if normal_chunk.usage.is_some() => Some(normal_chunk),
+                    _ => None,
+                });
+
+                let model = chunks.iter().find_map(|chunk| match chunk {
+                    CompletionChunk::Normal(c) => Some(c.model.clone()),
+                    _ => None,
+                });
+
+                if let Some(chunk) = last_normal_with_usage {
+                    if let Some(usage) = &chunk.usage {
+                        Self {
+                            prompt_tokens: usage.prompt_tokens as i64,
+                            completion_tokens: usage.completion_tokens as i64,
+                            total_tokens: usage.total_tokens as i64,
+                            response_type: "completion_stream".to_string(),
+                            response_model: model,
+                        }
+                    } else {
+                        Self {
+                            prompt_tokens: 0,
+                            completion_tokens: 0,
+                            total_tokens: 0,
+                            response_type: "completion_stream".to_string(),
+                            response_model: model,
+                        }
+                    }
+                } else {
+                    Self {
+                        prompt_tokens: 0,
+                        completion_tokens: 0,
+                        total_tokens: 0,
+                        response_type: "completion_stream".to_string(),
                         response_model: model,
                     }
                 }
