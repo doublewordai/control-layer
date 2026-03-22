@@ -26,6 +26,18 @@ pub fn stream_usage_transform(path: &str, headers: &axum::http::HeaderMap, body_
             return Some(axum::body::Bytes::from(bytes));
         }
     }
+    if path.ends_with("/responses")
+        && fusillade_stream
+        && let Ok(mut json_body) = serde_json::from_slice::<serde_json::Value>(body_bytes)
+        && let Some(obj) = json_body.as_object_mut()
+    {
+        obj.insert("stream".to_string(), serde_json::Value::Bool(true));
+
+        if let Ok(bytes) = serde_json::to_vec(&json_body) {
+            return Some(axum::body::Bytes::from(bytes));
+        }
+    }
+
     None
 }
 
@@ -90,7 +102,6 @@ mod tests {
             "stream": true
         });
         assert!(call("/embeddings", &body).is_none());
-        assert!(call("/responses", &body).is_none());
     }
 
     #[test]
@@ -168,5 +179,38 @@ mod tests {
             "input": "hello"
         });
         assert!(call_with_headers("/embeddings", &fusillade_stream_headers(), &body).is_none());
+    }
+
+    #[test]
+    fn responses_skips_without_fusillade_header() {
+        let body = serde_json::json!({
+            "model": "gpt-4",
+            "input": "hello",
+            "stream": true
+        });
+        assert!(call("/responses", &body).is_none());
+    }
+
+    #[test]
+    fn responses_fusillade_stream_injects_stream() {
+        let body = serde_json::json!({
+            "model": "gpt-4",
+            "input": "hello"
+        });
+        let result = call_with_headers("/responses", &fusillade_stream_headers(), &body).expect("should transform");
+        assert_eq!(result["stream"], true);
+        assert!(result.get("stream_options").is_none());
+    }
+
+    #[test]
+    fn responses_fusillade_stream_does_not_inject_stream_options() {
+        let body = serde_json::json!({
+            "model": "gpt-4",
+            "input": "hello",
+            "stream": false
+        });
+        let result = call_with_headers("/responses", &fusillade_stream_headers(), &body).expect("should transform");
+        assert_eq!(result["stream"], true);
+        assert!(result.get("stream_options").is_none());
     }
 }
