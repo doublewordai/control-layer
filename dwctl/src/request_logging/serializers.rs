@@ -255,12 +255,22 @@ pub fn parse_ai_response(request_data: &RequestData, response_data: &ResponseDat
         return Ok(AiResponse::Other(Value::Null));
     }
 
+    // Onwards injects stream:true into the forwarded body when it sees this header,
+    // but outlet captures the original request body (without stream:true). Check the
+    // header so we know to use the streaming parser for the response.
+    let fusillade_stream = request_data
+        .headers
+        .get("x-fusillade-stream")
+        .and_then(|values| values.first())
+        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+        == Some("true");
+
     // Parse response based on request type
     let result = match parse_ai_request(request_data) {
         Ok(parsed_request) => {
             // /v1/responses has its own SSE event format distinct from chat completions.
             if let Some(responses_req) = &parsed_request.responses_request {
-                if responses_req.stream.unwrap_or(false) {
+                if responses_req.stream.unwrap_or(false) || fusillade_stream {
                     utils::parse_responses_streaming_response(&body_str)
                 } else {
                     // Try the typed Response parser first. Fall back to the generic untagged
@@ -270,9 +280,8 @@ pub fn parse_ai_response(request_data: &RequestData, response_data: &ResponseDat
                 }
             } else {
                 match parsed_request.request {
-                    AiRequest::ChatCompletions(chat_req) if chat_req.stream.unwrap_or(false) => utils::parse_streaming_response(&body_str),
-                    AiRequest::Completions(completion_req) if completion_req.stream.unwrap_or(false) => {
-                        utils::parse_streaming_response(&body_str)
+                    AiRequest::ChatCompletions(chat_req) if chat_req.stream.unwrap_or(false) || fusillade_stream => utils::parse_streaming_response(&body_str),
+                    AiRequest::Completions(completion_req) if completion_req.stream.unwrap_or(false) || fusillade_stream => {
                         utils::parse_completions_streaming_response(&body_str)
                     }
                     _ => utils::parse_non_streaming_response(&body_str),
@@ -896,6 +905,112 @@ mod tests {
                 assert!(!chunks.is_empty());
             }
             _ => panic!("Expected AiResponse::ChatCompletionsStream"),
+        }
+    }
+
+    #[test]
+    fn test_parse_ai_response_fusillade_stream_header() {
+        // Request body has stream: false, but x-fusillade-stream header is set.
+        // Outlet captures the original body before onwards injects stream:true,
+        // so the header is the only signal that the response is SSE.
+        let request_json = r#"{"model": "gpt-4", "messages": [{"role": "user", "content": "hello"}], "stream": false}"#;
+        let mut headers = HashMap::new();
+        headers.insert(
+            "x-fusillade-stream".to_string(),
+            vec![Bytes::from("true")],
+        );
+        let request_data = RequestData {
+            correlation_id: 123,
+            timestamp: SystemTime::now(),
+            method: Method::POST,
+            uri: "/test".parse::<Uri>().unwrap(),
+            headers,
+            body: Some(Bytes::from(request_json)),
+            trace_id: None,
+            span_id: None,
+        };
+
+        let sse_response = "data: {\"id\":\"chatcmpl-123\",\"object\":\"chat.completion.chunk\",\"created\":1677652288,\"model\":\"gpt-4\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}],\"usage\":null}\n\ndata: {\"id\":\"chatcmpl-123\",\"object\":\"chat.completion.chunk\",\"created\":1677652288,\"model\":\"gpt-4\",\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\ndata: [DONE]\n\n";
+
+        let response_data = ResponseData {
+            correlation_id: 123,
+            timestamp: SystemTime::now(),
+            status: StatusCode::OK,
+            headers: HashMap::new(),
+            body: Some(Bytes::from(sse_response)),
+            duration: Duration::from_millis(100),
+            duration_to_first_byte: Duration::from_millis(50),
+        };
+
+        let result = parse_ai_response(&request_data, &response_data).unwrap();
+
+        match &result {
+            AiResponse::ChatCompletionsStream(chunks) => {
+                assert!(!chunks.is_empty(), "Expected parsed SSE chunks");
+                // Verify usage is extractable (this is what billing uses)
+                let metrics = UsageMetrics::extract(
+                    uuid::Uuid::nil(),
+                    &request_data,
+                    &response_data,
+                    &result,
+                    &crate::config::Config::default(),
+                );
+                assert_eq!(metrics.prompt_tokens, 10);
+                assert_eq!(metrics.completion_tokens, 5);
+                assert_eq!(metrics.total_tokens, 15);
+            }
+            other => panic!("Expected ChatCompletionsStream, got {:?}", std::mem::discriminant(other)),
+        }
+    }
+
+    #[test]
+    fn test_parse_ai_response_fusillade_completions_stream() {
+        let request_json = r#"{"model": "gpt-3.5-turbo-instruct", "prompt": "Hello", "stream": false}"#;
+        let mut headers = HashMap::new();
+        headers.insert(
+            "x-fusillade-stream".to_string(),
+            vec![Bytes::from("true")],
+        );
+        let request_data = RequestData {
+            correlation_id: 123,
+            timestamp: SystemTime::now(),
+            method: Method::POST,
+            uri: "/test".parse::<Uri>().unwrap(),
+            headers,
+            body: Some(Bytes::from(request_json)),
+            trace_id: None,
+            span_id: None,
+        };
+
+        let sse_response = "data: {\"id\":\"cmpl-123\",\"object\":\"text_completion\",\"created\":1677652288,\"model\":\"gpt-3.5-turbo-instruct\",\"choices\":[{\"text\":\" world\",\"index\":0}]}\n\ndata: {\"id\":\"cmpl-123\",\"object\":\"text_completion\",\"created\":1677652288,\"model\":\"gpt-3.5-turbo-instruct\",\"choices\":[],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":12,\"total_tokens\":20}}\n\ndata: [DONE]\n\n";
+
+        let response_data = ResponseData {
+            correlation_id: 123,
+            timestamp: SystemTime::now(),
+            status: StatusCode::OK,
+            headers: HashMap::new(),
+            body: Some(Bytes::from(sse_response)),
+            duration: Duration::from_millis(100),
+            duration_to_first_byte: Duration::from_millis(50),
+        };
+
+        let result = parse_ai_response(&request_data, &response_data).unwrap();
+
+        match &result {
+            AiResponse::CompletionsStream(chunks) => {
+                assert!(!chunks.is_empty(), "Expected parsed SSE chunks");
+                let metrics = UsageMetrics::extract(
+                    uuid::Uuid::nil(),
+                    &request_data,
+                    &response_data,
+                    &result,
+                    &crate::config::Config::default(),
+                );
+                assert_eq!(metrics.prompt_tokens, 8);
+                assert_eq!(metrics.completion_tokens, 12);
+                assert_eq!(metrics.total_tokens, 20);
+            }
+            other => panic!("Expected CompletionsStream, got {:?}", std::mem::discriminant(other)),
         }
     }
 
