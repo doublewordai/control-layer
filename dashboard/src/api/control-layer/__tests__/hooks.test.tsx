@@ -25,7 +25,6 @@ import {
   useAddFunds,
   useDeleteApiKey,
 } from "../hooks";
-import { queryKeys } from "../keys";
 
 // Setup MSW server
 const server = setupServer(...handlers);
@@ -464,7 +463,7 @@ describe("User Hooks", () => {
   });
 
   describe("API Key Mutations", () => {
-    it("should remove deleted API keys from cached list queries", async () => {
+    it("should invalidate the correct API key list prefix after deletion", async () => {
       const queryClient = new QueryClient({
         defaultOptions: { queries: { retry: false } },
       });
@@ -479,27 +478,6 @@ describe("User Hooks", () => {
 
       const userId = "current";
       const keyId = "key-1";
-      queryClient.setQueryData(queryKeys.apiKeys.query(userId, { skip: 0, limit: 10 }), {
-        data: [
-          {
-            id: keyId,
-            name: "Primary key",
-            description: "For production",
-            purpose: "realtime",
-            created_at: "2024-01-01T00:00:00Z",
-          },
-          {
-            id: "key-2",
-            name: "Backup key",
-            description: "For fallback traffic",
-            purpose: "realtime",
-            created_at: "2024-01-02T00:00:00Z",
-          },
-        ],
-        total_count: 2,
-        skip: 0,
-        limit: 10,
-      });
 
       const { result } = renderHook(() => useDeleteApiKey(), { wrapper });
 
@@ -509,25 +487,9 @@ describe("User Hooks", () => {
         expect(result.current.isSuccess).toBe(true);
       });
 
-      expect(
-        queryClient.getQueryData(queryKeys.apiKeys.query(userId, { skip: 0, limit: 10 })),
-      ).toEqual({
-        data: [
-          {
-            id: "key-2",
-            name: "Backup key",
-            description: "For fallback traffic",
-            purpose: "realtime",
-            created_at: "2024-01-02T00:00:00Z",
-          },
-        ],
-        total_count: 1,
-        skip: 0,
-        limit: 10,
-      });
-
       expect(invalidateQueriesSpy).toHaveBeenCalledWith({
         queryKey: ["apiKeys", "query", userId],
+        refetchType: "active",
       });
     });
   });

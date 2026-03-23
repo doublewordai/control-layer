@@ -46,8 +46,6 @@ import type {
   OrganizationUpdateRequest,
   InviteMemberRequest,
   OrgMemberRole,
-  PaginatedResponse,
-  ApiKey,
 } from "./types";
 
 // Config hooks
@@ -604,32 +602,12 @@ export function useDeleteApiKey() {
     onSuccess: (_, { keyId, userId = "current" }) => {
       const apiKeysQueryPrefix = ["apiKeys", "query", userId] as const;
 
-      queryClient.setQueriesData<PaginatedResponse<ApiKey>>(
-        {
-          queryKey: apiKeysQueryPrefix,
-        },
-        (existing) => {
-          if (!existing) {
-            return existing;
-          }
-
-          const nextData = existing.data.filter((apiKey) => apiKey.id !== keyId);
-          if (nextData.length === existing.data.length) {
-            return existing;
-          }
-
-          return {
-            ...existing,
-            data: nextData,
-            total_count: Math.max(0, existing.total_count - 1),
-          };
-        },
-      );
       queryClient.removeQueries({
         queryKey: queryKeys.apiKeys.byId(keyId, userId),
       });
       queryClient.invalidateQueries({
         queryKey: apiKeysQueryPrefix,
+        refetchType: "active",
       });
     },
   });
