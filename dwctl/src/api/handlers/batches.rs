@@ -441,12 +441,8 @@ pub async fn create_batch<P: PoolProvider>(
 
     tracing::debug!("Batch {} created successfully", batch.id);
 
-    crate::webhooks::emit::emit_platform_event(
-        state.db.write(),
-        crate::webhooks::WebhookEvent::batch_created(batch.id.0, current_user.id, &batch.endpoint),
-        crate::webhooks::WebhookEventType::BatchCreated,
-        Some(batch.id.0),
-    );
+    // batch.created webhook deliveries are created by the notification poller
+    // which polls fusillade.batches for new records.
 
     // For create, we have the current user's email directly
     Ok((

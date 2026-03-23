@@ -343,12 +343,8 @@ pub async fn create_user<P: PoolProvider>(
 
     tx.commit().await.map_err(|e| Error::Database(e.into()))?;
 
-    crate::webhooks::emit::emit_platform_event(
-        state.db.write(),
-        crate::webhooks::WebhookEvent::user_created(user.id, &user.email, &user.auth_source),
-        crate::webhooks::WebhookEventType::UserCreated,
-        Some(user.id),
-    );
+    // user.created webhook deliveries are created by the notification poller
+    // via PG LISTEN/NOTIFY on the users table.
 
     Ok((StatusCode::CREATED, Json(UserResponse::from(user))))
 }

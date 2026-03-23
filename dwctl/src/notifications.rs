@@ -1,14 +1,23 @@
-//! Batch completion poller.
+//! Notification poller and webhook event processor.
 //!
-//! Always runs to trigger lazy finalization of terminal batches (setting
-//! `completed_at` / `failed_at` timestamps via `poll_completed_batches`).
-//! When notifications are enabled (`config.enabled`), also:
-//! 1. Creates webhook delivery records for matching webhooks
-//! 2. Ticks the webhook dispatcher (claim → sign → send → process results)
-//! 3. Sends email notifications
+//! Centralizes all webhook delivery creation in a single place:
+//!
+//! **Polled events** (detected each tick via database queries):
+//! - `batch.completed` / `batch.failed`: Polls fusillade for terminal batches
+//! - `batch.created`: Polls fusillade for new batches without existing deliveries
+//!
+//! **Reactive events** (triggered via PostgreSQL LISTEN/NOTIFY):
+//! - `user.created`: PG trigger on `users` INSERT
+//! - `api_key.created`: PG trigger on `api_keys` INSERT
+//!
+//! The webhook dispatcher (claim → sign → send → process results) runs on
+//! each tick when `webhooks.enabled` is true. Email notifications are gated
+//! on `notifications.enabled` separately.
 //!
 //! Uses atomic `notification_sent_at` claiming to prevent duplicate
-//! notifications across replicas.
+//! notifications across replicas for batch completion events. Platform events
+//! use a unique partial index on `webhook_deliveries(webhook_id, event_type,
+//! resource_id)` for deduplication.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -18,6 +27,7 @@ use fusillade::manager::postgres::PostgresRequestManager;
 use metrics::counter;
 use rust_decimal::prelude::ToPrimitive;
 use sqlx::PgPool;
+use sqlx::postgres::PgListener;
 use sqlx_pool_router::DbPools;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -32,6 +42,9 @@ use crate::email::EmailService;
 use crate::payment_providers::{self, PaymentProvider};
 use crate::webhooks::WebhookDispatcher;
 use crate::webhooks::events::{WebhookEvent, WebhookEventType};
+
+/// PostgreSQL NOTIFY channel for webhook events (user.created, api_key.created).
+const WEBHOOK_EVENT_CHANNEL: &str = "webhook_event";
 
 /// Outcome of a completed batch for notification purposes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,7 +138,8 @@ pub async fn run_notification_poller(
     dwctl_pool: PgPool,
     shutdown: CancellationToken,
 ) {
-    let mut dispatcher = if config.enabled && config.webhooks.enabled {
+    // Webhook dispatcher runs independently of email notifications
+    let mut dispatcher = if config.webhooks.enabled {
         Some(WebhookDispatcher::spawn(dwctl_pool.clone(), &config.webhooks, shutdown.clone()))
     } else {
         None
@@ -149,24 +163,91 @@ pub async fn run_notification_poller(
         None
     };
 
+    // Set up PG listener for platform webhook events (user.created, api_key.created)
+    let mut listener = if dispatcher.is_some() {
+        match PgListener::connect_with(&dwctl_pool).await {
+            Ok(mut l) => match l.listen(WEBHOOK_EVENT_CHANNEL).await {
+                Ok(()) => {
+                    tracing::info!("Listening on PG channel '{WEBHOOK_EVENT_CHANNEL}' for platform webhook events");
+                    Some(l)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to subscribe to {WEBHOOK_EVENT_CHANNEL} channel");
+                    None
+                }
+            },
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to connect PG listener for webhook events");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Buffer for pending webhook event notifications received between ticks
+    let mut pending_webhook_events: Vec<(String, Uuid)> = Vec::new();
+
     tracing::info!(
         poll_interval = ?config.poll_interval,
         notifications = config.enabled,
         webhooks = dispatcher.is_some(),
         email = email_service.is_some(),
-        "Starting batch completion poller"
+        webhook_listener = listener.is_some(),
+        "Starting notification poller"
     );
 
     loop {
+        // Wait for either the poll interval or a webhook event notification
         tokio::select! {
             _ = tokio::time::sleep(config.poll_interval) => {}
+            result = async {
+                match listener.as_mut() {
+                    Some(l) => l.try_recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match result {
+                    Ok(Some(notification)) => {
+                        if let Some((table, id)) = parse_webhook_event_payload(notification.payload()) {
+                            pending_webhook_events.push((table, id));
+                        }
+                        // Drain any additional buffered notifications
+                        if let Some(ref mut l) = listener {
+                            while let Ok(Some(notification)) = l.try_recv().await {
+                                if let Some((table, id)) = parse_webhook_event_payload(notification.payload()) {
+                                    pending_webhook_events.push((table, id));
+                                }
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        tracing::warn!("Webhook event listener connection lost, will reconnect");
+                        listener = None;
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Webhook event listener error, will reconnect");
+                        listener = None;
+                    }
+                }
+            }
             _ = shutdown.cancelled() => {
-                tracing::info!("Batch completion poller shutting down");
+                tracing::info!("Notification poller shutting down");
                 return;
             }
         }
 
-        tracing::debug!("Completion poller tick");
+        // Reconnect listener if disconnected
+        if listener.is_none()
+            && dispatcher.is_some()
+            && let Ok(mut l) = PgListener::connect_with(&dwctl_pool).await
+            && l.listen(WEBHOOK_EVENT_CHANNEL).await.is_ok()
+        {
+            tracing::info!("Reconnected webhook event listener");
+            listener = Some(l);
+        }
+
+        tracing::debug!("Notification poller tick");
 
         let mut conn = match dwctl_pool.acquire().await {
             Ok(c) => c,
@@ -176,7 +257,15 @@ pub async fn run_notification_poller(
             }
         };
 
-        // === Step 1: Poll fusillade for completed batches ===
+        // === Step 1: Process platform webhook events (user.created, api_key.created) ===
+        if dispatcher.is_some() && !pending_webhook_events.is_empty() {
+            let events = std::mem::take(&mut pending_webhook_events);
+            let _ = process_platform_events(&mut conn, &events)
+                .await
+                .inspect_err(|e| tracing::warn!(error = %e, "Failed to process platform webhook events"));
+        }
+
+        // === Step 2: Poll fusillade for completed batches ===
         match request_manager.poll_completed_batches().await {
             Ok(batches) => {
                 if !batches.is_empty() {
@@ -184,14 +273,14 @@ pub async fn run_notification_poller(
 
                     let infos: Vec<_> = batches.iter().filter_map(BatchNotificationInfo::try_from_batch).collect();
 
-                    // === Step 2: Create webhook delivery records ===
+                    // === Step 3: Create webhook delivery records for batch completion ===
                     if dispatcher.is_some() {
                         let _ = create_batch_deliveries(&mut conn, &infos)
                             .await
                             .inspect_err(|e| tracing::warn!(error = %e, "Failed to create webhook delivery records"));
                     }
 
-                    // === Step 3: Send email notifications ===
+                    // === Step 4: Send email notifications ===
                     if let Some(ref email_service) = email_service {
                         send_email_notifications(email_service, &infos, &mut conn).await;
                     }
@@ -202,7 +291,14 @@ pub async fn run_notification_poller(
             }
         }
 
-        // === Step 4: Low-balance notifications ===
+        // === Step 5: Poll for new batches (batch.created) ===
+        if dispatcher.is_some() {
+            let _ = process_new_batches(&mut conn)
+                .await
+                .inspect_err(|e| tracing::warn!(error = %e, "Failed to process new batch webhooks"));
+        }
+
+        // === Step 6: Low-balance notifications ===
         if let Some(ref email_service) = email_service {
             // 1. Get users with thresholds
             let candidates = {
@@ -269,12 +365,12 @@ pub async fn run_notification_poller(
             }
         }
 
-        // === Step 5: Auto top-up charges ===
+        // === Step 7: Auto top-up charges ===
         if let Some(ref provider) = payment_provider {
             process_auto_topups(provider.as_ref(), &mut conn, email_service.as_ref()).await;
         }
 
-        // === Step 6: Dispatch webhooks (claim → sign → send → process results) ===
+        // === Step 8: Dispatch webhooks (claim → sign → send → process results) ===
         if let Some(ref mut dispatcher) = dispatcher {
             dispatcher.tick().await;
         }
@@ -334,6 +430,194 @@ async fn create_batch_deliveries(
                 batch_id = %info.batch_uuid,
                 "Webhook delivery record created"
             );
+        }
+    }
+
+    Ok(())
+}
+
+/// Parse a webhook event NOTIFY payload.
+///
+/// Expected format: `"table_name:record_uuid"`
+fn parse_webhook_event_payload(payload: &str) -> Option<(String, Uuid)> {
+    let (table, id_str) = payload.split_once(':')?;
+    let id = Uuid::parse_str(id_str).ok()?;
+    Some((table.to_string(), id))
+}
+
+/// Process platform webhook events received via LISTEN/NOTIFY.
+///
+/// For each (table, record_id) pair, queries the source table for record details,
+/// builds the webhook event payload, and creates delivery records for all eligible
+/// platform webhooks.
+async fn process_platform_events(conn: &mut sqlx::pool::PoolConnection<sqlx::Postgres>, events: &[(String, Uuid)]) -> anyhow::Result<()> {
+    let pm_webhooks = {
+        let mut repo = Webhooks::new(&mut *conn);
+        repo.get_enabled_platform_webhooks().await?
+    };
+
+    if pm_webhooks.is_empty() {
+        return Ok(());
+    }
+
+    for (table, id) in events {
+        let (event, event_type) = match table.as_str() {
+            "users" => {
+                let row = sqlx::query!(r#"SELECT id, email, auth_source FROM users WHERE id = $1"#, id,)
+                    .fetch_optional(&mut **conn)
+                    .await?;
+
+                let Some(row) = row else {
+                    tracing::debug!(user_id = %id, "User not found for webhook event, skipping");
+                    continue;
+                };
+
+                (
+                    WebhookEvent::user_created(row.id, &row.email, &row.auth_source),
+                    WebhookEventType::UserCreated,
+                )
+            }
+            "api_keys" => {
+                let row = sqlx::query!(r#"SELECT id, user_id, name FROM api_keys WHERE id = $1"#, id,)
+                    .fetch_optional(&mut **conn)
+                    .await?;
+
+                let Some(row) = row else {
+                    tracing::debug!(api_key_id = %id, "API key not found for webhook event, skipping");
+                    continue;
+                };
+
+                (
+                    WebhookEvent::api_key_created(row.id, row.user_id, &row.name),
+                    WebhookEventType::ApiKeyCreated,
+                )
+            }
+            _ => {
+                tracing::warn!(table = %table, "Unknown table in webhook event notification, skipping");
+                continue;
+            }
+        };
+
+        let payload = serde_json::to_value(&event)?;
+
+        let mut repo = Webhooks::new(&mut *conn);
+        for webhook in pm_webhooks.iter().filter(|w| w.accepts_event(event_type)) {
+            let delivery_request = WebhookDeliveryCreateDBRequest {
+                webhook_id: webhook.id,
+                event_id: Uuid::new_v4(),
+                event_type: event_type.to_string(),
+                payload: payload.clone(),
+                resource_id: Some(*id),
+                next_attempt_at: None,
+            };
+
+            let _ = repo.try_create_delivery(&delivery_request).await.inspect_err(|e| {
+                tracing::warn!(
+                    error = %e,
+                    webhook_id = %webhook.id,
+                    event_type = %event_type,
+                    "Failed to create platform webhook delivery"
+                );
+            });
+        }
+
+        tracing::debug!(
+            table = %table,
+            resource_id = %id,
+            event_type = %event_type,
+            webhooks = pm_webhooks.iter().filter(|w| w.accepts_event(event_type)).count(),
+            "Platform webhook event processed"
+        );
+    }
+
+    Ok(())
+}
+
+/// A new batch record from fusillade for webhook processing.
+struct NewBatch {
+    id: Uuid,
+    created_by: Option<String>,
+    endpoint: String,
+}
+
+/// Poll for newly created batches and create `batch.created` webhook deliveries.
+///
+/// Queries fusillade for recent batches that don't yet have a `batch.created`
+/// delivery record, then creates deliveries for all eligible platform webhooks.
+///
+/// Uses runtime-checked `sqlx::query()` because the fusillade schema is managed
+/// by an external crate and not available to sqlx's compile-time validation.
+async fn process_new_batches(conn: &mut sqlx::pool::PoolConnection<sqlx::Postgres>) -> anyhow::Result<()> {
+    // Find recent batches without a batch.created delivery
+    let rows = sqlx::query_as::<_, (Uuid, Option<String>, String)>(
+        r#"
+        SELECT b.id, b.created_by, b.endpoint
+        FROM fusillade.batches b
+        LEFT JOIN webhook_deliveries wd
+            ON wd.resource_id = b.id AND wd.event_type = 'batch.created'
+        WHERE wd.id IS NULL
+          AND b.created_at > now() - interval '5 minutes'
+          AND b.created_by IS NOT NULL
+        ORDER BY b.created_at
+        LIMIT 100
+        "#,
+    )
+    .fetch_all(&mut **conn)
+    .await?;
+
+    let new_batches: Vec<NewBatch> = rows
+        .into_iter()
+        .map(|(id, created_by, endpoint)| NewBatch { id, created_by, endpoint })
+        .collect();
+
+    if new_batches.is_empty() {
+        return Ok(());
+    }
+
+    tracing::info!(count = new_batches.len(), "Found new batches for webhook delivery");
+
+    let pm_webhooks = {
+        let mut repo = Webhooks::new(&mut *conn);
+        repo.get_enabled_platform_webhooks().await?
+    };
+
+    if pm_webhooks.is_empty() {
+        return Ok(());
+    }
+
+    let event_type = WebhookEventType::BatchCreated;
+
+    for batch in &new_batches {
+        let Some(ref created_by) = batch.created_by else {
+            continue;
+        };
+        let user_id: Uuid = match created_by.parse() {
+            Ok(id) => id,
+            Err(_) => continue,
+        };
+
+        let event = WebhookEvent::batch_created(batch.id, user_id, &batch.endpoint);
+        let payload = serde_json::to_value(&event)?;
+
+        let mut repo = Webhooks::new(&mut *conn);
+        for webhook in pm_webhooks.iter().filter(|w| w.accepts_event(event_type)) {
+            let delivery_request = WebhookDeliveryCreateDBRequest {
+                webhook_id: webhook.id,
+                event_id: Uuid::new_v4(),
+                event_type: event_type.to_string(),
+                payload: payload.clone(),
+                resource_id: Some(batch.id),
+                next_attempt_at: None,
+            };
+
+            let _ = repo.try_create_delivery(&delivery_request).await.inspect_err(|e| {
+                tracing::warn!(
+                    error = %e,
+                    webhook_id = %webhook.id,
+                    batch_id = %batch.id,
+                    "Failed to create batch.created webhook delivery"
+                );
+            });
         }
     }
 

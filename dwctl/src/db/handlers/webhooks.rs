@@ -284,6 +284,35 @@ impl<'c> Webhooks<'c> {
         Ok(delivery)
     }
 
+    /// Create a delivery record, skipping silently if a delivery already exists
+    /// for the same (webhook_id, event_type, resource_id) combination.
+    ///
+    /// Used by the notification poller for platform events where the LISTEN/NOTIFY
+    /// trigger may fire multiple times (e.g., during leadership transitions).
+    #[instrument(skip(self, request), fields(webhook_id = %abbrev_uuid(&request.webhook_id)), err)]
+    pub async fn try_create_delivery(&mut self, request: &WebhookDeliveryCreateDBRequest) -> Result<Option<WebhookDelivery>> {
+        let delivery = sqlx::query_as!(
+            WebhookDelivery,
+            r#"
+            INSERT INTO webhook_deliveries (webhook_id, event_id, event_type, payload, resource_id, next_attempt_at)
+            VALUES ($1, $2, $3, $4, $5, COALESCE($6, now()))
+            ON CONFLICT (webhook_id, event_type, resource_id) WHERE resource_id IS NOT NULL
+            DO NOTHING
+            RETURNING *
+            "#,
+            request.webhook_id,
+            request.event_id,
+            request.event_type,
+            request.payload,
+            request.resource_id,
+            request.next_attempt_at,
+        )
+        .fetch_optional(&mut *self.db)
+        .await?;
+
+        Ok(delivery)
+    }
+
     /// Atomically claim retriable deliveries for processing.
     ///
     /// Uses SELECT ... FOR UPDATE SKIP LOCKED to prevent multi-replica races.
