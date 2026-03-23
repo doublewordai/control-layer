@@ -1078,6 +1078,7 @@ pub async fn refresh_user_model_usage(pool: &PgPool) -> Result<()> {
         FROM http_analytics
         WHERE id > $1 AND id <= $2
               AND user_id IS NOT NULL AND model IS NOT NULL
+              AND status_code BETWEEN 200 AND 299
         GROUP BY user_id, model
         ON CONFLICT (user_id, model)
         DO UPDATE SET
@@ -1183,6 +1184,7 @@ pub async fn get_user_model_breakdown_for_range(
         FROM http_analytics
         WHERE user_id = $1
           AND timestamp >= $2 AND timestamp <= $3
+          AND status_code BETWEEN 200 AND 299
         GROUP BY model
         ORDER BY request_count DESC
         "#,
@@ -1217,6 +1219,7 @@ pub async fn get_user_batch_count_for_range(pool: &PgPool, user_id: Uuid, start:
         WHERE user_id = $1
           AND timestamp >= $2 AND timestamp <= $3
           AND fusillade_batch_id IS NOT NULL
+          AND status_code BETWEEN 200 AND 299
         "#,
         user_id,
         start,
