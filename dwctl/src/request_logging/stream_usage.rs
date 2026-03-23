@@ -26,17 +26,6 @@ pub fn stream_usage_transform(path: &str, headers: &axum::http::HeaderMap, body_
             return Some(axum::body::Bytes::from(bytes));
         }
     }
-    if path.ends_with("/responses")
-        && fusillade_stream
-        && let Ok(mut json_body) = serde_json::from_slice::<serde_json::Value>(body_bytes)
-        && let Some(obj) = json_body.as_object_mut()
-    {
-        obj.insert("stream".to_string(), serde_json::Value::Bool(true));
-
-        if let Ok(bytes) = serde_json::to_vec(&json_body) {
-            return Some(axum::body::Bytes::from(bytes));
-        }
-    }
 
     None
 }
