@@ -117,8 +117,7 @@ const PLATFORM_EVENT_TYPE_OPTIONS = [
   "data": {
     "user_id": "usr_abc123",
     "email": "jane@example.com",
-    "auth_source": "native",
-    "created_at": "2025-01-15T10:30:00Z"
+    "auth_source": "native"
   }
 }`,
   },
@@ -131,8 +130,7 @@ const PLATFORM_EVENT_TYPE_OPTIONS = [
   "data": {
     "batch_id": "batch_abc123",
     "user_id": "usr_abc123",
-    "endpoint": "/v1/chat/completions",
-    "created_at": "2025-01-15T10:30:00Z"
+    "endpoint": "/v1/chat/completions"
   }
 }`,
   },
@@ -145,8 +143,8 @@ const PLATFORM_EVENT_TYPE_OPTIONS = [
   "data": {
     "api_key_id": "key_abc123",
     "user_id": "usr_abc123",
-    "name": "My API Key",
-    "created_at": "2025-01-15T10:30:00Z"
+    "created_by": "usr_def456",
+    "name": "My API Key"
   }
 }`,
   },

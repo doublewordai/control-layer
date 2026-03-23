@@ -478,7 +478,7 @@ async fn process_platform_events(conn: &mut sqlx::pool::PoolConnection<sqlx::Pos
                 )
             }
             "api_keys" => {
-                let row = sqlx::query!(r#"SELECT id, user_id, name FROM api_keys WHERE id = $1"#, id,)
+                let row = sqlx::query!(r#"SELECT id, user_id, created_by, name FROM api_keys WHERE id = $1"#, id,)
                     .fetch_optional(&mut **conn)
                     .await?;
 
@@ -488,7 +488,7 @@ async fn process_platform_events(conn: &mut sqlx::pool::PoolConnection<sqlx::Pos
                 };
 
                 (
-                    WebhookEvent::api_key_created(row.id, row.user_id, &row.name),
+                    WebhookEvent::api_key_created(row.id, row.user_id, row.created_by, &row.name),
                     WebhookEventType::ApiKeyCreated,
                 )
             }

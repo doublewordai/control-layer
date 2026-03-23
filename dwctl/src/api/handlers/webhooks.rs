@@ -367,7 +367,7 @@ pub async fn update_webhook<P: PoolProvider>(
         for event_type in event_types {
             if event_type.parse::<WebhookEventType>().is_err() {
                 return Err(Error::BadRequest {
-                    message: format!("Invalid event type: {}. Valid types are: batch.completed, batch.failed", event_type),
+                    message: format!("Invalid event type: {}. Valid types are: batch.completed, batch.failed, user.created, batch.created, api_key.created", event_type),
                 });
             }
         }

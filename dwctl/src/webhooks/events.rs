@@ -168,13 +168,16 @@ impl WebhookEvent {
     }
 
     /// Create a webhook event for a new API key creation.
-    pub fn api_key_created(key_id: Uuid, user_id: UserId, name: &str) -> Self {
+    ///
+    /// `user_id` is the key owner (may be an org), `created_by` is the human who created it.
+    pub fn api_key_created(key_id: Uuid, user_id: UserId, created_by: UserId, name: &str) -> Self {
         Self {
             event_type: WebhookEventType::ApiKeyCreated.to_string(),
             timestamp: Utc::now(),
             data: serde_json::json!({
                 "api_key_id": key_id,
                 "user_id": user_id,
+                "created_by": created_by,
                 "name": name,
             }),
         }
@@ -245,5 +248,72 @@ mod tests {
         assert!(json.contains("user.created"));
         assert!(json.contains("test@example.com"));
         assert!(json.contains("native"));
+    }
+
+    #[test]
+    fn test_batch_created_event() {
+        let batch_id = Uuid::nil();
+        let user_id = Uuid::nil();
+        let event = WebhookEvent::batch_created(batch_id, user_id, "/v1/chat/completions");
+
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("batch.created"));
+        assert!(json.contains("batch_00000000-0000-0000-0000-000000000000"));
+        assert!(json.contains("/v1/chat/completions"));
+
+        let data = &event.data;
+        assert_eq!(data["endpoint"], "/v1/chat/completions");
+    }
+
+    #[test]
+    fn test_api_key_created_event() {
+        let key_id = Uuid::nil();
+        let user_id = Uuid::nil();
+        let created_by = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+        let event = WebhookEvent::api_key_created(key_id, user_id, created_by, "My Test Key");
+
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("api_key.created"));
+        assert!(json.contains("My Test Key"));
+
+        let data = &event.data;
+        assert_eq!(data["name"], "My Test Key");
+        assert_eq!(data["user_id"], user_id.to_string());
+        assert_eq!(data["created_by"], created_by.to_string());
+    }
+
+    #[test]
+    fn test_batch_failed_event() {
+        let info = BatchNotificationInfo {
+            batch_id: "batch_00000000-0000-0000-0000-000000000000".to_string(),
+            batch_uuid: Uuid::nil(),
+            user_id: Uuid::nil(),
+            endpoint: "test".to_string(),
+            model: "test-model".to_string(),
+            outcome: crate::notifications::BatchOutcome::Failed,
+            created_at: Utc::now(),
+            finished_at: Some(Utc::now()),
+            total_requests: 50,
+            completed_requests: 0,
+            failed_requests: 50,
+            cancelled_requests: 0,
+            completion_window: "24h".to_string(),
+            filename: None,
+            description: None,
+            output_file_id: None,
+            error_file_id: Some(Uuid::nil()),
+        };
+
+        let event = WebhookEvent::batch_terminal(WebhookEventType::BatchFailed, &info);
+
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("batch.failed"));
+        assert!(json.contains("\"status\":\"failed\""));
+
+        let data = &event.data;
+        assert_eq!(data["request_counts"]["total"], 50);
+        assert_eq!(data["request_counts"]["failed"], 50);
+        assert!(data["output_file_id"].is_null());
+        assert!(!data["error_file_id"].is_null());
     }
 }
