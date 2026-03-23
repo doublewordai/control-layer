@@ -202,6 +202,13 @@ pub fn create_test_config() -> crate::config::Config {
                 ..Default::default()
             },
             leader_election: LeaderElectionConfig { enabled: false },
+            notifications: crate::config::NotificationsConfig {
+                webhooks: crate::config::WebhookConfig {
+                    enabled: false,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
             ..Default::default()
         },
         email: crate::config::EmailConfig {
