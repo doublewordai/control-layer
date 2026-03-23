@@ -23,7 +23,9 @@ import {
   useAddModelToGroup,
   useTransactions,
   useAddFunds,
+  useDeleteApiKey,
 } from "../hooks";
+import { queryKeys } from "../keys";
 
 // Setup MSW server
 const server = setupServer(...handlers);
@@ -458,6 +460,75 @@ describe("User Hooks", () => {
         queryKey: ["models"],
       });
       expect(invalidateQueriesSpy).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  describe("API Key Mutations", () => {
+    it("should remove deleted API keys from cached list queries", async () => {
+      const queryClient = new QueryClient({
+        defaultOptions: { queries: { retry: false } },
+      });
+
+      const invalidateQueriesSpy = vi.spyOn(queryClient, "invalidateQueries");
+
+      const wrapper = ({ children }: { children: ReactNode }) => (
+        <QueryClientProvider client={queryClient}>
+          {children}
+        </QueryClientProvider>
+      );
+
+      const userId = "current";
+      const keyId = "key-1";
+      queryClient.setQueryData(queryKeys.apiKeys.query(userId, { skip: 0, limit: 10 }), {
+        data: [
+          {
+            id: keyId,
+            name: "Primary key",
+            description: "For production",
+            purpose: "realtime",
+            created_at: "2024-01-01T00:00:00Z",
+          },
+          {
+            id: "key-2",
+            name: "Backup key",
+            description: "For fallback traffic",
+            purpose: "realtime",
+            created_at: "2024-01-02T00:00:00Z",
+          },
+        ],
+        total_count: 2,
+        skip: 0,
+        limit: 10,
+      });
+
+      const { result } = renderHook(() => useDeleteApiKey(), { wrapper });
+
+      result.current.mutate({ keyId, userId });
+
+      await waitFor(() => {
+        expect(result.current.isSuccess).toBe(true);
+      });
+
+      expect(
+        queryClient.getQueryData(queryKeys.apiKeys.query(userId, { skip: 0, limit: 10 })),
+      ).toEqual({
+        data: [
+          {
+            id: "key-2",
+            name: "Backup key",
+            description: "For fallback traffic",
+            purpose: "realtime",
+            created_at: "2024-01-02T00:00:00Z",
+          },
+        ],
+        total_count: 1,
+        skip: 0,
+        limit: 10,
+      });
+
+      expect(invalidateQueriesSpy).toHaveBeenCalledWith({
+        queryKey: ["apiKeys", "query", userId],
+      });
     });
   });
 });
