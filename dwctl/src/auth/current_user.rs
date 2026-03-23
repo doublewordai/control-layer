@@ -246,15 +246,13 @@ async fn try_proxy_header_auth<P: sqlx_pool_router::PoolProvider + Clone + Send 
     }
 
     // Emit platform event for newly created users
-    if is_new_user {
-        if let Some((ref user, _)) = user_result {
-            crate::webhooks::emit::emit_platform_event(
-                state.db.write(),
-                crate::webhooks::WebhookEvent::user_created(user.id, &user.email, "proxy-header"),
-                crate::webhooks::WebhookEventType::UserCreated,
-                Some(user.id),
-            );
-        }
+    if is_new_user && let Some((ref user, _)) = user_result {
+        crate::webhooks::emit::emit_platform_event(
+            state.db.write(),
+            crate::webhooks::WebhookEvent::user_created(user.id, &user.email, "proxy-header"),
+            crate::webhooks::WebhookEventType::UserCreated,
+            Some(user.id),
+        );
     }
 
     // Create sample files after commit so the user and API keys are persisted
