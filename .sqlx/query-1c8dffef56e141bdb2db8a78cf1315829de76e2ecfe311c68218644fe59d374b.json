@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, user_id, name FROM api_keys WHERE id = $1",
+  "query": "SELECT id, user_id, created_by, name FROM api_keys WHERE id = $1",
   "describe": {
     "columns": [
       {
@@ -15,6 +15,11 @@
       },
       {
         "ordinal": 2,
+        "name": "created_by",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
         "name": "name",
         "type_info": "Varchar"
       }
@@ -27,8 +32,9 @@
     "nullable": [
       false,
       false,
+      false,
       false
     ]
   },
-  "hash": "21676c2bb25e00e061f315aae94ba5ca8fe5ca13fd41c8d633f439ff2ce11143"
+  "hash": "1c8dffef56e141bdb2db8a78cf1315829de76e2ecfe311c68218644fe59d374b"
 }
