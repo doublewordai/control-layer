@@ -280,7 +280,9 @@ pub fn parse_ai_response(request_data: &RequestData, response_data: &ResponseDat
                 }
             } else {
                 match parsed_request.request {
-                    AiRequest::ChatCompletions(chat_req) if chat_req.stream.unwrap_or(false) || fusillade_stream => utils::parse_streaming_response(&body_str),
+                    AiRequest::ChatCompletions(chat_req) if chat_req.stream.unwrap_or(false) || fusillade_stream => {
+                        utils::parse_streaming_response(&body_str)
+                    }
                     AiRequest::Completions(completion_req) if completion_req.stream.unwrap_or(false) || fusillade_stream => {
                         utils::parse_completions_streaming_response(&body_str)
                     }
@@ -915,10 +917,7 @@ mod tests {
         // so the header is the only signal that the response is SSE.
         let request_json = r#"{"model": "gpt-4", "messages": [{"role": "user", "content": "hello"}], "stream": false}"#;
         let mut headers = HashMap::new();
-        headers.insert(
-            "x-fusillade-stream".to_string(),
-            vec![Bytes::from("true")],
-        );
+        headers.insert("x-fusillade-stream".to_string(), vec![Bytes::from("true")]);
         let request_data = RequestData {
             correlation_id: 123,
             timestamp: SystemTime::now(),
@@ -967,10 +966,7 @@ mod tests {
     fn test_parse_ai_response_fusillade_completions_stream() {
         let request_json = r#"{"model": "gpt-3.5-turbo-instruct", "prompt": "Hello", "stream": false}"#;
         let mut headers = HashMap::new();
-        headers.insert(
-            "x-fusillade-stream".to_string(),
-            vec![Bytes::from("true")],
-        );
+        headers.insert("x-fusillade-stream".to_string(), vec![Bytes::from("true")]);
         let request_data = RequestData {
             correlation_id: 123,
             timestamp: SystemTime::now(),

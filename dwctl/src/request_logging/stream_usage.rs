@@ -169,5 +169,4 @@ mod tests {
         });
         assert!(call_with_headers("/embeddings", &fusillade_stream_headers(), &body).is_none());
     }
-
 }
