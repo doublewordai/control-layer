@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.27.1](https://github.com/doublewordai/control-layer/compare/v8.27.0...v8.27.1) (2026-03-20)
+
+
+### Bug Fixes
+
+* show realtime data in usage reports ([#904](https://github.com/doublewordai/control-layer/issues/904)) ([56f3ae9](https://github.com/doublewordai/control-layer/commit/56f3ae9f48099fd6f1545d401c548dc818f2fc8e))
+
 ## [8.27.0](https://github.com/doublewordai/control-layer/compare/v8.26.0...v8.27.0) (2026-03-19)
 
 
