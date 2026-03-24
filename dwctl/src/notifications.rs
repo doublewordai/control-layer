@@ -21,6 +21,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use fusillade::manager::postgres::PostgresRequestManager;
@@ -212,9 +213,10 @@ pub async fn run_notification_poller(
                         if let Some((table, id)) = parse_webhook_event_payload(notification.payload()) {
                             pending_webhook_events.push((table, id));
                         }
-                        // Drain any additional buffered notifications
+                        // Drain any additional buffered notifications (with timeout
+                        // since try_recv blocks when buffer is empty, not returns None)
                         if let Some(ref mut l) = listener {
-                            while let Ok(Some(notification)) = l.try_recv().await {
+                            while let Ok(Ok(Some(notification))) = tokio::time::timeout(Duration::from_millis(10), l.try_recv()).await {
                                 if let Some((table, id)) = parse_webhook_event_payload(notification.payload()) {
                                     pending_webhook_events.push((table, id));
                                 }
