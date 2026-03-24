@@ -25,7 +25,55 @@ interface ColumnActions {
   onTriggerBatch: (file: FileObject) => void;
   onViewBatches: (file: FileObject) => void;
   isFileInProgress: (file: FileObject) => boolean;
+  /** Show the User column (PlatformManagers or org context) */
+  showUserColumn?: boolean;
+  /** Show the Context column (personal vs org name) */
+  showContextColumn?: boolean;
 }
+
+const userColumn: ColumnDef<FileObject> = {
+  id: "user",
+  header: "User",
+  cell: ({ row }) => {
+    const file = row.original;
+    const email = file.created_by_email;
+    if (!email) {
+      return <span className="text-gray-400">-</span>;
+    }
+    return (
+      <Tooltip delayDuration={300}>
+        <TooltipTrigger asChild>
+          <span className="text-sm text-gray-700 truncate max-w-[120px] block cursor-default">
+            {email}
+          </span>
+        </TooltipTrigger>
+        <TooltipContent>{email}</TooltipContent>
+      </Tooltip>
+    );
+  },
+};
+
+const contextColumn: ColumnDef<FileObject> = {
+  id: "context",
+  header: "Context",
+  cell: ({ row }) => {
+    const file = row.original;
+    const { context_name, context_type } = file;
+    if (!context_name) {
+      return <span className="text-gray-400">-</span>;
+    }
+    const isOrg = context_type === "organization";
+    return (
+      <span
+        className={`text-sm truncate max-w-[120px] block ${
+          isOrg ? "text-blue-700 font-medium" : "text-gray-500"
+        }`}
+      >
+        {context_name}
+      </span>
+    );
+  },
+};
 
 export const createFileColumns = (
   actions: ColumnActions,
@@ -52,6 +100,8 @@ export const createFileColumns = (
       );
     },
   },
+  ...(actions.showUserColumn ? [userColumn] : []),
+  ...(actions.showContextColumn ? [contextColumn] : []),
   {
     accessorKey: "id",
     header: "File ID",

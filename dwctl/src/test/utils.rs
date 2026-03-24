@@ -36,7 +36,7 @@ pub async fn create_test_app_state_with_config(pool: PgPool, config: crate::conf
         .await
         .expect("Failed to create fusillade TestDbPools");
 
-    let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(fusillade_pools));
+    let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(fusillade_pools, Default::default()));
     let limiters = crate::limits::Limiters::new(&config.limits);
 
     crate::AppState::builder()
@@ -74,7 +74,7 @@ pub async fn create_test_app_state_with_fusillade(pool: PgPool, config: crate::c
     let fusillade_test_pools = TestDbPools::new(fusillade_pool)
         .await
         .expect("Failed to create fusillade TestDbPools");
-    let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(fusillade_test_pools));
+    let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(fusillade_test_pools, Default::default()));
     let limiters = crate::limits::Limiters::new(&config.limits);
 
     crate::AppState::builder()
@@ -202,6 +202,13 @@ pub fn create_test_config() -> crate::config::Config {
                 ..Default::default()
             },
             leader_election: LeaderElectionConfig { enabled: false },
+            notifications: crate::config::NotificationsConfig {
+                webhooks: crate::config::WebhookConfig {
+                    enabled: false,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
             ..Default::default()
         },
         email: crate::config::EmailConfig {
@@ -220,6 +227,7 @@ pub fn create_test_config() -> crate::config::Config {
         },
         onwards: crate::config::OnwardsConfig::default(),
         onboarding_url: None,
+        support_email: "support@test.com".to_string(),
     }
 }
 
@@ -394,6 +402,7 @@ pub async fn create_test_api_key_for_user(pool: &PgPool, user_id: UserId) -> Api
             purpose: ApiKeyPurpose::Realtime,
             requests_per_second: None,
             burst_size: None,
+            member_id: None,
         },
     );
 
@@ -514,13 +523,19 @@ pub async fn create_test_org(pool: &PgPool, created_by: UserId) -> UserResponse 
     let mut conn = pool.acquire().await.expect("Failed to acquire connection");
     let mut orgs = Organizations::new(&mut conn);
     let org = orgs
-        .create(&OrganizationCreateDBRequest {
-            name: org_name.clone(),
-            email: format!("{org_name}@example.com"),
-            display_name: Some("Test Organization".to_string()),
-            avatar_url: None,
-            created_by,
-        })
+        .create(
+            &OrganizationCreateDBRequest {
+                name: org_name.clone(),
+                email: format!("{org_name}@example.com"),
+                display_name: Some("Test Organization".to_string()),
+                avatar_url: None,
+                created_by,
+            },
+            &[
+                crate::api::models::users::Role::StandardUser,
+                crate::api::models::users::Role::BatchAPIUser,
+            ],
+        )
         .await
         .expect("Failed to create test organization");
     UserResponse {

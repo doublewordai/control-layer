@@ -171,6 +171,7 @@ impl RequestHandler for AnalyticsHandler {
                 batch_completion_window,
                 batch_created_at,
                 batch_request_source,
+                trace_id: request_data.trace_id.clone(),
             };
 
             // Send to batcher (non-blocking, just puts in channel)

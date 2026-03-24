@@ -159,7 +159,7 @@ async fn try_proxy_header_auth<P: sqlx_pool_router::PoolProvider + Clone + Send 
         Err(e) => return Some(Err(DbError::from(e).into())),
     };
     let mut user_repo = Users::new(&mut tx);
-    let mut should_create_sample_files = false;
+    let mut is_new_user = false;
 
     // Get or create user with group sync (only if auto_create is enabled)
     let user_result = if config.auth.proxy_header.auto_create_users {
@@ -170,7 +170,7 @@ async fn try_proxy_header_auth<P: sqlx_pool_router::PoolProvider + Clone + Send 
             Ok((user, was_created)) => {
                 // Grant initial credits for newly created users
                 if was_created {
-                    should_create_sample_files = true;
+                    is_new_user = true;
                     let initial_credits = config.credits.initial_credits_for_standard_users;
                     if initial_credits > rust_decimal::Decimal::ZERO && user.roles.contains(&Role::StandardUser) {
                         use crate::db::handlers::credits::Credits;
@@ -245,8 +245,11 @@ async fn try_proxy_header_auth<P: sqlx_pool_router::PoolProvider + Clone + Send 
         Err(e) => return Some(Err(DbError::from(e).into())),
     }
 
+    // user.created webhook deliveries are created by the notification poller
+    // via PG LISTEN/NOTIFY on the users table.
+
     // Create sample files after commit so the user and API keys are persisted
-    if should_create_sample_files
+    if is_new_user
         && config.sample_files.enabled
         && config.batches.enabled
         && let Some((ref user, _)) = user_result
@@ -296,11 +299,15 @@ async fn try_api_key_auth(parts: &axum::http::request::Parts, db: &PgPool) -> Op
         Ok(conn) => conn,
         Err(e) => return Some(Err(DbError::from(e).into())),
     };
+    // Join on created_by so CurrentUser always represents the actual human.
+    // user_id may be an org (for org-scoped keys) — we only use it for active_organization.
     let api_key_result = match sqlx::query!(
         r#"
-        SELECT ak.user_id, ak.purpose, u.username, u.email, u.is_admin, u.display_name, u.avatar_url, u.payment_provider_id, u.last_login
+        SELECT ak.user_id, ak.created_by, ak.purpose,
+               u.username, u.email, u.is_admin, u.display_name, u.avatar_url,
+               u.payment_provider_id, u.last_login
         FROM api_keys ak
-        INNER JOIN users u ON ak.user_id = u.id
+        INNER JOIN users u ON ak.created_by = u.id
         WHERE ak.secret = $1 AND ak.is_deleted = false
         "#,
         api_key
@@ -351,14 +358,14 @@ async fn try_api_key_auth(parts: &axum::http::request::Parts, db: &PgPool) -> Op
         }));
     }
 
-    // Get user roles
+    // Get the creator's roles (not the org's)
     let roles = match sqlx::query_scalar!(
         r#"
         SELECT role as "role!: Role"
         FROM user_roles
         WHERE user_id = $1
         "#,
-        api_key_data.user_id
+        api_key_data.created_by
     )
     .fetch_all(&mut *conn)
     .await
@@ -367,9 +374,17 @@ async fn try_api_key_auth(parts: &axum::http::request::Parts, db: &PgPool) -> Op
         Err(e) => return Some(Err(DbError::from(e).into())),
     };
 
+    // For org-scoped keys (created_by != user_id), user_id is the org.
+    // For personal keys, created_by == user_id so no org context.
+    let active_organization = if api_key_data.created_by != api_key_data.user_id {
+        Some(api_key_data.user_id)
+    } else {
+        None
+    };
+
     Some(Ok((
         CurrentUser {
-            id: api_key_data.user_id,
+            id: api_key_data.created_by,
             username: api_key_data.username,
             email: api_key_data.email,
             is_admin: api_key_data.is_admin,
@@ -378,7 +393,7 @@ async fn try_api_key_auth(parts: &axum::http::request::Parts, db: &PgPool) -> Op
             avatar_url: api_key_data.avatar_url,
             payment_provider_id: api_key_data.payment_provider_id,
             organizations: vec![],
-            active_organization: None,
+            active_organization,
         },
         api_key_data.last_login,
     )))
@@ -500,11 +515,11 @@ async fn populate_org_context(user: &mut CurrentUser, parts: &Parts, db: &PgPool
     }
 }
 
-/// Spawn a background task to update `last_login` if it is null or older than 1 hour.
+/// Spawn a background task to update `last_login` if it is null or older than 5 minutes.
 fn maybe_update_last_login(user_id: crate::types::UserId, last_login: Option<DateTime<Utc>>, db: &PgPool) {
     let should_update = match last_login {
         None => true,
-        Some(ts) => Utc::now() - ts > chrono::Duration::hours(1),
+        Some(ts) => Utc::now() - ts > chrono::Duration::minutes(5),
     };
     if should_update {
         let pool = db.clone();
@@ -1438,13 +1453,19 @@ mod tests {
         let mut conn = pool.acquire().await.unwrap();
         let mut orgs = Organizations::new(&mut conn);
         let org = orgs
-            .create(&OrganizationCreateDBRequest {
-                name: "test-org-header".to_string(),
-                email: "org@example.com".to_string(),
-                display_name: Some("Test Org".to_string()),
-                avatar_url: None,
-                created_by: test_user.id,
-            })
+            .create(
+                &OrganizationCreateDBRequest {
+                    name: "test-org-header".to_string(),
+                    email: "org@example.com".to_string(),
+                    display_name: Some("Test Org".to_string()),
+                    avatar_url: None,
+                    created_by: test_user.id,
+                },
+                &[
+                    crate::api::models::users::Role::StandardUser,
+                    crate::api::models::users::Role::BatchAPIUser,
+                ],
+            )
             .await
             .unwrap();
         drop(conn);
@@ -1509,13 +1530,19 @@ mod tests {
         // Create an org (user is a member)
         let mut conn = pool.acquire().await.unwrap();
         let mut orgs = Organizations::new(&mut conn);
-        orgs.create(&OrganizationCreateDBRequest {
-            name: "test-org-no-header".to_string(),
-            email: "org@example.com".to_string(),
-            display_name: None,
-            avatar_url: None,
-            created_by: test_user.id,
-        })
+        orgs.create(
+            &OrganizationCreateDBRequest {
+                name: "test-org-no-header".to_string(),
+                email: "org@example.com".to_string(),
+                display_name: None,
+                avatar_url: None,
+                created_by: test_user.id,
+            },
+            &[
+                crate::api::models::users::Role::StandardUser,
+                crate::api::models::users::Role::BatchAPIUser,
+            ],
+        )
         .await
         .unwrap();
         drop(conn);
@@ -1563,5 +1590,84 @@ mod tests {
         let current_user = result.unwrap();
         // Should silently ignore the malformed header
         assert_eq!(current_user.active_organization, None);
+    }
+
+    #[sqlx::test]
+    async fn test_last_login_updated_on_first_auth(pool: PgPool) {
+        let mut config = create_test_config();
+        config.auth.proxy_header.enabled = true;
+        config.auth.proxy_header.auto_create_users = true;
+
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
+
+        let email = "new-last-login@example.com";
+        let external_id = "auth0|lastlogin123";
+
+        // First auth creates the user — last_login should be null initially
+        let mut parts = create_test_parts_with_auth(external_id, email);
+        let user = CurrentUser::from_request_parts(&mut parts, &state).await.unwrap();
+
+        // Verify last_login was null at creation
+        let row = sqlx::query!("SELECT last_login, created_at FROM users WHERE id = $1", user.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(
+            row.last_login.is_none() || {
+                // Background task may have already completed — if so, it should
+                // be within a few seconds of created_at
+                let ll = row.last_login.unwrap();
+                (ll - row.created_at).num_seconds().abs() < 10
+            },
+            "On first auth, last_login should be null or just set by background task"
+        );
+
+        // Poll until the background task updates last_login
+        let mut last_login = None;
+        for _ in 0..50 {
+            let row = sqlx::query!("SELECT last_login FROM users WHERE id = $1", user.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            if row.last_login.is_some() {
+                last_login = row.last_login;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(last_login.is_some(), "Background task should have set last_login");
+    }
+
+    #[sqlx::test]
+    async fn test_last_login_not_updated_when_recent(pool: PgPool) {
+        let mut config = create_test_config();
+        config.auth.proxy_header.enabled = true;
+
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
+
+        let test_user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+        let external_user_id = test_user.external_user_id.as_ref().unwrap();
+
+        // Set last_login to 1 minute ago (within the 5-minute threshold)
+        let recent = chrono::Utc::now() - chrono::Duration::minutes(1);
+        sqlx::query!("UPDATE users SET last_login = $1 WHERE id = $2", recent, test_user.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // Authenticate — should NOT update last_login since it's recent
+        let mut parts = create_test_parts_with_auth(external_user_id, &test_user.email);
+        let _ = CurrentUser::from_request_parts(&mut parts, &state).await.unwrap();
+
+        // Give the background task a chance to run (it shouldn't)
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let row = sqlx::query!("SELECT last_login FROM users WHERE id = $1", test_user.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let actual = row.last_login.unwrap();
+        let diff = (actual - recent).num_seconds().abs();
+        assert!(diff < 2, "last_login should not have been updated (diff: {diff}s)");
     }
 }

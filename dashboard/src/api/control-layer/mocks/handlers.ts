@@ -1032,6 +1032,7 @@ export const handlers = [
       url: string;
       event_types?: string[];
       description?: string;
+      scope?: string;
     };
     const now = new Date().toISOString();
     return HttpResponse.json(
@@ -1042,6 +1043,7 @@ export const handlers = [
         enabled: true,
         event_types: body.event_types || null,
         description: body.description || null,
+        scope: body.scope || "own",
         created_at: now,
         updated_at: now,
         disabled_at: null,
@@ -1062,6 +1064,7 @@ export const handlers = [
         enabled: body.enabled !== undefined ? body.enabled : true,
         event_types: body.event_types !== undefined ? body.event_types : null,
         description: body.description !== undefined ? body.description : null,
+        scope: "own",
         created_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
         disabled_at: null,
@@ -1083,6 +1086,7 @@ export const handlers = [
         enabled: true,
         event_types: null,
         description: null,
+        scope: "own",
         created_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
         disabled_at: null,
@@ -2862,7 +2866,9 @@ export const handlers = [
             backoff_ms: 1000,
             backoff_factor: 2.0,
             max_backoff_ms: 30000,
-            timeout_ms: 300000,
+            first_chunk_timeout_ms: 86400000,
+            chunk_timeout_ms: 86400000,
+            body_timeout_ms: 86400000,
             status_log_interval_ms: null,
             heartbeat_interval_ms: 5000,
             claim_timeout_ms: 60000,
@@ -2894,7 +2900,9 @@ export const handlers = [
             backoff_ms: 1000,
             backoff_factor: 2.0,
             max_backoff_ms: 30000,
-            timeout_ms: 300000,
+            first_chunk_timeout_ms: 86400000,
+            chunk_timeout_ms: 86400000,
+            body_timeout_ms: 86400000,
             status_log_interval_ms: null,
             heartbeat_interval_ms: 5000,
             claim_timeout_ms: 60000,
@@ -2926,7 +2934,9 @@ export const handlers = [
             backoff_ms: 1000,
             backoff_factor: 2.0,
             max_backoff_ms: 30000,
-            timeout_ms: 300000,
+            first_chunk_timeout_ms: 86400000,
+            chunk_timeout_ms: 86400000,
+            body_timeout_ms: 86400000,
             status_log_interval_ms: null,
             heartbeat_interval_ms: 5000,
             claim_timeout_ms: 60000,
@@ -2935,5 +2945,10 @@ export const handlers = [
         },
       ],
     });
+  }),
+
+  // Support request (mock)
+  http.post("/admin/api/v1/support/requests", () => {
+    return HttpResponse.json({ sent: true });
   }),
 ];

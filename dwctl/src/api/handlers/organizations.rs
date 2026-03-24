@@ -123,7 +123,7 @@ pub async fn create_organization<P: PoolProvider>(
 
     let mut pool_conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut repo = Organizations::new(&mut pool_conn);
-    let org = repo.create(&db_request).await?;
+    let org = repo.create(&db_request, &state.config.auth.default_user_roles).await?;
 
     let response = OrganizationResponse::from_user(UserResponse::from(org)).with_member_count(1);
 
@@ -819,20 +819,26 @@ pub async fn set_active_organization<P: PoolProvider>(
     // Build the dw_active_org cookie using the same security settings as the session cookie
     let session_config = &state.config.auth.native.session;
     let secure = if session_config.cookie_secure { "; Secure" } else { "" };
+    let domain = session_config
+        .cookie_domain
+        .as_ref()
+        .map(|d| format!("; Domain={d}"))
+        .unwrap_or_default();
     let cookie = if let Some(org_id) = data.organization_id {
         // Set cookie with long max-age (30 days) — cleared explicitly when switching back
         format!(
-            "dw_active_org={}; Path=/; HttpOnly{}; SameSite={}; Max-Age={}",
+            "dw_active_org={}; Path=/; HttpOnly{}{}; SameSite={}; Max-Age={}",
             org_id,
             secure,
+            domain,
             session_config.cookie_same_site,
             30 * 24 * 60 * 60
         )
     } else {
         // Clear cookie
         format!(
-            "dw_active_org=; Path=/; HttpOnly{}; SameSite={}; Max-Age=0",
-            secure, session_config.cookie_same_site
+            "dw_active_org=; Path=/; HttpOnly{}{}; SameSite={}; Max-Age=0",
+            secure, domain, session_config.cookie_same_site
         )
     };
 
@@ -1222,7 +1228,9 @@ pub async fn cancel_invite<P: PoolProvider>(
 #[cfg(test)]
 mod tests {
     use crate::api::models::users::Role;
-    use crate::test::utils::{add_auth_headers, create_test_admin_user, create_test_app, create_test_user};
+    use crate::test::utils::{
+        add_auth_headers, create_test_admin_user, create_test_app, create_test_app_with_config, create_test_config, create_test_user,
+    };
     use serde_json::json;
     use sqlx::PgPool;
 
@@ -1537,5 +1545,85 @@ mod tests {
             .json(&json!({ "organization_id": null }))
             .await;
         resp.assert_status(axum::http::StatusCode::OK);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_set_active_org_cookie_includes_domain_when_configured(pool: PgPool) {
+        let mut config = create_test_config();
+        config.auth.native.session.cookie_domain = Some(".example.com".to_string());
+        let (server, _bg) = create_test_app_with_config(pool.clone(), config, false).await;
+
+        let pm = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let pm_headers = add_auth_headers(&pm);
+        let owner = create_test_user(&pool, Role::StandardUser).await;
+        let owner_headers = add_auth_headers(&owner);
+
+        // Create org
+        let resp = server
+            .post("/admin/api/v1/organizations")
+            .add_header(&pm_headers[0].0, &pm_headers[0].1)
+            .add_header(&pm_headers[1].0, &pm_headers[1].1)
+            .json(&json!({ "name": "domain-test-org", "email": "org@example.com", "owner_id": owner.id }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::CREATED);
+        let org_id = resp.json::<serde_json::Value>()["id"].as_str().unwrap().to_string();
+
+        // Set active org — cookie should include Domain
+        let resp = server
+            .post("/admin/api/v1/session/organization")
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .json(&json!({ "organization_id": org_id }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::OK);
+        let cookie = resp.headers().get("set-cookie").unwrap().to_str().unwrap();
+        assert!(cookie.contains("Domain=.example.com"), "set cookie should include Domain: {cookie}");
+
+        // Clear active org — cookie should also include Domain
+        let resp = server
+            .post("/admin/api/v1/session/organization")
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .json(&json!({ "organization_id": null }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::OK);
+        let cookie = resp.headers().get("set-cookie").unwrap().to_str().unwrap();
+        assert!(
+            cookie.contains("Domain=.example.com"),
+            "clear cookie should include Domain: {cookie}"
+        );
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_set_active_org_cookie_omits_domain_when_not_configured(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+
+        let pm = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let pm_headers = add_auth_headers(&pm);
+        let owner = create_test_user(&pool, Role::StandardUser).await;
+        let owner_headers = add_auth_headers(&owner);
+
+        // Create org
+        let resp = server
+            .post("/admin/api/v1/organizations")
+            .add_header(&pm_headers[0].0, &pm_headers[0].1)
+            .add_header(&pm_headers[1].0, &pm_headers[1].1)
+            .json(&json!({ "name": "no-domain-org", "email": "org@example.com", "owner_id": owner.id }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::CREATED);
+        let org_id = resp.json::<serde_json::Value>()["id"].as_str().unwrap().to_string();
+
+        // Set active org — cookie should NOT include Domain
+        let resp = server
+            .post("/admin/api/v1/session/organization")
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .json(&json!({ "organization_id": org_id }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::OK);
+        let cookie = resp.headers().get("set-cookie").unwrap().to_str().unwrap();
+        assert!(!cookie.contains("Domain="), "cookie should not include Domain: {cookie}");
     }
 }

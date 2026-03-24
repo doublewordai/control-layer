@@ -127,7 +127,10 @@ async fn test_route_at_claim_time_escalation(pool: PgPool) {
         backoff_ms: 100,
         backoff_factor: 2,
         max_backoff_ms: 1000,
-        timeout_ms: 5000,
+        timeout_ms: None,
+        first_chunk_timeout_ms: 86_400_000,
+        chunk_timeout_ms: 86_400_000,
+        body_timeout_ms: 86_400_000,
         claim_timeout_ms: 5000,
         processing_timeout_ms: 10000,
         status_log_interval_ms: Some(500),
@@ -148,6 +151,7 @@ async fn test_route_at_claim_time_escalation(pool: PgPool) {
         purge_interval_ms: 0,
         purge_batch_size: 1000,
         purge_throttle_ms: 100,
+        streamable_endpoints: vec![],
     };
 
     config.background_services.onwards_sync.enabled = true;
@@ -385,7 +389,10 @@ async fn test_no_escalation_when_not_near_expiry(pool: PgPool) {
         backoff_ms: 100,
         backoff_factor: 2,
         max_backoff_ms: 1000,
-        timeout_ms: 5000,
+        timeout_ms: None,
+        first_chunk_timeout_ms: 86_400_000,
+        chunk_timeout_ms: 86_400_000,
+        body_timeout_ms: 86_400_000,
         claim_timeout_ms: 5000,
         processing_timeout_ms: 10000,
         status_log_interval_ms: None,
@@ -404,6 +411,7 @@ async fn test_no_escalation_when_not_near_expiry(pool: PgPool) {
         purge_interval_ms: 0,
         purge_batch_size: 1000,
         purge_throttle_ms: 100,
+        streamable_endpoints: vec![],
     };
 
     config.background_services.onwards_sync.enabled = true;

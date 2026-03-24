@@ -15,6 +15,9 @@ dashboard_url: "http://localhost:5173"
 # When set, users who have never logged in will be redirected here after authentication.
 # onboarding_url: "https://onboarding.doubleword.ai"
 
+# Email address where support requests are sent
+# support_email: "support@doubleword.ai"
+
 # Database configuration
 database:
   # Configure connectivity to an external postgres database here
@@ -353,7 +356,10 @@ background_services:
     max_backoff_ms: 10000 # Maximum backoff duration in milliseconds
 
     # Timeout Settings
-    timeout_ms: 600000 # Timeout per request attempt (10 minutes)
+    # timeout_ms: 600000 # DEPRECATED: splits into 90% first_chunk_timeout_ms, 10% body_timeout_ms
+    first_chunk_timeout_ms: 86400000 # Max time waiting for response headers (24 hours)
+    chunk_timeout_ms: 86400000 # Max idle time between response body chunks (24 hours)
+    body_timeout_ms: 86400000 # Max total time for entire response body (24 hours)
     claim_timeout_ms: 60000 # Max time in "claimed" state before auto-unclaim (1 minute)
     processing_timeout_ms: 600000 # Max time in "processing" state before auto-unclaim (10 minutes)
 
@@ -369,6 +375,14 @@ background_services:
     #   gpt-4:  # Original model
     #     escalation_model: o1-preview  # Route to this model when near expiry
     #     escalation_threshold_seconds: 900  # Default: 900 (15 minutes before expiry)
+
+    # Endpoints that should use SSE streaming for usage tracking.
+    # Batch requests to these paths are sent with X-Fusillade-Stream: true,
+    # causing the upstream proxy to inject stream: true and stream_options.include_usage.
+    # The streamed response is reassembled into non-streaming JSON before storage.
+    streamable_endpoints:
+      - /v1/chat/completions
+      - /v1/completions
 
   # Batch completion notifications (emails + webhooks)
   # notifications:

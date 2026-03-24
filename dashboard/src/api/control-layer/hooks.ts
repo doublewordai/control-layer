@@ -77,6 +77,7 @@ export function useUsers(options?: UsersQuery & { enabled?: boolean }) {
   });
 }
 
+
 export function useUser(id: string, options?: { include?: string }) {
   return useQuery({
     queryKey: queryKeys.users.byId(id, options?.include),
@@ -1610,5 +1611,14 @@ export function useRemoveMember() {
         queryKey: queryKeys.organizations.byId(variables.orgId),
       });
     },
+  });
+}
+
+// Support
+export function useSubmitSupportRequest() {
+  return useMutation({
+    mutationKey: ["support", "submit"],
+    mutationFn: (data: { subject: string; message: string }) =>
+      dwctlApi.support.submitRequest(data),
   });
 }

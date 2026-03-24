@@ -26,6 +26,14 @@ vi.mock("../../../../api/control-layer/hooks", () => ({
     data: { roles: ["PlatformManager"] },
     isLoading: false,
   })),
+  useOrganizationMembers: vi.fn(() => ({
+    data: [],
+    isLoading: false,
+  })),
+  useUsers: vi.fn(() => ({
+    data: { data: [], total_count: 0 },
+    isLoading: false,
+  })),
 }));
 
 // Mock authorization hook
@@ -36,6 +44,16 @@ vi.mock("../../../../utils/authorization", () => ({
     hasPermission: () => true,
     canAccessRoute: () => true,
     getFirstAccessibleRoute: () => "/batches",
+  })),
+}));
+
+// Mock organization context
+vi.mock("../../../../contexts/organization/useOrganizationContext", () => ({
+  useOrganizationContext: vi.fn(() => ({
+    activeOrganizationId: null,
+    activeOrganization: null,
+    isOrgContext: false,
+    setActiveOrganization: vi.fn(),
   })),
 }));
 

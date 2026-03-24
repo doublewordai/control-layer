@@ -13,12 +13,19 @@ use crate::types::{UserId, UserIdOrCurrent};
 pub struct WebhookCreate {
     /// HTTPS URL to receive webhook events
     pub url: String,
-    /// Optional list of event types to receive (null for all events)
+    /// Optional list of event types to receive (null for all events within scope)
     #[serde(default)]
     pub event_types: Option<Vec<String>>,
     /// Optional description to identify this webhook
     #[serde(default)]
     pub description: Option<String>,
+    /// Webhook scope: "own" for user-scoped events, "platform" for platform-wide events (PlatformManager only)
+    #[serde(default = "default_scope")]
+    pub scope: String,
+}
+
+fn default_scope() -> String {
+    "own".to_string()
 }
 
 /// Request to update a webhook.
@@ -51,6 +58,7 @@ pub struct WebhookResponse {
     pub event_types: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    pub scope: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -68,6 +76,7 @@ impl From<Webhook> for WebhookResponse {
             enabled: webhook.enabled,
             event_types,
             description: webhook.description,
+            scope: webhook.scope,
             created_at: webhook.created_at,
             updated_at: webhook.updated_at,
             disabled_at: webhook.disabled_at,
@@ -90,6 +99,7 @@ pub struct WebhookWithSecretResponse {
     pub event_types: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    pub scope: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -106,6 +116,7 @@ impl From<Webhook> for WebhookWithSecretResponse {
             enabled: webhook.enabled,
             event_types,
             description: webhook.description,
+            scope: webhook.scope,
             created_at: webhook.created_at,
             updated_at: webhook.updated_at,
         }
