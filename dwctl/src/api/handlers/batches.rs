@@ -490,16 +490,24 @@ pub async fn create_batch<P: PoolProvider>(
         });
     });
 
-    // Create the batch record only (no template snapshot yet)
-    let batch = state.request_manager.create_batch_record(batch_input).await.map_err(|e| Error::Internal {
-        operation: format!("create batch record: {}", e),
+    // Create the batch record and enqueue background population in one transaction.
+    // If either fails, nothing is committed — no orphaned batch records.
+    let mut tx = state.db.write().begin().await.map_err(|e| Error::Internal {
+        operation: format!("begin transaction: {}", e),
     })?;
 
-    // Enqueue background job to populate requests from templates
+    let batch = state
+        .request_manager
+        .create_batch_record(&mut *tx, batch_input)
+        .await
+        .map_err(|e| Error::Internal {
+            operation: format!("create batch record: {}", e),
+        })?;
+
     state
         .task_runner
         .create_batch_job()
-        .enqueue(&CreateBatchInput {
+        .enqueue_using(&mut *tx, &CreateBatchInput {
             batch_id: *batch.id,
             file_id,
             created_by: Some(target_user_id.to_string()),
@@ -508,6 +516,10 @@ pub async fn create_batch<P: PoolProvider>(
         .map_err(|e| Error::Internal {
             operation: format!("enqueue batch population: {}", e),
         })?;
+
+    tx.commit().await.map_err(|e| Error::Internal {
+        operation: format!("commit batch creation: {}", e),
+    })?;
 
     tracing::debug!("Batch {} created, population enqueued", batch.id);
 
