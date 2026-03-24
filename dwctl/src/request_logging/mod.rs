@@ -6,5 +6,4 @@ pub mod stream_usage;
 mod utils;
 
 pub use analytics_handler::AnalyticsHandler;
-pub use batcher::AnalyticsBatcher;
 pub use models::{AiRequest, AiResponse, ParsedAIRequest};
