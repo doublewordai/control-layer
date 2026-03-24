@@ -1184,6 +1184,7 @@ pub async fn get_user_model_breakdown_for_range(
         FROM http_analytics
         WHERE user_id = $1
           AND timestamp >= $2 AND timestamp <= $3
+          AND model IS NOT NULL
           AND status_code BETWEEN 200 AND 299
         GROUP BY model
         ORDER BY request_count DESC
@@ -2116,6 +2117,20 @@ mod tests {
         timestamp: DateTime<Utc>,
         fusillade_batch_id: Option<Uuid>,
     ) {
+        insert_usage_analytics_with_status(pool, user_id, model, prompt_tokens, completion_tokens, total_cost, timestamp, fusillade_batch_id, 200).await;
+    }
+
+    async fn insert_usage_analytics_with_status(
+        pool: &PgPool,
+        user_id: Uuid,
+        model: &str,
+        prompt_tokens: i64,
+        completion_tokens: i64,
+        total_cost: f64,
+        timestamp: DateTime<Utc>,
+        fusillade_batch_id: Option<Uuid>,
+        status_code: i32,
+    ) {
         use rust_decimal::Decimal;
 
         sqlx::query!(
@@ -2126,7 +2141,7 @@ mod tests {
                 user_id, fusillade_batch_id,
                 input_price_per_token, output_price_per_token
             ) VALUES (
-                $1, $2, $3, '/ai/chat/completions', 'POST', 200,
+                $1, $2, $3, '/ai/chat/completions', 'POST', $12,
                 100, $4, $5, $6, $7,
                 $8, $9,
                 $10, $11
@@ -2159,6 +2174,7 @@ mod tests {
                     Some(Decimal::ZERO)
                 }
             },
+            status_code,
         )
         .execute(pool)
         .await
@@ -2239,6 +2255,69 @@ mod tests {
 
         let count = get_user_batch_count_for_range(&pool, user_id, one_hour_ago, now).await.unwrap();
         // Only 1 distinct batch, realtime requests not counted
+        assert_eq!(count, 1);
+    }
+
+    #[sqlx::test]
+    async fn test_refresh_user_model_usage_excludes_errors(pool: PgPool) {
+        let user_id = create_usage_test_user(&pool).await;
+        let now = Utc::now();
+
+        // Insert successful requests
+        insert_usage_analytics(&pool, user_id, "gpt-4", 100, 50, 0.0, now, None).await;
+        insert_usage_analytics(&pool, user_id, "gpt-4", 200, 100, 0.0, now, None).await;
+        // Insert error requests that should be excluded
+        insert_usage_analytics_with_status(&pool, user_id, "gpt-4", 80, 0, 0.0, now, None, 400).await;
+        insert_usage_analytics_with_status(&pool, user_id, "gpt-4", 90, 0, 0.0, now, None, 500).await;
+        insert_usage_analytics_with_status(&pool, user_id, "gpt-4", 70, 0, 0.0, now, None, 429).await;
+
+        refresh_user_model_usage(&pool).await.unwrap();
+
+        let breakdown = get_user_model_breakdown(&pool, user_id).await.unwrap();
+        assert_eq!(breakdown.len(), 1);
+        assert_eq!(breakdown[0].model, "gpt-4");
+        // Only the two 200 requests should be counted
+        assert_eq!(breakdown[0].request_count, 2);
+        assert_eq!(breakdown[0].input_tokens, 300); // 100 + 200
+        assert_eq!(breakdown[0].output_tokens, 150); // 50 + 100
+    }
+
+    #[sqlx::test]
+    async fn test_get_user_model_breakdown_for_range_excludes_errors(pool: PgPool) {
+        let user_id = create_usage_test_user(&pool).await;
+        let now = Utc::now();
+        let one_hour_ago = now - Duration::hours(1);
+
+        // Insert successful requests
+        insert_usage_analytics(&pool, user_id, "claude-3", 80, 40, 0.0, now, None).await;
+        // Insert error requests that should be excluded
+        insert_usage_analytics_with_status(&pool, user_id, "claude-3", 60, 0, 0.0, now, None, 400).await;
+        insert_usage_analytics_with_status(&pool, user_id, "claude-3", 70, 0, 0.0, now, None, 502).await;
+
+        let breakdown = get_user_model_breakdown_for_range(&pool, user_id, one_hour_ago, now).await.unwrap();
+        assert_eq!(breakdown.len(), 1);
+        assert_eq!(breakdown[0].model, "claude-3");
+        // Only the successful request should be counted
+        assert_eq!(breakdown[0].request_count, 1);
+        assert_eq!(breakdown[0].input_tokens, 80);
+        assert_eq!(breakdown[0].output_tokens, 40);
+    }
+
+    #[sqlx::test]
+    async fn test_get_user_batch_count_for_range_excludes_errors(pool: PgPool) {
+        let user_id = create_usage_test_user(&pool).await;
+        let now = Utc::now();
+        let one_hour_ago = now - Duration::hours(1);
+        let batch_ok = Uuid::new_v4();
+        let batch_err = Uuid::new_v4();
+
+        // Successful batch request
+        insert_usage_analytics(&pool, user_id, "gpt-4", 100, 50, 0.0, now, Some(batch_ok)).await;
+        // Failed batch request (different batch) - should be excluded
+        insert_usage_analytics_with_status(&pool, user_id, "gpt-4", 80, 0, 0.0, now, Some(batch_err), 500).await;
+
+        let count = get_user_batch_count_for_range(&pool, user_id, one_hour_ago, now).await.unwrap();
+        // Only the successful batch should be counted
         assert_eq!(count, 1);
     }
 }
