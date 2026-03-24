@@ -28,9 +28,64 @@ use bytes::Bytes;
 use chrono::{Duration, Utc};
 use fusillade::Storage;
 use futures::StreamExt;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::pin::Pin;
 use uuid::Uuid;
+
+// ---------------------------------------------------------------------------
+// Background task: batch population
+// ---------------------------------------------------------------------------
+
+/// Input for the batch population background job.
+///
+/// After the handler creates a batch record and returns it to the client,
+/// this job copies templates into requests in the background.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CreateBatchInput {
+    pub batch_id: Uuid,
+    pub file_id: Uuid,
+    pub created_by: Option<String>,
+}
+
+/// Build the underway job for batch population.
+pub async fn build_create_batch_job<P: sqlx_pool_router::PoolProvider + Clone + Send + Sync + 'static>(
+    pool: sqlx::PgPool,
+    state: crate::tasks::TaskState<P>,
+) -> anyhow::Result<underway::Job<CreateBatchInput, crate::tasks::TaskState<P>>> {
+    use underway::Job;
+    use underway::job::To;
+    use underway::task::Error as TaskError;
+
+    Job::<CreateBatchInput, _>::builder()
+        .state(state)
+        .step(|cx, input: CreateBatchInput| async move {
+            let batch_id = fusillade::BatchId(input.batch_id);
+
+            if let Err(e) = cx.state.request_manager.populate_batch(
+                batch_id,
+                fusillade::FileId(input.file_id),
+                input.created_by,
+            ).await {
+                tracing::error!(
+                    batch_id = %input.batch_id,
+                    error = %e,
+                    "Failed to populate batch"
+                );
+                return Err(TaskError::Retryable(e.to_string()));
+            }
+
+            tracing::info!(batch_id = %input.batch_id, "Batch populated");
+            To::done()
+        })
+        .name("create-batch")
+        .pool(pool)
+        .build()
+        .await
+        .map_err(Into::into)
+}
+
+// ---------------------------------------------------------------------------
 
 /// Check if the current user "owns" a batch, considering org context.
 /// Returns true if the batch creator matches the user's ID or their active organization.
@@ -435,11 +490,26 @@ pub async fn create_batch<P: PoolProvider>(
         });
     });
 
-    let batch = state.request_manager.create_batch(batch_input).await.map_err(|e| Error::Internal {
-        operation: format!("create batch: {}", e),
+    // Create the batch record only (no template snapshot yet)
+    let batch = state.request_manager.create_batch_record(batch_input).await.map_err(|e| Error::Internal {
+        operation: format!("create batch record: {}", e),
     })?;
 
-    tracing::debug!("Batch {} created successfully", batch.id);
+    // Enqueue background job to populate requests from templates
+    state
+        .task_runner
+        .create_batch_job()
+        .enqueue(&CreateBatchInput {
+            batch_id: *batch.id,
+            file_id,
+            created_by: Some(target_user_id.to_string()),
+        })
+        .await
+        .map_err(|e| Error::Internal {
+            operation: format!("enqueue batch population: {}", e),
+        })?;
+
+    tracing::debug!("Batch {} created, population enqueued", batch.id);
 
     // For create, we have the current user's email directly
     Ok((

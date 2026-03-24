@@ -17,6 +17,7 @@ use sqlx::PgPool;
 use sqlx_pool_router::{DbPools, PoolProvider};
 use tracing::info;
 use utils::{add_auth_headers, create_test_admin_user, create_test_config, create_test_user};
+use crate::tasks::TaskState;
 
 /// End-to-end integration test: Full AI proxy flow through API
 /// Follows a real user journey: admin creates endpoint/model, user gets API key, user makes inference request
@@ -887,10 +888,18 @@ async fn test_request_logging_disabled(pool: PgPool) {
         Default::default(),
     ));
     let limiters = crate::limits::Limiters::new(&config.limits);
+    underway::run_migrations(&pool).await.expect("Failed to run underway migrations");
+    let task_state = TaskState {
+        request_manager: request_manager.clone(),
+    };
+    let task_runner = std::sync::Arc::new(
+        crate::tasks::TaskRunner::new(pool.clone(), task_state).await.expect("Failed to create task runner"),
+    );
     let mut app_state = AppState::builder()
         .db(DbPools::new(pool.clone()))
         .config(config)
         .request_manager(request_manager)
+        .task_runner(task_runner)
         .limiters(limiters)
         .build();
     let onwards_router = axum::Router::new(); // Empty onwards router for testing
@@ -1225,10 +1234,18 @@ async fn test_build_router_with_metrics_disabled(pool: PgPool) {
         Default::default(),
     ));
     let limiters = crate::limits::Limiters::new(&config.limits);
+    underway::run_migrations(&pool).await.expect("Failed to run underway migrations");
+    let task_state = crate::tasks::TaskState {
+        request_manager: request_manager.clone(),
+    };
+    let task_runner = std::sync::Arc::new(
+        crate::tasks::TaskRunner::new(pool.clone(), task_state).await.expect("Failed to create task runner"),
+    );
     let mut app_state = AppState::builder()
         .db(DbPools::new(pool))
         .config(config)
         .request_manager(request_manager)
+        .task_runner(task_runner)
         .limiters(limiters)
         .build();
 
@@ -1256,10 +1273,18 @@ async fn test_build_router_with_metrics_enabled(pool: PgPool) {
         Default::default(),
     ));
     let limiters = crate::limits::Limiters::new(&config.limits);
+    underway::run_migrations(&pool).await.expect("Failed to run underway migrations");
+    let task_state = TaskState {
+        request_manager: request_manager.clone(),
+    };
+    let task_runner = std::sync::Arc::new(
+        crate::tasks::TaskRunner::new(pool.clone(), task_state).await.expect("Failed to create task runner"),
+    );
     let mut app_state = AppState::builder()
         .db(DbPools::new(pool))
         .config(config)
         .request_manager(request_manager)
+        .task_runner(task_runner)
         .limiters(limiters)
         .build();
 

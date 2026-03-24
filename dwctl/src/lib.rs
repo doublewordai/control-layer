@@ -159,6 +159,7 @@ mod request_logging;
 pub mod sample_files;
 mod static_assets;
 mod sync;
+pub mod tasks;
 pub mod telemetry;
 pub mod tool_executor;
 pub mod tool_injection;
@@ -256,6 +257,8 @@ where
     #[builder(default = false)]
     pub is_leader: bool,
     pub request_manager: Arc<fusillade::PostgresRequestManager<P, fusillade::ReqwestHttpClient>>,
+    /// Background task runner for enqueuing deferred work (batch population, etc.)
+    pub task_runner: Arc<tasks::TaskRunner<P>>,
     /// Resource limiters for protecting system capacity.
     pub limiters: limits::Limiters,
 }
@@ -742,6 +745,9 @@ async fn setup_database(
         }
     };
     fusillade::migrator().run(&*fusillade_pools).await?;
+
+    // Run underway migrations (background task queue)
+    underway::run_migrations(&*db_pools).await?;
 
     // Setup outlet schema and pool if request logging is enabled
     let outlet_pools = if config.enable_request_logging {
@@ -1526,6 +1532,7 @@ async fn inject_trace_id(request: axum::extract::Request, next: middleware::Next
 /// the shutdown token, signaling all tasks to stop.
 pub struct BackgroundServices {
     request_manager: Arc<fusillade::PostgresRequestManager<DbPools, fusillade::ReqwestHttpClient>>,
+    task_runner: Arc<tasks::TaskRunner>,
     is_leader: bool,
     onwards_targets: onwards::target::Targets,
     #[cfg_attr(not(test), allow(dead_code))]
@@ -2050,10 +2057,25 @@ async fn setup_background_services(
         None
     };
 
+    // Build the underway task runner for background jobs (batch population, etc.)
+    let task_state = tasks::TaskState {
+        request_manager: request_manager.clone(),
+    };
+    let task_runner = Arc::new(tasks::TaskRunner::new(pool.clone(), task_state).await?);
+    let task_runner_handle = task_runner.start();
+    background_tasks.spawn("underway-worker", async move {
+        match task_runner_handle.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(anyhow::anyhow!("Underway worker error: {}", e)),
+            Err(e) => Err(anyhow::anyhow!("Underway worker join error: {}", e)),
+        }
+    });
+
     let (background_tasks, task_names) = background_tasks.into_parts();
 
     Ok(BackgroundServices {
         request_manager,
+        task_runner,
         is_leader,
         onwards_targets: initial_targets,
         onwards_sender,
@@ -2185,6 +2207,7 @@ impl Application {
             .config(config.clone())
             .is_leader(bg_services.is_leader)
             .request_manager(bg_services.request_manager.clone())
+            .task_runner(bg_services.task_runner.clone())
             .maybe_outlet_db(outlet_pools.clone())
             .limiters(limiters)
             .build();
