@@ -60,9 +60,6 @@ pub async fn build_create_batch_job<P: sqlx_pool_router::PoolProvider + Clone + 
     Job::<CreateBatchInput, _>::builder()
         .state(state)
         .step(|cx, input: CreateBatchInput| async move {
-            // TODO: remove — temporary delay to observe "validating" state in the frontend
-            tokio::time::sleep(std::time::Duration::from_secs(120)).await;
-
             let batch_id = fusillade::BatchId(input.batch_id);
 
             if let Err(e) = cx
