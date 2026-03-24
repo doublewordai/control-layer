@@ -2063,12 +2063,13 @@ async fn setup_background_services(
     };
     let task_runner = Arc::new(tasks::TaskRunner::new(pool.clone(), task_state).await?);
     let task_runner_handle = task_runner.start();
+    let underway_shutdown = shutdown_token.clone();
     background_tasks.spawn("underway-worker", async move {
-        match task_runner_handle.await {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(e)) => Err(anyhow::anyhow!("Underway worker error: {}", e)),
-            Err(e) => Err(anyhow::anyhow!("Underway worker join error: {}", e)),
-        }
+        underway_shutdown.cancelled().await;
+        task_runner_handle
+            .shutdown()
+            .await
+            .map_err(|e| anyhow::anyhow!("Underway worker shutdown error: {}", e))
     });
 
     let (background_tasks, task_names) = background_tasks.into_parts();
