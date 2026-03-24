@@ -2119,7 +2119,18 @@ mod tests {
         timestamp: DateTime<Utc>,
         fusillade_batch_id: Option<Uuid>,
     ) {
-        insert_usage_analytics_with_status(pool, user_id, model, prompt_tokens, completion_tokens, total_cost, timestamp, fusillade_batch_id, 200).await;
+        insert_usage_analytics_with_status(
+            pool,
+            user_id,
+            model,
+            prompt_tokens,
+            completion_tokens,
+            total_cost,
+            timestamp,
+            fusillade_batch_id,
+            200,
+        )
+        .await;
     }
 
     async fn insert_usage_analytics_with_status(
