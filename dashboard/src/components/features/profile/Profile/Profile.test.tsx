@@ -40,6 +40,7 @@ function makeWebhook(overrides: Partial<Webhook> = {}): Webhook {
     enabled: true,
     event_types: ["batch.completed", "batch.failed"],
     description: "My test webhook",
+    scope: "own",
     created_at: "2025-01-01T00:00:00Z",
     updated_at: "2025-01-01T00:00:00Z",
     disabled_at: null,
@@ -514,5 +515,180 @@ describe("Webhooks", () => {
     await waitFor(() => {
       expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     });
+  });
+});
+
+describe("Webhook Scope", () => {
+  it("shows scope selector for PlatformManager users", async () => {
+    const { container, user } = await renderAndWaitForProfile();
+
+    await user.click(
+      within(container).getByRole("button", { name: "Add webhook" }),
+    );
+
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getByText("Scope")).toBeInTheDocument();
+    expect(within(dialog).getByRole("tab", { name: "Personal" })).toHaveAttribute("data-state", "active");
+    expect(within(dialog).getByRole("tab", { name: "Platform" })).toBeInTheDocument();
+  });
+
+  it("does not show scope selector for non-PM users", async () => {
+    server.use(
+      http.get("/admin/api/v1/users/:id", () => {
+        return HttpResponse.json({
+          id: "550e8400-e29b-41d4-a716-446655440001",
+          username: "standard-user",
+          email: "user@acme.com",
+          display_name: "Standard User",
+          avatar_url: null,
+          roles: ["StandardUser"],
+          created_at: "2025-03-10T10:00:00Z",
+          updated_at: "2025-12-20T15:30:00Z",
+          auth_source: "native",
+        });
+      }),
+    );
+
+    const { container, user } = await renderAndWaitForProfile();
+
+    await user.click(
+      within(container).getByRole("button", { name: "Add webhook" }),
+    );
+
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).queryByText("Scope")).not.toBeInTheDocument();
+    expect(within(dialog).queryByRole("tab", { name: "Platform" })).not.toBeInTheDocument();
+  });
+
+  it("switches event types when scope changes", async () => {
+    const { container, user } = await renderAndWaitForProfile();
+
+    await user.click(
+      within(container).getByRole("button", { name: "Add webhook" }),
+    );
+
+    const dialog = await screen.findByRole("dialog");
+
+    // Own scope shows batch events by default
+    expect(within(dialog).getByText("Batch completed")).toBeInTheDocument();
+    expect(within(dialog).getByText("Batch failed")).toBeInTheDocument();
+    expect(within(dialog).queryByText("User created")).not.toBeInTheDocument();
+
+    // Switch to platform scope
+    await user.click(within(dialog).getByRole("tab", { name: "Platform" }));
+
+    // Platform events shown, own events gone
+    expect(within(dialog).getByText("User created")).toBeInTheDocument();
+    expect(within(dialog).getByText("Batch created")).toBeInTheDocument();
+    expect(within(dialog).getByText("API key created")).toBeInTheDocument();
+    expect(within(dialog).queryByText("Batch completed")).not.toBeInTheDocument();
+    expect(within(dialog).queryByText("Batch failed")).not.toBeInTheDocument();
+  });
+
+  it("sends scope in create request", async () => {
+    let postedBody: Record<string, unknown> | null = null;
+    server.use(
+      http.post("/admin/api/v1/users/:userId/webhooks", async ({ request }) => {
+        postedBody = (await request.json()) as Record<string, unknown>;
+        const now = new Date().toISOString();
+        return HttpResponse.json(
+          {
+            id: "wh-new",
+            user_id: "550e8400-e29b-41d4-a716-446655440000",
+            url: postedBody.url,
+            enabled: true,
+            event_types: postedBody.event_types,
+            description: null,
+            scope: postedBody.scope || "own",
+            created_at: now,
+            updated_at: now,
+            disabled_at: null,
+            secret: "whsec_test123",
+          },
+          { status: 201 },
+        );
+      }),
+    );
+
+    const { container, user } = await renderAndWaitForProfile();
+
+    await user.click(
+      within(container).getByRole("button", { name: "Add webhook" }),
+    );
+
+    const dialog = await screen.findByRole("dialog");
+
+    // Switch to platform scope
+    await user.click(within(dialog).getByRole("tab", { name: "Platform" }));
+
+    // Fill URL
+    const urlInput = within(dialog).getByLabelText("Endpoint URL");
+    await user.type(urlInput, "https://example.com/platform-hook");
+
+    // Submit
+    await user.click(
+      within(dialog).getByRole("button", { name: "Create Webhook" }),
+    );
+
+    await waitFor(() => {
+      expect(postedBody).not.toBeNull();
+    });
+    expect(postedBody).toMatchObject({
+      scope: "platform",
+      event_types: ["user.created", "batch.created", "api_key.created"],
+    });
+  });
+
+  it("shows Platform badge on platform-scoped webhooks", async () => {
+    server.use(
+      http.get("/admin/api/v1/users/:userId/webhooks", () => {
+        return HttpResponse.json([
+          makeWebhook({
+            scope: "platform",
+            event_types: ["user.created"],
+          }),
+        ]);
+      }),
+    );
+
+    const { container } = await renderAndWaitForProfile();
+
+    await waitFor(() => {
+      expect(within(container).getByText("Platform")).toBeInTheDocument();
+    });
+  });
+
+  it("shows scope as read-only in edit dialog for platform webhooks", async () => {
+    const webhook = makeWebhook({
+      scope: "platform",
+      event_types: ["user.created", "batch.created"],
+    });
+    server.use(
+      http.get("/admin/api/v1/users/:userId/webhooks", () => {
+        return HttpResponse.json([webhook]);
+      }),
+    );
+
+    const { container, user } = await renderAndWaitForProfile();
+
+    await waitFor(() => {
+      expect(within(container).getByText(webhook.url)).toBeInTheDocument();
+    });
+
+    await user.click(
+      within(container).getByRole("button", {
+        name: `Edit webhook ${webhook.url}`,
+      }),
+    );
+
+    const dialog = await screen.findByRole("dialog");
+
+    // Scope shown as read-only badge, no tabs
+    expect(within(dialog).getByText("Platform")).toBeInTheDocument();
+    expect(within(dialog).queryByRole("tab", { name: "Personal" })).not.toBeInTheDocument();
+
+    // Platform event types shown in edit mode
+    expect(within(dialog).getByText("User created")).toBeInTheDocument();
+    expect(within(dialog).getByText("Batch created")).toBeInTheDocument();
   });
 });

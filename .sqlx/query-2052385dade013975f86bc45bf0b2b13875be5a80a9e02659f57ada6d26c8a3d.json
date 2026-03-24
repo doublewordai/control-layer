@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            INSERT INTO user_webhooks (user_id, url, secret, event_types, description)\n            VALUES ($1, $2, $3, $4, $5)\n            RETURNING *\n            ",
+  "query": "\n            INSERT INTO user_webhooks (user_id, url, secret, event_types, description, scope)\n            VALUES ($1, $2, $3, $4, $5, $6)\n            RETURNING *\n            ",
   "describe": {
     "columns": [
       {
@@ -57,6 +57,11 @@
         "ordinal": 10,
         "name": "disabled_at",
         "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 11,
+        "name": "scope",
+        "type_info": "Text"
       }
     ],
     "parameters": {
@@ -65,6 +70,7 @@
         "Text",
         "Text",
         "Jsonb",
+        "Text",
         "Text"
       ]
     },
@@ -79,8 +85,9 @@
       false,
       false,
       false,
-      true
+      true,
+      false
     ]
   },
-  "hash": "fc1db0fe12827b670e632d38b7a94d8c9548352829f5605adc9f27db9ab43d6b"
+  "hash": "2052385dade013975f86bc45bf0b2b13875be5a80a9e02659f57ada6d26c8a3d"
 }

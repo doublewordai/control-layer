@@ -23,6 +23,7 @@ pub struct Webhook {
     pub enabled: bool,
     pub event_types: Option<serde_json::Value>,
     pub description: Option<String>,
+    pub scope: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub consecutive_failures: i32,
@@ -31,12 +32,27 @@ pub struct Webhook {
 
 impl Webhook {
     /// Check if this webhook should receive the given event type.
+    ///
+    /// Enforces scope matching: an own-scoped webhook only receives own-scope events,
+    /// a platform-scoped webhook only receives platform-scope events. This means
+    /// `event_types = null` (accept all) is scoped — it never leaks events across
+    /// scope boundaries.
     pub fn accepts_event(&self, event_type: WebhookEventType) -> bool {
         if !self.enabled {
             return false;
         }
 
-        // If event_types is null, accept all events
+        // Scope must match
+        let webhook_scope = if self.scope == "platform" {
+            crate::webhooks::WebhookScope::Platform
+        } else {
+            crate::webhooks::WebhookScope::Own
+        };
+        if event_type.scope() != webhook_scope {
+            return false;
+        }
+
+        // If event_types is null, accept all events within this scope
         let Some(ref types) = self.event_types else {
             return true;
         };
@@ -79,7 +95,7 @@ pub struct WebhookDelivery {
     pub status: String,
     pub attempt_count: i32,
     pub next_attempt_at: DateTime<Utc>,
-    pub batch_id: Uuid,
+    pub resource_id: Option<Uuid>,
     pub last_status_code: Option<i32>,
     pub last_error: Option<String>,
     pub created_at: DateTime<Utc>,
@@ -98,7 +114,7 @@ pub struct ClaimedDelivery {
     pub status: String,
     pub attempt_count: i32,
     pub next_attempt_at: DateTime<Utc>,
-    pub batch_id: Uuid,
+    pub resource_id: Option<Uuid>,
     pub last_status_code: Option<i32>,
     pub last_error: Option<String>,
     pub created_at: DateTime<Utc>,
@@ -117,6 +133,7 @@ pub struct WebhookCreateDBRequest {
     pub secret: String,
     pub event_types: Option<Vec<String>>,
     pub description: Option<String>,
+    pub scope: String,
 }
 
 /// Request to update a webhook.
@@ -135,7 +152,7 @@ pub struct WebhookDeliveryCreateDBRequest {
     pub event_id: Uuid,
     pub event_type: String,
     pub payload: serde_json::Value,
-    pub batch_id: Uuid,
+    pub resource_id: Option<Uuid>,
     /// When to attempt delivery. `None` defaults to `now()` in the DB.
     pub next_attempt_at: Option<DateTime<Utc>>,
 }
