@@ -73,7 +73,14 @@ pub async fn build_create_batch_job<P: sqlx_pool_router::PoolProvider + Clone + 
                     error = %e,
                     "Failed to populate batch"
                 );
-                return Err(TaskError::Retryable(e.to_string()));
+
+                return match &e {
+                    fusillade::FusilladeError::ValidationError(_) => {
+                        let _ = cx.state.request_manager.mark_batch_failed(batch_id, &e.to_string()).await;
+                        Err(TaskError::Fatal(e.to_string()))
+                    }
+                    _ => Err(TaskError::Retryable(e.to_string())),
+                };
             }
 
             tracing::info!(batch_id = %input.batch_id, "Batch populated");
@@ -138,10 +145,12 @@ fn to_batch_response_with_email(batch: fusillade::Batch, creator_email: Option<&
             // Still cancelling
             "cancelling"
         }
+    } else if batch.failed_at.is_some() && !has_started {
+        // Batch failed before population (e.g. empty file, validation error)
+        "failed"
     } else if !has_started {
-        // despite its name requests_started_at null actually means batch hasn't been populated yet
-        // total_requests may already be set from the template count at creation
-        // time, but no request rows exist yet.
+        // Batch hasn't been populated yet — total_requests may already be set
+        // from the template count at creation time, but no request rows exist yet.
         "validating"
     } else if is_finished && batch.failed_requests == batch.total_requests {
         // All requests failed (batch.failed_requests already filtered by SLA status)
