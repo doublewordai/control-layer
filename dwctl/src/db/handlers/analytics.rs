@@ -796,6 +796,7 @@ pub async fn get_batch_analytics(pool: &PgPool, batch_id: &Uuid) -> Result<Batch
                 (completion_tokens * COALESCE(output_price_per_token, 0))) as "total_cost"
         FROM http_analytics
         WHERE fusillade_batch_id = $1
+          AND status_code BETWEEN 200 AND 299
         "#,
         batch_id
     )
@@ -835,6 +836,7 @@ pub async fn get_batches_analytics_bulk(pool: &PgPool, batch_ids: &[Uuid]) -> Re
                 (completion_tokens * COALESCE(output_price_per_token, 0))) as "total_cost"
         FROM http_analytics
         WHERE fusillade_batch_id = ANY($1)
+          AND status_code BETWEEN 200 AND 299
         GROUP BY fusillade_batch_id
         "#,
         batch_ids
