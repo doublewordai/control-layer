@@ -137,7 +137,10 @@ fn to_batch_response_with_email(batch: fusillade::Batch, creator_email: Option<&
             // Still cancelling
             "cancelling"
         }
-    } else if batch.total_requests == 0 {
+    } else if !has_started {
+        // despite its name requests_started_at null actually means batch hasn't been populated yet
+        // total_requests may already be set from the template count at creation
+        // time, but no request rows exist yet.
         "validating"
     } else if is_finished && batch.failed_requests == batch.total_requests {
         // All requests failed (batch.failed_requests already filtered by SLA status)
