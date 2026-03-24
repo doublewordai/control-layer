@@ -217,15 +217,16 @@ async fn test_cache_shape_composite_pool_strategy_and_fallback(pool: sqlx::PgPoo
     assert!(composite_pool.should_fallback_on_status(503));
     assert!(!composite_pool.should_fallback_on_status(500));
 
-    // Current behavior: composite models require positive balance for non-system keys.
-    // With this fixture (no credits), only the system key is included.
+    // Composite model has no tariff in this fixture, so it's free.
+    // Free models allow group-authorized keys regardless of balance.
+    // User A is in group cache-private-a which has access to this composite.
     assert_eq!(
         pool_keys_len(composite_pool),
-        1,
-        "composite access currently requires positive balance"
+        2,
+        "free composite should include system key and group-authorized keys"
     );
     assert!(pool_has_key(composite_pool, SYSTEM_KEY_SECRET));
-    assert!(!pool_has_key(composite_pool, KEY_A_SECRET));
+    assert!(pool_has_key(composite_pool, KEY_A_SECRET));
     assert!(!pool_has_key(composite_pool, KEY_B_SECRET));
     assert!(!pool_has_key(composite_pool, KEY_BATCH_SECRET));
 
@@ -374,17 +375,10 @@ async fn test_known_issue_composite_invalid_component_endpoint_should_be_skipped
 }
 
 #[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
-#[ignore = "Known issue: composite key visibility lacks the unmetered-model bypass used by regular models"]
-async fn test_known_issue_composite_unmetered_access_should_match_regular_model_policy(pool: sqlx::PgPool) {
-    // Expected behavior:
-    // - For unmetered aliases (no active non-zero tariff), group-authorized keys are allowed
-    //   even when user balance is non-positive.
-    // - Composite and regular aliases follow the same key visibility policy.
-    //
-    // Bug outline:
-    // - Regular-model query includes an "unmetered bypass" for non-positive balances.
-    // - Composite query currently requires positive balance for non-system users.
-    // - This creates policy mismatch: keys visible for regular aliases may be hidden for composites.
+async fn test_composite_unmetered_access_matches_regular_model_policy(pool: sqlx::PgPool) {
+    // For unmetered aliases (no active non-zero tariff), group-authorized keys are allowed
+    // even when user balance is non-positive. Composite and regular aliases follow the same
+    // key visibility policy.
     let targets = super::load_targets_from_db(&pool, &[], false).await.unwrap();
     let composite = targets.targets.get("composite-priority").expect("composite-priority should exist");
     let composite_pool = composite.value();
