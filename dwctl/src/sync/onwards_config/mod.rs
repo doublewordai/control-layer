@@ -544,12 +544,20 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                     AND cm.alias = ANY($1::text[])
                 )
             )
-            -- Require positive balance (system user always passes)
+            -- Require positive balance OR free model (system user always passes)
             AND (
                 ak.user_id = '00000000-0000-0000-0000-000000000000'
                 OR EXISTS (
                     SELECT 1 FROM user_balances ub
                     WHERE ub.user_id = ak.user_id AND ub.balance > 0
+                )
+                OR (
+                    NOT EXISTS (
+                        SELECT 1 FROM model_tariffs mt
+                        WHERE mt.deployed_model_id = cm.id
+                          AND mt.valid_until IS NULL
+                          AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
+                    )
                 )
             )
             AND ak.is_deleted = false
