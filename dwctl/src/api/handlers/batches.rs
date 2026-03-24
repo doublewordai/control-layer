@@ -450,6 +450,7 @@ pub async fn create_batch<P: PoolProvider>(
     let metadata = serde_json::to_value(metadata_map).ok();
 
     // Create batch input — created_by uses org ID when in org context for ownership scoping
+    let total_requests: i64 = file_model_counts.values().sum();
     let batch_input = fusillade::BatchInput {
         file_id: fusillade::FileId(file_id),
         endpoint: req.endpoint.clone(),
@@ -458,6 +459,7 @@ pub async fn create_batch<P: PoolProvider>(
         created_by: Some(target_user_id.to_string()),
         api_key_id: Some(api_key_id),
         api_key: Some(batch_api_key),
+        total_requests: Some(total_requests),
     };
 
     let reservation_ids = reserve_capacity_for_batch(
