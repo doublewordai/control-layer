@@ -52,12 +52,17 @@ import {
   DialogDescription,
   DialogFooter,
 } from "../../../ui/dialog";
+import { Tabs, TabsList, TabsTrigger } from "../../../ui/tabs";
 import { AVAILABLE_ROLES, getRoleDisplayName } from "../../../../utils/roles";
-import type { Role, Webhook } from "../../../../api/control-layer/types";
+import type {
+  Role,
+  Webhook,
+  WebhookScope,
+} from "../../../../api/control-layer/types";
 import { dwctlApi } from "../../../../api/control-layer/client";
 import { ApiError } from "../../../../api/control-layer/errors";
 
-const EVENT_TYPE_OPTIONS = [
+const OWN_EVENT_TYPE_OPTIONS = [
   {
     value: "batch.completed",
     label: "Batch completed",
@@ -102,6 +107,55 @@ const EVENT_TYPE_OPTIONS = [
   },
 ];
 
+const PLATFORM_EVENT_TYPE_OPTIONS = [
+  {
+    value: "user.created",
+    label: "User created",
+    example: `{
+  "type": "user.created",
+  "timestamp": "2025-01-15T10:30:00Z",
+  "data": {
+    "user_id": "usr_abc123",
+    "email": "jane@example.com",
+    "auth_source": "native"
+  }
+}`,
+  },
+  {
+    value: "batch.created",
+    label: "Batch created",
+    example: `{
+  "type": "batch.created",
+  "timestamp": "2025-01-15T10:30:00Z",
+  "data": {
+    "batch_id": "batch_abc123",
+    "user_id": "usr_abc123",
+    "endpoint": "/v1/chat/completions"
+  }
+}`,
+  },
+  {
+    value: "api_key.created",
+    label: "API key created",
+    example: `{
+  "type": "api_key.created",
+  "timestamp": "2025-01-15T10:30:00Z",
+  "data": {
+    "api_key_id": "key_abc123",
+    "user_id": "usr_abc123",
+    "created_by": "usr_def456",
+    "name": "My API Key"
+  }
+}`,
+  },
+];
+
+function eventTypeOptionsForScope(scope: WebhookScope) {
+  return scope === "platform"
+    ? PLATFORM_EVENT_TYPE_OPTIONS
+    : OWN_EVENT_TYPE_OPTIONS;
+}
+
 export const Profile: React.FC = () => {
   const {
     data: currentUser,
@@ -141,6 +195,10 @@ export const Profile: React.FC = () => {
     null,
   );
   const [copiedSecret, setCopiedSecret] = useState(false);
+  const [webhookScope, setWebhookScope] = useState<WebhookScope>("own");
+
+  const isPlatformManager =
+    currentUser?.roles?.includes("PlatformManager") ?? false;
 
   const handleRoleChange = (role: Role) => {
     setRoles((prev) =>
@@ -311,22 +369,26 @@ export const Profile: React.FC = () => {
   // Webhook handlers
   const openCreateWebhookDialog = () => {
     setEditingWebhook(null);
+    setWebhookScope("own");
     setWebhookUrl("");
     setWebhookDescription("");
-    setWebhookEventTypes(EVENT_TYPE_OPTIONS.map((o) => o.value));
+    setWebhookEventTypes(OWN_EVENT_TYPE_OPTIONS.map((o) => o.value));
     setWebhookSecret(null);
     setWebhookError("");
     setWebhookDialogOpen(true);
   };
 
   const openEditWebhookDialog = (webhook: Webhook) => {
+    const scope = webhook.scope || "own";
     setEditingWebhook(webhook);
+    setWebhookScope(scope);
     setWebhookUrl(webhook.url);
     setWebhookDescription(webhook.description || "");
+    const options = eventTypeOptionsForScope(scope);
     setWebhookEventTypes(
       webhook.event_types && webhook.event_types.length > 0
         ? webhook.event_types
-        : EVENT_TYPE_OPTIONS.map((o) => o.value),
+        : options.map((o) => o.value),
     );
     setWebhookSecret(null);
     setWebhookError("");
@@ -339,6 +401,12 @@ export const Profile: React.FC = () => {
         ? prev.filter((t) => t !== eventType)
         : [...prev, eventType],
     );
+  };
+
+  const handleScopeChange = (scope: WebhookScope) => {
+    setWebhookScope(scope);
+    const options = eventTypeOptionsForScope(scope);
+    setWebhookEventTypes(options.map((o) => o.value));
   };
 
   const handleWebhookSave = async () => {
@@ -378,6 +446,7 @@ export const Profile: React.FC = () => {
             url: webhookUrl,
             description: webhookDescription.trim() || undefined,
             event_types: webhookEventTypes,
+            scope: webhookScope,
           },
         });
         setWebhookSecret(result.secret);
@@ -1008,6 +1077,14 @@ export const Profile: React.FC = () => {
                               <code className="text-sm text-gray-900 truncate block">
                                 {webhook.url}
                               </code>
+                              {webhook.scope === "platform" && (
+                                <Badge
+                                  variant="outline"
+                                  className="text-[10px] px-1.5 py-0 border-blue-200 text-blue-700 bg-blue-50"
+                                >
+                                  Platform
+                                </Badge>
+                              )}
                               {!webhook.enabled && (
                                 <Badge variant="secondary">Disabled</Badge>
                               )}
@@ -1211,13 +1288,48 @@ export const Profile: React.FC = () => {
                     className="mt-1"
                   />
                 </div>
+                {isPlatformManager && !editingWebhook && (
+                  <div>
+                    <Label className="text-sm font-medium">Scope</Label>
+                    <p className="text-xs text-gray-500 mt-0.5 mb-2">
+                      Personal webhooks receive events for your own activity.
+                      Platform webhooks receive events across all users.
+                    </p>
+                    <Tabs
+                      value={webhookScope}
+                      onValueChange={(v) =>
+                        handleScopeChange(v as WebhookScope)
+                      }
+                    >
+                      <TabsList className="w-full">
+                        <TabsTrigger value="own" className="flex-1">
+                          Personal
+                        </TabsTrigger>
+                        <TabsTrigger value="platform" className="flex-1">
+                          Platform
+                        </TabsTrigger>
+                      </TabsList>
+                    </Tabs>
+                  </div>
+                )}
+                {editingWebhook && editingWebhook.scope === "platform" && (
+                  <div className="flex items-center gap-2">
+                    <Label className="text-sm font-medium">Scope</Label>
+                    <Badge
+                      variant="outline"
+                      className="border-blue-200 text-blue-700 bg-blue-50"
+                    >
+                      Platform
+                    </Badge>
+                  </div>
+                )}
                 <div>
                   <Label className="text-sm font-medium">Event Types</Label>
                   <p className="text-xs text-gray-500 mt-0.5 mb-2">
                     Select at least one event to listen for.
                   </p>
                   <div className="space-y-2">
-                    {EVENT_TYPE_OPTIONS.map((option) => (
+                    {eventTypeOptionsForScope(webhookScope).map((option) => (
                       <label
                         key={option.value}
                         className="flex items-center gap-2 cursor-pointer"
