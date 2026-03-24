@@ -4,6 +4,7 @@ pub mod sla_waterfall;
 pub mod strict_mode;
 pub mod utils;
 
+use crate::tasks::TaskState;
 use crate::{AppState, create_initial_admin_user};
 use crate::{
     api::models::{groups::GroupResponse, users::Role},
@@ -17,7 +18,6 @@ use sqlx::PgPool;
 use sqlx_pool_router::{DbPools, PoolProvider};
 use tracing::info;
 use utils::{add_auth_headers, create_test_admin_user, create_test_config, create_test_user};
-use crate::tasks::TaskState;
 
 /// End-to-end integration test: Full AI proxy flow through API
 /// Follows a real user journey: admin creates endpoint/model, user gets API key, user makes inference request
@@ -893,7 +893,9 @@ async fn test_request_logging_disabled(pool: PgPool) {
         request_manager: request_manager.clone(),
     };
     let task_runner = std::sync::Arc::new(
-        crate::tasks::TaskRunner::new(pool.clone(), task_state).await.expect("Failed to create task runner"),
+        crate::tasks::TaskRunner::new(pool.clone(), task_state)
+            .await
+            .expect("Failed to create task runner"),
     );
     let mut app_state = AppState::builder()
         .db(DbPools::new(pool.clone()))
@@ -1239,7 +1241,9 @@ async fn test_build_router_with_metrics_disabled(pool: PgPool) {
         request_manager: request_manager.clone(),
     };
     let task_runner = std::sync::Arc::new(
-        crate::tasks::TaskRunner::new(pool.clone(), task_state).await.expect("Failed to create task runner"),
+        crate::tasks::TaskRunner::new(pool.clone(), task_state)
+            .await
+            .expect("Failed to create task runner"),
     );
     let mut app_state = AppState::builder()
         .db(DbPools::new(pool))
@@ -1278,7 +1282,9 @@ async fn test_build_router_with_metrics_enabled(pool: PgPool) {
         request_manager: request_manager.clone(),
     };
     let task_runner = std::sync::Arc::new(
-        crate::tasks::TaskRunner::new(pool.clone(), task_state).await.expect("Failed to create task runner"),
+        crate::tasks::TaskRunner::new(pool.clone(), task_state)
+            .await
+            .expect("Failed to create task runner"),
     );
     let mut app_state = AppState::builder()
         .db(DbPools::new(pool))

@@ -1,4 +1,3 @@
-
 //! Background task processing via underway.
 //!
 //! This module provides a task runner that manages underway jobs for deferred
