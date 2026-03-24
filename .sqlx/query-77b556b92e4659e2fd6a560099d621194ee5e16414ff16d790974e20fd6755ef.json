@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            fusillade_batch_id,\n            COUNT(*) as \"total_requests!\",\n            COALESCE(SUM(prompt_tokens), 0) as \"total_prompt_tokens!\",\n            COALESCE(SUM(completion_tokens), 0) as \"total_completion_tokens!\",\n            COALESCE(SUM(total_tokens), 0) as \"total_tokens!\",\n            AVG(duration_ms) as \"avg_duration_ms\",\n            AVG(duration_to_first_byte_ms) as \"avg_ttfb_ms\",\n            SUM((prompt_tokens * COALESCE(input_price_per_token, 0)) +\n                (completion_tokens * COALESCE(output_price_per_token, 0))) as \"total_cost\"\n        FROM http_analytics\n        WHERE fusillade_batch_id = ANY($1)\n        GROUP BY fusillade_batch_id\n        ",
+  "query": "\n        SELECT\n            fusillade_batch_id,\n            COUNT(*) as \"total_requests!\",\n            COALESCE(SUM(prompt_tokens), 0) as \"total_prompt_tokens!\",\n            COALESCE(SUM(completion_tokens), 0) as \"total_completion_tokens!\",\n            COALESCE(SUM(total_tokens), 0) as \"total_tokens!\",\n            AVG(duration_ms) as \"avg_duration_ms\",\n            AVG(duration_to_first_byte_ms) as \"avg_ttfb_ms\",\n            SUM((prompt_tokens * COALESCE(input_price_per_token, 0)) +\n                (completion_tokens * COALESCE(output_price_per_token, 0))) as \"total_cost\"\n        FROM http_analytics\n        WHERE fusillade_batch_id = ANY($1)\n          AND status_code BETWEEN 200 AND 299\n        GROUP BY fusillade_batch_id\n        ",
   "describe": {
     "columns": [
       {
@@ -60,5 +60,5 @@
       null
     ]
   },
-  "hash": "4776d053a2e3ac09af497c1589b4450211757d358a0f8e244b56f2430a8b14d1"
+  "hash": "77b556b92e4659e2fd6a560099d621194ee5e16414ff16d790974e20fd6755ef"
 }
