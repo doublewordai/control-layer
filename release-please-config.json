@@ -3,6 +3,7 @@
     "dwctl": {
       "release-type": "rust",
       "changelog-path": "/CHANGELOG.md",
+      "include-paths": ["dashboard"],
       "extra-files": [
         {
           "type": "json",

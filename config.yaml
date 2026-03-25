@@ -383,6 +383,7 @@ background_services:
     streamable_endpoints:
       - /v1/chat/completions
       - /v1/completions
+      - /v1/responses
 
   # Batch completion notifications (emails + webhooks)
   # notifications:

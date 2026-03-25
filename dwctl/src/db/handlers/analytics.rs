@@ -796,6 +796,7 @@ pub async fn get_batch_analytics(pool: &PgPool, batch_id: &Uuid) -> Result<Batch
                 (completion_tokens * COALESCE(output_price_per_token, 0))) as "total_cost"
         FROM http_analytics
         WHERE fusillade_batch_id = $1
+          AND status_code BETWEEN 200 AND 299
         "#,
         batch_id
     )
@@ -835,6 +836,7 @@ pub async fn get_batches_analytics_bulk(pool: &PgPool, batch_ids: &[Uuid]) -> Re
                 (completion_tokens * COALESCE(output_price_per_token, 0))) as "total_cost"
         FROM http_analytics
         WHERE fusillade_batch_id = ANY($1)
+          AND status_code BETWEEN 200 AND 299
         GROUP BY fusillade_batch_id
         "#,
         batch_ids
@@ -1078,6 +1080,7 @@ pub async fn refresh_user_model_usage(pool: &PgPool) -> Result<()> {
         FROM http_analytics
         WHERE id > $1 AND id <= $2
               AND user_id IS NOT NULL AND model IS NOT NULL
+              AND status_code BETWEEN 200 AND 299
         GROUP BY user_id, model
         ON CONFLICT (user_id, model)
         DO UPDATE SET
@@ -1184,6 +1187,7 @@ pub async fn get_user_model_breakdown_for_range(
         WHERE user_id = $1
           AND timestamp >= $2 AND timestamp <= $3
           AND model IS NOT NULL
+          AND status_code BETWEEN 200 AND 299
         GROUP BY model
         ORDER BY request_count DESC
         "#,
@@ -1218,6 +1222,7 @@ pub async fn get_user_batch_count_for_range(pool: &PgPool, user_id: Uuid, start:
         WHERE user_id = $1
           AND timestamp >= $2 AND timestamp <= $3
           AND fusillade_batch_id IS NOT NULL
+          AND status_code BETWEEN 200 AND 299
         "#,
         user_id,
         start,
@@ -2103,18 +2108,42 @@ mod tests {
         assert!(analytics_3.avg_duration_ms.is_none());
     }
 
-    /// Insert an http_analytics row with user_id and optional batch_id for usage tests.
-    async fn insert_usage_analytics(
-        pool: &PgPool,
+    struct UsageAnalyticsParams<'a> {
         user_id: Uuid,
-        model: &str,
+        model: &'a str,
         prompt_tokens: i64,
         completion_tokens: i64,
         total_cost: f64,
         timestamp: DateTime<Utc>,
         fusillade_batch_id: Option<Uuid>,
-    ) {
+        status_code: i32,
+    }
+
+    /// Insert an http_analytics row with user_id and optional batch_id for usage tests.
+    async fn insert_usage_analytics(pool: &PgPool, params: UsageAnalyticsParams<'_>) {
+        insert_usage_analytics_with_status(
+            pool,
+            UsageAnalyticsParams {
+                status_code: 200,
+                ..params
+            },
+        )
+        .await;
+    }
+
+    async fn insert_usage_analytics_with_status(pool: &PgPool, params: UsageAnalyticsParams<'_>) {
         use rust_decimal::Decimal;
+
+        let UsageAnalyticsParams {
+            user_id,
+            model,
+            prompt_tokens,
+            completion_tokens,
+            total_cost,
+            timestamp,
+            fusillade_batch_id,
+            status_code,
+        } = params;
 
         sqlx::query!(
             r#"
@@ -2124,7 +2153,7 @@ mod tests {
                 user_id, fusillade_batch_id,
                 input_price_per_token, output_price_per_token
             ) VALUES (
-                $1, $2, $3, '/ai/chat/completions', 'POST', 200,
+                $1, $2, $3, '/ai/chat/completions', 'POST', $12,
                 100, $4, $5, $6, $7,
                 $8, $9,
                 $10, $11
@@ -2157,6 +2186,7 @@ mod tests {
                     Some(Decimal::ZERO)
                 }
             },
+            status_code,
         )
         .execute(pool)
         .await
@@ -2188,9 +2218,35 @@ mod tests {
         let now = Utc::now();
 
         // Insert a realtime request (no batch id)
-        insert_usage_analytics(&pool, user_id, "gpt-4", 100, 50, 0.0, now, None).await;
+        insert_usage_analytics(
+            &pool,
+            UsageAnalyticsParams {
+                user_id,
+                model: "gpt-4",
+                prompt_tokens: 100,
+                completion_tokens: 50,
+                total_cost: 0.0,
+                timestamp: now,
+                fusillade_batch_id: None,
+                status_code: 200,
+            },
+        )
+        .await;
         // Insert a batch request
-        insert_usage_analytics(&pool, user_id, "gpt-4", 200, 100, 0.0, now, Some(Uuid::new_v4())).await;
+        insert_usage_analytics(
+            &pool,
+            UsageAnalyticsParams {
+                user_id,
+                model: "gpt-4",
+                prompt_tokens: 200,
+                completion_tokens: 100,
+                total_cost: 0.0,
+                timestamp: now,
+                fusillade_batch_id: Some(Uuid::new_v4()),
+                status_code: 200,
+            },
+        )
+        .await;
 
         refresh_user_model_usage(&pool).await.unwrap();
 
@@ -2210,9 +2266,35 @@ mod tests {
         let one_hour_ago = now - Duration::hours(1);
 
         // Insert a realtime request (no batch id)
-        insert_usage_analytics(&pool, user_id, "claude-3", 80, 40, 0.0, now, None).await;
+        insert_usage_analytics(
+            &pool,
+            UsageAnalyticsParams {
+                user_id,
+                model: "claude-3",
+                prompt_tokens: 80,
+                completion_tokens: 40,
+                total_cost: 0.0,
+                timestamp: now,
+                fusillade_batch_id: None,
+                status_code: 200,
+            },
+        )
+        .await;
         // Insert a batch request
-        insert_usage_analytics(&pool, user_id, "claude-3", 120, 60, 0.0, now, Some(Uuid::new_v4())).await;
+        insert_usage_analytics(
+            &pool,
+            UsageAnalyticsParams {
+                user_id,
+                model: "claude-3",
+                prompt_tokens: 120,
+                completion_tokens: 60,
+                total_cost: 0.0,
+                timestamp: now,
+                fusillade_batch_id: Some(Uuid::new_v4()),
+                status_code: 200,
+            },
+        )
+        .await;
 
         let breakdown = get_user_model_breakdown_for_range(&pool, user_id, one_hour_ago, now).await.unwrap();
         assert_eq!(breakdown.len(), 1);
@@ -2230,13 +2312,245 @@ mod tests {
         let batch_id = Uuid::new_v4();
 
         // Insert a realtime request (no batch id)
-        insert_usage_analytics(&pool, user_id, "gpt-4", 100, 50, 0.0, now, None).await;
+        insert_usage_analytics(
+            &pool,
+            UsageAnalyticsParams {
+                user_id,
+                model: "gpt-4",
+                prompt_tokens: 100,
+                completion_tokens: 50,
+                total_cost: 0.0,
+                timestamp: now,
+                fusillade_batch_id: None,
+                status_code: 200,
+            },
+        )
+        .await;
         // Insert two requests from the same batch
-        insert_usage_analytics(&pool, user_id, "gpt-4", 200, 100, 0.0, now, Some(batch_id)).await;
-        insert_usage_analytics(&pool, user_id, "gpt-4", 150, 75, 0.0, now, Some(batch_id)).await;
+        insert_usage_analytics(
+            &pool,
+            UsageAnalyticsParams {
+                user_id,
+                model: "gpt-4",
+                prompt_tokens: 200,
+                completion_tokens: 100,
+                total_cost: 0.0,
+                timestamp: now,
+                fusillade_batch_id: Some(batch_id),
+                status_code: 200,
+            },
+        )
+        .await;
+        insert_usage_analytics(
+            &pool,
+            UsageAnalyticsParams {
+                user_id,
+                model: "gpt-4",
+                prompt_tokens: 150,
+                completion_tokens: 75,
+                total_cost: 0.0,
+                timestamp: now,
+                fusillade_batch_id: Some(batch_id),
+                status_code: 200,
+            },
+        )
+        .await;
 
         let count = get_user_batch_count_for_range(&pool, user_id, one_hour_ago, now).await.unwrap();
         // Only 1 distinct batch, realtime requests not counted
+        assert_eq!(count, 1);
+    }
+
+    #[sqlx::test]
+    async fn test_refresh_user_model_usage_excludes_errors(pool: PgPool) {
+        let user_id = create_usage_test_user(&pool).await;
+        let now = Utc::now();
+
+        // Insert successful requests
+        insert_usage_analytics(
+            &pool,
+            UsageAnalyticsParams {
+                user_id,
+                model: "gpt-4",
+                prompt_tokens: 100,
+                completion_tokens: 50,
+                total_cost: 0.0,
+                timestamp: now,
+                fusillade_batch_id: None,
+                status_code: 200,
+            },
+        )
+        .await;
+        insert_usage_analytics(
+            &pool,
+            UsageAnalyticsParams {
+                user_id,
+                model: "gpt-4",
+                prompt_tokens: 200,
+                completion_tokens: 100,
+                total_cost: 0.0,
+                timestamp: now,
+                fusillade_batch_id: None,
+                status_code: 200,
+            },
+        )
+        .await;
+        // Insert error requests that should be excluded
+        insert_usage_analytics_with_status(
+            &pool,
+            UsageAnalyticsParams {
+                user_id,
+                model: "gpt-4",
+                prompt_tokens: 80,
+                completion_tokens: 0,
+                total_cost: 0.0,
+                timestamp: now,
+                fusillade_batch_id: None,
+                status_code: 400,
+            },
+        )
+        .await;
+        insert_usage_analytics_with_status(
+            &pool,
+            UsageAnalyticsParams {
+                user_id,
+                model: "gpt-4",
+                prompt_tokens: 90,
+                completion_tokens: 0,
+                total_cost: 0.0,
+                timestamp: now,
+                fusillade_batch_id: None,
+                status_code: 500,
+            },
+        )
+        .await;
+        insert_usage_analytics_with_status(
+            &pool,
+            UsageAnalyticsParams {
+                user_id,
+                model: "gpt-4",
+                prompt_tokens: 70,
+                completion_tokens: 0,
+                total_cost: 0.0,
+                timestamp: now,
+                fusillade_batch_id: None,
+                status_code: 429,
+            },
+        )
+        .await;
+
+        refresh_user_model_usage(&pool).await.unwrap();
+
+        let breakdown = get_user_model_breakdown(&pool, user_id).await.unwrap();
+        assert_eq!(breakdown.len(), 1);
+        assert_eq!(breakdown[0].model, "gpt-4");
+        // Only the two 200 requests should be counted
+        assert_eq!(breakdown[0].request_count, 2);
+        assert_eq!(breakdown[0].input_tokens, 300); // 100 + 200
+        assert_eq!(breakdown[0].output_tokens, 150); // 50 + 100
+    }
+
+    #[sqlx::test]
+    async fn test_get_user_model_breakdown_for_range_excludes_errors(pool: PgPool) {
+        let user_id = create_usage_test_user(&pool).await;
+        let now = Utc::now();
+        let one_hour_ago = now - Duration::hours(1);
+
+        // Insert successful requests
+        insert_usage_analytics(
+            &pool,
+            UsageAnalyticsParams {
+                user_id,
+                model: "claude-3",
+                prompt_tokens: 80,
+                completion_tokens: 40,
+                total_cost: 0.0,
+                timestamp: now,
+                fusillade_batch_id: None,
+                status_code: 200,
+            },
+        )
+        .await;
+        // Insert error requests that should be excluded
+        insert_usage_analytics_with_status(
+            &pool,
+            UsageAnalyticsParams {
+                user_id,
+                model: "claude-3",
+                prompt_tokens: 60,
+                completion_tokens: 0,
+                total_cost: 0.0,
+                timestamp: now,
+                fusillade_batch_id: None,
+                status_code: 400,
+            },
+        )
+        .await;
+        insert_usage_analytics_with_status(
+            &pool,
+            UsageAnalyticsParams {
+                user_id,
+                model: "claude-3",
+                prompt_tokens: 70,
+                completion_tokens: 0,
+                total_cost: 0.0,
+                timestamp: now,
+                fusillade_batch_id: None,
+                status_code: 502,
+            },
+        )
+        .await;
+
+        let breakdown = get_user_model_breakdown_for_range(&pool, user_id, one_hour_ago, now).await.unwrap();
+        assert_eq!(breakdown.len(), 1);
+        assert_eq!(breakdown[0].model, "claude-3");
+        // Only the successful request should be counted
+        assert_eq!(breakdown[0].request_count, 1);
+        assert_eq!(breakdown[0].input_tokens, 80);
+        assert_eq!(breakdown[0].output_tokens, 40);
+    }
+
+    #[sqlx::test]
+    async fn test_get_user_batch_count_for_range_excludes_errors(pool: PgPool) {
+        let user_id = create_usage_test_user(&pool).await;
+        let now = Utc::now();
+        let one_hour_ago = now - Duration::hours(1);
+        let batch_ok = Uuid::new_v4();
+        let batch_err = Uuid::new_v4();
+
+        // Successful batch request
+        insert_usage_analytics(
+            &pool,
+            UsageAnalyticsParams {
+                user_id,
+                model: "gpt-4",
+                prompt_tokens: 100,
+                completion_tokens: 50,
+                total_cost: 0.0,
+                timestamp: now,
+                fusillade_batch_id: Some(batch_ok),
+                status_code: 200,
+            },
+        )
+        .await;
+        // Failed batch request (different batch) - should be excluded
+        insert_usage_analytics_with_status(
+            &pool,
+            UsageAnalyticsParams {
+                user_id,
+                model: "gpt-4",
+                prompt_tokens: 80,
+                completion_tokens: 0,
+                total_cost: 0.0,
+                timestamp: now,
+                fusillade_batch_id: Some(batch_err),
+                status_code: 500,
+            },
+        )
+        .await;
+
+        let count = get_user_batch_count_for_range(&pool, user_id, one_hour_ago, now).await.unwrap();
+        // Only the successful batch should be counted
         assert_eq!(count, 1);
     }
 }

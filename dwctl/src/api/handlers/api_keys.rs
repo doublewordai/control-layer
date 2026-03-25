@@ -158,6 +158,10 @@ pub async fn create_user_api_key<P: PoolProvider>(
     let db_request = ApiKeyCreateDBRequest::new(target_user_id, created_by, data);
 
     let api_key = repo.create(&db_request).await?;
+
+    // api_key.created webhook deliveries are created by the notification poller
+    // via PG LISTEN/NOTIFY on the api_keys table.
+
     Ok((StatusCode::CREATED, Json(ApiKeyResponse::from(api_key))))
 }
 

@@ -159,6 +159,9 @@ pub async fn register<P: PoolProvider>(
 
     tx.commit().await.map_err(|e| Error::Database(e.into()))?;
 
+    // user.created webhook deliveries are created by the notification poller
+    // via PG LISTEN/NOTIFY on the users table.
+
     // Create sample files for new user if enabled (non-blocking, failures are logged)
     if state.config.sample_files.enabled && state.config.batches.enabled {
         let user_id = created_user.id;

@@ -1,5 +1,25 @@
 # Changelog
 
+## [8.28.1](https://github.com/doublewordai/control-layer/compare/v8.28.0...v8.28.1) (2026-03-25)
+
+
+### Bug Fixes
+
+* batch streaming ([#909](https://github.com/doublewordai/control-layer/issues/909)) ([3c6ce8d](https://github.com/doublewordai/control-layer/commit/3c6ce8db9a5bad3c95f2bf2874aeb4f02881396b))
+
+## [8.28.0](https://github.com/doublewordai/control-layer/compare/v8.27.1...v8.28.0) (2026-03-24)
+
+
+### Features
+
+* platform webhooks extension ([#902](https://github.com/doublewordai/control-layer/issues/902)) ([1a8a0cf](https://github.com/doublewordai/control-layer/commit/1a8a0cf42725dc06a97b9220fe89757c0e4c4efc))
+
+
+### Bug Fixes
+
+* enrich 402 when balance &lt;= 0 ([#859](https://github.com/doublewordai/control-layer/issues/859)) ([3ed3703](https://github.com/doublewordai/control-layer/commit/3ed37030d8c65607e045da4d5f8efeefe4db19de))
+* error realtime usage ([#913](https://github.com/doublewordai/control-layer/issues/913)) ([6ffa10d](https://github.com/doublewordai/control-layer/commit/6ffa10ddd16038d1216dfbd5a4e8e1d2690b6de0))
+
 ## [8.27.1](https://github.com/doublewordai/control-layer/compare/v8.27.0...v8.27.1) (2026-03-20)
 
 

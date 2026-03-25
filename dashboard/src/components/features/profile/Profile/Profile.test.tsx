@@ -7,6 +7,7 @@ import { ReactNode } from "react";
 import { describe, it, expect, beforeAll, afterEach, afterAll } from "vitest";
 import userEvent from "@testing-library/user-event";
 import { Profile } from "./Profile";
+import { OrganizationProvider } from "../../../../contexts/organization/OrganizationContext";
 import { handlers } from "../../../../api/control-layer/mocks/handlers";
 import type { Webhook } from "../../../../api/control-layer/types";
 
@@ -40,6 +41,7 @@ function makeWebhook(overrides: Partial<Webhook> = {}): Webhook {
     enabled: true,
     event_types: ["batch.completed", "batch.failed"],
     description: "My test webhook",
+    scope: "own",
     created_at: "2025-01-01T00:00:00Z",
     updated_at: "2025-01-01T00:00:00Z",
     disabled_at: null,
@@ -59,7 +61,9 @@ function createWrapper() {
 
   return ({ children }: { children: ReactNode }) => (
     <QueryClientProvider client={queryClient}>
-      <MemoryRouter>{children}</MemoryRouter>
+      <MemoryRouter>
+        <OrganizationProvider>{children}</OrganizationProvider>
+      </MemoryRouter>
     </QueryClientProvider>
   );
 }
@@ -514,5 +518,265 @@ describe("Webhooks", () => {
     await waitFor(() => {
       expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     });
+  });
+});
+
+describe("Webhook Scope", () => {
+  it("shows scope selector for PlatformManager users", async () => {
+    const { container, user } = await renderAndWaitForProfile();
+
+    await user.click(
+      within(container).getByRole("button", { name: "Add webhook" }),
+    );
+
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getByText("Scope")).toBeInTheDocument();
+    expect(within(dialog).getByRole("tab", { name: "Personal" })).toHaveAttribute("data-state", "active");
+    expect(within(dialog).getByRole("tab", { name: "Platform" })).toBeInTheDocument();
+  });
+
+  it("does not show scope selector for non-PM users", async () => {
+    server.use(
+      http.get("/admin/api/v1/users/:id", () => {
+        return HttpResponse.json({
+          id: "550e8400-e29b-41d4-a716-446655440001",
+          username: "standard-user",
+          email: "user@acme.com",
+          display_name: "Standard User",
+          avatar_url: null,
+          roles: ["StandardUser"],
+          created_at: "2025-03-10T10:00:00Z",
+          updated_at: "2025-12-20T15:30:00Z",
+          auth_source: "native",
+        });
+      }),
+    );
+
+    const { container, user } = await renderAndWaitForProfile();
+
+    await user.click(
+      within(container).getByRole("button", { name: "Add webhook" }),
+    );
+
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).queryByText("Scope")).not.toBeInTheDocument();
+    expect(within(dialog).queryByRole("tab", { name: "Platform" })).not.toBeInTheDocument();
+  });
+
+  it("switches event types when scope changes", async () => {
+    const { container, user } = await renderAndWaitForProfile();
+
+    await user.click(
+      within(container).getByRole("button", { name: "Add webhook" }),
+    );
+
+    const dialog = await screen.findByRole("dialog");
+
+    // Own scope shows batch events by default
+    expect(within(dialog).getByText("Batch completed")).toBeInTheDocument();
+    expect(within(dialog).getByText("Batch failed")).toBeInTheDocument();
+    expect(within(dialog).queryByText("User created")).not.toBeInTheDocument();
+
+    // Switch to platform scope
+    await user.click(within(dialog).getByRole("tab", { name: "Platform" }));
+
+    // Platform events shown, own events gone
+    expect(within(dialog).getByText("User created")).toBeInTheDocument();
+    expect(within(dialog).getByText("Batch created")).toBeInTheDocument();
+    expect(within(dialog).getByText("API key created")).toBeInTheDocument();
+    expect(within(dialog).queryByText("Batch completed")).not.toBeInTheDocument();
+    expect(within(dialog).queryByText("Batch failed")).not.toBeInTheDocument();
+  });
+
+  it("sends scope in create request", async () => {
+    let postedBody: Record<string, unknown> | null = null;
+    server.use(
+      http.post("/admin/api/v1/users/:userId/webhooks", async ({ request }) => {
+        postedBody = (await request.json()) as Record<string, unknown>;
+        const now = new Date().toISOString();
+        return HttpResponse.json(
+          {
+            id: "wh-new",
+            user_id: "550e8400-e29b-41d4-a716-446655440000",
+            url: postedBody.url,
+            enabled: true,
+            event_types: postedBody.event_types,
+            description: null,
+            scope: postedBody.scope || "own",
+            created_at: now,
+            updated_at: now,
+            disabled_at: null,
+            secret: "whsec_test123",
+          },
+          { status: 201 },
+        );
+      }),
+    );
+
+    const { container, user } = await renderAndWaitForProfile();
+
+    await user.click(
+      within(container).getByRole("button", { name: "Add webhook" }),
+    );
+
+    const dialog = await screen.findByRole("dialog");
+
+    // Switch to platform scope
+    await user.click(within(dialog).getByRole("tab", { name: "Platform" }));
+
+    // Fill URL
+    const urlInput = within(dialog).getByLabelText("Endpoint URL");
+    await user.type(urlInput, "https://example.com/platform-hook");
+
+    // Submit
+    await user.click(
+      within(dialog).getByRole("button", { name: "Create Webhook" }),
+    );
+
+    await waitFor(() => {
+      expect(postedBody).not.toBeNull();
+    });
+    expect(postedBody).toMatchObject({
+      scope: "platform",
+      event_types: ["user.created", "batch.created", "api_key.created"],
+    });
+  });
+
+  it("shows Platform badge on platform-scoped webhooks", async () => {
+    server.use(
+      http.get("/admin/api/v1/users/:userId/webhooks", () => {
+        return HttpResponse.json([
+          makeWebhook({
+            scope: "platform",
+            event_types: ["user.created"],
+          }),
+        ]);
+      }),
+    );
+
+    const { container } = await renderAndWaitForProfile();
+
+    await waitFor(() => {
+      expect(within(container).getByText("Platform")).toBeInTheDocument();
+    });
+  });
+
+  it("shows scope as read-only in edit dialog for platform webhooks", async () => {
+    const webhook = makeWebhook({
+      scope: "platform",
+      event_types: ["user.created", "batch.created"],
+    });
+    server.use(
+      http.get("/admin/api/v1/users/:userId/webhooks", () => {
+        return HttpResponse.json([webhook]);
+      }),
+    );
+
+    const { container, user } = await renderAndWaitForProfile();
+
+    await waitFor(() => {
+      expect(within(container).getByText(webhook.url)).toBeInTheDocument();
+    });
+
+    await user.click(
+      within(container).getByRole("button", {
+        name: `Edit webhook ${webhook.url}`,
+      }),
+    );
+
+    const dialog = await screen.findByRole("dialog");
+
+    // Scope shown as read-only badge, no tabs
+    expect(within(dialog).getByText("Platform")).toBeInTheDocument();
+    expect(within(dialog).queryByRole("tab", { name: "Personal" })).not.toBeInTheDocument();
+
+    // Platform event types shown in edit mode
+    expect(within(dialog).getByText("User created")).toBeInTheDocument();
+    expect(within(dialog).getByText("Batch created")).toBeInTheDocument();
+  });
+});
+
+describe("Organization Context", () => {
+  const ORG_ID = "org-test-123";
+  const ORG_NAME = "Test Org";
+
+  /** Override the current user response to include an active organization. */
+  function useOrgContextHandler(role: string) {
+    return http.get("/admin/api/v1/users/:id", ({ params }) => {
+      if (params.id !== "current") {
+        return HttpResponse.json(
+          { error: "User not found" },
+          { status: 404 },
+        );
+      }
+      return HttpResponse.json({
+        id: "550e8400-e29b-41d4-a716-446655440001",
+        username: "github|109540503",
+        email: "sarah.chen@acme.com",
+        display_name: "Sarah Chen",
+        roles: ["StandardUser"],
+        created_at: "2025-03-10T10:00:00Z",
+        updated_at: "2025-12-20T15:30:00Z",
+        auth_source: "proxy-header",
+        is_admin: false,
+        has_payment_provider_id: false,
+        batch_notifications_enabled: false,
+        low_balance_threshold: null,
+        auto_topup_amount: null,
+        auto_topup_threshold: null,
+        auto_topup_monthly_limit: null,
+        has_auto_topup_payment_method: false,
+        active_organization_id: ORG_ID,
+        organizations: [{ id: ORG_ID, name: ORG_NAME, role }],
+      });
+    });
+  }
+
+  it("shows org banner instead of notification settings for admin", async () => {
+    server.use(useOrgContextHandler("admin"));
+    const { container } = render(<Profile />, { wrapper: createWrapper() });
+
+    await waitFor(() => {
+      expect(
+        within(container).getByRole("heading", { name: "Profile Settings" }),
+      ).toBeInTheDocument();
+    });
+
+    // Should show org banner with link to org settings
+    expect(
+      within(container).getByText(/managed at the organization level/),
+    ).toBeInTheDocument();
+    expect(
+      within(container).getByRole("button", { name: "organization settings" }),
+    ).toBeInTheDocument();
+
+    // Should NOT render notification toggles
+    expect(
+      within(container).queryByRole("switch", { name: "Email notifications" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("shows contact admin message for regular members", async () => {
+    server.use(useOrgContextHandler("member"));
+    const { container } = render(<Profile />, { wrapper: createWrapper() });
+
+    await waitFor(() => {
+      expect(
+        within(container).getByRole("heading", { name: "Profile Settings" }),
+      ).toBeInTheDocument();
+    });
+
+    expect(
+      within(container).getByText(
+        /Contact an admin of your organization to request changes/,
+      ),
+    ).toBeInTheDocument();
+
+    // Should NOT show link to org settings
+    expect(
+      within(container).queryByRole("button", {
+        name: "organization settings",
+      }),
+    ).not.toBeInTheDocument();
   });
 });

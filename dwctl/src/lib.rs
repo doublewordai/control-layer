@@ -2191,6 +2191,7 @@ impl Application {
         // Build onwards router from targets with body transform, response sanitization, and tool executor.
         let onwards_app_state = onwards::AppState::with_transform(bg_services.onwards_targets.clone(), body_transform)
             .with_response_transform(onwards::create_openai_sanitizer())
+            .with_streaming_header("x-fusillade-stream")
             .with_tool_executor(Arc::new(tool_executor));
         let onwards_router = if bg_services.onwards_targets.strict_mode {
             tracing::info!("Strict mode enabled - using typed request validation");
