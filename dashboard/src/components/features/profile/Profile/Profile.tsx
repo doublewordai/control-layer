@@ -649,7 +649,7 @@ export const Profile: React.FC = () => {
                         >
                           organization settings
                         </button>
-                        {" "}to configure notifications for {activeOrganization.name}.
+                        {" "}to configure notifications for {activeOrganization?.name ?? "your organization"}.
                       </>
                     ) : (
                       "Contact an admin of your organization to request changes."

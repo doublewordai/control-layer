@@ -282,6 +282,7 @@ export const NotificationSettings: React.FC<NotificationSettingsProps> = ({
     try {
       if (editingWebhook) {
         await updateWebhookMutation.mutateAsync({
+          userId,
           webhookId: editingWebhook.id,
           data: {
             url: webhookUrl,
@@ -313,7 +314,7 @@ export const NotificationSettings: React.FC<NotificationSettingsProps> = ({
 
   const handleWebhookDelete = async (webhookId: string) => {
     try {
-      await deleteWebhookMutation.mutateAsync({ webhookId });
+      await deleteWebhookMutation.mutateAsync({ userId, webhookId });
       setDeletingWebhookId(null);
     } catch {
       // Error handled by mutation
@@ -323,6 +324,7 @@ export const NotificationSettings: React.FC<NotificationSettingsProps> = ({
   const handleWebhookToggle = async (webhook: Webhook) => {
     try {
       await updateWebhookMutation.mutateAsync({
+        userId,
         webhookId: webhook.id,
         data: { enabled: !webhook.enabled },
       });
@@ -333,7 +335,7 @@ export const NotificationSettings: React.FC<NotificationSettingsProps> = ({
 
   const handleRotateSecret = async (webhookId: string) => {
     try {
-      const result = await rotateSecretMutation.mutateAsync({ webhookId });
+      const result = await rotateSecretMutation.mutateAsync({ userId, webhookId });
       setWebhookSecret(result.secret);
     } catch {
       // Error handled by mutation

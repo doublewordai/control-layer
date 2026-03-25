@@ -695,3 +695,88 @@ describe("Webhook Scope", () => {
     expect(within(dialog).getByText("Batch created")).toBeInTheDocument();
   });
 });
+
+describe("Organization Context", () => {
+  const ORG_ID = "org-test-123";
+  const ORG_NAME = "Test Org";
+
+  /** Override the current user response to include an active organization. */
+  function useOrgContextHandler(role: string) {
+    return http.get("/admin/api/v1/users/:id", ({ params }) => {
+      if (params.id !== "current") {
+        return HttpResponse.json(
+          { error: "User not found" },
+          { status: 404 },
+        );
+      }
+      return HttpResponse.json({
+        id: "550e8400-e29b-41d4-a716-446655440001",
+        username: "github|109540503",
+        email: "sarah.chen@acme.com",
+        display_name: "Sarah Chen",
+        roles: ["StandardUser"],
+        created_at: "2025-03-10T10:00:00Z",
+        updated_at: "2025-12-20T15:30:00Z",
+        auth_source: "proxy-header",
+        is_admin: false,
+        has_payment_provider_id: false,
+        batch_notifications_enabled: false,
+        low_balance_threshold: null,
+        auto_topup_amount: null,
+        auto_topup_threshold: null,
+        auto_topup_monthly_limit: null,
+        has_auto_topup_payment_method: false,
+        active_organization_id: ORG_ID,
+        organizations: [{ id: ORG_ID, name: ORG_NAME, role }],
+      });
+    });
+  }
+
+  it("shows org banner instead of notification settings for admin", async () => {
+    server.use(useOrgContextHandler("admin"));
+    const { container } = render(<Profile />, { wrapper: createWrapper() });
+
+    await waitFor(() => {
+      expect(
+        within(container).getByRole("heading", { name: "Profile Settings" }),
+      ).toBeInTheDocument();
+    });
+
+    // Should show org banner with link to org settings
+    expect(
+      within(container).getByText(/managed at the organization level/),
+    ).toBeInTheDocument();
+    expect(
+      within(container).getByRole("button", { name: "organization settings" }),
+    ).toBeInTheDocument();
+
+    // Should NOT render notification toggles
+    expect(
+      within(container).queryByRole("switch", { name: "Email notifications" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("shows contact admin message for regular members", async () => {
+    server.use(useOrgContextHandler("member"));
+    const { container } = render(<Profile />, { wrapper: createWrapper() });
+
+    await waitFor(() => {
+      expect(
+        within(container).getByRole("heading", { name: "Profile Settings" }),
+      ).toBeInTheDocument();
+    });
+
+    expect(
+      within(container).getByText(
+        /Contact an admin of your organization to request changes/,
+      ),
+    ).toBeInTheDocument();
+
+    // Should NOT show link to org settings
+    expect(
+      within(container).queryByRole("button", {
+        name: "organization settings",
+      }),
+    ).not.toBeInTheDocument();
+  });
+});
