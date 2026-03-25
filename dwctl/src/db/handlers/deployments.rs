@@ -3503,7 +3503,7 @@ mod tests {
             assert_eq!(b_rules[0].action, "redirect");
 
             // model_c has no rules (absent key)
-            assert!(map.get(&model_c.id).is_none());
+            assert!(!map.contains_key(&model_c.id));
 
             tx.commit().await.unwrap();
         }
@@ -3799,11 +3799,7 @@ mod tests {
         let filter = DeploymentFilter::new(0, 100).with_provider("openai".to_string());
         let models = repo.list(&filter).await.unwrap();
         assert!(models.iter().any(|m| m.id == openai_model.id));
-        assert!(models.iter().all(|m| {
-            // Models matching the filter should have OpenAI provider
-            // (other models without metadata won't match anyway)
-            m.id != openai_model.id || m.id == openai_model.id
-        }));
+        assert_eq!(models.len(), 1, "provider filter should only return the OpenAI model");
         // Verify the anthropic model is not returned
         assert!(!models.iter().any(|m| m.alias == "provider-filter-anthropic"));
     }

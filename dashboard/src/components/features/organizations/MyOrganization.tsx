@@ -1,6 +1,7 @@
 import { useOrganization } from "@/api/control-layer/hooks";
 import { useOrganizationContext } from "@/contexts";
 import { MemberManagement } from "./MemberManagement";
+import { NotificationSettings } from "../notifications/NotificationSettings";
 import { Building } from "lucide-react";
 
 export function MyOrganization() {
@@ -61,6 +62,10 @@ export function MyOrganization() {
         organizationId={activeOrganizationId}
         readOnly={!canManage}
       />
+
+      {canManage && (
+        <NotificationSettings userId={activeOrganizationId} />
+      )}
     </div>
   );
 }
