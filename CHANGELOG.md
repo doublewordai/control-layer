@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.28.1](https://github.com/doublewordai/control-layer/compare/v8.28.0...v8.28.1) (2026-03-25)
+
+
+### Bug Fixes
+
+* batch streaming ([#909](https://github.com/doublewordai/control-layer/issues/909)) ([3c6ce8d](https://github.com/doublewordai/control-layer/commit/3c6ce8db9a5bad3c95f2bf2874aeb4f02881396b))
+
 ## [8.28.0](https://github.com/doublewordai/control-layer/compare/v8.27.1...v8.28.0) (2026-03-24)
 
 
