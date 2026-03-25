@@ -7,6 +7,7 @@ import { ReactNode } from "react";
 import { describe, it, expect, beforeAll, afterEach, afterAll } from "vitest";
 import userEvent from "@testing-library/user-event";
 import { Profile } from "./Profile";
+import { OrganizationProvider } from "../../../../contexts/organization/OrganizationContext";
 import { handlers } from "../../../../api/control-layer/mocks/handlers";
 import type { Webhook } from "../../../../api/control-layer/types";
 
@@ -60,7 +61,9 @@ function createWrapper() {
 
   return ({ children }: { children: ReactNode }) => (
     <QueryClientProvider client={queryClient}>
-      <MemoryRouter>{children}</MemoryRouter>
+      <MemoryRouter>
+        <OrganizationProvider>{children}</OrganizationProvider>
+      </MemoryRouter>
     </QueryClientProvider>
   );
 }
