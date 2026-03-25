@@ -196,7 +196,9 @@ async fn test_cache_shape_batch_escalation_access_for_private_alias(pool: sqlx::
     assert!(pool_has_key(pool_without.value(), SYSTEM_KEY_SECRET));
     assert!(!pool_has_key(pool_without.value(), KEY_BATCH_SECRET));
 
-    let with_escalation = super::load_targets_from_db(&pool, &[alias.clone()], false).await.unwrap();
+    let with_escalation = super::load_targets_from_db(&pool, std::slice::from_ref(&alias), false)
+        .await
+        .unwrap();
     let pool_with = with_escalation.targets.get(&alias).expect("target should exist");
     assert_eq!(pool_keys_len(pool_with.value()), 2, "with escalation batch key should be added");
     assert!(pool_has_key(pool_with.value(), SYSTEM_KEY_SECRET));

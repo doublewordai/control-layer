@@ -3141,7 +3141,6 @@ mod tests {
             })
             .await
             .unwrap();
-        drop(credits_repo);
         drop(conn);
 
         let create_req = CreateBatchRequest {
@@ -3251,7 +3250,6 @@ mod tests {
             })
             .await
             .unwrap();
-        drop(credits_repo);
         drop(conn);
 
         // Give org access to a model

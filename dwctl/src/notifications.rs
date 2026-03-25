@@ -970,6 +970,42 @@ async fn process_auto_topups(
     }
 }
 
+/// Send low-balance notification emails to the given users.
+async fn send_low_balance_notifications(
+    email_service: &EmailService,
+    users: &[&LowBalanceUser],
+    balance_for: &impl Fn(&LowBalanceUser) -> Option<rust_decimal::Decimal>,
+    conn: &mut sqlx::pool::PoolConnection<sqlx::Postgres>,
+) {
+    let mut sent_ids = Vec::new();
+
+    for user in users {
+        let Some(balance) = balance_for(user) else { continue };
+        let name = user.display_name.as_deref().unwrap_or(&user.username);
+
+        if let Err(e) = email_service.send_low_balance_email(&user.email, Some(name), &balance).await {
+            tracing::warn!(
+                user_id = %user.id,
+                email = %user.email,
+                error = %e,
+                "Failed to send low-balance notification email"
+            );
+            continue;
+        }
+
+        tracing::info!(user_id = %user.id, email = %user.email, balance = %balance, "Sent low-balance notification");
+        sent_ids.push(user.id);
+    }
+
+    // Bulk-mark all successfully sent notifications
+    if !sent_ids.is_empty() {
+        let mut users_repo = Users::new(&mut *conn);
+        if let Err(e) = users_repo.mark_low_balance_notification_sent(&sent_ids).await {
+            tracing::warn!(error = %e, "Failed to mark low-balance notifications as sent");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1317,41 +1353,5 @@ mod tests {
             1,
             "Should NOT have charged (limit fully exhausted, zero headroom)"
         );
-    }
-}
-
-/// Send low-balance notification emails to the given users.
-async fn send_low_balance_notifications(
-    email_service: &EmailService,
-    users: &[&LowBalanceUser],
-    balance_for: &impl Fn(&LowBalanceUser) -> Option<rust_decimal::Decimal>,
-    conn: &mut sqlx::pool::PoolConnection<sqlx::Postgres>,
-) {
-    let mut sent_ids = Vec::new();
-
-    for user in users {
-        let Some(balance) = balance_for(user) else { continue };
-        let name = user.display_name.as_deref().unwrap_or(&user.username);
-
-        if let Err(e) = email_service.send_low_balance_email(&user.email, Some(name), &balance).await {
-            tracing::warn!(
-                user_id = %user.id,
-                email = %user.email,
-                error = %e,
-                "Failed to send low-balance notification email"
-            );
-            continue;
-        }
-
-        tracing::info!(user_id = %user.id, email = %user.email, balance = %balance, "Sent low-balance notification");
-        sent_ids.push(user.id);
-    }
-
-    // Bulk-mark all successfully sent notifications
-    if !sent_ids.is_empty() {
-        let mut users_repo = Users::new(&mut *conn);
-        if let Err(e) = users_repo.mark_low_balance_notification_sent(&sent_ids).await {
-            tracing::warn!(error = %e, "Failed to mark low-balance notifications as sent");
-        }
     }
 }

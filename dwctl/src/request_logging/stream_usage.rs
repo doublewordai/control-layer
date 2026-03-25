@@ -1,29 +1,42 @@
-/// Body transform that injects `stream_options.include_usage = true` into streaming
-/// completion requests. This ensures upstream providers report token usage in the final
-/// SSE chunk, which is required for accurate billing and analytics.
+/// Body transform that injects streaming flags for generative requests.
 ///
-/// Also handles the `X-Fusillade-Stream: true` header: when present, sets `stream: true`
-/// and `stream_options.include_usage = true` so fusillade batch requests are executed as
-/// streaming requests to capture usage data.
+/// For `/completions` and `/chat/completions`, it injects `stream_options.include_usage = true`
+/// into streaming requests so providers report token usage in the final SSE chunk.
+///
+/// Also handles the `X-Fusillade-Stream: true` header:
+/// - for `/completions` and `/chat/completions`, sets `stream: true` and
+///   `stream_options.include_usage = true`
+/// - for `/responses`, sets `stream: true` so the provider returns SSE events that include
+///   the final `response.completed` usage payload.
 pub fn stream_usage_transform(path: &str, headers: &axum::http::HeaderMap, body_bytes: &[u8]) -> Option<axum::body::Bytes> {
     let fusillade_stream = headers.get("x-fusillade-stream").and_then(|v| v.to_str().ok()) == Some("true");
 
-    if path.ends_with("/completions")
-        && let Ok(mut json_body) = serde_json::from_slice::<serde_json::Value>(body_bytes)
-        && let Some(obj) = json_body.as_object_mut()
-        && (obj.get("stream").and_then(|v| v.as_bool()) == Some(true) || fusillade_stream)
-    {
-        if fusillade_stream {
-            obj.insert("stream".to_string(), serde_json::Value::Bool(true));
+    if let Ok(mut json_body) = serde_json::from_slice::<serde_json::Value>(body_bytes) {
+        let request_streaming =
+            json_body.as_object().and_then(|obj| obj.get("stream")).and_then(|v| v.as_bool()) == Some(true) || fusillade_stream;
+
+        if path.ends_with("/completions") && request_streaming {
+            let obj = json_body.as_object_mut()?;
+            if fusillade_stream {
+                obj.insert("stream".to_string(), serde_json::Value::Bool(true));
+            }
+
+            obj.entry("stream_options")
+                .or_insert_with(|| serde_json::json!({}))
+                .as_object_mut()?
+                .insert("include_usage".to_string(), serde_json::json!(true));
+
+            if let Ok(bytes) = serde_json::to_vec(&json_body) {
+                return Some(axum::body::Bytes::from(bytes));
+            }
         }
 
-        obj.entry("stream_options")
-            .or_insert_with(|| serde_json::json!({}))
-            .as_object_mut()?
-            .insert("include_usage".to_string(), serde_json::json!(true));
-
-        if let Ok(bytes) = serde_json::to_vec(&json_body) {
-            return Some(axum::body::Bytes::from(bytes));
+        if path.ends_with("/responses") && fusillade_stream {
+            let obj = json_body.as_object_mut()?;
+            obj.insert("stream".to_string(), serde_json::Value::Bool(true));
+            if let Ok(bytes) = serde_json::to_vec(&json_body) {
+                return Some(axum::body::Bytes::from(bytes));
+            }
         }
     }
 
@@ -168,5 +181,16 @@ mod tests {
             "input": "hello"
         });
         assert!(call_with_headers("/embeddings", &fusillade_stream_headers(), &body).is_none());
+    }
+
+    #[test]
+    fn fusillade_stream_skips_responses_endpoint() {
+        let body = serde_json::json!({
+            "model": "gpt-4o",
+            "input": "hello"
+        });
+        let result = call_with_headers("/v1/responses", &fusillade_stream_headers(), &body).expect("should transform");
+        assert_eq!(result["stream"], true);
+        assert!(result.get("stream_options").is_none());
     }
 }
