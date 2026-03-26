@@ -1354,7 +1354,7 @@ pub async fn get_file_content<P: PoolProvider>(
                     .map_err(|e| Error::Internal {
                         operation: format!("get batch status: {}", e),
                     })?;
-                let still_processing = status.pending_requests > 0 || status.in_progress_requests > 0;
+                let still_processing = !status.is_finished();
                 (still_processing, Some(status.completed_requests as usize))
             } else {
                 (false, None)
@@ -1376,7 +1376,7 @@ pub async fn get_file_content<P: PoolProvider>(
                     .map_err(|e| Error::Internal {
                         operation: format!("get batch status: {}", e),
                     })?;
-                let still_processing = status.pending_requests > 0 || status.in_progress_requests > 0;
+                let still_processing = !status.is_finished();
                 (still_processing, Some(status.failed_requests as usize))
             } else {
                 (false, None)
