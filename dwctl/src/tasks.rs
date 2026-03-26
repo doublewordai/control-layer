@@ -56,5 +56,4 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> TaskRunner<P> {
             }
         });
     }
-
 }
