@@ -2,14 +2,7 @@
   "packages": {
     "dwctl": {
       "release-type": "rust",
-      "changelog-path": "/CHANGELOG.md",
-      "extra-files": [
-        {
-          "type": "json",
-          "path": "/dashboard/package.json",
-          "jsonpath": "$.version"
-        }
-      ]
+      "changelog-path": "/CHANGELOG.md"
     }
   },
   "plugins": ["cargo-workspace"],
