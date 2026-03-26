@@ -12,46 +12,31 @@ use crate::{
     openapi::{AdminApiDoc, AiApiDoc},
     request_logging::{AiRequest, AiResponse},
 };
+use axum_test::TestServer;
 use outlet_postgres::RequestFilter;
 use sqlx::PgPool;
 use sqlx_pool_router::{DbPools, PoolProvider};
 use tracing::info;
 use utils::{add_auth_headers, create_test_admin_user, create_test_config, create_test_user};
+use uuid::Uuid;
+use wiremock::matchers::{body_partial_json, method, path};
 
-/// End-to-end integration test: Full AI proxy flow through API
-/// Follows a real user journey: admin creates endpoint/model, user gets API key, user makes inference request
-#[sqlx::test]
-#[test_log::test]
-async fn test_e2e_ai_proxy_with_mocked_inference(pool: PgPool) {
-    // Setup wiremock server to mock inference endpoint
-    let mock_server = wiremock::MockServer::start().await;
+struct StreamingFixture {
+    server: TestServer,
+    bg_services: crate::BackgroundServices,
+    admin_headers: Vec<(String, String)>,
+    regular_user_id: Uuid,
+    api_key: String,
+    group_id: Uuid,
+}
 
-    // Mock OpenAI-style chat completion response
-    wiremock::Mock::given(wiremock::matchers::method("POST"))
-        .and(wiremock::matchers::path("/v1/chat/completions"))
-        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "id": "chatcmpl-123",
-            "object": "chat.completion",
-            "created": 1677652288,
-            "model": "gpt-3.5-turbo",
-            "choices": [{
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": "Hello! How can I help you today?"
-                },
-                "finish_reason": "stop"
-            }],
-            "usage": {
-                "prompt_tokens": 9,
-                "completion_tokens": 12,
-                "total_tokens": 21
-            }
-        })))
-        .mount(&mock_server)
-        .await;
-
-    // Create test app with onwards_sync and request logging enabled
+async fn setup_streaming_fixture(
+    pool: &PgPool,
+    mock_endpoint_url: String,
+    model_name: &str,
+    alias: &str,
+    open_responses_adapter: Option<bool>,
+) -> StreamingFixture {
     let mut config = crate::test::utils::create_test_config();
     config.background_services.onwards_sync.enabled = true;
     config.enable_request_logging = true;
@@ -61,27 +46,24 @@ async fn test_e2e_ai_proxy_with_mocked_inference(pool: PgPool) {
         .expect("Failed to create application");
     let (server, bg_services) = app.into_test_server();
 
-    // Step 1: Create admin and regular users
-    let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
+    let admin_user = create_test_admin_user(pool, Role::PlatformManager).await;
     let admin_headers = add_auth_headers(&admin_user);
 
-    let regular_user = create_test_user(&pool, Role::StandardUser).await;
+    let regular_user = create_test_user(pool, Role::StandardUser).await;
     let regular_headers = add_auth_headers(&regular_user);
 
-    // Step 2: Admin creates a group via API
     let group_response = server
         .post("/admin/api/v1/groups")
         .add_header(&admin_headers[0].0, &admin_headers[0].1)
         .add_header(&admin_headers[1].0, &admin_headers[1].1)
         .json(&serde_json::json!({
-            "name": "test-group",
-            "description": "Test group for E2E test"
+            "name": format!("test-group-{}", Uuid::new_v4()),
+            "description": "Test group for streaming E2E"
         }))
         .await;
     assert_eq!(group_response.status_code(), 201, "Failed to create group");
     let group: GroupResponse = group_response.json();
 
-    // Step 3: Admin adds user to group via API
     let add_user_response = server
         .post(&format!("/admin/api/v1/groups/{}/users/{}", group.id, regular_user.id))
         .add_header(&admin_headers[0].0, &admin_headers[0].1)
@@ -89,7 +71,6 @@ async fn test_e2e_ai_proxy_with_mocked_inference(pool: PgPool) {
         .await;
     assert_eq!(add_user_response.status_code(), 204, "Failed to add user to group");
 
-    // Step 4: Admin grants credits to user via API
     let credits_response = server
         .post("/admin/api/v1/transactions")
         .add_header(&admin_headers[0].0, &admin_headers[0].1)
@@ -99,37 +80,35 @@ async fn test_e2e_ai_proxy_with_mocked_inference(pool: PgPool) {
             "transaction_type": "admin_grant",
             "amount": 1000,
             "source_id": admin_user.id,
-            "description": "Test credits for E2E test"
+            "description": "Test credits for streaming E2E"
         }))
         .await;
     assert_eq!(credits_response.status_code(), 201, "Failed to grant credits");
 
-    // Step 5: Admin creates inference endpoint via API
-    let mock_endpoint_url = format!("{}/v1", mock_server.uri());
     let endpoint_response = server
         .post("/admin/api/v1/endpoints")
         .add_header(&admin_headers[0].0, &admin_headers[0].1)
         .add_header(&admin_headers[1].0, &admin_headers[1].1)
         .json(&serde_json::json!({
-            "name": "Mock Inference Endpoint",
+            "name": format!("Mock Endpoint {}", alias),
             "url": mock_endpoint_url,
-            "description": "Mock OpenAI-compatible endpoint for testing"
+            "description": "Mock OpenAI-compatible endpoint for streaming E2E"
         }))
         .await;
     assert_eq!(endpoint_response.status_code(), 201, "Failed to create endpoint");
     let endpoint: crate::api::models::inference_endpoints::InferenceEndpointResponse = endpoint_response.json();
 
-    // Step 6: Admin creates deployment via API (with tariffs for credit deduction)
     let deployment_response = server
         .post("/admin/api/v1/models")
         .add_header(&admin_headers[0].0, &admin_headers[0].1)
         .add_header(&admin_headers[1].0, &admin_headers[1].1)
         .json(&serde_json::json!({
             "type": "standard",
-            "model_name": "gpt-3.5-turbo",
-            "alias": "test-model",
+            "model_name": model_name,
+            "alias": alias,
             "description": "Test model deployment",
             "hosted_on": endpoint.id,
+            "open_responses_adapter": open_responses_adapter,
             "tariffs": [{
                 "name": "batch",
                 "input_price_per_token": "0.001",
@@ -141,7 +120,6 @@ async fn test_e2e_ai_proxy_with_mocked_inference(pool: PgPool) {
     assert_eq!(deployment_response.status_code(), 200, "Failed to create deployment");
     let deployment: crate::api::models::deployments::DeployedModelResponse = deployment_response.json();
 
-    // Step 7: Admin adds deployment to group via API
     let add_deployment_response = server
         .post(&format!("/admin/api/v1/groups/{}/models/{}", group.id, deployment.id))
         .add_header(&admin_headers[0].0, &admin_headers[0].1)
@@ -149,107 +127,98 @@ async fn test_e2e_ai_proxy_with_mocked_inference(pool: PgPool) {
         .await;
     assert_eq!(add_deployment_response.status_code(), 204, "Failed to add deployment to group");
 
-    // Step 8: User creates API key via API
     let api_key_response = server
         .post(&format!("/admin/api/v1/users/{}/api-keys", regular_user.id))
         .add_header(&regular_headers[0].0, &regular_headers[0].1)
         .add_header(&regular_headers[1].0, &regular_headers[1].1)
         .json(&serde_json::json!({
             "name": "Test Inference Key",
-            "description": "API key for E2E test",
+            "description": "API key for streaming E2E",
             "purpose": "realtime"
         }))
         .await;
     assert_eq!(api_key_response.status_code(), 201, "Failed to create API key");
     let api_key: crate::api::models::api_keys::ApiKeyResponse = api_key_response.json();
 
-    // Step 9: Sync once, then poll until model becomes available in onwards config
-    bg_services.sync_onwards_config(&pool).await.expect("Failed to sync onwards config");
+    bg_services.sync_onwards_config(pool).await.expect("Failed to sync onwards config");
+    wait_for_model(&server, &api_key.key, alias).await;
 
-    // Poll: Initial state should be 404, target state is 200
+    StreamingFixture {
+        server,
+        bg_services,
+        admin_headers,
+        regular_user_id: regular_user.id,
+        api_key: api_key.key,
+        group_id: group.id,
+    }
+}
+
+async fn wait_for_model(server: &TestServer, api_key: &str, alias: &str) {
     let poll_start = std::time::Instant::now();
     let mut status = 404;
     let mut attempts = 0;
+
     for i in 0..50 {
-        // 50 attempts, no sleep for fast polling
         attempts = i + 1;
         let test_response = server
-            .post("/ai/v1/chat/completions")
-            .add_header("authorization", format!("Bearer {}", api_key.key))
-            .json(&serde_json::json!({
-                "model": "test-model",
-                "messages": [{"role": "user", "content": "test"}]
-            }))
+            .get("/ai/v1/models")
+            .add_header("authorization", format!("Bearer {}", api_key))
             .await;
 
         status = test_response.status_code().as_u16();
-        if status != 404 {
-            // Model is now in onwards config
-            break;
+        if status == 200 {
+            let models: serde_json::Value = test_response.json();
+            if let Some(data) = models["data"].as_array()
+                && data.iter().any(|m| m["id"].as_str() == Some(alias))
+            {
+                break;
+            }
         }
         tokio::task::yield_now().await;
     }
-    let poll_duration = poll_start.elapsed();
+
     println!(
         "Polled for {:?} over {} attempts, final status: {}",
-        poll_duration, attempts, status
+        poll_start.elapsed(),
+        attempts,
+        status
     );
-    assert_ne!(status, 404, "Model should be available in onwards config after polling");
+    assert_eq!(status, 200, "Model should be available in onwards config after polling");
+}
 
-    // Test 1: User makes successful inference request via API key
-    let inference_response = server
-        .post("/ai/v1/chat/completions")
-        .add_header("authorization", format!("Bearer {}", api_key.key))
-        .json(&serde_json::json!({
-            "model": "test-model",
-            "messages": [{"role": "user", "content": "Hello from E2E test"}]
-        }))
-        .await;
-
-    assert_eq!(inference_response.status_code().as_u16(), 200, "Inference request should succeed");
-    let inference_body: serde_json::Value = inference_response.json();
-    assert_eq!(
-        inference_body["choices"][0]["message"]["content"], "Hello! How can I help you today?",
-        "Should receive mocked response from inference endpoint"
-    );
-
+async fn assert_usage_recorded(fixture: &StreamingFixture, expected_uri: &str, prompt_tokens: i64, completion_tokens: i64) {
     let mut tries = 0;
-    // Verify credit deduction: Check that credits were deducted based on token usage
-    // Credits can lag usage, so poll
     let usage_tx = loop {
-        let transactions_response = server
-            .get(&format!("/admin/api/v1/transactions?user_id={}", regular_user.id))
-            .add_header(&admin_headers[0].0, &admin_headers[0].1)
-            .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        let transactions_response = fixture
+            .server
+            .get(&format!("/admin/api/v1/transactions?user_id={}", fixture.regular_user_id))
+            .add_header(&fixture.admin_headers[0].0, &fixture.admin_headers[0].1)
+            .add_header(&fixture.admin_headers[1].0, &fixture.admin_headers[1].1)
             .await;
 
         assert_eq!(transactions_response.status_code(), 200, "Should fetch transactions");
         let transactions: serde_json::Value = transactions_response.json();
-
         info!("Received {:?}", serde_json::to_string(&transactions));
-        // Find the usage transaction (there should be an admin_grant and a usage transaction)
-        // Response is now TransactionListResponse with data array
+
         let usage_tx = transactions["data"]
             .as_array()
             .and_then(|x| x.iter().find(|tx| tx["transaction_type"] == "usage"));
 
         if let Some(tx) = usage_tx {
-            // Get page_start_balance which represents the user's current balance (since skip=0)
             let page_start_balance: f64 = transactions["page_start_balance"].as_str().unwrap().parse().unwrap();
             break (tx.clone(), page_start_balance);
-        } else {
-            tries += 1;
-            if tries >= 50 {
-                panic!("Usage transaction not found after {} attempts", tries);
-            }
-            tokio::task::yield_now().await;
         }
+
+        tries += 1;
+        if tries >= 100 {
+            panic!("Usage transaction not found after {} attempts", tries);
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
     };
 
     assert_eq!(usage_tx.0["transaction_type"], "usage", "Should be usage transaction");
-    // Amount is returned as string due to high precision decimal
     let amount: f64 = usage_tx.0["amount"].as_str().unwrap().parse().unwrap();
-    let balance = usage_tx.1; // page_start_balance represents the user's current balance
+    let balance = usage_tx.1;
     assert!(amount > 0.0, "Usage amount should be positive (absolute value), got: {}", amount);
     assert!(
         balance < 1000.0,
@@ -257,173 +226,185 @@ async fn test_e2e_ai_proxy_with_mocked_inference(pool: PgPool) {
         balance
     );
 
-    // Verify request was logged: Check http_analytics recorded the request via API
-    let requests_response = server
-        .get(&format!("/admin/api/v1/requests?user_id={}&limit=1", regular_user.id))
-        .add_header(&admin_headers[0].0, &admin_headers[0].1)
-        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+    let requests_response = fixture
+        .server
+        .get(&format!("/admin/api/v1/requests?user_id={}&limit=1", fixture.regular_user_id))
+        .add_header(&fixture.admin_headers[0].0, &fixture.admin_headers[0].1)
+        .add_header(&fixture.admin_headers[1].0, &fixture.admin_headers[1].1)
         .await;
 
     assert_eq!(requests_response.status_code(), 200, "Should fetch logged requests");
     let requests: serde_json::Value = requests_response.json();
     let logged_entry = &requests["entries"][0];
 
-    // Request details (now flat structure in AnalyticsEntry)
     assert_eq!(logged_entry["method"], "POST");
-    assert_eq!(logged_entry["uri"], "http://localhost/chat/completions");
-
-    // Response details (now flat structure in AnalyticsEntry)
+    assert_eq!(logged_entry["uri"], expected_uri);
     assert_eq!(logged_entry["status_code"], 200);
-    assert_eq!(logged_entry["prompt_tokens"], 9, "Should have 9 prompt tokens from mock");
-    assert_eq!(logged_entry["completion_tokens"], 12, "Should have 12 completion tokens from mock");
-    assert_eq!(logged_entry["total_tokens"], 21, "Should match mocked token count");
+    assert_eq!(logged_entry["prompt_tokens"], prompt_tokens);
+    assert_eq!(logged_entry["completion_tokens"], completion_tokens);
+    assert_eq!(logged_entry["total_tokens"], prompt_tokens + completion_tokens);
+}
 
-    // Note: Pricing is now fetched from tariffs table, not from response headers
-
-    // Test 2: Proxy header auth also works (SSO-style authentication)
-    let regular_user_external_id = regular_user.external_user_id.as_ref().unwrap_or(&regular_user.username);
-
-    // First request creates a hidden API key, but it's not synced yet - should be 403
-    let first_proxy_response = server
-        .post("/admin/api/v1/ai/v1/chat/completions")
-        .add_header("x-doubleword-user", regular_user_external_id)
-        .add_header("x-doubleword-email", &regular_user.email)
-        .json(&serde_json::json!({
-            "model": "test-model",
-            "messages": [{"role": "user", "content": "Hello via proxy headers"}]
-        }))
-        .await;
-    let first_status = first_proxy_response.status_code().as_u16();
-    assert!(
-        first_status == 200 || first_status == 403,
-        "First proxy request might succeed (200) or fail (403) depending on sync timing, got {}",
-        first_status
-    );
-
-    // Sync to pick up the hidden API key
-    bg_services.sync_onwards_config(&pool).await.expect("Failed to sync onwards config");
-
-    // Poll until hidden key becomes available
-    for _ in 0..50 {
-        let test_response = server
-            .post("/admin/api/v1/ai/v1/chat/completions")
-            .add_header("x-doubleword-user", regular_user_external_id)
-            .add_header("x-doubleword-email", &regular_user.email)
-            .json(&serde_json::json!({
-                "model": "test-model",
-                "messages": [{"role": "user", "content": "test"}]
-            }))
-            .await;
-
-        status = test_response.status_code().as_u16();
-        if status == 200 {
-            break;
-        }
-        tokio::task::yield_now().await;
-    }
-
-    // Now proxy auth should work
-    let proxy_response = server
-        .post("/admin/api/v1/ai/v1/chat/completions")
-        .add_header("x-doubleword-user", regular_user_external_id)
-        .add_header("x-doubleword-email", &regular_user.email)
-        .json(&serde_json::json!({
-            "model": "test-model",
-            "messages": [{"role": "user", "content": "Hello via proxy headers"}]
-        }))
-        .await;
-
-    assert_eq!(
-        proxy_response.status_code().as_u16(),
-        200,
-        "Proxy header auth should work after sync"
-    );
-    let proxy_body: serde_json::Value = proxy_response.json();
-    assert_eq!(proxy_body["choices"][0]["message"]["content"], "Hello! How can I help you today?");
-
-    // Test 3: User without model access should be rejected (not in group)
-    let restricted_user = create_test_user(&pool, Role::StandardUser).await;
-    let restricted_headers = add_auth_headers(&restricted_user);
-
-    // Create API key for restricted user
-    let restricted_key_response = server
-        .post(&format!("/admin/api/v1/users/{}/api-keys", restricted_user.id))
-        .add_header(&restricted_headers[0].0, &restricted_headers[0].1)
-        .add_header(&restricted_headers[1].0, &restricted_headers[1].1)
-        .json(&serde_json::json!({
-            "name": "Restricted User Key",
-            "purpose": "realtime"
-        }))
-        .await;
-    let restricted_key: crate::api::models::api_keys::ApiKeyResponse = restricted_key_response.json();
-
-    let no_access_response = server
-        .post("/ai/v1/chat/completions")
-        .add_header("authorization", format!("Bearer {}", restricted_key.key))
-        .json(&serde_json::json!({
-            "model": "test-model",
-            "messages": [{"role": "user", "content": "Hello"}]
-        }))
-        .await;
-
-    // Should reject - 403 (key not synced) or 404 (user has no access to model)
-    let status = no_access_response.status_code().as_u16();
-    assert!(
-        status == 403 || status == 404,
-        "Should reject user without model access, got {}",
-        status
-    );
-
-    // Test 4: Missing authentication should fail
-    let missing_auth_response = server
-        .post("/ai/v1/chat/completions")
-        .json(&serde_json::json!({
-            "model": "test-model",
-            "messages": [{"role": "user", "content": "Hello"}]
-        }))
-        .await;
-
-    assert_eq!(missing_auth_response.status_code().as_u16(), 401, "Should require authentication");
-
-    // Test 5: Invalid API key should fail
-    let invalid_key_response = server
-        .post("/ai/v1/chat/completions")
-        .add_header("authorization", "Bearer invalid-key-12345")
-        .json(&serde_json::json!({
-            "model": "test-model",
-            "messages": [{"role": "user", "content": "Hello"}]
-        }))
-        .await;
-
-    assert_eq!(invalid_key_response.status_code().as_u16(), 403, "Should reject invalid API key");
-
-    // Test 6: Non-existent model should return 404
-    let nonexistent_model_response = server
-        .post("/ai/v1/chat/completions")
-        .add_header("authorization", format!("Bearer {}", api_key.key))
-        .json(&serde_json::json!({
-            "model": "nonexistent-model",
-            "messages": [{"role": "user", "content": "Hello"}]
-        }))
-        .await;
-
-    assert_eq!(
-        nonexistent_model_response.status_code().as_u16(),
-        404,
-        "Should return 404 for non-existent model"
-    );
-
-    // Cleanup: Delete the group before test ends to avoid unique constraint violations
-    // when tests run multiple times (especially in CI with soft-deleted users)
-    let delete_group_response = server
-        .delete(&format!("/admin/api/v1/groups/{}", group.id))
-        .add_header(&admin_headers[0].0, &admin_headers[0].1)
-        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+async fn cleanup_fixture(fixture: StreamingFixture) {
+    let delete_group_response = fixture
+        .server
+        .delete(&format!("/admin/api/v1/groups/{}", fixture.group_id))
+        .add_header(&fixture.admin_headers[0].0, &fixture.admin_headers[0].1)
+        .add_header(&fixture.admin_headers[1].0, &fixture.admin_headers[1].1)
         .await;
     assert_eq!(delete_group_response.status_code(), 204, "Should delete test group");
+    fixture.bg_services.shutdown().await;
+}
 
-    // Gracefully shutdown background services to avoid slow test cleanup
-    bg_services.shutdown().await;
+#[sqlx::test]
+#[test_log::test]
+async fn test_e2e_ai_proxy_streaming_chat_completions_with_fusillade_header(pool: PgPool) {
+    let mock_server = wiremock::MockServer::start().await;
+    let sse_response = "data: {\"id\":\"chatcmpl-123\",\"object\":\"chat.completion.chunk\",\"created\":1677652288,\"model\":\"gpt-3.5-turbo\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hello! How can I help you today?\"}}],\"usage\":null}\n\ndata: {\"id\":\"chatcmpl-123\",\"object\":\"chat.completion.chunk\",\"created\":1677652288,\"model\":\"gpt-3.5-turbo\",\"choices\":[],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":12,\"total_tokens\":21}}\n\ndata: [DONE]\n\n";
+
+    wiremock::Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_partial_json(serde_json::json!({
+            "stream": true,
+            "stream_options": { "include_usage": true }
+        })))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .insert_header("cache-control", "no-cache")
+                .set_body_raw(sse_response, "text/event-stream"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let fixture = setup_streaming_fixture(&pool, format!("{}/v1", mock_server.uri()), "gpt-3.5-turbo", "test-model", None).await;
+
+    let inference_response = fixture
+        .server
+        .post("/ai/v1/chat/completions")
+        .add_header("authorization", format!("Bearer {}", fixture.api_key))
+        .add_header("x-fusillade-stream", "true")
+        .json(&serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Hello from E2E test"}]
+        }))
+        .await;
+
+    assert_eq!(inference_response.status_code().as_u16(), 200);
+    assert_eq!(inference_response.text(), sse_response);
+    assert_usage_recorded(&fixture, "http://localhost/chat/completions", 9, 12).await;
+    cleanup_fixture(fixture).await;
+}
+
+#[sqlx::test]
+#[test_log::test]
+async fn test_e2e_ai_proxy_streaming_completions_with_fusillade_header(pool: PgPool) {
+    let mock_server = wiremock::MockServer::start().await;
+    let sse_response = "data: {\"id\":\"cmpl-123\",\"object\":\"text_completion\",\"created\":1677652288,\"model\":\"gpt-3.5-turbo-instruct\",\"choices\":[{\"text\":\"Hello world\",\"index\":0}]}\n\ndata: {\"id\":\"cmpl-123\",\"object\":\"text_completion\",\"created\":1677652288,\"model\":\"gpt-3.5-turbo-instruct\",\"choices\":[],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":12,\"total_tokens\":20}}\n\ndata: [DONE]\n\n";
+
+    wiremock::Mock::given(method("POST"))
+        .and(path("/v1/completions"))
+        .and(body_partial_json(serde_json::json!({
+            "stream": true,
+            "stream_options": { "include_usage": true }
+        })))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .insert_header("cache-control", "no-cache")
+                .set_body_raw(sse_response, "text/event-stream"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let fixture = setup_streaming_fixture(
+        &pool,
+        format!("{}/v1", mock_server.uri()),
+        "gpt-3.5-turbo-instruct",
+        "test-model",
+        None,
+    )
+    .await;
+
+    let inference_response = fixture
+        .server
+        .post("/ai/v1/completions")
+        .add_header("authorization", format!("Bearer {}", fixture.api_key))
+        .add_header("x-fusillade-stream", "true")
+        .json(&serde_json::json!({
+            "model": "test-model",
+            "prompt": "Hello from E2E test"
+        }))
+        .await;
+
+    assert_eq!(inference_response.status_code().as_u16(), 200);
+    assert_eq!(inference_response.text(), sse_response);
+    assert_usage_recorded(&fixture, "http://localhost/completions", 8, 12).await;
+    cleanup_fixture(fixture).await;
+}
+
+#[sqlx::test]
+#[test_log::test]
+async fn test_e2e_ai_proxy_streaming_responses_with_fusillade_header(pool: PgPool) {
+    let mock_server = wiremock::MockServer::start().await;
+    let response_json = serde_json::json!({
+        "id": "resp-123",
+        "object": "response",
+        "created_at": 1677652288,
+        "status": "completed",
+        "model": "gpt-4o",
+        "output": [],
+        "usage": {
+            "input_tokens": 15,
+            "output_tokens": 25,
+            "total_tokens": 40,
+            "input_tokens_details": { "cached_tokens": 0 },
+            "output_tokens_details": { "reasoning_tokens": 0 }
+        }
+    });
+    let sse_response = format!(
+        "data: {{\"type\":\"response.output_text.delta\",\"sequence_number\":1,\"item_id\":\"item_1\",\"output_index\":0,\"content_index\":0,\"delta\":\"Hello from responses\"}}\n\ndata: {{\"type\":\"response.completed\",\"sequence_number\":5,\"response\":{response_json}}}\n\n"
+    );
+
+    wiremock::Mock::given(method("POST"))
+        .and(path("/responses"))
+        .and(body_partial_json(serde_json::json!({
+            "stream": true
+        })))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .insert_header("cache-control", "no-cache")
+                .set_body_raw(sse_response.clone(), "text/event-stream"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let fixture = setup_streaming_fixture(&pool, mock_server.uri(), "gpt-4o", "test-model", Some(false)).await;
+
+    let inference_response = fixture
+        .server
+        .post("/ai/v1/responses")
+        .add_header("authorization", format!("Bearer {}", fixture.api_key))
+        .add_header("x-fusillade-stream", "true")
+        .json(&serde_json::json!({
+            "model": "test-model",
+            "input": "Hello from E2E test"
+        }))
+        .await;
+
+    if inference_response.status_code().as_u16() != 200 {
+        let received = mock_server.received_requests().await.unwrap_or_default();
+        panic!(
+            "Responses streaming request failed with status {}. Mock received: {:?}",
+            inference_response.status_code().as_u16(),
+            received
+        );
+    }
+    assert_eq!(inference_response.status_code().as_u16(), 200);
+    assert_eq!(inference_response.text(), sse_response);
+    assert_usage_recorded(&fixture, "http://localhost/responses", 15, 25).await;
+    cleanup_fixture(fixture).await;
 }
 
 /// End-to-end test: Traffic routing rules are enforced by onwards after sync.

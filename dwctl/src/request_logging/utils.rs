@@ -6,7 +6,7 @@ use outlet_postgres::SerializationError;
 use std::io::Read as _;
 use tracing::instrument;
 
-use super::models::{ChatCompletionChunk, SseParseError};
+use super::models::{ChatCompletionChunk, CompletionChunk, SseParseError};
 
 /// Parse a Server-Sent Events string into a vector of data chunks
 ///
@@ -52,6 +52,22 @@ fn parse_sse_chunks(body_str: &str) -> Result<Vec<String>, SseParseError> {
     Ok(chunks)
 }
 
+/// Converts JSON strings to CompletionChunk objects and wraps in AiResponse
+fn process_completion_sse_chunks(chunks: Vec<String>) -> AiResponse {
+    let chunks = chunks
+        .into_iter()
+        .filter_map(|x| {
+            if x.trim() == "[DONE]" {
+                Some(CompletionChunk::Done)
+            } else {
+                serde_json::from_str::<CompletionChunk>(&x).ok()
+            }
+        })
+        .collect::<Vec<_>>();
+
+    AiResponse::CompletionsStream(chunks)
+}
+
 /// Converts JSON strings to ChatCompletionChunk objects and wraps in AiResponse
 fn process_sse_chunks(chunks: Vec<String>) -> AiResponse {
     let chunks = chunks
@@ -68,6 +84,15 @@ fn process_sse_chunks(chunks: Vec<String>) -> AiResponse {
         .collect::<Vec<_>>();
 
     AiResponse::ChatCompletionsStream(chunks)
+}
+
+/// Parses legacy /v1/completions streaming response body, trying SSE first then JSON fallback
+#[instrument(skip_all, name = "dwctl.parse_completions_streaming_response")]
+pub(crate) fn parse_completions_streaming_response(body_str: &str) -> Result<AiResponse, Box<dyn std::error::Error>> {
+    parse_sse_chunks(body_str)
+        .map(process_completion_sse_chunks)
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+        .or_else(|_| serde_json::from_str(body_str).map_err(|e| Box::new(e) as Box<dyn std::error::Error>))
 }
 
 /// Parses streaming response body, trying SSE first then JSON fallback
@@ -197,7 +222,7 @@ pub(crate) fn extract_header_as_string(request_data: &outlet::RequestData, heade
         .map(|s| s.to_string())
 }
 
-// Mylena & Sebastien 2026 <3
+// Mylena & Sebastien 2026 <3 :)
 
 #[cfg(test)]
 mod tests {

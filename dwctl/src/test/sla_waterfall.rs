@@ -244,7 +244,6 @@ async fn test_sla_waterfall_all_tiers(pool: PgPool) {
         .get_or_create_hidden_key(user.id, ApiKeyPurpose::Batch, user.id)
         .await
         .expect("Failed to get batch API key");
-    drop(api_keys_repo);
     drop(conn);
 
     // Shift tariff valid_from back so they're valid at any shifted batch_created_at
