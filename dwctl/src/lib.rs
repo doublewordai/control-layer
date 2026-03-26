@@ -1589,27 +1589,42 @@ impl BackgroundServices {
     /// This method is cancel-safe - can be used in tokio::select! without losing tasks
     /// Returns an error with details about which task failed
     pub async fn wait_for_failure(&mut self) -> anyhow::Result<std::convert::Infallible> {
-        match self.background_tasks.join_next_with_id().await {
-            None => {
-                // No background tasks - wait forever
-                futures::future::pending::<()>().await;
-                unreachable!()
-            }
-            Some(Ok((task_id, Ok(())))) => {
-                let task_name = self.task_names.get(&task_id).copied().unwrap_or("unknown");
-                tracing::warn!(task = task_name, "Background task completed unexpectedly");
-                anyhow::bail!("Background task '{}' completed early", task_name)
-            }
-            Some(Ok((task_id, Err(e)))) => {
-                let task_name = self.task_names.get(&task_id).copied().unwrap_or("unknown");
-                tracing::error!(task = task_name, error = %e, "Background task failed");
-                anyhow::bail!("Background task '{}' failed: {}", task_name, e)
-            }
-            Some(Err(e)) => {
-                let task_id = e.id();
-                let task_name = self.task_names.get(&task_id).copied().unwrap_or("unknown");
-                tracing::error!(task = task_name, error = %e, "Background task panicked");
-                anyhow::bail!("Background task '{}' panicked: {}", task_name, e)
+        loop {
+            match self.background_tasks.join_next_with_id().await {
+                None => {
+                    // No background tasks - wait forever
+                    futures::future::pending::<()>().await;
+                    unreachable!()
+                }
+                Some(Ok((task_id, Ok(())))) if self.shutdown_token.is_cancelled() => {
+                    let task_name = self.task_names.get(&task_id).copied().unwrap_or("unknown");
+                    tracing::debug!(task = task_name, "Background task completed during shutdown");
+                }
+                Some(Ok((task_id, Ok(())))) => {
+                    let task_name = self.task_names.get(&task_id).copied().unwrap_or("unknown");
+                    tracing::warn!(task = task_name, "Background task completed unexpectedly");
+                    anyhow::bail!("Background task '{}' completed early", task_name)
+                }
+                Some(Ok((task_id, Err(e)))) if self.shutdown_token.is_cancelled() => {
+                    let task_name = self.task_names.get(&task_id).copied().unwrap_or("unknown");
+                    tracing::debug!(task = task_name, error = %e, "Background task exited with error during shutdown");
+                }
+                Some(Ok((task_id, Err(e)))) => {
+                    let task_name = self.task_names.get(&task_id).copied().unwrap_or("unknown");
+                    tracing::error!(task = task_name, error = %e, "Background task failed");
+                    anyhow::bail!("Background task '{}' failed: {}", task_name, e)
+                }
+                Some(Err(e)) if self.shutdown_token.is_cancelled() => {
+                    let task_id = e.id();
+                    let task_name = self.task_names.get(&task_id).copied().unwrap_or("unknown");
+                    tracing::debug!(task = task_name, error = %e, "Background task panicked during shutdown");
+                }
+                Some(Err(e)) => {
+                    let task_id = e.id();
+                    let task_name = self.task_names.get(&task_id).copied().unwrap_or("unknown");
+                    tracing::error!(task = task_name, error = %e, "Background task panicked");
+                    anyhow::bail!("Background task '{}' panicked: {}", task_name, e)
+                }
             }
         }
     }

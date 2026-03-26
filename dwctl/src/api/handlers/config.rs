@@ -221,8 +221,7 @@ onwards:
         let config_path = tempdir.path().join("config.yaml");
         write_test_config(&config_path, "Initial Org", "https://docs.example.com/initial");
 
-        let config =
-            crate::config::Config::load_from_path(config_path.to_string_lossy().into_owned()).expect("failed to load initial test config");
+        let config = crate::config::Config::load_from_path(&config_path).expect("failed to load initial test config");
         let app = Application::new_with_pool_and_config_path(config, Some(config_path.clone()), Some(pool.clone()), None)
             .await
             .expect("failed to create application");

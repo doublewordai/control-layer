@@ -17,6 +17,8 @@ struct WatcherState {
 
 fn normalize_path(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
+    let is_absolute = path.is_absolute();
+    let mut depth = 0usize;
 
     for component in path.components() {
         match component {
@@ -24,9 +26,17 @@ fn normalize_path(path: &Path) -> PathBuf {
             Component::RootDir => normalized.push(component.as_os_str()),
             Component::CurDir => {}
             Component::ParentDir => {
-                normalized.pop();
+                if depth > 0 {
+                    normalized.pop();
+                    depth -= 1;
+                } else if !is_absolute {
+                    normalized.push(component.as_os_str());
+                }
             }
-            Component::Normal(part) => normalized.push(part),
+            Component::Normal(part) => {
+                normalized.push(part);
+                depth += 1;
+            }
         }
     }
 
@@ -58,7 +68,7 @@ fn event_touches_config_file(event: &Event, watch_dir: &Path, config_path: &Path
             watch_dir.join(path)
         };
 
-        normalize_path(&path) == config_path
+        std::fs::canonicalize(&path).unwrap_or_else(|_| normalize_path(&path)) == config_path
     })
 }
 
@@ -129,7 +139,7 @@ pub async fn watch_config_file(config_path: PathBuf, shared_config: SharedConfig
                 info!(path = %config_path.display(), "Config file changed, reloading");
                 let load_path = config_path.clone();
                 match tokio::task::spawn_blocking(move || {
-                    Config::load_from_path(load_path.to_string_lossy().into_owned()).map_err(anyhow::Error::from)
+                    Config::load_from_path(&load_path).map_err(anyhow::Error::from)
                 })
                 .await
                 {
@@ -216,6 +226,34 @@ mod tests {
         };
 
         assert!(!event_touches_config_file(&event, &config_dir, &config_path));
+    }
+
+    #[test]
+    fn normalize_path_does_not_pop_past_root() {
+        let normalized = super::normalize_path(Path::new("/../configs/./dwctl.toml"));
+        assert_eq!(normalized, PathBuf::from("/configs/dwctl.toml"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn event_touches_config_file_resolves_symlinked_paths() {
+        let tempdir = tempdir().expect("failed to create temp dir");
+        let real_dir = tempdir.path().join("real");
+        std::fs::create_dir_all(&real_dir).expect("failed to create real dir");
+        let config_path = real_dir.join("dwctl.toml");
+        std::fs::write(&config_path, "port = 8080\n").expect("failed to write config file");
+
+        let symlink_dir = tempdir.path().join("symlinked");
+        std::os::unix::fs::symlink(&real_dir, &symlink_dir).expect("failed to create symlink");
+
+        let canonical_config = std::fs::canonicalize(&config_path).expect("failed to canonicalize config path");
+        let event = Event {
+            kind: EventKind::Create(CreateKind::File),
+            paths: vec![symlink_dir.join("dwctl.toml")],
+            attrs: Default::default(),
+        };
+
+        assert!(event_touches_config_file(&event, tempdir.path(), &canonical_config));
     }
 
     #[tokio::test]
