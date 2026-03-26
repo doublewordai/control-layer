@@ -165,6 +165,7 @@ pub fn create_test_config() -> crate::config::Config {
                 },
                 replica_pool: None,
             },
+            underway_pool: crate::config::default_underway_pool(),
         },
         slow_statement_threshold_ms: 1000,
         host: "127.0.0.1".to_string(),

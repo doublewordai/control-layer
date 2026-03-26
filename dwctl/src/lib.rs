@@ -2015,6 +2015,26 @@ async fn setup_background_services(
         });
     }
 
+    // Create a dedicated pool for the underway worker so its long-lived
+    // PgListener connections don't compete with the main pool.
+    let uw = config.database.underway_pool_settings();
+    let underway_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(uw.max_connections)
+        .min_connections(uw.min_connections)
+        .acquire_timeout(std::time::Duration::from_secs(uw.acquire_timeout_secs))
+        .idle_timeout(if uw.idle_timeout_secs > 0 {
+            Some(std::time::Duration::from_secs(uw.idle_timeout_secs))
+        } else {
+            None
+        })
+        .max_lifetime(if uw.max_lifetime_secs > 0 {
+            Some(std::time::Duration::from_secs(uw.max_lifetime_secs))
+        } else {
+            None
+        })
+        .connect_with(pool.connect_options().as_ref().clone())
+        .await?;
+
     // Start pool metrics sampler if metrics are enabled
     if config.enable_metrics {
         let mut pools = vec![
@@ -2025,6 +2045,10 @@ async fn setup_background_services(
             db::LabeledPool {
                 name: "fusillade",
                 pool: fusillade_pool_for_metrics,
+            },
+            db::LabeledPool {
+                name: "main_underway",
+                pool: underway_pool.clone(),
             },
         ];
         if let Some(outlet) = outlet_pool {
@@ -2061,7 +2085,7 @@ async fn setup_background_services(
     let task_state = tasks::TaskState {
         request_manager: request_manager.clone(),
     };
-    let task_runner = Arc::new(tasks::TaskRunner::new(pool.clone(), task_state).await?);
+    let task_runner = Arc::new(tasks::TaskRunner::new(underway_pool, task_state).await?);
     task_runner.start(shutdown_token.clone());
 
     let (background_tasks, task_names) = background_tasks.into_parts();
