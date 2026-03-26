@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT EXISTS(\n            SELECT 1\n            FROM deployed_models d\n            JOIN deployment_groups dg ON dg.deployment_id = d.id\n            WHERE d.alias = $1\n              AND d.deleted = false\n              AND dg.group_id IN (\n                  SELECT ug.group_id FROM user_groups ug WHERE ug.user_id = $2\n                  UNION\n                  SELECT '00000000-0000-0000-0000-000000000000'::uuid\n                  WHERE $2 != '00000000-0000-0000-0000-000000000000'\n              )\n        ) as \"has_access!\"\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "has_access!",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "621aaa07dcfb96ff4e3ded74e652ef45e46eaff4f9c87bddf4868a9b803eae82"
+}

@@ -32,6 +32,10 @@ pub struct OrganizationUpdate {
     pub display_name: Option<String>,
     /// New contact email
     pub email: Option<String>,
+    /// Whether batch completion/failure email notifications are enabled
+    pub batch_notifications_enabled: Option<bool>,
+    /// Threshold for low balance notifications (null to disable)
+    pub low_balance_threshold: Option<f32>,
 }
 
 /// Full organization details returned by the API.

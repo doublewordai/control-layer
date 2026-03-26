@@ -19,6 +19,8 @@ pub struct OrganizationUpdateDBRequest {
     pub display_name: Option<String>,
     pub avatar_url: Option<String>,
     pub email: Option<String>,
+    pub batch_notifications_enabled: Option<bool>,
+    pub low_balance_threshold: Option<f32>,
 }
 
 /// Database response for an organization membership

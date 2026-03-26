@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT COUNT(*) as total_requests FROM http_analytics WHERE timestamp >= $1 AND timestamp <= $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "total_requests",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Timestamptz",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "6a4d5c4e65fea3936fb9c05b32093483fcec7561081b3e05045fe5592f66d76d"
+}

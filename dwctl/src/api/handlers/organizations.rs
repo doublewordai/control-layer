@@ -336,6 +336,8 @@ pub async fn update_organization<P: PoolProvider>(
         display_name: data.display_name,
         avatar_url: None,
         email: data.email,
+        batch_notifications_enabled: data.batch_notifications_enabled,
+        low_balance_threshold: data.low_balance_threshold,
     };
 
     let mut repo = Organizations::new(&mut pool_conn);
