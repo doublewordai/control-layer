@@ -64,7 +64,7 @@ export function MyOrganization() {
       />
 
       {canManage && (
-        <NotificationSettings userId={activeOrganizationId} />
+        <NotificationSettings userId={activeOrganizationId} isOrganization />
       )}
     </div>
   );

@@ -222,7 +222,7 @@ pub(crate) fn extract_header_as_string(request_data: &outlet::RequestData, heade
         .map(|s| s.to_string())
 }
 
-// Mylena & Sebastien 2026 <3
+// Mylena & Sebastien 2026 <3 :)
 
 #[cfg(test)]
 mod tests {

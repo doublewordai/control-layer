@@ -205,6 +205,15 @@ impl<'c> Organizations<'c> {
                 display_name = COALESCE($2, display_name),
                 avatar_url = COALESCE($3, avatar_url),
                 email = COALESCE($4, email),
+                batch_notifications_enabled = COALESCE($5, batch_notifications_enabled),
+                low_balance_threshold = CASE
+                    WHEN $6::boolean THEN $7
+                    ELSE low_balance_threshold
+                END,
+                low_balance_notification_sent = CASE
+                    WHEN $6::boolean THEN false
+                    ELSE low_balance_notification_sent
+                END,
                 updated_at = NOW()
             WHERE id = $1 AND user_type = 'organization' AND is_deleted = false
             RETURNING id, username, email, display_name, avatar_url, auth_source, created_at, updated_at,
@@ -217,6 +226,9 @@ impl<'c> Organizations<'c> {
             request.display_name,
             request.avatar_url,
             request.email,
+            request.batch_notifications_enabled,
+            request.low_balance_threshold.is_some() as bool,
+            request.low_balance_threshold.flatten(),
         )
         .fetch_optional(&mut *self.db)
         .await?
@@ -752,6 +764,8 @@ mod tests {
                     display_name: Some("New Acme Name".to_string()),
                     avatar_url: None,
                     email: Some("new@acme.example.com".to_string()),
+                    batch_notifications_enabled: None,
+                    low_balance_threshold: None,
                 },
             )
             .await
@@ -792,6 +806,8 @@ mod tests {
                     display_name: None,
                     avatar_url: None,
                     email: Some("new@acme.example.com".to_string()),
+                    batch_notifications_enabled: None,
+                    low_balance_threshold: None,
                 },
             )
             .await
@@ -799,6 +815,107 @@ mod tests {
 
         assert_eq!(updated.display_name.as_deref(), Some("Acme Corporation"));
         assert_eq!(updated.email, "new@acme.example.com");
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_update_organization_notification_settings(pool: PgPool) {
+        let creator = create_individual(&pool, "alice", "alice@example.com").await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut orgs = Organizations::new(&mut conn);
+
+        let org = orgs
+            .create(
+                &OrganizationCreateDBRequest {
+                    name: "acme-corp".to_string(),
+                    email: "billing@acme.example.com".to_string(),
+                    display_name: Some("Acme Corporation".to_string()),
+                    avatar_url: None,
+                    created_by: creator,
+                },
+                TEST_DEFAULT_ROLES,
+            )
+            .await
+            .unwrap();
+
+        // Default: notifications disabled, no threshold
+        assert!(!org.batch_notifications_enabled);
+        assert!(org.low_balance_threshold.is_none());
+
+        // Enable notifications and set threshold
+        let updated = orgs
+            .update(
+                org.id,
+                &OrganizationUpdateDBRequest {
+                    display_name: None,
+                    avatar_url: None,
+                    email: None,
+                    batch_notifications_enabled: Some(true),
+                    low_balance_threshold: Some(Some(10.0)),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(updated.batch_notifications_enabled);
+        assert_eq!(updated.low_balance_threshold, Some(10.0));
+        assert!(!updated.low_balance_notification_sent);
+
+        // Partial update: change threshold only, notifications stay enabled
+        let updated = orgs
+            .update(
+                org.id,
+                &OrganizationUpdateDBRequest {
+                    display_name: None,
+                    avatar_url: None,
+                    email: None,
+                    batch_notifications_enabled: None,
+                    low_balance_threshold: Some(Some(25.0)),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(updated.batch_notifications_enabled);
+        assert_eq!(updated.low_balance_threshold, Some(25.0));
+        // Threshold change resets notification_sent flag
+        assert!(!updated.low_balance_notification_sent);
+
+        // Clear threshold to disable alerts
+        let updated = orgs
+            .update(
+                org.id,
+                &OrganizationUpdateDBRequest {
+                    display_name: None,
+                    avatar_url: None,
+                    email: None,
+                    batch_notifications_enabled: None,
+                    low_balance_threshold: Some(None),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(updated.batch_notifications_enabled);
+        assert!(updated.low_balance_threshold.is_none());
+
+        // Omitting threshold entirely leaves it unchanged
+        let updated = orgs
+            .update(
+                org.id,
+                &OrganizationUpdateDBRequest {
+                    display_name: None,
+                    avatar_url: None,
+                    email: None,
+                    batch_notifications_enabled: None,
+                    low_balance_threshold: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(updated.low_balance_threshold.is_none());
     }
 
     #[sqlx::test]
