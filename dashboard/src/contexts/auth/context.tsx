@@ -116,12 +116,18 @@ export function AuthProvider({ children }: AuthProviderProps) {
   };
 
   const logout = async () => {
+    if (authState.authMethod === "proxy") {
+      // SSO users must go through oauth2-proxy sign_out to clear the
+      // dw_cookie. Skipping this leaves a stale SSO cookie that causes
+      // a 401 loop on next login.
+      window.location.href = "/authentication/logout";
+      return;
+    }
     try {
       await dwctlApi.auth.logout();
-      // Always redirect to root after successful logout
       window.location.href = "/";
     } catch {
-      // POST failed. Assume that its because of proxy auth and redirect to logout endpoint
+      // POST failed — fall back to proxy logout
       window.location.href = "/authentication/logout";
     }
   };
