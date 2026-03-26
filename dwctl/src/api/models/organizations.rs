@@ -6,6 +6,7 @@ use crate::api::models::users::UserResponse;
 use crate::types::UserId;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_with::rust::double_option;
 use utoipa::{IntoParams, ToSchema};
 
 /// Request body for creating a new organization
@@ -34,8 +35,11 @@ pub struct OrganizationUpdate {
     pub email: Option<String>,
     /// Whether batch completion/failure email notifications are enabled
     pub batch_notifications_enabled: Option<bool>,
-    /// Threshold for low balance notifications (null to disable)
-    pub low_balance_threshold: Option<f32>,
+    /// Low balance notification threshold in dollars
+    /// (e.g. 2.0 means notify when balance drops below $2), set to null to disable.
+    /// Omit entirely to leave unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
+    pub low_balance_threshold: Option<Option<f32>>,
 }
 
 /// Full organization details returned by the API.

@@ -206,7 +206,14 @@ impl<'c> Organizations<'c> {
                 avatar_url = COALESCE($3, avatar_url),
                 email = COALESCE($4, email),
                 batch_notifications_enabled = COALESCE($5, batch_notifications_enabled),
-                low_balance_threshold = COALESCE($6, low_balance_threshold),
+                low_balance_threshold = CASE
+                    WHEN $6::boolean THEN $7
+                    ELSE low_balance_threshold
+                END,
+                low_balance_notification_sent = CASE
+                    WHEN $6::boolean THEN false
+                    ELSE low_balance_notification_sent
+                END,
                 updated_at = NOW()
             WHERE id = $1 AND user_type = 'organization' AND is_deleted = false
             RETURNING id, username, email, display_name, avatar_url, auth_source, created_at, updated_at,
@@ -220,7 +227,8 @@ impl<'c> Organizations<'c> {
             request.avatar_url,
             request.email,
             request.batch_notifications_enabled,
-            request.low_balance_threshold,
+            request.low_balance_threshold.is_some() as bool,
+            request.low_balance_threshold.flatten(),
         )
         .fetch_optional(&mut *self.db)
         .await?
@@ -844,7 +852,7 @@ mod tests {
                     avatar_url: None,
                     email: None,
                     batch_notifications_enabled: Some(true),
-                    low_balance_threshold: Some(10.0),
+                    low_balance_threshold: Some(Some(10.0)),
                 },
             )
             .await
@@ -852,6 +860,7 @@ mod tests {
 
         assert!(updated.batch_notifications_enabled);
         assert_eq!(updated.low_balance_threshold, Some(10.0));
+        assert!(!updated.low_balance_notification_sent);
 
         // Partial update: change threshold only, notifications stay enabled
         let updated = orgs
@@ -862,7 +871,7 @@ mod tests {
                     avatar_url: None,
                     email: None,
                     batch_notifications_enabled: None,
-                    low_balance_threshold: Some(25.0),
+                    low_balance_threshold: Some(Some(25.0)),
                 },
             )
             .await
@@ -870,6 +879,43 @@ mod tests {
 
         assert!(updated.batch_notifications_enabled);
         assert_eq!(updated.low_balance_threshold, Some(25.0));
+        // Threshold change resets notification_sent flag
+        assert!(!updated.low_balance_notification_sent);
+
+        // Clear threshold to disable alerts
+        let updated = orgs
+            .update(
+                org.id,
+                &OrganizationUpdateDBRequest {
+                    display_name: None,
+                    avatar_url: None,
+                    email: None,
+                    batch_notifications_enabled: None,
+                    low_balance_threshold: Some(None),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(updated.batch_notifications_enabled);
+        assert!(updated.low_balance_threshold.is_none());
+
+        // Omitting threshold entirely leaves it unchanged
+        let updated = orgs
+            .update(
+                org.id,
+                &OrganizationUpdateDBRequest {
+                    display_name: None,
+                    avatar_url: None,
+                    email: None,
+                    batch_notifications_enabled: None,
+                    low_balance_threshold: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(updated.low_balance_threshold.is_none());
     }
 
     #[sqlx::test]

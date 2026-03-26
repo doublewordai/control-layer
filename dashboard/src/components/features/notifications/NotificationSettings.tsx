@@ -179,7 +179,7 @@ export const NotificationSettings: React.FC<NotificationSettingsProps> = ({
   const [copiedSecret, setCopiedSecret] = useState(false);
   const [webhookScope, setWebhookScope] = useState<WebhookScope>("own");
 
-  const updateSettings = async (data: Record<string, unknown>) => {
+  const updateSettings = async (data: { batch_notifications_enabled?: boolean; low_balance_threshold?: number | null }) => {
     if (!user) return;
     if (isOrganization) {
       await updateOrgMutation.mutateAsync({ id: user.id, data });
