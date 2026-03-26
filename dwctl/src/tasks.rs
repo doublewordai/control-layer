@@ -46,14 +46,14 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> TaskRunner<P> {
     /// The worker stops when the token is cancelled — either explicitly via
     /// [`BackgroundServices::shutdown`] or automatically via its `DropGuard`.
     /// Interrupted tasks are retried on next startup (state tracked in Postgres).
-    pub fn start(&self, shutdown_token: CancellationToken) {
+    pub fn start(&self, shutdown_token: CancellationToken) -> Vec<tokio::task::JoinHandle<()>> {
         let mut worker = self.create_batch_job.worker();
         worker.set_shutdown_token(shutdown_token);
 
-        tokio::spawn(async move {
+        vec![tokio::spawn(async move {
             if let Err(e) = worker.run().await {
                 tracing::error!(error = %e, "Underway worker error");
             }
-        });
+        })]
     }
 }

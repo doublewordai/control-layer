@@ -2086,7 +2086,11 @@ async fn setup_background_services(
         request_manager: request_manager.clone(),
     };
     let task_runner = Arc::new(tasks::TaskRunner::new(underway_pool, task_state).await?);
-    task_runner.start(shutdown_token.clone());
+    for handle in task_runner.start(shutdown_token.clone()) {
+        background_tasks.spawn("underway-worker", async move {
+            handle.await.map_err(|e| anyhow::anyhow!("{}", e))
+        });
+    }
 
     let (background_tasks, task_names) = background_tasks.into_parts();
 
