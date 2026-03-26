@@ -437,6 +437,20 @@ user1_batch_id: jsonpath "$.id"
 jsonpath "$.input_file_id" == "{{user1_gpt4_file_id}}"
 jsonpath "$.status" == "validating"
 jsonpath "$.endpoint" == "/v1/chat/completions"
+jsonpath "$.output_file_id" != null
+jsonpath "$.error_file_id" != null
+
+# Poll until the worker populates the batch and transitions to in_progress
+GET http://localhost:3001/ai/v1/batches/{{user1_batch_id}}
+[Options]
+retry: 10
+retry-interval: 500
+[Cookies]
+dwctl_session: {{user_jwt}}
+HTTP 200
+[Asserts]
+jsonpath "$.status" == "in_progress"
+jsonpath "$.request_counts.total" > 0
 
 # User1 CANNOT create batch from user2's file
 POST http://localhost:3001/ai/v1/batches
