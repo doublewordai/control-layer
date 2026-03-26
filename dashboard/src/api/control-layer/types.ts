@@ -1405,6 +1405,8 @@ export interface OrganizationCreateRequest {
 export interface OrganizationUpdateRequest {
   display_name?: string;
   email?: string;
+  batch_notifications_enabled?: boolean;
+  low_balance_threshold?: number | null;
 }
 
 export interface InviteMemberRequest {
