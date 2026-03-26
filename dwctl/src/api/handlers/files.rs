@@ -2759,13 +2759,24 @@ mod tests {
         let batch_id = batch["id"].as_str().expect("Should have id");
         let output_file_id = batch["output_file_id"].as_str().expect("Should have output_file_id");
 
-        // Manually complete all requests by updating their state in the database
         // Extract batch UUID from "batch_xxx" format
         let batch_uuid = batch_id.strip_prefix("batch_").unwrap_or(batch_id);
         let batch_uuid = Uuid::parse_str(batch_uuid).expect("Valid batch UUID");
 
-        // Use unchecked query since fusillade schema is created at runtime
-        // Must set completed_at to satisfy the completed_fields_check constraint
+        // Wait for the underway worker to populate the batch with requests
+        loop {
+            let count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM fusillade.requests WHERE batch_id = $1")
+                .bind(batch_uuid)
+                .fetch_one(&pool)
+                .await
+                .expect("Failed to count requests");
+            if count > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        // Manually complete all requests
         sqlx::query(
             r#"
             UPDATE fusillade.requests
@@ -3019,10 +3030,23 @@ mod tests {
         let batch_id_str = batch["id"].as_str().expect("Should have id");
         let output_file_id = batch["output_file_id"].as_str().expect("Should have output_file_id");
 
-        // Complete all requests so the output file has content
         let batch_uuid_str = batch_id_str.strip_prefix("batch_").unwrap_or(batch_id_str);
         let batch_uuid = Uuid::parse_str(batch_uuid_str).expect("Valid batch UUID");
 
+        // Wait for the underway worker to populate requests
+        loop {
+            let count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM fusillade.requests WHERE batch_id = $1")
+                .bind(batch_uuid)
+                .fetch_one(&pool)
+                .await
+                .expect("Failed to count requests");
+            if count > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        // Complete all requests so the output file has content
         sqlx::query(
             r#"
             UPDATE fusillade.requests

@@ -45,7 +45,6 @@ use uuid::Uuid;
 pub struct CreateBatchInput {
     pub batch_id: Uuid,
     pub file_id: Uuid,
-    pub created_by: Option<String>,
 }
 
 /// Build the underway job for batch population.
@@ -65,7 +64,7 @@ pub async fn build_create_batch_job<P: sqlx_pool_router::PoolProvider + Clone + 
             if let Err(e) = cx
                 .state
                 .request_manager
-                .populate_batch(batch_id, fusillade::FileId(input.file_id), input.created_by)
+                .populate_batch(batch_id, fusillade::FileId(input.file_id))
                 .await
             {
                 tracing::error!(
@@ -524,7 +523,6 @@ pub async fn create_batch<P: PoolProvider>(
         .enqueue(&CreateBatchInput {
             batch_id: *batch.id,
             file_id,
-            created_by: Some(target_user_id.to_string()),
         })
         .await
         .map_err(|e| Error::Internal {
