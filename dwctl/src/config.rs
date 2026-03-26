@@ -299,7 +299,7 @@ pub fn default_outlet_component() -> ComponentDb {
 /// Default underway task worker pool settings (small — only needs PgListener + task processing)
 pub fn default_underway_pool() -> PoolSettings {
     PoolSettings {
-        max_connections: 3,
+        max_connections: 5,
         min_connections: 0,
         ..Default::default()
     }
