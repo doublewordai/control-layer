@@ -75,8 +75,16 @@ pub async fn build_create_batch_job<P: sqlx_pool_router::PoolProvider + Clone + 
 
                 return match &e {
                     fusillade::FusilladeError::ValidationError(_) => {
-                        let _ = cx.state.request_manager.mark_batch_failed(batch_id, &e.to_string()).await;
-                        Err(TaskError::Fatal(e.to_string()))
+                        if let Err(mark_err) = cx.state.request_manager.mark_batch_failed(batch_id, &e.to_string()).await {
+                            tracing::error!(
+                                batch_id = %input.batch_id,
+                                error = %mark_err,
+                                "Failed to mark batch as failed after validation error"
+                            );
+                            Err(TaskError::Retryable(mark_err.to_string()))
+                        } else {
+                            Err(TaskError::Fatal(e.to_string()))
+                        }
                     }
                     _ => Err(TaskError::Retryable(e.to_string())),
                 };
@@ -515,9 +523,7 @@ pub async fn create_batch<P: PoolProvider>(
         })?;
 
     // Enqueue background job to populate requests from templates.
-    // If this fails, we have an orphaned "validating" batch — acceptable since the
-    // enqueue failure case is unlikely and a sweeper can clean up.
-    state
+    if let Err(e) = state
         .task_runner
         .create_batch_job
         .enqueue(&CreateBatchInput {
@@ -525,9 +531,15 @@ pub async fn create_batch<P: PoolProvider>(
             file_id,
         })
         .await
-        .map_err(|e| Error::Internal {
+    {
+        let _ = state
+            .request_manager
+            .mark_batch_failed(batch.id, &format!("Failed to enqueue population: {e}"))
+            .await;
+        return Err(Error::Internal {
             operation: format!("enqueue batch population: {}", e),
-        })?;
+        });
+    }
 
     tracing::debug!("Batch {} created, population enqueued", batch.id);
 

@@ -2764,7 +2764,7 @@ mod tests {
         let batch_uuid = Uuid::parse_str(batch_uuid).expect("Valid batch UUID");
 
         // Wait for the underway worker to populate the batch with requests
-        loop {
+        for attempt in 0..200 {
             let count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM fusillade.requests WHERE batch_id = $1")
                 .bind(batch_uuid)
                 .fetch_one(&pool)
@@ -2773,6 +2773,10 @@ mod tests {
             if count > 0 {
                 break;
             }
+            assert!(
+                attempt < 199,
+                "Timed out waiting for requests to be populated for batch {batch_uuid}"
+            );
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
 
