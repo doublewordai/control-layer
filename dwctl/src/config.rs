@@ -296,6 +296,15 @@ pub fn default_outlet_component() -> ComponentDb {
     }
 }
 
+/// Default underway task worker pool settings (small — only needs PgListener + task processing)
+pub fn default_underway_pool() -> PoolSettings {
+    PoolSettings {
+        max_connections: 3,
+        min_connections: 0,
+        ..Default::default()
+    }
+}
+
 /// Database configuration.
 ///
 /// Supports either an embedded PostgreSQL instance (for development) or an external
@@ -327,6 +336,10 @@ pub enum DatabaseConfig {
         /// Outlet request logging database configuration
         #[serde(default = "default_outlet_component")]
         outlet: ComponentDb,
+        /// Underway task worker pool (separate from main because the worker
+        /// holds long-lived PgListener connections)
+        #[serde(default = "default_underway_pool")]
+        underway_pool: PoolSettings,
     },
     /// Use external PostgreSQL database
     External {
@@ -348,6 +361,10 @@ pub enum DatabaseConfig {
         /// Outlet request logging database configuration
         #[serde(default = "default_outlet_component")]
         outlet: ComponentDb,
+        /// Underway task worker pool (separate from main because the worker
+        /// holds long-lived PgListener connections)
+        #[serde(default = "default_underway_pool")]
+        underway_pool: PoolSettings,
     },
 }
 
@@ -363,6 +380,7 @@ impl Default for DatabaseConfig {
                 replica_pool: None,
                 fusillade: default_fusillade_component(),
                 outlet: default_outlet_component(),
+                underway_pool: default_underway_pool(),
             }
         }
         #[cfg(not(feature = "embedded-db"))]
@@ -374,6 +392,7 @@ impl Default for DatabaseConfig {
                 replica_pool: None,
                 fusillade: default_fusillade_component(),
                 outlet: default_outlet_component(),
+                underway_pool: default_underway_pool(),
             }
         }
     }
@@ -447,6 +466,14 @@ impl DatabaseConfig {
         match self {
             DatabaseConfig::Embedded { outlet, .. } => outlet,
             DatabaseConfig::External { outlet, .. } => outlet,
+        }
+    }
+
+    /// Get the underway task worker pool settings
+    pub fn underway_pool_settings(&self) -> &PoolSettings {
+        match self {
+            DatabaseConfig::Embedded { underway_pool, .. } => underway_pool,
+            DatabaseConfig::External { underway_pool, .. } => underway_pool,
         }
     }
 }
@@ -1669,6 +1696,7 @@ impl Config {
             let pool = config.database.main_pool_settings().clone();
             let fusillade = config.database.fusillade().clone();
             let outlet = config.database.outlet().clone();
+            let underway_pool = config.database.underway_pool_settings().clone();
 
             // Preserve original replica_pool if it was explicitly configured (not using fallback)
             let original_replica_pool = match &config.database {
@@ -1686,6 +1714,7 @@ impl Config {
                 replica_pool: original_replica_pool, // Always preserve original replica_pool if it existed
                 fusillade,
                 outlet,
+                underway_pool,
             };
         } else if let Some(replica_url) = config.database_replica_url.take() {
             // Only replica_url is set via environment variable, apply it to existing config

@@ -2016,6 +2016,7 @@ mod tests {
                 replica_pool: None,
                 fusillade: crate::config::default_fusillade_component(),
                 outlet: crate::config::default_outlet_component(),
+                underway_pool: crate::config::default_underway_pool(),
             },
             slow_statement_threshold_ms: 1000,
             admin_email: "admin@example.org".to_string(),
