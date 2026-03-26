@@ -34,14 +34,13 @@ use uuid::Uuid;
 
 /// Check if the current user "owns" a batch, considering org context.
 /// Returns true if the batch creator matches the user's ID or their active organization.
-fn is_batch_owner(current_user: &CurrentUser, created_by: Option<&str>) -> bool {
+fn is_batch_owner(current_user: &CurrentUser, created_by: &str) -> bool {
     let user_id = current_user.id.to_string();
-    if created_by == Some(user_id.as_str()) {
+    if created_by == user_id {
         return true;
     }
     if let Some(org_id) = current_user.active_organization {
-        let org_id_str = org_id.to_string();
-        if created_by == Some(org_id_str.as_str()) {
+        if created_by == org_id.to_string() {
             return true;
         }
     }
@@ -170,8 +169,10 @@ fn to_batch_response_with_email(batch: fusillade::Batch, creator_email: Option<&
 /// Helper to fetch creator email for a batch from the database.
 ///
 async fn fetch_creator_email(db: &sqlx::PgPool, batch: &fusillade::Batch) -> Option<String> {
-    let created_by = batch.created_by.as_ref()?;
-    let user_id = Uuid::parse_str(created_by).ok()?;
+    if batch.created_by.is_empty() {
+        return None;
+    }
+    let user_id = Uuid::parse_str(&batch.created_by).ok()?;
     let mut conn = db.acquire().await.ok()?;
     Users::new(&mut conn).get_by_id(user_id).await.ok().flatten().map(|u| u.email)
 }
@@ -262,7 +263,7 @@ pub async fn create_batch<P: PoolProvider>(
     // In org context, files owned by the active org are also considered "own"
     use crate::types::Resource;
     let has_read_all = can_read_all_resources(&current_user, Resource::Files);
-    if !has_read_all && !is_batch_owner(&current_user, file.uploaded_by.as_deref()) {
+    if !has_read_all && !file.uploaded_by.as_deref().is_some_and(|owner| is_batch_owner(&current_user, owner)) {
         use crate::types::{Operation, Permission};
         return Err(Error::InsufficientPermissions {
             required: Permission::Allow(Resource::Files, Operation::ReadAll),
@@ -403,6 +404,7 @@ pub async fn create_batch<P: PoolProvider>(
         created_by: Some(target_user_id.to_string()),
         api_key_id: Some(api_key_id),
         api_key: Some(batch_api_key),
+        total_requests: Some(file_model_counts.values().sum()),
     };
 
     let reservation_ids = reserve_capacity_for_batch(
@@ -718,7 +720,7 @@ pub async fn get_batch<P: PoolProvider>(
 
     // Check ownership: users without ReadAll permission can only see their own batches (or org batches)
     let can_read_all = can_read_all_resources(&current_user, Resource::Batches);
-    if !can_read_all && !is_batch_owner(&current_user, batch.created_by.as_deref()) {
+    if !can_read_all && !is_batch_owner(&current_user, &batch.created_by) {
         return Err(Error::NotFound {
             resource: "Batch".to_string(),
             id: batch_id_str,
@@ -748,26 +750,22 @@ pub async fn get_batch<P: PoolProvider>(
         }
     } else {
         // Fall back to owner email (legacy batches without api_key_id)
-        if let Some(created_by) = batch.created_by.as_ref() {
-            if let Ok(user_id) = Uuid::parse_str(created_by) {
-                Users::new(&mut read_conn)
-                    .get_bulk(vec![user_id])
-                    .await
-                    .map_err(|e| Error::Internal {
-                        operation: format!("fetch owner user: {}", e),
-                    })?
-                    .get(&user_id)
-                    .map(|u| u.email.clone())
-            } else {
-                None
-            }
+        if let Ok(user_id) = Uuid::parse_str(&batch.created_by) {
+            Users::new(&mut read_conn)
+                .get_bulk(vec![user_id])
+                .await
+                .map_err(|e| Error::Internal {
+                    operation: format!("fetch owner user: {}", e),
+                })?
+                .get(&user_id)
+                .map(|u| u.email.clone())
         } else {
             None
         }
     };
 
     // Resolve context from batch owner (created_by field)
-    let (context_name, context_type) = if let Some(owner_id) = batch.created_by.as_ref().and_then(|id| Uuid::parse_str(id).ok()) {
+    let (context_name, context_type) = if let Some(owner_id) = Uuid::parse_str(&batch.created_by).ok() {
         let user_map = Users::new(&mut read_conn)
             .get_bulk(vec![owner_id])
             .await
@@ -848,7 +846,7 @@ pub async fn get_batch_analytics<P: PoolProvider>(
 
     // Check ownership: users without ReadAll permission can only see their own batches (or org batches)
     let can_read_all = can_read_all_resources(&current_user, Resource::Batches);
-    if !can_read_all && !is_batch_owner(&current_user, batch.created_by.as_deref()) {
+    if !can_read_all && !is_batch_owner(&current_user, &batch.created_by) {
         return Err(Error::NotFound {
             resource: "Batch".to_string(),
             id: batch_id_str.clone(),
@@ -908,7 +906,7 @@ pub async fn get_batch_results<P: PoolProvider>(
 
     // Check ownership: users without ReadAll permission can only see their own batches (or org batches)
     let can_read_all = can_read_all_resources(&current_user, Resource::Batches);
-    if !can_read_all && !is_batch_owner(&current_user, batch.created_by.as_deref()) {
+    if !can_read_all && !is_batch_owner(&current_user, &batch.created_by) {
         return Err(Error::NotFound {
             resource: "Batch".to_string(),
             id: batch_id_str.clone(),
@@ -1064,7 +1062,7 @@ pub async fn cancel_batch<P: PoolProvider>(
 
     // Check ownership: users without UpdateAll permission can only cancel their own batches (or org batches)
     let can_update_all = has_permission(&current_user, Resource::Batches, Operation::UpdateAll);
-    if !can_update_all && !is_batch_owner(&current_user, batch.created_by.as_deref()) {
+    if !can_update_all && !is_batch_owner(&current_user, &batch.created_by) {
         return Err(Error::NotFound {
             resource: "Batch".to_string(),
             id: batch_id_str.clone(),
@@ -1137,7 +1135,7 @@ pub async fn delete_batch<P: PoolProvider>(
 
     // Check ownership: users without DeleteAll permission can only delete their own batches (or org batches)
     let can_delete_all = has_permission(&current_user, Resource::Batches, Operation::DeleteAll);
-    if !can_delete_all && !is_batch_owner(&current_user, batch.created_by.as_deref()) {
+    if !can_delete_all && !is_batch_owner(&current_user, &batch.created_by) {
         return Err(Error::NotFound {
             resource: "Batch".to_string(),
             id: batch_id_str.clone(),
@@ -1198,7 +1196,7 @@ pub async fn retry_failed_batch_requests<P: PoolProvider>(
 
     // Check ownership: users without UpdateAll permission can only retry their own batches (or org batches)
     let can_update_all = has_permission(&current_user, Resource::Batches, Operation::UpdateAll);
-    if !can_update_all && !is_batch_owner(&current_user, batch.created_by.as_deref()) {
+    if !can_update_all && !is_batch_owner(&current_user, &batch.created_by) {
         return Err(Error::NotFound {
             resource: "Batch".to_string(),
             id: batch_id_str.clone(),
@@ -1283,7 +1281,7 @@ pub async fn retry_specific_requests<P: PoolProvider>(
 
     // Check ownership: users without UpdateAll permission can only retry their own batches (or org batches)
     let can_update_all = has_permission(&current_user, Resource::Batches, Operation::UpdateAll);
-    if !can_update_all && !is_batch_owner(&current_user, batch.created_by.as_deref()) {
+    if !can_update_all && !is_batch_owner(&current_user, &batch.created_by) {
         return Err(Error::NotFound {
             resource: "Batch".to_string(),
             id: batch_id_str.clone(),
@@ -1495,7 +1493,7 @@ pub async fn list_batches<P: PoolProvider>(
     // - Individual creator IDs from api_key resolution
     let mut all_user_ids: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
     for batch in &batches {
-        if let Some(owner_id) = batch.created_by.as_ref().and_then(|id| Uuid::parse_str(id).ok()) {
+        if let Ok(owner_id) = Uuid::parse_str(&batch.created_by) {
             all_user_ids.insert(owner_id);
         }
         if let Some(api_key_id) = batch.api_key_id
@@ -1554,10 +1552,8 @@ pub async fn list_batches<P: PoolProvider>(
                 .or_else(|| {
                     // Legacy fallback: use batch owner (created_by) when api_key_id is NULL
                     if batch.api_key_id.is_none() {
-                        batch
-                            .created_by
-                            .as_ref()
-                            .and_then(|id| Uuid::parse_str(id).ok())
+                        Uuid::parse_str(&batch.created_by)
+                            .ok()
                             .and_then(|uid| user_map.get(&uid))
                             .map(|u| u.email.clone())
                     } else {
@@ -1566,7 +1562,7 @@ pub async fn list_batches<P: PoolProvider>(
                 });
 
             // Resolve context from batch owner (created_by field)
-            let owner_id = batch.created_by.as_ref().and_then(|id| Uuid::parse_str(id).ok());
+            let owner_id = Uuid::parse_str(&batch.created_by).ok();
             let owner = owner_id.and_then(|id| user_map.get(&id));
             let (context_name, context_type) = match owner {
                 Some(u) if u.user_type == "organization" => {

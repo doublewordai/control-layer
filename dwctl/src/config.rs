@@ -1133,6 +1133,16 @@ pub struct DaemonConfig {
     /// Example: `["/v1/chat/completions", "/v1/completions"]`
     #[serde(default)]
     pub streamable_endpoints: Vec<String>,
+
+    /// Weight controlling how much SLA urgency influences claim scheduling (0.0–1.0).
+    /// Blends per-user fairness with batch deadline urgency when ordering claims.
+    /// 0.0 = pure user-fairness, 1.0 = pure deadline urgency. Default: 0.3.
+    #[serde(default = "default_urgency_weight")]
+    pub urgency_weight: f64,
+}
+
+fn default_urgency_weight() -> f64 {
+    0.3
 }
 
 fn default_batch_metadata_fields_dwctl() -> Vec<String> {
@@ -1170,6 +1180,7 @@ impl Default for DaemonConfig {
             purge_batch_size: 1000,
             purge_throttle_ms: 100,
             streamable_endpoints: Vec::new(),
+            urgency_weight: default_urgency_weight(),
         }
     }
 }
@@ -1223,6 +1234,7 @@ impl DaemonConfig {
             purge_batch_size: self.purge_batch_size,
             purge_throttle_ms: self.purge_throttle_ms,
             streamable_endpoints: self.streamable_endpoints.clone(),
+            urgency_weight: self.urgency_weight,
             ..Default::default()
         }
     }
