@@ -1142,7 +1142,7 @@ pub struct DaemonConfig {
 }
 
 fn default_urgency_weight() -> f64 {
-    0.3
+    0.5
 }
 
 fn default_batch_metadata_fields_dwctl() -> Vec<String> {
