@@ -15,6 +15,7 @@ import { useNavigate } from "react-router-dom";
 import {
   useUser,
   useUpdateUser,
+  useUpdateOrganization,
   useWebhooks,
   useCreateWebhook,
   useUpdateWebhook,
@@ -145,14 +146,18 @@ interface NotificationSettingsProps {
   userId: string;
   /** Whether to show platform webhook scope option */
   showPlatformScope?: boolean;
+  /** Whether the userId refers to an organization */
+  isOrganization?: boolean;
 }
 
 export const NotificationSettings: React.FC<NotificationSettingsProps> = ({
   userId,
   showPlatformScope = false,
+  isOrganization = false,
 }) => {
   const { data: user, refetch: refetchUser } = useUser(userId);
   const updateUserMutation = useUpdateUser();
+  const updateOrgMutation = useUpdateOrganization();
   const navigate = useNavigate();
 
   const { data: webhooks } = useWebhooks(userId);
@@ -174,14 +179,20 @@ export const NotificationSettings: React.FC<NotificationSettingsProps> = ({
   const [copiedSecret, setCopiedSecret] = useState(false);
   const [webhookScope, setWebhookScope] = useState<WebhookScope>("own");
 
+  const updateSettings = async (data: { batch_notifications_enabled?: boolean; low_balance_threshold?: number | null }) => {
+    if (!user) return;
+    if (isOrganization) {
+      await updateOrgMutation.mutateAsync({ id: user.id, data });
+    } else {
+      await updateUserMutation.mutateAsync({ id: user.id, data });
+    }
+    await refetchUser();
+  };
+
   const handleEmailNotificationsToggle = async (enabled: boolean) => {
     if (!user) return;
     try {
-      await updateUserMutation.mutateAsync({
-        id: user.id,
-        data: { batch_notifications_enabled: enabled },
-      });
-      await refetchUser();
+      await updateSettings({ batch_notifications_enabled: enabled });
     } catch {
       // Revert will happen via refetchUser
     }
@@ -190,13 +201,7 @@ export const NotificationSettings: React.FC<NotificationSettingsProps> = ({
   const handleLowBalanceToggle = async (enabled: boolean) => {
     if (!user) return;
     try {
-      await updateUserMutation.mutateAsync({
-        id: user.id,
-        data: {
-          low_balance_threshold: enabled ? 2.0 : null,
-        },
-      });
-      await refetchUser();
+      await updateSettings({ low_balance_threshold: enabled ? 2.0 : null });
     } catch {
       // Revert will happen via refetchUser
     }
@@ -207,11 +212,7 @@ export const NotificationSettings: React.FC<NotificationSettingsProps> = ({
     const num = parseFloat(value);
     if (isNaN(num) || num <= 0) return;
     try {
-      await updateUserMutation.mutateAsync({
-        id: user.id,
-        data: { low_balance_threshold: num },
-      });
-      await refetchUser();
+      await updateSettings({ low_balance_threshold: num });
     } catch {
       // Revert will happen via refetchUser
     }
@@ -383,7 +384,7 @@ export const NotificationSettings: React.FC<NotificationSettingsProps> = ({
               id="emailNotifications"
               checked={user?.batch_notifications_enabled ?? false}
               onCheckedChange={handleEmailNotificationsToggle}
-              disabled={updateUserMutation.isPending}
+              disabled={updateUserMutation.isPending || updateOrgMutation.isPending}
               aria-label="Email notifications"
             />
           </div>
@@ -428,7 +429,7 @@ export const NotificationSettings: React.FC<NotificationSettingsProps> = ({
                   onBlur={(e) =>
                     handleLowBalanceThresholdChange(e.target.value)
                   }
-                  disabled={updateUserMutation.isPending}
+                  disabled={updateUserMutation.isPending || updateOrgMutation.isPending}
                   aria-label="Low balance threshold"
                 />
               </div>
@@ -437,7 +438,7 @@ export const NotificationSettings: React.FC<NotificationSettingsProps> = ({
               id="lowBalanceNotifications"
               checked={user?.low_balance_threshold != null}
               onCheckedChange={handleLowBalanceToggle}
-              disabled={updateUserMutation.isPending}
+              disabled={updateUserMutation.isPending || updateOrgMutation.isPending}
               aria-label="Low balance notifications"
             />
           </div>

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            UPDATE users SET\n                display_name = COALESCE($2, display_name),\n                avatar_url = COALESCE($3, avatar_url),\n                email = COALESCE($4, email),\n                updated_at = NOW()\n            WHERE id = $1 AND user_type = 'organization' AND is_deleted = false\n            RETURNING id, username, email, display_name, avatar_url, auth_source, created_at, updated_at,\n                      is_admin, password_hash, external_user_id, payment_provider_id,\n                      batch_notifications_enabled, first_batch_email_sent,\n                      low_balance_notification_sent, low_balance_threshold,\n                      auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, user_type\n            ",
+  "query": "\n            UPDATE users SET\n                display_name = COALESCE($2, display_name),\n                avatar_url = COALESCE($3, avatar_url),\n                email = COALESCE($4, email),\n                batch_notifications_enabled = COALESCE($5, batch_notifications_enabled),\n                low_balance_threshold = CASE\n                    WHEN $6::boolean THEN $7\n                    ELSE low_balance_threshold\n                END,\n                low_balance_notification_sent = CASE\n                    WHEN $6::boolean THEN false\n                    ELSE low_balance_notification_sent\n                END,\n                updated_at = NOW()\n            WHERE id = $1 AND user_type = 'organization' AND is_deleted = false\n            RETURNING id, username, email, display_name, avatar_url, auth_source, created_at, updated_at,\n                      is_admin, password_hash, external_user_id, payment_provider_id,\n                      batch_notifications_enabled, first_batch_email_sent,\n                      low_balance_notification_sent, low_balance_threshold,\n                      auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, user_type\n            ",
   "describe": {
     "columns": [
       {
@@ -109,7 +109,10 @@
         "Uuid",
         "Varchar",
         "Varchar",
-        "Varchar"
+        "Varchar",
+        "Bool",
+        "Bool",
+        "Float4"
       ]
     },
     "nullable": [
@@ -135,5 +138,5 @@
       false
     ]
   },
-  "hash": "42bb2bdf8a6c09b96feb8f581f224b7aa8a0b102c31376452f139f678bed4fdf"
+  "hash": "5ac34e086e5616ea4b5a5f2499eeb01f4891d617df7169e08fafde2948dfe29d"
 }

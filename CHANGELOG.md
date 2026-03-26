@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.29.0](https://github.com/doublewordai/control-layer/compare/v8.28.1...v8.29.0) (2026-03-26)
+
+
+### Features
+
+* org notification settings in api handlers ([#921](https://github.com/doublewordai/control-layer/issues/921)) ([05d2051](https://github.com/doublewordai/control-layer/commit/05d2051004386a569cbc7676a05f7869aff65d6e))
+
 ## [8.28.1](https://github.com/doublewordai/control-layer/compare/v8.28.0...v8.28.1) (2026-03-25)
 
 
