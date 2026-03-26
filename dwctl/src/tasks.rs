@@ -10,6 +10,7 @@ use anyhow::Result;
 use fusillade::PostgresRequestManager;
 use sqlx::PgPool;
 use sqlx_pool_router::PoolProvider;
+use tokio_util::sync::CancellationToken;
 use underway::Job;
 
 use crate::api::handlers::batches::{CreateBatchInput, build_create_batch_job};
@@ -40,9 +41,20 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> TaskRunner<P> {
         Ok(Self { create_batch_job })
     }
 
-    /// Start the underway worker. Returns a handle for graceful shutdown.
-    pub fn start(&self) -> underway::job::JobHandle {
-        self.create_batch_job.start()
+    /// Start the underway worker with the given shutdown token.
+    ///
+    /// The worker stops when the token is cancelled — either explicitly via
+    /// [`BackgroundServices::shutdown`] or automatically via its `DropGuard`.
+    /// Interrupted tasks are retried on next startup (state tracked in Postgres).
+    pub fn start(&self, shutdown_token: CancellationToken) {
+        let mut worker = self.create_batch_job.worker();
+        worker.set_shutdown_token(shutdown_token);
+
+        tokio::spawn(async move {
+            if let Err(e) = worker.run().await {
+                tracing::error!(error = %e, "Underway worker error");
+            }
+        });
     }
 
     /// Get the create-batch job for enqueuing.
