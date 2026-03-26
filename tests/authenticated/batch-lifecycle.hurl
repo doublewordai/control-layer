@@ -8,7 +8,7 @@ POST http://localhost:3001/ai/v1/files
 dwctl_session: {{admin_jwt}}
 [MultipartFormData]
 purpose: batch
-file: file,tests/files/gpt4.jsonl; application/x-ndjson
+file: file,../files/gpt4.jsonl; application/x-ndjson
 HTTP 201
 [Captures]
 file_id: jsonpath "$.id"

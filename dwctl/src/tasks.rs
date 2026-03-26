@@ -29,7 +29,7 @@ pub struct TaskState<P: PoolProvider + Clone = sqlx_pool_router::DbPools> {
 /// Built once at startup, stored in `AppState`. Handlers use it to enqueue
 /// work; the worker processes jobs in the background.
 pub struct TaskRunner<P: PoolProvider + Clone + 'static = sqlx_pool_router::DbPools> {
-    create_batch_job: Job<CreateBatchInput, TaskState<P>>,
+    pub create_batch_job: Job<CreateBatchInput, TaskState<P>>,
 }
 
 impl<P: PoolProvider + Clone + Send + Sync + 'static> TaskRunner<P> {
@@ -57,8 +57,4 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> TaskRunner<P> {
         });
     }
 
-    /// Get the create-batch job for enqueuing.
-    pub fn create_batch_job(&self) -> &Job<CreateBatchInput, TaskState<P>> {
-        &self.create_batch_job
-    }
 }

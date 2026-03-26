@@ -519,7 +519,7 @@ pub async fn create_batch<P: PoolProvider>(
     // enqueue failure case is unlikely and a sweeper can clean up.
     state
         .task_runner
-        .create_batch_job()
+        .create_batch_job
         .enqueue(&CreateBatchInput {
             batch_id: *batch.id,
             file_id,
