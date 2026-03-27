@@ -109,10 +109,10 @@ fn is_batch_owner(current_user: &CurrentUser, created_by: &str) -> bool {
     if created_by == user_id {
         return true;
     }
-    if let Some(org_id) = current_user.active_organization {
-        if created_by == org_id.to_string() {
-            return true;
-        }
+    if let Some(org_id) = current_user.active_organization
+        && created_by == org_id.to_string()
+    {
+        return true;
     }
     false
 }
@@ -871,7 +871,7 @@ pub async fn get_batch<P: PoolProvider>(
     };
 
     // Resolve context from batch owner (created_by field)
-    let (context_name, context_type) = if let Some(owner_id) = Uuid::parse_str(&batch.created_by).ok() {
+    let (context_name, context_type) = if let Ok(owner_id) = Uuid::parse_str(&batch.created_by) {
         let user_map = Users::new(&mut read_conn)
             .get_bulk(vec![owner_id])
             .await
