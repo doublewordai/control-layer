@@ -49,10 +49,11 @@ use crate::request_logging::AiResponse;
 use crate::request_logging::batcher::{AnalyticsSender, RawAnalyticsRecord};
 use crate::request_logging::serializers::{Auth, UsageMetrics, parse_ai_response};
 use crate::request_logging::utils::{extract_header_as_string, extract_header_as_uuid};
+use axum::http::Uri;
 use metrics::counter;
 use outlet::{RequestData, RequestHandler, ResponseData};
 use serde_json::Value;
-use tracing::{Instrument, info_span, warn};
+use tracing::{Instrument, error, info_span, warn};
 use uuid::Uuid;
 
 /// A request handler that sends analytics data to a background batcher.
@@ -87,6 +88,24 @@ impl AnalyticsHandler {
             config,
         }
     }
+
+    fn usage_required_endpoint(uri: &Uri) -> Option<&'static str> {
+        match uri.path() {
+            path if path.ends_with("/v1/chat/completions") || path.ends_with("/chat/completions") => Some("/v1/chat/completions"),
+            path if path.ends_with("/v1/completions") || path.ends_with("/completions") => Some("/v1/completions"),
+            path if path.ends_with("/v1/responses") || path.ends_with("/responses") => Some("/v1/responses"),
+            _ => None,
+        }
+    }
+
+    fn is_fusillade_stream(request_data: &RequestData) -> bool {
+        request_data
+            .headers
+            .get("x-fusillade-stream")
+            .and_then(|values| values.first())
+            .and_then(|bytes| std::str::from_utf8(bytes).ok())
+            == Some("true")
+    }
 }
 
 impl RequestHandler for AnalyticsHandler {
@@ -112,17 +131,68 @@ impl RequestHandler for AnalyticsHandler {
         );
 
         async {
+            let usage_required_endpoint = Self::usage_required_endpoint(&request_data.uri);
+            let fusillade_stream = Self::is_fusillade_stream(&request_data);
+
             // Try to parse the response - may fail for error responses (4xx, 5xx)
             let parse_result = parse_ai_response(&request_data, &response_data);
 
             // Use parsed response for metrics, or fallback to Other for error responses
             let metrics_response = match &parse_result {
                 Ok(response) => response.clone(),
-                Err(_) => AiResponse::Other(Value::Null),
+                Err(e) => {
+                    if response_data.status.is_success() {
+                        tracing::warn!(
+                            correlation_id = correlation_id,
+                            uri = %request_data.uri,
+                            error = %e.error,
+                            "Failed to parse successful AI response — tokens will be zero"
+                        );
+                        if let Some(endpoint) = usage_required_endpoint {
+                            counter!(
+                                "dwctl_usage_extraction_failures_total",
+                                "endpoint" => endpoint,
+                                "reason" => "parse_error"
+                            )
+                            .increment(1);
+                            error!(
+                                correlation_id = correlation_id,
+                                uri = %request_data.uri,
+                                endpoint,
+                                fusillade_stream,
+                                error = %e.error,
+                                "CRITICAL: failed to serialize usage for successful generative response"
+                            );
+                        }
+                    }
+                    AiResponse::Other(Value::Null)
+                }
             };
 
             // Extract basic metrics - captures status_code, duration, model from request, etc.
             let metrics = UsageMetrics::extract(self.instance_id, &request_data, &response_data, &metrics_response, &self.config);
+
+            if response_data.status.is_success()
+                && metrics.total_tokens == 0
+                && let Some(endpoint) = usage_required_endpoint
+            {
+                counter!(
+                    "dwctl_usage_extraction_failures_total",
+                    "endpoint" => endpoint,
+                    "reason" => "missing_usage"
+                )
+                .increment(1);
+                error!(
+                    correlation_id = correlation_id,
+                    uri = %request_data.uri,
+                    endpoint,
+                    response_type = %metrics.response_type,
+                    fusillade_stream,
+                    request_model = ?metrics.request_model,
+                    response_model = ?metrics.response_model,
+                    "CRITICAL: successful generative response recorded zero tokens"
+                );
+            }
 
             // Extract auth information from headers
             let auth = Auth::from_request(&request_data, &self.config);
@@ -244,6 +314,35 @@ mod tests {
         let data = create_test_response_data();
         assert_eq!(data.correlation_id, 123);
         assert_eq!(data.status, StatusCode::OK);
+    }
+
+    #[test]
+    fn test_usage_required_endpoint_matches_proxied_and_v1_paths() {
+        assert_eq!(
+            AnalyticsHandler::usage_required_endpoint(&Uri::from_static("/v1/chat/completions")),
+            Some("/v1/chat/completions")
+        );
+        assert_eq!(
+            AnalyticsHandler::usage_required_endpoint(&Uri::from_static("/chat/completions")),
+            Some("/v1/chat/completions")
+        );
+        assert_eq!(
+            AnalyticsHandler::usage_required_endpoint(&Uri::from_static("/v1/completions")),
+            Some("/v1/completions")
+        );
+        assert_eq!(
+            AnalyticsHandler::usage_required_endpoint(&Uri::from_static("/completions")),
+            Some("/v1/completions")
+        );
+        assert_eq!(
+            AnalyticsHandler::usage_required_endpoint(&Uri::from_static("/v1/responses")),
+            Some("/v1/responses")
+        );
+        assert_eq!(
+            AnalyticsHandler::usage_required_endpoint(&Uri::from_static("/responses")),
+            Some("/v1/responses")
+        );
+        assert_eq!(AnalyticsHandler::usage_required_endpoint(&Uri::from_static("/embeddings")), None);
     }
 
     #[tokio::test]

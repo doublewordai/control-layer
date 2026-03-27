@@ -1032,6 +1032,9 @@ pub async fn build_router(
     // API routes
     let api_routes = Router::new()
         .route("/config", get(api::handlers::config::get_config))
+        // CLI login endpoints — under /admin/api/v1/ so they route through the app,
+        // not through oauth2-proxy (which intercepts all /authentication/* paths).
+        .route("/auth/cli-callback", get(api::handlers::auth::cli_callback))
         // User management (admin only for collection operations)
         .route("/users", get(api::handlers::users::list_users))
         .route("/users", post(api::handlers::users::create_user))
@@ -2249,6 +2252,7 @@ impl Application {
         // Build onwards router from targets with body transform, response sanitization, and tool executor.
         let onwards_app_state = onwards::AppState::with_transform(bg_services.onwards_targets.clone(), body_transform)
             .with_response_transform(onwards::create_openai_sanitizer())
+            .with_streaming_header("x-fusillade-stream")
             .with_tool_executor(Arc::new(tool_executor));
         let onwards_router = if bg_services.onwards_targets.strict_mode {
             tracing::info!("Strict mode enabled - using typed request validation");

@@ -1132,6 +1132,13 @@ pub struct DaemonConfig {
     /// cycle (milliseconds). Prevents sustained high DB load when many orphans
     /// exist. Default: 100.
     pub purge_throttle_ms: u64,
+
+    /// Request paths that should use SSE streaming for usage tracking.
+    /// When a request's path matches, an `X-Fusillade-Stream` header is sent
+    /// and the response is read as SSE, then reassembled into non-streaming JSON.
+    /// Example: `["/v1/chat/completions", "/v1/completions"]`
+    #[serde(default)]
+    pub streamable_endpoints: Vec<String>,
 }
 
 fn default_batch_metadata_fields_dwctl() -> Vec<String> {
@@ -1168,6 +1175,7 @@ impl Default for DaemonConfig {
             purge_interval_ms: 600_000,
             purge_batch_size: 1000,
             purge_throttle_ms: 100,
+            streamable_endpoints: Vec::new(),
         }
     }
 }
@@ -1220,6 +1228,7 @@ impl DaemonConfig {
             purge_interval_ms: self.purge_interval_ms,
             purge_batch_size: self.purge_batch_size,
             purge_throttle_ms: self.purge_throttle_ms,
+            streamable_endpoints: self.streamable_endpoints.clone(),
             ..Default::default()
         }
     }

@@ -343,6 +343,10 @@ pub async fn create_user<P: PoolProvider>(
     // explicitly via API and can tolerate activation delay.
 
     tx.commit().await.map_err(|e| Error::Database(e.into()))?;
+
+    // user.created webhook deliveries are created by the notification poller
+    // via PG LISTEN/NOTIFY on the users table.
+
     Ok((StatusCode::CREATED, Json(UserResponse::from(user))))
 }
 

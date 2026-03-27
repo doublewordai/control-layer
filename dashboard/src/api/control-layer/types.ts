@@ -1338,6 +1338,8 @@ export interface DaemonsQuery {
 
 // ===== WEBHOOK TYPES =====
 
+export type WebhookScope = "own" | "platform";
+
 export interface Webhook {
   id: string;
   user_id: string;
@@ -1345,6 +1347,7 @@ export interface Webhook {
   enabled: boolean;
   event_types?: string[] | null;
   description?: string | null;
+  scope: WebhookScope;
   created_at: string;
   updated_at: string;
   disabled_at?: string | null;
@@ -1358,6 +1361,7 @@ export interface WebhookCreateRequest {
   url: string;
   event_types?: string[];
   description?: string;
+  scope?: WebhookScope;
 }
 
 export interface WebhookUpdateRequest {
@@ -1401,6 +1405,8 @@ export interface OrganizationCreateRequest {
 export interface OrganizationUpdateRequest {
   display_name?: string;
   email?: string;
+  batch_notifications_enabled?: boolean;
+  low_balance_threshold?: number | null;
 }
 
 export interface InviteMemberRequest {

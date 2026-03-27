@@ -442,6 +442,9 @@ pub async fn create_batch<P: PoolProvider>(
 
     tracing::debug!("Batch {} created successfully", batch.id);
 
+    // batch.created webhook deliveries are created by the notification poller
+    // which polls fusillade.batches for new records.
+
     // For create, we have the current user's email directly
     Ok((
         StatusCode::CREATED,
@@ -3140,7 +3143,6 @@ mod tests {
             })
             .await
             .unwrap();
-        drop(credits_repo);
         drop(conn);
 
         let create_req = CreateBatchRequest {
@@ -3250,7 +3252,6 @@ mod tests {
             })
             .await
             .unwrap();
-        drop(credits_repo);
         drop(conn);
 
         // Give org access to a model
