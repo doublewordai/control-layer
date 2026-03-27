@@ -1183,10 +1183,7 @@ where
 
     match opt {
         None => Ok(default_urgency_weight()),
-        Some(value) if !value.is_finite() => Err(D::Error::custom(format!(
-            "urgency_weight must be a finite number, got {}",
-            value
-        ))),
+        Some(value) if !value.is_finite() => Err(D::Error::custom(format!("urgency_weight must be a finite number, got {}", value))),
         Some(value) if !(0.0..=1.0).contains(&value) => Err(D::Error::custom(format!(
             "urgency_weight must be between 0.0 and 1.0, got {}",
             value

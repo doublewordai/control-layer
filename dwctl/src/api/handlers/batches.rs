@@ -338,7 +338,12 @@ pub async fn create_batch<P: PoolProvider>(
     // In org context, files owned by the active org are also considered "own"
     use crate::types::Resource;
     let has_read_all = can_read_all_resources(&current_user, Resource::Files);
-    if !has_read_all && !file.uploaded_by.as_deref().is_some_and(|owner| is_batch_owner(&current_user, owner)) {
+    if !has_read_all
+        && !file
+            .uploaded_by
+            .as_deref()
+            .is_some_and(|owner| is_batch_owner(&current_user, owner))
+    {
         use crate::types::{Operation, Permission};
         return Err(Error::InsufficientPermissions {
             required: Permission::Allow(Resource::Files, Operation::ReadAll),
