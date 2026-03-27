@@ -301,6 +301,7 @@ pub fn migrator() -> sqlx::migrate::Migrator {
 
 /// Global Prometheus handle - ensures recorder is only installed once
 static PROMETHEUS_HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
+static AXUM_PROMETHEUS_PREFIX_SET: OnceLock<()> = OnceLock::new();
 
 /// Get or install the Prometheus metrics recorder.
 ///
@@ -1379,11 +1380,18 @@ pub async fn build_router(
     if config.enable_metrics {
         let metric_handle = get_or_install_prometheus_handle();
 
-        let prometheus_layer = PrometheusMetricLayerBuilder::new()
-            .with_prefix("dwctl")
-            .with_metrics_from_fn(move || metric_handle.clone())
-            .build_pair()
-            .0;
+        let prometheus_layer = if AXUM_PROMETHEUS_PREFIX_SET.set(()).is_ok() {
+            PrometheusMetricLayerBuilder::new()
+                .with_prefix("dwctl")
+                .with_metrics_from_fn(move || metric_handle.clone())
+                .build_pair()
+                .0
+        } else {
+            PrometheusMetricLayerBuilder::new()
+                .with_metrics_from_fn(move || metric_handle.clone())
+                .build_pair()
+                .0
+        };
 
         // Get the GenAI registry from the metrics recorder (already initialized earlier)
         let gen_ai_registry = if let Some(ref recorder) = state.metrics_recorder {
