@@ -28,9 +28,79 @@ use bytes::Bytes;
 use chrono::{Duration, Utc};
 use fusillade::Storage;
 use futures::StreamExt;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::pin::Pin;
 use uuid::Uuid;
+
+// ---------------------------------------------------------------------------
+// Background task: batch population
+// ---------------------------------------------------------------------------
+
+/// Input for the batch population background job.
+///
+/// After the handler creates a batch record and returns it to the client,
+/// this job copies templates into requests in the background.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CreateBatchInput {
+    pub batch_id: Uuid,
+    pub file_id: Uuid,
+}
+
+/// Build the underway job for batch population.
+pub async fn build_create_batch_job<P: sqlx_pool_router::PoolProvider + Clone + Send + Sync + 'static>(
+    pool: sqlx::PgPool,
+    state: crate::tasks::TaskState<P>,
+) -> anyhow::Result<underway::Job<CreateBatchInput, crate::tasks::TaskState<P>>> {
+    use underway::Job;
+    use underway::job::To;
+    use underway::task::Error as TaskError;
+
+    Job::<CreateBatchInput, _>::builder()
+        .state(state)
+        .step(|cx, input: CreateBatchInput| async move {
+            let batch_id = fusillade::BatchId(input.batch_id);
+
+            if let Err(e) = cx
+                .state
+                .request_manager
+                .populate_batch(batch_id, fusillade::FileId(input.file_id))
+                .await
+            {
+                tracing::error!(
+                    batch_id = %input.batch_id,
+                    error = %e,
+                    "Failed to populate batch"
+                );
+
+                return match &e {
+                    fusillade::FusilladeError::ValidationError(_) => {
+                        if let Err(mark_err) = cx.state.request_manager.mark_batch_failed(batch_id, &e.to_string()).await {
+                            tracing::error!(
+                                batch_id = %input.batch_id,
+                                error = %mark_err,
+                                "Failed to mark batch as failed after validation error"
+                            );
+                            Err(TaskError::Retryable(mark_err.to_string()))
+                        } else {
+                            Err(TaskError::Fatal(e.to_string()))
+                        }
+                    }
+                    _ => Err(TaskError::Retryable(e.to_string())),
+                };
+            }
+
+            tracing::info!(batch_id = %input.batch_id, "Batch populated");
+            To::done()
+        })
+        .name("create-batch")
+        .pool(pool)
+        .build()
+        .await
+        .map_err(Into::into)
+}
+
+// ---------------------------------------------------------------------------
 
 /// Check if the current user "owns" a batch, considering org context.
 /// Returns true if the batch creator matches the user's ID or their active organization.
@@ -81,7 +151,12 @@ fn to_batch_response_with_email(batch: fusillade::Batch, creator_email: Option<&
             // Still cancelling
             "cancelling"
         }
-    } else if batch.total_requests == 0 {
+    } else if batch.failed_at.is_some() && !has_started {
+        // Batch failed before population (e.g. empty file, validation error)
+        "failed"
+    } else if !has_started {
+        // Batch hasn't been populated yet — total_requests may already be set
+        // from the template count at creation time, but no request rows exist yet.
         "validating"
     } else if is_finished && batch.failed_requests == batch.total_requests {
         // All requests failed (batch.failed_requests already filtered by SLA status)
@@ -396,6 +471,7 @@ pub async fn create_batch<P: PoolProvider>(
     let metadata = serde_json::to_value(metadata_map).ok();
 
     // Create batch input — created_by uses org ID when in org context for ownership scoping
+    let total_requests: i64 = file_model_counts.values().sum();
     let batch_input = fusillade::BatchInput {
         file_id: fusillade::FileId(file_id),
         endpoint: req.endpoint.clone(),
@@ -404,7 +480,7 @@ pub async fn create_batch<P: PoolProvider>(
         created_by: Some(target_user_id.to_string()),
         api_key_id: Some(api_key_id),
         api_key: Some(batch_api_key),
-        total_requests: Some(file_model_counts.values().sum()),
+        total_requests: Some(total_requests),
     };
 
     let reservation_ids = reserve_capacity_for_batch(
@@ -437,11 +513,36 @@ pub async fn create_batch<P: PoolProvider>(
         });
     });
 
-    let batch = state.request_manager.create_batch(batch_input).await.map_err(|e| Error::Internal {
-        operation: format!("create batch: {}", e),
-    })?;
+    // Batch record (fusillade DB) and job enqueue (dwctl DB) are on separate databases,
+    // so true atomicity isn't possible. Each is a single independent write.
+    let batch = state
+        .request_manager
+        .create_batch_record(batch_input)
+        .await
+        .map_err(|e| Error::Internal {
+            operation: format!("create batch record: {}", e),
+        })?;
 
-    tracing::debug!("Batch {} created successfully", batch.id);
+    // Enqueue background job to populate requests from templates.
+    if let Err(e) = state
+        .task_runner
+        .create_batch_job
+        .enqueue(&CreateBatchInput {
+            batch_id: *batch.id,
+            file_id,
+        })
+        .await
+    {
+        let _ = state
+            .request_manager
+            .mark_batch_failed(batch.id, &format!("Failed to enqueue population: {e}"))
+            .await;
+        return Err(Error::Internal {
+            operation: format!("enqueue batch population: {}", e),
+        });
+    }
+
+    tracing::debug!("Batch {} created, population enqueued", batch.id);
 
     // batch.created webhook deliveries are created by the notification poller
     // which polls fusillade.batches for new records.

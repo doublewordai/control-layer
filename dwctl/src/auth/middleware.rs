@@ -504,6 +504,7 @@ mod tests {
             metrics_recorder: None,
             is_leader: false,
             request_manager: state.request_manager,
+            task_runner: state.task_runner,
             limiters: state.limiters,
         };
 
@@ -610,6 +611,7 @@ mod tests {
             metrics_recorder: None,
             is_leader: false,
             request_manager: state.request_manager,
+            task_runner: state.task_runner,
             limiters: state.limiters,
         };
 
@@ -718,6 +720,7 @@ mod tests {
             metrics_recorder: None,
             is_leader: false,
             request_manager: state.request_manager,
+            task_runner: state.task_runner,
             limiters: state.limiters,
         };
 
@@ -893,6 +896,7 @@ mod tests {
             metrics_recorder: None,
             is_leader: false,
             request_manager: state.request_manager,
+            task_runner: state.task_runner,
             limiters: state.limiters,
         };
 
@@ -1001,6 +1005,7 @@ mod tests {
             metrics_recorder: None,
             is_leader: false,
             request_manager: state.request_manager,
+            task_runner: state.task_runner,
             limiters: state.limiters,
         };
 
