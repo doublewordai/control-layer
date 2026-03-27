@@ -83,13 +83,11 @@ impl BatchNotificationInfo {
         let batch = &notif.batch;
         let batch_id_str = batch.id.to_string();
 
-        let created_by = match &batch.created_by {
-            Some(id) => id.clone(),
-            None => {
-                tracing::debug!(batch_id = %batch_id_str, "Batch has no creator, skipping notification");
-                return None;
-            }
-        };
+        let created_by = &batch.created_by;
+        if created_by.is_empty() {
+            tracing::debug!(batch_id = %batch_id_str, "Batch has no creator, skipping notification");
+            return None;
+        }
 
         let user_id: Uuid = match created_by.parse() {
             Ok(id) => id,
