@@ -1,5 +1,13 @@
 # Changelog
 
+## [8.30.0](https://github.com/doublewordai/control-layer/compare/v8.29.0...v8.30.0) (2026-03-27)
+
+
+### Features
+
+* Add underway as job handler, and move batch creation to it ([#914](https://github.com/doublewordai/control-layer/issues/914)) ([bb90e58](https://github.com/doublewordai/control-layer/commit/bb90e58cebd961c236073148ca3d615364e9b11e))
+* fusillade fair usage ([#923](https://github.com/doublewordai/control-layer/issues/923)) ([26c3da7](https://github.com/doublewordai/control-layer/commit/26c3da70b5037f84cf592c4e9b9c0cb08cd46dc9))
+
 ## [8.29.0](https://github.com/doublewordai/control-layer/compare/v8.28.1...v8.29.0) (2026-03-26)
 
 
