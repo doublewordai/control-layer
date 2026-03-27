@@ -47,6 +47,7 @@
 use crate::config::Config;
 use crate::request_logging::AiResponse;
 use crate::request_logging::batcher::{AnalyticsSender, RawAnalyticsRecord};
+use crate::request_logging::models::{ChatCompletionChunk, CompletionChunk};
 use crate::request_logging::serializers::{Auth, UsageMetrics, parse_ai_response};
 use crate::request_logging::utils::{extract_header_as_string, extract_header_as_uuid};
 use axum::http::Uri;
@@ -172,6 +173,30 @@ impl RequestHandler for AnalyticsHandler {
             // Extract basic metrics - captures status_code, duration, model from request, etc.
             let metrics = UsageMetrics::extract(self.instance_id, &request_data, &response_data, &metrics_response, &self.config);
 
+            // Extract auth information from headers
+            let auth = Auth::from_request(&request_data, &self.config);
+
+            // Extract fusillade batch metadata from headers
+            let fusillade_batch_id = extract_header_as_uuid(&request_data, "x-fusillade-batch-id");
+            let fusillade_request_id = extract_header_as_uuid(&request_data, "x-fusillade-request-id");
+
+            // Compute stream diagnostics for zero-token warnings.
+            // Tells us whether the stream was truncated (missing [DONE]) or complete but missing usage,
+            // and captures the last few chunks so we can see exactly what the provider sent.
+            let (stream_chunk_count, stream_has_done, stream_tail) = match &metrics_response {
+                AiResponse::ChatCompletionsStream(chunks) => (
+                    Some(chunks.len()),
+                    Some(chunks.iter().any(|c| matches!(c, ChatCompletionChunk::Done))),
+                    serde_json::to_string(&chunks.iter().rev().take(5).collect::<Vec<_>>()).ok(),
+                ),
+                AiResponse::CompletionsStream(chunks) => (
+                    Some(chunks.len()),
+                    Some(chunks.iter().any(|c| matches!(c, CompletionChunk::Done))),
+                    serde_json::to_string(&chunks.iter().rev().take(5).collect::<Vec<_>>()).ok(),
+                ),
+                _ => (None, None, None),
+            };
+
             if response_data.status.is_success()
                 && metrics.total_tokens == 0
                 && let Some(endpoint) = usage_required_endpoint
@@ -190,16 +215,33 @@ impl RequestHandler for AnalyticsHandler {
                     fusillade_stream,
                     request_model = ?metrics.request_model,
                     response_model = ?metrics.response_model,
+                    ?fusillade_batch_id,
+                    ?fusillade_request_id,
+                    ?stream_chunk_count,
+                    ?stream_has_done,
+                    ?stream_tail,
                     "CRITICAL: successful generative response recorded zero tokens"
                 );
+            } else if response_data.status.is_success()
+                && metrics.completion_tokens == 0
+                && metrics.total_tokens > 0
+                && let Some(endpoint) = usage_required_endpoint
+            {
+                warn!(
+                    correlation_id = correlation_id,
+                    uri = %request_data.uri,
+                    endpoint,
+                    response_type = %metrics.response_type,
+                    fusillade_stream,
+                    prompt_tokens = metrics.prompt_tokens,
+                    total_tokens = metrics.total_tokens,
+                    request_model = ?metrics.request_model,
+                    response_model = ?metrics.response_model,
+                    ?fusillade_batch_id,
+                    ?fusillade_request_id,
+                    "successful response with zero completion tokens"
+                );
             }
-
-            // Extract auth information from headers
-            let auth = Auth::from_request(&request_data, &self.config);
-
-            // Extract fusillade batch metadata from headers
-            let fusillade_batch_id = extract_header_as_uuid(&request_data, "x-fusillade-batch-id");
-            let fusillade_request_id = extract_header_as_uuid(&request_data, "x-fusillade-request-id");
             let custom_id = extract_header_as_string(&request_data, "x-fusillade-custom-id");
             let batch_completion_window = extract_header_as_string(&request_data, "x-fusillade-batch-completion-window");
             let batch_request_source = extract_header_as_string(&request_data, "x-fusillade-batch-request-source").unwrap_or_default();
