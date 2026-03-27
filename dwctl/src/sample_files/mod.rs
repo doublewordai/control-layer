@@ -8,7 +8,7 @@ pub mod generators;
 
 use crate::db::models::deployments::DeploymentDBResponse;
 use crate::errors::Result;
-use fusillade::{FileId, Storage};
+use fusillade::{FileId, FileStreamResult, Storage};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -128,12 +128,22 @@ pub async fn create_sample_files_for_user<S: Storage>(
         }
 
         // Create file via fusillade with streaming to include metadata
-        let file_id = storage
+        let file_id = match storage
             .create_file_stream(stream::iter(items))
             .await
             .map_err(|e| crate::errors::Error::Internal {
                 operation: format!("create sample file '{}': {}", generator.name(), e),
-            })?;
+            })? {
+            FileStreamResult::Success(file_id) => file_id,
+            FileStreamResult::Aborted => {
+                return Err(crate::errors::Error::Internal {
+                    operation: format!(
+                        "create sample file '{}': fusillade aborted an internally generated stream",
+                        generator.name()
+                    ),
+                });
+            }
+        };
 
         tracing::info!(
             generator = generator.name(),

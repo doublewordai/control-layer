@@ -19,7 +19,8 @@ embedded-db = ["dep:postgresql_embedded"]
 
 [dependencies]
 axum = { version = "0.8", features = ["multipart"] }
-fusillade = { version = "13.1.1" }
+# Temporary pin until fusillade 14.0.1 is available through the normal crate release flow.
+fusillade = { git = "https://github.com/doublewordai/fusillade", rev = "aadce09c5062c04bbeef5eaa38b8cfb928846979" }
 tokio = { version = "1.0", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = "0.7"

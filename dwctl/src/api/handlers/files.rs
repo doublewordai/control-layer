@@ -445,7 +445,7 @@ fn create_file_stream(
                     Ok(mut guard) => *guard = Some($error),
                     Err(poisoned) => *poisoned.into_inner() = Some($error),
                 }
-                let _ = tx.send(fusillade::FileStreamItem::Error("aborted".to_string())).await;
+                let _ = tx.send(fusillade::FileStreamItem::Abort).await;
                 return;
             }};
         }
@@ -877,7 +877,7 @@ pub async fn upload_file<P: PoolProvider>(
     );
 
     // Create file via request manager with streaming
-    let created_file_id = state.request_manager.create_file_stream(file_stream).await.map_err(|e| {
+    let created_file_result = state.request_manager.create_file_stream(file_stream).await.map_err(|e| {
         // Check if WE aborted (control-layer error in slot)
         // Handle poisoned mutex gracefully - the data is still valid
         let upload_err = match error_slot.lock() {
@@ -898,6 +898,24 @@ pub async fn upload_file<P: PoolProvider>(
             },
         }
     })?;
+
+    let created_file_id = match created_file_result {
+        fusillade::FileStreamResult::Success(file_id) => file_id,
+        fusillade::FileStreamResult::Aborted => {
+            let upload_err = match error_slot.lock() {
+                Ok(mut guard) => guard.take(),
+                Err(poisoned) => poisoned.into_inner().take(),
+            };
+            if let Some(upload_err) = upload_err {
+                tracing::warn!("File upload aborted with error: {:?}", upload_err);
+                return Err(upload_err.into_http_error());
+            }
+
+            return Err(Error::Internal {
+                operation: "create file: fusillade returned Aborted without an upload error".to_string(),
+            });
+        }
+    };
 
     tracing::debug!("File {} uploaded successfully", created_file_id);
 
