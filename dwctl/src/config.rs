@@ -1160,6 +1160,36 @@ pub struct DaemonConfig {
     /// Example: `["/v1/chat/completions", "/v1/completions"]`
     #[serde(default)]
     pub streamable_endpoints: Vec<String>,
+
+    /// Weight controlling how much SLA urgency influences claim scheduling (0.0–1.0).
+    /// Blends per-user fairness with batch deadline urgency when ordering claims.
+    /// 0.0 = pure user-fairness, 1.0 = pure deadline urgency. Default: 0.5.
+    #[serde(default = "default_urgency_weight", deserialize_with = "deserialize_urgency_weight")]
+    pub urgency_weight: f64,
+}
+
+fn default_urgency_weight() -> f64 {
+    0.5
+}
+
+/// Custom deserializer that validates urgency_weight is in the 0.0–1.0 range and finite.
+fn deserialize_urgency_weight<'de, D>(deserializer: D) -> Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+
+    let opt: Option<f64> = Option::deserialize(deserializer)?;
+
+    match opt {
+        None => Ok(default_urgency_weight()),
+        Some(value) if !value.is_finite() => Err(D::Error::custom(format!("urgency_weight must be a finite number, got {}", value))),
+        Some(value) if !(0.0..=1.0).contains(&value) => Err(D::Error::custom(format!(
+            "urgency_weight must be between 0.0 and 1.0, got {}",
+            value
+        ))),
+        Some(value) => Ok(value),
+    }
 }
 
 fn default_batch_metadata_fields_dwctl() -> Vec<String> {
@@ -1197,6 +1227,7 @@ impl Default for DaemonConfig {
             purge_batch_size: 1000,
             purge_throttle_ms: 100,
             streamable_endpoints: Vec::new(),
+            urgency_weight: default_urgency_weight(),
         }
     }
 }
@@ -1250,6 +1281,7 @@ impl DaemonConfig {
             purge_batch_size: self.purge_batch_size,
             purge_throttle_ms: self.purge_throttle_ms,
             streamable_endpoints: self.streamable_endpoints.clone(),
+            urgency_weight: self.urgency_weight,
             ..Default::default()
         }
     }
@@ -2753,6 +2785,132 @@ auth:
 
             let config = Config::load(&args)?;
             assert_eq!(config.auth.native.session.cookie_domain, None);
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_urgency_weight_default() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+"#,
+            )?;
+
+            let args = Args {
+                config: "test.yaml".to_string(),
+                validate: false,
+            };
+
+            let config = Config::load(&args)?;
+            assert_eq!(config.background_services.batch_daemon.urgency_weight, 0.5);
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_urgency_weight_yaml_override() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+background_services:
+  batch_daemon:
+    urgency_weight: 0.8
+"#,
+            )?;
+
+            let args = Args {
+                config: "test.yaml".to_string(),
+                validate: false,
+            };
+
+            let config = Config::load(&args)?;
+            assert_eq!(config.background_services.batch_daemon.urgency_weight, 0.8);
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_urgency_weight_negative_rejected() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+background_services:
+  batch_daemon:
+    urgency_weight: -0.1
+"#,
+            )?;
+
+            let args = Args {
+                config: "test.yaml".to_string(),
+                validate: false,
+            };
+
+            let result = Config::load(&args);
+            assert!(result.is_err());
+            let err = result.unwrap_err().to_string();
+            assert!(err.contains("urgency_weight must be between 0.0 and 1.0"));
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_urgency_weight_above_one_rejected() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+background_services:
+  batch_daemon:
+    urgency_weight: 1.5
+"#,
+            )?;
+
+            let args = Args {
+                config: "test.yaml".to_string(),
+                validate: false,
+            };
+
+            let result = Config::load(&args);
+            assert!(result.is_err());
+            let err = result.unwrap_err().to_string();
+            assert!(err.contains("urgency_weight must be between 0.0 and 1.0"));
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_urgency_weight_null_uses_default() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+background_services:
+  batch_daemon:
+    urgency_weight: null
+"#,
+            )?;
+
+            let args = Args {
+                config: "test.yaml".to_string(),
+                validate: false,
+            };
+
+            let config = Config::load(&args)?;
+            assert_eq!(config.background_services.batch_daemon.urgency_weight, 0.5);
 
             Ok(())
         });

@@ -104,16 +104,15 @@ pub async fn build_create_batch_job<P: sqlx_pool_router::PoolProvider + Clone + 
 
 /// Check if the current user "owns" a batch, considering org context.
 /// Returns true if the batch creator matches the user's ID or their active organization.
-fn is_batch_owner(current_user: &CurrentUser, created_by: Option<&str>) -> bool {
+fn is_batch_owner(current_user: &CurrentUser, created_by: &str) -> bool {
     let user_id = current_user.id.to_string();
-    if created_by == Some(user_id.as_str()) {
+    if created_by == user_id {
         return true;
     }
-    if let Some(org_id) = current_user.active_organization {
-        let org_id_str = org_id.to_string();
-        if created_by == Some(org_id_str.as_str()) {
-            return true;
-        }
+    if let Some(org_id) = current_user.active_organization
+        && created_by == org_id.to_string()
+    {
+        return true;
     }
     false
 }
@@ -245,6 +244,9 @@ fn to_batch_response_with_email(batch: fusillade::Batch, creator_email: Option<&
 /// Helper to fetch creator email for a batch from the database.
 ///
 async fn fetch_creator_email(db: &sqlx::PgPool, batch: &fusillade::Batch) -> Option<String> {
+    if batch.created_by.is_empty() {
+        return None;
+    }
     let user_id = Uuid::parse_str(&batch.created_by).ok()?;
     let mut conn = db.acquire().await.ok()?;
     Users::new(&mut conn).get_by_id(user_id).await.ok().flatten().map(|u| u.email)
@@ -336,7 +338,12 @@ pub async fn create_batch<P: PoolProvider>(
     // In org context, files owned by the active org are also considered "own"
     use crate::types::Resource;
     let has_read_all = can_read_all_resources(&current_user, Resource::Files);
-    if !has_read_all && !is_batch_owner(&current_user, file.uploaded_by.as_deref()) {
+    if !has_read_all
+        && !file
+            .uploaded_by
+            .as_deref()
+            .is_some_and(|owner| is_batch_owner(&current_user, owner))
+    {
         use crate::types::{Operation, Permission};
         return Err(Error::InsufficientPermissions {
             required: Permission::Allow(Resource::Files, Operation::ReadAll),
@@ -819,7 +826,7 @@ pub async fn get_batch<P: PoolProvider>(
 
     // Check ownership: users without ReadAll permission can only see their own batches (or org batches)
     let can_read_all = can_read_all_resources(&current_user, Resource::Batches);
-    if !can_read_all && !is_batch_owner(&current_user, Some(batch.created_by.as_str())) {
+    if !can_read_all && !is_batch_owner(&current_user, &batch.created_by) {
         return Err(Error::NotFound {
             resource: "Batch".to_string(),
             id: batch_id_str,
@@ -945,7 +952,7 @@ pub async fn get_batch_analytics<P: PoolProvider>(
 
     // Check ownership: users without ReadAll permission can only see their own batches (or org batches)
     let can_read_all = can_read_all_resources(&current_user, Resource::Batches);
-    if !can_read_all && !is_batch_owner(&current_user, Some(batch.created_by.as_str())) {
+    if !can_read_all && !is_batch_owner(&current_user, &batch.created_by) {
         return Err(Error::NotFound {
             resource: "Batch".to_string(),
             id: batch_id_str.clone(),
@@ -1005,7 +1012,7 @@ pub async fn get_batch_results<P: PoolProvider>(
 
     // Check ownership: users without ReadAll permission can only see their own batches (or org batches)
     let can_read_all = can_read_all_resources(&current_user, Resource::Batches);
-    if !can_read_all && !is_batch_owner(&current_user, Some(batch.created_by.as_str())) {
+    if !can_read_all && !is_batch_owner(&current_user, &batch.created_by) {
         return Err(Error::NotFound {
             resource: "Batch".to_string(),
             id: batch_id_str.clone(),
@@ -1161,7 +1168,7 @@ pub async fn cancel_batch<P: PoolProvider>(
 
     // Check ownership: users without UpdateAll permission can only cancel their own batches (or org batches)
     let can_update_all = has_permission(&current_user, Resource::Batches, Operation::UpdateAll);
-    if !can_update_all && !is_batch_owner(&current_user, Some(batch.created_by.as_str())) {
+    if !can_update_all && !is_batch_owner(&current_user, &batch.created_by) {
         return Err(Error::NotFound {
             resource: "Batch".to_string(),
             id: batch_id_str.clone(),
@@ -1234,7 +1241,7 @@ pub async fn delete_batch<P: PoolProvider>(
 
     // Check ownership: users without DeleteAll permission can only delete their own batches (or org batches)
     let can_delete_all = has_permission(&current_user, Resource::Batches, Operation::DeleteAll);
-    if !can_delete_all && !is_batch_owner(&current_user, Some(batch.created_by.as_str())) {
+    if !can_delete_all && !is_batch_owner(&current_user, &batch.created_by) {
         return Err(Error::NotFound {
             resource: "Batch".to_string(),
             id: batch_id_str.clone(),
@@ -1295,7 +1302,7 @@ pub async fn retry_failed_batch_requests<P: PoolProvider>(
 
     // Check ownership: users without UpdateAll permission can only retry their own batches (or org batches)
     let can_update_all = has_permission(&current_user, Resource::Batches, Operation::UpdateAll);
-    if !can_update_all && !is_batch_owner(&current_user, Some(batch.created_by.as_str())) {
+    if !can_update_all && !is_batch_owner(&current_user, &batch.created_by) {
         return Err(Error::NotFound {
             resource: "Batch".to_string(),
             id: batch_id_str.clone(),
@@ -1380,7 +1387,7 @@ pub async fn retry_specific_requests<P: PoolProvider>(
 
     // Check ownership: users without UpdateAll permission can only retry their own batches (or org batches)
     let can_update_all = has_permission(&current_user, Resource::Batches, Operation::UpdateAll);
-    if !can_update_all && !is_batch_owner(&current_user, Some(batch.created_by.as_str())) {
+    if !can_update_all && !is_batch_owner(&current_user, &batch.created_by) {
         return Err(Error::NotFound {
             resource: "Batch".to_string(),
             id: batch_id_str.clone(),
