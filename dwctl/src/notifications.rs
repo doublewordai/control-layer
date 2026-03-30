@@ -587,6 +587,14 @@ async fn process_new_batches(conn: &mut sqlx::pool::PoolConnection<sqlx::Postgre
     let event_type = WebhookEventType::BatchCreated;
 
     for batch in &new_batches {
+        if batch.created_by.is_empty() {
+            tracing::debug!(
+                batch_id = %batch.id,
+                "Skipping batch webhook delivery for empty creator"
+            );
+            continue;
+        }
+
         let user_id: Uuid = match batch.created_by.parse() {
             Ok(id) => id,
             Err(e) => {
