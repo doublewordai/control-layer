@@ -8,7 +8,7 @@ pub mod generators;
 
 use crate::db::models::deployments::DeploymentDBResponse;
 use crate::errors::Result;
-use fusillade::{FileId, Storage};
+use fusillade::{FileId, FileStreamResult, Storage};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -128,12 +128,15 @@ pub async fn create_sample_files_for_user<S: Storage>(
         }
 
         // Create file via fusillade with streaming to include metadata
-        let file_id = storage
-            .create_file_stream(stream::iter(items))
-            .await
-            .map_err(|e| crate::errors::Error::Internal {
-                operation: format!("create sample file '{}': {}", generator.name(), e),
-            })?;
+        let file_id = expect_sample_file_id(
+            generator.name(),
+            storage
+                .create_file_stream(stream::iter(items))
+                .await
+                .map_err(|e| crate::errors::Error::Internal {
+                    operation: format!("create sample file '{}': {}", generator.name(), e),
+                })?,
+        )?;
 
         tracing::info!(
             generator = generator.name(),
@@ -147,6 +150,18 @@ pub async fn create_sample_files_for_user<S: Storage>(
     }
 
     Ok(created_files)
+}
+
+fn expect_sample_file_id(generator_name: &str, result: FileStreamResult) -> Result<FileId> {
+    match result {
+        FileStreamResult::Success(file_id) => Ok(file_id),
+        FileStreamResult::Aborted => Err(crate::errors::Error::Internal {
+            operation: format!(
+                "create sample file '{}': fusillade aborted an internally generated stream",
+                generator_name
+            ),
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -225,6 +240,20 @@ mod tests {
         let vision_generator = generators::VisionGenerator;
         let result = find_matching_model(&deployments, &vision_generator);
         assert_eq!(result, Some("gpt-4-vision".to_string()));
+    }
+
+    #[test]
+    fn test_expect_sample_file_id_returns_internal_error_on_aborted() {
+        let err = super::expect_sample_file_id("Sample: Chat", FileStreamResult::Aborted)
+            .expect_err("aborted result should map to internal error");
+
+        match err {
+            crate::errors::Error::Internal { operation } => {
+                assert!(operation.contains("Sample: Chat"));
+                assert!(operation.contains("aborted an internally generated stream"));
+            }
+            other => panic!("Expected Internal error, got {other:?}"),
+        }
     }
 
     #[test]
