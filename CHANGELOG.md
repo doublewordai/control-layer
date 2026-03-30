@@ -1,5 +1,13 @@
 # Changelog
 
+## [8.30.1](https://github.com/doublewordai/control-layer/compare/v8.30.0...v8.30.1) (2026-03-30)
+
+
+### Bug Fixes
+
+* bump fusillade 14.1.0 ([#929](https://github.com/doublewordai/control-layer/issues/929)) ([9273a82](https://github.com/doublewordai/control-layer/commit/9273a82965c7ffd67ad235a7735c0d7b51102ca2))
+* support fusillade 14.0.1 file stream handling ([#927](https://github.com/doublewordai/control-layer/issues/927)) ([17c05cd](https://github.com/doublewordai/control-layer/commit/17c05cd756372c9b9b8b22d8da6121f7f9cf5d7e))
+
 ## [8.30.0](https://github.com/doublewordai/control-layer/compare/v8.29.0...v8.30.0) (2026-03-27)
 
 
