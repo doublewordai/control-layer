@@ -473,6 +473,7 @@ pub async fn create_batch<P: PoolProvider>(
     }
     metadata_map.insert("request_source".to_string(), request_source.to_string());
     metadata_map.insert("created_by".to_string(), current_user.id.to_string());
+    metadata_map.insert("created_by_email".to_string(), current_user.email.clone());
     let metadata = serde_json::to_value(metadata_map).ok();
 
     // Create batch input — created_by uses org ID when in org context for ownership scoping

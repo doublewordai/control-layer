@@ -475,31 +475,21 @@ pub async fn delete_user<P: PoolProvider>(
         });
     }
 
-    // Cancel all active batches for this user before deletion
+    // Soft-delete all user batches (with metadata scrub) and files in chunks
     let user_id_str = user_id.to_string();
-    let batches = state
-        .request_manager
-        .list_batches(fusillade::ListBatchesFilter {
-            created_by: Some(user_id_str.clone()),
-            limit: Some(i64::MAX),
-            ..Default::default()
-        })
-        .await
-        .map_err(|_| Error::NotFound {
-            resource: "Batch".to_string(),
-            id: user_id_str.clone(),
-        })?;
-
-    for batch in batches {
-        if batch.completed_at.is_none()
-            && let Err(e) = state.request_manager.cancel_batch(batch.id).await
-        {
-            tracing::warn!(
-                batch_id = %batch.id,
-                user_id = %user_id,
-                error = %e,
-                "Failed to cancel batch during user deletion"
-            );
+    let chunk_size = 1000i64;
+    loop {
+        match state.request_manager.bulk_delete_data(&user_id_str, chunk_size).await {
+            Ok(0) => break,
+            Ok(_) => continue,
+            Err(e) => {
+                tracing::error!(
+                    user_id = %user_id,
+                    error = %e,
+                    "Failed to delete user data during user deletion"
+                );
+                break;
+            }
         }
     }
 

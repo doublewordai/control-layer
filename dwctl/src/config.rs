@@ -1199,6 +1199,7 @@ fn default_batch_metadata_fields_dwctl() -> Vec<String> {
         "created_at".to_string(),
         "completion_window".to_string(),
         "request_source".to_string(),
+        "created_by_email".to_string(),
     ]
 }
 
