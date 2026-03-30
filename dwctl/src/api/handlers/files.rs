@@ -1793,6 +1793,7 @@ mod tests {
     use crate::db::models::api_keys::ApiKeyPurpose;
     use crate::test::utils::*;
     use sqlx::PgPool;
+    use std::sync::{Arc, Mutex};
     use uuid::Uuid;
 
     #[sqlx::test]
