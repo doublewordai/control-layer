@@ -78,7 +78,7 @@ pub struct BatchNotificationInfo {
 
 impl BatchNotificationInfo {
     /// Build from a fusillade batch notification, returning `None` for batches
-    /// that can't be notified about (no creator, invalid UUID, no outcome).
+    /// that can't be notified about (empty/invalid creator, no outcome).
     fn try_from_batch(notif: &fusillade::batch::BatchNotification) -> Option<Self> {
         let batch = &notif.batch;
         let batch_id_str = batch.id.to_string();
@@ -589,7 +589,15 @@ async fn process_new_batches(conn: &mut sqlx::pool::PoolConnection<sqlx::Postgre
     for batch in &new_batches {
         let user_id: Uuid = match batch.created_by.parse() {
             Ok(id) => id,
-            Err(_) => continue,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    batch_id = %batch.id,
+                    created_by = %batch.created_by,
+                    "Failed to parse batch.created_by as UUID; skipping batch for webhook delivery"
+                );
+                continue;
+            }
         };
 
         let event = WebhookEvent::batch_created(batch.id, user_id, &batch.endpoint);
