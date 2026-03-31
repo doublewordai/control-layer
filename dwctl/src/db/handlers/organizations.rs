@@ -392,6 +392,24 @@ impl<'c> Organizations<'c> {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
+    /// Count the number of active organizations a user belongs to.
+    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
+    pub async fn count_user_organizations(&mut self, user_id: UserId) -> Result<i64> {
+        let count = sqlx::query_scalar!(
+            r#"
+            SELECT COUNT(*) as "count!"
+            FROM user_organizations uo
+            INNER JOIN users u ON u.id = uo.organization_id
+            WHERE uo.user_id = $1 AND uo.status = 'active' AND u.is_deleted = false
+            "#,
+            user_id
+        )
+        .fetch_one(&mut *self.db)
+        .await?;
+
+        Ok(count)
+    }
+
     /// Get a user's role in an organization (active memberships only, None if not a member)
     #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id), org_id = %abbrev_uuid(&org_id)), err)]
     pub async fn get_user_org_role(&mut self, user_id: UserId, org_id: UserId) -> Result<Option<String>> {
