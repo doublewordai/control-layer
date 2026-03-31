@@ -660,26 +660,39 @@ pub async fn enable_auto_topup<P: PoolProvider>(
         }
     };
 
-    // Check if user has a customer ID with the payment provider, create one if not
-    let customer_id = match &user.payment_provider_id {
+    // When in org context, load the org's payment details; otherwise use the caller's
+    let target_id = user.active_organization.unwrap_or(user.id);
+    let (target_payment_id, target_email, target_display_name) = if let Some(org_id) = user.active_organization {
+        let mut conn = state.db.write().acquire().await.map_err(|e| {
+            tracing::error!("Failed to acquire database connection: {:?}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+        let org = Users::new(&mut conn).get_by_id(org_id).await.map_err(|e| {
+            tracing::error!("Failed to load org user: {:?}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?.ok_or(StatusCode::NOT_FOUND)?;
+        (org.payment_provider_id, org.email, org.display_name)
+    } else {
+        (user.payment_provider_id.clone(), user.email.clone(), user.display_name.clone())
+    };
+
+    // Check if target user has a customer ID with the payment provider, create one if not
+    let customer_id = match &target_payment_id {
         Some(id) if !id.is_empty() => id.clone(),
         _ => {
-            // No customer — create one so we can redirect to the billing portal
             let new_id = provider
-                .create_customer(&user.email, user.display_name.as_deref())
+                .create_customer(&target_email, target_display_name.as_deref())
                 .await
                 .map_err(|e| {
                     tracing::error!("Failed to create payment provider customer: {:?}", e);
                     StatusCode::INTERNAL_SERVER_ERROR
                 })?;
 
-            // Persist the new customer ID
             let mut conn = state.db.write().acquire().await.map_err(|e| {
                 tracing::error!("Failed to acquire database connection: {:?}", e);
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
-            let mut users = Users::new(&mut conn);
-            users.set_payment_provider_id_if_empty(user.id, &new_id).await.map_err(|e| {
+            Users::new(&mut conn).set_payment_provider_id_if_empty(target_id, &new_id).await.map_err(|e| {
                 tracing::error!("Failed to save customer ID: {:?}", e);
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
@@ -732,7 +745,7 @@ pub async fn enable_auto_topup<P: PoolProvider>(
             })?;
 
             let mut users = Users::new(&mut conn);
-            users.update(user.id, &update).await.map_err(|e| {
+            users.update(target_id, &update).await.map_err(|e| {
                 tracing::error!("Failed to enable auto top-up: {:?}", e);
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
@@ -763,6 +776,59 @@ pub async fn enable_auto_topup<P: PoolProvider>(
                 .into_response())
         }
     }
+}
+
+/// Disable auto top-up by clearing the threshold, amount, and monthly limit.
+///
+/// Respects org context: when an active organization is set, disables auto top-up
+/// for the org rather than the individual user.
+#[utoipa::path(
+    post,
+    path = "/auto-topup/disable",
+    tag = "payments",
+    summary = "Disable auto top-up",
+    description = "Clears auto top-up configuration for the current user or active organization.",
+    responses(
+        (status = 200, description = "Auto top-up disabled"),
+        (status = 404, description = "Target user not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
+        ("X-Doubleword-User" = [])
+    )
+)]
+#[tracing::instrument(skip_all)]
+pub async fn disable_auto_topup<P: PoolProvider>(
+    State(state): State<AppState<P>>,
+    user: CurrentUser,
+) -> Result<Response, StatusCode> {
+    let target_id = user.active_organization.unwrap_or(user.id);
+
+    let update = UserUpdateDBRequest {
+        display_name: None,
+        avatar_url: None,
+        roles: None,
+        password_hash: None,
+        batch_notifications_enabled: None,
+        low_balance_threshold: None,
+        auto_topup_amount: Some(None),
+        auto_topup_threshold: Some(None),
+        auto_topup_monthly_limit: Some(None),
+    };
+
+    let mut conn = state.db.write().acquire().await.map_err(|e| {
+        tracing::error!("Failed to acquire database connection: {:?}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    Users::new(&mut conn).update(target_id, &update).await.map_err(|e| {
+        tracing::error!("Failed to disable auto top-up: {:?}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    Ok(Json(json!({ "message": "Auto top-up disabled" })).into_response())
 }
 
 #[cfg(test)]

@@ -1312,6 +1312,18 @@ export function useEnableAutoTopup() {
   });
 }
 
+export function useDisableAutoTopup() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationKey: ["payments", "auto-topup-disable"],
+    mutationFn: () => dwctlApi.payments.disableAutoTopup(),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.users.all });
+    },
+  });
+}
+
 
 // ===== DAEMONS HOOKS =====
 

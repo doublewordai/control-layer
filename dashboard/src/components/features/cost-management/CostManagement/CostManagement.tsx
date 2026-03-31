@@ -229,7 +229,6 @@ export function CostManagement() {
   const autoTopupElement = showAutoTopupSection ? (
     <AutoTopupSection
       user={displayUser!}
-      userId={currentUser!.id}
       onSuccess={() => {
         refetchCurrentUser();
         refetchDisplayUser();
