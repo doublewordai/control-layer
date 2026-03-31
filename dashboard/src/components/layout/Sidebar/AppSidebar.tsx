@@ -81,7 +81,9 @@ interface NavItem {
 export function AppSidebar() {
   const navigate = useNavigate();
   const location = useLocation();
-  const { data: currentUser, isLoading: loading } = useUser("current", { include: "organizations" });
+  const { data: currentUser, isLoading: loading } = useUser("current", {
+    include: "organizations",
+  });
   const { canAccessRoute, hasPermission } = useAuthorization();
   const { logout } = useAuth();
   const { isFeatureEnabled } = useSettings();
@@ -158,8 +160,7 @@ export function AppSidebar() {
                 if (item.path === "/models" && canManageModels) {
                   const isManageModelsActive =
                     location.pathname.startsWith("/models/manage");
-                  const isEndpointsActive =
-                    location.pathname === "/endpoints";
+                  const isEndpointsActive = location.pathname === "/endpoints";
                   return (
                     <Collapsible
                       key="models"
@@ -305,7 +306,9 @@ export function AppSidebar() {
                     Switch Account
                   </DropdownMenuLabel>
                   <DropdownMenuItem
-                    onClick={() => void setActiveOrganization(null).catch(console.error)}
+                    onClick={() =>
+                      void setActiveOrganization(null).catch(console.error)
+                    }
                   >
                     <User className="w-4 h-4 mr-2" />
                     Personal
@@ -316,7 +319,9 @@ export function AppSidebar() {
                   {currentUser.organizations.map((org) => (
                     <DropdownMenuItem
                       key={org.id}
-                      onClick={() => void setActiveOrganization(org.id).catch(console.error)}
+                      onClick={() =>
+                        void setActiveOrganization(org.id).catch(console.error)
+                      }
                     >
                       <Building className="w-4 h-4 mr-2" />
                       <span className="truncate">{org.name}</span>
@@ -369,8 +374,7 @@ export function AppLayout({ children }: { children: React.ReactNode }) {
   const { user } = useAuth();
   const { data: config, isLoading: configLoading } = useConfig();
   const { isFeatureEnabled } = useSettings();
-  const { activeOrganizationId, activeOrganization } =
-    useOrganizationContext();
+  const { activeOrganizationId, activeOrganization } = useOrganizationContext();
   const isDemoMode = isFeatureEnabled("demo");
   const [isSupportModalOpen, setIsSupportModalOpen] = useState(false);
 
@@ -455,16 +459,16 @@ export function AppLayout({ children }: { children: React.ReactNode }) {
               {config?.docs_url && (
                 <>
                   <div className="hidden md:block w-px h-4 bg-border"></div>
-                <a
-                  href={config.docs_url}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="flex items-center gap-2 text-muted-foreground hover:text-primary transition-colors font-medium"
-                >
-                  <span className="hidden sm:inline">Documentation</span>
-                  <span className="sm:hidden">Docs</span>
-                  <ExternalLink className="w-3 h-3" />
-                </a>
+                  <a
+                    href={config.docs_url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="flex items-center gap-2 text-muted-foreground hover:text-primary transition-colors font-medium"
+                  >
+                    <span className="hidden sm:inline">Documentation</span>
+                    <span className="sm:hidden">Docs</span>
+                    <ExternalLink className="w-3 h-3" />
+                  </a>
                 </>
               )}
             </div>
