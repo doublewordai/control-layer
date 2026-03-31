@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.31.1](https://github.com/doublewordai/control-layer/compare/v8.31.0...v8.31.1) (2026-03-31)
+
+
+### Bug Fixes
+
+* Handle errors appearing in sse streams ([#934](https://github.com/doublewordai/control-layer/issues/934)) ([dce40fa](https://github.com/doublewordai/control-layer/commit/dce40faa9db51322de3f610ef1976e94cf26d9d5))
+
 ## [8.31.0](https://github.com/doublewordai/control-layer/compare/v8.30.2...v8.31.0) (2026-03-31)
 
 
