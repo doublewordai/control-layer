@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE api_keys SET is_deleted = true WHERE user_id = $1 AND created_by = $2 AND is_deleted = false",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "8f8bf471c5d13cb8e17687309d199365311417326218258c1293d017b8c2549c"
+}
