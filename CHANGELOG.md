@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.32.1](https://github.com/doublewordai/control-layer/compare/v8.32.0...v8.32.1) (2026-03-31)
+
+
+### Bug Fixes
+
+* update personal domain list ([#943](https://github.com/doublewordai/control-layer/issues/943)) ([b29cd0a](https://github.com/doublewordai/control-layer/commit/b29cd0a7a1ada44ceec50467a8dbc9c08efd046e))
+
 ## [8.32.0](https://github.com/doublewordai/control-layer/compare/v8.31.1...v8.32.0) (2026-03-31)
 
 
