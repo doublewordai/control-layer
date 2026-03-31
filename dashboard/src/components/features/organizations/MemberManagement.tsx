@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { useNavigate } from "react-router-dom";
 import {
   useOrganizationMembers,
   useInviteMember,
@@ -8,6 +9,7 @@ import {
   useLeaveOrganization,
   useUser,
 } from "@/api/control-layer/hooks";
+import { useOrganizationContext } from "@/contexts";
 import type { OrgMemberRole, OrganizationMember } from "@/api/control-layer/types";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -36,6 +38,8 @@ interface MemberManagementProps {
 }
 
 export function MemberManagement({ organizationId, readOnly = false }: MemberManagementProps) {
+  const navigate = useNavigate();
+  const { setActiveOrganization } = useOrganizationContext();
   const { data: members = [], isLoading } =
     useOrganizationMembers(organizationId);
   const { data: currentUser } = useUser("current");
@@ -109,8 +113,10 @@ export function MemberManagement({ organizationId, readOnly = false }: MemberMan
   const handleLeave = async () => {
     try {
       await leaveOrg.mutateAsync(organizationId);
+      await setActiveOrganization(null);
       toast.success("You have left the organization");
       setShowLeaveConfirm(false);
+      navigate("/");
     } catch (error) {
       toast.error(
         error instanceof Error ? error.message : "Failed to leave organization",
