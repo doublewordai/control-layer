@@ -1420,6 +1420,38 @@ mod tests {
         resp.assert_status(axum::http::StatusCode::FORBIDDEN);
     }
 
+    // ── Org membership limit ──────────────────────────────────────────────
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_cannot_create_org_when_at_limit(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let user_headers = add_auth_headers(&user);
+
+        // Create MAX_ORGS_PER_USER orgs
+        for i in 0..super::MAX_ORGS_PER_USER {
+            let resp = server
+                .post("/admin/api/v1/organizations")
+                .add_header(&user_headers[0].0, &user_headers[0].1)
+                .add_header(&user_headers[1].0, &user_headers[1].1)
+                .json(&json!({ "name": format!("org-{i}"), "email": format!("org{i}@example.com") }))
+                .await;
+            resp.assert_status(axum::http::StatusCode::CREATED);
+        }
+
+        // Next one should fail
+        let resp = server
+            .post("/admin/api/v1/organizations")
+            .add_header(&user_headers[0].0, &user_headers[0].1)
+            .add_header(&user_headers[1].0, &user_headers[1].1)
+            .json(&json!({ "name": "one-too-many", "email": "extra@example.com" }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::BAD_REQUEST);
+        let body = resp.text();
+        assert!(body.contains("maximum"));
+    }
+
     // ── Leave organization ────────────────────────────────────────────────
 
     #[sqlx::test]
