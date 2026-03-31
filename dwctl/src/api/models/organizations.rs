@@ -12,8 +12,8 @@ use utoipa::{IntoParams, ToSchema};
 /// Request body for creating a new organization
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct OrganizationCreate {
-    /// Unique slug/handle for the organization (becomes username)
-    #[schema(example = "acme-corp")]
+    /// Organization domain or unique identifier (becomes username, used for domain-based auto-join)
+    #[schema(example = "acme.com")]
     pub name: String,
     /// Organization contact email (for billing, notifications)
     #[schema(example = "admin@acme.com")]

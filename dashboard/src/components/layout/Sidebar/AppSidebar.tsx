@@ -359,7 +359,7 @@ export function AppSidebar() {
       <CreateOrganizationModal
         isOpen={isCreateOrgModalOpen}
         onClose={() => setIsCreateOrgModalOpen(false)}
-        isPlatformManager={canManageModels}
+        isPlatformManager={hasPermission("users-groups")}
       />
     </Sidebar>
   );
