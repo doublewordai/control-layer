@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { useNavigate } from "react-router-dom";
 import {
   useOrganizationMembers,
   useInviteMember,
@@ -8,6 +9,7 @@ import {
   useLeaveOrganization,
   useUser,
 } from "@/api/control-layer/hooks";
+import { useOrganizationContext } from "@/contexts";
 import type { OrgMemberRole, OrganizationMember } from "@/api/control-layer/types";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -36,6 +38,8 @@ interface MemberManagementProps {
 }
 
 export function MemberManagement({ organizationId, readOnly = false }: MemberManagementProps) {
+  const navigate = useNavigate();
+  const { setActiveOrganization } = useOrganizationContext();
   const { data: members = [], isLoading } =
     useOrganizationMembers(organizationId);
   const { data: currentUser } = useUser("current");
@@ -109,8 +113,10 @@ export function MemberManagement({ organizationId, readOnly = false }: MemberMan
   const handleLeave = async () => {
     try {
       await leaveOrg.mutateAsync(organizationId);
+      await setActiveOrganization(null);
       toast.success("You have left the organization");
       setShowLeaveConfirm(false);
+      navigate("/");
     } catch (error) {
       toast.error(
         error instanceof Error ? error.message : "Failed to leave organization",
@@ -228,7 +234,21 @@ export function MemberManagement({ organizationId, readOnly = false }: MemberMan
                   </div>
                 </div>
                 <div className="flex items-center gap-2">
-                  {readOnly ? (
+                  {member.user?.id === currentUser?.id ? (
+                    <>
+                      <span className="text-xs text-muted-foreground capitalize px-2 py-1 bg-muted rounded">
+                        {member.role}
+                      </span>
+                      <button
+                        onClick={() => setShowLeaveConfirm(true)}
+                        className="h-8 px-2 rounded text-red-600 hover:text-red-700 hover:bg-red-50 transition-all flex items-center gap-1 text-xs"
+                        title="Leave organization"
+                      >
+                        <LogOut className="h-3.5 w-3.5" />
+                        Leave
+                      </button>
+                    </>
+                  ) : readOnly ? (
                     <span className="text-xs text-muted-foreground capitalize px-2 py-1 bg-muted rounded">
                       {member.role}
                     </span>
@@ -257,16 +277,6 @@ export function MemberManagement({ organizationId, readOnly = false }: MemberMan
                         <Trash2 className="h-4 w-4" />
                       </button>
                     </>
-                  )}
-                  {member.user?.id === currentUser?.id && (
-                    <button
-                      onClick={() => setShowLeaveConfirm(true)}
-                      className="h-8 px-2 rounded text-red-600 hover:text-red-700 hover:bg-red-50 transition-all flex items-center gap-1 text-xs"
-                      title="Leave organization"
-                    >
-                      <LogOut className="h-3.5 w-3.5" />
-                      Leave
-                    </button>
                   )}
                 </div>
               </div>

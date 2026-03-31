@@ -7,6 +7,7 @@ import { ReactNode } from "react";
 import { describe, it, expect, beforeAll, afterEach, afterAll } from "vitest";
 import userEvent from "@testing-library/user-event";
 import { MemberManagement } from "./MemberManagement";
+import { OrganizationProvider } from "../../../contexts/organization/OrganizationContext";
 import { handlers } from "../../../api/control-layer/mocks/handlers";
 
 const server = setupServer(...handlers);
@@ -21,7 +22,9 @@ function createWrapper() {
   });
   return ({ children }: { children: ReactNode }) => (
     <QueryClientProvider client={queryClient}>
-      <MemoryRouter>{children}</MemoryRouter>
+      <MemoryRouter>
+        <OrganizationProvider>{children}</OrganizationProvider>
+      </MemoryRouter>
     </QueryClientProvider>
   );
 }
@@ -134,7 +137,7 @@ describe("MemberManagement", () => {
     );
 
     await waitFor(() => {
-      expect(within(container).getByText("Sarah Chen")).toBeInTheDocument();
+      expect(within(container).getByText("James Wilson")).toBeInTheDocument();
     });
 
     const removeButtons = within(container).getAllByTitle("Remove member");
@@ -142,7 +145,7 @@ describe("MemberManagement", () => {
 
     const dialog = await screen.findByRole("dialog");
     expect(within(dialog).getByText("Remove Member")).toBeInTheDocument();
-    expect(within(dialog).getByText(/Sarah Chen/)).toBeInTheDocument();
+    expect(within(dialog).getByText(/James Wilson/)).toBeInTheDocument();
   });
 
   it("cancels remove member dialog", async () => {
@@ -165,6 +168,43 @@ describe("MemberManagement", () => {
     await waitFor(() => {
       expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     });
+  });
+
+  it("shows leave button for current user and no remove button", async () => {
+    const { container } = render(
+      <MemberManagement organizationId="org-550e8400-0001" />,
+      { wrapper: createWrapper() },
+    );
+
+    await waitFor(() => {
+      expect(within(container).getByText("Sarah Chen")).toBeInTheDocument();
+    });
+
+    expect(
+      within(container).getByTitle("Leave organization"),
+    ).toBeInTheDocument();
+
+    // Current user's row should not have a remove button
+    const removeButtons = within(container).getAllByTitle("Remove member");
+    expect(removeButtons).toHaveLength(1); // Only for the other member
+  });
+
+  it("opens leave confirmation dialog", async () => {
+    const user = userEvent.setup();
+    const { container } = render(
+      <MemberManagement organizationId="org-550e8400-0001" />,
+      { wrapper: createWrapper() },
+    );
+
+    await waitFor(() => {
+      expect(within(container).getByText("Sarah Chen")).toBeInTheDocument();
+    });
+
+    await user.click(within(container).getByTitle("Leave organization"));
+
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getByText("Leave Organization")).toBeInTheDocument();
+    expect(within(dialog).getByText(/API keys will be deleted/)).toBeInTheDocument();
   });
 
   it("shows cancel invite button for pending invites", async () => {
