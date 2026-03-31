@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.30.2](https://github.com/doublewordai/control-layer/compare/v8.30.1...v8.30.2) (2026-03-31)
+
+
+### Bug Fixes
+
+* bump fusillade 14.2.0 ([#931](https://github.com/doublewordai/control-layer/issues/931)) ([81d7b6b](https://github.com/doublewordai/control-layer/commit/81d7b6b7edde045f7530ce0800fb4b41cab70d56))
+
 ## [8.30.1](https://github.com/doublewordai/control-layer/compare/v8.30.0...v8.30.1) (2026-03-30)
 
 
