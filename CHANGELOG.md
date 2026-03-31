@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.31.0](https://github.com/doublewordai/control-layer/compare/v8.30.2...v8.31.0) (2026-03-31)
+
+
+### Features
+
+* migration to allow multiple orgs with same email ([#933](https://github.com/doublewordai/control-layer/issues/933)) ([f2f3a16](https://github.com/doublewordai/control-layer/commit/f2f3a169603849de03f60b4412ad7bd2cc925dc6))
+
 ## [8.30.2](https://github.com/doublewordai/control-layer/compare/v8.30.1...v8.30.2) (2026-03-31)
 
 
