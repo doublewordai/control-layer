@@ -7,6 +7,7 @@ import { ReactNode } from "react";
 import { describe, it, expect, beforeAll, afterEach, afterAll } from "vitest";
 import userEvent from "@testing-library/user-event";
 import { OrganizationDetail } from "./OrganizationDetail";
+import { OrganizationProvider } from "../../../contexts/organization/OrganizationContext";
 import { handlers } from "../../../api/control-layer/mocks/handlers";
 
 const server = setupServer(...handlers);
@@ -22,12 +23,14 @@ function createWrapper(orgId: string) {
   return ({ children }: { children: ReactNode }) => (
     <QueryClientProvider client={queryClient}>
       <MemoryRouter initialEntries={[`/organizations/${orgId}`]}>
-        <Routes>
-          <Route
-            path="/organizations/:organizationId"
-            element={children}
-          />
-        </Routes>
+        <OrganizationProvider>
+          <Routes>
+            <Route
+              path="/organizations/:organizationId"
+              element={children}
+            />
+          </Routes>
+        </OrganizationProvider>
       </MemoryRouter>
     </QueryClientProvider>
   );
