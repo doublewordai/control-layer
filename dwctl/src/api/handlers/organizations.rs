@@ -97,10 +97,12 @@ pub async fn create_organization<P: PoolProvider>(
     current_user: CurrentUser,
     Json(data): Json<OrganizationCreate>,
 ) -> Result<(StatusCode, Json<OrganizationResponse>)> {
-    if !crate::auth::permissions::has_permission(&current_user, Resource::Organizations, Operation::CreateAll) {
+    let is_platform_manager = crate::auth::permissions::has_permission(&current_user, Resource::Organizations, Operation::CreateAll);
+
+    if !is_platform_manager && !crate::auth::permissions::has_permission(&current_user, Resource::Organizations, Operation::CreateOwn) {
         return Err(Error::InsufficientPermissions {
-            required: Permission::Allow(Resource::Organizations, Operation::CreateAll),
-            action: Operation::CreateAll,
+            required: Permission::Allow(Resource::Organizations, Operation::CreateOwn),
+            action: Operation::CreateOwn,
             resource: "Organizations".to_string(),
         });
     }
@@ -111,7 +113,19 @@ pub async fn create_organization<P: PoolProvider>(
         });
     }
 
-    let owner_id = data.owner_id.unwrap_or(current_user.id);
+    // Only platform managers can specify a different owner
+    let owner_id = if is_platform_manager {
+        data.owner_id.unwrap_or(current_user.id)
+    } else {
+        if data.owner_id.is_some() {
+            return Err(Error::InsufficientPermissions {
+                required: Permission::Allow(Resource::Organizations, Operation::CreateAll),
+                action: Operation::CreateAll,
+                resource: "Organization owner assignment".to_string(),
+            });
+        }
+        current_user.id
+    };
 
     let db_request = OrganizationCreateDBRequest {
         name: data.name,

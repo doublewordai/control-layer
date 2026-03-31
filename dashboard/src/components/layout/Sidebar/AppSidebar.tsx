@@ -19,6 +19,7 @@ import {
   Activity,
   Building,
   Check,
+  Plus,
 } from "lucide-react";
 import {
   useUser,
@@ -31,6 +32,7 @@ import { useAuthorization } from "../../../utils";
 import { useAuth } from "../../../contexts/auth";
 import { useSettings, useOrganizationContext } from "../../../contexts";
 import { SupportRequestModal } from "../../modals";
+import { CreateOrganizationModal } from "../../features/organizations/CreateOrganizationModal";
 import type { FeatureFlags } from "../../../contexts/settings/types";
 import onwardsLogo from "../../../assets/onwards-logo.svg";
 import {
@@ -87,6 +89,7 @@ export function AppSidebar() {
     useOrganizationContext();
   const { data: config } = useConfig();
   const [isSupportModalOpen, setIsSupportModalOpen] = useState(false);
+  const [isCreateOrgModalOpen, setIsCreateOrgModalOpen] = useState(false);
 
   const canManageModels = hasPermission("manage-models");
 
@@ -322,9 +325,13 @@ export function AppSidebar() {
                       )}
                     </DropdownMenuItem>
                   ))}
-                  <DropdownMenuSeparator />
                 </>
               )}
+            <DropdownMenuItem onClick={() => setIsCreateOrgModalOpen(true)}>
+              <Plus className="w-4 h-4 mr-2" />
+              New Organization
+            </DropdownMenuItem>
+            <DropdownMenuSeparator />
             <DropdownMenuItem onClick={() => navigate("/profile")}>
               <User className="w-4 h-4 mr-2" />
               Profile
@@ -348,6 +355,11 @@ export function AppSidebar() {
       <SupportRequestModal
         isOpen={isSupportModalOpen}
         onClose={() => setIsSupportModalOpen(false)}
+      />
+      <CreateOrganizationModal
+        isOpen={isCreateOrgModalOpen}
+        onClose={() => setIsCreateOrgModalOpen(false)}
+        isPlatformManager={canManageModels}
       />
     </Sidebar>
   );
