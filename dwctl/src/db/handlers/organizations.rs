@@ -1305,4 +1305,48 @@ mod tests {
         let page3 = orgs.list(&OrganizationFilter::new(4, 2)).await.unwrap();
         assert_eq!(page3.len(), 1);
     }
+
+    /// Organizations can share the same contact email (non-unique for org users).
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_orgs_can_share_contact_email(pool: PgPool) {
+        let creator = create_individual(&pool, "alice", "alice@example.com").await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut orgs = Organizations::new(&mut conn);
+
+        let shared_email = "shared@contact.example.com";
+
+        let org1 = orgs
+            .create(
+                &OrganizationCreateDBRequest {
+                    name: "org-alpha".to_string(),
+                    email: shared_email.to_string(),
+                    display_name: None,
+                    avatar_url: None,
+                    created_by: creator,
+                },
+                TEST_DEFAULT_ROLES,
+            )
+            .await
+            .unwrap();
+
+        let org2 = orgs
+            .create(
+                &OrganizationCreateDBRequest {
+                    name: "org-beta".to_string(),
+                    email: shared_email.to_string(),
+                    display_name: None,
+                    avatar_url: None,
+                    created_by: creator,
+                },
+                TEST_DEFAULT_ROLES,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(org1.email, shared_email);
+        assert_eq!(org2.email, shared_email);
+        assert_ne!(org1.id, org2.id);
+    }
 }
