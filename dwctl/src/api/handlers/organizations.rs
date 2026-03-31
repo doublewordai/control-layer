@@ -29,6 +29,9 @@ use axum::{
     response::Json,
 };
 
+/// Maximum number of organizations a user can belong to simultaneously.
+const MAX_ORGS_PER_USER: i64 = 3;
+
 /// Hash a token with SHA-256 for deterministic DB lookup.
 /// Since invite tokens are 256 bits of cryptographic randomness,
 /// a fast hash is secure enough (no brute-force risk).
@@ -137,6 +140,15 @@ pub async fn create_organization<P: PoolProvider>(
 
     let mut pool_conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut repo = Organizations::new(&mut pool_conn);
+
+    // Check org membership limit for the owner
+    let org_count = repo.count_user_organizations(owner_id).await?;
+    if org_count >= MAX_ORGS_PER_USER {
+        return Err(Error::BadRequest {
+            message: format!("Cannot create organization: user is already a member of {MAX_ORGS_PER_USER} organizations (maximum)"),
+        });
+    }
+
     let org = repo.create(&db_request, &state.config.auth.default_user_roles).await?;
 
     let response = OrganizationResponse::from_user(UserResponse::from(org)).with_member_count(1);
@@ -542,6 +554,15 @@ pub async fn add_member<P: PoolProvider>(
     check_role_assignment_privilege(&current_user, id, role, can_all, &mut pool_conn).await?;
 
     let mut repo = Organizations::new(&mut pool_conn);
+
+    // Check org membership limit for the target user
+    let org_count = repo.count_user_organizations(data.user_id).await?;
+    if org_count >= MAX_ORGS_PER_USER {
+        return Err(Error::BadRequest {
+            message: format!("Cannot add member: user is already a member of {MAX_ORGS_PER_USER} organizations (maximum)"),
+        });
+    }
+
     let membership = repo.add_member(id, data.user_id, role).await?;
 
     // Fetch user details for response
@@ -1200,6 +1221,14 @@ pub async fn accept_invite<P: PoolProvider>(
         });
     }
 
+    // Check org membership limit
+    let org_count = org_repo.count_user_organizations(current_user.id).await?;
+    if org_count >= MAX_ORGS_PER_USER {
+        return Err(Error::BadRequest {
+            message: format!("Cannot accept invite: you are already a member of {MAX_ORGS_PER_USER} organizations (maximum)"),
+        });
+    }
+
     org_repo.accept_invite(invite.id, current_user.id).await?;
 
     Ok(Json(serde_json::json!({ "message": "Invite accepted" })))
@@ -1389,6 +1418,38 @@ mod tests {
             .json(&json!({ "name": "hijack-org", "email": "x@example.com", "owner_id": other.id }))
             .await;
         resp.assert_status(axum::http::StatusCode::FORBIDDEN);
+    }
+
+    // ── Org membership limit ──────────────────────────────────────────────
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_cannot_create_org_when_at_limit(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let user_headers = add_auth_headers(&user);
+
+        // Create MAX_ORGS_PER_USER orgs
+        for i in 0..super::MAX_ORGS_PER_USER {
+            let resp = server
+                .post("/admin/api/v1/organizations")
+                .add_header(&user_headers[0].0, &user_headers[0].1)
+                .add_header(&user_headers[1].0, &user_headers[1].1)
+                .json(&json!({ "name": format!("org-{i}"), "email": format!("org{i}@example.com") }))
+                .await;
+            resp.assert_status(axum::http::StatusCode::CREATED);
+        }
+
+        // Next one should fail
+        let resp = server
+            .post("/admin/api/v1/organizations")
+            .add_header(&user_headers[0].0, &user_headers[0].1)
+            .add_header(&user_headers[1].0, &user_headers[1].1)
+            .json(&json!({ "name": "one-too-many", "email": "extra@example.com" }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::BAD_REQUEST);
+        let body = resp.text();
+        assert!(body.contains("maximum"));
     }
 
     // ── Leave organization ────────────────────────────────────────────────

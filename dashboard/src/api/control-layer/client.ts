@@ -1855,6 +1855,22 @@ const organizationsApi = {
     }
   },
 
+  async leave(orgId: string): Promise<void> {
+    const response = await fetch(
+      `/admin/api/v1/organizations/${orgId}/leave`,
+      {
+        method: "POST",
+      },
+    );
+    if (!response.ok) {
+      const error = await response.text();
+      throw new ApiError(
+        response.status,
+        `Failed to leave organization: ${error}`,
+      );
+    }
+  },
+
   async setActive(
     organizationId: string | null,
   ): Promise<SetActiveOrganizationResponse> {
