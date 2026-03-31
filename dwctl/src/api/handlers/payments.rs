@@ -667,10 +667,14 @@ pub async fn enable_auto_topup<P: PoolProvider>(
             tracing::error!("Failed to acquire database connection: {:?}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
-        let org = Users::new(&mut conn).get_by_id(org_id).await.map_err(|e| {
-            tracing::error!("Failed to load org user: {:?}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?.ok_or(StatusCode::NOT_FOUND)?;
+        let org = Users::new(&mut conn)
+            .get_by_id(org_id)
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to load org user: {:?}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?
+            .ok_or(StatusCode::NOT_FOUND)?;
         (org.payment_provider_id, org.email, org.display_name)
     } else {
         (user.payment_provider_id.clone(), user.email.clone(), user.display_name.clone())
@@ -692,10 +696,13 @@ pub async fn enable_auto_topup<P: PoolProvider>(
                 tracing::error!("Failed to acquire database connection: {:?}", e);
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
-            Users::new(&mut conn).set_payment_provider_id_if_empty(target_id, &new_id).await.map_err(|e| {
-                tracing::error!("Failed to save customer ID: {:?}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
+            Users::new(&mut conn)
+                .set_payment_provider_id_if_empty(target_id, &new_id)
+                .await
+                .map_err(|e| {
+                    tracing::error!("Failed to save customer ID: {:?}", e);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?;
 
             new_id
         }
@@ -800,10 +807,7 @@ pub async fn enable_auto_topup<P: PoolProvider>(
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn disable_auto_topup<P: PoolProvider>(
-    State(state): State<AppState<P>>,
-    user: CurrentUser,
-) -> Result<Response, StatusCode> {
+pub async fn disable_auto_topup<P: PoolProvider>(State(state): State<AppState<P>>, user: CurrentUser) -> Result<Response, StatusCode> {
     let target_id = user.active_organization.unwrap_or(user.id);
 
     let update = UserUpdateDBRequest {
