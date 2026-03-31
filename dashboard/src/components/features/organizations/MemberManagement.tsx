@@ -234,7 +234,21 @@ export function MemberManagement({ organizationId, readOnly = false }: MemberMan
                   </div>
                 </div>
                 <div className="flex items-center gap-2">
-                  {readOnly ? (
+                  {member.user?.id === currentUser?.id ? (
+                    <>
+                      <span className="text-xs text-muted-foreground capitalize px-2 py-1 bg-muted rounded">
+                        {member.role}
+                      </span>
+                      <button
+                        onClick={() => setShowLeaveConfirm(true)}
+                        className="h-8 px-2 rounded text-red-600 hover:text-red-700 hover:bg-red-50 transition-all flex items-center gap-1 text-xs"
+                        title="Leave organization"
+                      >
+                        <LogOut className="h-3.5 w-3.5" />
+                        Leave
+                      </button>
+                    </>
+                  ) : readOnly ? (
                     <span className="text-xs text-muted-foreground capitalize px-2 py-1 bg-muted rounded">
                       {member.role}
                     </span>
@@ -263,16 +277,6 @@ export function MemberManagement({ organizationId, readOnly = false }: MemberMan
                         <Trash2 className="h-4 w-4" />
                       </button>
                     </>
-                  )}
-                  {member.user?.id === currentUser?.id && (
-                    <button
-                      onClick={() => setShowLeaveConfirm(true)}
-                      className="h-8 px-2 rounded text-red-600 hover:text-red-700 hover:bg-red-50 transition-all flex items-center gap-1 text-xs"
-                      title="Leave organization"
-                    >
-                      <LogOut className="h-3.5 w-3.5" />
-                      Leave
-                    </button>
                   )}
                 </div>
               </div>
