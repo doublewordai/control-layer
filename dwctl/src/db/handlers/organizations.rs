@@ -101,6 +101,60 @@ impl<'c> Organizations<'c> {
         Ok(exists)
     }
 
+    /// Find an organization by its domain (stored as username).
+    /// Returns `None` if no active (non-deleted) organization exists with that domain.
+    #[instrument(skip(self), fields(domain = %domain), err)]
+    pub async fn find_by_domain(&mut self, domain: &str) -> Result<Option<UserDBResponse>> {
+        let row = sqlx::query!(
+            r#"
+            SELECT id, username, email, display_name, avatar_url, auth_source, created_at, updated_at,
+                   is_admin, password_hash, external_user_id, payment_provider_id,
+                   is_deleted, is_internal, batch_notifications_enabled, first_batch_email_sent,
+                   low_balance_notification_sent, low_balance_threshold,
+                   auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, user_type
+            FROM users
+            WHERE username = $1 AND user_type = 'organization' AND is_deleted = false
+            "#,
+            domain
+        )
+        .fetch_optional(&mut *self.db)
+        .await?;
+
+        match row {
+            Some(r) => {
+                let roles = sqlx::query_scalar!(r#"SELECT role as "role!: Role" FROM user_roles WHERE user_id = $1"#, r.id)
+                    .fetch_all(&mut *self.db)
+                    .await?;
+
+                Ok(Some(UserDBResponse {
+                    id: r.id,
+                    username: r.username,
+                    email: r.email,
+                    display_name: r.display_name,
+                    avatar_url: r.avatar_url,
+                    created_at: r.created_at,
+                    updated_at: r.updated_at,
+                    last_login: None,
+                    auth_source: r.auth_source,
+                    is_admin: r.is_admin,
+                    roles,
+                    password_hash: r.password_hash,
+                    external_user_id: r.external_user_id,
+                    payment_provider_id: r.payment_provider_id,
+                    batch_notifications_enabled: r.batch_notifications_enabled,
+                    first_batch_email_sent: r.first_batch_email_sent,
+                    low_balance_notification_sent: r.low_balance_notification_sent,
+                    low_balance_threshold: r.low_balance_threshold,
+                    auto_topup_amount: r.auto_topup_amount,
+                    auto_topup_threshold: r.auto_topup_threshold,
+                    auto_topup_monthly_limit: r.auto_topup_monthly_limit,
+                    user_type: r.user_type,
+                }))
+            }
+            None => Ok(None),
+        }
+    }
+
     /// Create a new organization. The creator is automatically added as owner.
     ///
     /// `default_roles` specifies which roles to assign to the org user entity.
@@ -1366,5 +1420,39 @@ mod tests {
         assert_eq!(org1.email, shared_email);
         assert_eq!(org2.email, shared_email);
         assert_ne!(org1.id, org2.id);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_find_by_domain(pool: PgPool) {
+        let creator = create_individual(&pool, "alice", "alice@example.com").await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut orgs = Organizations::new(&mut conn);
+
+        // No org yet
+        let result = orgs.find_by_domain("acme.com").await.unwrap();
+        assert!(result.is_none());
+
+        // Create org with domain as username
+        orgs.create(
+            &OrganizationCreateDBRequest {
+                name: "acme.com".to_string(),
+                email: "contact@acme.com".to_string(),
+                display_name: Some("Acme Corp".to_string()),
+                avatar_url: None,
+                created_by: creator,
+            },
+            TEST_DEFAULT_ROLES,
+        )
+        .await
+        .unwrap();
+
+        // Now found
+        let result = orgs.find_by_domain("acme.com").await.unwrap();
+        assert!(result.is_some());
+        let org = result.unwrap();
+        assert_eq!(org.username, "acme.com");
+        assert_eq!(org.user_type, "organization");
     }
 }
