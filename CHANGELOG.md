@@ -1,5 +1,13 @@
 # Changelog
 
+## [8.32.0](https://github.com/doublewordai/control-layer/compare/v8.31.1...v8.32.0) (2026-03-31)
+
+
+### Features
+
+* org auto-enrollment ([#938](https://github.com/doublewordai/control-layer/issues/938)) ([2563db3](https://github.com/doublewordai/control-layer/commit/2563db35e29c20027b18fa27436ab5778a8e7ec9))
+* self serve orgs ([#936](https://github.com/doublewordai/control-layer/issues/936)) ([ab8b48f](https://github.com/doublewordai/control-layer/commit/ab8b48fcc9edc52ba9c17983ee7338aaba71675c))
+
 ## [8.31.1](https://github.com/doublewordai/control-layer/compare/v8.31.0...v8.31.1) (2026-03-31)
 
 
