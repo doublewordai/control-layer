@@ -10,7 +10,10 @@ import {
   useUser,
 } from "@/api/control-layer/hooks";
 import { useOrganizationContext } from "@/contexts";
-import type { OrgMemberRole, OrganizationMember } from "@/api/control-layer/types";
+import type {
+  OrgMemberRole,
+  OrganizationMember,
+} from "@/api/control-layer/types";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -37,7 +40,10 @@ interface MemberManagementProps {
   readOnly?: boolean;
 }
 
-export function MemberManagement({ organizationId, readOnly = false }: MemberManagementProps) {
+export function MemberManagement({
+  organizationId,
+  readOnly = false,
+}: MemberManagementProps) {
   const navigate = useNavigate();
   const { setActiveOrganization } = useOrganizationContext();
   const { data: members = [], isLoading } =
@@ -92,10 +98,7 @@ export function MemberManagement({ organizationId, readOnly = false }: MemberMan
     }
   };
 
-  const handleRoleChange = async (
-    userId: string,
-    newRole: OrgMemberRole,
-  ) => {
+  const handleRoleChange = async (userId: string, newRole: OrgMemberRole) => {
     try {
       await updateRole.mutateAsync({
         orgId: organizationId,
@@ -216,29 +219,73 @@ export function MemberManagement({ organizationId, readOnly = false }: MemberMan
 
         {/* Active Members */}
         <div className="divide-y divide-gray-200">
-          {activeMembers.map((member) =>
-            member.user && (
-              <div
-                key={member.id}
-                className="flex items-center justify-between py-3"
-              >
-                <div className="flex items-center gap-3">
-                  <UserAvatar user={member.user} size="md" />
-                  <div>
-                    <p className="text-sm font-medium text-gray-900">
-                      {member.user.display_name || member.user.username}
-                    </p>
-                    <p className="text-xs text-gray-500">
-                      {member.user.email}
-                    </p>
+          {activeMembers.map(
+            (member) =>
+              member.user && (
+                <div
+                  key={member.id}
+                  className="flex items-center justify-between py-3"
+                >
+                  <div className="flex items-center gap-3">
+                    <UserAvatar user={member.user} size="md" />
+                    <div>
+                      <p className="text-sm font-medium text-gray-900">
+                        {member.user.display_name || member.user.username}
+                      </p>
+                      <p className="text-xs text-gray-500">
+                        {member.user.email}
+                      </p>
+                    </div>
                   </div>
-                </div>
-                <div className="flex items-center gap-2">
-                  {member.user?.id === currentUser?.id ? (
-                    <>
+                  <div className="flex items-center gap-2">
+                    {member.user?.id === currentUser?.id ? (
+                      <>
+                        <span className="text-xs text-muted-foreground capitalize px-2 py-1 bg-muted rounded">
+                          {member.role}
+                        </span>
+                        <button
+                          onClick={() => setShowLeaveConfirm(true)}
+                          className="h-8 px-2 rounded text-red-600 hover:text-red-700 hover:bg-red-50 transition-all flex items-center gap-1 text-xs"
+                          title="Leave organization"
+                        >
+                          <LogOut className="h-3.5 w-3.5" />
+                          Leave
+                        </button>
+                      </>
+                    ) : readOnly ? (
                       <span className="text-xs text-muted-foreground capitalize px-2 py-1 bg-muted rounded">
                         {member.role}
                       </span>
+                    ) : (
+                      <>
+                        <Select
+                          value={member.role}
+                          onValueChange={(v) =>
+                            handleRoleChange(
+                              member.user!.id,
+                              v as OrgMemberRole,
+                            )
+                          }
+                        >
+                          <SelectTrigger className="w-28 h-8 text-xs">
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="member">Member</SelectItem>
+                            <SelectItem value="admin">Admin</SelectItem>
+                            <SelectItem value="owner">Owner</SelectItem>
+                          </SelectContent>
+                        </Select>
+                        <button
+                          onClick={() => setMemberToRemove(member)}
+                          className="h-8 w-8 p-0 rounded text-red-600 hover:text-red-700 hover:bg-red-50 transition-all flex items-center justify-center"
+                          title="Remove member"
+                        >
+                          <Trash2 className="h-4 w-4" />
+                        </button>
+                      </>
+                    )}
+                    {member.user?.id === currentUser?.id && (
                       <button
                         onClick={() => setShowLeaveConfirm(true)}
                         className="h-8 px-2 rounded text-red-600 hover:text-red-700 hover:bg-red-50 transition-all flex items-center gap-1 text-xs"
@@ -247,45 +294,13 @@ export function MemberManagement({ organizationId, readOnly = false }: MemberMan
                         <LogOut className="h-3.5 w-3.5" />
                         Leave
                       </button>
-                    </>
-                  ) : readOnly ? (
-                    <span className="text-xs text-muted-foreground capitalize px-2 py-1 bg-muted rounded">
-                      {member.role}
-                    </span>
-                  ) : (
-                    <>
-                      <Select
-                        value={member.role}
-                        onValueChange={(v) =>
-                          handleRoleChange(member.user!.id, v as OrgMemberRole)
-                        }
-                      >
-                        <SelectTrigger className="w-28 h-8 text-xs">
-                          <SelectValue />
-                        </SelectTrigger>
-                        <SelectContent>
-                          <SelectItem value="member">Member</SelectItem>
-                          <SelectItem value="admin">Admin</SelectItem>
-                          <SelectItem value="owner">Owner</SelectItem>
-                        </SelectContent>
-                      </Select>
-                      <button
-                        onClick={() => setMemberToRemove(member)}
-                        className="h-8 w-8 p-0 rounded text-red-600 hover:text-red-700 hover:bg-red-50 transition-all flex items-center justify-center"
-                        title="Remove member"
-                      >
-                        <Trash2 className="h-4 w-4" />
-                      </button>
-                    </>
-                  )}
+                    )}
+                  </div>
                 </div>
-              </div>
-            ),
+              ),
           )}
           {activeMembers.length === 0 && (
-            <div className="py-8 text-center text-gray-500">
-              No members yet
-            </div>
+            <div className="py-8 text-center text-gray-500">No members yet</div>
           )}
         </div>
 
