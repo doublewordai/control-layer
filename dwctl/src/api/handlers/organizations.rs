@@ -1250,6 +1250,72 @@ mod tests {
     use serde_json::json;
     use sqlx::PgPool;
 
+    // ── Self-serve org creation ────────────────────────────────────────────
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_standard_user_can_create_organization(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let user_headers = add_auth_headers(&user);
+
+        let resp = server
+            .post("/admin/api/v1/organizations")
+            .add_header(&user_headers[0].0, &user_headers[0].1)
+            .add_header(&user_headers[1].0, &user_headers[1].1)
+            .json(&json!({ "name": "my-org", "email": "contact@my-org.com" }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::CREATED);
+        let body = resp.json::<serde_json::Value>();
+        assert_eq!(body["username"].as_str().unwrap(), "my-org");
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_standard_user_becomes_owner_of_created_org(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let user_headers = add_auth_headers(&user);
+
+        let resp = server
+            .post("/admin/api/v1/organizations")
+            .add_header(&user_headers[0].0, &user_headers[0].1)
+            .add_header(&user_headers[1].0, &user_headers[1].1)
+            .json(&json!({ "name": "self-serve-org", "email": "contact@example.com" }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::CREATED);
+        let org_id = resp.json::<serde_json::Value>()["id"].as_str().unwrap().to_string();
+
+        // Verify the creator is listed as owner
+        let resp = server
+            .get(&format!("/admin/api/v1/organizations/{org_id}/members"))
+            .add_header(&user_headers[0].0, &user_headers[0].1)
+            .add_header(&user_headers[1].0, &user_headers[1].1)
+            .await;
+        resp.assert_status(axum::http::StatusCode::OK);
+        let members = resp.json::<Vec<serde_json::Value>>();
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0]["role"].as_str().unwrap(), "owner");
+        assert_eq!(members[0]["user"]["id"].as_str().unwrap(), user.id.to_string());
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_standard_user_cannot_set_owner_id(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let user_headers = add_auth_headers(&user);
+        let other = create_test_user(&pool, Role::StandardUser).await;
+
+        let resp = server
+            .post("/admin/api/v1/organizations")
+            .add_header(&user_headers[0].0, &user_headers[0].1)
+            .add_header(&user_headers[1].0, &user_headers[1].1)
+            .json(&json!({ "name": "hijack-org", "email": "x@example.com", "owner_id": other.id }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::FORBIDDEN);
+    }
+
     // ── Last-owner guard ─────────────────────────────────────────────────
 
     #[sqlx::test]
