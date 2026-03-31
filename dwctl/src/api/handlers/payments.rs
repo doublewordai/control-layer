@@ -1411,4 +1411,169 @@ mod tests {
             .unwrap();
         assert!(row.payment_provider_id.is_some(), "Customer ID should be saved");
     }
+
+    #[sqlx::test]
+    async fn test_enable_auto_topup_in_org_context(pool: PgPool) {
+        let mut config = create_test_config();
+        config.payment = Some(PaymentConfig::Dummy(DummyConfig {
+            amount: Decimal::new(100, 0),
+        }));
+
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
+
+        let user = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
+        let org = crate::test::utils::create_test_org(&pool, user.id).await;
+
+        // Give the org a payment provider ID
+        sqlx::query!("UPDATE users SET payment_provider_id = $1 WHERE id = $2", "cus_org_123", org.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let mut auth_headers = crate::test::utils::add_auth_headers(&user);
+        auth_headers.push(("x-organization-id".to_string(), org.id.to_string()));
+
+        let app = Router::new()
+            .route("/auto-topup/enable", post(enable_auto_topup))
+            .with_state(state);
+
+        let server = TestServer::new(app).unwrap();
+
+        let mut request = server.post("/auto-topup/enable").json(&serde_json::json!({
+            "threshold": 10.0,
+            "amount": 50.0,
+            "monthly_limit": 200.0
+        }));
+        for (key, value) in &auth_headers {
+            request = request.add_header(key.as_str(), value.as_str());
+        }
+        let response = request.await;
+
+        response.assert_status(StatusCode::OK);
+        let body: serde_json::Value = response.json();
+        assert_eq!(body["has_payment_method"], true);
+
+        // Verify settings saved on the ORG, not the individual
+        let org_row = sqlx::query!(
+            "SELECT auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit FROM users WHERE id = $1",
+            org.id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(org_row.auto_topup_amount, Some(50.0));
+        assert_eq!(org_row.auto_topup_threshold, Some(10.0));
+        assert_eq!(org_row.auto_topup_monthly_limit, Some(200.0));
+
+        // Verify individual user was NOT modified
+        let user_row = sqlx::query!(
+            "SELECT auto_topup_amount, auto_topup_threshold FROM users WHERE id = $1",
+            user.id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(user_row.auto_topup_amount, None);
+        assert_eq!(user_row.auto_topup_threshold, None);
+    }
+
+    #[sqlx::test]
+    async fn test_disable_auto_topup(pool: PgPool) {
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), create_test_config()).await;
+
+        let user = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
+
+        // Set up auto-topup fields directly in DB
+        sqlx::query!(
+            "UPDATE users SET auto_topup_amount = 25.0, auto_topup_threshold = 5.0, auto_topup_monthly_limit = 100.0 WHERE id = $1",
+            user.id
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let auth_headers = crate::test::utils::add_auth_headers(&user);
+
+        let app = Router::new()
+            .route("/auto-topup/disable", post(disable_auto_topup))
+            .with_state(state);
+
+        let server = TestServer::new(app).unwrap();
+
+        let mut request = server.post("/auto-topup/disable");
+        for (key, value) in &auth_headers {
+            request = request.add_header(key.as_str(), value.as_str());
+        }
+        let response = request.await;
+
+        response.assert_status(StatusCode::OK);
+
+        // Verify fields cleared
+        let row = sqlx::query!(
+            "SELECT auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit FROM users WHERE id = $1",
+            user.id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.auto_topup_amount, None);
+        assert_eq!(row.auto_topup_threshold, None);
+        assert_eq!(row.auto_topup_monthly_limit, None);
+    }
+
+    #[sqlx::test]
+    async fn test_disable_auto_topup_in_org_context(pool: PgPool) {
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), create_test_config()).await;
+
+        let user = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
+        let org = crate::test::utils::create_test_org(&pool, user.id).await;
+
+        // Set up auto-topup on the org
+        sqlx::query!(
+            "UPDATE users SET auto_topup_amount = 50.0, auto_topup_threshold = 10.0 WHERE id = $1",
+            org.id
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut auth_headers = crate::test::utils::add_auth_headers(&user);
+        auth_headers.push(("x-organization-id".to_string(), org.id.to_string()));
+
+        let app = Router::new()
+            .route("/auto-topup/disable", post(disable_auto_topup))
+            .with_state(state);
+
+        let server = TestServer::new(app).unwrap();
+
+        let mut request = server.post("/auto-topup/disable");
+        for (key, value) in &auth_headers {
+            request = request.add_header(key.as_str(), value.as_str());
+        }
+        let response = request.await;
+
+        response.assert_status(StatusCode::OK);
+
+        // Verify org's auto-topup cleared
+        let org_row = sqlx::query!(
+            "SELECT auto_topup_amount, auto_topup_threshold FROM users WHERE id = $1",
+            org.id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(org_row.auto_topup_amount, None);
+        assert_eq!(org_row.auto_topup_threshold, None);
+
+        // Verify individual user was NOT touched
+        let user_row = sqlx::query!(
+            "SELECT auto_topup_amount, auto_topup_threshold FROM users WHERE id = $1",
+            user.id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(user_row.auto_topup_amount, None);
+        assert_eq!(user_row.auto_topup_threshold, None);
+    }
 }
