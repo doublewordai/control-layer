@@ -1614,6 +1614,23 @@ export function useRemoveMember() {
   });
 }
 
+export function useLeaveOrganization() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationKey: ["organizations", "leave"],
+    mutationFn: (orgId: string) => dwctlApi.organizations.leave(orgId),
+    onSettled: () => {
+      queryClient.invalidateQueries({
+        queryKey: queryKeys.organizations.all,
+      });
+      queryClient.invalidateQueries({
+        queryKey: queryKeys.users.byId("current"),
+      });
+    },
+  });
+}
+
 // Support
 export function useSubmitSupportRequest() {
   return useMutation({
