@@ -29,6 +29,7 @@ function transformAnalyticsEntry(entry: AnalyticsEntry): RequestsEntry {
     duration_ms: entry.duration_ms,
     prompt_tokens: entry.prompt_tokens,
     completion_tokens: entry.completion_tokens,
+    reasoning_tokens: entry.reasoning_tokens,
     total_tokens: entry.total_tokens,
     response_type: entry.response_type,
     fusillade_batch_id: entry.fusillade_batch_id,
