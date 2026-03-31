@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                SELECT purpose\n                FROM files\n                WHERE id = $1 AND deleted_at IS NULL\n                ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "purpose",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "81e2d86c701961a65c40611601bb4fdc61acc0f9b75e52071653a573eeb301f8"
+}

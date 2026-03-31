@@ -1,0 +1,70 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT id, deployed_model_id, name, input_price_per_token, output_price_per_token,\n                   valid_from, valid_until, api_key_purpose as \"api_key_purpose: _\", completion_window\n            FROM model_tariffs\n            WHERE deployed_model_id = $1\n            ORDER BY valid_from DESC, api_key_purpose ASC NULLS LAST, completion_window ASC NULLS LAST, name ASC\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "deployed_model_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "input_price_per_token",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 4,
+        "name": "output_price_per_token",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 5,
+        "name": "valid_from",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 6,
+        "name": "valid_until",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 7,
+        "name": "api_key_purpose: _",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 8,
+        "name": "completion_window",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "89a2fb9275fcd4c0e65c78df980024410709fe0aef058d3bc115bc2efc0dc4fb"
+}

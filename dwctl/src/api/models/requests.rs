@@ -220,6 +220,9 @@ pub struct AnalyticsEntry {
     /// Number of completion/output tokens
     #[serde(skip_serializing_if = "Option::is_none")]
     pub completion_tokens: Option<i64>,
+    /// Number of reasoning tokens included in completion/output tokens
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<i64>,
     /// Total tokens (prompt + completion)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub total_tokens: Option<i64>,

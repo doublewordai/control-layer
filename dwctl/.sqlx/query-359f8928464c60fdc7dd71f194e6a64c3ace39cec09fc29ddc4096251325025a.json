@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO requests (batch_id, template_id, state, custom_id, retry_attempt, model)\n            SELECT $1, id, 'pending', custom_id, 0, model\n            FROM request_templates\n            WHERE file_id = $2\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "359f8928464c60fdc7dd71f194e6a64c3ace39cec09fc29ddc4096251325025a"
+}

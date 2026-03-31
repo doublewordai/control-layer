@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO credits_transactions (user_id, amount, transaction_type, source_id, balance_after, description)\n            VALUES ($1, 1000000, 'admin_grant', 'test-grant', 1000000, 'Test credits for API key access')\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "f56ab94b6301deb6e8c02ca08ec7d8d6ca7b310b2c4594bc2873cae0970cd102"
+}

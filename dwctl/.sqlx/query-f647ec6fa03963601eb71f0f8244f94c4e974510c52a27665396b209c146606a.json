@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE users SET last_login = created_at + interval '2 hours' WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "f647ec6fa03963601eb71f0f8244f94c4e974510c52a27665396b209c146606a"
+}

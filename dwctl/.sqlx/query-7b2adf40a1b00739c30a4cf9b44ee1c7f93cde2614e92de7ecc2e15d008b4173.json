@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            DELETE FROM request_templates\n            WHERE id IN (\n                SELECT rt.id\n                FROM (SELECT id FROM files WHERE deleted_at IS NOT NULL) f,\n                LATERAL (\n                    SELECT id FROM request_templates\n                    WHERE file_id = f.id\n                    LIMIT $1\n                    FOR UPDATE SKIP LOCKED\n                ) rt\n                LIMIT $1\n            )\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "7b2adf40a1b00739c30a4cf9b44ee1c7f93cde2614e92de7ecc2e15d008b4173"
+}

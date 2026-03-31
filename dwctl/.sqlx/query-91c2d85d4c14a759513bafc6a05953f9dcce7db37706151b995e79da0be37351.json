@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT secret FROM api_keys WHERE user_id = $1 AND purpose = 'batch' AND hidden = true",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "secret",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "91c2d85d4c14a759513bafc6a05953f9dcce7db37706151b995e79da0be37351"
+}

@@ -90,6 +90,7 @@ pub struct HttpAnalyticsRow {
     pub duration_to_first_byte_ms: Option<i64>,
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
+    pub reasoning_tokens: i64,
     pub total_tokens: i64,
     pub response_type: String,
     pub user_id: Option<Uuid>,
@@ -131,6 +132,7 @@ pub struct UsageMetrics {
     pub duration_to_first_byte_ms: Option<i64>,
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
+    pub reasoning_tokens: i64,
     pub total_tokens: i64,
     pub response_type: String,
     pub server_address: String,
@@ -369,6 +371,7 @@ impl UsageMetrics {
             duration_to_first_byte_ms: Some(response_data.duration_to_first_byte.as_millis() as i64),
             prompt_tokens: response_metrics.prompt_tokens,
             completion_tokens: response_metrics.completion_tokens,
+            reasoning_tokens: response_metrics.reasoning_tokens,
             total_tokens: response_metrics.total_tokens,
             response_type: response_metrics.response_type,
             server_address: config.host.clone(),
@@ -409,9 +412,18 @@ impl Auth {
 struct TokenMetrics {
     prompt_tokens: i64,
     completion_tokens: i64,
+    reasoning_tokens: i64,
     total_tokens: i64,
     response_type: String,
     response_model: Option<String>,
+}
+
+fn extract_reasoning_tokens_from_value(value: &serde_json::Value, details_field: &str) -> i64 {
+    value
+        .get(details_field)
+        .and_then(|details| details.get("reasoning_tokens"))
+        .and_then(|tokens| tokens.as_i64())
+        .unwrap_or(0)
 }
 
 impl From<&AiResponse> for TokenMetrics {
@@ -419,9 +431,14 @@ impl From<&AiResponse> for TokenMetrics {
         match response {
             AiResponse::ChatCompletions(response) => {
                 if let Some(usage) = &response.usage {
+                    let usage_value = serde_json::to_value(usage).unwrap_or_default();
                     Self {
                         prompt_tokens: usage.prompt_tokens as i64,
                         completion_tokens: usage.completion_tokens as i64,
+                        reasoning_tokens: extract_reasoning_tokens_from_value(
+                            &usage_value,
+                            "completion_tokens_details",
+                        ),
                         total_tokens: usage.total_tokens as i64,
                         response_type: "chat_completion".to_string(),
                         response_model: Some(response.model.clone()),
@@ -430,6 +447,7 @@ impl From<&AiResponse> for TokenMetrics {
                     Self {
                         prompt_tokens: 0,
                         completion_tokens: 0,
+                        reasoning_tokens: 0,
                         total_tokens: 0,
                         response_type: "chat_completion".to_string(),
                         response_model: Some(response.model.clone()),
@@ -451,9 +469,14 @@ impl From<&AiResponse> for TokenMetrics {
 
                 if let Some(chunk) = last_normal_with_usage {
                     if let Some(usage) = &chunk.usage {
+                        let usage_value = serde_json::to_value(usage).unwrap_or_default();
                         Self {
                             prompt_tokens: usage.prompt_tokens as i64,
                             completion_tokens: usage.completion_tokens as i64,
+                            reasoning_tokens: extract_reasoning_tokens_from_value(
+                                &usage_value,
+                                "completion_tokens_details",
+                            ),
                             total_tokens: usage.total_tokens as i64,
                             response_type: "chat_completion_stream".to_string(),
                             response_model: model,
@@ -463,6 +486,7 @@ impl From<&AiResponse> for TokenMetrics {
                         Self {
                             prompt_tokens: 0,
                             completion_tokens: 0,
+                            reasoning_tokens: 0,
                             total_tokens: 0,
                             response_type: "chat_completion_stream".to_string(),
                             response_model: model,
@@ -472,6 +496,7 @@ impl From<&AiResponse> for TokenMetrics {
                     Self {
                         prompt_tokens: 0,
                         completion_tokens: 0,
+                        reasoning_tokens: 0,
                         total_tokens: 0,
                         response_type: "chat_completion_stream".to_string(),
                         response_model: model,
@@ -491,9 +516,14 @@ impl From<&AiResponse> for TokenMetrics {
 
                 if let Some(chunk) = last_normal_with_usage {
                     if let Some(usage) = &chunk.usage {
+                        let usage_value = serde_json::to_value(usage).unwrap_or_default();
                         Self {
                             prompt_tokens: usage.prompt_tokens as i64,
                             completion_tokens: usage.completion_tokens as i64,
+                            reasoning_tokens: extract_reasoning_tokens_from_value(
+                                &usage_value,
+                                "completion_tokens_details",
+                            ),
                             total_tokens: usage.total_tokens as i64,
                             response_type: "completion_stream".to_string(),
                             response_model: model,
@@ -502,6 +532,7 @@ impl From<&AiResponse> for TokenMetrics {
                         Self {
                             prompt_tokens: 0,
                             completion_tokens: 0,
+                            reasoning_tokens: 0,
                             total_tokens: 0,
                             response_type: "completion_stream".to_string(),
                             response_model: model,
@@ -511,6 +542,7 @@ impl From<&AiResponse> for TokenMetrics {
                     Self {
                         prompt_tokens: 0,
                         completion_tokens: 0,
+                        reasoning_tokens: 0,
                         total_tokens: 0,
                         response_type: "completion_stream".to_string(),
                         response_model: model,
@@ -519,9 +551,14 @@ impl From<&AiResponse> for TokenMetrics {
             }
             AiResponse::Completions(response) => {
                 if let Some(usage) = &response.usage {
+                    let usage_value = serde_json::to_value(usage).unwrap_or_default();
                     Self {
                         prompt_tokens: usage.prompt_tokens as i64,
                         completion_tokens: usage.completion_tokens as i64,
+                        reasoning_tokens: extract_reasoning_tokens_from_value(
+                            &usage_value,
+                            "completion_tokens_details",
+                        ),
                         total_tokens: usage.total_tokens as i64,
                         response_type: "completion".to_string(),
                         response_model: Some(response.model.clone()),
@@ -530,6 +567,7 @@ impl From<&AiResponse> for TokenMetrics {
                     Self {
                         prompt_tokens: 0,
                         completion_tokens: 0,
+                        reasoning_tokens: 0,
                         total_tokens: 0,
                         response_type: "completion".to_string(),
                         response_model: Some(response.model.clone()),
@@ -541,6 +579,7 @@ impl From<&AiResponse> for TokenMetrics {
                 Self {
                     prompt_tokens: usage.prompt_tokens as i64,
                     completion_tokens: 0, // Embeddings don't have completion tokens
+                    reasoning_tokens: 0,
                     total_tokens: usage.total_tokens as i64,
                     response_type: "embeddings".to_string(),
                     response_model: Some(response.model.clone()),
@@ -551,6 +590,7 @@ impl From<&AiResponse> for TokenMetrics {
                 Self {
                     prompt_tokens: usage.prompt_tokens as i64,
                     completion_tokens: 0, // Embeddings don't have completion tokens
+                    reasoning_tokens: 0,
                     total_tokens: usage.total_tokens as i64,
                     response_type: "base64_embeddings".to_string(),
                     response_model: Some(response.model.clone()),
@@ -558,9 +598,14 @@ impl From<&AiResponse> for TokenMetrics {
             }
             AiResponse::Responses(response) => {
                 if let Some(usage) = &response.usage {
+                    let usage_value = serde_json::to_value(usage).unwrap_or_default();
                     Self {
                         prompt_tokens: usage.input_tokens as i64,
                         completion_tokens: usage.output_tokens as i64,
+                        reasoning_tokens: extract_reasoning_tokens_from_value(
+                            &usage_value,
+                            "output_tokens_details",
+                        ),
                         total_tokens: usage.total_tokens as i64,
                         response_type: "response".to_string(),
                         response_model: Some(response.model.clone()),
@@ -569,6 +614,7 @@ impl From<&AiResponse> for TokenMetrics {
                     Self {
                         prompt_tokens: 0,
                         completion_tokens: 0,
+                        reasoning_tokens: 0,
                         total_tokens: 0,
                         response_type: "response".to_string(),
                         response_model: Some(response.model.clone()),
@@ -588,9 +634,14 @@ impl From<&AiResponse> for TokenMetrics {
                 let model = completed.map(|r| r.model.clone());
 
                 if let Some(usage) = completed.and_then(|r| r.usage.as_ref()) {
+                    let usage_value = serde_json::to_value(usage).unwrap_or_default();
                     Self {
                         prompt_tokens: usage.input_tokens as i64,
                         completion_tokens: usage.output_tokens as i64,
+                        reasoning_tokens: extract_reasoning_tokens_from_value(
+                            &usage_value,
+                            "output_tokens_details",
+                        ),
                         total_tokens: usage.total_tokens as i64,
                         response_type: "response_stream".to_string(),
                         response_model: model,
@@ -599,6 +650,7 @@ impl From<&AiResponse> for TokenMetrics {
                     Self {
                         prompt_tokens: 0,
                         completion_tokens: 0,
+                        reasoning_tokens: 0,
                         total_tokens: 0,
                         response_type: "response_stream".to_string(),
                         response_model: model,
@@ -608,6 +660,7 @@ impl From<&AiResponse> for TokenMetrics {
             AiResponse::Other(_) => Self {
                 prompt_tokens: 0,
                 completion_tokens: 0,
+                reasoning_tokens: 0,
                 total_tokens: 0,
                 response_type: "other".to_string(),
                 response_model: None,

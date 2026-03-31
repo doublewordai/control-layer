@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT COALESCE(SUM(response_size), 0)::BIGINT as \"sum!\"\n            FROM requests\n            WHERE batch_id = $1\n              AND state = $2\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "sum!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "2cdee36e028de40f163e7ffcf7ff7cb9ef6e134584a2c781fe8e67b708129686"
+}

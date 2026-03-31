@@ -571,6 +571,7 @@ export interface AnalyticsEntry {
   duration_ms?: number;
   prompt_tokens?: number;
   completion_tokens?: number;
+  reasoning_tokens?: number;
   total_tokens?: number;
   response_type?: string;
   fusillade_batch_id?: string;
@@ -1254,6 +1255,7 @@ export interface BatchAnalytics {
   total_requests: number;
   total_prompt_tokens: number;
   total_completion_tokens: number;
+  total_reasoning_tokens?: number | null;
   total_tokens: number;
   avg_duration_ms?: number | null;
   avg_ttfb_ms?: number | null;
@@ -1279,6 +1281,8 @@ export interface BatchResultItem {
   input_body: Record<string, unknown>;
   /** Full response object (choices, usage, etc.) for completed requests */
   response_body: Record<string, unknown> | null;
+  /** Separately captured reasoning artifact for completed requests */
+  reasoning_artifact?: Record<string, unknown> | null;
   /** Error message for failed requests */
   error: string | null;
   /** Current status of the request */

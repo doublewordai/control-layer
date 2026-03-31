@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE batches SET output_file_id = $2, error_file_id = $3 WHERE id = $1\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "1727149e75361e7e8d0c4417a78e7fd6faf4cc304e65a4d7cadaf66d57620f14"
+}

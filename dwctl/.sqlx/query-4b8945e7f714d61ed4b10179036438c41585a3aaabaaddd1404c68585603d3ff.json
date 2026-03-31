@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT reserved_requests, released_at FROM batch_capacity_reservations WHERE id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "reserved_requests",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "released_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      true
+    ]
+  },
+  "hash": "4b8945e7f714d61ed4b10179036438c41585a3aaabaaddd1404c68585603d3ff"
+}

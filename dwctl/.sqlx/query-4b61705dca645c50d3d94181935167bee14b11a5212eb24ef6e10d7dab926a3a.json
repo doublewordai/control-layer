@@ -1,0 +1,58 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT g.* FROM groups g\n            INNER JOIN user_groups ug ON g.id = ug.group_id\n            WHERE ug.user_id = $1 AND g.id != '00000000-0000-0000-0000-000000000000'\n            ORDER BY g.name\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "description",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "created_by",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 4,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 5,
+        "name": "updated_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 6,
+        "name": "source",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "4b61705dca645c50d3d94181935167bee14b11a5212eb24ef6e10d7dab926a3a"
+}

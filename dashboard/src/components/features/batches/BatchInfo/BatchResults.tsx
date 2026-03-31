@@ -258,14 +258,33 @@ export default function BatchResults({
                   content = selectedResult.response_body;
                 }
 
-                return content ? (
-                  <CodeBlock language="json">
-                    {JSON.stringify(content, null, 2)}
-                  </CodeBlock>
-                ) : (
-                  <p className="text-gray-500 text-sm p-4">
-                    No content available
-                  </p>
+                return (
+                  <div className="space-y-4">
+                    {content ? (
+                      <CodeBlock language="json">
+                        {JSON.stringify(content, null, 2)}
+                      </CodeBlock>
+                    ) : (
+                      <p className="text-gray-500 text-sm p-4">
+                        No content available
+                      </p>
+                    )}
+                    {modalContentType === "response" &&
+                      selectedResult.reasoning_artifact && (
+                        <div className="space-y-2">
+                          <p className="text-sm font-medium text-gray-700">
+                            Reasoning Artifact
+                          </p>
+                          <CodeBlock language="json">
+                            {JSON.stringify(
+                              selectedResult.reasoning_artifact,
+                              null,
+                              2,
+                            )}
+                          </CodeBlock>
+                        </div>
+                      )}
+                  </div>
                 );
               })()}
           </div>

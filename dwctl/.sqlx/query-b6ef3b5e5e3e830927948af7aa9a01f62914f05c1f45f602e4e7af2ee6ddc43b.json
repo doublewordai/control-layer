@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE users SET auto_topup_limit_notification_sent = true WHERE id = ANY($1)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "b6ef3b5e5e3e830927948af7aa9a01f62914f05c1f45f602e4e7af2ee6ddc43b"
+}

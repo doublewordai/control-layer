@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO credits_transactions (user_id, transaction_type, amount, source_id, description, created_at)\n            VALUES ($1, 'admin_grant', $2, $3, $4, NOW() - interval '5 hours')\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Numeric",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "ff4cafb40d72c38ee03b0de0c0023b4a46e1ee1e2d1c58f9bcb666bb3f64b8dd"
+}

@@ -1,0 +1,100 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT id, name, description, size_bytes, size_finalized, status, error_message, purpose, expires_at, deleted_at, uploaded_by, created_at, updated_at, api_key_id\n            FROM files\n            WHERE id = $1 AND deleted_at IS NULL\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "description",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "size_bytes",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 4,
+        "name": "size_finalized",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 5,
+        "name": "status",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "error_message",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "purpose",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "expires_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 9,
+        "name": "deleted_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 10,
+        "name": "uploaded_by",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 11,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 12,
+        "name": "updated_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 13,
+        "name": "api_key_id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "5264fb57b5bf373cf805802352c73c9bfee6d46ca03f0b305d0c2b9d87c4c48d"
+}

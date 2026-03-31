@@ -1,0 +1,173 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            WITH active_batch_ids AS MATERIALIZED (\n                SELECT b.id, b.expires_at, b.created_by\n                FROM batches b\n                WHERE b.cancelling_at IS NULL\n                    AND b.deleted_at IS NULL\n                    AND b.completed_at IS NULL\n                    AND b.failed_at IS NULL\n                    AND b.cancelled_at IS NULL\n                    AND EXISTS (\n                        SELECT 1 FROM requests r\n                        WHERE r.batch_id = b.id\n                            AND r.state = 'pending'\n                    )\n            ),\n            user_priority AS (\n                SELECT * FROM unnest($6::TEXT[], $7::BIGINT[]) AS u(user_id, active_count)\n            ),\n            to_claim AS (\n                SELECT claimed.id, claimed.template_id, claimed.batch_id\n                FROM unnest($4::TEXT[], $5::BIGINT[]) AS m(model, capacity)\n                CROSS JOIN LATERAL (\n                    SELECT r2.id, r2.template_id, r2.batch_id\n                    FROM active_batch_ids ab\n                    LEFT JOIN user_priority up ON ab.created_by = up.user_id\n                    CROSS JOIN LATERAL (\n                        SELECT r3.id, r3.template_id, r3.batch_id\n                        FROM requests r3\n                        WHERE r3.state = 'pending'\n                            AND r3.model = m.model\n                            AND r3.template_id IS NOT NULL\n                            AND r3.batch_id = ab.id\n                            AND (r3.not_before IS NULL OR r3.not_before <= $3)\n                        LIMIT m.capacity\n                        FOR UPDATE OF r3 SKIP LOCKED\n                    ) r2\n                    ORDER BY\n                        (1.0 - $8::DOUBLE PRECISION)\n                            * COALESCE(up.active_count, 0)::DOUBLE PRECISION\n                            / GREATEST(NULLIF((SELECT MAX(v) FROM unnest($7::BIGINT[]) v), 0), 1)::DOUBLE PRECISION\n                        + $8::DOUBLE PRECISION\n                            * LEAST(GREATEST(EXTRACT(EPOCH FROM ab.expires_at - $3), 0.0) / 86400.0, 1.0)\n                        ASC,\n                        ab.expires_at ASC,\n                        ab.id ASC\n                    LIMIT m.capacity\n                ) claimed\n                LIMIT $2::BIGINT\n            )\n            UPDATE requests r\n            SET\n                state = 'claimed',\n                daemon_id = $1,\n                claimed_at = $3\n            FROM to_claim tc\n            JOIN active_request_templates t ON tc.template_id = t.id\n            JOIN batches b ON tc.batch_id = b.id\n            WHERE r.id = tc.id\n            RETURNING r.id, r.batch_id as \"batch_id!\", r.template_id as \"template_id!\", r.retry_attempt,\n                      t.custom_id, t.endpoint as \"endpoint!\", t.method as \"method!\", t.path as \"path!\",\n                      t.body as \"body!\", t.model as \"model!\", COALESCE(b.api_key, t.api_key) as \"api_key!\",\n                      b.expires_at as batch_expires_at,\n                      b.id::TEXT as \"batch_id_str!\",\n                      b.file_id::TEXT as \"batch_file_id!\",\n                      b.endpoint as \"batch_endpoint!\",\n                      b.completion_window as \"batch_completion_window!\",\n                      b.metadata::TEXT as \"batch_metadata\",\n                      b.output_file_id::TEXT as \"batch_output_file_id\",\n                      b.error_file_id::TEXT as \"batch_error_file_id\",\n                      b.created_by as \"batch_created_by!\",\n                      to_char(b.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') as \"batch_created_at!\",\n                      to_char(b.expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') as \"batch_expires_at_str\",\n                      to_char(b.cancelling_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') as \"batch_cancelling_at\",\n                      b.errors::TEXT as \"batch_errors\",\n                      b.total_requests::TEXT as \"batch_total_requests!\"\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "batch_id!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "template_id!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "retry_attempt",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 4,
+        "name": "custom_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "endpoint!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "method!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "path!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "body!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 9,
+        "name": "model!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 10,
+        "name": "api_key!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 11,
+        "name": "batch_expires_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 12,
+        "name": "batch_id_str!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 13,
+        "name": "batch_file_id!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 14,
+        "name": "batch_endpoint!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 15,
+        "name": "batch_completion_window!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 16,
+        "name": "batch_metadata",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 17,
+        "name": "batch_output_file_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 18,
+        "name": "batch_error_file_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 19,
+        "name": "batch_created_by!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 20,
+        "name": "batch_created_at!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 21,
+        "name": "batch_expires_at_str",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 22,
+        "name": "batch_cancelling_at",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 23,
+        "name": "batch_errors",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 24,
+        "name": "batch_total_requests!",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int8",
+        "Timestamptz",
+        "TextArray",
+        "Int8Array",
+        "TextArray",
+        "Int8Array",
+        "Float8"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      true,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      null,
+      false,
+      null,
+      null,
+      false,
+      false,
+      null,
+      null,
+      null,
+      false,
+      null,
+      null,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "e03c140eac4cecb376564c441b410015d8b175d9d2d8b1e34e2dc719a6ed88b0"
+}
