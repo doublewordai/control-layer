@@ -61,11 +61,13 @@ pub fn email_domain(email: &str) -> Option<&str> {
 /// where auto-org creation would be inappropriate.
 pub fn is_personal_email_domain(domain: &str) -> bool {
     const PERSONAL_DOMAINS: &[&str] = &[
+        // Major providers
         "gmail.com",
         "googlemail.com",
         "hotmail.com",
         "hotmail.co.uk",
         "live.com",
+        "live.fr",
         "outlook.com",
         "msn.com",
         "yahoo.com",
@@ -73,19 +75,30 @@ pub fn is_personal_email_domain(domain: &str) -> bool {
         "yahoo.co.jp",
         "ymail.com",
         "aol.com",
-        "protonmail.com",
-        "proton.me",
+        "aim.com",
         "icloud.com",
         "me.com",
         "mac.com",
         "mail.com",
         "zoho.com",
         "yandex.com",
-        "gmx.com",
-        "gmx.de",
-        "fastmail.com",
+        "163.com",
+        // Privacy-focused
+        "protonmail.com",
+        "protonmail.ch",
+        "proton.me",
         "tutanota.com",
         "tuta.com",
+        "fastmail.com",
+        // Regional/misc
+        "gmx.com",
+        "gmx.de",
+        "gmx.net",
+        // Privacy relays and aliases
+        "privaterelay.appleid.com",
+        "mozmail.com",
+        "duck.com",
+        "passmail.net",
     ];
 
     let lower = domain.to_lowercase();
