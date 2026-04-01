@@ -1151,6 +1151,8 @@ pub async fn build_router(
             "/organizations/{id}/members/{user_id}",
             delete(api::handlers::organizations::remove_member),
         )
+        // Leave organization (self-removal)
+        .route("/organizations/{id}/leave", post(api::handlers::organizations::leave_organization))
         // Organization invites
         .route("/organizations/{id}/invites", post(api::handlers::organizations::invite_member))
         .route(

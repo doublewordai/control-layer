@@ -1,11 +1,15 @@
 import { useState } from "react";
+import { useNavigate } from "react-router-dom";
 import {
   useOrganizationMembers,
   useInviteMember,
   useCancelInvite,
   useUpdateMemberRole,
   useRemoveMember,
+  useLeaveOrganization,
+  useUser,
 } from "@/api/control-layer/hooks";
+import { useOrganizationContext } from "@/contexts";
 import type { OrgMemberRole, OrganizationMember } from "@/api/control-layer/types";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -25,7 +29,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { UserAvatar } from "@/components/ui";
-import { UserPlus, Trash2, Mail, X } from "lucide-react";
+import { UserPlus, Trash2, Mail, X, LogOut } from "lucide-react";
 import { toast } from "sonner";
 
 interface MemberManagementProps {
@@ -34,18 +38,23 @@ interface MemberManagementProps {
 }
 
 export function MemberManagement({ organizationId, readOnly = false }: MemberManagementProps) {
+  const navigate = useNavigate();
+  const { setActiveOrganization } = useOrganizationContext();
   const { data: members = [], isLoading } =
     useOrganizationMembers(organizationId);
+  const { data: currentUser } = useUser("current");
   const inviteMember = useInviteMember();
   const cancelInvite = useCancelInvite();
   const updateRole = useUpdateMemberRole();
   const removeMember = useRemoveMember();
+  const leaveOrg = useLeaveOrganization();
 
   const [showAddForm, setShowAddForm] = useState(false);
   const [email, setEmail] = useState("");
   const [selectedRole, setSelectedRole] = useState<OrgMemberRole>("member");
   const [memberToRemove, setMemberToRemove] =
     useState<OrganizationMember | null>(null);
+  const [showLeaveConfirm, setShowLeaveConfirm] = useState(false);
 
   const activeMembers = members.filter((m) => m.status === "active");
   const pendingInvites = members.filter((m) => m.status === "pending");
@@ -97,6 +106,20 @@ export function MemberManagement({ organizationId, readOnly = false }: MemberMan
     } catch (error) {
       toast.error(
         error instanceof Error ? error.message : "Failed to update role",
+      );
+    }
+  };
+
+  const handleLeave = async () => {
+    try {
+      await leaveOrg.mutateAsync(organizationId);
+      await setActiveOrganization(null);
+      toast.success("You have left the organization");
+      setShowLeaveConfirm(false);
+      navigate("/");
+    } catch (error) {
+      toast.error(
+        error instanceof Error ? error.message : "Failed to leave organization",
       );
     }
   };
@@ -211,7 +234,21 @@ export function MemberManagement({ organizationId, readOnly = false }: MemberMan
                   </div>
                 </div>
                 <div className="flex items-center gap-2">
-                  {readOnly ? (
+                  {member.user?.id === currentUser?.id ? (
+                    <>
+                      <span className="text-xs text-muted-foreground capitalize px-2 py-1 bg-muted rounded">
+                        {member.role}
+                      </span>
+                      <button
+                        onClick={() => setShowLeaveConfirm(true)}
+                        className="h-8 px-2 rounded text-red-600 hover:text-red-700 hover:bg-red-50 transition-all flex items-center gap-1 text-xs"
+                        title="Leave organization"
+                      >
+                        <LogOut className="h-3.5 w-3.5" />
+                        Leave
+                      </button>
+                    </>
+                  ) : readOnly ? (
                     <span className="text-xs text-muted-foreground capitalize px-2 py-1 bg-muted rounded">
                       {member.role}
                     </span>
@@ -325,6 +362,36 @@ export function MemberManagement({ organizationId, readOnly = false }: MemberMan
               disabled={removeMember.isPending}
             >
               {removeMember.isPending ? "Removing..." : "Remove"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={showLeaveConfirm}
+        onOpenChange={(open) => !open && setShowLeaveConfirm(false)}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Leave Organization</DialogTitle>
+            <DialogDescription>
+              Are you sure you want to leave this organization? Your
+              organization API keys will be deleted.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => setShowLeaveConfirm(false)}
+            >
+              Cancel
+            </Button>
+            <Button
+              variant="destructive"
+              onClick={handleLeave}
+              disabled={leaveOrg.isPending}
+            >
+              {leaveOrg.isPending ? "Leaving..." : "Leave"}
             </Button>
           </DialogFooter>
         </DialogContent>

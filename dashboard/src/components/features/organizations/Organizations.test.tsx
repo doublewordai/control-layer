@@ -119,8 +119,8 @@ describe("Organizations", () => {
     expect(
       within(dialog).getByText("Create Organization"),
     ).toBeInTheDocument();
-    expect(within(dialog).getByLabelText("Slug")).toBeInTheDocument();
-    expect(within(dialog).getByLabelText("Email")).toBeInTheDocument();
+    expect(within(dialog).getByLabelText("Domain")).toBeInTheDocument();
+    expect(within(dialog).getByLabelText("Contact Email")).toBeInTheDocument();
   });
 
   it("opens edit organization modal via action button", async () => {
