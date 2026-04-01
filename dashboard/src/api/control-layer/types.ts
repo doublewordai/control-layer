@@ -9,6 +9,7 @@ export interface PaginatedResponse<T> {
 }
 
 export type ModelType = "CHAT" | "EMBEDDINGS" | "RERANKER";
+export type ModelDisplayCategory = "generation" | "embedding" | "ocr";
 
 // Virtual model types (virtual models route requests across multiple hosted models)
 export type LoadBalancingStrategy = "weighted_random" | "priority";
@@ -153,6 +154,7 @@ export interface TariffDefinition {
 // Model metadata (enriched model information from provider data)
 export interface ModelMetadata {
   provider?: string;
+  display_category?: ModelDisplayCategory;
   intelligence_index?: number;
   context_window?: number;
   released_at?: string; // ISO date string (YYYY-MM-DD)
@@ -161,7 +163,33 @@ export interface ModelMetadata {
     evaluations?: Record<string, number>;
     summary?: string; // Short one-line description for catalog views
     use_cases?: string[]; // e.g., ["Research & analysis", "High volume tasks"]
+    model_order?: number;
   };
+}
+
+export interface ProviderDisplayConfig {
+  provider_key: string;
+  display_name: string;
+  icon?: string | null;
+  sort_order: number;
+  model_count: number;
+  configured: boolean;
+  created_by?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+}
+
+export interface ProviderDisplayConfigCreateRequest {
+  provider_key: string;
+  display_name?: string;
+  icon?: string;
+  sort_order?: number;
+}
+
+export interface ProviderDisplayConfigUpdateRequest {
+  display_name?: string;
+  icon?: string | null;
+  sort_order?: number;
 }
 
 // Base model types

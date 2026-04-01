@@ -13,9 +13,10 @@ import {
   Brain,
   Code,
 } from "lucide-react";
-import { useModels, useGroups } from "../../../../api/control-layer";
+import { useModels, useGroups, useProviderDisplayConfigs } from "../../../../api/control-layer";
 import type {
   Model,
+  ModelDisplayCategory,
   ModelSortField,
   SortDirection,
 } from "../../../../api/control-layer/types";
@@ -32,6 +33,7 @@ import { Input } from "../../../ui/input";
 import { Badge } from "../../../ui/badge";
 import { Button } from "../../../ui/button";
 import { Popover, PopoverContent, PopoverTrigger } from "../../../ui/popover";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "../../../ui/tabs";
 import {
   Table,
   TableBody,
@@ -52,13 +54,17 @@ import {
 } from "../../../ui/hover-card";
 import { Skeleton } from "../../../ui/skeleton";
 import { ApiExamples } from "../../../modals";
+import { CatalogIcon } from "./CatalogIcon";
+import { getModelOrder } from "./catalogPresentation";
 
 const EVERYONE_GROUP_ID = "00000000-0000-0000-0000-000000000000";
 
-const MODEL_TYPE_SECTIONS: { type: string; label: string }[] = [
-  { type: "CHAT", label: "Generation Models" },
-  { type: "EMBEDDINGS", label: "Embedding Models" },
-  { type: "RERANKER", label: "Reranker Models" },
+type CatalogTab = ModelDisplayCategory;
+
+const MODEL_TYPE_SECTIONS: { type: CatalogTab; label: string }[] = [
+  { type: "generation", label: "Generation" },
+  { type: "embedding", label: "Embedding" },
+  { type: "ocr", label: "OCR" },
 ];
 
 const CAPABILITY_CONFIG: Record<
@@ -71,14 +77,12 @@ const CAPABILITY_CONFIG: Record<
   embeddings: { icon: Layers, label: "Text embeddings", color: "text-gray-400" },
 };
 
-const DEFAULT_SORT_DIRECTIONS: Record<ModelSortField, SortDirection> = {
+const DEFAULT_SORT_DIRECTIONS: Partial<Record<ModelSortField, SortDirection>> = {
   alias: "asc",
-  provider: "asc",
   intelligence_index: "desc",
   released_at: "desc",
   context_window: "desc",
   price_from: "asc",
-  created_at: "desc",
 };
 
 function formatReleaseDate(dateStr: string): string {
@@ -99,6 +103,18 @@ function getCheapestInputPrice(tariffs: Model["tariffs"]): string | null {
   return formatTariffPrice(String(cheapest));
 }
 
+function getCheapestInputPriceValue(tariffs: Model["tariffs"]): number | null {
+  if (!tariffs) return null;
+  const visible = getUserFacingTariffs(tariffs);
+  if (visible.length === 0) return null;
+  let cheapest = Infinity;
+  for (const t of visible) {
+    const price = parseFloat(t.input_price_per_token);
+    if (price < cheapest) cheapest = price;
+  }
+  return Number.isFinite(cheapest) ? cheapest : null;
+}
+
 /** Derive display capabilities from model type + backend capabilities. */
 function getDisplayCapabilities(model: Model): string[] {
   const caps: string[] = [];
@@ -114,6 +130,17 @@ function getDisplayCapabilities(model: Model): string[] {
     }
   }
   return caps;
+}
+
+function getCatalogTabForModel(model: Model): CatalogTab | null {
+  if (model.metadata?.display_category) {
+    return model.metadata.display_category;
+  }
+  if (model.model_type === "EMBEDDINGS") return "embedding";
+  if (model.model_type === "CHAT" || model.model_type === "RERANKER") {
+    return "generation";
+  }
+  return null;
 }
 
 function CapabilityIcons({ capabilities }: { capabilities: string[] }) {
@@ -252,7 +279,7 @@ function ModelRow({
     visibleTariffs.length > 0 ? getCheapestInputPrice(model.tariffs) : null;
 
   const playgroundAvailable = !isPlaygroundDenied(model);
-  const colCount = 9;
+  const colCount = 8;
 
   return (
     <Fragment>
@@ -285,9 +312,6 @@ function ModelRow({
               </span>
             )}
           </div>
-        </TableCell>
-        <TableCell className="text-muted-foreground">
-          {model.metadata?.provider || "\u2014"}
         </TableCell>
         <TableCell>
           <CapabilityIcons capabilities={getDisplayCapabilities(model)} />
@@ -388,25 +412,29 @@ function ModelRow({
 }
 
 function SectionTable({
+  tableKey,
   models,
   isChat,
   expandedRows,
   onToggleExpand,
   onRowClick,
   onApiClick,
+  nameColumnWidth,
   sortField,
   sortDirection,
   onSort,
 }: {
+  tableKey: string;
   models: Model[];
   isChat: boolean;
   expandedRows: Set<string>;
   onToggleExpand: (id: string) => void;
   onRowClick: (id: string) => void;
   onApiClick: (model: Model) => void;
+  nameColumnWidth: string;
   sortField: ModelSortField | null;
   sortDirection: SortDirection | null;
-  onSort: (field: ModelSortField) => void;
+  onSort: (tableKey: string, field: ModelSortField) => void;
 }) {
   const newModelIds = useMemo(() => {
     const cutoff = new Date();
@@ -421,41 +449,134 @@ function SectionTable({
     return ids;
   }, [models]);
 
-  const sortProps = { sortField, sortDirection, onSort };
+  const sortedModels = useMemo(() => {
+    const directionMultiplier = sortDirection === "asc" ? 1 : -1;
+
+    const compareReleasedAt = (a: Model, b: Model) =>
+      (a.metadata?.released_at || "").localeCompare(b.metadata?.released_at || "");
+
+    const compareNumbers = (a?: number | null, b?: number | null) => {
+      if (a == null && b == null) return 0;
+      if (a == null) return 1;
+      if (b == null) return -1;
+      return a - b;
+    };
+
+    return [...models].sort((a, b) => {
+      let comparison = 0;
+
+      switch (sortField) {
+        case "alias":
+          comparison = a.alias.localeCompare(b.alias);
+          break;
+        case "intelligence_index":
+          comparison = compareNumbers(
+            a.metadata?.intelligence_index,
+            b.metadata?.intelligence_index,
+          );
+          break;
+        case "price_from": {
+          comparison = compareNumbers(
+            getCheapestInputPriceValue(a.tariffs),
+            getCheapestInputPriceValue(b.tariffs),
+          );
+          break;
+        }
+        case "context_window":
+          comparison = compareNumbers(
+            a.metadata?.context_window,
+            b.metadata?.context_window,
+          );
+          break;
+        case "released_at":
+          comparison = compareReleasedAt(a, b);
+          break;
+        default:
+          comparison = compareNumbers(
+            a.metadata?.intelligence_index,
+            b.metadata?.intelligence_index,
+          );
+          break;
+      }
+
+      if (comparison !== 0) {
+        return comparison * directionMultiplier;
+      }
+
+      return a.alias.localeCompare(b.alias);
+    });
+  }, [models, sortDirection, sortField]);
 
   return (
     <div className="border rounded-lg overflow-hidden">
       <div className="overflow-x-auto">
-        <Table>
+        <Table className="table-fixed w-full">
+          <colgroup>
+            <col className="w-8" />
+            <col style={{ width: nameColumnWidth }} />
+            <col className="w-[120px]" />
+            <col className="w-[140px]" />
+            <col className="w-[120px]" />
+            <col className="w-[104px]" />
+            <col className="w-[104px]" />
+            <col className="w-[112px]" />
+          </colgroup>
           <TableHeader>
             <TableRow>
               <TableHead className="w-8 px-2" />
-              <TableHead className="min-w-[200px]">
-                <SortButton field="alias" label="Name" {...sortProps} />
+              <TableHead>
+                <SortButton
+                  field="alias"
+                  label="Name"
+                  sortField={sortField}
+                  sortDirection={sortDirection}
+                  onSort={(field) => onSort(tableKey, field)}
+                />
               </TableHead>
-              <TableHead className="min-w-[100px]">
-                <SortButton field="provider" label="Provider" {...sortProps} />
-              </TableHead>
-              <TableHead className="min-w-[100px]">
+              <TableHead>
                 Capabilities
               </TableHead>
-              <TableHead className="min-w-[130px]">
-                <SortButton field="intelligence_index" label="Intelligence" {...sortProps} />
+              <TableHead>
+                <SortButton
+                  field="intelligence_index"
+                  label="Intelligence"
+                  sortField={sortField}
+                  sortDirection={sortDirection}
+                  onSort={(field) => onSort(tableKey, field)}
+                />
               </TableHead>
-              <TableHead className="min-w-[110px]">
-                <SortButton field="price_from" label="Cost" {...sortProps} />
+              <TableHead>
+                <SortButton
+                  field="price_from"
+                  label="Cost"
+                  sortField={sortField}
+                  sortDirection={sortDirection}
+                  onSort={(field) => onSort(tableKey, field)}
+                />
               </TableHead>
-              <TableHead className="min-w-[80px]">
-                <SortButton field="context_window" label="Context" {...sortProps} />
+              <TableHead>
+                <SortButton
+                  field="context_window"
+                  label="Context"
+                  sortField={sortField}
+                  sortDirection={sortDirection}
+                  onSort={(field) => onSort(tableKey, field)}
+                />
               </TableHead>
-              <TableHead className="min-w-[80px]">
-                <SortButton field="released_at" label="Released" {...sortProps} />
+              <TableHead>
+                <SortButton
+                  field="released_at"
+                  label="Released"
+                  sortField={sortField}
+                  sortDirection={sortDirection}
+                  onSort={(field) => onSort(tableKey, field)}
+                />
               </TableHead>
-              <TableHead className="w-16" />
+              <TableHead className="w-[112px]" />
             </TableRow>
           </TableHeader>
           <TableBody>
-            {models.map((model) => (
+            {sortedModels.map((model) => (
               <ModelRow
                 key={model.id}
                 model={model}
@@ -480,17 +601,27 @@ function LoadingSkeleton() {
       <div>
         <Skeleton className="h-6 w-48 mb-3" />
         <div className="border rounded-lg overflow-hidden">
-          <Table>
+          <Table className="table-fixed w-full">
+            <colgroup>
+              <col className="w-8" />
+              <col className="w-[32ch]" />
+              <col className="w-[120px]" />
+              <col className="w-[140px]" />
+              <col className="w-[120px]" />
+              <col className="w-[104px]" />
+              <col className="w-[104px]" />
+              <col className="w-[112px]" />
+            </colgroup>
             <TableHeader>
               <TableRow>
                 <TableHead className="w-8 px-2" />
                 <TableHead>Name</TableHead>
-                <TableHead>Provider</TableHead>
                 <TableHead>Capabilities</TableHead>
                 <TableHead>Intelligence</TableHead>
                 <TableHead>Cost</TableHead>
                 <TableHead>Context</TableHead>
                 <TableHead>Released</TableHead>
+                <TableHead />
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -501,9 +632,6 @@ function LoadingSkeleton() {
                   </TableCell>
                   <TableCell>
                     <Skeleton className="h-5 w-48" />
-                  </TableCell>
-                  <TableCell>
-                    <Skeleton className="h-5 w-20" />
                   </TableCell>
                   <TableCell>
                     <Skeleton className="h-5 w-16" />
@@ -548,10 +676,10 @@ export const ModelCatalog: React.FC = () => {
       return new Set();
     }
   });
-  const [sortField, setSortField] = useState<ModelSortField | null>(null);
-  const [sortDirection, setSortDirection] = useState<SortDirection | null>(
-    null,
-  );
+  const [activeTab, setActiveTab] = useState<CatalogTab>("generation");
+  const [tableSorts, setTableSorts] = useState<
+    Record<string, { field: ModelSortField; direction: SortDirection }>
+  >({});
   const [apiExamplesModel, setApiExamplesModel] = useState<Model | null>(null);
 
   // Debounce search for server-side filtering
@@ -577,33 +705,111 @@ export const ModelCatalog: React.FC = () => {
     include: "pricing",
     is_composite: true,
     search: debouncedSearch || undefined,
-    sort: sortField ?? undefined,
-    sort_direction: sortDirection ?? undefined,
   });
+  const { data: providerDisplayConfigs = [] } = useProviderDisplayConfigs();
 
-  const handleSort = (field: ModelSortField) => {
-    const defaultDir = DEFAULT_SORT_DIRECTIONS[field];
-    if (sortField === field) {
-      if (sortDirection === defaultDir) {
-        setSortDirection(defaultDir === "asc" ? "desc" : "asc");
-      } else {
-        setSortField(null);
-        setSortDirection(null);
+  const handleSort = (tableKey: string, field: ModelSortField) => {
+    const defaultDir = DEFAULT_SORT_DIRECTIONS[field] ?? "asc";
+    setTableSorts((current) => {
+      const existing = current[tableKey];
+      if (!existing || existing.field !== field) {
+        return {
+          ...current,
+          [tableKey]: { field, direction: defaultDir },
+        };
       }
-    } else {
-      setSortField(field);
-      setSortDirection(defaultDir);
-    }
+
+      return {
+        ...current,
+        [tableKey]: {
+          field,
+          direction: existing.direction === defaultDir
+            ? (defaultDir === "asc" ? "desc" : "asc")
+            : defaultDir,
+        },
+      };
+    });
   };
 
-  // Group models by type into sections
+  const nameColumnWidth = useMemo(() => {
+    const maxAliasLength = Math.max(
+      ...((data?.data || []).map((model) => model.alias.length)),
+      24,
+    );
+    const widthInCh = Math.min(Math.max(maxAliasLength + 4, 28), 44);
+    return `${widthInCh}ch`;
+  }, [data?.data]);
+
+  // Group models by catalog tab, then by provider.
   const sections = useMemo(() => {
     const allModels = data?.data || [];
-    return MODEL_TYPE_SECTIONS.map((section) => ({
-      ...section,
-      models: allModels.filter((m) => m.model_type === section.type),
-    })).filter((section) => section.models.length > 0);
-  }, [data]);
+    const providerConfigMap = new Map(
+      providerDisplayConfigs.map((config) => [config.provider_key, config]),
+    );
+    return MODEL_TYPE_SECTIONS.map((section) => {
+      const grouped = new Map<
+        string,
+        {
+          key: string;
+          label: string;
+          icon?: string | null;
+          sortOrder: number;
+          models: Model[];
+        }
+      >();
+
+      for (const model of allModels) {
+        if (getCatalogTabForModel(model) !== section.type) continue;
+        const providerLabel = model.metadata?.provider?.trim() || "Other";
+        const providerKey = providerLabel.toLowerCase();
+        const providerConfig = providerConfigMap.get(providerKey);
+        const existing = grouped.get(providerKey);
+        if (existing) {
+          existing.models.push(model);
+        } else {
+          grouped.set(providerKey, {
+            key: providerKey,
+            label: providerConfig?.display_name || providerLabel,
+            icon: providerConfig?.icon || undefined,
+            sortOrder: providerConfig?.sort_order ?? Number.MAX_SAFE_INTEGER,
+            models: [model],
+          });
+        }
+      }
+
+      const groups = [...grouped.values()]
+        .map((group) => ({
+          ...group,
+          models: [...group.models].sort((a, b) => {
+            const orderA = getModelOrder(a);
+            const orderB = getModelOrder(b);
+            if (orderA != null && orderB != null && orderA !== orderB) {
+              return orderA - orderB;
+            }
+            if (orderA != null) return -1;
+            if (orderB != null) return 1;
+            return a.alias.localeCompare(b.alias);
+          }),
+        }))
+        .sort((a, b) =>
+          a.sortOrder === b.sortOrder
+            ? a.label.localeCompare(b.label)
+            : a.sortOrder - b.sortOrder,
+        );
+
+      return {
+        ...section,
+        groups,
+      };
+    }).filter((section) => section.groups.length > 0);
+  }, [data?.data, providerDisplayConfigs]);
+
+  useEffect(() => {
+    if (sections.length === 0) return;
+    if (!sections.some((section) => section.type === activeTab)) {
+      setActiveTab(sections[0].type);
+    }
+  }, [activeTab, sections]);
 
   const toggleExpand = (id: string) => {
     setExpandedRows((prev) => {
@@ -734,7 +940,6 @@ export const ModelCatalog: React.FC = () => {
           </div>
         </div>
       </div>
-
       {/* Content */}
       {isLoading ? (
         <LoadingSkeleton />
@@ -745,26 +950,64 @@ export const ModelCatalog: React.FC = () => {
             : "No models available"}
         </div>
       ) : (
-        <div className="space-y-8">
-          {sections.map((section) => (
-            <div key={section.type}>
-              <h2 className="text-lg font-semibold text-gray-900 mb-3">
+        <Tabs
+          value={activeTab}
+          onValueChange={(value) => setActiveTab(value as CatalogTab)}
+          className="space-y-4"
+        >
+          <TabsList className="w-full justify-start overflow-x-auto bg-transparent p-0">
+            {sections.map((section) => (
+              <TabsTrigger
+                key={section.type}
+                value={section.type}
+                className="rounded-none bg-transparent px-0 py-2 mr-6 shadow-none data-[state=active]:bg-transparent data-[state=active]:shadow-none"
+              >
                 {section.label}
-              </h2>
-              <SectionTable
-                models={section.models}
-                isChat={section.type === "CHAT"}
-                expandedRows={expandedRows}
-                onToggleExpand={toggleExpand}
-                onRowClick={(id) => navigate(`/models/${id}`)}
-                onApiClick={(model) => setApiExamplesModel(model)}
-                sortField={sortField}
-                sortDirection={sortDirection}
-                onSort={handleSort}
-              />
-            </div>
+              </TabsTrigger>
+            ))}
+          </TabsList>
+
+          {sections.map((section) => (
+            <TabsContent key={section.type} value={section.type} className="space-y-4">
+              {section.groups.map((group) => (
+                <div key={group.key} className="space-y-3">
+                  <div className="flex items-center gap-2 px-1">
+                    <CatalogIcon
+                      icon={group.icon || undefined}
+                      label={group.label}
+                      size="sm"
+                      fallback="none"
+                    />
+                    <div className="min-w-0">
+                      <h3 className="text-sm font-semibold text-gray-900">
+                        {group.label}
+                      </h3>
+                    </div>
+                  </div>
+                  <SectionTable
+                    tableKey={`${section.type}:${group.key}`}
+                    models={group.models}
+                    isChat={section.type !== "embedding"}
+                    expandedRows={expandedRows}
+                    onToggleExpand={toggleExpand}
+                    onRowClick={(id) => navigate(`/models/${id}`)}
+                    onApiClick={(model) => setApiExamplesModel(model)}
+                    nameColumnWidth={nameColumnWidth}
+                    sortField={
+                      tableSorts[`${section.type}:${group.key}`]?.field ??
+                      "intelligence_index"
+                    }
+                    sortDirection={
+                      tableSorts[`${section.type}:${group.key}`]?.direction ??
+                      "desc"
+                    }
+                    onSort={handleSort}
+                  />
+                </div>
+              ))}
+            </TabsContent>
           ))}
-        </div>
+        </Tabs>
       )}
 
       <ApiExamples

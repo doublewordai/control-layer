@@ -1076,6 +1076,26 @@ pub async fn build_router(
         .route("/models/{id}", get(api::handlers::deployments::get_deployed_model))
         .route("/models/{id}", patch(api::handlers::deployments::update_deployed_model))
         .route("/models/{id}", delete(api::handlers::deployments::delete_deployed_model))
+        .route(
+            "/provider-display-configs",
+            get(api::handlers::provider_display_configs::list_provider_display_configs),
+        )
+        .route(
+            "/provider-display-configs",
+            post(api::handlers::provider_display_configs::create_provider_display_config),
+        )
+        .route(
+            "/provider-display-configs/{provider_key}",
+            get(api::handlers::provider_display_configs::get_provider_display_config),
+        )
+        .route(
+            "/provider-display-configs/{provider_key}",
+            patch(api::handlers::provider_display_configs::update_provider_display_config),
+        )
+        .route(
+            "/provider-display-configs/{provider_key}",
+            delete(api::handlers::provider_display_configs::delete_provider_display_config),
+        )
         // Composite model component management (for models where is_composite=true)
         .route("/models/{id}/components", get(api::handlers::deployments::get_model_components))
         .route(

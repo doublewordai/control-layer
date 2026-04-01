@@ -12,6 +12,7 @@ pub mod groups;
 pub mod inference_endpoints;
 pub mod organizations;
 pub mod pagination;
+pub mod provider_display_configs;
 pub mod probes;
 pub mod requests;
 pub mod tariffs;

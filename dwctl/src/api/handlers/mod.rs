@@ -42,6 +42,7 @@ pub mod groups;
 pub mod inference_endpoints;
 pub mod organizations;
 pub mod payments;
+pub mod provider_display_configs;
 pub mod probes;
 pub mod queue;
 pub mod requests;

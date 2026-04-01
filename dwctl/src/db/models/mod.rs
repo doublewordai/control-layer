@@ -67,6 +67,7 @@ pub mod groups;
 pub mod inference_endpoints;
 pub mod organizations;
 pub mod password_reset_tokens;
+pub mod provider_display_configs;
 pub mod probes;
 pub mod tariffs;
 pub mod tool_sources;

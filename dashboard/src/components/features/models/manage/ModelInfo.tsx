@@ -26,6 +26,7 @@ import {
 import type {
   ApiKeyPurpose,
   ModelMetadata,
+  ModelDisplayCategory,
   TrafficRoutingRule,
 } from "../../../../api/control-layer";
 import { useAuthorization, isPlaygroundDenied } from "../../../../utils";
@@ -83,6 +84,15 @@ const TRAFFIC_PURPOSE_OPTIONS: ApiKeyPurpose[] = [
   "realtime",
   "batch",
   "playground",
+];
+
+const DISPLAY_CATEGORY_OPTIONS: {
+  value: ModelDisplayCategory;
+  label: string;
+}[] = [
+  { value: "generation", label: "Generation" },
+  { value: "embedding", label: "Embedding" },
+  { value: "ocr", label: "OCR" },
 ];
 
 const ModelInfo: React.FC = () => {
@@ -801,15 +811,15 @@ const ModelInfo: React.FC = () => {
                         </div>
                       )}
 
-                      {/* Catalog Metadata Section */}
+                      {/* Display Metadata Section */}
                       <div className="border-t pt-4">
                         <div className="flex items-center gap-1 mb-3">
                           <label className="text-sm text-gray-600 font-medium">
-                            Catalog Metadata
+                            Display Metadata
                           </label>
                           <InfoTip>
                             <p className="text-sm text-muted-foreground">
-                              Display metadata shown in the model catalog.
+                              Display metadata shown on the public models page.
                               These fields are informational and do not affect
                               model behavior.
                             </p>
@@ -818,7 +828,7 @@ const ModelInfo: React.FC = () => {
                         <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                           <div>
                             <label className="text-sm text-gray-600 mb-2 block">
-                              Provider
+                              Provider Key
                             </label>
                             <Input
                               value={updateData.metadata?.provider ?? ""}
@@ -827,12 +837,17 @@ const ModelInfo: React.FC = () => {
                                   ...prev,
                                   metadata: {
                                     ...prev.metadata,
-                                    provider: e.target.value || undefined,
+                                    provider:
+                                      e.target.value.trim().toLowerCase() ||
+                                      undefined,
                                   },
                                 }))
                               }
-                              placeholder="e.g. OpenAI, Alibaba"
+                              placeholder="e.g. openai, anthropic, alibaba"
                             />
+                            <p className="text-xs text-gray-400 mt-1">
+                              Matches the global provider config by key.
+                            </p>
                           </div>
                           <div>
                             <label className="text-sm text-gray-600 mb-2 block">
@@ -881,6 +896,41 @@ const ModelInfo: React.FC = () => {
                         <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mt-4">
                           <div>
                             <label className="text-sm text-gray-600 mb-2 block">
+                              Display Category
+                            </label>
+                            <Select
+                              value={updateData.metadata?.display_category ?? "__unset__"}
+                              onValueChange={(value) =>
+                                setUpdateData((prev) => ({
+                                  ...prev,
+                                  metadata: {
+                                    ...prev.metadata,
+                                    display_category:
+                                      value === "__unset__"
+                                        ? undefined
+                                        : (value as ModelDisplayCategory),
+                                  },
+                                }))
+                              }
+                            >
+                              <SelectTrigger>
+                                <SelectValue placeholder="Use model type defaults" />
+                              </SelectTrigger>
+                              <SelectContent>
+                                <SelectItem value="__unset__">Use model type defaults</SelectItem>
+                                {DISPLAY_CATEGORY_OPTIONS.map((option) => (
+                                  <SelectItem key={option.value} value={option.value}>
+                                    {option.label}
+                                  </SelectItem>
+                                ))}
+                              </SelectContent>
+                            </Select>
+                            <p className="text-xs text-gray-400 mt-1">
+                              Controls which catalog tab this model appears in.
+                            </p>
+                          </div>
+                          <div>
+                            <label className="text-sm text-gray-600 mb-2 block">
                               Intelligence Index
                             </label>
                             <Input
@@ -918,6 +968,35 @@ const ModelInfo: React.FC = () => {
                                 }))
                               }
                               placeholder="e.g. artificial_analysis"
+                            />
+                          </div>
+                        </div>
+                        <div className="grid grid-cols-1 md:grid-cols-1 gap-4 mt-4">
+                          <div>
+                            <label className="text-sm text-gray-600 mb-2 block">
+                              Model Order
+                            </label>
+                            <Input
+                              type="number"
+                              step="1"
+                              value={
+                                (updateData.metadata?.extra as Record<string, unknown>)?.model_order as number ?? ""
+                              }
+                              onChange={(e) =>
+                                setUpdateData((prev) => ({
+                                  ...prev,
+                                  metadata: {
+                                    ...prev.metadata,
+                                    extra: {
+                                      ...(prev.metadata?.extra ?? {}),
+                                      model_order: e.target.value
+                                        ? parseInt(e.target.value, 10)
+                                        : undefined,
+                                    },
+                                  },
+                                }))
+                              }
+                              placeholder="Lower numbers appear first"
                             />
                           </div>
                         </div>
@@ -1805,21 +1884,29 @@ const ModelInfo: React.FC = () => {
                           </div>
                         )}
 
-                      {/* Catalog Metadata Display */}
+                      {/* Display Metadata */}
                       {model.metadata && (
                         <div className="border-t pt-6">
                           <div className="flex items-center gap-1 mb-3">
                             <p className="text-sm text-gray-600 font-medium">
-                              Catalog Metadata
+                              Display Metadata
                             </p>
                           </div>
                           <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-                            {model.metadata.provider && (
-                              <div>
-                                <p className="text-xs text-gray-400 mb-1">Provider</p>
+                          {model.metadata.provider && (
+                            <div>
+                                <p className="text-xs text-gray-400 mb-1">Provider Key</p>
                                 <p className="text-sm font-medium">{model.metadata.provider}</p>
-                              </div>
-                            )}
+                            </div>
+                          )}
+                          {model.metadata.display_category && (
+                            <div>
+                                <p className="text-xs text-gray-400 mb-1">Display Category</p>
+                                <p className="text-sm font-medium capitalize">
+                                  {model.metadata.display_category}
+                                </p>
+                            </div>
+                          )}
                             {model.metadata.context_window != null && (
                               <div>
                                 <p className="text-xs text-gray-400 mb-1">Context Window</p>
@@ -1852,6 +1939,14 @@ const ModelInfo: React.FC = () => {
                               <div>
                                 <p className="text-xs text-gray-400 mb-1">Attribution</p>
                                 <p className="text-sm font-medium">{model.metadata.attribution}</p>
+                              </div>
+                            )}
+                            {model.metadata.extra?.model_order != null && (
+                              <div>
+                                <p className="text-xs text-gray-400 mb-1">Model Order</p>
+                                <p className="text-sm font-medium tabular-nums">
+                                  {model.metadata.extra.model_order}
+                                </p>
                               </div>
                             )}
                           </div>

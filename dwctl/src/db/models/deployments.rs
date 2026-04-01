@@ -226,6 +226,14 @@ impl ModelType {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelDisplayCategory {
+    Generation,
+    Embedding,
+    Ocr,
+}
+
 /// Maximum serialized size of ModelCatalogMetadata in bytes (16 KB).
 pub const MODEL_CATALOG_METADATA_MAX_BYTES: usize = 16_384;
 /// Maximum number of keys allowed in the `extra` object.
@@ -237,6 +245,10 @@ pub struct ModelCatalogMetadata {
     /// Provider name (e.g. "OpenAI", "Anthropic")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
+
+    /// Display category for catalog organization independent of runtime model type
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_category: Option<ModelDisplayCategory>,
 
     /// Intelligence index score (e.g. from Artificial Analysis)
     #[serde(skip_serializing_if = "Option::is_none")]
