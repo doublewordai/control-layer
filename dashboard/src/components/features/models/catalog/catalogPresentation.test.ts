@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
 import type { Model } from "../../../../api/control-layer/types";
 import {
-  getModelIcon,
-  getModelIconLabel,
+  getCatalogIconInitials,
+  getModelOrder,
 } from "./catalogPresentation";
 
 function buildModel(overrides: Partial<Model> = {}): Model {
@@ -17,37 +17,29 @@ function buildModel(overrides: Partial<Model> = {}): Model {
 }
 
 describe("catalogPresentation", () => {
-  it("falls back to provider icons for known providers", () => {
+  it("returns the explicit model order when present", () => {
     const model = buildModel({
       metadata: {
-        provider: "OpenAI",
+        extra: {
+          model_order: 7,
+        },
       },
     });
 
-    expect(getModelIcon(model)).toBe("openai");
-    expect(getModelIconLabel(model)).toBe("OpenAI");
+    expect(getModelOrder(model)).toBe(7);
   });
 
-  it("prefers explicit entry icons over provider icons", () => {
-    const model = buildModel({
-      metadata: {
-        provider: "OpenAI",
-      },
-    });
-
-    expect(
-      getModelIcon(model, {
-        deployment_id: model.id,
-        sort_order: 0,
-        icon: "https://cdn.example.com/jv-mark.svg",
-        created_at: "2026-03-31T00:00:00Z",
-      }),
-    ).toBe("https://cdn.example.com/jv-mark.svg");
-  });
-
-  it("returns undefined when there is no known icon source", () => {
+  it("returns undefined when no model order is present", () => {
     const model = buildModel();
 
-    expect(getModelIcon(model)).toBeUndefined();
+    expect(getModelOrder(model)).toBeUndefined();
+  });
+
+  it("uses the first letters of the first two words for initials", () => {
+    expect(getCatalogIconInitials("Open AI")).toBe("OA");
+  });
+
+  it("falls back to the first two characters when there is a single word", () => {
+    expect(getCatalogIconInitials("OpenAI")).toBe("OP");
   });
 });
