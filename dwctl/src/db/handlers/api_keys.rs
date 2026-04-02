@@ -779,6 +779,21 @@ impl<'c> ApiKeys<'c> {
             (i.user_id, i.email, purpose)
         }))
     }
+
+    /// Soft-delete all API keys created by a member for an organization.
+    /// Returns the number of keys deleted.
+    #[instrument(skip(self), fields(org_id = %abbrev_uuid(&org_id), member_id = %abbrev_uuid(&member_id)), err)]
+    pub async fn soft_delete_member_org_keys(&mut self, org_id: UserId, member_id: UserId) -> Result<u64> {
+        let result = sqlx::query!(
+            "UPDATE api_keys SET is_deleted = true WHERE user_id = $1 AND created_by = $2 AND is_deleted = false",
+            org_id,
+            member_id,
+        )
+        .execute(&mut *self.db)
+        .await?;
+
+        Ok(result.rows_affected())
+    }
 }
 
 #[cfg(test)]
@@ -2016,6 +2031,7 @@ mod tests {
                 replica_pool: None,
                 fusillade: crate::config::default_fusillade_component(),
                 outlet: crate::config::default_outlet_component(),
+                underway_pool: crate::config::default_underway_pool(),
             },
             slow_statement_threshold_ms: 1000,
             admin_email: "admin@example.org".to_string(),

@@ -160,6 +160,7 @@ mod request_logging;
 pub mod sample_files;
 mod static_assets;
 mod sync;
+pub mod tasks;
 pub mod telemetry;
 pub mod tool_executor;
 pub mod tool_injection;
@@ -281,6 +282,8 @@ where
     #[builder(default = false)]
     pub is_leader: bool,
     pub request_manager: Arc<fusillade::PostgresRequestManager<P, fusillade::ReqwestHttpClient>>,
+    /// Background task runner for enqueuing deferred work (batch population, etc.)
+    pub task_runner: Arc<tasks::TaskRunner<P>>,
     /// Resource limiters for protecting system capacity.
     pub limiters: limits::Limiters,
 }
@@ -498,6 +501,7 @@ pub async fn seed_database(sources: &[config::ModelSource], db: &PgPool) -> Resu
                         DeployedModelCreate::Standard(StandardModelCreate {
                             model_name: model.name.clone(),
                             alias: Some(model.name.clone()),
+                            display_name: None,
                             hosted_on: endpoint_id,
                             description: None,
                             model_type: None,
@@ -777,6 +781,9 @@ async fn setup_database(
         }
     };
     fusillade::migrator().run(&*fusillade_pools).await?;
+
+    // Run underway migrations (background task queue)
+    underway::run_migrations(&*db_pools).await?;
 
     // Setup outlet schema and pool if request logging is enabled
     let outlet_pools = if config.enable_request_logging {
@@ -1107,6 +1114,26 @@ pub async fn build_router(
         .route("/models/{id}", get(api::handlers::deployments::get_deployed_model))
         .route("/models/{id}", patch(api::handlers::deployments::update_deployed_model))
         .route("/models/{id}", delete(api::handlers::deployments::delete_deployed_model))
+        .route(
+            "/provider-display-configs",
+            get(api::handlers::provider_display_configs::list_provider_display_configs),
+        )
+        .route(
+            "/provider-display-configs",
+            post(api::handlers::provider_display_configs::create_provider_display_config),
+        )
+        .route(
+            "/provider-display-configs/{provider_key}",
+            get(api::handlers::provider_display_configs::get_provider_display_config),
+        )
+        .route(
+            "/provider-display-configs/{provider_key}",
+            patch(api::handlers::provider_display_configs::update_provider_display_config),
+        )
+        .route(
+            "/provider-display-configs/{provider_key}",
+            delete(api::handlers::provider_display_configs::delete_provider_display_config),
+        )
         // Composite model component management (for models where is_composite=true)
         .route("/models/{id}/components", get(api::handlers::deployments::get_model_components))
         .route(
@@ -1162,6 +1189,8 @@ pub async fn build_router(
             "/organizations/{id}/members/{user_id}",
             delete(api::handlers::organizations::remove_member),
         )
+        // Leave organization (self-removal)
+        .route("/organizations/{id}/leave", post(api::handlers::organizations::leave_organization))
         // Organization invites
         .route("/organizations/{id}/invites", post(api::handlers::organizations::invite_member))
         .route(
@@ -1570,6 +1599,7 @@ async fn inject_trace_id(request: axum::extract::Request, next: middleware::Next
 /// the shutdown token, signaling all tasks to stop.
 pub struct BackgroundServices {
     request_manager: Arc<fusillade::PostgresRequestManager<DbPools, fusillade::ReqwestHttpClient>>,
+    task_runner: Arc<tasks::TaskRunner>,
     is_leader: bool,
     onwards_targets: onwards::target::Targets,
     #[cfg_attr(not(test), allow(dead_code))]
@@ -2075,6 +2105,26 @@ async fn setup_background_services(
         });
     }
 
+    // Create a dedicated pool for the underway worker so its long-lived
+    // PgListener connections don't compete with the main pool.
+    let uw = config.database.underway_pool_settings();
+    let underway_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(uw.max_connections)
+        .min_connections(uw.min_connections)
+        .acquire_timeout(std::time::Duration::from_secs(uw.acquire_timeout_secs))
+        .idle_timeout(if uw.idle_timeout_secs > 0 {
+            Some(std::time::Duration::from_secs(uw.idle_timeout_secs))
+        } else {
+            None
+        })
+        .max_lifetime(if uw.max_lifetime_secs > 0 {
+            Some(std::time::Duration::from_secs(uw.max_lifetime_secs))
+        } else {
+            None
+        })
+        .connect_with(pool.connect_options().as_ref().clone())
+        .await?;
+
     // Start pool metrics sampler if metrics are enabled
     if config.enable_metrics {
         let mut pools = vec![
@@ -2085,6 +2135,10 @@ async fn setup_background_services(
             db::LabeledPool {
                 name: "fusillade",
                 pool: fusillade_pool_for_metrics,
+            },
+            db::LabeledPool {
+                name: "main_underway",
+                pool: underway_pool.clone(),
             },
         ];
         if let Some(outlet) = outlet_pool {
@@ -2117,10 +2171,20 @@ async fn setup_background_services(
         None
     };
 
+    // Build the underway task runner for background jobs (batch population, etc.)
+    let task_state = tasks::TaskState {
+        request_manager: request_manager.clone(),
+    };
+    let task_runner = Arc::new(tasks::TaskRunner::new(underway_pool, task_state).await?);
+    for handle in task_runner.start(shutdown_token.clone()) {
+        background_tasks.spawn("underway-worker", async move { handle.await.map_err(|e| anyhow::anyhow!("{}", e)) });
+    }
+
     let (background_tasks, task_names) = background_tasks.into_parts();
 
     Ok(BackgroundServices {
         request_manager,
+        task_runner,
         is_leader,
         onwards_targets: initial_targets,
         onwards_sender,
@@ -2271,6 +2335,7 @@ impl Application {
             .config(shared_config.clone())
             .is_leader(bg_services.is_leader)
             .request_manager(bg_services.request_manager.clone())
+            .task_runner(bg_services.task_runner.clone())
             .maybe_outlet_db(outlet_pools.clone())
             .limiters(limiters)
             .build();

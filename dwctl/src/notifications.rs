@@ -78,18 +78,16 @@ pub struct BatchNotificationInfo {
 
 impl BatchNotificationInfo {
     /// Build from a fusillade batch notification, returning `None` for batches
-    /// that can't be notified about (no creator, invalid UUID, no outcome).
+    /// that can't be notified about (empty/invalid creator, no outcome).
     fn try_from_batch(notif: &fusillade::batch::BatchNotification) -> Option<Self> {
         let batch = &notif.batch;
         let batch_id_str = batch.id.to_string();
 
-        let created_by = match &batch.created_by {
-            Some(id) => id.clone(),
-            None => {
-                tracing::debug!(batch_id = %batch_id_str, "Batch has no creator, skipping notification");
-                return None;
-            }
-        };
+        let created_by = &batch.created_by;
+        if created_by.is_empty() {
+            tracing::debug!(batch_id = %batch_id_str, "Batch has no creator, skipping notification");
+            return None;
+        }
 
         let user_id: Uuid = match created_by.parse() {
             Ok(id) => id,
@@ -538,7 +536,7 @@ async fn process_platform_events(conn: &mut sqlx::pool::PoolConnection<sqlx::Pos
 /// A new batch record from fusillade for webhook processing.
 struct NewBatch {
     id: Uuid,
-    created_by: Option<String>,
+    created_by: String,
     endpoint: String,
 }
 
@@ -551,7 +549,7 @@ struct NewBatch {
 /// by an external crate and not available to sqlx's compile-time validation.
 async fn process_new_batches(conn: &mut sqlx::pool::PoolConnection<sqlx::Postgres>) -> anyhow::Result<()> {
     // Find recent batches without a batch.created delivery
-    let rows = sqlx::query_as::<_, (Uuid, Option<String>, String)>(
+    let rows = sqlx::query_as::<_, (Uuid, String, String)>(
         r#"
         SELECT b.id, b.created_by, b.endpoint
         FROM fusillade.batches b
@@ -559,7 +557,6 @@ async fn process_new_batches(conn: &mut sqlx::pool::PoolConnection<sqlx::Postgre
             ON wd.resource_id = b.id AND wd.event_type = 'batch.created'
         WHERE wd.id IS NULL
           AND b.created_at > now() - interval '5 minutes'
-          AND b.created_by IS NOT NULL
         ORDER BY b.created_at
         LIMIT 100
         "#,
@@ -590,12 +587,25 @@ async fn process_new_batches(conn: &mut sqlx::pool::PoolConnection<sqlx::Postgre
     let event_type = WebhookEventType::BatchCreated;
 
     for batch in &new_batches {
-        let Some(ref created_by) = batch.created_by else {
+        if batch.created_by.is_empty() {
+            tracing::debug!(
+                batch_id = %batch.id,
+                "Skipping batch webhook delivery for empty creator"
+            );
             continue;
-        };
-        let user_id: Uuid = match created_by.parse() {
+        }
+
+        let user_id: Uuid = match batch.created_by.parse() {
             Ok(id) => id,
-            Err(_) => continue,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    batch_id = %batch.id,
+                    created_by = %batch.created_by,
+                    "Failed to parse batch.created_by as UUID; skipping batch for webhook delivery"
+                );
+                continue;
+            }
         };
 
         let event = WebhookEvent::batch_created(batch.id, user_id, &batch.endpoint);

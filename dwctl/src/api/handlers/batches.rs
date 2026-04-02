@@ -28,22 +28,91 @@ use bytes::Bytes;
 use chrono::{Duration, Utc};
 use fusillade::Storage;
 use futures::StreamExt;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::pin::Pin;
 use uuid::Uuid;
 
+// ---------------------------------------------------------------------------
+// Background task: batch population
+// ---------------------------------------------------------------------------
+
+/// Input for the batch population background job.
+///
+/// After the handler creates a batch record and returns it to the client,
+/// this job copies templates into requests in the background.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CreateBatchInput {
+    pub batch_id: Uuid,
+    pub file_id: Uuid,
+}
+
+/// Build the underway job for batch population.
+pub async fn build_create_batch_job<P: sqlx_pool_router::PoolProvider + Clone + Send + Sync + 'static>(
+    pool: sqlx::PgPool,
+    state: crate::tasks::TaskState<P>,
+) -> anyhow::Result<underway::Job<CreateBatchInput, crate::tasks::TaskState<P>>> {
+    use underway::Job;
+    use underway::job::To;
+    use underway::task::Error as TaskError;
+
+    Job::<CreateBatchInput, _>::builder()
+        .state(state)
+        .step(|cx, input: CreateBatchInput| async move {
+            let batch_id = fusillade::BatchId(input.batch_id);
+
+            if let Err(e) = cx
+                .state
+                .request_manager
+                .populate_batch(batch_id, fusillade::FileId(input.file_id))
+                .await
+            {
+                tracing::error!(
+                    batch_id = %input.batch_id,
+                    error = %e,
+                    "Failed to populate batch"
+                );
+
+                return match &e {
+                    fusillade::FusilladeError::ValidationError(_) => {
+                        if let Err(mark_err) = cx.state.request_manager.mark_batch_failed(batch_id, &e.to_string()).await {
+                            tracing::error!(
+                                batch_id = %input.batch_id,
+                                error = %mark_err,
+                                "Failed to mark batch as failed after validation error"
+                            );
+                            Err(TaskError::Retryable(mark_err.to_string()))
+                        } else {
+                            Err(TaskError::Fatal(e.to_string()))
+                        }
+                    }
+                    _ => Err(TaskError::Retryable(e.to_string())),
+                };
+            }
+
+            tracing::info!(batch_id = %input.batch_id, "Batch populated");
+            To::done()
+        })
+        .name("create-batch")
+        .pool(pool)
+        .build()
+        .await
+        .map_err(Into::into)
+}
+
+// ---------------------------------------------------------------------------
+
 /// Check if the current user "owns" a batch, considering org context.
 /// Returns true if the batch creator matches the user's ID or their active organization.
-fn is_batch_owner(current_user: &CurrentUser, created_by: Option<&str>) -> bool {
+fn is_batch_owner(current_user: &CurrentUser, created_by: &str) -> bool {
     let user_id = current_user.id.to_string();
-    if created_by == Some(user_id.as_str()) {
+    if created_by == user_id {
         return true;
     }
-    if let Some(org_id) = current_user.active_organization {
-        let org_id_str = org_id.to_string();
-        if created_by == Some(org_id_str.as_str()) {
-            return true;
-        }
+    if let Some(org_id) = current_user.active_organization
+        && created_by == org_id.to_string()
+    {
+        return true;
     }
     false
 }
@@ -82,7 +151,12 @@ fn to_batch_response_with_email(batch: fusillade::Batch, creator_email: Option<&
             // Still cancelling
             "cancelling"
         }
-    } else if batch.total_requests == 0 {
+    } else if batch.failed_at.is_some() && !has_started {
+        // Batch failed before population (e.g. empty file, validation error)
+        "failed"
+    } else if !has_started {
+        // Batch hasn't been populated yet — total_requests may already be set
+        // from the template count at creation time, but no request rows exist yet.
         "validating"
     } else if is_finished && batch.failed_requests == batch.total_requests {
         // All requests failed (batch.failed_requests already filtered by SLA status)
@@ -170,8 +244,10 @@ fn to_batch_response_with_email(batch: fusillade::Batch, creator_email: Option<&
 /// Helper to fetch creator email for a batch from the database.
 ///
 async fn fetch_creator_email(db: &sqlx::PgPool, batch: &fusillade::Batch) -> Option<String> {
-    let created_by = batch.created_by.as_ref()?;
-    let user_id = Uuid::parse_str(created_by).ok()?;
+    if batch.created_by.is_empty() {
+        return None;
+    }
+    let user_id = Uuid::parse_str(&batch.created_by).ok()?;
     let mut conn = db.acquire().await.ok()?;
     Users::new(&mut conn).get_by_id(user_id).await.ok().flatten().map(|u| u.email)
 }
@@ -263,7 +339,12 @@ pub async fn create_batch<P: PoolProvider>(
     // In org context, files owned by the active org are also considered "own"
     use crate::types::Resource;
     let has_read_all = can_read_all_resources(&current_user, Resource::Files);
-    if !has_read_all && !is_batch_owner(&current_user, file.uploaded_by.as_deref()) {
+    if !has_read_all
+        && !file
+            .uploaded_by
+            .as_deref()
+            .is_some_and(|owner| is_batch_owner(&current_user, owner))
+    {
         use crate::types::{Operation, Permission};
         return Err(Error::InsufficientPermissions {
             required: Permission::Allow(Resource::Files, Operation::ReadAll),
@@ -396,6 +477,7 @@ pub async fn create_batch<P: PoolProvider>(
     let metadata = serde_json::to_value(metadata_map).ok();
 
     // Create batch input — created_by uses org ID when in org context for ownership scoping
+    let total_requests: i64 = file_model_counts.values().sum();
     let batch_input = fusillade::BatchInput {
         file_id: fusillade::FileId(file_id),
         endpoint: req.endpoint.clone(),
@@ -404,6 +486,7 @@ pub async fn create_batch<P: PoolProvider>(
         created_by: Some(target_user_id.to_string()),
         api_key_id: Some(api_key_id),
         api_key: Some(batch_api_key),
+        total_requests: Some(total_requests),
     };
 
     let reservation_ids = reserve_capacity_for_batch(
@@ -436,11 +519,36 @@ pub async fn create_batch<P: PoolProvider>(
         });
     });
 
-    let batch = state.request_manager.create_batch(batch_input).await.map_err(|e| Error::Internal {
-        operation: format!("create batch: {}", e),
-    })?;
+    // Batch record (fusillade DB) and job enqueue (dwctl DB) are on separate databases,
+    // so true atomicity isn't possible. Each is a single independent write.
+    let batch = state
+        .request_manager
+        .create_batch_record(batch_input)
+        .await
+        .map_err(|e| Error::Internal {
+            operation: format!("create batch record: {}", e),
+        })?;
 
-    tracing::debug!("Batch {} created successfully", batch.id);
+    // Enqueue background job to populate requests from templates.
+    if let Err(e) = state
+        .task_runner
+        .create_batch_job
+        .enqueue(&CreateBatchInput {
+            batch_id: *batch.id,
+            file_id,
+        })
+        .await
+    {
+        let _ = state
+            .request_manager
+            .mark_batch_failed(batch.id, &format!("Failed to enqueue population: {e}"))
+            .await;
+        return Err(Error::Internal {
+            operation: format!("enqueue batch population: {}", e),
+        });
+    }
+
+    tracing::debug!("Batch {} created, population enqueued", batch.id);
 
     // batch.created webhook deliveries are created by the notification poller
     // which polls fusillade.batches for new records.
@@ -720,7 +828,7 @@ pub async fn get_batch<P: PoolProvider>(
 
     // Check ownership: users without ReadAll permission can only see their own batches (or org batches)
     let can_read_all = can_read_all_resources(&current_user, Resource::Batches);
-    if !can_read_all && !is_batch_owner(&current_user, batch.created_by.as_deref()) {
+    if !can_read_all && !is_batch_owner(&current_user, &batch.created_by) {
         return Err(Error::NotFound {
             resource: "Batch".to_string(),
             id: batch_id_str,
@@ -750,26 +858,22 @@ pub async fn get_batch<P: PoolProvider>(
         }
     } else {
         // Fall back to owner email (legacy batches without api_key_id)
-        if let Some(created_by) = batch.created_by.as_ref() {
-            if let Ok(user_id) = Uuid::parse_str(created_by) {
-                Users::new(&mut read_conn)
-                    .get_bulk(vec![user_id])
-                    .await
-                    .map_err(|e| Error::Internal {
-                        operation: format!("fetch owner user: {}", e),
-                    })?
-                    .get(&user_id)
-                    .map(|u| u.email.clone())
-            } else {
-                None
-            }
+        if let Ok(user_id) = Uuid::parse_str(&batch.created_by) {
+            Users::new(&mut read_conn)
+                .get_bulk(vec![user_id])
+                .await
+                .map_err(|e| Error::Internal {
+                    operation: format!("fetch owner user: {}", e),
+                })?
+                .get(&user_id)
+                .map(|u| u.email.clone())
         } else {
             None
         }
     };
 
     // Resolve context from batch owner (created_by field)
-    let (context_name, context_type) = if let Some(owner_id) = batch.created_by.as_ref().and_then(|id| Uuid::parse_str(id).ok()) {
+    let (context_name, context_type) = if let Ok(owner_id) = Uuid::parse_str(&batch.created_by) {
         let user_map = Users::new(&mut read_conn)
             .get_bulk(vec![owner_id])
             .await
@@ -850,7 +954,7 @@ pub async fn get_batch_analytics<P: PoolProvider>(
 
     // Check ownership: users without ReadAll permission can only see their own batches (or org batches)
     let can_read_all = can_read_all_resources(&current_user, Resource::Batches);
-    if !can_read_all && !is_batch_owner(&current_user, batch.created_by.as_deref()) {
+    if !can_read_all && !is_batch_owner(&current_user, &batch.created_by) {
         return Err(Error::NotFound {
             resource: "Batch".to_string(),
             id: batch_id_str.clone(),
@@ -910,7 +1014,7 @@ pub async fn get_batch_results<P: PoolProvider>(
 
     // Check ownership: users without ReadAll permission can only see their own batches (or org batches)
     let can_read_all = can_read_all_resources(&current_user, Resource::Batches);
-    if !can_read_all && !is_batch_owner(&current_user, batch.created_by.as_deref()) {
+    if !can_read_all && !is_batch_owner(&current_user, &batch.created_by) {
         return Err(Error::NotFound {
             resource: "Batch".to_string(),
             id: batch_id_str.clone(),
@@ -1066,7 +1170,7 @@ pub async fn cancel_batch<P: PoolProvider>(
 
     // Check ownership: users without UpdateAll permission can only cancel their own batches (or org batches)
     let can_update_all = has_permission(&current_user, Resource::Batches, Operation::UpdateAll);
-    if !can_update_all && !is_batch_owner(&current_user, batch.created_by.as_deref()) {
+    if !can_update_all && !is_batch_owner(&current_user, &batch.created_by) {
         return Err(Error::NotFound {
             resource: "Batch".to_string(),
             id: batch_id_str.clone(),
@@ -1139,7 +1243,7 @@ pub async fn delete_batch<P: PoolProvider>(
 
     // Check ownership: users without DeleteAll permission can only delete their own batches (or org batches)
     let can_delete_all = has_permission(&current_user, Resource::Batches, Operation::DeleteAll);
-    if !can_delete_all && !is_batch_owner(&current_user, batch.created_by.as_deref()) {
+    if !can_delete_all && !is_batch_owner(&current_user, &batch.created_by) {
         return Err(Error::NotFound {
             resource: "Batch".to_string(),
             id: batch_id_str.clone(),
@@ -1200,7 +1304,7 @@ pub async fn retry_failed_batch_requests<P: PoolProvider>(
 
     // Check ownership: users without UpdateAll permission can only retry their own batches (or org batches)
     let can_update_all = has_permission(&current_user, Resource::Batches, Operation::UpdateAll);
-    if !can_update_all && !is_batch_owner(&current_user, batch.created_by.as_deref()) {
+    if !can_update_all && !is_batch_owner(&current_user, &batch.created_by) {
         return Err(Error::NotFound {
             resource: "Batch".to_string(),
             id: batch_id_str.clone(),
@@ -1285,7 +1389,7 @@ pub async fn retry_specific_requests<P: PoolProvider>(
 
     // Check ownership: users without UpdateAll permission can only retry their own batches (or org batches)
     let can_update_all = has_permission(&current_user, Resource::Batches, Operation::UpdateAll);
-    if !can_update_all && !is_batch_owner(&current_user, batch.created_by.as_deref()) {
+    if !can_update_all && !is_batch_owner(&current_user, &batch.created_by) {
         return Err(Error::NotFound {
             resource: "Batch".to_string(),
             id: batch_id_str.clone(),
@@ -1497,7 +1601,7 @@ pub async fn list_batches<P: PoolProvider>(
     // - Individual creator IDs from api_key resolution
     let mut all_user_ids: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
     for batch in &batches {
-        if let Some(owner_id) = batch.created_by.as_ref().and_then(|id| Uuid::parse_str(id).ok()) {
+        if let Ok(owner_id) = Uuid::parse_str(&batch.created_by) {
             all_user_ids.insert(owner_id);
         }
         if let Some(api_key_id) = batch.api_key_id
@@ -1556,10 +1660,8 @@ pub async fn list_batches<P: PoolProvider>(
                 .or_else(|| {
                     // Legacy fallback: use batch owner (created_by) when api_key_id is NULL
                     if batch.api_key_id.is_none() {
-                        batch
-                            .created_by
-                            .as_ref()
-                            .and_then(|id| Uuid::parse_str(id).ok())
+                        Uuid::parse_str(&batch.created_by)
+                            .ok()
                             .and_then(|uid| user_map.get(&uid))
                             .map(|u| u.email.clone())
                     } else {
@@ -1568,7 +1670,7 @@ pub async fn list_batches<P: PoolProvider>(
                 });
 
             // Resolve context from batch owner (created_by field)
-            let owner_id = batch.created_by.as_ref().and_then(|id| Uuid::parse_str(id).ok());
+            let owner_id = Uuid::parse_str(&batch.created_by).ok();
             let owner = owner_id.and_then(|id| user_map.get(&id));
             let (context_name, context_type) = match owner {
                 Some(u) if u.user_type == "organization" => {

@@ -202,6 +202,8 @@ pub struct StandardModelCreate {
     pub model_name: String,
     /// User-friendly alias (e.g., "GPT-4 Turbo", "Claude Sonnet") - defaults to model_name if not provided
     pub alias: Option<String>,
+    /// Human-readable display name for the model catalog (e.g., "Qwen 3.5 397B")
+    pub display_name: Option<String>,
     /// Inference endpoint ID where the model is hosted
     #[schema(value_type = String, format = "uuid")]
     pub hosted_on: InferenceEndpointId,
@@ -254,6 +256,8 @@ pub struct CompositeModelCreate {
     pub model_name: String,
     /// User-friendly alias - defaults to model_name if not provided
     pub alias: Option<String>,
+    /// Human-readable display name for the model catalog (e.g., "Qwen 3.5 397B")
+    pub display_name: Option<String>,
     /// Optional description of the composite model
     pub description: Option<String>,
     /// Optional model type (Chat or Embeddings)
@@ -324,6 +328,8 @@ fn default_fallback_statuses() -> Vec<i32> {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct DeployedModelUpdate {
     pub alias: Option<String>,
+    /// Human-readable display name for the model catalog
+    pub display_name: Option<String>,
     pub description: Option<Option<String>>,
     pub model_type: Option<Option<ModelType>>,
     pub capabilities: Option<Option<Vec<String>>>,
@@ -414,6 +420,9 @@ pub struct DeployedModelResponse {
     pub id: DeploymentId,
     pub model_name: String,
     pub alias: String,
+    /// Human-readable display name for the model catalog
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     pub description: Option<String>,
     pub model_type: Option<ModelType>,
     pub capabilities: Option<Vec<String>>,
@@ -515,6 +524,7 @@ impl From<DeploymentDBResponse> for DeployedModelResponse {
             id: db.id,
             model_name: db.model_name,
             alias: db.alias,
+            display_name: db.display_name,
             description: db.description,
             model_type: db.model_type,
             capabilities: db.capabilities,

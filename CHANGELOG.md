@@ -1,5 +1,57 @@
 # Changelog
 
+## [8.32.1](https://github.com/doublewordai/control-layer/compare/v8.32.0...v8.32.1) (2026-03-31)
+
+
+### Bug Fixes
+
+* update personal domain list ([#943](https://github.com/doublewordai/control-layer/issues/943)) ([b29cd0a](https://github.com/doublewordai/control-layer/commit/b29cd0a7a1ada44ceec50467a8dbc9c08efd046e))
+
+## [8.32.0](https://github.com/doublewordai/control-layer/compare/v8.31.1...v8.32.0) (2026-03-31)
+
+
+### Features
+
+* org auto-enrollment ([#938](https://github.com/doublewordai/control-layer/issues/938)) ([2563db3](https://github.com/doublewordai/control-layer/commit/2563db35e29c20027b18fa27436ab5778a8e7ec9))
+* self serve orgs ([#936](https://github.com/doublewordai/control-layer/issues/936)) ([ab8b48f](https://github.com/doublewordai/control-layer/commit/ab8b48fcc9edc52ba9c17983ee7338aaba71675c))
+
+## [8.31.1](https://github.com/doublewordai/control-layer/compare/v8.31.0...v8.31.1) (2026-03-31)
+
+
+### Bug Fixes
+
+* Handle errors appearing in sse streams ([#934](https://github.com/doublewordai/control-layer/issues/934)) ([dce40fa](https://github.com/doublewordai/control-layer/commit/dce40faa9db51322de3f610ef1976e94cf26d9d5))
+
+## [8.31.0](https://github.com/doublewordai/control-layer/compare/v8.30.2...v8.31.0) (2026-03-31)
+
+
+### Features
+
+* migration to allow multiple orgs with same email ([#933](https://github.com/doublewordai/control-layer/issues/933)) ([f2f3a16](https://github.com/doublewordai/control-layer/commit/f2f3a169603849de03f60b4412ad7bd2cc925dc6))
+
+## [8.30.2](https://github.com/doublewordai/control-layer/compare/v8.30.1...v8.30.2) (2026-03-31)
+
+
+### Bug Fixes
+
+* bump fusillade 14.2.0 ([#931](https://github.com/doublewordai/control-layer/issues/931)) ([81d7b6b](https://github.com/doublewordai/control-layer/commit/81d7b6b7edde045f7530ce0800fb4b41cab70d56))
+
+## [8.30.1](https://github.com/doublewordai/control-layer/compare/v8.30.0...v8.30.1) (2026-03-30)
+
+
+### Bug Fixes
+
+* bump fusillade 14.1.0 ([#929](https://github.com/doublewordai/control-layer/issues/929)) ([9273a82](https://github.com/doublewordai/control-layer/commit/9273a82965c7ffd67ad235a7735c0d7b51102ca2))
+* support fusillade 14.0.1 file stream handling ([#927](https://github.com/doublewordai/control-layer/issues/927)) ([17c05cd](https://github.com/doublewordai/control-layer/commit/17c05cd756372c9b9b8b22d8da6121f7f9cf5d7e))
+
+## [8.30.0](https://github.com/doublewordai/control-layer/compare/v8.29.0...v8.30.0) (2026-03-27)
+
+
+### Features
+
+* Add underway as job handler, and move batch creation to it ([#914](https://github.com/doublewordai/control-layer/issues/914)) ([bb90e58](https://github.com/doublewordai/control-layer/commit/bb90e58cebd961c236073148ca3d615364e9b11e))
+* fusillade fair usage ([#923](https://github.com/doublewordai/control-layer/issues/923)) ([26c3da7](https://github.com/doublewordai/control-layer/commit/26c3da70b5037f84cf592c4e9b9c0cb08cd46dc9))
+
 ## [8.29.0](https://github.com/doublewordai/control-layer/compare/v8.28.1...v8.29.0) (2026-03-26)
 
 

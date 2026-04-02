@@ -39,10 +39,21 @@ pub async fn create_test_app_state_with_config(pool: PgPool, config: crate::conf
     let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(fusillade_pools, Default::default()));
     let limiters = crate::limits::Limiters::new(&config.limits);
 
+    underway::run_migrations(&pool).await.expect("Failed to run underway migrations");
+    let task_state = crate::tasks::TaskState {
+        request_manager: request_manager.clone(),
+    };
+    let task_runner = std::sync::Arc::new(
+        crate::tasks::TaskRunner::new(pool, task_state)
+            .await
+            .expect("Failed to create task runner"),
+    );
+
     crate::AppState::builder()
         .db(test_pools)
         .config(crate::SharedConfig::new(config.clone()))
         .request_manager(request_manager)
+        .task_runner(task_runner)
         .limiters(limiters)
         .build()
 }
@@ -77,10 +88,21 @@ pub async fn create_test_app_state_with_fusillade(pool: PgPool, config: crate::c
     let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(fusillade_test_pools, Default::default()));
     let limiters = crate::limits::Limiters::new(&config.limits);
 
+    underway::run_migrations(&pool).await.expect("Failed to run underway migrations");
+    let task_state = crate::tasks::TaskState {
+        request_manager: request_manager.clone(),
+    };
+    let task_runner = std::sync::Arc::new(
+        crate::tasks::TaskRunner::new(pool, task_state)
+            .await
+            .expect("Failed to create task runner"),
+    );
+
     crate::AppState::builder()
         .db(test_pools)
         .config(crate::SharedConfig::new(config))
         .request_manager(request_manager)
+        .task_runner(task_runner)
         .limiters(limiters)
         .build()
 }
@@ -143,6 +165,7 @@ pub fn create_test_config() -> crate::config::Config {
                 },
                 replica_pool: None,
             },
+            underway_pool: crate::config::default_underway_pool(),
         },
         slow_statement_threshold_ms: 1000,
         host: "127.0.0.1".to_string(),

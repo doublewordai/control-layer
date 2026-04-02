@@ -11,11 +11,14 @@ import {
   Eye,
   Layers,
   Brain,
+  Braces,
   Code,
+  Copy,
 } from "lucide-react";
-import { useModels, useGroups } from "../../../../api/control-layer";
+import { useModels, useGroups, useProviderDisplayConfigs } from "../../../../api/control-layer";
 import type {
   Model,
+  ModelDisplayCategory,
   ModelSortField,
   SortDirection,
 } from "../../../../api/control-layer/types";
@@ -32,6 +35,7 @@ import { Input } from "../../../ui/input";
 import { Badge } from "../../../ui/badge";
 import { Button } from "../../../ui/button";
 import { Popover, PopoverContent, PopoverTrigger } from "../../../ui/popover";
+
 import {
   Table,
   TableBody,
@@ -52,13 +56,15 @@ import {
 } from "../../../ui/hover-card";
 import { Skeleton } from "../../../ui/skeleton";
 import { ApiExamples } from "../../../modals";
+import { CatalogIcon } from "./CatalogIcon";
+import { getModelOrder } from "./catalogPresentation";
 
 const EVERYONE_GROUP_ID = "00000000-0000-0000-0000-000000000000";
 
-const MODEL_TYPE_SECTIONS: { type: string; label: string }[] = [
-  { type: "CHAT", label: "Generation Models" },
-  { type: "EMBEDDINGS", label: "Embedding Models" },
-  { type: "RERANKER", label: "Reranker Models" },
+const MODEL_PURPOSE_SECTIONS: { type: ModelDisplayCategory; label: string }[] = [
+  { type: "generation", label: "Generation" },
+  { type: "embedding", label: "Embedding" },
+  { type: "ocr", label: "OCR" },
 ];
 
 const CAPABILITY_CONFIG: Record<
@@ -69,16 +75,15 @@ const CAPABILITY_CONFIG: Record<
   vision: { icon: Eye, label: "Vision / image input", color: "text-gray-400" },
   reasoning: { icon: Brain, label: "Reasoning", color: "text-gray-400" },
   embeddings: { icon: Layers, label: "Text embeddings", color: "text-gray-400" },
+  enhanced_structured_generation: { icon: Braces, label: "Enhanced structured generation", color: "text-gray-400" },
 };
 
-const DEFAULT_SORT_DIRECTIONS: Record<ModelSortField, SortDirection> = {
+const DEFAULT_SORT_DIRECTIONS: Partial<Record<ModelSortField, SortDirection>> = {
   alias: "asc",
-  provider: "asc",
   intelligence_index: "desc",
   released_at: "desc",
   context_window: "desc",
   price_from: "asc",
-  created_at: "desc",
 };
 
 function formatReleaseDate(dateStr: string): string {
@@ -99,6 +104,18 @@ function getCheapestInputPrice(tariffs: Model["tariffs"]): string | null {
   return formatTariffPrice(String(cheapest));
 }
 
+function getCheapestInputPriceValue(tariffs: Model["tariffs"]): number | null {
+  if (!tariffs) return null;
+  const visible = getUserFacingTariffs(tariffs);
+  if (visible.length === 0) return null;
+  let cheapest = Infinity;
+  for (const t of visible) {
+    const price = parseFloat(t.input_price_per_token);
+    if (price < cheapest) cheapest = price;
+  }
+  return Number.isFinite(cheapest) ? cheapest : null;
+}
+
 /** Derive display capabilities from model type + backend capabilities. */
 function getDisplayCapabilities(model: Model): string[] {
   const caps: string[] = [];
@@ -114,6 +131,17 @@ function getDisplayCapabilities(model: Model): string[] {
     }
   }
   return caps;
+}
+
+function getCatalogTabForModel(model: Model): ModelDisplayCategory | null {
+  if (model.metadata?.display_category) {
+    return model.metadata.display_category;
+  }
+  if (model.model_type === "EMBEDDINGS") return "embedding";
+  if (model.model_type === "CHAT" || model.model_type === "RERANKER") {
+    return "generation";
+  }
+  return null;
 }
 
 function CapabilityIcons({ capabilities }: { capabilities: string[] }) {
@@ -231,7 +259,9 @@ function ExpandedContent({ model }: { model: Model }) {
 
 function ModelRow({
   model,
-  isChat,
+  providerLabel,
+  providerIcon,
+  providerConfigMap,
   isLatest,
   isExpanded,
   onToggleExpand,
@@ -239,7 +269,9 @@ function ModelRow({
   onApiClick,
 }: {
   model: Model;
-  isChat: boolean;
+  providerLabel: string;
+  providerIcon?: string | null;
+  providerConfigMap: Map<string, { display_name: string; icon?: string | null }>;
   isLatest: boolean;
   isExpanded: boolean;
   onToggleExpand: () => void;
@@ -247,20 +279,22 @@ function ModelRow({
   onApiClick: () => void;
 }) {
   const navigate = useNavigate();
+  const [copied, setCopied] = useState(false);
   const visibleTariffs = model.tariffs ? getUserFacingTariffs(model.tariffs) : [];
   const cheapestPrice =
     visibleTariffs.length > 0 ? getCheapestInputPrice(model.tariffs) : null;
 
   const playgroundAvailable = !isPlaygroundDenied(model);
+  const isChat = getCatalogTabForModel(model) !== "embedding";
   const colCount = 9;
 
   return (
     <Fragment>
       <TableRow
-        className="cursor-pointer hover:bg-muted/50 transition-colors [&>td]:py-3"
+        className="cursor-pointer hover:bg-muted/50 transition-colors [&>td]:py-1.5"
         onClick={onClick}
       >
-        <TableCell className="w-8 px-2">
+        <TableCell className="px-2">
           <button
             onClick={(e) => {
               e.stopPropagation();
@@ -276,18 +310,82 @@ function ModelRow({
             )}
           </button>
         </TableCell>
-        <TableCell>
-          <div className="flex items-center gap-2">
-            <span className="font-medium">{model.alias}</span>
+        <TableCell className="overflow-hidden">
+          <div className="flex items-center gap-2 min-w-0">
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <span className="font-medium truncate">{model.display_name || model.alias}</span>
+              </TooltipTrigger>
+              <TooltipContent>
+                <span className="font-mono text-xs">{model.alias}</span>
+              </TooltipContent>
+            </Tooltip>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <button
+                  type="button"
+                  className="shrink-0 p-0.5 text-gray-400 hover:text-gray-600 transition-colors"
+                  aria-label="Copy model alias"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    navigator.clipboard.writeText(model.alias).then(() => {
+                      setCopied(true);
+                      setTimeout(() => setCopied(false), 1500);
+                    });
+                  }}
+                >
+                  {copied ? (
+                    <Check className="h-3.5 w-3.5 text-green-600" />
+                  ) : (
+                    <Copy className="h-3.5 w-3.5" />
+                  )}
+                </button>
+              </TooltipTrigger>
+              <TooltipContent>
+                <span className="font-mono text-xs">{model.alias}</span>
+              </TooltipContent>
+            </Tooltip>
             {isLatest && (
-              <span className="inline-flex items-center rounded-full bg-blue-100 text-blue-800 px-2 py-0.5 text-[10px] font-semibold tracking-wide uppercase">
+              <span className="inline-flex items-center shrink-0 rounded-full bg-blue-100 text-blue-800 px-2 py-0.5 text-[10px] font-semibold tracking-wide uppercase">
                 New
               </span>
             )}
+            {model.metadata?.quantization && (
+              <span className="inline-flex items-center shrink-0 rounded-full bg-gray-100 text-gray-600 px-2 py-0.5 text-[10px] font-semibold tracking-wide uppercase">
+                {model.metadata.quantization}
+              </span>
+            )}
+            {model.metadata?.extra?.deployment_providers?.map((dp) => {
+              const config = providerConfigMap.get(dp);
+              if (!config) return null;
+              return (
+                <Tooltip key={dp}>
+                  <TooltipTrigger asChild>
+                    <span className="shrink-0">
+                      <CatalogIcon
+                        icon={config.icon || undefined}
+                        label={config.display_name}
+                        size="sm"
+                        fallback="none"
+                      />
+                    </span>
+                  </TooltipTrigger>
+                  <TooltipContent>{config.display_name}</TooltipContent>
+                </Tooltip>
+              );
+            })}
           </div>
         </TableCell>
-        <TableCell className="text-muted-foreground">
-          {model.metadata?.provider || "\u2014"}
+        <TableCell className="overflow-hidden">
+          <div className="flex items-center gap-2 min-w-0">
+            <CatalogIcon
+              icon={providerIcon || undefined}
+              label={providerLabel}
+              size="sm"
+              fallback="none"
+            />
+            <span className="text-sm text-muted-foreground truncate">{providerLabel}</span>
+          </div>
         </TableCell>
         <TableCell>
           <CapabilityIcons capabilities={getDisplayCapabilities(model)} />
@@ -388,8 +486,9 @@ function ModelRow({
 }
 
 function SectionTable({
+  tableKey,
   models,
-  isChat,
+  providerConfigMap,
   expandedRows,
   onToggleExpand,
   onRowClick,
@@ -398,15 +497,16 @@ function SectionTable({
   sortDirection,
   onSort,
 }: {
+  tableKey: string;
   models: Model[];
-  isChat: boolean;
+  providerConfigMap: Map<string, { display_name: string; icon?: string | null }>;
   expandedRows: Set<string>;
   onToggleExpand: (id: string) => void;
   onRowClick: (id: string) => void;
   onApiClick: (model: Model) => void;
   sortField: ModelSortField | null;
   sortDirection: SortDirection | null;
-  onSort: (field: ModelSortField) => void;
+  onSort: (tableKey: string, field: ModelSortField) => void;
 }) {
   const newModelIds = useMemo(() => {
     const cutoff = new Date();
@@ -421,52 +521,164 @@ function SectionTable({
     return ids;
   }, [models]);
 
-  const sortProps = { sortField, sortDirection, onSort };
+  const sortedModels = useMemo(() => {
+    const compareNumbers = (a?: number | null, b?: number | null) => {
+      if (a == null && b == null) return 0;
+      if (a == null) return 1;
+      if (b == null) return -1;
+      return a - b;
+    };
+
+    // Default: sort by provider name, then model order, then alias
+    if (!sortField) {
+      return [...models].sort((a, b) => {
+        const keyA = (a.metadata?.provider?.trim() || "Other").toLowerCase();
+        const keyB = (b.metadata?.provider?.trim() || "Other").toLowerCase();
+        if (keyA !== keyB) return keyA.localeCompare(keyB);
+        const orderA = getModelOrder(a);
+        const orderB = getModelOrder(b);
+        if (orderA != null && orderB != null && orderA !== orderB) return orderA - orderB;
+        if (orderA != null) return -1;
+        if (orderB != null) return 1;
+        return a.alias.localeCompare(b.alias);
+      });
+    }
+
+    const directionMultiplier = sortDirection === "asc" ? 1 : -1;
+
+    const compareReleasedAt = (a: Model, b: Model) =>
+      (a.metadata?.released_at || "").localeCompare(b.metadata?.released_at || "");
+
+    return [...models].sort((a, b) => {
+      let comparison = 0;
+
+      switch (sortField) {
+        case "alias":
+          comparison = a.alias.localeCompare(b.alias);
+          break;
+        case "intelligence_index":
+          comparison = compareNumbers(
+            a.metadata?.intelligence_index,
+            b.metadata?.intelligence_index,
+          );
+          break;
+        case "price_from": {
+          comparison = compareNumbers(
+            getCheapestInputPriceValue(a.tariffs),
+            getCheapestInputPriceValue(b.tariffs),
+          );
+          break;
+        }
+        case "context_window":
+          comparison = compareNumbers(
+            a.metadata?.context_window,
+            b.metadata?.context_window,
+          );
+          break;
+        case "released_at":
+          comparison = compareReleasedAt(a, b);
+          break;
+      }
+
+      if (comparison !== 0) {
+        return comparison * directionMultiplier;
+      }
+
+      return a.alias.localeCompare(b.alias);
+    });
+  }, [models, sortDirection, sortField]);
 
   return (
     <div className="border rounded-lg overflow-hidden">
       <div className="overflow-x-auto">
-        <Table>
+        <Table className="table-fixed w-full">
+          <colgroup>
+            <col style={{ width: "3%" }} />
+            <col />
+            <col style={{ width: "13%" }} />
+            <col style={{ width: "10%" }} />
+            <col style={{ width: "11%" }} />
+            <col style={{ width: "10%" }} />
+            <col style={{ width: "8%" }} />
+            <col style={{ width: "8%" }} />
+            <col style={{ width: "12%" }} />
+          </colgroup>
           <TableHeader>
             <TableRow>
-              <TableHead className="w-8 px-2" />
-              <TableHead className="min-w-[200px]">
-                <SortButton field="alias" label="Name" {...sortProps} />
+              <TableHead className="px-2" />
+              <TableHead>
+                <SortButton
+                  field="alias"
+                  label="Name"
+                  sortField={sortField}
+                  sortDirection={sortDirection}
+                  onSort={(field) => onSort(tableKey, field)}
+                />
               </TableHead>
-              <TableHead className="min-w-[100px]">
-                <SortButton field="provider" label="Provider" {...sortProps} />
+              <TableHead>
+                Provider
               </TableHead>
-              <TableHead className="min-w-[100px]">
+              <TableHead>
                 Capabilities
               </TableHead>
-              <TableHead className="min-w-[130px]">
-                <SortButton field="intelligence_index" label="Intelligence" {...sortProps} />
+              <TableHead>
+                <SortButton
+                  field="intelligence_index"
+                  label="Intelligence"
+                  sortField={sortField}
+                  sortDirection={sortDirection}
+                  onSort={(field) => onSort(tableKey, field)}
+                />
               </TableHead>
-              <TableHead className="min-w-[110px]">
-                <SortButton field="price_from" label="Cost" {...sortProps} />
+              <TableHead>
+                <SortButton
+                  field="price_from"
+                  label="Cost"
+                  sortField={sortField}
+                  sortDirection={sortDirection}
+                  onSort={(field) => onSort(tableKey, field)}
+                />
               </TableHead>
-              <TableHead className="min-w-[80px]">
-                <SortButton field="context_window" label="Context" {...sortProps} />
+              <TableHead>
+                <SortButton
+                  field="context_window"
+                  label="Context"
+                  sortField={sortField}
+                  sortDirection={sortDirection}
+                  onSort={(field) => onSort(tableKey, field)}
+                />
               </TableHead>
-              <TableHead className="min-w-[80px]">
-                <SortButton field="released_at" label="Released" {...sortProps} />
+              <TableHead>
+                <SortButton
+                  field="released_at"
+                  label="Released"
+                  sortField={sortField}
+                  sortDirection={sortDirection}
+                  onSort={(field) => onSort(tableKey, field)}
+                />
               </TableHead>
-              <TableHead className="w-16" />
+              <TableHead />
             </TableRow>
           </TableHeader>
           <TableBody>
-            {models.map((model) => (
-              <ModelRow
-                key={model.id}
-                model={model}
-                isChat={isChat}
-                isLatest={newModelIds.has(model.id)}
-                isExpanded={expandedRows.has(model.id)}
-                onToggleExpand={() => onToggleExpand(model.id)}
-                onClick={() => onRowClick(model.id)}
-                onApiClick={() => onApiClick(model)}
-              />
-            ))}
+            {sortedModels.map((model) => {
+              const providerKey = (model.metadata?.provider?.trim() || "Other").toLowerCase();
+              const providerConfig = providerConfigMap.get(providerKey);
+              return (
+                <ModelRow
+                  key={model.id}
+                  model={model}
+                  providerLabel={providerConfig?.display_name || model.metadata?.provider?.trim() || "Other"}
+                  providerIcon={providerConfig?.icon}
+                  providerConfigMap={providerConfigMap}
+                  isLatest={newModelIds.has(model.id)}
+                  isExpanded={expandedRows.has(model.id)}
+                  onToggleExpand={() => onToggleExpand(model.id)}
+                  onClick={() => onRowClick(model.id)}
+                  onApiClick={() => onApiClick(model)}
+                />
+              );
+            })}
           </TableBody>
         </Table>
       </div>
@@ -476,56 +688,66 @@ function SectionTable({
 
 function LoadingSkeleton() {
   return (
-    <div className="space-y-8">
-      <div>
-        <Skeleton className="h-6 w-48 mb-3" />
-        <div className="border rounded-lg overflow-hidden">
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead className="w-8 px-2" />
-                <TableHead>Name</TableHead>
-                <TableHead>Provider</TableHead>
-                <TableHead>Capabilities</TableHead>
-                <TableHead>Intelligence</TableHead>
-                <TableHead>Cost</TableHead>
-                <TableHead>Context</TableHead>
-                <TableHead>Released</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {Array.from({ length: 5 }).map((_, i) => (
-                <TableRow key={i}>
-                  <TableCell className="w-8 px-2">
-                    <Skeleton className="h-4 w-4" />
-                  </TableCell>
-                  <TableCell>
-                    <Skeleton className="h-5 w-48" />
-                  </TableCell>
-                  <TableCell>
-                    <Skeleton className="h-5 w-20" />
-                  </TableCell>
-                  <TableCell>
-                    <Skeleton className="h-5 w-16" />
-                  </TableCell>
-                  <TableCell>
-                    <Skeleton className="h-5 w-20" />
-                  </TableCell>
-                  <TableCell>
-                    <Skeleton className="h-5 w-16" />
-                  </TableCell>
-                  <TableCell>
-                    <Skeleton className="h-5 w-12" />
-                  </TableCell>
-                  <TableCell>
-                    <Skeleton className="h-5 w-14" />
-                  </TableCell>
-                </TableRow>
-              ))}
-            </TableBody>
-          </Table>
-        </div>
-      </div>
+    <div className="border rounded-lg overflow-hidden">
+      <Table className="table-fixed w-full">
+        <colgroup>
+          <col style={{ width: "3%" }} />
+          <col />
+          <col style={{ width: "13%" }} />
+          <col style={{ width: "10%" }} />
+          <col style={{ width: "11%" }} />
+          <col style={{ width: "10%" }} />
+          <col style={{ width: "8%" }} />
+          <col style={{ width: "8%" }} />
+          <col style={{ width: "12%" }} />
+        </colgroup>
+        <TableHeader>
+          <TableRow>
+            <TableHead className="px-2" />
+            <TableHead>Name</TableHead>
+            <TableHead>Provider</TableHead>
+            <TableHead>Capabilities</TableHead>
+            <TableHead>Intelligence</TableHead>
+            <TableHead>Cost</TableHead>
+            <TableHead>Context</TableHead>
+            <TableHead>Released</TableHead>
+            <TableHead />
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          {Array.from({ length: 8 }).map((_, i) => (
+            <TableRow key={i}>
+              <TableCell className="w-8 px-2">
+                <Skeleton className="h-4 w-4" />
+              </TableCell>
+              <TableCell>
+                <Skeleton className="h-5 w-48" />
+              </TableCell>
+              <TableCell>
+                <div className="flex items-center gap-2">
+                  <Skeleton className="h-5 w-5 rounded" />
+                  <Skeleton className="h-5 w-20" />
+                </div>
+              </TableCell>
+              <TableCell>
+                <Skeleton className="h-5 w-16" />
+              </TableCell>
+              <TableCell>
+                <Skeleton className="h-5 w-20" />
+              </TableCell>
+              <TableCell>
+                <Skeleton className="h-5 w-16" />
+              </TableCell>
+              <TableCell>
+                <Skeleton className="h-5 w-12" />
+              </TableCell>
+              <TableCell>
+                <Skeleton className="h-5 w-14" />
+              </TableCell>
+            </TableRow>
+          ))}
+        </TableBody>
+      </Table>
     </div>
   );
 }
@@ -548,10 +770,9 @@ export const ModelCatalog: React.FC = () => {
       return new Set();
     }
   });
-  const [sortField, setSortField] = useState<ModelSortField | null>(null);
-  const [sortDirection, setSortDirection] = useState<SortDirection | null>(
-    null,
-  );
+  const [tableSorts, setTableSorts] = useState<
+    Record<string, { field: ModelSortField; direction: SortDirection }>
+  >({});
   const [apiExamplesModel, setApiExamplesModel] = useState<Model | null>(null);
 
   // Debounce search for server-side filtering
@@ -577,33 +798,46 @@ export const ModelCatalog: React.FC = () => {
     include: "pricing",
     is_composite: true,
     search: debouncedSearch || undefined,
-    sort: sortField ?? undefined,
-    sort_direction: sortDirection ?? undefined,
   });
+  const { data: providerDisplayConfigs = [] } = useProviderDisplayConfigs();
 
-  const handleSort = (field: ModelSortField) => {
-    const defaultDir = DEFAULT_SORT_DIRECTIONS[field];
-    if (sortField === field) {
-      if (sortDirection === defaultDir) {
-        setSortDirection(defaultDir === "asc" ? "desc" : "asc");
-      } else {
-        setSortField(null);
-        setSortDirection(null);
+  const handleSort = (tableKey: string, field: ModelSortField) => {
+    const defaultDir = DEFAULT_SORT_DIRECTIONS[field] ?? "asc";
+    setTableSorts((current) => {
+      const existing = current[tableKey];
+      if (!existing || existing.field !== field) {
+        return {
+          ...current,
+          [tableKey]: { field, direction: defaultDir },
+        };
       }
-    } else {
-      setSortField(field);
-      setSortDirection(defaultDir);
-    }
+
+      return {
+        ...current,
+        [tableKey]: {
+          field,
+          direction: existing.direction === defaultDir
+            ? (defaultDir === "asc" ? "desc" : "asc")
+            : defaultDir,
+        },
+      };
+    });
   };
 
-  // Group models by type into sections
+  const providerConfigMap = useMemo(
+    () => new Map(providerDisplayConfigs.map((config) => [config.provider_key, config])),
+    [providerDisplayConfigs],
+  );
+
   const sections = useMemo(() => {
-    const allModels = data?.data || [];
-    return MODEL_TYPE_SECTIONS.map((section) => ({
-      ...section,
-      models: allModels.filter((m) => m.model_type === section.type),
-    })).filter((section) => section.models.length > 0);
-  }, [data]);
+    const all = data?.data || [];
+    return MODEL_PURPOSE_SECTIONS
+      .map((section) => ({
+        ...section,
+        models: all.filter((m) => getCatalogTabForModel(m) === section.type),
+      }))
+      .filter((section) => section.models.length > 0);
+  }, [data?.data]);
 
   const toggleExpand = (id: string) => {
     setExpandedRows((prev) => {
@@ -618,9 +852,9 @@ export const ModelCatalog: React.FC = () => {
   const hasAnyFilters = !!debouncedSearch;
 
   return (
-    <div className="p-4 md:p-6">
+    <div className="p-3 md:p-4">
       {/* Header */}
-      <div className="mb-6">
+      <div className="mb-3">
         <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
           <h1 className="text-2xl md:text-3xl font-bold text-doubleword-neutral-900">
             Models
@@ -734,7 +968,6 @@ export const ModelCatalog: React.FC = () => {
           </div>
         </div>
       </div>
-
       {/* Content */}
       {isLoading ? (
         <LoadingSkeleton />
@@ -745,21 +978,22 @@ export const ModelCatalog: React.FC = () => {
             : "No models available"}
         </div>
       ) : (
-        <div className="space-y-8">
+        <div className="space-y-4">
           {sections.map((section) => (
             <div key={section.type}>
-              <h2 className="text-lg font-semibold text-gray-900 mb-3">
+              <h2 className="text-sm font-medium text-muted-foreground mb-1.5">
                 {section.label}
               </h2>
               <SectionTable
+                tableKey={section.type}
                 models={section.models}
-                isChat={section.type === "CHAT"}
+                providerConfigMap={providerConfigMap}
                 expandedRows={expandedRows}
                 onToggleExpand={toggleExpand}
                 onRowClick={(id) => navigate(`/models/${id}`)}
                 onApiClick={(model) => setApiExamplesModel(model)}
-                sortField={sortField}
-                sortDirection={sortDirection}
+                sortField={tableSorts[section.type]?.field ?? null}
+                sortDirection={tableSorts[section.type]?.direction ?? null}
                 onSort={handleSort}
               />
             </div>

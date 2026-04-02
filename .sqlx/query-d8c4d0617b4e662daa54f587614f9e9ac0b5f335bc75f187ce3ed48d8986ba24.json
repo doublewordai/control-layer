@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT COUNT(*) as \"count!\"\n            FROM user_organizations uo\n            INNER JOIN users u ON u.id = uo.organization_id\n            WHERE uo.user_id = $1 AND uo.status = 'active' AND u.is_deleted = false\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "count!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "d8c4d0617b4e662daa54f587614f9e9ac0b5f335bc75f187ce3ed48d8986ba24"
+}

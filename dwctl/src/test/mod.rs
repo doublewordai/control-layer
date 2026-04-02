@@ -1,9 +1,9 @@
 pub mod databases;
 pub mod sla;
-pub mod sla_waterfall;
 pub mod strict_mode;
 pub mod utils;
 
+use crate::tasks::TaskState;
 use crate::{AppState, create_initial_admin_user};
 use crate::{
     api::models::{groups::GroupResponse, users::Role},
@@ -868,10 +868,20 @@ async fn test_request_logging_disabled(pool: PgPool) {
         Default::default(),
     ));
     let limiters = crate::limits::Limiters::new(&config.limits);
+    underway::run_migrations(&pool).await.expect("Failed to run underway migrations");
+    let task_state = TaskState {
+        request_manager: request_manager.clone(),
+    };
+    let task_runner = std::sync::Arc::new(
+        crate::tasks::TaskRunner::new(pool.clone(), task_state)
+            .await
+            .expect("Failed to create task runner"),
+    );
     let mut app_state = AppState::builder()
         .db(DbPools::new(pool.clone()))
         .config(crate::SharedConfig::new(config))
         .request_manager(request_manager)
+        .task_runner(task_runner)
         .limiters(limiters)
         .build();
     let onwards_router = axum::Router::new(); // Empty onwards router for testing
@@ -946,6 +956,7 @@ async fn test_dedicated_databases_for_components(pool: PgPool) {
             },
             replica_pool: None,
         },
+        underway_pool: crate::config::default_underway_pool(),
     };
 
     // Create application - this will run migrations on the dedicated databases
@@ -1206,10 +1217,20 @@ async fn test_build_router_with_metrics_disabled(pool: PgPool) {
         Default::default(),
     ));
     let limiters = crate::limits::Limiters::new(&config.limits);
+    underway::run_migrations(&pool).await.expect("Failed to run underway migrations");
+    let task_state = crate::tasks::TaskState {
+        request_manager: request_manager.clone(),
+    };
+    let task_runner = std::sync::Arc::new(
+        crate::tasks::TaskRunner::new(pool.clone(), task_state)
+            .await
+            .expect("Failed to create task runner"),
+    );
     let mut app_state = AppState::builder()
         .db(DbPools::new(pool))
         .config(crate::SharedConfig::new(config))
         .request_manager(request_manager)
+        .task_runner(task_runner)
         .limiters(limiters)
         .build();
 
@@ -1237,10 +1258,20 @@ async fn test_build_router_with_metrics_enabled(pool: PgPool) {
         Default::default(),
     ));
     let limiters = crate::limits::Limiters::new(&config.limits);
+    underway::run_migrations(&pool).await.expect("Failed to run underway migrations");
+    let task_state = TaskState {
+        request_manager: request_manager.clone(),
+    };
+    let task_runner = std::sync::Arc::new(
+        crate::tasks::TaskRunner::new(pool.clone(), task_state)
+            .await
+            .expect("Failed to create task runner"),
+    );
     let mut app_state = AppState::builder()
         .db(DbPools::new(pool))
         .config(crate::SharedConfig::new(config))
         .request_manager(request_manager)
+        .task_runner(task_runner)
         .limiters(limiters)
         .build();
 
