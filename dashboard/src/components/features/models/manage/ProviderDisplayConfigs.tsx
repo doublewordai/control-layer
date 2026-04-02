@@ -17,7 +17,6 @@ type EditableProvider = {
   provider_key: string;
   display_name: string;
   icon: string;
-  sort_order: number;
   configured: boolean;
   model_count: number;
 };
@@ -32,8 +31,6 @@ function toDraft(provider: ProviderDisplayConfig): EditableProvider {
     provider_key: provider.provider_key,
     display_name: provider.display_name,
     icon: provider.icon || "",
-    sort_order:
-      provider.sort_order === Number.MAX_SAFE_INTEGER ? 0 : provider.sort_order,
     configured: provider.configured,
     model_count: provider.model_count,
   };
@@ -77,7 +74,6 @@ const ProviderDisplayConfigs: React.FC = () => {
         provider_key: providerKey,
         display_name: displayName,
         icon: icon || undefined,
-        sort_order: draft.sort_order,
       });
       return;
     }
@@ -87,7 +83,6 @@ const ProviderDisplayConfigs: React.FC = () => {
       data: {
         display_name: displayName,
         icon: icon || null,
-        sort_order: draft.sort_order,
       },
     });
   };
@@ -110,7 +105,7 @@ const ProviderDisplayConfigs: React.FC = () => {
               Manage Providers
             </h1>
             <p className="text-sm text-muted-foreground">
-              Configure provider-level icons and ordering for the public models page.
+              Configure provider-level icons for the public models page.
             </p>
           </div>
         </div>
@@ -125,7 +120,6 @@ const ProviderDisplayConfigs: React.FC = () => {
                 provider_key: "",
                 display_name: "",
                 icon: "",
-                sort_order: 0,
                 configured: false,
                 model_count: 0,
               },
@@ -150,7 +144,7 @@ const ProviderDisplayConfigs: React.FC = () => {
         ) : (
           drafts.map((draft, index) => (
             <div key={draft.draft_id} className="rounded-xl border bg-white p-5">
-              <div className="grid gap-4 md:grid-cols-[1.2fr_1.2fr_2fr_120px_auto] md:items-end">
+              <div className="grid gap-4 md:grid-cols-[1.2fr_1.2fr_2fr_auto] md:items-end">
                 <div>
                   <Label>Provider Key</Label>
                   <Input
@@ -192,20 +186,6 @@ const ProviderDisplayConfigs: React.FC = () => {
                     }
                     className="mt-1"
                     placeholder="https://..., /asset.svg, or built-in key"
-                  />
-                </div>
-                <div>
-                  <Label>Sort Order</Label>
-                  <Input
-                    type="number"
-                    value={draft.sort_order}
-                    onChange={(e) =>
-                      updateDraft(index, (current) => ({
-                        ...current,
-                        sort_order: e.target.value ? parseInt(e.target.value, 10) : 0,
-                      }))
-                    }
-                    className="mt-1"
                   />
                 </div>
                 <div className="flex gap-2">

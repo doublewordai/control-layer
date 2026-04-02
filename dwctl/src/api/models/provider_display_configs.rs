@@ -12,7 +12,6 @@ pub struct CreateProviderDisplayConfig {
     pub provider_key: String,
     pub display_name: Option<String>,
     pub icon: Option<String>,
-    pub sort_order: Option<i32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -20,7 +19,6 @@ pub struct UpdateProviderDisplayConfig {
     pub display_name: Option<String>,
     #[serde(default)]
     pub icon: Option<Option<String>>,
-    pub sort_order: Option<i32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -28,7 +26,6 @@ pub struct ProviderDisplayConfigResponse {
     pub provider_key: String,
     pub display_name: String,
     pub icon: Option<String>,
-    pub sort_order: i32,
     pub model_count: i64,
     pub configured: bool,
     #[schema(value_type = Option<String>, format = "uuid")]
@@ -44,7 +41,6 @@ impl ProviderDisplayConfigResponse {
                 provider_key: config.provider_key,
                 display_name: config.display_name,
                 icon: config.icon,
-                sort_order: config.sort_order,
                 model_count: known.model_count,
                 configured: true,
                 created_by: Some(config.created_by),
@@ -55,7 +51,6 @@ impl ProviderDisplayConfigResponse {
                 provider_key: config.provider_key,
                 display_name: config.display_name,
                 icon: config.icon,
-                sort_order: config.sort_order,
                 model_count: 0,
                 configured: true,
                 created_by: Some(config.created_by),
@@ -66,7 +61,6 @@ impl ProviderDisplayConfigResponse {
                 provider_key: known.provider_key,
                 display_name: known.display_name,
                 icon: None,
-                sort_order: i32::MAX,
                 model_count: known.model_count,
                 configured: false,
                 created_by: None,

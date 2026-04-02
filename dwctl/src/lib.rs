@@ -466,6 +466,7 @@ pub async fn seed_database(sources: &[config::ModelSource], db: &PgPool) -> Resu
                         DeployedModelCreate::Standard(StandardModelCreate {
                             model_name: model.name.clone(),
                             alias: Some(model.name.clone()),
+                            display_name: None,
                             hosted_on: endpoint_id,
                             description: None,
                             model_type: None,

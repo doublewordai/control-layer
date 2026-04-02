@@ -1486,6 +1486,7 @@ mod integration_tests {
                 created_by: user.id,
                 model_name: model_name.to_string(),
                 alias: model_name.to_string(),
+                display_name: None,
                 description: None,
                 model_type: None,
                 capabilities: None,

@@ -421,6 +421,7 @@ pub struct DeploymentCreateDBRequest {
     pub created_by: UserId,
     pub model_name: String,
     pub alias: String,
+    pub display_name: Option<String>,
     pub description: Option<String>,
     pub model_type: Option<ModelType>,
     pub capabilities: Option<Vec<String>>,
@@ -468,6 +469,7 @@ impl DeploymentCreateDBRequest {
                 .created_by(created_by)
                 .model_name(standard.model_name.clone())
                 .alias(standard.alias.unwrap_or(standard.model_name))
+                .maybe_display_name(standard.display_name)
                 .maybe_description(standard.description)
                 .maybe_model_type(standard.model_type)
                 .maybe_capabilities(standard.capabilities)
@@ -489,6 +491,7 @@ impl DeploymentCreateDBRequest {
                 .created_by(created_by)
                 .model_name(composite.model_name.clone())
                 .alias(composite.alias.unwrap_or(composite.model_name))
+                .maybe_display_name(composite.display_name)
                 .maybe_description(composite.description)
                 .maybe_model_type(composite.model_type)
                 .maybe_capabilities(composite.capabilities)
@@ -519,6 +522,7 @@ impl DeploymentCreateDBRequest {
 pub struct DeploymentUpdateDBRequest {
     pub model_name: Option<String>,
     pub alias: Option<String>,
+    pub display_name: Option<String>,
     pub description: Option<Option<String>>,
     pub model_type: Option<Option<ModelType>>,
     pub capabilities: Option<Option<Vec<String>>>,
@@ -555,6 +559,7 @@ impl From<DeployedModelUpdate> for DeploymentUpdateDBRequest {
     fn from(update: DeployedModelUpdate) -> Self {
         Self::builder()
             .maybe_alias(update.alias)
+            .maybe_display_name(update.display_name)
             .maybe_description(update.description)
             .maybe_model_type(update.model_type)
             .maybe_capabilities(update.capabilities)
@@ -603,6 +608,7 @@ pub struct DeploymentDBResponse {
     pub id: DeploymentId,
     pub model_name: String,
     pub alias: String,
+    pub display_name: Option<String>,
     pub description: Option<String>,
     pub model_type: Option<ModelType>,
     pub capabilities: Option<Vec<String>>,

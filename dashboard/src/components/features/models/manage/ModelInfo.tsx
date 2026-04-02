@@ -140,6 +140,7 @@ const ModelInfo: React.FC = () => {
   // Settings form state
   const [updateData, setUpdateData] = useState({
     alias: "",
+    display_name: "",
     description: "",
     model_type: "" as "CHAT" | "EMBEDDINGS" | "",
     capabilities: [] as string[],
@@ -243,6 +244,7 @@ const ModelInfo: React.FC = () => {
 
       setUpdateData({
         alias: model.alias,
+        display_name: model.display_name || "",
         description: model.description || "",
         model_type: effectiveType as "CHAT" | "EMBEDDINGS",
         capabilities: model.capabilities || [],
@@ -301,6 +303,7 @@ const ModelInfo: React.FC = () => {
         id: model.id,
         data: {
           alias: updateData.alias,
+          display_name: updateData.display_name || null,
           description: updateData.description,
           model_type:
             updateData.model_type === ""
@@ -339,6 +342,7 @@ const ModelInfo: React.FC = () => {
       const effectiveType = model.model_type || "CHAT";
       setUpdateData({
         alias: model.alias,
+        display_name: model.display_name || "",
         description: model.description || "",
         model_type: effectiveType as "CHAT" | "EMBEDDINGS",
         capabilities: model.capabilities || [],
@@ -707,6 +711,24 @@ const ModelInfo: React.FC = () => {
                         </div>
                         <div>
                           <label className="text-sm text-gray-600 mb-2 block">
+                            Display Name
+                          </label>
+                          <Input
+                            value={updateData.display_name}
+                            onChange={(e) =>
+                              setUpdateData((prev) => ({
+                                ...prev,
+                                display_name: e.target.value,
+                              }))
+                            }
+                            placeholder="Human-readable name for catalog"
+                          />
+                          <p className="text-xs text-gray-400 mt-1">
+                            Shown in the model catalog instead of alias
+                          </p>
+                        </div>
+                        <div>
+                          <label className="text-sm text-gray-600 mb-2 block">
                             Type
                           </label>
                           <Select
@@ -769,17 +791,17 @@ const ModelInfo: React.FC = () => {
                             {[
                               { id: "vision", label: "Vision", tip: "Enables image upload in the playground." },
                               { id: "reasoning", label: "Reasoning", tip: "Model supports extended reasoning / chain-of-thought." },
+                              { id: "enhanced_structured_generation", label: "Enhanced Structured Generation", tip: "Model support enchanced generation for complex schema generation" },
                             ].map((cap) => (
-                              <div key={cap.id} className="flex items-center space-x-2">
-                                <input
-                                  type="checkbox"
+                              <label key={cap.id} className="flex items-center gap-2 text-sm">
+                                <Checkbox
                                   id={`${cap.id}-capability`}
                                   checked={
                                     updateData.capabilities?.includes(cap.id) ??
                                     false
                                   }
-                                  onChange={(e) => {
-                                    const newCapabilities = e.target.checked
+                                  onCheckedChange={(checked) => {
+                                    const newCapabilities = checked
                                       ? [
                                           ...(updateData.capabilities || []),
                                           cap.id,
@@ -792,20 +814,16 @@ const ModelInfo: React.FC = () => {
                                       capabilities: newCapabilities,
                                     }));
                                   }}
-                                  className="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
                                 />
-                                <label
-                                  htmlFor={`${cap.id}-capability`}
-                                  className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70 flex items-center gap-1"
-                                >
+                                <span className="text-sm font-medium leading-none flex items-center gap-1">
                                   {cap.label}
                                   <InfoTip>
                                     <p className="text-sm text-muted-foreground">
                                       {cap.tip}
                                     </p>
                                   </InfoTip>
-                                </label>
-                              </div>
+                                </span>
+                              </label>
                             ))}
                           </div>
                         </div>
@@ -968,6 +986,51 @@ const ModelInfo: React.FC = () => {
                                 }))
                               }
                               placeholder="e.g. artificial_analysis"
+                            />
+                          </div>
+                        </div>
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mt-4">
+                          <div>
+                            <label className="text-sm text-gray-600 mb-2 block">
+                              Quantization
+                            </label>
+                            <Input
+                              value={updateData.metadata?.quantization ?? ""}
+                              onChange={(e) =>
+                                setUpdateData((prev) => ({
+                                  ...prev,
+                                  metadata: {
+                                    ...prev.metadata,
+                                    quantization: e.target.value.toUpperCase() || undefined,
+                                  },
+                                }))
+                              }
+                              placeholder="e.g. FP8, FP16, INT4"
+                            />
+                          </div>
+                          <div>
+                            <label className="text-sm text-gray-600 mb-2 block">
+                              Deployment Providers
+                            </label>
+                            <Input
+                              value={
+                                ((updateData.metadata?.extra as Record<string, unknown>)?.deployment_providers as string[] | undefined)?.join(", ") ?? ""
+                              }
+                              onChange={(e) =>
+                                setUpdateData((prev) => ({
+                                  ...prev,
+                                  metadata: {
+                                    ...prev.metadata,
+                                    extra: {
+                                      ...(prev.metadata?.extra ?? {}),
+                                      deployment_providers: e.target.value
+                                        ? e.target.value.toLowerCase().split(",").map((s) => s.trim()).filter(Boolean)
+                                        : undefined,
+                                    },
+                                  },
+                                }))
+                              }
+                              placeholder="e.g. snowflake, onwards"
                             />
                           </div>
                         </div>
@@ -1829,18 +1892,18 @@ const ModelInfo: React.FC = () => {
                               {[
                                 { id: "vision", label: "Vision", tip: "Enables image upload in the playground." },
                                 { id: "reasoning", label: "Reasoning", tip: "Model supports extended reasoning / chain-of-thought." },
+                                { id: "enhanced_structured_generation", label: "Enhanced Structured Generation", tip: "Model support enchanced generation for complex schema generation" },
                               ].map((cap) => (
                                 <div key={cap.id} className="flex items-center justify-between">
-                                  <div className="flex items-center space-x-2">
-                                    <input
-                                      type="checkbox"
+                                  <label className="flex items-center gap-2 text-sm">
+                                    <Checkbox
                                       id={`${cap.id}-capability-readonly`}
                                       checked={
                                         model.capabilities?.includes(cap.id) ??
                                         false
                                       }
-                                      onChange={async (e) => {
-                                        const newCapabilities = e.target.checked
+                                      onCheckedChange={async (checked) => {
+                                        const newCapabilities = checked
                                           ? [
                                               ...(model.capabilities || []),
                                               cap.id,
@@ -1864,20 +1927,16 @@ const ModelInfo: React.FC = () => {
                                         }
                                       }}
                                       disabled={updateModelMutation.isPending}
-                                      className="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500 disabled:opacity-50"
                                     />
-                                    <label
-                                      htmlFor={`${cap.id}-capability-readonly`}
-                                      className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70 flex items-center gap-1"
-                                    >
+                                    <span className="text-sm font-medium leading-none flex items-center gap-1">
                                       {cap.label}
                                       <InfoTip>
                                         <p className="text-sm text-muted-foreground">
                                           {cap.tip}
                                         </p>
                                       </InfoTip>
-                                    </label>
-                                  </div>
+                                    </span>
+                                  </label>
                                 </div>
                               ))}
                             </div>
@@ -1939,6 +1998,18 @@ const ModelInfo: React.FC = () => {
                               <div>
                                 <p className="text-xs text-gray-400 mb-1">Attribution</p>
                                 <p className="text-sm font-medium">{model.metadata.attribution}</p>
+                              </div>
+                            )}
+                            {model.metadata.quantization && (
+                              <div>
+                                <p className="text-xs text-gray-400 mb-1">Quantization</p>
+                                <p className="text-sm font-medium">{model.metadata.quantization}</p>
+                              </div>
+                            )}
+                            {model.metadata.extra?.deployment_providers && model.metadata.extra.deployment_providers.length > 0 && (
+                              <div>
+                                <p className="text-xs text-gray-400 mb-1">Deployment Providers</p>
+                                <p className="text-sm font-medium">{model.metadata.extra.deployment_providers.join(", ")}</p>
                               </div>
                             )}
                             {model.metadata.extra?.model_order != null && (

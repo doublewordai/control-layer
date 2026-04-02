@@ -1,15 +1,13 @@
 use sqlx_pool_router::PoolProvider;
 
+use crate::AppState;
 use crate::api::models::provider_display_configs::{
     CreateProviderDisplayConfig, ProviderDisplayConfigResponse, UpdateProviderDisplayConfig,
 };
 use crate::auth::permissions::{RequiresPermission, operation, resource};
 use crate::db::handlers::ProviderDisplayConfigs;
-use crate::db::models::provider_display_configs::{
-    ProviderDisplayConfigCreateDBRequest, ProviderDisplayConfigUpdateDBRequest,
-};
+use crate::db::models::provider_display_configs::{ProviderDisplayConfigCreateDBRequest, ProviderDisplayConfigUpdateDBRequest};
 use crate::errors::{Error, Result};
-use crate::AppState;
 use axum::{
     Json,
     extract::{Path, State},
@@ -68,10 +66,7 @@ pub async fn list_provider_display_configs<P: PoolProvider>(
     let configs = repo.list().await?;
     let known = repo.list_known_providers().await?;
 
-    let config_map: HashMap<_, _> = configs
-        .into_iter()
-        .map(|config| (config.provider_key.clone(), config))
-        .collect();
+    let config_map: HashMap<_, _> = configs.into_iter().map(|config| (config.provider_key.clone(), config)).collect();
     let known_map: HashMap<_, _> = known
         .into_iter()
         .map(|provider| (provider.provider_key.clone(), provider))
@@ -93,11 +88,7 @@ pub async fn list_provider_display_configs<P: PoolProvider>(
         ));
     }
 
-    response.sort_by(|a, b| {
-        a.sort_order
-            .cmp(&b.sort_order)
-            .then_with(|| a.display_name.cmp(&b.display_name))
-    });
+    response.sort_by(|a, b| a.display_name.cmp(&b.display_name));
 
     Ok(Json(response))
 }
@@ -183,7 +174,6 @@ pub async fn create_provider_display_config<P: PoolProvider>(
             provider_key: provider_key.clone(),
             display_name,
             icon: create.icon.filter(|value| !value.trim().is_empty()),
-            sort_order: create.sort_order.unwrap_or(0),
             created_by: current_user.id,
         })
         .await?;
@@ -238,8 +228,9 @@ pub async fn update_provider_display_config<P: PoolProvider>(
                     let trimmed = value.trim().to_string();
                     (!trimmed.is_empty()).then_some(trimmed)
                 }),
-                icon: update.icon.map(|value| value.and_then(|icon| (!icon.trim().is_empty()).then_some(icon))),
-                sort_order: update.sort_order,
+                icon: update
+                    .icon
+                    .map(|value| value.and_then(|icon| (!icon.trim().is_empty()).then_some(icon))),
             },
         )
         .await?;

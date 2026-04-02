@@ -11,7 +11,9 @@ import {
   Eye,
   Layers,
   Brain,
+  Braces,
   Code,
+  Copy,
 } from "lucide-react";
 import { useModels, useGroups, useProviderDisplayConfigs } from "../../../../api/control-layer";
 import type {
@@ -33,7 +35,7 @@ import { Input } from "../../../ui/input";
 import { Badge } from "../../../ui/badge";
 import { Button } from "../../../ui/button";
 import { Popover, PopoverContent, PopoverTrigger } from "../../../ui/popover";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "../../../ui/tabs";
+
 import {
   Table,
   TableBody,
@@ -59,9 +61,7 @@ import { getModelOrder } from "./catalogPresentation";
 
 const EVERYONE_GROUP_ID = "00000000-0000-0000-0000-000000000000";
 
-type CatalogTab = ModelDisplayCategory;
-
-const MODEL_TYPE_SECTIONS: { type: CatalogTab; label: string }[] = [
+const MODEL_PURPOSE_SECTIONS: { type: ModelDisplayCategory; label: string }[] = [
   { type: "generation", label: "Generation" },
   { type: "embedding", label: "Embedding" },
   { type: "ocr", label: "OCR" },
@@ -75,6 +75,7 @@ const CAPABILITY_CONFIG: Record<
   vision: { icon: Eye, label: "Vision / image input", color: "text-gray-400" },
   reasoning: { icon: Brain, label: "Reasoning", color: "text-gray-400" },
   embeddings: { icon: Layers, label: "Text embeddings", color: "text-gray-400" },
+  enhanced_structured_generation: { icon: Braces, label: "Enhanced structured generation", color: "text-gray-400" },
 };
 
 const DEFAULT_SORT_DIRECTIONS: Partial<Record<ModelSortField, SortDirection>> = {
@@ -132,7 +133,7 @@ function getDisplayCapabilities(model: Model): string[] {
   return caps;
 }
 
-function getCatalogTabForModel(model: Model): CatalogTab | null {
+function getCatalogTabForModel(model: Model): ModelDisplayCategory | null {
   if (model.metadata?.display_category) {
     return model.metadata.display_category;
   }
@@ -258,7 +259,9 @@ function ExpandedContent({ model }: { model: Model }) {
 
 function ModelRow({
   model,
-  isChat,
+  providerLabel,
+  providerIcon,
+  providerConfigMap,
   isLatest,
   isExpanded,
   onToggleExpand,
@@ -266,7 +269,9 @@ function ModelRow({
   onApiClick,
 }: {
   model: Model;
-  isChat: boolean;
+  providerLabel: string;
+  providerIcon?: string | null;
+  providerConfigMap: Map<string, { display_name: string; icon?: string | null }>;
   isLatest: boolean;
   isExpanded: boolean;
   onToggleExpand: () => void;
@@ -274,20 +279,22 @@ function ModelRow({
   onApiClick: () => void;
 }) {
   const navigate = useNavigate();
+  const [copied, setCopied] = useState(false);
   const visibleTariffs = model.tariffs ? getUserFacingTariffs(model.tariffs) : [];
   const cheapestPrice =
     visibleTariffs.length > 0 ? getCheapestInputPrice(model.tariffs) : null;
 
   const playgroundAvailable = !isPlaygroundDenied(model);
-  const colCount = 8;
+  const isChat = getCatalogTabForModel(model) !== "embedding";
+  const colCount = 9;
 
   return (
     <Fragment>
       <TableRow
-        className="cursor-pointer hover:bg-muted/50 transition-colors [&>td]:py-3"
+        className="cursor-pointer hover:bg-muted/50 transition-colors [&>td]:py-1.5"
         onClick={onClick}
       >
-        <TableCell className="w-8 px-2">
+        <TableCell className="px-2">
           <button
             onClick={(e) => {
               e.stopPropagation();
@@ -303,14 +310,81 @@ function ModelRow({
             )}
           </button>
         </TableCell>
-        <TableCell>
-          <div className="flex items-center gap-2">
-            <span className="font-medium">{model.alias}</span>
+        <TableCell className="overflow-hidden">
+          <div className="flex items-center gap-2 min-w-0">
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <span className="font-medium truncate">{model.display_name || model.alias}</span>
+              </TooltipTrigger>
+              <TooltipContent>
+                <span className="font-mono text-xs">{model.alias}</span>
+              </TooltipContent>
+            </Tooltip>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <button
+                  type="button"
+                  className="shrink-0 p-0.5 text-gray-400 hover:text-gray-600 transition-colors"
+                  aria-label="Copy model alias"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    navigator.clipboard.writeText(model.alias).then(() => {
+                      setCopied(true);
+                      setTimeout(() => setCopied(false), 1500);
+                    });
+                  }}
+                >
+                  {copied ? (
+                    <Check className="h-3.5 w-3.5 text-green-600" />
+                  ) : (
+                    <Copy className="h-3.5 w-3.5" />
+                  )}
+                </button>
+              </TooltipTrigger>
+              <TooltipContent>
+                <span className="font-mono text-xs">{model.alias}</span>
+              </TooltipContent>
+            </Tooltip>
             {isLatest && (
-              <span className="inline-flex items-center rounded-full bg-blue-100 text-blue-800 px-2 py-0.5 text-[10px] font-semibold tracking-wide uppercase">
+              <span className="inline-flex items-center shrink-0 rounded-full bg-blue-100 text-blue-800 px-2 py-0.5 text-[10px] font-semibold tracking-wide uppercase">
                 New
               </span>
             )}
+            {model.metadata?.quantization && (
+              <span className="inline-flex items-center shrink-0 rounded-full bg-gray-100 text-gray-600 px-2 py-0.5 text-[10px] font-semibold tracking-wide uppercase">
+                {model.metadata.quantization}
+              </span>
+            )}
+            {model.metadata?.extra?.deployment_providers?.map((dp) => {
+              const config = providerConfigMap.get(dp);
+              if (!config) return null;
+              return (
+                <Tooltip key={dp}>
+                  <TooltipTrigger asChild>
+                    <span className="shrink-0">
+                      <CatalogIcon
+                        icon={config.icon || undefined}
+                        label={config.display_name}
+                        size="sm"
+                        fallback="none"
+                      />
+                    </span>
+                  </TooltipTrigger>
+                  <TooltipContent>{config.display_name}</TooltipContent>
+                </Tooltip>
+              );
+            })}
+          </div>
+        </TableCell>
+        <TableCell className="overflow-hidden">
+          <div className="flex items-center gap-2 min-w-0">
+            <CatalogIcon
+              icon={providerIcon || undefined}
+              label={providerLabel}
+              size="sm"
+              fallback="none"
+            />
+            <span className="text-sm text-muted-foreground truncate">{providerLabel}</span>
           </div>
         </TableCell>
         <TableCell>
@@ -414,24 +488,22 @@ function ModelRow({
 function SectionTable({
   tableKey,
   models,
-  isChat,
+  providerConfigMap,
   expandedRows,
   onToggleExpand,
   onRowClick,
   onApiClick,
-  nameColumnWidth,
   sortField,
   sortDirection,
   onSort,
 }: {
   tableKey: string;
   models: Model[];
-  isChat: boolean;
+  providerConfigMap: Map<string, { display_name: string; icon?: string | null }>;
   expandedRows: Set<string>;
   onToggleExpand: (id: string) => void;
   onRowClick: (id: string) => void;
   onApiClick: (model: Model) => void;
-  nameColumnWidth: string;
   sortField: ModelSortField | null;
   sortDirection: SortDirection | null;
   onSort: (tableKey: string, field: ModelSortField) => void;
@@ -450,17 +522,32 @@ function SectionTable({
   }, [models]);
 
   const sortedModels = useMemo(() => {
-    const directionMultiplier = sortDirection === "asc" ? 1 : -1;
-
-    const compareReleasedAt = (a: Model, b: Model) =>
-      (a.metadata?.released_at || "").localeCompare(b.metadata?.released_at || "");
-
     const compareNumbers = (a?: number | null, b?: number | null) => {
       if (a == null && b == null) return 0;
       if (a == null) return 1;
       if (b == null) return -1;
       return a - b;
     };
+
+    // Default: sort by provider name, then model order, then alias
+    if (!sortField) {
+      return [...models].sort((a, b) => {
+        const keyA = (a.metadata?.provider?.trim() || "Other").toLowerCase();
+        const keyB = (b.metadata?.provider?.trim() || "Other").toLowerCase();
+        if (keyA !== keyB) return keyA.localeCompare(keyB);
+        const orderA = getModelOrder(a);
+        const orderB = getModelOrder(b);
+        if (orderA != null && orderB != null && orderA !== orderB) return orderA - orderB;
+        if (orderA != null) return -1;
+        if (orderB != null) return 1;
+        return a.alias.localeCompare(b.alias);
+      });
+    }
+
+    const directionMultiplier = sortDirection === "asc" ? 1 : -1;
+
+    const compareReleasedAt = (a: Model, b: Model) =>
+      (a.metadata?.released_at || "").localeCompare(b.metadata?.released_at || "");
 
     return [...models].sort((a, b) => {
       let comparison = 0;
@@ -491,12 +578,6 @@ function SectionTable({
         case "released_at":
           comparison = compareReleasedAt(a, b);
           break;
-        default:
-          comparison = compareNumbers(
-            a.metadata?.intelligence_index,
-            b.metadata?.intelligence_index,
-          );
-          break;
       }
 
       if (comparison !== 0) {
@@ -512,18 +593,19 @@ function SectionTable({
       <div className="overflow-x-auto">
         <Table className="table-fixed w-full">
           <colgroup>
-            <col className="w-8" />
-            <col style={{ width: nameColumnWidth }} />
-            <col className="w-[120px]" />
-            <col className="w-[140px]" />
-            <col className="w-[120px]" />
-            <col className="w-[104px]" />
-            <col className="w-[104px]" />
-            <col className="w-[112px]" />
+            <col style={{ width: "3%" }} />
+            <col />
+            <col style={{ width: "13%" }} />
+            <col style={{ width: "10%" }} />
+            <col style={{ width: "11%" }} />
+            <col style={{ width: "10%" }} />
+            <col style={{ width: "8%" }} />
+            <col style={{ width: "8%" }} />
+            <col style={{ width: "12%" }} />
           </colgroup>
           <TableHeader>
             <TableRow>
-              <TableHead className="w-8 px-2" />
+              <TableHead className="px-2" />
               <TableHead>
                 <SortButton
                   field="alias"
@@ -532,6 +614,9 @@ function SectionTable({
                   sortDirection={sortDirection}
                   onSort={(field) => onSort(tableKey, field)}
                 />
+              </TableHead>
+              <TableHead>
+                Provider
               </TableHead>
               <TableHead>
                 Capabilities
@@ -572,22 +657,28 @@ function SectionTable({
                   onSort={(field) => onSort(tableKey, field)}
                 />
               </TableHead>
-              <TableHead className="w-[112px]" />
+              <TableHead />
             </TableRow>
           </TableHeader>
           <TableBody>
-            {sortedModels.map((model) => (
-              <ModelRow
-                key={model.id}
-                model={model}
-                isChat={isChat}
-                isLatest={newModelIds.has(model.id)}
-                isExpanded={expandedRows.has(model.id)}
-                onToggleExpand={() => onToggleExpand(model.id)}
-                onClick={() => onRowClick(model.id)}
-                onApiClick={() => onApiClick(model)}
-              />
-            ))}
+            {sortedModels.map((model) => {
+              const providerKey = (model.metadata?.provider?.trim() || "Other").toLowerCase();
+              const providerConfig = providerConfigMap.get(providerKey);
+              return (
+                <ModelRow
+                  key={model.id}
+                  model={model}
+                  providerLabel={providerConfig?.display_name || model.metadata?.provider?.trim() || "Other"}
+                  providerIcon={providerConfig?.icon}
+                  providerConfigMap={providerConfigMap}
+                  isLatest={newModelIds.has(model.id)}
+                  isExpanded={expandedRows.has(model.id)}
+                  onToggleExpand={() => onToggleExpand(model.id)}
+                  onClick={() => onRowClick(model.id)}
+                  onApiClick={() => onApiClick(model)}
+                />
+              );
+            })}
           </TableBody>
         </Table>
       </div>
@@ -597,63 +688,66 @@ function SectionTable({
 
 function LoadingSkeleton() {
   return (
-    <div className="space-y-8">
-      <div>
-        <Skeleton className="h-6 w-48 mb-3" />
-        <div className="border rounded-lg overflow-hidden">
-          <Table className="table-fixed w-full">
-            <colgroup>
-              <col className="w-8" />
-              <col className="w-[32ch]" />
-              <col className="w-[120px]" />
-              <col className="w-[140px]" />
-              <col className="w-[120px]" />
-              <col className="w-[104px]" />
-              <col className="w-[104px]" />
-              <col className="w-[112px]" />
-            </colgroup>
-            <TableHeader>
-              <TableRow>
-                <TableHead className="w-8 px-2" />
-                <TableHead>Name</TableHead>
-                <TableHead>Capabilities</TableHead>
-                <TableHead>Intelligence</TableHead>
-                <TableHead>Cost</TableHead>
-                <TableHead>Context</TableHead>
-                <TableHead>Released</TableHead>
-                <TableHead />
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {Array.from({ length: 5 }).map((_, i) => (
-                <TableRow key={i}>
-                  <TableCell className="w-8 px-2">
-                    <Skeleton className="h-4 w-4" />
-                  </TableCell>
-                  <TableCell>
-                    <Skeleton className="h-5 w-48" />
-                  </TableCell>
-                  <TableCell>
-                    <Skeleton className="h-5 w-16" />
-                  </TableCell>
-                  <TableCell>
-                    <Skeleton className="h-5 w-20" />
-                  </TableCell>
-                  <TableCell>
-                    <Skeleton className="h-5 w-16" />
-                  </TableCell>
-                  <TableCell>
-                    <Skeleton className="h-5 w-12" />
-                  </TableCell>
-                  <TableCell>
-                    <Skeleton className="h-5 w-14" />
-                  </TableCell>
-                </TableRow>
-              ))}
-            </TableBody>
-          </Table>
-        </div>
-      </div>
+    <div className="border rounded-lg overflow-hidden">
+      <Table className="table-fixed w-full">
+        <colgroup>
+          <col style={{ width: "3%" }} />
+          <col />
+          <col style={{ width: "13%" }} />
+          <col style={{ width: "10%" }} />
+          <col style={{ width: "11%" }} />
+          <col style={{ width: "10%" }} />
+          <col style={{ width: "8%" }} />
+          <col style={{ width: "8%" }} />
+          <col style={{ width: "12%" }} />
+        </colgroup>
+        <TableHeader>
+          <TableRow>
+            <TableHead className="px-2" />
+            <TableHead>Name</TableHead>
+            <TableHead>Provider</TableHead>
+            <TableHead>Capabilities</TableHead>
+            <TableHead>Intelligence</TableHead>
+            <TableHead>Cost</TableHead>
+            <TableHead>Context</TableHead>
+            <TableHead>Released</TableHead>
+            <TableHead />
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          {Array.from({ length: 8 }).map((_, i) => (
+            <TableRow key={i}>
+              <TableCell className="w-8 px-2">
+                <Skeleton className="h-4 w-4" />
+              </TableCell>
+              <TableCell>
+                <Skeleton className="h-5 w-48" />
+              </TableCell>
+              <TableCell>
+                <div className="flex items-center gap-2">
+                  <Skeleton className="h-5 w-5 rounded" />
+                  <Skeleton className="h-5 w-20" />
+                </div>
+              </TableCell>
+              <TableCell>
+                <Skeleton className="h-5 w-16" />
+              </TableCell>
+              <TableCell>
+                <Skeleton className="h-5 w-20" />
+              </TableCell>
+              <TableCell>
+                <Skeleton className="h-5 w-16" />
+              </TableCell>
+              <TableCell>
+                <Skeleton className="h-5 w-12" />
+              </TableCell>
+              <TableCell>
+                <Skeleton className="h-5 w-14" />
+              </TableCell>
+            </TableRow>
+          ))}
+        </TableBody>
+      </Table>
     </div>
   );
 }
@@ -676,7 +770,6 @@ export const ModelCatalog: React.FC = () => {
       return new Set();
     }
   });
-  const [activeTab, setActiveTab] = useState<CatalogTab>("generation");
   const [tableSorts, setTableSorts] = useState<
     Record<string, { field: ModelSortField; direction: SortDirection }>
   >({});
@@ -731,85 +824,20 @@ export const ModelCatalog: React.FC = () => {
     });
   };
 
-  const nameColumnWidth = useMemo(() => {
-    const maxAliasLength = Math.max(
-      ...((data?.data || []).map((model) => model.alias.length)),
-      24,
-    );
-    const widthInCh = Math.min(Math.max(maxAliasLength + 4, 28), 44);
-    return `${widthInCh}ch`;
-  }, [data?.data]);
+  const providerConfigMap = useMemo(
+    () => new Map(providerDisplayConfigs.map((config) => [config.provider_key, config])),
+    [providerDisplayConfigs],
+  );
 
-  // Group models by catalog tab, then by provider.
   const sections = useMemo(() => {
-    const allModels = data?.data || [];
-    const providerConfigMap = new Map(
-      providerDisplayConfigs.map((config) => [config.provider_key, config]),
-    );
-    return MODEL_TYPE_SECTIONS.map((section) => {
-      const grouped = new Map<
-        string,
-        {
-          key: string;
-          label: string;
-          icon?: string | null;
-          sortOrder: number;
-          models: Model[];
-        }
-      >();
-
-      for (const model of allModels) {
-        if (getCatalogTabForModel(model) !== section.type) continue;
-        const providerLabel = model.metadata?.provider?.trim() || "Other";
-        const providerKey = providerLabel.toLowerCase();
-        const providerConfig = providerConfigMap.get(providerKey);
-        const existing = grouped.get(providerKey);
-        if (existing) {
-          existing.models.push(model);
-        } else {
-          grouped.set(providerKey, {
-            key: providerKey,
-            label: providerConfig?.display_name || providerLabel,
-            icon: providerConfig?.icon || undefined,
-            sortOrder: providerConfig?.sort_order ?? Number.MAX_SAFE_INTEGER,
-            models: [model],
-          });
-        }
-      }
-
-      const groups = [...grouped.values()]
-        .map((group) => ({
-          ...group,
-          models: [...group.models].sort((a, b) => {
-            const orderA = getModelOrder(a);
-            const orderB = getModelOrder(b);
-            if (orderA != null && orderB != null && orderA !== orderB) {
-              return orderA - orderB;
-            }
-            if (orderA != null) return -1;
-            if (orderB != null) return 1;
-            return a.alias.localeCompare(b.alias);
-          }),
-        }))
-        .sort((a, b) =>
-          a.sortOrder === b.sortOrder
-            ? a.label.localeCompare(b.label)
-            : a.sortOrder - b.sortOrder,
-        );
-
-      return {
+    const all = data?.data || [];
+    return MODEL_PURPOSE_SECTIONS
+      .map((section) => ({
         ...section,
-        groups,
-      };
-    }).filter((section) => section.groups.length > 0);
-  }, [data?.data, providerDisplayConfigs]);
-
-  useEffect(() => {
-    if (sections.length === 0) return;
-    if (!sections.some((section) => section.type === activeTab)) {
-      setActiveTab(sections[0].type);
-    }
-  }, [activeTab, sections]);
+        models: all.filter((m) => getCatalogTabForModel(m) === section.type),
+      }))
+      .filter((section) => section.models.length > 0);
+  }, [data?.data]);
 
   const toggleExpand = (id: string) => {
     setExpandedRows((prev) => {
@@ -824,9 +852,9 @@ export const ModelCatalog: React.FC = () => {
   const hasAnyFilters = !!debouncedSearch;
 
   return (
-    <div className="p-4 md:p-6">
+    <div className="p-3 md:p-4">
       {/* Header */}
-      <div className="mb-6">
+      <div className="mb-3">
         <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
           <h1 className="text-2xl md:text-3xl font-bold text-doubleword-neutral-900">
             Models
@@ -950,64 +978,27 @@ export const ModelCatalog: React.FC = () => {
             : "No models available"}
         </div>
       ) : (
-        <Tabs
-          value={activeTab}
-          onValueChange={(value) => setActiveTab(value as CatalogTab)}
-          className="space-y-4"
-        >
-          <TabsList className="w-full justify-start overflow-x-auto bg-transparent p-0">
-            {sections.map((section) => (
-              <TabsTrigger
-                key={section.type}
-                value={section.type}
-                className="rounded-none bg-transparent px-0 py-2 mr-6 shadow-none data-[state=active]:bg-transparent data-[state=active]:shadow-none"
-              >
-                {section.label}
-              </TabsTrigger>
-            ))}
-          </TabsList>
-
+        <div className="space-y-4">
           {sections.map((section) => (
-            <TabsContent key={section.type} value={section.type} className="space-y-4">
-              {section.groups.map((group) => (
-                <div key={group.key} className="space-y-3">
-                  <div className="flex items-center gap-2 px-1">
-                    <CatalogIcon
-                      icon={group.icon || undefined}
-                      label={group.label}
-                      size="sm"
-                      fallback="none"
-                    />
-                    <div className="min-w-0">
-                      <h3 className="text-sm font-semibold text-gray-900">
-                        {group.label}
-                      </h3>
-                    </div>
-                  </div>
-                  <SectionTable
-                    tableKey={`${section.type}:${group.key}`}
-                    models={group.models}
-                    isChat={section.type !== "embedding"}
-                    expandedRows={expandedRows}
-                    onToggleExpand={toggleExpand}
-                    onRowClick={(id) => navigate(`/models/${id}`)}
-                    onApiClick={(model) => setApiExamplesModel(model)}
-                    nameColumnWidth={nameColumnWidth}
-                    sortField={
-                      tableSorts[`${section.type}:${group.key}`]?.field ??
-                      "intelligence_index"
-                    }
-                    sortDirection={
-                      tableSorts[`${section.type}:${group.key}`]?.direction ??
-                      "desc"
-                    }
-                    onSort={handleSort}
-                  />
-                </div>
-              ))}
-            </TabsContent>
+            <div key={section.type}>
+              <h2 className="text-sm font-medium text-muted-foreground mb-1.5">
+                {section.label}
+              </h2>
+              <SectionTable
+                tableKey={section.type}
+                models={section.models}
+                providerConfigMap={providerConfigMap}
+                expandedRows={expandedRows}
+                onToggleExpand={toggleExpand}
+                onRowClick={(id) => navigate(`/models/${id}`)}
+                onApiClick={(model) => setApiExamplesModel(model)}
+                sortField={tableSorts[section.type]?.field ?? null}
+                sortDirection={tableSorts[section.type]?.direction ?? null}
+                onSort={handleSort}
+              />
+            </div>
           ))}
-        </Tabs>
+        </div>
       )}
 
       <ApiExamples

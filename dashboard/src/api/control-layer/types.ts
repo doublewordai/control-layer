@@ -159,11 +159,13 @@ export interface ModelMetadata {
   context_window?: number;
   released_at?: string; // ISO date string (YYYY-MM-DD)
   attribution?: string;
+  quantization?: string; // e.g. "FP8", "FP16", "INT4"
   extra?: {
     evaluations?: Record<string, number>;
     summary?: string; // Short one-line description for catalog views
     use_cases?: string[]; // e.g., ["Research & analysis", "High volume tasks"]
     model_order?: number;
+    deployment_providers?: string[]; // e.g., ["snowflake", "onwards"]
   };
 }
 
@@ -171,7 +173,6 @@ export interface ProviderDisplayConfig {
   provider_key: string;
   display_name: string;
   icon?: string | null;
-  sort_order: number;
   model_count: number;
   configured: boolean;
   created_by?: string | null;
@@ -183,19 +184,18 @@ export interface ProviderDisplayConfigCreateRequest {
   provider_key: string;
   display_name?: string;
   icon?: string;
-  sort_order?: number;
 }
 
 export interface ProviderDisplayConfigUpdateRequest {
   display_name?: string;
   icon?: string | null;
-  sort_order?: number;
 }
 
 // Base model types
 export interface Model {
   id: string;
   alias: string;
+  display_name?: string | null;
   model_name: string;
   description?: string | null;
   model_type?: ModelType | null;
@@ -229,6 +229,7 @@ export interface StandardModelCreate {
   type: "standard";
   model_name: string;
   alias?: string;
+  display_name?: string;
   hosted_on: string; // endpoint ID (UUID)
   description?: string;
   model_type?: ModelType;
@@ -250,6 +251,7 @@ export interface VirtualModelCreate {
   type: "composite" | "virtual"; // API accepts "composite", UI uses "virtual"
   model_name: string;
   alias?: string;
+  display_name?: string;
   description?: string;
   model_type?: ModelType;
   capabilities?: string[];
@@ -476,6 +478,7 @@ export interface GroupUpdateRequest {
 
 export interface ModelUpdateRequest {
   alias?: string;
+  display_name?: string | null;
   description?: string | null;
   model_type?: ModelType | null;
   capabilities?: string[] | null;
