@@ -150,7 +150,7 @@ pub async fn create_organization<P: PoolProvider>(
         });
     }
 
-    let org = repo.create(&db_request, &state.config.auth.default_user_roles).await?;
+    let org = repo.create(&db_request, &config.auth.default_user_roles).await?;
 
     let response = OrganizationResponse::from_user(UserResponse::from(org)).with_member_count(1);
 

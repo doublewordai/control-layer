@@ -2816,7 +2816,7 @@ secret_key: "test-secret-key"
             )?;
 
             let args = Args {
-                config: "test.yaml".to_string(),
+                config: "test.yaml".into(),
                 validate: false,
             };
 
@@ -2841,7 +2841,7 @@ background_services:
             )?;
 
             let args = Args {
-                config: "test.yaml".to_string(),
+                config: "test.yaml".into(),
                 validate: false,
             };
 
@@ -2866,7 +2866,7 @@ background_services:
             )?;
 
             let args = Args {
-                config: "test.yaml".to_string(),
+                config: "test.yaml".into(),
                 validate: false,
             };
 
@@ -2893,7 +2893,7 @@ background_services:
             )?;
 
             let args = Args {
-                config: "test.yaml".to_string(),
+                config: "test.yaml".into(),
                 validate: false,
             };
 
@@ -2920,7 +2920,7 @@ background_services:
             )?;
 
             let args = Args {
-                config: "test.yaml".to_string(),
+                config: "test.yaml".into(),
                 validate: false,
             };
 
