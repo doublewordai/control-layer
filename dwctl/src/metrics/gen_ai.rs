@@ -298,6 +298,7 @@ mod tests {
             duration_to_first_byte_ms: Some(200),
             prompt_tokens: 10,
             completion_tokens: 50,
+            reasoning_tokens: 0,
             total_tokens: 60,
             response_type: "chat_completion_stream".to_string(),
             user_id: None,
@@ -413,6 +414,7 @@ mod tests {
             duration_to_first_byte_ms: Some(1800), // Non-streaming still has TTFB but close to total
             prompt_tokens: 20,
             completion_tokens: 100,
+            reasoning_tokens: 0,
             total_tokens: 120,
             response_type: "chat_completion".to_string(), // NOT streaming
             user_id: None,
@@ -476,6 +478,7 @@ mod tests {
             duration_to_first_byte_ms: Some(450),
             prompt_tokens: 100,
             completion_tokens: 0, // Embeddings don't have completion tokens
+            reasoning_tokens: 0,
             total_tokens: 100,
             response_type: "embeddings".to_string(),
             user_id: None,
@@ -550,6 +553,7 @@ mod tests {
             duration_to_first_byte_ms: Some(100),
             prompt_tokens: 0, // No tokens on error
             completion_tokens: 0,
+            reasoning_tokens: 0,
             total_tokens: 0,
             response_type: "chat_completion".to_string(),
             user_id: None,
@@ -610,6 +614,7 @@ mod tests {
             duration_to_first_byte_ms: None, // Missing TTFB
             prompt_tokens: 10,
             completion_tokens: 20,
+            reasoning_tokens: 0,
             total_tokens: 30,
             response_type: "completion".to_string(),
             user_id: None,
@@ -673,6 +678,7 @@ mod tests {
             duration_to_first_byte_ms: Some(400),
             prompt_tokens: 50,
             completion_tokens: 0, // No output tokens
+            reasoning_tokens: 0,
             total_tokens: 50,
             response_type: "chat_completion".to_string(),
             user_id: None,
@@ -733,6 +739,7 @@ mod tests {
             duration_to_first_byte_ms: Some(50),
             prompt_tokens: 0,
             completion_tokens: 0,
+            reasoning_tokens: 0,
             total_tokens: 0,
             response_type: "other".to_string(),
             user_id: None,
@@ -788,6 +795,7 @@ mod tests {
                 duration_to_first_byte_ms: Some(50),
                 prompt_tokens: 0,
                 completion_tokens: 0,
+                reasoning_tokens: 0,
                 total_tokens: 0,
                 response_type: "chat_completion".to_string(),
                 user_id: None,
@@ -841,6 +849,7 @@ mod tests {
             duration_to_first_byte_ms: Some(250),
             prompt_tokens: 50,
             completion_tokens: 0,
+            reasoning_tokens: 0,
             total_tokens: 50,
             response_type: "base64_embeddings".to_string(),
             user_id: None,

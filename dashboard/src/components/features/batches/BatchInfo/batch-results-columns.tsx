@@ -35,6 +35,14 @@ const getContentPreview = (
     content = { error: result.error };
   }
 
+  if (
+    contentType === "response" &&
+    !result.response_body &&
+    result.reasoning_artifact
+  ) {
+    return "No visible response (reasoning available)";
+  }
+
   const previewText = content
     ? typeof content === "string"
       ? content
