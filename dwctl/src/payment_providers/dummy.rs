@@ -7,12 +7,11 @@ use async_trait::async_trait;
 use sqlx::PgPool;
 
 use crate::{
-    api::models::users::CurrentUser,
     db::{
         handlers::{credits::Credits, repository::Repository},
         models::credits::{CreditTransactionCreateDBRequest, CreditTransactionType},
     },
-    payment_providers::{PaymentError, PaymentProvider, PaymentSession, Result, WebhookEvent},
+    payment_providers::{CheckoutPayer, PaymentError, PaymentProvider, PaymentSession, Result, WebhookEvent},
 };
 
 /// Dummy payment provider that adds credits automatically
@@ -30,28 +29,28 @@ impl From<crate::config::DummyConfig> for DummyProvider {
 impl PaymentProvider for DummyProvider {
     async fn create_checkout_session(
         &self,
-        user: &CurrentUser,
+        payer: &CheckoutPayer,
         creditee_id: Option<&str>,
         _cancel_url: &str,
         success_url: &str,
     ) -> Result<String> {
         // Determine which user will receive the credits
-        // If creditee_id is provided, use that; otherwise use the authenticated user
-        let user_id_string = user.id.to_string();
-        let recipient_id = creditee_id.unwrap_or(&user_id_string);
+        // If creditee_id is provided, use that; otherwise use the payer
+        let payer_id_string = payer.id.to_string();
+        let recipient_id = creditee_id.unwrap_or(&payer_id_string);
 
         // Generate a unique session ID that includes both payer and recipient user IDs
         // Format: dummy_session_{recipient_id}_{payer_id}_{uuid}
-        let session_id = format!("dummy_session_{}_{}_{}", recipient_id, user.id, uuid::Uuid::new_v4());
+        let session_id = format!("dummy_session_{}_{}_{}", recipient_id, payer.id, uuid::Uuid::new_v4());
 
         // Build success URL with session ID
         let redirect_url = success_url.replace("{CHECKOUT_SESSION_ID}", &session_id);
 
         tracing::info!(
-            "Dummy provider created checkout session {} for user {} (payer: {})",
+            "Dummy provider created checkout session {} for creditee {} (payer: {})",
             session_id,
             recipient_id,
-            user.id
+            payer.id
         );
 
         // Return the success URL - payment is instantly "complete" for dummy provider
@@ -170,9 +169,9 @@ impl PaymentProvider for DummyProvider {
         Ok(())
     }
 
-    async fn create_auto_topup_checkout_session(&self, user: &CurrentUser, _cancel_url: &str, success_url: &str) -> Result<String> {
+    async fn create_auto_topup_checkout_session(&self, payer: &CheckoutPayer, _cancel_url: &str, success_url: &str) -> Result<String> {
         // Dummy provider: always redirect to success URL (no real payment flow)
-        let session_id = format!("dummy_session_{}_{}", user.id, uuid::Uuid::new_v4());
+        let session_id = format!("dummy_session_{}_{}", payer.id, uuid::Uuid::new_v4());
         let redirect_url = success_url.replace("{CHECKOUT_SESSION_ID}", &session_id);
         Ok(redirect_url)
     }
@@ -217,21 +216,27 @@ impl PaymentProvider for DummyProvider {
         Ok(format!("dummy_cus_{}", uuid::Uuid::new_v4()))
     }
 
-    async fn create_billing_portal_session(&self, user: &CurrentUser, return_url: &str) -> Result<String> {
-        // Check if user has a payment provider ID (required for billing portal)
-        let _customer_id = user.payment_provider_id.as_ref().ok_or(PaymentError::NoCustomerId)?;
-
+    async fn create_billing_portal_session(&self, customer_id: &str, return_url: &str) -> Result<String> {
         // For dummy provider, return a mock billing portal URL that redirects back to the provided return_url
-        Ok(format!("{}?dummy_billing_portal=true&user_id={}", return_url, user.id))
+        Ok(format!("{}?dummy_billing_portal=true&customer_id={}", return_url, customer_id))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::models::users::Role;
+    use crate::api::models::users::{CurrentUser, Role};
+    use crate::payment_providers::CheckoutPayer;
     use rust_decimal::Decimal;
     use sqlx::PgPool;
+
+    fn payer_from(user: &CurrentUser) -> CheckoutPayer {
+        CheckoutPayer {
+            id: user.id,
+            email: user.email.clone(),
+            payment_provider_id: user.payment_provider_id.clone(),
+        }
+    }
 
     /// Helper to create a test user in the database
     async fn create_test_user(pool: &PgPool) -> CurrentUser {
@@ -273,7 +278,7 @@ mod tests {
 
         // Step 1: Create checkout session
         let checkout_url = provider
-            .create_checkout_session(&user, None, cancel_url, success_url)
+            .create_checkout_session(&payer_from(&user), None, cancel_url, success_url)
             .await
             .unwrap();
 
@@ -335,7 +340,7 @@ mod tests {
 
         // Create checkout session
         let checkout_url = provider
-            .create_checkout_session(&user, None, cancel_url, success_url)
+            .create_checkout_session(&payer_from(&user), None, cancel_url, success_url)
             .await
             .unwrap();
 

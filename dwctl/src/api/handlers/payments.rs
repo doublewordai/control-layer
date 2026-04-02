@@ -77,9 +77,61 @@ use sqlx_pool_router::PoolProvider;
 use crate::{
     AppState,
     api::models::users::CurrentUser,
+    auth::permissions,
     db::{handlers::repository::Repository, handlers::users::Users, models::users::UserUpdateDBRequest},
     payment_providers,
 };
+
+/// Resolved billing target for payment operations.
+struct BillingTarget {
+    id: crate::types::UserId,
+    payment_provider_id: Option<String>,
+    email: String,
+    display_name: Option<String>,
+}
+
+/// Resolve the billing target for payment operations.
+///
+/// In org context: verifies the caller is an org admin/owner, loads the org's
+/// payment details, and returns the org as the target.
+/// Otherwise: returns the caller's own details.
+async fn resolve_billing_target(
+    user: &CurrentUser,
+    conn: &mut sqlx::PgConnection,
+) -> Result<BillingTarget, StatusCode> {
+    if let Some(org_id) = user.active_organization {
+        let can_manage = permissions::can_manage_org_resource(user, org_id, conn)
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to check org permissions: {:?}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+        if !can_manage {
+            return Err(StatusCode::FORBIDDEN);
+        }
+        let org = Users::new(conn)
+            .get_by_id(org_id)
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to load org user: {:?}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?
+            .ok_or(StatusCode::NOT_FOUND)?;
+        Ok(BillingTarget {
+            id: org.id,
+            payment_provider_id: org.payment_provider_id,
+            email: org.email,
+            display_name: org.display_name,
+        })
+    } else {
+        Ok(BillingTarget {
+            id: user.id,
+            payment_provider_id: user.payment_provider_id.clone(),
+            email: user.email.clone(),
+            display_name: user.display_name.clone(),
+        })
+    }
+}
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct PaymentQuery {
@@ -152,11 +204,25 @@ pub async fn create_payment<P: PoolProvider>(
         }
     );
 
+    // Resolve billing target (org or individual)
+    let mut conn = state.db.write().acquire().await.map_err(|e| {
+        tracing::error!("Failed to acquire database connection: {:?}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    let target = resolve_billing_target(&user, &mut conn).await?;
+    drop(conn);
+
+    let payer = payment_providers::CheckoutPayer {
+        id: target.id,
+        email: target.email,
+        payment_provider_id: target.payment_provider_id,
+    };
+
     let provider = payment_providers::create_provider(payment_config);
 
     // Create checkout session using the provider trait
     let checkout_url = provider
-        .create_checkout_session(&user, query.creditee_id.as_deref(), &cancel_url, &success_url)
+        .create_checkout_session(&payer, query.creditee_id.as_deref(), &cancel_url, &success_url)
         .await
         .map_err(|e| {
             tracing::error!("Failed to create checkout session: {:?}", e);
@@ -357,12 +423,24 @@ pub async fn create_billing_portal_session<P: PoolProvider>(
         }
     };
 
+    // Resolve billing target (org or individual) with permission check
+    let mut conn = state.db.write().acquire().await.map_err(|e| {
+        tracing::error!("Failed to acquire database connection: {:?}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    let target = resolve_billing_target(&user, &mut conn).await?;
+
+    let customer_id = target.payment_provider_id.filter(|s| !s.is_empty()).ok_or_else(|| {
+        tracing::warn!("Target {} has no payment provider customer ID", target.id);
+        StatusCode::BAD_REQUEST
+    })?;
+
     let return_url = format!("{}/cost-management", config.dashboard_url);
 
     let provider = payment_providers::create_provider(payment_config);
 
     // Create billing portal session using the provider trait
-    let portal_url = provider.create_billing_portal_session(&user, &return_url).await.map_err(|e| {
+    let portal_url = provider.create_billing_portal_session(&customer_id, &return_url).await.map_err(|e| {
         tracing::error!("Failed to create billing portal session: {:?}", e);
         StatusCode::from(e)
     })?;
@@ -416,10 +494,16 @@ pub async fn create_auto_topup_checkout<P: PoolProvider>(
     let success_url = format!("{}/cost-management?autoTopupId={{CHECKOUT_SESSION_ID}}&autoTopup=true", origin);
     let cancel_url = format!("{}/cost-management?autoTopup=true&autoTopupId=fail", origin);
 
+    let payer = payment_providers::CheckoutPayer {
+        id: user.id,
+        email: user.email.clone(),
+        payment_provider_id: user.payment_provider_id.clone(),
+    };
+
     let provider = payment_providers::create_provider(payment_config);
 
     let checkout_url = provider
-        .create_auto_topup_checkout_session(&user, &cancel_url, &success_url)
+        .create_auto_topup_checkout_session(&payer, &cancel_url, &success_url)
         .await
         .map_err(|e| {
             tracing::error!("Failed to create auto top-up checkout session: {:?}", e);
@@ -668,44 +752,27 @@ pub async fn enable_auto_topup<P: PoolProvider>(
         }
     };
 
-    // When in org context, load the org's payment details; otherwise use the caller's
-    let target_id = user.active_organization.unwrap_or(user.id);
-    let (target_payment_id, target_email, target_display_name) = if let Some(org_id) = user.active_organization {
-        let mut conn = state.db.write().acquire().await.map_err(|e| {
-            tracing::error!("Failed to acquire database connection: {:?}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-        let org = Users::new(&mut conn)
-            .get_by_id(org_id)
-            .await
-            .map_err(|e| {
-                tracing::error!("Failed to load org user: {:?}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?
-            .ok_or(StatusCode::NOT_FOUND)?;
-        (org.payment_provider_id, org.email, org.display_name)
-    } else {
-        (user.payment_provider_id.clone(), user.email.clone(), user.display_name.clone())
-    };
+    // Resolve billing target (org or individual) with permission check
+    let mut conn = state.db.write().acquire().await.map_err(|e| {
+        tracing::error!("Failed to acquire database connection: {:?}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    let target = resolve_billing_target(&user, &mut conn).await?;
 
     // Check if target user has a customer ID with the payment provider, create one if not
-    let customer_id = match &target_payment_id {
+    let customer_id = match &target.payment_provider_id {
         Some(id) if !id.is_empty() => id.clone(),
         _ => {
             let new_id = provider
-                .create_customer(&target_email, target_display_name.as_deref())
+                .create_customer(&target.email, target.display_name.as_deref())
                 .await
                 .map_err(|e| {
                     tracing::error!("Failed to create payment provider customer: {:?}", e);
                     StatusCode::INTERNAL_SERVER_ERROR
                 })?;
 
-            let mut conn = state.db.write().acquire().await.map_err(|e| {
-                tracing::error!("Failed to acquire database connection: {:?}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
             Users::new(&mut conn)
-                .set_payment_provider_id_if_empty(target_id, &new_id)
+                .set_payment_provider_id_if_empty(target.id, &new_id)
                 .await
                 .map_err(|e| {
                     tracing::error!("Failed to save customer ID: {:?}", e);
@@ -754,13 +821,7 @@ pub async fn enable_auto_topup<P: PoolProvider>(
                 auto_topup_monthly_limit: Some(body.monthly_limit),
             };
 
-            let mut conn = state.db.write().acquire().await.map_err(|e| {
-                tracing::error!("Failed to acquire database connection: {:?}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
-
-            let mut users = Users::new(&mut conn);
-            users.update(target_id, &update).await.map_err(|e| {
+            Users::new(&mut conn).update(target.id, &update).await.map_err(|e| {
                 tracing::error!("Failed to enable auto top-up: {:?}", e);
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
@@ -816,7 +877,11 @@ pub async fn enable_auto_topup<P: PoolProvider>(
 )]
 #[tracing::instrument(skip_all)]
 pub async fn disable_auto_topup<P: PoolProvider>(State(state): State<AppState<P>>, user: CurrentUser) -> Result<Response, StatusCode> {
-    let target_id = user.active_organization.unwrap_or(user.id);
+    let mut conn = state.db.write().acquire().await.map_err(|e| {
+        tracing::error!("Failed to acquire database connection: {:?}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    let target = resolve_billing_target(&user, &mut conn).await?;
 
     let update = UserUpdateDBRequest {
         display_name: None,
@@ -830,12 +895,7 @@ pub async fn disable_auto_topup<P: PoolProvider>(State(state): State<AppState<P>
         auto_topup_monthly_limit: Some(None),
     };
 
-    let mut conn = state.db.write().acquire().await.map_err(|e| {
-        tracing::error!("Failed to acquire database connection: {:?}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-
-    Users::new(&mut conn).update(target_id, &update).await.map_err(|e| match e {
+    Users::new(&mut conn).update(target.id, &update).await.map_err(|e| match e {
         crate::db::errors::DbError::NotFound => StatusCode::NOT_FOUND,
         other => {
             tracing::error!("Failed to disable auto top-up: {:?}", other);
@@ -1085,7 +1145,7 @@ mod tests {
         let url = body["url"].as_str().expect("Response should contain url field");
         assert!(url.starts_with("http://localhost:3001/cost-management"));
         assert!(url.contains("dummy_billing_portal=true"));
-        assert!(url.contains(&format!("user_id={}", user.id)));
+        assert!(url.contains(&format!("customer_id=cus_test_{}", user.id)));
     }
 
     #[sqlx::test]

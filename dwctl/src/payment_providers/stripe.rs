@@ -26,12 +26,11 @@ use stripe_types::Currency;
 use stripe_webhook::{EventObject, Webhook};
 
 use crate::{
-    api::models::users::CurrentUser,
     db::{
         handlers::{credits::Credits, repository::Repository},
         models::credits::{CreditTransactionCreateDBRequest, CreditTransactionType},
     },
-    payment_providers::{AutoTopupSetupResult, PaymentError, PaymentProvider, PaymentSession, Result, WebhookEvent},
+    payment_providers::{AutoTopupSetupResult, CheckoutPayer, PaymentError, PaymentProvider, PaymentSession, Result, WebhookEvent},
     types::UserId,
 };
 
@@ -133,7 +132,7 @@ impl StripeProvider {
 impl PaymentProvider for StripeProvider {
     async fn create_checkout_session(
         &self,
-        user: &CurrentUser,
+        payer: &CheckoutPayer,
         creditee_id: Option<&str>,
         cancel_url: &str,
         success_url: &str,
@@ -141,7 +140,7 @@ impl PaymentProvider for StripeProvider {
         let mut checkout_params = CreateCheckoutSession::new()
             .cancel_url(cancel_url)
             .success_url(success_url)
-            .client_reference_id(user.id.to_string()) // This is who will purchase the credits
+            .client_reference_id(payer.id.to_string()) // This is who will purchase the credits
             .currency(Currency::USD)
             .line_items(vec![CreateCheckoutSessionLineItems {
                 price: Some(self.config.price_id.clone()),
@@ -175,21 +174,19 @@ impl PaymentProvider for StripeProvider {
         }
 
         // Include existing customer ID if we have one
-        if let Some(existing_id) = &user.payment_provider_id {
-            // This is who is giving the credits
-            tracing::debug!("Using existing Stripe customer ID {} for user {}", existing_id, user.id);
+        if let Some(existing_id) = &payer.payment_provider_id {
+            tracing::debug!("Using existing Stripe customer ID {} for payer {}", existing_id, payer.id);
             checkout_params = checkout_params
-                .customer(existing_id.as_str())
+                .customer(existing_id)
                 .customer_update(CreateCheckoutSessionCustomerUpdate {
                     address: Some(CreateCheckoutSessionCustomerUpdateAddress::Auto),
                     name: Some(CreateCheckoutSessionCustomerUpdateName::Auto),
                     shipping: None,
                 })
         } else {
-            tracing::debug!("No customer ID found for user {}, Stripe will create one", user.id);
-            // Provide customer email for the new customer
+            tracing::debug!("No customer ID found for payer {}, Stripe will create one", payer.id);
             checkout_params = checkout_params
-                .customer_email(&user.email)
+                .customer_email(&payer.email)
                 .customer_creation(CreateCheckoutSessionCustomerCreation::Always);
         }
 
@@ -200,10 +197,10 @@ impl PaymentProvider for StripeProvider {
         })?;
 
         tracing::debug!(
-            "Created checkout session {} for user {} (payer: {})",
+            "Created checkout session {} for creditee {} (payer: {})",
             checkout_session.id,
-            creditee_id.unwrap_or(&user.id.to_string()),
-            user.id
+            creditee_id.unwrap_or(&payer.id.to_string()),
+            payer.id
         );
 
         // Return checkout URL for hosted checkout
@@ -421,11 +418,11 @@ impl PaymentProvider for StripeProvider {
         self.process_payment_session(db_pool, session_id).await
     }
 
-    async fn create_auto_topup_checkout_session(&self, user: &CurrentUser, cancel_url: &str, success_url: &str) -> Result<String> {
+    async fn create_auto_topup_checkout_session(&self, payer: &CheckoutPayer, cancel_url: &str, success_url: &str) -> Result<String> {
         let mut checkout_params = CreateCheckoutSession::new()
             .cancel_url(cancel_url)
             .success_url(success_url)
-            .client_reference_id(user.id.to_string()) // This is who will purchase the credits
+            .client_reference_id(payer.id.to_string())
             .mode(CheckoutSessionMode::Setup)
             .ui_mode(CheckoutSessionUiMode::Hosted)
             .tax_id_collection(CreateCheckoutSessionTaxIdCollection::new(true))
@@ -462,21 +459,19 @@ impl PaymentProvider for StripeProvider {
             });
 
         // Include existing customer ID if we have one
-        if let Some(existing_id) = &user.payment_provider_id {
-            // This is who is giving the credits
-            tracing::debug!("Using existing Stripe customer ID {} for user {}", existing_id, user.id);
+        if let Some(existing_id) = &payer.payment_provider_id {
+            tracing::debug!("Using existing Stripe customer ID {} for payer {}", existing_id, payer.id);
             checkout_params = checkout_params
-                .customer(existing_id.as_str())
+                .customer(existing_id)
                 .customer_update(CreateCheckoutSessionCustomerUpdate {
                     address: Some(CreateCheckoutSessionCustomerUpdateAddress::Auto),
                     name: Some(CreateCheckoutSessionCustomerUpdateName::Auto),
                     shipping: None,
                 })
         } else {
-            tracing::debug!("No customer ID found for user {}, Stripe will create one", user.id);
-            // Provide customer email for the new customer
+            tracing::debug!("No customer ID found for payer {}, Stripe will create one", payer.id);
             checkout_params = checkout_params
-                .customer_email(&user.email)
+                .customer_email(&payer.email)
                 .customer_creation(CreateCheckoutSessionCustomerCreation::Always);
         }
 
@@ -486,7 +481,7 @@ impl PaymentProvider for StripeProvider {
             PaymentError::ProviderApi(e.to_string())
         })?;
 
-        tracing::debug!("Created checkout session {} for user {} ", checkout_session.id, user.id);
+        tracing::debug!("Created checkout session {} for payer {} ", checkout_session.id, payer.id);
 
         // Return checkout URL for hosted checkout
         checkout_session.url.ok_or_else(|| {
@@ -637,13 +632,10 @@ impl PaymentProvider for StripeProvider {
         Ok(customer.id.to_string())
     }
 
-    async fn create_billing_portal_session(&self, user: &CurrentUser, return_url: &str) -> Result<String> {
-        // Fetch user's payment provider customer ID from user struct
-        let customer_id_str = user.payment_provider_id.as_ref().ok_or(PaymentError::NoCustomerId)?;
-
+    async fn create_billing_portal_session(&self, customer_id: &str, return_url: &str) -> Result<String> {
         // Create billing portal session using builder pattern
         let session = CreateBillingPortalSession::new()
-            .customer(customer_id_str.as_str())
+            .customer(customer_id)
             .return_url(return_url)
             .send(&self.client)
             .await
@@ -653,10 +645,9 @@ impl PaymentProvider for StripeProvider {
             })?;
 
         tracing::debug!(
-            "Created billing portal session {} for user {} (customer: {})",
+            "Created billing portal session {} for customer {}",
             session.id,
-            user.id,
-            customer_id_str
+            customer_id
         );
 
         // Return the portal session URL
