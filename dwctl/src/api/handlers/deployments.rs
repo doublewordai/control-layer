@@ -469,7 +469,8 @@ pub async fn create_deployed_model<P: PoolProvider>(
         DeployedModelCreate::Composite(c) => &c.allowed_batch_completion_windows,
     };
     if let Some(windows) = batch_windows {
-        let allowed = &state.config.batches.allowed_completion_windows;
+        let config = state.current_config();
+        let allowed = &config.batches.allowed_completion_windows;
         for window in windows {
             if !allowed.contains(window) {
                 return Err(Error::BadRequest {
@@ -600,7 +601,8 @@ pub async fn update_deployed_model<P: PoolProvider>(
 
     // Validate allowed batch completion windows against global config
     if let Some(Some(windows)) = &update.allowed_batch_completion_windows {
-        let allowed = &state.config.batches.allowed_completion_windows;
+        let config = state.current_config();
+        let allowed = &config.batches.allowed_completion_windows;
         for window in windows {
             if !allowed.contains(window) {
                 return Err(Error::BadRequest {
