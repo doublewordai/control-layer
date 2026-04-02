@@ -610,6 +610,7 @@ pub async fn process_auto_topup<P: PoolProvider>(
     responses(
         (status = 200, description = "Result of the enable attempt", body = inline(Object)),
         (status = 400, description = "Invalid threshold or amount"),
+        (status = 404, description = "Target organization not found"),
         (status = 503, description = "No payment provider configured"),
     ),
     security(
@@ -827,9 +828,12 @@ pub async fn disable_auto_topup<P: PoolProvider>(State(state): State<AppState<P>
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    Users::new(&mut conn).update(target_id, &update).await.map_err(|e| {
-        tracing::error!("Failed to disable auto top-up: {:?}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
+    Users::new(&mut conn).update(target_id, &update).await.map_err(|e| match e {
+        crate::db::errors::DbError::NotFound => StatusCode::NOT_FOUND,
+        other => {
+            tracing::error!("Failed to disable auto top-up: {:?}", other);
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
     })?;
 
     Ok(Json(json!({ "message": "Auto top-up disabled" })).into_response())
@@ -1433,9 +1437,7 @@ mod tests {
         let mut auth_headers = crate::test::utils::add_auth_headers(&user);
         auth_headers.push(("x-organization-id".to_string(), org.id.to_string()));
 
-        let app = Router::new()
-            .route("/auto-topup/enable", post(enable_auto_topup))
-            .with_state(state);
+        let app = Router::new().route("/auto-topup/enable", post(enable_auto_topup)).with_state(state);
 
         let server = TestServer::new(app).unwrap();
 
@@ -1466,13 +1468,10 @@ mod tests {
         assert_eq!(org_row.auto_topup_monthly_limit, Some(200.0));
 
         // Verify individual user was NOT modified
-        let user_row = sqlx::query!(
-            "SELECT auto_topup_amount, auto_topup_threshold FROM users WHERE id = $1",
-            user.id
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let user_row = sqlx::query!("SELECT auto_topup_amount, auto_topup_threshold FROM users WHERE id = $1", user.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(user_row.auto_topup_amount, None);
         assert_eq!(user_row.auto_topup_threshold, None);
     }
@@ -1555,24 +1554,18 @@ mod tests {
         response.assert_status(StatusCode::OK);
 
         // Verify org's auto-topup cleared
-        let org_row = sqlx::query!(
-            "SELECT auto_topup_amount, auto_topup_threshold FROM users WHERE id = $1",
-            org.id
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let org_row = sqlx::query!("SELECT auto_topup_amount, auto_topup_threshold FROM users WHERE id = $1", org.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(org_row.auto_topup_amount, None);
         assert_eq!(org_row.auto_topup_threshold, None);
 
         // Verify individual user was NOT touched
-        let user_row = sqlx::query!(
-            "SELECT auto_topup_amount, auto_topup_threshold FROM users WHERE id = $1",
-            user.id
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let user_row = sqlx::query!("SELECT auto_topup_amount, auto_topup_threshold FROM users WHERE id = $1", user.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(user_row.auto_topup_amount, None);
         assert_eq!(user_row.auto_topup_threshold, None);
     }
