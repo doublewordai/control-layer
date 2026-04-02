@@ -26,12 +26,12 @@ use crate::errors::{Error, Result};
 // ---------------------------------------------------------------------------
 
 fn get_encryption_key<P: PoolProvider>(state: &AppState<P>) -> Result<Vec<u8>> {
-    let secret = state
-        .config
+    let config = state.config.snapshot();
+    let secret = config
         .connections
         .encryption_key
         .as_deref()
-        .or(state.config.secret_key.as_deref())
+        .or(config.secret_key.as_deref())
         .ok_or_else(|| Error::Internal {
             operation: "connections encryption key not configured".to_string(),
         })?;
@@ -333,10 +333,11 @@ pub async fn trigger_sync<P: PoolProvider>(
     }
 
     // Build sync config from request + defaults
-    let ai_base_url = format!("http://{}:{}/ai", state.config.host, state.config.port);
+    let config = state.config.snapshot();
+    let ai_base_url = format!("http://{}:{}/ai", config.host, config.port);
     let sync_config = serde_json::json!({
-        "endpoint": req.endpoint.as_deref().unwrap_or(&state.config.connections.sync.default_endpoint),
-        "completion_window": req.completion_window.as_deref().unwrap_or(&state.config.connections.sync.default_completion_window),
+        "endpoint": req.endpoint.as_deref().unwrap_or(&config.connections.sync.default_endpoint),
+        "completion_window": req.completion_window.as_deref().unwrap_or(&config.connections.sync.default_completion_window),
         "ai_base_url": ai_base_url,
     });
 
