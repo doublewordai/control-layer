@@ -2,7 +2,7 @@ import { useState, useEffect } from "react";
 import { Switch } from "@/components/ui/switch";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
-import { useUpdateUser, useEnableAutoTopup } from "@/api/control-layer";
+import { useEnableAutoTopup, useDisableAutoTopup } from "@/api/control-layer";
 import { useCreateBillingPortalSession } from "@/api/control-layer";
 import { toast } from "sonner";
 import { formatDollars } from "@/utils/money";
@@ -10,13 +10,11 @@ import type { User } from "@/api/control-layer";
 
 interface AutoTopupSectionProps {
   user: User;
-  userId: string;
   onSuccess: () => void;
 }
 
 export function AutoTopupSection({
   user,
-  userId,
   onSuccess,
 }: AutoTopupSectionProps) {
   const hasPaymentMethod = user.has_auto_topup_payment_method;
@@ -36,13 +34,13 @@ export function AutoTopupSection({
     user.auto_topup_monthly_limit?.toString() ?? "",
   );
 
-  const updateUserMutation = useUpdateUser();
   const enableAutoTopupMutation = useEnableAutoTopup();
+  const disableAutoTopupMutation = useDisableAutoTopup();
   const billingPortalMutation = useCreateBillingPortalSession();
 
   const isPending =
-    updateUserMutation.isPending ||
     enableAutoTopupMutation.isPending ||
+    disableAutoTopupMutation.isPending ||
     billingPortalMutation.isPending;
 
   useEffect(() => {
@@ -84,7 +82,7 @@ export function AutoTopupSection({
           toast.success("Auto top-up enabled");
           onSuccess();
         } else if (result.needs_billing_portal) {
-          // No card on file — redirect to billing portal to add one
+          // No card on file -- redirect to billing portal to add one
           const portal = await billingPortalMutation.mutateAsync();
           window.location.href = portal.url;
         }
@@ -94,14 +92,7 @@ export function AutoTopupSection({
       }
     } else {
       try {
-        await updateUserMutation.mutateAsync({
-          id: userId,
-          data: {
-            auto_topup_threshold: null,
-            auto_topup_amount: null,
-            auto_topup_monthly_limit: null,
-          },
-        });
+        await disableAutoTopupMutation.mutateAsync();
         toast.success("Auto top-up disabled");
         setIsEditing(false);
         onSuccess();
@@ -125,13 +116,10 @@ export function AutoTopupSection({
     }
     const limitNum = parseMonthlyLimit();
     try {
-      await updateUserMutation.mutateAsync({
-        id: userId,
-        data: {
-          auto_topup_threshold: thresholdNum,
-          auto_topup_amount: amountNum,
-          auto_topup_monthly_limit: limitNum,
-        },
+      await enableAutoTopupMutation.mutateAsync({
+        threshold: thresholdNum,
+        amount: amountNum,
+        monthlyLimit: limitNum,
       });
       toast.success(
         `Auto top-up updated: ${formatDollars(amountNum)} when below ${formatDollars(thresholdNum)}`,

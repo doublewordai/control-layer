@@ -29,7 +29,7 @@ export function CostManagement() {
   const { isFeatureEnabled, settings } = useSettings();
   const isDemoMode = isFeatureEnabled("demo");
   const { data: config } = useConfig();
-  const { activeOrganizationId } = useOrganizationContext();
+  const { activeOrganizationId, activeOrganization } = useOrganizationContext();
 
   const [showSuccessModal, setShowSuccessModal] = useState(false);
   const [showCancelledModal, setShowCancelledModal] = useState(false);
@@ -223,13 +223,15 @@ export function CostManagement() {
     }
   })();
 
+  // Only show auto-topup for personal context or org admins/owners
+  const isOrgAdmin = activeOrganization?.role === "owner" || activeOrganization?.role === "admin";
   const showAutoTopupSection =
-    (isDemoMode || !!config?.payment_enabled) && displayUser && !filterUserId;
+    (isDemoMode || !!config?.payment_enabled) && displayUser && !filterUserId
+    && (!activeOrganizationId || isOrgAdmin);
 
   const autoTopupElement = showAutoTopupSection ? (
     <AutoTopupSection
       user={displayUser!}
-      userId={currentUser!.id}
       onSuccess={() => {
         refetchCurrentUser();
         refetchDisplayUser();
