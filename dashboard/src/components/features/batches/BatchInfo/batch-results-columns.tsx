@@ -31,10 +31,16 @@ const getContentPreview = (
     content = result.input_body;
   } else if (result.response_body) {
     content = result.response_body;
-  } else if (result.reasoning_artifact) {
-    content = { reasoning_artifact: result.reasoning_artifact };
   } else if (result.error) {
     content = { error: result.error };
+  }
+
+  if (
+    contentType === "response" &&
+    !result.response_body &&
+    result.reasoning_artifact
+  ) {
+    return "No visible response (reasoning available)";
   }
 
   const previewText = content

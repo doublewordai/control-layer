@@ -1676,6 +1676,7 @@ mod tests {
         duration_to_first_byte_ms: Option<f64>,
         prompt_tokens: i64,
         completion_tokens: i64,
+        reasoning_tokens: i64,
         input_price_per_token: Option<f64>,
         output_price_per_token: Option<f64>,
     }
@@ -1690,9 +1691,9 @@ mod tests {
             INSERT INTO http_analytics (
                 instance_id, correlation_id, timestamp, uri, method, status_code,
                 duration_ms, duration_to_first_byte_ms, model, prompt_tokens,
-                completion_tokens, total_tokens, fusillade_batch_id, fusillade_request_id,
+                completion_tokens, reasoning_tokens, total_tokens, fusillade_batch_id, fusillade_request_id,
                 input_price_per_token, output_price_per_token
-            ) VALUES ($1, $2, $3, '/ai/chat/completions', 'POST', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+            ) VALUES ($1, $2, $3, '/ai/chat/completions', 'POST', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
             "#,
             Uuid::new_v4(),
             1i64,
@@ -1703,6 +1704,7 @@ mod tests {
             data.model,
             data.prompt_tokens,
             data.completion_tokens,
+            data.reasoning_tokens,
             data.prompt_tokens + data.completion_tokens,
             data.fusillade_batch_id,
             data.fusillade_request_id,
@@ -1732,6 +1734,7 @@ mod tests {
                 duration_to_first_byte_ms: Some(50.0),
                 prompt_tokens: 100,
                 completion_tokens: 50,
+                reasoning_tokens: 20,
                 input_price_per_token: Some(0.00001),  // $0.00001 per token
                 output_price_per_token: Some(0.00003), // $0.00003 per token
             },
@@ -1743,6 +1746,7 @@ mod tests {
         assert_eq!(result.total_requests, 1);
         assert_eq!(result.total_prompt_tokens, 100);
         assert_eq!(result.total_completion_tokens, 50);
+        assert_eq!(result.total_reasoning_tokens, Some(20));
         assert_eq!(result.total_tokens, 150);
         assert_eq!(result.avg_duration_ms, Some(150.0));
         assert_eq!(result.avg_ttfb_ms, Some(50.0));
@@ -1771,6 +1775,7 @@ mod tests {
                 duration_to_first_byte_ms: Some(30.0),
                 prompt_tokens: 50,
                 completion_tokens: 25,
+                reasoning_tokens: 10,
                 input_price_per_token: Some(0.00001),
                 output_price_per_token: Some(0.00003),
             },
@@ -1789,6 +1794,7 @@ mod tests {
                 duration_to_first_byte_ms: Some(70.0),
                 prompt_tokens: 100,
                 completion_tokens: 50,
+                reasoning_tokens: 20,
                 input_price_per_token: Some(0.00001),
                 output_price_per_token: Some(0.00003),
             },
@@ -1807,6 +1813,7 @@ mod tests {
                 duration_to_first_byte_ms: Some(40.0),
                 prompt_tokens: 75,
                 completion_tokens: 35,
+                reasoning_tokens: 5,
                 input_price_per_token: Some(0.00002),
                 output_price_per_token: Some(0.00004),
             },
@@ -1818,6 +1825,7 @@ mod tests {
         assert_eq!(result.total_requests, 3);
         assert_eq!(result.total_prompt_tokens, 225); // 50 + 100 + 75
         assert_eq!(result.total_completion_tokens, 110); // 25 + 50 + 35
+        assert_eq!(result.total_reasoning_tokens, Some(35)); // 10 + 20 + 5
         assert_eq!(result.total_tokens, 335); // 75 + 150 + 110
 
         // Average duration: (100 + 200 + 150) / 3 = 150.0
@@ -1871,6 +1879,7 @@ mod tests {
                 duration_to_first_byte_ms: Some(30.0),
                 prompt_tokens: 50,
                 completion_tokens: 25,
+                reasoning_tokens: 0,
                 input_price_per_token: Some(0.00001),
                 output_price_per_token: Some(0.00003),
             },
@@ -1890,6 +1899,7 @@ mod tests {
                 duration_to_first_byte_ms: Some(40.0),
                 prompt_tokens: 100,
                 completion_tokens: 50,
+                reasoning_tokens: 0,
                 input_price_per_token: Some(0.00001),
                 output_price_per_token: Some(0.00003),
             },
@@ -1925,6 +1935,7 @@ mod tests {
                 duration_to_first_byte_ms: None, // No TTFB
                 prompt_tokens: 50,
                 completion_tokens: 25,
+                reasoning_tokens: 0,
                 input_price_per_token: None,  // No input price
                 output_price_per_token: None, // No output price
             },
@@ -1965,6 +1976,7 @@ mod tests {
                 duration_to_first_byte_ms: Some(30.0),
                 prompt_tokens: 50,
                 completion_tokens: 25,
+                reasoning_tokens: 0,
                 input_price_per_token: Some(0.00001),
                 output_price_per_token: Some(0.00003),
             },
@@ -1983,6 +1995,7 @@ mod tests {
                 duration_to_first_byte_ms: Some(45.0),
                 prompt_tokens: 75,
                 completion_tokens: 30,
+                reasoning_tokens: 0,
                 input_price_per_token: Some(0.00001),
                 output_price_per_token: Some(0.00003),
             },
@@ -2002,6 +2015,7 @@ mod tests {
                 duration_to_first_byte_ms: Some(40.0),
                 prompt_tokens: 100,
                 completion_tokens: 50,
+                reasoning_tokens: 0,
                 input_price_per_token: Some(0.00001),
                 output_price_per_token: Some(0.00003),
             },
@@ -2045,6 +2059,7 @@ mod tests {
                 duration_to_first_byte_ms: Some(20.0),
                 prompt_tokens: 50,
                 completion_tokens: 25,
+                reasoning_tokens: 0,
                 input_price_per_token: Some(0.00001),
                 output_price_per_token: Some(0.00003),
             },
@@ -2064,6 +2079,7 @@ mod tests {
                 duration_to_first_byte_ms: Some(10.0),
                 prompt_tokens: 100,
                 completion_tokens: 50,
+                reasoning_tokens: 0,
                 input_price_per_token: Some(0.000001),
                 output_price_per_token: Some(0.000002),
             },
@@ -2081,6 +2097,7 @@ mod tests {
                 duration_to_first_byte_ms: Some(15.0),
                 prompt_tokens: 200,
                 completion_tokens: 100,
+                reasoning_tokens: 0,
                 input_price_per_token: Some(0.000001),
                 output_price_per_token: Some(0.000002),
             },
