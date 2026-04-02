@@ -657,11 +657,14 @@ export function useDeleteApiKey() {
       userId?: string;
     }) => dwctlApi.users.apiKeys.delete(keyId, userId),
     onSuccess: (_, { keyId, userId = "current" }) => {
-      queryClient.invalidateQueries({
-        queryKey: queryKeys.apiKeys.query(userId),
-      });
+      const apiKeysQueryPrefix = ["apiKeys", "query", userId] as const;
+
       queryClient.removeQueries({
         queryKey: queryKeys.apiKeys.byId(keyId, userId),
+      });
+      queryClient.invalidateQueries({
+        queryKey: apiKeysQueryPrefix,
+        refetchType: "active",
       });
     },
   });
