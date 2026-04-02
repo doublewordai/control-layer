@@ -791,7 +791,7 @@ const ModelInfo: React.FC = () => {
                             {[
                               { id: "vision", label: "Vision", tip: "Enables image upload in the playground." },
                               { id: "reasoning", label: "Reasoning", tip: "Model supports extended reasoning / chain-of-thought." },
-                              { id: "enhanced_structured_generation", label: "Enhanced Structured Generation", tip: "Model support enchanced generation for complex schema generation" },
+                              { id: "enhanced_structured_generation", label: "Enhanced Structured Generation", tip: "Model supports enhanced generation for complex schema generation." },
                             ].map((cap) => (
                               <label key={cap.id} className="flex items-center gap-2 text-sm">
                                 <Checkbox
@@ -1892,7 +1892,7 @@ const ModelInfo: React.FC = () => {
                               {[
                                 { id: "vision", label: "Vision", tip: "Enables image upload in the playground." },
                                 { id: "reasoning", label: "Reasoning", tip: "Model supports extended reasoning / chain-of-thought." },
-                                { id: "enhanced_structured_generation", label: "Enhanced Structured Generation", tip: "Model support enchanced generation for complex schema generation" },
+                                { id: "enhanced_structured_generation", label: "Enhanced Structured Generation", tip: "Model supports enhanced generation for complex schema generation." },
                               ].map((cap) => (
                                 <div key={cap.id} className="flex items-center justify-between">
                                   <label className="flex items-center gap-2 text-sm">

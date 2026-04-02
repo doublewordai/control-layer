@@ -228,9 +228,12 @@ pub async fn update_provider_display_config<P: PoolProvider>(
                     let trimmed = value.trim().to_string();
                     (!trimmed.is_empty()).then_some(trimmed)
                 }),
-                icon: update
-                    .icon
-                    .map(|value| value.and_then(|icon| (!icon.trim().is_empty()).then_some(icon))),
+                icon: update.icon.map(|value| {
+                    value.and_then(|icon| {
+                        let trimmed = icon.trim().to_string();
+                        (!trimmed.is_empty()).then_some(trimmed)
+                    })
+                }),
             },
         )
         .await?;
