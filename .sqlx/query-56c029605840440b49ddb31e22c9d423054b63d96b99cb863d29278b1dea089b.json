@@ -1,0 +1,32 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT\n                LOWER(BTRIM(metadata->>'provider')) AS provider_key,\n                MIN(BTRIM(metadata->>'provider')) AS display_name,\n                COUNT(*)::BIGINT AS model_count\n            FROM deployed_models\n            WHERE\n                deleted = false\n                AND metadata->>'provider' IS NOT NULL\n                AND BTRIM(metadata->>'provider') <> ''\n            GROUP BY LOWER(BTRIM(metadata->>'provider'))\n            ORDER BY MIN(BTRIM(metadata->>'provider'))\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "provider_key",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "display_name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "model_count",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "56c029605840440b49ddb31e22c9d423054b63d96b99cb863d29278b1dea089b"
+}

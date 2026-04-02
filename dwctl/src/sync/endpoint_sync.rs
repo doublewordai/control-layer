@@ -724,6 +724,7 @@ mod tests {
                 id: mock.id,
                 model_name: mock.model_name,
                 alias: mock.alias,
+                display_name: None,
                 created_by: mock.created_by,
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),

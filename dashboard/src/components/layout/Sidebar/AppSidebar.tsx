@@ -157,7 +157,11 @@ export function AppSidebar() {
                 // Platform managers get collapsible Models section with sub-items
                 if (item.path === "/models" && canManageModels) {
                   const isManageModelsActive =
-                    location.pathname.startsWith("/models/manage");
+                    location.pathname === "/models/manage" ||
+                    (location.pathname.startsWith("/models/manage/") &&
+                      location.pathname !== "/models/manage/providers");
+                  const isManageProvidersActive =
+                    location.pathname === "/models/manage/providers";
                   const isEndpointsActive =
                     location.pathname === "/endpoints";
                   return (
@@ -201,6 +205,21 @@ export function AppSidebar() {
                               >
                                 <NavLink to="/models/manage">
                                   Manage Models
+                                </NavLink>
+                              </SidebarMenuSubButton>
+                            </SidebarMenuSubItem>
+                            <SidebarMenuSubItem>
+                              <SidebarMenuSubButton
+                                asChild
+                                isActive={isManageProvidersActive}
+                                className={
+                                  isManageProvidersActive
+                                    ? "bg-sidebar-accent! text-sidebar-accent-foreground!"
+                                    : "hover:bg-sidebar-border/50 hover:text-sidebar-foreground"
+                                }
+                              >
+                                <NavLink to="/models/manage/providers">
+                                  Manage Providers
                                 </NavLink>
                               </SidebarMenuSubButton>
                             </SidebarMenuSubItem>
