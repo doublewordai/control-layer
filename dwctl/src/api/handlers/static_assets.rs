@@ -23,6 +23,7 @@ fn inject_title(html: &str, title: Option<&str>) -> String {
 /// Serve embedded static assets with SPA fallback
 #[instrument(skip(state))]
 pub async fn serve_embedded_asset<P: PoolProvider + Clone>(State(state): State<AppState<P>>, uri: Uri) -> impl IntoResponse {
+    let config = state.current_config();
     let mut path = uri.path().trim_start_matches('/');
 
     // If path is empty or ends with /, serve index.html
@@ -60,7 +61,7 @@ pub async fn serve_embedded_asset<P: PoolProvider + Clone>(State(state): State<A
         // For index.html, inject the configured title
         if path == "index.html" {
             let html = String::from_utf8_lossy(&content.data);
-            let html_with_title = inject_title(&html, state.config.metadata.title.as_deref());
+            let html_with_title = inject_title(&html, config.metadata.title.as_deref());
             return Response::builder()
                 .header(axum::http::header::CONTENT_TYPE, mime.as_ref())
                 .header(axum::http::header::CACHE_CONTROL, cache_control)
@@ -78,7 +79,7 @@ pub async fn serve_embedded_asset<P: PoolProvider + Clone>(State(state): State<A
     // If not found, serve index.html for SPA client-side routing
     if let Some(index) = static_assets::Assets::get("index.html") {
         let html = String::from_utf8_lossy(&index.data);
-        let html_with_title = inject_title(&html, state.config.metadata.title.as_deref());
+        let html_with_title = inject_title(&html, config.metadata.title.as_deref());
         return Response::builder()
             .header(axum::http::header::CONTENT_TYPE, "text/html")
             .header(axum::http::header::CACHE_CONTROL, "no-cache")
@@ -94,11 +95,12 @@ pub async fn serve_embedded_asset<P: PoolProvider + Clone>(State(state): State<A
 #[instrument(skip(state), err)]
 pub async fn spa_fallback<P: PoolProvider + Clone>(State(state): State<AppState<P>>, uri: Uri) -> Result<Html<String>, StatusCode> {
     debug!("Hitting SPA fallback for: {}", uri.path());
+    let config = state.current_config();
 
     // Serve embedded index.html with injected title
     if let Some(index) = static_assets::Assets::get("index.html") {
         let html = String::from_utf8_lossy(&index.data);
-        let html_with_title = inject_title(&html, state.config.metadata.title.as_deref());
+        let html_with_title = inject_title(&html, config.metadata.title.as_deref());
         Ok(Html(html_with_title))
     } else {
         Err(StatusCode::INTERNAL_SERVER_ERROR)

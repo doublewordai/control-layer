@@ -3,6 +3,7 @@
     {
       "id": "d1a2b3c4-e5f6-4a7b-8c9d-0e1f2a3b4c5d",
       "alias": "Qwen/Qwen3.5-397B-A17B-FP8",
+      "display_name": "Qwen 3.5 397B",
       "model_name": "Qwen/Qwen3.5-397B-A17B-FP8",
       "description": "Meet Qwen3.5-397B-A17B - released Feb 2026, it is Qwen's most powerful model, delivering performance similar to GPT-5.2 and Claude Opus 4.5 on challenging tasks including advanced reasoning, mathematics, and complex code generation. Offers frontier-level capabilities at a fraction of the cost.\n\n**Best for:**\n- Tasks requiring maximum intelligence\n- Complex analysis\n- Sophisticated coding projects\n- Scenarios where quality justifies the additional cost over smaller models\n\n**Max New Tokens:** 16384\n\n**Max Total Tokens:** 262144\n\n**Sampling Parameters:**\n\nWe have set the default sampling parameters using the recommended values set out by the Qwen team:\n\nWe suggest using Temperature=0.7, TopP=0.8, TopK=20, and MinP=0.\n\nFor supported frameworks, you can adjust the `presence_penalty` parameter between 0 and 2 to reduce endless repetitions. However, using a higher value may occasionally result in language mixing and a slight decrease in model performance.\n\nWe use a default `presence_penalty` of 1.5 to bias the model against endless repetitions, if you still notice this behaviour try increasing the `presence_penalty`.\n\nYou can adjust these on a per-request basis by setting the sampling parameters in the request body.",
       "model_type": "CHAT",
@@ -30,6 +31,7 @@
         "context_window": 262144,
         "released_at": "2026-02-16",
         "attribution": "artificial_analysis",
+        "quantization": "FP8",
         "extra": {
           "evaluations": {
             "artificial_analysis_coding_index": 41.3,
@@ -47,13 +49,15 @@
             "Complex reasoning",
             "Sophisticated coding",
             "Max performance tasks"
-          ]
+          ],
+          "deployment_providers": ["snowflake", "onwards"]
         }
       }
     },
     {
       "id": "d2a3b4c5-e6f7-4a8b-9c0d-1e2f3a4b5c6d",
       "alias": "Qwen/Qwen3.5-35B-A3B-FP8",
+      "display_name": "Qwen 3.5 35B",
       "model_name": "Qwen/Qwen3.5-35B-A3B-FP8",
       "description": "Qwen3.5-35B-A3B is a high-intelligence, mid-sized model that hits a very compelling price/performance point for async workloads. In Qwen's published benchmarks, this model outperformed GPT-5-mini, GPT-OSS-120B, and Claude Sonnet 4.5.\n\n**Thinking Mode:**\n\nThis model reasons step-by-step before responding by default. To disable thinking, include the following in your request body: `\"chat_template_kwargs\": {\"enable_thinking\": false}` This model does not support graduated thinking levels. Parameters such as `reasoning_effort` are not supported and will have no effect.",
       "model_type": "CHAT",
@@ -81,6 +85,7 @@
         "context_window": 262144,
         "released_at": "2026-02-24",
         "attribution": "artificial_analysis",
+        "quantization": "FP8",
         "extra": {
           "evaluations": {
             "artificial_analysis_coding_index": 30.3,
@@ -97,13 +102,15 @@
             "Async batch workloads",
             "Reasoning tasks",
             "Cost-effective intelligence"
-          ]
+          ],
+          "deployment_providers": ["snowflake"]
         }
       }
     },
     {
       "id": "d3a4b5c6-e7f8-4a9b-0c1d-2e3f4a5b6c7d",
       "alias": "openai/gpt-oss-20b",
+      "display_name": "GPT-oss 20B",
       "model_name": "openai/gpt-oss-20b",
       "description": "Meet gpt-oss-20b \u2014 for lower latency, and local or specialized use cases (21B parameters with 3.6B active parameters).",
       "model_type": "CHAT",
@@ -150,7 +157,8 @@
             "Low latency tasks",
             "Specialized use cases",
             "Cost-sensitive workloads"
-          ]
+          ],
+          "deployment_providers": ["openai"]
         }
       }
     },
@@ -289,6 +297,7 @@
         "context_window": 32768,
         "released_at": "2025-04-28",
         "attribution": "artificial_analysis",
+        "quantization": "FP8",
         "extra": {
           "evaluations": {
             "aime": 0.28,
@@ -358,6 +367,7 @@
     {
       "id": "d8b9c0d1-e2f3-4a4b-5c6d-7e8f9a0b1c2d",
       "alias": "Qwen/Qwen3.5-9B",
+      "display_name": "Qwen 3.5 9B",
       "model_name": "Qwen/Qwen3.5-9B",
       "description": "Qwen3.5-9B is a small, highly efficient multimodal model from the Qwen3.5 Small Model Series. Despite having only 9B parameters, it matches or surpasses GPT-OSS-120B on GPQA Diamond (81.7 vs 71.5) and beats GPT-5-Nano on MMMU-Pro by 13 points. Uses a hybrid Gated DeltaNet + MoE architecture for fast inference.\n\n**Best for:**\n- On-device / edge deployment\n- High volume tasks requiring strong reasoning\n- Vision and video understanding at low cost\n- Scenarios where efficiency matters more than absolute peak performance",
       "model_type": "CHAT",

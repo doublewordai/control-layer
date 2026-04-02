@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { setupServer } from "msw/node";
+import { http, HttpResponse } from "msw";
 import type { ReactNode } from "react";
 import {
   describe,
@@ -461,6 +462,75 @@ describe("API Keys Component - Functional Tests", () => {
           ).not.toBeInTheDocument();
         });
       }
+    });
+
+    it("removes the deleted API key from the table without a manual refresh", async () => {
+      const user = userEvent.setup();
+      let apiKeys = [
+        {
+          id: "key-1",
+          name: "CI/CD Pipeline",
+          description: "Automated testing and evaluation pipeline",
+          created_at: "2025-04-01T10:00:00Z",
+        },
+        {
+          id: "key-2",
+          name: "Batch Processing - Production",
+          description: "Production batch job submissions",
+          created_at: "2025-05-15T09:15:00Z",
+        },
+      ];
+
+      server.use(
+        http.get("/admin/api/v1/users/:userId/api-keys", ({ request }) => {
+          const url = new URL(request.url);
+          const skip = parseInt(url.searchParams.get("skip") || "0", 10);
+          const limit = parseInt(url.searchParams.get("limit") || "10", 10);
+
+          return HttpResponse.json({
+            data: apiKeys.slice(skip, skip + limit),
+            total_count: apiKeys.length,
+            skip,
+            limit,
+          });
+        }),
+        http.delete("/admin/api/v1/users/:userId/api-keys/:keyId", ({ params }) => {
+          apiKeys = apiKeys.filter((apiKey) => apiKey.id !== params.keyId);
+          return HttpResponse.json(null, { status: 204 });
+        }),
+      );
+
+      const { container } = render(<ApiKeys />, { wrapper: createWrapper() });
+
+      await waitFor(() => {
+        expect(
+          within(container).getByRole("heading", { name: /api keys/i }),
+        ).toBeInTheDocument();
+      });
+
+      const keyName = screen.getByText("CI/CD Pipeline");
+      expect(keyName).toBeInTheDocument();
+
+      const keyRow = keyName.closest("tr");
+      expect(keyRow).not.toBeNull();
+
+      await user.click(within(keyRow!).getByRole("button"));
+
+      await waitFor(() => {
+        expect(
+          screen.getByRole("heading", { name: /delete api key/i }),
+        ).toBeInTheDocument();
+      });
+
+      await user.click(
+        screen.getByRole("button", {
+          name: /delete api key/i,
+        }),
+      );
+
+      await waitFor(() => {
+        expect(screen.queryByText("CI/CD Pipeline")).not.toBeInTheDocument();
+      });
     });
   });
 

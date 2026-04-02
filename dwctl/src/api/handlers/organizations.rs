@@ -12,7 +12,7 @@ use crate::{
         users::{CurrentUser, UserResponse},
     },
     auth::permissions::{can_manage_org_resource, can_read_all_resources, can_read_own_resource},
-    db::handlers::{Credits, Organizations, Repository, Users, organizations::OrganizationFilter},
+    db::handlers::{Credits, Organizations, Repository, Users, api_keys::ApiKeys, organizations::OrganizationFilter},
     db::models::organizations::{OrganizationCreateDBRequest, OrganizationUpdateDBRequest},
     email::EmailService,
     errors::{Error, Result},
@@ -28,6 +28,9 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     response::Json,
 };
+
+/// Maximum number of organizations a user can belong to simultaneously.
+const MAX_ORGS_PER_USER: i64 = 3;
 
 /// Hash a token with SHA-256 for deterministic DB lookup.
 /// Since invite tokens are 256 bits of cryptographic randomness,
@@ -97,10 +100,12 @@ pub async fn create_organization<P: PoolProvider>(
     current_user: CurrentUser,
     Json(data): Json<OrganizationCreate>,
 ) -> Result<(StatusCode, Json<OrganizationResponse>)> {
-    if !crate::auth::permissions::has_permission(&current_user, Resource::Organizations, Operation::CreateAll) {
+    let is_platform_manager = crate::auth::permissions::has_permission(&current_user, Resource::Organizations, Operation::CreateAll);
+
+    if !is_platform_manager && !crate::auth::permissions::has_permission(&current_user, Resource::Organizations, Operation::CreateOwn) {
         return Err(Error::InsufficientPermissions {
-            required: Permission::Allow(Resource::Organizations, Operation::CreateAll),
-            action: Operation::CreateAll,
+            required: Permission::Allow(Resource::Organizations, Operation::CreateOwn),
+            action: Operation::CreateOwn,
             resource: "Organizations".to_string(),
         });
     }
@@ -111,7 +116,19 @@ pub async fn create_organization<P: PoolProvider>(
         });
     }
 
-    let owner_id = data.owner_id.unwrap_or(current_user.id);
+    // Only platform managers can specify a different owner
+    let owner_id = if is_platform_manager {
+        data.owner_id.unwrap_or(current_user.id)
+    } else {
+        if data.owner_id.is_some() {
+            return Err(Error::InsufficientPermissions {
+                required: Permission::Allow(Resource::Organizations, Operation::CreateAll),
+                action: Operation::CreateAll,
+                resource: "Organization owner assignment".to_string(),
+            });
+        }
+        current_user.id
+    };
 
     let db_request = OrganizationCreateDBRequest {
         name: data.name,
@@ -121,9 +138,19 @@ pub async fn create_organization<P: PoolProvider>(
         created_by: owner_id,
     };
 
+    let config = state.current_config();
     let mut pool_conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut repo = Organizations::new(&mut pool_conn);
-    let org = repo.create(&db_request, &state.config.auth.default_user_roles).await?;
+
+    // Check org membership limit for the owner
+    let org_count = repo.count_user_organizations(owner_id).await?;
+    if org_count >= MAX_ORGS_PER_USER {
+        return Err(Error::BadRequest {
+            message: format!("Cannot create organization: user is already a member of {MAX_ORGS_PER_USER} organizations (maximum)"),
+        });
+    }
+
+    let org = repo.create(&db_request, &config.auth.default_user_roles).await?;
 
     let response = OrganizationResponse::from_user(UserResponse::from(org)).with_member_count(1);
 
@@ -528,6 +555,15 @@ pub async fn add_member<P: PoolProvider>(
     check_role_assignment_privilege(&current_user, id, role, can_all, &mut pool_conn).await?;
 
     let mut repo = Organizations::new(&mut pool_conn);
+
+    // Check org membership limit for the target user
+    let org_count = repo.count_user_organizations(data.user_id).await?;
+    if org_count >= MAX_ORGS_PER_USER {
+        return Err(Error::BadRequest {
+            message: format!("Cannot add member: user is already a member of {MAX_ORGS_PER_USER} organizations (maximum)"),
+        });
+    }
+
     let membership = repo.add_member(id, data.user_id, role).await?;
 
     // Fetch user details for response
@@ -706,6 +742,81 @@ pub async fn remove_member<P: PoolProvider>(
         });
     }
 
+    // Soft-delete the removed member's org API keys
+    let mut api_keys_repo = ApiKeys::new(&mut tx);
+    let keys_deleted = api_keys_repo.soft_delete_member_org_keys(id, user_id).await?;
+    if keys_deleted > 0 {
+        tracing::info!("Soft-deleted {keys_deleted} API key(s) for removed member {user_id} in org {id}");
+    }
+
+    tx.commit().await.map_err(|e| Error::Database(e.into()))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Leave an organization (self-removal)
+#[utoipa::path(
+    post,
+    path = "/organizations/{id}/leave",
+    tag = "organizations",
+    summary = "Leave organization",
+    description = "Leave an organization voluntarily. Cannot leave if you are the last owner.",
+    params(
+        ("id" = String, Path, description = "Organization ID (UUID)"),
+    ),
+    responses(
+        (status = 204, description = "Left organization"),
+        (status = 400, description = "Bad request - last owner cannot leave"),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Not found - not a member"),
+    ),
+    security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
+        ("X-Doubleword-User" = [])
+    )
+)]
+#[tracing::instrument(skip_all)]
+pub async fn leave_organization<P: PoolProvider>(
+    State(state): State<AppState<P>>,
+    Path(id): Path<UserId>,
+    current_user: CurrentUser,
+) -> Result<StatusCode> {
+    let mut tx = state.db.write().begin().await.map_err(|e| Error::Database(e.into()))?;
+
+    let mut repo = Organizations::new(&mut tx);
+
+    // Verify user is a member
+    let role = repo.get_user_org_role(current_user.id, id).await?;
+    if role.is_none() {
+        return Err(Error::NotFound {
+            resource: "Organization membership".to_string(),
+            id: format!("{} in organization {id}", current_user.id),
+        });
+    }
+
+    // Prevent last owner from leaving
+    if role.as_deref() == Some("owner") {
+        let members = repo.list_members(id).await?;
+        let owner_count = members.iter().filter(|m| m.role == "owner").count();
+        if owner_count <= 1 {
+            return Err(Error::BadRequest {
+                message: "Cannot leave as the last owner. Transfer ownership first.".to_string(),
+            });
+        }
+    }
+
+    repo.remove_member(id, current_user.id).await?;
+
+    // Soft-delete the leaving member's org API keys
+    let mut api_keys_repo = ApiKeys::new(&mut tx);
+    let keys_deleted = api_keys_repo.soft_delete_member_org_keys(id, current_user.id).await?;
+    if keys_deleted > 0 {
+        tracing::info!(
+            "Soft-deleted {keys_deleted} API key(s) for user {} leaving org {id}",
+            current_user.id
+        );
+    }
+
     tx.commit().await.map_err(|e| Error::Database(e.into()))?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -819,7 +930,8 @@ pub async fn set_active_organization<P: PoolProvider>(
     }
 
     // Build the dw_active_org cookie using the same security settings as the session cookie
-    let session_config = &state.config.auth.native.session;
+    let config = state.current_config();
+    let session_config = &config.auth.native.session;
     let secure = if session_config.cookie_secure { "; Secure" } else { "" };
     let domain = session_config
         .cookie_domain
@@ -956,8 +1068,9 @@ pub async fn invite_member<P: PoolProvider>(
         .unwrap_or_else(|| inviter.as_ref().map(|u| u.username.clone()).unwrap_or_default());
 
     // Send invite email
-    let invite_link = format!("{}/org-invite?token={}", state.config.dashboard_url.trim_end_matches('/'), token);
-    let email_service = EmailService::new(&state.config)?;
+    let config = state.current_config();
+    let invite_link = format!("{}/org-invite?token={}", config.dashboard_url.trim_end_matches('/'), token);
+    let email_service = EmailService::new(&config)?;
     if let Err(e) = email_service
         .send_org_invite_email(&email, &org_name, &inviter_name, role, &invite_link)
         .await
@@ -1111,6 +1224,14 @@ pub async fn accept_invite<P: PoolProvider>(
         });
     }
 
+    // Check org membership limit
+    let org_count = org_repo.count_user_organizations(current_user.id).await?;
+    if org_count >= MAX_ORGS_PER_USER {
+        return Err(Error::BadRequest {
+            message: format!("Cannot accept invite: you are already a member of {MAX_ORGS_PER_USER} organizations (maximum)"),
+        });
+    }
+
     org_repo.accept_invite(invite.id, current_user.id).await?;
 
     Ok(Json(serde_json::json!({ "message": "Invite accepted" })))
@@ -1235,6 +1356,213 @@ mod tests {
     };
     use serde_json::json;
     use sqlx::PgPool;
+
+    // ── Self-serve org creation ────────────────────────────────────────────
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_standard_user_can_create_organization(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let user_headers = add_auth_headers(&user);
+
+        let resp = server
+            .post("/admin/api/v1/organizations")
+            .add_header(&user_headers[0].0, &user_headers[0].1)
+            .add_header(&user_headers[1].0, &user_headers[1].1)
+            .json(&json!({ "name": "my-org", "email": "contact@my-org.com" }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::CREATED);
+        let body = resp.json::<serde_json::Value>();
+        assert_eq!(body["username"].as_str().unwrap(), "my-org");
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_standard_user_becomes_owner_of_created_org(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let user_headers = add_auth_headers(&user);
+
+        let resp = server
+            .post("/admin/api/v1/organizations")
+            .add_header(&user_headers[0].0, &user_headers[0].1)
+            .add_header(&user_headers[1].0, &user_headers[1].1)
+            .json(&json!({ "name": "self-serve-org", "email": "contact@example.com" }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::CREATED);
+        let org_id = resp.json::<serde_json::Value>()["id"].as_str().unwrap().to_string();
+
+        // Verify the creator is listed as owner
+        let resp = server
+            .get(&format!("/admin/api/v1/organizations/{org_id}/members"))
+            .add_header(&user_headers[0].0, &user_headers[0].1)
+            .add_header(&user_headers[1].0, &user_headers[1].1)
+            .await;
+        resp.assert_status(axum::http::StatusCode::OK);
+        let members = resp.json::<Vec<serde_json::Value>>();
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0]["role"].as_str().unwrap(), "owner");
+        assert_eq!(members[0]["user"]["id"].as_str().unwrap(), user.id.to_string());
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_standard_user_cannot_set_owner_id(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let user_headers = add_auth_headers(&user);
+        let other = create_test_user(&pool, Role::StandardUser).await;
+
+        let resp = server
+            .post("/admin/api/v1/organizations")
+            .add_header(&user_headers[0].0, &user_headers[0].1)
+            .add_header(&user_headers[1].0, &user_headers[1].1)
+            .json(&json!({ "name": "hijack-org", "email": "x@example.com", "owner_id": other.id }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::FORBIDDEN);
+    }
+
+    // ── Org membership limit ──────────────────────────────────────────────
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_cannot_create_org_when_at_limit(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let user_headers = add_auth_headers(&user);
+
+        // Create MAX_ORGS_PER_USER orgs
+        for i in 0..super::MAX_ORGS_PER_USER {
+            let resp = server
+                .post("/admin/api/v1/organizations")
+                .add_header(&user_headers[0].0, &user_headers[0].1)
+                .add_header(&user_headers[1].0, &user_headers[1].1)
+                .json(&json!({ "name": format!("org-{i}"), "email": format!("org{i}@example.com") }))
+                .await;
+            resp.assert_status(axum::http::StatusCode::CREATED);
+        }
+
+        // Next one should fail
+        let resp = server
+            .post("/admin/api/v1/organizations")
+            .add_header(&user_headers[0].0, &user_headers[0].1)
+            .add_header(&user_headers[1].0, &user_headers[1].1)
+            .json(&json!({ "name": "one-too-many", "email": "extra@example.com" }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::BAD_REQUEST);
+        let body = resp.text();
+        assert!(body.contains("maximum"));
+    }
+
+    // ── Leave organization ────────────────────────────────────────────────
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_member_can_leave_organization(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let pm = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let pm_headers = add_auth_headers(&pm);
+
+        let owner = create_test_user(&pool, Role::StandardUser).await;
+        let member = create_test_user(&pool, Role::StandardUser).await;
+        let member_headers = add_auth_headers(&member);
+
+        // PM creates org with owner
+        let resp = server
+            .post("/admin/api/v1/organizations")
+            .add_header(&pm_headers[0].0, &pm_headers[0].1)
+            .add_header(&pm_headers[1].0, &pm_headers[1].1)
+            .json(&json!({ "name": "leave-org", "email": "org@example.com", "owner_id": owner.id }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::CREATED);
+        let org_id = resp.json::<serde_json::Value>()["id"].as_str().unwrap().to_string();
+
+        // PM adds member
+        let resp = server
+            .post(&format!("/admin/api/v1/organizations/{org_id}/members"))
+            .add_header(&pm_headers[0].0, &pm_headers[0].1)
+            .add_header(&pm_headers[1].0, &pm_headers[1].1)
+            .json(&json!({ "user_id": member.id, "role": "member" }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::CREATED);
+
+        // Member leaves
+        let resp = server
+            .post(&format!("/admin/api/v1/organizations/{org_id}/leave"))
+            .add_header(&member_headers[0].0, &member_headers[0].1)
+            .add_header(&member_headers[1].0, &member_headers[1].1)
+            .await;
+        resp.assert_status(axum::http::StatusCode::NO_CONTENT);
+
+        // Verify member is no longer in the org
+        let resp = server
+            .get(&format!("/admin/api/v1/organizations/{org_id}/members"))
+            .add_header(&pm_headers[0].0, &pm_headers[0].1)
+            .add_header(&pm_headers[1].0, &pm_headers[1].1)
+            .await;
+        resp.assert_status(axum::http::StatusCode::OK);
+        let members = resp.json::<Vec<serde_json::Value>>();
+        assert_eq!(members.len(), 1); // Only owner remains
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_last_owner_cannot_leave(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let owner = create_test_user(&pool, Role::StandardUser).await;
+        let owner_headers = add_auth_headers(&owner);
+
+        // Owner creates org (self-serve)
+        let resp = server
+            .post("/admin/api/v1/organizations")
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .json(&json!({ "name": "solo-org", "email": "solo@example.com" }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::CREATED);
+        let org_id = resp.json::<serde_json::Value>()["id"].as_str().unwrap().to_string();
+
+        // Last owner tries to leave — should fail
+        let resp = server
+            .post(&format!("/admin/api/v1/organizations/{org_id}/leave"))
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .await;
+        resp.assert_status(axum::http::StatusCode::BAD_REQUEST);
+        let body = resp.text();
+        assert!(body.contains("last owner"));
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_non_member_cannot_leave(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let pm = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let pm_headers = add_auth_headers(&pm);
+
+        let owner = create_test_user(&pool, Role::StandardUser).await;
+        let outsider = create_test_user(&pool, Role::StandardUser).await;
+        let outsider_headers = add_auth_headers(&outsider);
+
+        // PM creates org
+        let resp = server
+            .post("/admin/api/v1/organizations")
+            .add_header(&pm_headers[0].0, &pm_headers[0].1)
+            .add_header(&pm_headers[1].0, &pm_headers[1].1)
+            .json(&json!({ "name": "private-org", "email": "org@example.com", "owner_id": owner.id }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::CREATED);
+        let org_id = resp.json::<serde_json::Value>()["id"].as_str().unwrap().to_string();
+
+        // Non-member tries to leave
+        let resp = server
+            .post(&format!("/admin/api/v1/organizations/{org_id}/leave"))
+            .add_header(&outsider_headers[0].0, &outsider_headers[0].1)
+            .add_header(&outsider_headers[1].0, &outsider_headers[1].1)
+            .await;
+        resp.assert_status(axum::http::StatusCode::NOT_FOUND);
+    }
 
     // ── Last-owner guard ─────────────────────────────────────────────────
 

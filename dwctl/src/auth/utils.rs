@@ -50,3 +50,57 @@ pub fn generate_random_display_name() -> String {
 
     format!("{} {} {}", adjective, noun, number)
 }
+
+/// Extract the domain part from an email address.
+/// Returns `None` if the email doesn't contain an `@`.
+pub fn email_domain(email: &str) -> Option<&str> {
+    email.rsplit_once('@').map(|(_, domain)| domain)
+}
+
+/// Returns `true` if the domain belongs to a personal/free email provider
+/// where auto-org creation would be inappropriate.
+pub fn is_personal_email_domain(domain: &str) -> bool {
+    const PERSONAL_DOMAINS: &[&str] = &[
+        // Major providers
+        "gmail.com",
+        "googlemail.com",
+        "hotmail.com",
+        "hotmail.co.uk",
+        "live.com",
+        "live.fr",
+        "outlook.com",
+        "msn.com",
+        "yahoo.com",
+        "yahoo.co.uk",
+        "yahoo.co.jp",
+        "ymail.com",
+        "aol.com",
+        "aim.com",
+        "icloud.com",
+        "me.com",
+        "mac.com",
+        "mail.com",
+        "zoho.com",
+        "yandex.com",
+        "163.com",
+        // Privacy-focused
+        "protonmail.com",
+        "protonmail.ch",
+        "proton.me",
+        "tutanota.com",
+        "tuta.com",
+        "fastmail.com",
+        // Regional/misc
+        "gmx.com",
+        "gmx.de",
+        "gmx.net",
+        // Privacy relays and aliases
+        "privaterelay.appleid.com",
+        "mozmail.com",
+        "duck.com",
+        "passmail.net",
+    ];
+
+    let lower = domain.to_lowercase();
+    PERSONAL_DOMAINS.contains(&lower.as_str())
+}

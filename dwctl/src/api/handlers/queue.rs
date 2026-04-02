@@ -41,9 +41,10 @@ pub async fn get_pending_request_counts<P: PoolProvider>(
     State(state): State<AppState<P>>,
     _: RequiresPermission<resource::System, operation::ReadAll>,
 ) -> Result<Json<PendingCountsByModelAndWindow>, Error> {
+    let config = state.current_config();
+
     // Call fusillade storage API to get pending request counts
-    let windows = state
-        .config
+    let windows = config
         .batches
         .allowed_completion_windows
         .iter()
