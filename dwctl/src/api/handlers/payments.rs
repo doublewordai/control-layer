@@ -89,14 +89,14 @@ async fn require_org_admin_and_resolve_target(
     conn: &mut sqlx::PgConnection,
 ) -> Result<crate::types::UserId, StatusCode> {
     if let Some(org_id) = user.active_organization {
-        let can_manage = permissions::can_manage_org_resource(user, org_id, conn)
-            .await
-            .map_err(|e| {
+        if !user.is_admin {
+            let can_manage = permissions::can_manage_org_resource(user, org_id, conn).await.map_err(|e| {
                 tracing::error!("Failed to check org permissions: {:?}", e);
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
-        if !can_manage {
-            return Err(StatusCode::FORBIDDEN);
+            if !can_manage {
+                return Err(StatusCode::FORBIDDEN);
+            }
         }
         Ok(org_id)
     } else {
@@ -691,18 +691,19 @@ pub async fn enable_auto_topup<P: PoolProvider>(
         }
     };
 
-    // Resolve target (org or individual) with permission check
-    let mut conn = state.db.write().acquire().await.map_err(|e| {
-        tracing::error!("Failed to acquire database connection: {:?}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-    let target_id = require_org_admin_and_resolve_target(&user, &mut conn).await?;
+    // Resolve target with permission check (short-lived connection)
+    let target_id = {
+        let mut conn = state.db.write().acquire().await.map_err(|e| {
+            tracing::error!("Failed to acquire database connection: {:?}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+        require_org_admin_and_resolve_target(&user, &mut conn).await?
+    };
 
     // Use the admin's personal payment info for Stripe operations
-    let customer_id = match &user.payment_provider_id {
-        Some(id) if !id.is_empty() => id.clone(),
+    let (customer_id, new_customer) = match &user.payment_provider_id {
+        Some(id) if !id.is_empty() => (id.clone(), false),
         _ => {
-            // No customer — create one so we can redirect to the billing portal
             let new_id = provider
                 .create_customer(&user.email, user.display_name.as_deref())
                 .await
@@ -710,24 +711,9 @@ pub async fn enable_auto_topup<P: PoolProvider>(
                     tracing::error!("Failed to create payment provider customer: {:?}", e);
                     StatusCode::INTERNAL_SERVER_ERROR
                 })?;
-
-            Users::new(&mut conn).set_payment_provider_id_if_empty(user.id, &new_id).await.map_err(|e| {
-                tracing::error!("Failed to save customer ID: {:?}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
-
-            new_id
+            (new_id, true)
         }
     };
-
-    // In org context, copy the admin's payment provider ID to the org so the
-    // auto-topup daemon can find it (it queries payment_provider_id on the org record)
-    if user.active_organization.is_some() {
-        Users::new(&mut conn).set_payment_provider_id_if_empty(target_id, &customer_id).await.map_err(|e| {
-            tracing::error!("Failed to copy payment provider ID to org: {:?}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-    }
 
     // Check if customer has an address (required for tax calculation)
     match provider.customer_has_address(&customer_id).await {
@@ -767,8 +753,30 @@ pub async fn enable_auto_topup<P: PoolProvider>(
                 auto_topup_monthly_limit: Some(body.monthly_limit),
             };
 
-            // Write auto-topup settings to the target (org or individual)
-            Users::new(&mut conn).update(target_id, &update).await.map_err(|e| {
+            // Persist all DB changes in one connection
+            let mut conn = state.db.write().acquire().await.map_err(|e| {
+                tracing::error!("Failed to acquire database connection: {:?}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+            let mut users = Users::new(&mut conn);
+
+            if new_customer {
+                users.set_payment_provider_id_if_empty(user.id, &customer_id).await.map_err(|e| {
+                    tracing::error!("Failed to save customer ID: {:?}", e);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?;
+            }
+
+            // In org context, copy the admin's payment provider ID to the org so the
+            // auto-topup daemon can find it (it queries payment_provider_id on the org record)
+            if user.active_organization.is_some() {
+                users.set_payment_provider_id_if_empty(target_id, &customer_id).await.map_err(|e| {
+                    tracing::error!("Failed to copy payment provider ID to org: {:?}", e);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?;
+            }
+
+            users.update(target_id, &update).await.map_err(|e| {
                 tracing::error!("Failed to enable auto top-up: {:?}", e);
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
@@ -824,10 +832,7 @@ pub async fn enable_auto_topup<P: PoolProvider>(
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn disable_auto_topup<P: PoolProvider>(
-    State(state): State<AppState<P>>,
-    user: CurrentUser,
-) -> Result<Response, StatusCode> {
+pub async fn disable_auto_topup<P: PoolProvider>(State(state): State<AppState<P>>, user: CurrentUser) -> Result<Response, StatusCode> {
     let mut conn = state.db.write().acquire().await.map_err(|e| {
         tracing::error!("Failed to acquire database connection: {:?}", e);
         StatusCode::INTERNAL_SERVER_ERROR
@@ -1455,9 +1460,7 @@ mod tests {
         let mut auth_headers = crate::test::utils::add_auth_headers(&user);
         auth_headers.push(("x-organization-id".to_string(), org.id.to_string()));
 
-        let app = Router::new()
-            .route("/auto-topup/enable", post(enable_auto_topup))
-            .with_state(state);
+        let app = Router::new().route("/auto-topup/enable", post(enable_auto_topup)).with_state(state);
 
         let server = TestServer::new(app).unwrap();
 
@@ -1488,13 +1491,10 @@ mod tests {
         assert_eq!(org_row.auto_topup_monthly_limit, Some(200.0));
 
         // Verify individual user was NOT modified
-        let user_row = sqlx::query!(
-            "SELECT auto_topup_amount, auto_topup_threshold FROM users WHERE id = $1",
-            user.id
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let user_row = sqlx::query!("SELECT auto_topup_amount, auto_topup_threshold FROM users WHERE id = $1", user.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(user_row.auto_topup_amount, None);
         assert_eq!(user_row.auto_topup_threshold, None);
     }
@@ -1576,13 +1576,10 @@ mod tests {
         response.assert_status(StatusCode::OK);
 
         // Verify org's auto-topup cleared
-        let org_row = sqlx::query!(
-            "SELECT auto_topup_amount, auto_topup_threshold FROM users WHERE id = $1",
-            org.id
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let org_row = sqlx::query!("SELECT auto_topup_amount, auto_topup_threshold FROM users WHERE id = $1", org.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(org_row.auto_topup_amount, None);
         assert_eq!(org_row.auto_topup_threshold, None);
     }
