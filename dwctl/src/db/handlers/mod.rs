@@ -60,6 +60,7 @@
 pub mod analytics;
 pub mod api_keys;
 pub mod capacity_reservations;
+pub mod connections;
 pub mod credits;
 pub mod deployments;
 pub mod groups;
@@ -73,6 +74,7 @@ pub mod users;
 pub mod webhooks;
 
 pub use capacity_reservations::BatchCapacityReservations;
+pub use connections::{Connections, SyncEntries, SyncOperations};
 pub use credits::Credits;
 pub use deployments::Deployments;
 pub use groups::Groups;

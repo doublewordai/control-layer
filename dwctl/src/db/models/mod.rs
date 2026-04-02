@@ -61,6 +61,7 @@
 //! ```
 
 pub mod api_keys;
+pub mod connections;
 pub mod credits;
 pub mod deployments;
 pub mod groups;

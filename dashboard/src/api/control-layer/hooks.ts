@@ -46,6 +46,9 @@ import type {
   OrganizationUpdateRequest,
   InviteMemberRequest,
   OrgMemberRole,
+  ConnectionCreateRequest,
+  TriggerSyncRequest,
+  ExternalFileListResponse,
 } from "./types";
 
 // Config hooks
@@ -1620,5 +1623,138 @@ export function useSubmitSupportRequest() {
     mutationKey: ["support", "submit"],
     mutationFn: (data: { subject: string; message: string }) =>
       dwctlApi.support.submitRequest(data),
+  });
+}
+
+// ===== CONNECTION HOOKS =====
+
+export function useConnections(kind?: string) {
+  return useQuery({
+    queryKey: queryKeys.connections.list(kind),
+    queryFn: () => dwctlApi.connections.list(kind),
+    select: (data) => data.data,
+  });
+}
+
+export function useCreateConnection() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationKey: ["connections", "create"],
+    mutationFn: (data: ConnectionCreateRequest) =>
+      dwctlApi.connections.create(data),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.connections.all });
+    },
+  });
+}
+
+export function useDeleteConnection() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationKey: ["connections", "delete"],
+    mutationFn: (connectionId: string) =>
+      dwctlApi.connections.delete(connectionId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.connections.all });
+    },
+  });
+}
+
+export function useTestConnection() {
+  return useMutation({
+    mutationKey: ["connections", "test"],
+    mutationFn: (connectionId: string) =>
+      dwctlApi.connections.test(connectionId),
+  });
+}
+
+export function useTriggerSync() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationKey: ["connections", "sync"],
+    mutationFn: ({
+      connectionId,
+      data,
+    }: {
+      connectionId: string;
+      data: TriggerSyncRequest;
+    }) => dwctlApi.connections.triggerSync(connectionId, data),
+    onSuccess: (_data, variables) => {
+      queryClient.invalidateQueries({
+        queryKey: queryKeys.connections.syncs(variables.connectionId),
+      });
+      // Invalidate synced-keys so file browser refreshes status
+      queryClient.invalidateQueries({
+        queryKey: [...queryKeys.connections.all, variables.connectionId, "synced-keys"],
+      });
+    },
+  });
+}
+
+export function useSyncs(connectionId: string) {
+  return useQuery({
+    queryKey: queryKeys.connections.syncs(connectionId),
+    queryFn: () => dwctlApi.connections.listSyncs(connectionId),
+    select: (data) => data.data,
+    enabled: !!connectionId,
+  });
+}
+
+export function useSync(connectionId: string, syncId: string) {
+  return useQuery({
+    queryKey: queryKeys.connections.sync(connectionId, syncId),
+    queryFn: () => dwctlApi.connections.getSync(connectionId, syncId),
+    enabled: !!connectionId && !!syncId,
+    refetchInterval: (query) => {
+      const status = query.state.data?.status;
+      // Poll while sync is in progress
+      if (status && !["completed", "failed", "cancelled"].includes(status)) {
+        return 2000;
+      }
+      return false;
+    },
+  });
+}
+
+export function useSyncEntries(connectionId: string, syncId: string) {
+  return useQuery({
+    queryKey: queryKeys.connections.syncEntries(connectionId, syncId),
+    queryFn: () => dwctlApi.connections.listSyncEntries(connectionId, syncId),
+    select: (data) => data.data,
+    enabled: !!connectionId && !!syncId,
+    refetchInterval: (query) => {
+      // query.state.data is pre-select (raw { data: SyncEntry[] })
+      const entries = query.state.data?.data;
+      if (!entries) return 2000; // Haven't loaded yet — keep polling
+      // Poll while any entries are still in progress
+      if (entries.some((e: { status: string }) => !["activated", "failed", "skipped"].includes(e.status))) {
+        return 2000;
+      }
+      return false;
+    },
+  });
+}
+
+export function useSyncedKeys(connectionId: string) {
+  return useQuery({
+    queryKey: [...queryKeys.connections.all, connectionId, "synced-keys"],
+    queryFn: () => dwctlApi.connections.listSyncedKeys(connectionId),
+    enabled: !!connectionId,
+  });
+}
+
+export function useConnectionFiles(
+  connectionId: string,
+  options?: { search?: string; cursor?: string; limit?: number },
+) {
+  return useQuery({
+    queryKey: queryKeys.connections.files(connectionId, {
+      search: options?.search,
+      cursor: options?.cursor,
+    }),
+    queryFn: () => dwctlApi.connections.listFiles(connectionId, options),
+    enabled: !!connectionId,
+    // Keep previous page visible while loading next page
+    placeholderData: keepPreviousData,
   });
 }

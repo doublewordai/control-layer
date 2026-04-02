@@ -152,4 +152,17 @@ export const queryKeys = {
     members: (orgId: string) =>
       ["organizations", "members", orgId] as const,
   },
+
+  // Connections
+  connections: {
+    all: ["connections"] as const,
+    list: (kind?: string) => ["connections", "list", kind] as const,
+    byId: (id: string) => ["connections", "byId", id] as const,
+    syncs: (connectionId: string) => ["connections", connectionId, "syncs"] as const,
+    sync: (connectionId: string, syncId: string) => ["connections", connectionId, "syncs", syncId] as const,
+    syncEntries: (connectionId: string, syncId: string) =>
+      ["connections", connectionId, "syncs", syncId, "entries"] as const,
+    files: (connectionId: string, options?: { search?: string; cursor?: string }) =>
+      ["connections", connectionId, "files", options] as const,
+  },
 } as const;

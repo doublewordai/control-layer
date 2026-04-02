@@ -143,9 +143,11 @@ fn install_crypto_provider() {
 pub mod api;
 pub mod auth;
 pub mod config;
+pub mod connections;
 mod crypto;
 pub mod db;
 mod email;
+pub mod encryption;
 mod error_enrichment;
 pub mod errors;
 mod leader_election;
@@ -1210,6 +1212,24 @@ pub async fn build_router(
         .route(
             "/groups/{id}/tool-sources/{source_id}",
             delete(api::handlers::tool_sources::detach_tool_source_from_group),
+        )
+        // Connections (external data sources)
+        .route("/connections", post(api::handlers::connections::create_connection))
+        .route("/connections", get(api::handlers::connections::list_connections))
+        .route("/connections/{connection_id}", get(api::handlers::connections::get_connection))
+        .route("/connections/{connection_id}", delete(api::handlers::connections::delete_connection))
+        .route("/connections/{connection_id}/test", post(api::handlers::connections::test_connection))
+        .route("/connections/{connection_id}/files", get(api::handlers::connections::list_connection_files))
+        .route("/connections/{connection_id}/synced-keys", get(api::handlers::connections::list_synced_keys))
+        .route("/connections/{connection_id}/sync", post(api::handlers::connections::trigger_sync))
+        .route("/connections/{connection_id}/syncs", get(api::handlers::connections::list_syncs))
+        .route(
+            "/connections/{connection_id}/syncs/{sync_id}",
+            get(api::handlers::connections::get_sync),
+        )
+        .route(
+            "/connections/{connection_id}/syncs/{sync_id}/entries",
+            get(api::handlers::connections::list_sync_entries),
         );
 
     let api_routes_with_state = api_routes.with_state(state.clone());
@@ -2081,9 +2101,20 @@ async fn setup_background_services(
         None
     };
 
-    // Build the underway task runner for background jobs (batch population, etc.)
+    // Build the underway task runner for background jobs (batch population, sync pipeline, etc.)
+    let encryption_key = config
+        .connections
+        .encryption_key
+        .as_deref()
+        .or(config.secret_key.as_deref())
+        .and_then(|s| encryption::derive_encryption_key(s).ok());
     let task_state = tasks::TaskState {
         request_manager: request_manager.clone(),
+        dwctl_pool: pool.clone(),
+        encryption_key,
+        ingest_file_job: None,
+        activate_batch_job: None,
+        create_batch_job: None,
     };
     let task_runner = Arc::new(tasks::TaskRunner::new(underway_pool, task_state).await?);
     for handle in task_runner.start(shutdown_token.clone()) {

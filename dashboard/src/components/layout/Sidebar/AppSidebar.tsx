@@ -19,6 +19,7 @@ import {
   Activity,
   Building,
   Check,
+  Cable,
 } from "lucide-react";
 import {
   useUser,
@@ -114,6 +115,7 @@ export function AppSidebar() {
       : []),
     { path: "/api-keys", icon: Key, label: "API Keys" },
     { path: "/usage", icon: Activity, label: "Usage" },
+    { path: "/connections", icon: Cable, label: "Connections" },
     { path: "/system", icon: Settings, label: "System" },
   ];
 

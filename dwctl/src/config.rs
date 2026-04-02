@@ -176,6 +176,9 @@ pub struct Config {
     pub onboarding_url: Option<String>,
     /// Email address where support requests are sent (default: "support@doubleword.ai")
     pub support_email: String,
+    /// External data source connections configuration
+    #[serde(default)]
+    pub connections: ConnectionsConfig,
 }
 
 /// Individual pool configuration with all SQLx parameters.
@@ -1571,6 +1574,58 @@ impl Default for AnalyticsConfig {
     }
 }
 
+/// External data source connections configuration.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ConnectionsConfig {
+    /// Encryption key for connection credentials (base64 or 32-byte string).
+    /// Falls back to `secret_key` if not set.
+    pub encryption_key: Option<String>,
+    /// Sync pipeline configuration.
+    pub sync: SyncPipelineConfig,
+}
+
+impl Default for ConnectionsConfig {
+    fn default() -> Self {
+        Self {
+            encryption_key: None,
+            sync: SyncPipelineConfig::default(),
+        }
+    }
+}
+
+/// Configuration for the sync ingestion/activation pipeline.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SyncPipelineConfig {
+    /// Maximum number of concurrent file ingestion jobs (default: 4).
+    pub max_concurrent_ingestions: usize,
+    /// Whether batch activation should respect SLA capacity reservations (default: true).
+    /// Set to false to activate batches immediately without capacity checks.
+    pub respect_capacity_reservations: bool,
+    /// Default completion window for sync-created batches (default: "24h").
+    pub default_completion_window: String,
+    /// Default endpoint for sync-created batches (default: "/v1/chat/completions").
+    pub default_endpoint: String,
+    /// Backoff in milliseconds when no capacity is available (default: 5000).
+    pub activation_retry_backoff_ms: u64,
+    /// Maximum activation retry attempts before failing (default: 720 = ~1hr at 5s).
+    pub activation_max_retries: u32,
+}
+
+impl Default for SyncPipelineConfig {
+    fn default() -> Self {
+        Self {
+            max_concurrent_ingestions: 4,
+            respect_capacity_reservations: true,
+            default_completion_window: "24h".to_string(),
+            default_endpoint: "/v1/chat/completions".to_string(),
+            activation_retry_backoff_ms: 5000,
+            activation_max_retries: 720,
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -1602,6 +1657,7 @@ impl Default for Config {
             onwards: OnwardsConfig::default(),
             onboarding_url: None,
             support_email: "support@doubleword.ai".to_string(),
+            connections: ConnectionsConfig::default(),
         }
     }
 }
