@@ -37,6 +37,13 @@ export const queryKeys = {
     }) => ["models", "metrics", options] as const,
   },
 
+  providerDisplayConfigs: {
+    all: ["providerDisplayConfigs"] as const,
+    query: () => ["providerDisplayConfigs", "query"] as const,
+    byKey: (providerKey: string) =>
+      ["providerDisplayConfigs", "byKey", providerKey] as const,
+  },
+
   // Groups
   groups: {
     all: ["groups"] as const,

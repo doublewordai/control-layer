@@ -1,5 +1,49 @@
 # Changelog
 
+## [8.33.0](https://github.com/doublewordai/control-layer/compare/v8.32.1...v8.33.0) (2026-04-02)
+
+
+### Features
+
+* add live reload for config.yaml ([#879](https://github.com/doublewordai/control-layer/issues/879)) ([7394715](https://github.com/doublewordai/control-layer/commit/73947151b95b8ca403eff6a33f8b851573516543))
+* add provider display configuration to model catalog ([#945](https://github.com/doublewordai/control-layer/issues/945)) ([ad14021](https://github.com/doublewordai/control-layer/commit/ad14021f92c7b6c13cad14b7f06b7dfdd6ad9ebd))
+
+## [8.32.1](https://github.com/doublewordai/control-layer/compare/v8.32.0...v8.32.1) (2026-03-31)
+
+
+### Bug Fixes
+
+* update personal domain list ([#943](https://github.com/doublewordai/control-layer/issues/943)) ([b29cd0a](https://github.com/doublewordai/control-layer/commit/b29cd0a7a1ada44ceec50467a8dbc9c08efd046e))
+
+## [8.32.0](https://github.com/doublewordai/control-layer/compare/v8.31.1...v8.32.0) (2026-03-31)
+
+
+### Features
+
+* org auto-enrollment ([#938](https://github.com/doublewordai/control-layer/issues/938)) ([2563db3](https://github.com/doublewordai/control-layer/commit/2563db35e29c20027b18fa27436ab5778a8e7ec9))
+* self serve orgs ([#936](https://github.com/doublewordai/control-layer/issues/936)) ([ab8b48f](https://github.com/doublewordai/control-layer/commit/ab8b48fcc9edc52ba9c17983ee7338aaba71675c))
+
+## [8.31.1](https://github.com/doublewordai/control-layer/compare/v8.31.0...v8.31.1) (2026-03-31)
+
+
+### Bug Fixes
+
+* Handle errors appearing in sse streams ([#934](https://github.com/doublewordai/control-layer/issues/934)) ([dce40fa](https://github.com/doublewordai/control-layer/commit/dce40faa9db51322de3f610ef1976e94cf26d9d5))
+
+## [8.31.0](https://github.com/doublewordai/control-layer/compare/v8.30.2...v8.31.0) (2026-03-31)
+
+
+### Features
+
+* migration to allow multiple orgs with same email ([#933](https://github.com/doublewordai/control-layer/issues/933)) ([f2f3a16](https://github.com/doublewordai/control-layer/commit/f2f3a169603849de03f60b4412ad7bd2cc925dc6))
+
+## [8.30.2](https://github.com/doublewordai/control-layer/compare/v8.30.1...v8.30.2) (2026-03-31)
+
+
+### Bug Fixes
+
+* bump fusillade 14.2.0 ([#931](https://github.com/doublewordai/control-layer/issues/931)) ([81d7b6b](https://github.com/doublewordai/control-layer/commit/81d7b6b7edde045f7530ce0800fb4b41cab70d56))
+
 ## [8.30.1](https://github.com/doublewordai/control-layer/compare/v8.30.0...v8.30.1) (2026-03-30)
 
 

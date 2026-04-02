@@ -86,6 +86,9 @@ import type {
   TriggerSyncRequest,
   ExternalFileListResponse,
   SyncedKey,
+  ProviderDisplayConfig,
+  ProviderDisplayConfigCreateRequest,
+  ProviderDisplayConfigUpdateRequest,
 } from "./types";
 import { ApiError } from "./errors";
 
@@ -484,6 +487,66 @@ const modelApi = {
         throw new Error(`Failed to remove component: ${response.status}`);
       }
     },
+  },
+};
+
+const providerDisplayConfigApi = {
+  async list(): Promise<ProviderDisplayConfig[]> {
+    const response = await fetch("/admin/api/v1/provider-display-configs");
+    if (!response.ok) {
+      throw new Error(`Failed to fetch provider display configs: ${response.status}`);
+    }
+    return response.json();
+  },
+
+  async create(data: ProviderDisplayConfigCreateRequest): Promise<ProviderDisplayConfig> {
+    const response = await fetch("/admin/api/v1/provider-display-configs", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data),
+    });
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new ApiError(
+        response.status,
+        errorText || `Failed to create provider display config: ${response.status}`,
+      );
+    }
+    return response.json();
+  },
+
+  async update(
+    providerKey: string,
+    data: ProviderDisplayConfigUpdateRequest,
+  ): Promise<ProviderDisplayConfig> {
+    const response = await fetch(
+      `/admin/api/v1/provider-display-configs/${encodeURIComponent(providerKey)}`,
+      {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(data),
+      },
+    );
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new ApiError(
+        response.status,
+        errorText || `Failed to update provider display config: ${response.status}`,
+      );
+    }
+    return response.json();
+  },
+
+  async delete(providerKey: string): Promise<void> {
+    const response = await fetch(
+      `/admin/api/v1/provider-display-configs/${encodeURIComponent(providerKey)}`,
+      {
+        method: "DELETE",
+      },
+    );
+    if (!response.ok) {
+      throw new Error(`Failed to delete provider display config: ${response.status}`);
+    }
   },
 };
 
@@ -1863,6 +1926,22 @@ const organizationsApi = {
     }
   },
 
+  async leave(orgId: string): Promise<void> {
+    const response = await fetch(
+      `/admin/api/v1/organizations/${orgId}/leave`,
+      {
+        method: "POST",
+      },
+    );
+    if (!response.ok) {
+      const error = await response.text();
+      throw new ApiError(
+        response.status,
+        `Failed to leave organization: ${error}`,
+      );
+    }
+  },
+
   async setActive(
     organizationId: string | null,
   ): Promise<SetActiveOrganizationResponse> {
@@ -2019,6 +2098,7 @@ const connectionsApi = {
 export const dwctlApi = {
   users: userApi,
   models: modelApi,
+  providerDisplayConfigs: providerDisplayConfigApi,
   endpoints: endpointApi,
   groups: groupApi,
   config: configApi,

@@ -97,6 +97,11 @@ const ModelInfo = lazy(() =>
     default: m.ModelInfo,
   })),
 );
+const ProviderDisplayConfigs = lazy(() =>
+  import("./components/features/models").then((m) => ({
+    default: m.ProviderDisplayConfigs,
+  })),
+);
 const Playground = lazy(() =>
   import("./components/features/playground").then((m) => ({
     default: m.Playground,
@@ -446,6 +451,18 @@ function AppRoutes() {
               <ProtectedRoute path="/models/manage">
                 <Suspense fallback={<RouteLoader />}>
                   <ModelInfo />
+                </Suspense>
+              </ProtectedRoute>
+            </AppLayout>
+          }
+        />
+        <Route
+          path="/models/manage/providers"
+          element={
+            <AppLayout>
+              <ProtectedRoute path="/models/manage">
+                <Suspense fallback={<RouteLoader />}>
+                  <ProviderDisplayConfigs />
                 </Suspense>
               </ProtectedRoute>
             </AppLayout>

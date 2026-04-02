@@ -45,6 +45,7 @@ pub async fn submit_support_request<P: PoolProvider>(
 ) -> Result<Json<SupportResponse>> {
     let subject = request.subject.trim();
     let message = request.message.trim();
+    let config = state.current_config();
 
     if subject.is_empty() || message.is_empty() {
         return Err(Error::BadRequest {
@@ -52,10 +53,10 @@ pub async fn submit_support_request<P: PoolProvider>(
         });
     }
 
-    let email_service = EmailService::new(&state.config)?;
+    let email_service = EmailService::new(&config)?;
     email_service
         .send_support_request(
-            &state.config.support_email,
+            &config.support_email,
             &current_user.email,
             current_user.display_name.as_deref(),
             subject,

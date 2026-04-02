@@ -14,6 +14,7 @@ pub mod inference_endpoints;
 pub mod organizations;
 pub mod pagination;
 pub mod probes;
+pub mod provider_display_configs;
 pub mod requests;
 pub mod tariffs;
 pub mod tool_sources;

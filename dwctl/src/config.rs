@@ -72,7 +72,13 @@ use figment::{
     providers::{Env, Format, Yaml},
 };
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    ffi::OsString,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 use url::Url;
 
 use crate::api::models::users::Role;
@@ -88,7 +94,7 @@ pub static ONWARDS_CONFIG_CHANGED_CHANNEL: &str = "auth_config_changed";
 pub struct Args {
     /// Path to configuration file
     #[arg(short = 'f', long, env = "DWCTL_CONFIG", default_value = "config.yaml")]
-    pub config: String,
+    pub config: PathBuf,
 
     /// Validate configuration and exit without starting the server.
     /// Useful for CI/CD pipelines to catch config errors before deployment.
@@ -1776,6 +1782,14 @@ impl ModelSource {
 
 impl Config {
     #[allow(clippy::result_large_err)]
+    pub fn load_from_path(path: impl AsRef<Path>) -> Result<Self, figment::Error> {
+        Self::load(&Args {
+            config: path.as_ref().to_path_buf(),
+            validate: false,
+        })
+    }
+
+    #[allow(clippy::result_large_err)]
     pub fn load(args: &Args) -> Result<Self, figment::Error> {
         let mut config: Self = Self::figment(args).extract()?;
 
@@ -2048,9 +2062,10 @@ impl Config {
     }
 
     pub fn figment(args: &Args) -> Figment {
+        let config_path: OsString = args.config.as_os_str().to_owned();
         Figment::new()
             // Load base config file
-            .merge(Yaml::file(&args.config))
+            .merge(Yaml::file(config_path))
             // Environment variables can still override specific values
             .merge(Env::prefixed("DWCTL_").split("__"))
             // Common DATABASE_URL and DATABASE_REPLICA_URL patterns
@@ -2091,7 +2106,7 @@ model_sources:
             )?;
 
             let args = Args {
-                config: "test.yaml".to_string(),
+                config: "test.yaml".into(),
                 validate: false,
             };
 
@@ -2130,7 +2145,7 @@ metadata:
             jail.set_env("DWCTL_PORT", "8080");
 
             let args = Args {
-                config: "test.yaml".to_string(),
+                config: "test.yaml".into(),
                 validate: false,
             };
 
@@ -2170,7 +2185,7 @@ auth:
             )?;
 
             let args = Args {
-                config: "test.yaml".to_string(),
+                config: "test.yaml".into(),
                 validate: false,
             };
 
@@ -2256,7 +2271,7 @@ batches:
             )?;
 
             let args = Args {
-                config: "test.yaml".to_string(),
+                config: "test.yaml".into(),
                 validate: false,
             };
 
@@ -2280,7 +2295,7 @@ secret_key: "test-secret-key"
             jail.set_env("DWCTL_BATCHES__FILES__BATCH_INSERT_SIZE", "7500");
 
             let args = Args {
-                config: "test.yaml".to_string(),
+                config: "test.yaml".into(),
                 validate: false,
             };
 
@@ -2479,7 +2494,7 @@ batches:
             )?;
 
             let args = Args {
-                config: "test.yaml".to_string(),
+                config: "test.yaml".into(),
                 validate: false,
             };
 
@@ -2503,7 +2518,7 @@ batches:
             )?;
 
             let args = Args {
-                config: "test.yaml".to_string(),
+                config: "test.yaml".into(),
                 validate: false,
             };
 
@@ -2527,7 +2542,7 @@ batches:
             )?;
 
             let args = Args {
-                config: "test.yaml".to_string(),
+                config: "test.yaml".into(),
                 validate: false,
             };
 
@@ -2551,7 +2566,7 @@ batches:
             )?;
 
             let args = Args {
-                config: "test.yaml".to_string(),
+                config: "test.yaml".into(),
                 validate: false,
             };
 
@@ -2577,7 +2592,7 @@ batches:
             )?;
 
             let args = Args {
-                config: "test.yaml".to_string(),
+                config: "test.yaml".into(),
                 validate: false,
             };
 
@@ -2603,7 +2618,7 @@ secret_key: "test-secret-key"
             jail.set_env("DWCTL_BATCHES__DEFAULT_THROUGHPUT", "75.5");
 
             let args = Args {
-                config: "test.yaml".to_string(),
+                config: "test.yaml".into(),
                 validate: false,
             };
 
@@ -2627,7 +2642,7 @@ batches:
             )?;
 
             let args = Args {
-                config: "test.yaml".to_string(),
+                config: "test.yaml".into(),
                 validate: false,
             };
             let result = Config::load(&args);
@@ -2651,7 +2666,7 @@ batches:
             )?;
 
             let args = Args {
-                config: "test.yaml".to_string(),
+                config: "test.yaml".into(),
                 validate: false,
             };
             let result = Config::load(&args);
@@ -2675,7 +2690,7 @@ batches:
             )?;
 
             let args = Args {
-                config: "test.yaml".to_string(),
+                config: "test.yaml".into(),
                 validate: false,
             };
             let config = Config::load(&args)?;
@@ -2713,7 +2728,7 @@ batches:
 "#,
             )?;
             let args = Args {
-                config: "test.yaml".to_string(),
+                config: "test.yaml".into(),
                 validate: false,
             };
             let config = Config::load(&args)?;
@@ -2737,7 +2752,7 @@ batches:
 "#,
             )?;
             let args = Args {
-                config: "test.yaml".to_string(),
+                config: "test.yaml".into(),
                 validate: false,
             };
             let result = Config::load(&args);
@@ -2761,7 +2776,7 @@ batches:
 "#,
             )?;
             let args = Args {
-                config: "test.yaml".to_string(),
+                config: "test.yaml".into(),
                 validate: false,
             };
             let result = Config::load(&args);
@@ -2785,7 +2800,7 @@ batches:
 "#,
             )?;
             let args = Args {
-                config: "test.yaml".to_string(),
+                config: "test.yaml".into(),
                 validate: false,
             };
             let config = Config::load(&args)?;
@@ -2806,7 +2821,7 @@ batches:
 "#,
             )?;
             let args = Args {
-                config: "test.yaml".to_string(),
+                config: "test.yaml".into(),
                 validate: false,
             };
             let config = Config::load(&args)?;
@@ -2835,7 +2850,7 @@ auth:
             jail.set_env("DWCTL_AUTH__NATIVE__SESSION__COOKIE_DOMAIN", "");
 
             let args = Args {
-                config: "test.yaml".to_string(),
+                config: "test.yaml".into(),
                 validate: false,
             };
 
@@ -2857,7 +2872,7 @@ secret_key: "test-secret-key"
             )?;
 
             let args = Args {
-                config: "test.yaml".to_string(),
+                config: "test.yaml".into(),
                 validate: false,
             };
 
@@ -2882,7 +2897,7 @@ background_services:
             )?;
 
             let args = Args {
-                config: "test.yaml".to_string(),
+                config: "test.yaml".into(),
                 validate: false,
             };
 
@@ -2907,7 +2922,7 @@ background_services:
             )?;
 
             let args = Args {
-                config: "test.yaml".to_string(),
+                config: "test.yaml".into(),
                 validate: false,
             };
 
@@ -2934,7 +2949,7 @@ background_services:
             )?;
 
             let args = Args {
-                config: "test.yaml".to_string(),
+                config: "test.yaml".into(),
                 validate: false,
             };
 
@@ -2961,7 +2976,7 @@ background_services:
             )?;
 
             let args = Args {
-                config: "test.yaml".to_string(),
+                config: "test.yaml".into(),
                 validate: false,
             };
 

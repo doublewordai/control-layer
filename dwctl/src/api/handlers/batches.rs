@@ -276,9 +276,10 @@ pub async fn create_batch<P: PoolProvider>(
     has_api_key: crate::auth::current_user::HasApiKey,
     Json(req): Json<CreateBatchRequest>,
 ) -> Result<(StatusCode, Json<BatchResponse>)> {
+    let config = state.current_config();
     // Validate completion_window against configured allowed values
-    if !state.config.batches.allowed_completion_windows.contains(&req.completion_window) {
-        let allowed: Vec<&str> = state.config.batches.allowed_completion_windows.iter().map(|w| w.as_str()).collect();
+    if !config.batches.allowed_completion_windows.contains(&req.completion_window) {
+        let allowed: Vec<&str> = config.batches.allowed_completion_windows.iter().map(|w| w.as_str()).collect();
 
         return Err(Error::BadRequest {
             message: format!("Unsupported completion_window. Allowed values: {}", allowed.join(", ")),
@@ -286,7 +287,7 @@ pub async fn create_batch<P: PoolProvider>(
     }
 
     // Validate endpoint
-    let supported_endpoints = &state.config.batches.allowed_url_paths;
+    let supported_endpoints = &config.batches.allowed_url_paths;
     if !supported_endpoints.iter().any(|endpoint| endpoint == &req.endpoint) {
         return Err(Error::BadRequest {
             message: format!(
@@ -497,7 +498,7 @@ pub async fn create_batch<P: PoolProvider>(
         &windows,
         &states,
         &model_aliases,
-        state.config.batches.relaxation_factor(&req.completion_window),
+        config.batches.relaxation_factor(&req.completion_window),
     )
     .await?;
 
@@ -660,6 +661,7 @@ async fn reserve_capacity_for_batch<P: PoolProvider>(
     relaxation_factor: f32,
 ) -> Result<Vec<Uuid>> {
     use crate::db::handlers::BatchCapacityReservations;
+    let config = state.current_config();
 
     let mut tx = state.db.write().begin().await.map_err(|e| Error::Internal {
         operation: format!("begin reservation transaction: {}", e),
@@ -716,7 +718,7 @@ async fn reserve_capacity_for_batch<P: PoolProvider>(
         file_model_counts,
         &pending_with_reservations,
         model_throughputs,
-        state.config.batches.default_throughput,
+        config.batches.default_throughput,
         completion_window,
         relaxation_factor,
     );
@@ -746,7 +748,7 @@ async fn reserve_capacity_for_batch<P: PoolProvider>(
         });
     }
 
-    let expires_at = Utc::now() + Duration::seconds(state.config.batches.reservation_ttl_secs);
+    let expires_at = Utc::now() + Duration::seconds(config.batches.reservation_ttl_secs);
 
     let mut rows = Vec::new();
     for (alias, model_id) in &model_pairs {
