@@ -24,6 +24,7 @@ import type {
   AddFundsRequest,
   Role,
   ModelType,
+  ProviderDisplayConfig,
 } from "../types";
 import usersDataRaw from "./users.json";
 import groupsDataRaw from "./groups.json";
@@ -93,6 +94,18 @@ const modelsData = modelsDataRaw.data as Model[];
 const apiKeysData = apiKeysDataRaw as ApiKey[];
 const transactionsData = transactionsDataRaw as Transaction[];
 const organizationsData = organizationsDataRaw as unknown as Organization[];
+let providerDisplayConfigsData: ProviderDisplayConfig[] = [
+  {
+    provider_key: "openai",
+    display_name: "OpenAI",
+    icon: "openai",
+    model_count: 2,
+    configured: true,
+    created_by: "550e8400-e29b-41d4-a716-446655440000",
+    created_at: "2026-03-31T09:00:00Z",
+    updated_at: "2026-03-31T09:00:00Z",
+  },
+];
 
 // Mock organization members
 const orgMembersData: Record<string, OrganizationMember[]> = {
@@ -1032,6 +1045,7 @@ export const handlers = [
       url: string;
       event_types?: string[];
       description?: string;
+      scope?: string;
     };
     const now = new Date().toISOString();
     return HttpResponse.json(
@@ -1042,6 +1056,7 @@ export const handlers = [
         enabled: true,
         event_types: body.event_types || null,
         description: body.description || null,
+        scope: body.scope || "own",
         created_at: now,
         updated_at: now,
         disabled_at: null,
@@ -1062,6 +1077,7 @@ export const handlers = [
         enabled: body.enabled !== undefined ? body.enabled : true,
         event_types: body.event_types !== undefined ? body.event_types : null,
         description: body.description !== undefined ? body.description : null,
+        scope: "own",
         created_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
         disabled_at: null,
@@ -1083,6 +1099,7 @@ export const handlers = [
         enabled: true,
         event_types: null,
         description: null,
+        scope: "own",
         created_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
         disabled_at: null,
@@ -1090,6 +1107,62 @@ export const handlers = [
       });
     },
   ),
+
+  // Provider display configs API
+  http.get("/admin/api/v1/provider-display-configs", () => {
+    return HttpResponse.json(providerDisplayConfigsData);
+  }),
+
+  http.get("/admin/api/v1/provider-display-configs/:providerKey", ({ params }) => {
+    const provider = providerDisplayConfigsData.find((item) => item.provider_key === params.providerKey);
+    if (!provider) {
+      return HttpResponse.json(
+        { error: "Provider display config not found" },
+        { status: 404 },
+      );
+    }
+    return HttpResponse.json(provider);
+  }),
+
+  http.post("/admin/api/v1/provider-display-configs", async ({ request }) => {
+    const body = (await request.json()) as Partial<ProviderDisplayConfig>;
+    const created: ProviderDisplayConfig = {
+      provider_key: body.provider_key || "provider",
+      display_name: body.display_name || body.provider_key || "Provider",
+      icon: body.icon || null,
+      model_count: 0,
+      configured: true,
+      created_by: usersData[0]?.id || crypto.randomUUID(),
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+    providerDisplayConfigsData = [...providerDisplayConfigsData, created];
+    return HttpResponse.json(created, { status: 201 });
+  }),
+
+  http.patch("/admin/api/v1/provider-display-configs/:providerKey", async ({ params, request }) => {
+    const index = providerDisplayConfigsData.findIndex((item) => item.provider_key === params.providerKey);
+    if (index === -1) {
+      return HttpResponse.json(
+        { error: "Provider display config not found" },
+        { status: 404 },
+      );
+    }
+    const body = (await request.json()) as Partial<ProviderDisplayConfig>;
+    providerDisplayConfigsData[index] = {
+      ...providerDisplayConfigsData[index],
+      ...body,
+      updated_at: new Date().toISOString(),
+    };
+    return HttpResponse.json(providerDisplayConfigsData[index]);
+  }),
+
+  http.delete("/admin/api/v1/provider-display-configs/:providerKey", ({ params }) => {
+    providerDisplayConfigsData = providerDisplayConfigsData.filter(
+      (item) => item.provider_key !== params.providerKey,
+    );
+    return new HttpResponse(null, { status: 204 });
+  }),
 
   // Models API
   http.get("/admin/api/v1/models", ({ request }) => {

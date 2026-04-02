@@ -1,11 +1,15 @@
 import { useState } from "react";
+import { useNavigate } from "react-router-dom";
 import {
   useOrganizationMembers,
   useInviteMember,
   useCancelInvite,
   useUpdateMemberRole,
   useRemoveMember,
+  useLeaveOrganization,
+  useUser,
 } from "@/api/control-layer/hooks";
+import { useOrganizationContext } from "@/contexts";
 import type { OrgMemberRole, OrganizationMember } from "@/api/control-layer/types";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -25,7 +29,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { UserAvatar } from "@/components/ui";
-import { UserPlus, Trash2, Mail, X } from "lucide-react";
+import { UserPlus, Trash2, Mail, X, LogOut } from "lucide-react";
 import { toast } from "sonner";
 
 interface MemberManagementProps {
@@ -34,18 +38,23 @@ interface MemberManagementProps {
 }
 
 export function MemberManagement({ organizationId, readOnly = false }: MemberManagementProps) {
+  const navigate = useNavigate();
+  const { setActiveOrganization } = useOrganizationContext();
   const { data: members = [], isLoading } =
     useOrganizationMembers(organizationId);
+  const { data: currentUser } = useUser("current");
   const inviteMember = useInviteMember();
   const cancelInvite = useCancelInvite();
   const updateRole = useUpdateMemberRole();
   const removeMember = useRemoveMember();
+  const leaveOrg = useLeaveOrganization();
 
   const [showAddForm, setShowAddForm] = useState(false);
   const [email, setEmail] = useState("");
   const [selectedRole, setSelectedRole] = useState<OrgMemberRole>("member");
   const [memberToRemove, setMemberToRemove] =
     useState<OrganizationMember | null>(null);
+  const [showLeaveConfirm, setShowLeaveConfirm] = useState(false);
 
   const activeMembers = members.filter((m) => m.status === "active");
   const pendingInvites = members.filter((m) => m.status === "pending");
@@ -101,6 +110,20 @@ export function MemberManagement({ organizationId, readOnly = false }: MemberMan
     }
   };
 
+  const handleLeave = async () => {
+    try {
+      await leaveOrg.mutateAsync(organizationId);
+      await setActiveOrganization(null);
+      toast.success("You have left the organization");
+      setShowLeaveConfirm(false);
+      navigate("/");
+    } catch (error) {
+      toast.error(
+        error instanceof Error ? error.message : "Failed to leave organization",
+      );
+    }
+  };
+
   const handleRemoveMember = async () => {
     if (!memberToRemove || !memberToRemove.user) return;
 
@@ -128,174 +151,190 @@ export function MemberManagement({ organizationId, readOnly = false }: MemberMan
 
   return (
     <div className="space-y-4">
-      <div className="flex items-center justify-between">
-        <h3 className="text-lg font-semibold">
-          Members ({activeMembers.length})
-        </h3>
-        {!readOnly && (
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => setShowAddForm(!showAddForm)}
-          >
-            <UserPlus className="h-4 w-4 mr-2" />
-            Invite Member
-          </Button>
-        )}
-      </div>
-
-      {showAddForm && (
-        <div className="border rounded-lg p-4 space-y-3 bg-muted/30">
-          <div className="grid gap-2">
-            <Input
-              type="email"
-              placeholder="Enter email address..."
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
-            />
-          </div>
-          <div className="flex items-center gap-2">
-            <Select
-              value={selectedRole}
-              onValueChange={(v) => setSelectedRole(v as OrgMemberRole)}
-            >
-              <SelectTrigger className="w-32">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="member">Member</SelectItem>
-                <SelectItem value="admin">Admin</SelectItem>
-                <SelectItem value="owner">Owner</SelectItem>
-              </SelectContent>
-            </Select>
-            <Button
-              size="sm"
-              onClick={handleInviteMember}
-              disabled={!email || inviteMember.isPending}
-            >
-              {inviteMember.isPending ? "Sending..." : "Send Invite"}
-            </Button>
-            <Button
-              size="sm"
-              variant="ghost"
-              onClick={() => {
-                setShowAddForm(false);
-                setEmail("");
-                setSelectedRole("member");
-              }}
-            >
-              Cancel
-            </Button>
-          </div>
-        </div>
-      )}
-
-      {/* Active Members */}
-      <div className="border rounded-lg divide-y">
-        {activeMembers.map((member) =>
-          member.user && (
-            <div
-              key={member.id}
-              className="flex items-center justify-between px-4 py-3"
-            >
-              <div className="flex items-center gap-3">
-                <UserAvatar user={member.user} size="md" />
-                <div>
-                  <p className="text-sm font-medium">
-                    {member.user.display_name || member.user.username}
-                  </p>
-                  <p className="text-xs text-muted-foreground">
-                    {member.user.email}
-                  </p>
-                </div>
-              </div>
-              <div className="flex items-center gap-2">
-                {readOnly ? (
-                  <span className="text-xs text-muted-foreground capitalize px-2 py-1 bg-muted rounded">
-                    {member.role}
-                  </span>
-                ) : (
-                  <>
-                    <Select
-                      value={member.role}
-                      onValueChange={(v) =>
-                        handleRoleChange(member.user!.id, v as OrgMemberRole)
-                      }
-                    >
-                      <SelectTrigger className="w-28 h-8 text-xs">
-                        <SelectValue />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="member">Member</SelectItem>
-                        <SelectItem value="admin">Admin</SelectItem>
-                        <SelectItem value="owner">Owner</SelectItem>
-                      </SelectContent>
-                    </Select>
-                    <button
-                      onClick={() => setMemberToRemove(member)}
-                      className="h-8 w-8 p-0 rounded text-red-600 hover:text-red-700 hover:bg-red-50 transition-all flex items-center justify-center"
-                      title="Remove member"
-                    >
-                      <Trash2 className="h-4 w-4" />
-                    </button>
-                  </>
-                )}
-              </div>
-            </div>
-          ),
-        )}
-        {activeMembers.length === 0 && (
-          <div className="px-4 py-8 text-center text-muted-foreground">
-            No members yet
-          </div>
-        )}
-      </div>
-
-      {/* Pending Invites */}
-      {pendingInvites.length > 0 && (
-        <div className="space-y-2">
-          <h4 className="text-sm font-medium text-muted-foreground">
-            Pending Invites ({pendingInvites.length})
+      <div className="bg-white rounded-lg shadow-sm border border-gray-200 p-6">
+        <div className="flex items-center justify-between mb-4">
+          <h4 className="text-lg font-medium text-gray-900">
+            Members ({activeMembers.length})
           </h4>
-          <div className="border rounded-lg divide-y">
-            {pendingInvites.map((member) => (
+          {!readOnly && (
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setShowAddForm(!showAddForm)}
+            >
+              <UserPlus className="h-4 w-4 mr-2" />
+              Invite Member
+            </Button>
+          )}
+        </div>
+
+        {showAddForm && (
+          <div className="border rounded-lg p-4 space-y-3 bg-muted/30 mb-4">
+            <div className="grid gap-2">
+              <Input
+                type="email"
+                placeholder="Enter email address..."
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+              />
+            </div>
+            <div className="flex items-center gap-2">
+              <Select
+                value={selectedRole}
+                onValueChange={(v) => setSelectedRole(v as OrgMemberRole)}
+              >
+                <SelectTrigger className="w-32">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="member">Member</SelectItem>
+                  <SelectItem value="admin">Admin</SelectItem>
+                  <SelectItem value="owner">Owner</SelectItem>
+                </SelectContent>
+              </Select>
+              <Button
+                size="sm"
+                onClick={handleInviteMember}
+                disabled={!email || inviteMember.isPending}
+              >
+                {inviteMember.isPending ? "Sending..." : "Send Invite"}
+              </Button>
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() => {
+                  setShowAddForm(false);
+                  setEmail("");
+                  setSelectedRole("member");
+                }}
+              >
+                Cancel
+              </Button>
+            </div>
+          </div>
+        )}
+
+        {/* Active Members */}
+        <div className="divide-y divide-gray-200">
+          {activeMembers.map((member) =>
+            member.user && (
               <div
                 key={member.id}
-                className="flex items-center justify-between px-4 py-3"
+                className="flex items-center justify-between py-3"
               >
                 <div className="flex items-center gap-3">
-                  <div className="h-8 w-8 rounded-full bg-muted flex items-center justify-center">
-                    <Mail className="h-4 w-4 text-muted-foreground" />
-                  </div>
+                  <UserAvatar user={member.user} size="md" />
                   <div>
-                    <p className="text-sm font-medium">
-                      {member.invite_email}
+                    <p className="text-sm font-medium text-gray-900">
+                      {member.user.display_name || member.user.username}
                     </p>
-                    <span className="text-xs bg-amber-100 text-amber-800 dark:bg-amber-900/30 dark:text-amber-400 px-1.5 py-0.5 rounded">
-                      Pending
-                    </span>
+                    <p className="text-xs text-gray-500">
+                      {member.user.email}
+                    </p>
                   </div>
                 </div>
                 <div className="flex items-center gap-2">
-                  <span className="text-xs text-muted-foreground capitalize">
-                    {member.role}
-                  </span>
-                  {!readOnly && (
-                    <button
-                      onClick={() => handleCancelInvite(member)}
-                      className="h-8 w-8 p-0 rounded text-red-600 hover:text-red-700 hover:bg-red-50 transition-all flex items-center justify-center"
-                      title="Cancel invite"
-                      disabled={cancelInvite.isPending}
-                    >
-                      <X className="h-4 w-4" />
-                    </button>
+                  {member.user?.id === currentUser?.id ? (
+                    <>
+                      <span className="text-xs text-muted-foreground capitalize px-2 py-1 bg-muted rounded">
+                        {member.role}
+                      </span>
+                      <button
+                        onClick={() => setShowLeaveConfirm(true)}
+                        className="h-8 px-2 rounded text-red-600 hover:text-red-700 hover:bg-red-50 transition-all flex items-center gap-1 text-xs"
+                        title="Leave organization"
+                      >
+                        <LogOut className="h-3.5 w-3.5" />
+                        Leave
+                      </button>
+                    </>
+                  ) : readOnly ? (
+                    <span className="text-xs text-muted-foreground capitalize px-2 py-1 bg-muted rounded">
+                      {member.role}
+                    </span>
+                  ) : (
+                    <>
+                      <Select
+                        value={member.role}
+                        onValueChange={(v) =>
+                          handleRoleChange(member.user!.id, v as OrgMemberRole)
+                        }
+                      >
+                        <SelectTrigger className="w-28 h-8 text-xs">
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="member">Member</SelectItem>
+                          <SelectItem value="admin">Admin</SelectItem>
+                          <SelectItem value="owner">Owner</SelectItem>
+                        </SelectContent>
+                      </Select>
+                      <button
+                        onClick={() => setMemberToRemove(member)}
+                        className="h-8 w-8 p-0 rounded text-red-600 hover:text-red-700 hover:bg-red-50 transition-all flex items-center justify-center"
+                        title="Remove member"
+                      >
+                        <Trash2 className="h-4 w-4" />
+                      </button>
+                    </>
                   )}
                 </div>
               </div>
-            ))}
-          </div>
+            ),
+          )}
+          {activeMembers.length === 0 && (
+            <div className="py-8 text-center text-gray-500">
+              No members yet
+            </div>
+          )}
         </div>
-      )}
+
+        {/* Pending Invites */}
+        {pendingInvites.length > 0 && (
+          <>
+            <h5 className="text-sm font-medium text-gray-500 uppercase tracking-wide mt-6 mb-3">
+              Pending Invites ({pendingInvites.length})
+            </h5>
+            <div className="divide-y divide-gray-200">
+              {pendingInvites.map((member) => (
+                <div
+                  key={member.id}
+                  className="flex items-center justify-between py-3"
+                >
+                  <div className="flex items-center gap-3">
+                    <div className="h-8 w-8 rounded-full bg-gray-100 flex items-center justify-center">
+                      <Mail className="h-4 w-4 text-gray-500" />
+                    </div>
+                    <div>
+                      <p className="text-sm font-medium text-gray-900">
+                        {member.invite_email}
+                      </p>
+                      <span className="text-xs bg-amber-100 text-amber-800 dark:bg-amber-900/30 dark:text-amber-400 px-1.5 py-0.5 rounded">
+                        Pending
+                      </span>
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs text-gray-500 capitalize">
+                      {member.role}
+                    </span>
+                    {!readOnly && (
+                      <button
+                        onClick={() => handleCancelInvite(member)}
+                        className="h-8 w-8 p-0 rounded text-red-600 hover:text-red-700 hover:bg-red-50 transition-all flex items-center justify-center"
+                        title="Cancel invite"
+                        disabled={cancelInvite.isPending}
+                      >
+                        <X className="h-4 w-4" />
+                      </button>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </>
+        )}
+      </div>
 
       <Dialog
         open={!!memberToRemove}
@@ -323,6 +362,36 @@ export function MemberManagement({ organizationId, readOnly = false }: MemberMan
               disabled={removeMember.isPending}
             >
               {removeMember.isPending ? "Removing..." : "Remove"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={showLeaveConfirm}
+        onOpenChange={(open) => !open && setShowLeaveConfirm(false)}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Leave Organization</DialogTitle>
+            <DialogDescription>
+              Are you sure you want to leave this organization? Your
+              organization API keys will be deleted.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => setShowLeaveConfirm(false)}
+            >
+              Cancel
+            </Button>
+            <Button
+              variant="destructive"
+              onClick={handleLeave}
+              disabled={leaveOrg.isPending}
+            >
+              {leaveOrg.isPending ? "Leaving..." : "Leave"}
             </Button>
           </DialogFooter>
         </DialogContent>

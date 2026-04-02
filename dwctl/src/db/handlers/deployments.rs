@@ -147,6 +147,7 @@ struct DeployedModel {
     pub id: DeploymentId,
     pub model_name: String,
     pub alias: String,
+    pub display_name: Option<String>,
     pub description: Option<String>,
     pub r#type: Option<String>,
     pub capabilities: Option<Vec<String>>,
@@ -210,6 +211,7 @@ impl From<(Option<ModelType>, DeployedModel)> for DeploymentDBResponse {
             id: m.id,
             model_name: m.model_name,
             alias: m.alias,
+            display_name: m.display_name,
             description: m.description,
             model_type,
             capabilities: m.capabilities,
@@ -281,7 +283,7 @@ impl<'c> Repository for Deployments<'c> {
             DeployedModel,
             r#"
             INSERT INTO deployed_models (
-                model_name, alias, description, type, capabilities, created_by, hosted_on, created_at, updated_at,
+                model_name, alias, display_name, description, type, capabilities, created_by, hosted_on, created_at, updated_at,
                 requests_per_second, burst_size, capacity, batch_capacity, throughput,
                 downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token,
                 downstream_hourly_rate, downstream_input_token_cost_ratio,
@@ -290,11 +292,12 @@ impl<'c> Repository for Deployments<'c> {
                 sanitize_responses, trusted, open_responses_adapter, allowed_batch_completion_windows,
                 metadata
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32)
             RETURNING *
             "#,
             request.model_name.trim(),
             request.alias.trim(),
+            request.display_name.as_deref(),
             request.description,
             model_type_str,
             request.capabilities.as_ref().map(|caps| caps.as_slice()),
@@ -342,7 +345,7 @@ impl<'c> Repository for Deployments<'c> {
     async fn get_by_id(&mut self, id: Self::Id) -> Result<Option<Self::Response>> {
         let model = sqlx::query_as!(
             DeployedModel,
-            "SELECT id, model_name, alias, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_with_replacement, fallback_max_attempts, sanitize_responses, trusted, open_responses_adapter, allowed_batch_completion_windows, metadata FROM deployed_models WHERE id = $1",
+            "SELECT id, model_name, alias, display_name, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_with_replacement, fallback_max_attempts, sanitize_responses, trusted, open_responses_adapter, allowed_batch_completion_windows, metadata FROM deployed_models WHERE id = $1",
             id
         )
             .fetch_optional(&mut *self.db)
@@ -367,7 +370,7 @@ impl<'c> Repository for Deployments<'c> {
 
         let deployments = sqlx::query_as!(
             DeployedModel,
-            "SELECT id, model_name, alias, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_with_replacement, fallback_max_attempts, sanitize_responses, trusted, open_responses_adapter, allowed_batch_completion_windows, metadata FROM deployed_models WHERE id = ANY($1)",
+            "SELECT id, model_name, alias, display_name, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_with_replacement, fallback_max_attempts, sanitize_responses, trusted, open_responses_adapter, allowed_batch_completion_windows, metadata FROM deployed_models WHERE id = ANY($1)",
             ids.as_slice()
         )
             .fetch_all(&mut *self.db)
@@ -542,6 +545,8 @@ impl<'c> Repository for Deployments<'c> {
                 ELSE metadata
             END,
 
+            display_name = COALESCE($48, display_name),
+
             updated_at = NOW()
         WHERE id = $1
         RETURNING *
@@ -607,6 +612,7 @@ impl<'c> Repository for Deployments<'c> {
                 .as_ref()
                 .map(|m| serde_json::to_value(m).unwrap_or_else(|_| serde_json::json!({})))
                 .unwrap_or_else(|| serde_json::json!({})) as serde_json::Value, // $47
+            request.display_name.as_deref(),    // $48
         )
         .fetch_one(&mut *self.db)
         .await?;
@@ -3503,7 +3509,7 @@ mod tests {
             assert_eq!(b_rules[0].action, "redirect");
 
             // model_c has no rules (absent key)
-            assert!(map.get(&model_c.id).is_none());
+            assert!(!map.contains_key(&model_c.id));
 
             tx.commit().await.unwrap();
         }
@@ -3799,11 +3805,7 @@ mod tests {
         let filter = DeploymentFilter::new(0, 100).with_provider("openai".to_string());
         let models = repo.list(&filter).await.unwrap();
         assert!(models.iter().any(|m| m.id == openai_model.id));
-        assert!(models.iter().all(|m| {
-            // Models matching the filter should have OpenAI provider
-            // (other models without metadata won't match anyway)
-            m.id != openai_model.id || m.id == openai_model.id
-        }));
+        assert_eq!(models.len(), 1, "provider filter should only return the OpenAI model");
         // Verify the anthropic model is not returned
         assert!(!models.iter().any(|m| m.alias == "provider-filter-anthropic"));
     }

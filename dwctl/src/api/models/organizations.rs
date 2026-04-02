@@ -6,13 +6,14 @@ use crate::api::models::users::UserResponse;
 use crate::types::UserId;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_with::rust::double_option;
 use utoipa::{IntoParams, ToSchema};
 
 /// Request body for creating a new organization
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct OrganizationCreate {
-    /// Unique slug/handle for the organization (becomes username)
-    #[schema(example = "acme-corp")]
+    /// Organization domain or unique identifier (becomes username, used for domain-based auto-join)
+    #[schema(example = "acme.com")]
     pub name: String,
     /// Organization contact email (for billing, notifications)
     #[schema(example = "admin@acme.com")]
@@ -32,6 +33,13 @@ pub struct OrganizationUpdate {
     pub display_name: Option<String>,
     /// New contact email
     pub email: Option<String>,
+    /// Whether batch completion/failure email notifications are enabled
+    pub batch_notifications_enabled: Option<bool>,
+    /// Low balance notification threshold in dollars
+    /// (e.g. 2.0 means notify when balance drops below $2), set to null to disable.
+    /// Omit entirely to leave unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
+    pub low_balance_threshold: Option<Option<f32>>,
 }
 
 /// Full organization details returned by the API.

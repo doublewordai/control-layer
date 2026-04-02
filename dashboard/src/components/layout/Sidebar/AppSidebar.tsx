@@ -19,6 +19,7 @@ import {
   Activity,
   Building,
   Check,
+  Plus,
 } from "lucide-react";
 import {
   useUser,
@@ -31,6 +32,7 @@ import { useAuthorization } from "../../../utils";
 import { useAuth } from "../../../contexts/auth";
 import { useSettings, useOrganizationContext } from "../../../contexts";
 import { SupportRequestModal } from "../../modals";
+import { CreateOrganizationModal } from "../../features/organizations/CreateOrganizationModal";
 import type { FeatureFlags } from "../../../contexts/settings/types";
 import onwardsLogo from "../../../assets/onwards-logo.svg";
 import {
@@ -87,6 +89,7 @@ export function AppSidebar() {
     useOrganizationContext();
   const { data: config } = useConfig();
   const [isSupportModalOpen, setIsSupportModalOpen] = useState(false);
+  const [isCreateOrgModalOpen, setIsCreateOrgModalOpen] = useState(false);
 
   const canManageModels = hasPermission("manage-models");
 
@@ -154,7 +157,11 @@ export function AppSidebar() {
                 // Platform managers get collapsible Models section with sub-items
                 if (item.path === "/models" && canManageModels) {
                   const isManageModelsActive =
-                    location.pathname.startsWith("/models/manage");
+                    location.pathname === "/models/manage" ||
+                    (location.pathname.startsWith("/models/manage/") &&
+                      location.pathname !== "/models/manage/providers");
+                  const isManageProvidersActive =
+                    location.pathname === "/models/manage/providers";
                   const isEndpointsActive =
                     location.pathname === "/endpoints";
                   return (
@@ -198,6 +205,21 @@ export function AppSidebar() {
                               >
                                 <NavLink to="/models/manage">
                                   Manage Models
+                                </NavLink>
+                              </SidebarMenuSubButton>
+                            </SidebarMenuSubItem>
+                            <SidebarMenuSubItem>
+                              <SidebarMenuSubButton
+                                asChild
+                                isActive={isManageProvidersActive}
+                                className={
+                                  isManageProvidersActive
+                                    ? "bg-sidebar-accent! text-sidebar-accent-foreground!"
+                                    : "hover:bg-sidebar-border/50 hover:text-sidebar-foreground"
+                                }
+                              >
+                                <NavLink to="/models/manage/providers">
+                                  Manage Providers
                                 </NavLink>
                               </SidebarMenuSubButton>
                             </SidebarMenuSubItem>
@@ -322,9 +344,13 @@ export function AppSidebar() {
                       )}
                     </DropdownMenuItem>
                   ))}
-                  <DropdownMenuSeparator />
                 </>
               )}
+            <DropdownMenuItem onClick={() => setIsCreateOrgModalOpen(true)}>
+              <Plus className="w-4 h-4 mr-2" />
+              New Organization
+            </DropdownMenuItem>
+            <DropdownMenuSeparator />
             <DropdownMenuItem onClick={() => navigate("/profile")}>
               <User className="w-4 h-4 mr-2" />
               Profile
@@ -348,6 +374,11 @@ export function AppSidebar() {
       <SupportRequestModal
         isOpen={isSupportModalOpen}
         onClose={() => setIsSupportModalOpen(false)}
+      />
+      <CreateOrganizationModal
+        isOpen={isCreateOrgModalOpen}
+        onClose={() => setIsCreateOrgModalOpen(false)}
+        isPlatformManager={hasPermission("users-groups")}
       />
     </Sidebar>
   );

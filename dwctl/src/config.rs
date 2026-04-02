@@ -296,6 +296,15 @@ pub fn default_outlet_component() -> ComponentDb {
     }
 }
 
+/// Default underway task worker pool settings (small — only needs PgListener + task processing)
+pub fn default_underway_pool() -> PoolSettings {
+    PoolSettings {
+        max_connections: 100,
+        min_connections: 0,
+        ..Default::default()
+    }
+}
+
 /// Database configuration.
 ///
 /// Supports either an embedded PostgreSQL instance (for development) or an external
@@ -327,6 +336,10 @@ pub enum DatabaseConfig {
         /// Outlet request logging database configuration
         #[serde(default = "default_outlet_component")]
         outlet: ComponentDb,
+        /// Underway task worker pool (separate from main because the worker
+        /// holds long-lived PgListener connections)
+        #[serde(default = "default_underway_pool")]
+        underway_pool: PoolSettings,
     },
     /// Use external PostgreSQL database
     External {
@@ -348,6 +361,10 @@ pub enum DatabaseConfig {
         /// Outlet request logging database configuration
         #[serde(default = "default_outlet_component")]
         outlet: ComponentDb,
+        /// Underway task worker pool (separate from main because the worker
+        /// holds long-lived PgListener connections)
+        #[serde(default = "default_underway_pool")]
+        underway_pool: PoolSettings,
     },
 }
 
@@ -363,6 +380,7 @@ impl Default for DatabaseConfig {
                 replica_pool: None,
                 fusillade: default_fusillade_component(),
                 outlet: default_outlet_component(),
+                underway_pool: default_underway_pool(),
             }
         }
         #[cfg(not(feature = "embedded-db"))]
@@ -374,6 +392,7 @@ impl Default for DatabaseConfig {
                 replica_pool: None,
                 fusillade: default_fusillade_component(),
                 outlet: default_outlet_component(),
+                underway_pool: default_underway_pool(),
             }
         }
     }
@@ -447,6 +466,14 @@ impl DatabaseConfig {
         match self {
             DatabaseConfig::Embedded { outlet, .. } => outlet,
             DatabaseConfig::External { outlet, .. } => outlet,
+        }
+    }
+
+    /// Get the underway task worker pool settings
+    pub fn underway_pool_settings(&self) -> &PoolSettings {
+        match self {
+            DatabaseConfig::Embedded { underway_pool, .. } => underway_pool,
+            DatabaseConfig::External { underway_pool, .. } => underway_pool,
         }
     }
 }
@@ -1133,6 +1160,36 @@ pub struct DaemonConfig {
     /// Example: `["/v1/chat/completions", "/v1/completions"]`
     #[serde(default)]
     pub streamable_endpoints: Vec<String>,
+
+    /// Weight controlling how much SLA urgency influences claim scheduling (0.0–1.0).
+    /// Blends per-user fairness with batch deadline urgency when ordering claims.
+    /// 0.0 = pure user-fairness, 1.0 = pure deadline urgency. Default: 0.5.
+    #[serde(default = "default_urgency_weight", deserialize_with = "deserialize_urgency_weight")]
+    pub urgency_weight: f64,
+}
+
+fn default_urgency_weight() -> f64 {
+    0.5
+}
+
+/// Custom deserializer that validates urgency_weight is in the 0.0–1.0 range and finite.
+fn deserialize_urgency_weight<'de, D>(deserializer: D) -> Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+
+    let opt: Option<f64> = Option::deserialize(deserializer)?;
+
+    match opt {
+        None => Ok(default_urgency_weight()),
+        Some(value) if !value.is_finite() => Err(D::Error::custom(format!("urgency_weight must be a finite number, got {}", value))),
+        Some(value) if !(0.0..=1.0).contains(&value) => Err(D::Error::custom(format!(
+            "urgency_weight must be between 0.0 and 1.0, got {}",
+            value
+        ))),
+        Some(value) => Ok(value),
+    }
 }
 
 fn default_batch_metadata_fields_dwctl() -> Vec<String> {
@@ -1170,6 +1227,7 @@ impl Default for DaemonConfig {
             purge_batch_size: 1000,
             purge_throttle_ms: 100,
             streamable_endpoints: Vec::new(),
+            urgency_weight: default_urgency_weight(),
         }
     }
 }
@@ -1223,6 +1281,7 @@ impl DaemonConfig {
             purge_batch_size: self.purge_batch_size,
             purge_throttle_ms: self.purge_throttle_ms,
             streamable_endpoints: self.streamable_endpoints.clone(),
+            urgency_weight: self.urgency_weight,
             ..Default::default()
         }
     }
@@ -1669,6 +1728,7 @@ impl Config {
             let pool = config.database.main_pool_settings().clone();
             let fusillade = config.database.fusillade().clone();
             let outlet = config.database.outlet().clone();
+            let underway_pool = config.database.underway_pool_settings().clone();
 
             // Preserve original replica_pool if it was explicitly configured (not using fallback)
             let original_replica_pool = match &config.database {
@@ -1686,6 +1746,7 @@ impl Config {
                 replica_pool: original_replica_pool, // Always preserve original replica_pool if it existed
                 fusillade,
                 outlet,
+                underway_pool,
             };
         } else if let Some(replica_url) = config.database_replica_url.take() {
             // Only replica_url is set via environment variable, apply it to existing config
@@ -2724,6 +2785,132 @@ auth:
 
             let config = Config::load(&args)?;
             assert_eq!(config.auth.native.session.cookie_domain, None);
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_urgency_weight_default() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+"#,
+            )?;
+
+            let args = Args {
+                config: "test.yaml".to_string(),
+                validate: false,
+            };
+
+            let config = Config::load(&args)?;
+            assert_eq!(config.background_services.batch_daemon.urgency_weight, 0.5);
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_urgency_weight_yaml_override() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+background_services:
+  batch_daemon:
+    urgency_weight: 0.8
+"#,
+            )?;
+
+            let args = Args {
+                config: "test.yaml".to_string(),
+                validate: false,
+            };
+
+            let config = Config::load(&args)?;
+            assert_eq!(config.background_services.batch_daemon.urgency_weight, 0.8);
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_urgency_weight_negative_rejected() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+background_services:
+  batch_daemon:
+    urgency_weight: -0.1
+"#,
+            )?;
+
+            let args = Args {
+                config: "test.yaml".to_string(),
+                validate: false,
+            };
+
+            let result = Config::load(&args);
+            assert!(result.is_err());
+            let err = result.unwrap_err().to_string();
+            assert!(err.contains("urgency_weight must be between 0.0 and 1.0"));
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_urgency_weight_above_one_rejected() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+background_services:
+  batch_daemon:
+    urgency_weight: 1.5
+"#,
+            )?;
+
+            let args = Args {
+                config: "test.yaml".to_string(),
+                validate: false,
+            };
+
+            let result = Config::load(&args);
+            assert!(result.is_err());
+            let err = result.unwrap_err().to_string();
+            assert!(err.contains("urgency_weight must be between 0.0 and 1.0"));
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_urgency_weight_null_uses_default() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+background_services:
+  batch_daemon:
+    urgency_weight: null
+"#,
+            )?;
+
+            let args = Args {
+                config: "test.yaml".to_string(),
+                validate: false,
+            };
+
+            let config = Config::load(&args)?;
+            assert_eq!(config.background_services.batch_daemon.urgency_weight, 0.5);
 
             Ok(())
         });

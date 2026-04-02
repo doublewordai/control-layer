@@ -9,6 +9,7 @@ export interface PaginatedResponse<T> {
 }
 
 export type ModelType = "CHAT" | "EMBEDDINGS" | "RERANKER";
+export type ModelDisplayCategory = "generation" | "embedding" | "ocr";
 
 // Virtual model types (virtual models route requests across multiple hosted models)
 export type LoadBalancingStrategy = "weighted_random" | "priority";
@@ -153,21 +154,48 @@ export interface TariffDefinition {
 // Model metadata (enriched model information from provider data)
 export interface ModelMetadata {
   provider?: string;
+  display_category?: ModelDisplayCategory;
   intelligence_index?: number;
   context_window?: number;
   released_at?: string; // ISO date string (YYYY-MM-DD)
   attribution?: string;
+  quantization?: string; // e.g. "FP8", "FP16", "INT4"
   extra?: {
     evaluations?: Record<string, number>;
     summary?: string; // Short one-line description for catalog views
     use_cases?: string[]; // e.g., ["Research & analysis", "High volume tasks"]
+    model_order?: number;
+    deployment_providers?: string[]; // e.g., ["snowflake", "onwards"]
   };
+}
+
+export interface ProviderDisplayConfig {
+  provider_key: string;
+  display_name: string;
+  icon?: string | null;
+  model_count: number;
+  configured: boolean;
+  created_by?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+}
+
+export interface ProviderDisplayConfigCreateRequest {
+  provider_key: string;
+  display_name?: string;
+  icon?: string;
+}
+
+export interface ProviderDisplayConfigUpdateRequest {
+  display_name?: string;
+  icon?: string | null;
 }
 
 // Base model types
 export interface Model {
   id: string;
   alias: string;
+  display_name?: string | null;
   model_name: string;
   description?: string | null;
   model_type?: ModelType | null;
@@ -201,6 +229,7 @@ export interface StandardModelCreate {
   type: "standard";
   model_name: string;
   alias?: string;
+  display_name?: string;
   hosted_on: string; // endpoint ID (UUID)
   description?: string;
   model_type?: ModelType;
@@ -222,6 +251,7 @@ export interface VirtualModelCreate {
   type: "composite" | "virtual"; // API accepts "composite", UI uses "virtual"
   model_name: string;
   alias?: string;
+  display_name?: string;
   description?: string;
   model_type?: ModelType;
   capabilities?: string[];
@@ -448,6 +478,7 @@ export interface GroupUpdateRequest {
 
 export interface ModelUpdateRequest {
   alias?: string;
+  display_name?: string | null;
   description?: string | null;
   model_type?: ModelType | null;
   capabilities?: string[] | null;
@@ -1338,6 +1369,8 @@ export interface DaemonsQuery {
 
 // ===== WEBHOOK TYPES =====
 
+export type WebhookScope = "own" | "platform";
+
 export interface Webhook {
   id: string;
   user_id: string;
@@ -1345,6 +1378,7 @@ export interface Webhook {
   enabled: boolean;
   event_types?: string[] | null;
   description?: string | null;
+  scope: WebhookScope;
   created_at: string;
   updated_at: string;
   disabled_at?: string | null;
@@ -1358,6 +1392,7 @@ export interface WebhookCreateRequest {
   url: string;
   event_types?: string[];
   description?: string;
+  scope?: WebhookScope;
 }
 
 export interface WebhookUpdateRequest {
@@ -1401,6 +1436,8 @@ export interface OrganizationCreateRequest {
 export interface OrganizationUpdateRequest {
   display_name?: string;
   email?: string;
+  batch_notifications_enabled?: boolean;
+  low_balance_threshold?: number | null;
 }
 
 export interface InviteMemberRequest {

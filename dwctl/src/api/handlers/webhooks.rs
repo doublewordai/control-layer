@@ -18,7 +18,7 @@ use crate::{
     db::models::webhooks::{WebhookCreateDBRequest, WebhookUpdateDBRequest},
     errors::{Error, Result},
     types::{Operation, Permission, Resource, UserId, UserIdOrCurrent},
-    webhooks::{WebhookEventType, signing},
+    webhooks::{WebhookEventType, WebhookScope, signing},
 };
 
 /// List all webhooks for a user.
@@ -151,12 +151,45 @@ pub async fn create_webhook<P: PoolProvider>(
         });
     }
 
+    // Validate scope
+    if request.scope != "own" && request.scope != "platform" {
+        return Err(Error::BadRequest {
+            message: format!("Invalid scope: '{}'. Valid scopes are: own, platform", request.scope),
+        });
+    }
+
+    // Platform scope requires PlatformManager role (fail fast before hitting DB trigger)
+    if request.scope == "platform" && !current_user.roles.contains(&crate::Role::PlatformManager) {
+        return Err(Error::InsufficientPermissions {
+            required: Permission::Allow(Resource::Webhooks, Operation::CreateAll),
+            action: Operation::CreateAll,
+            resource: "platform-scoped webhooks".to_string(),
+        });
+    }
+
     // Validate event types if provided
     if let Some(ref event_types) = request.event_types {
         for event_type in event_types {
-            if event_type.parse::<WebhookEventType>().is_err() {
+            let parsed = event_type.parse::<WebhookEventType>().map_err(|_| Error::BadRequest {
+                message: format!(
+                    "Invalid event type: '{}'. Valid types are: batch.completed, batch.failed, user.created, batch.created, api_key.created",
+                    event_type,
+                ),
+            })?;
+            // Validate event type matches webhook scope
+            let expected_scope = if request.scope == "platform" {
+                WebhookScope::Platform
+            } else {
+                WebhookScope::Own
+            };
+            if parsed.scope() != expected_scope {
                 return Err(Error::BadRequest {
-                    message: format!("Invalid event type: {}. Valid types are: batch.completed, batch.failed", event_type),
+                    message: format!(
+                        "Event type '{}' belongs to scope '{:?}', but webhook scope is '{}'",
+                        event_type,
+                        parsed.scope(),
+                        request.scope,
+                    ),
                 });
             }
         }
@@ -174,6 +207,7 @@ pub async fn create_webhook<P: PoolProvider>(
         secret,
         event_types: request.event_types,
         description: request.description,
+        scope: request.scope,
     };
 
     let webhook = repo.create(&db_request).await?;
@@ -333,7 +367,10 @@ pub async fn update_webhook<P: PoolProvider>(
         for event_type in event_types {
             if event_type.parse::<WebhookEventType>().is_err() {
                 return Err(Error::BadRequest {
-                    message: format!("Invalid event type: {}. Valid types are: batch.completed, batch.failed", event_type),
+                    message: format!(
+                        "Invalid event type: {}. Valid types are: batch.completed, batch.failed, user.created, batch.created, api_key.created",
+                        event_type
+                    ),
                 });
             }
         }

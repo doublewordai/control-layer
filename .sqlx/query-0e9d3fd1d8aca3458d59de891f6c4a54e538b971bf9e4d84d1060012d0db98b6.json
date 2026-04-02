@@ -57,6 +57,11 @@
         "ordinal": 10,
         "name": "disabled_at",
         "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 11,
+        "name": "scope",
+        "type_info": "Text"
       }
     ],
     "parameters": {
@@ -76,7 +81,8 @@
       false,
       false,
       false,
-      true
+      true,
+      false
     ]
   },
   "hash": "0e9d3fd1d8aca3458d59de891f6c4a54e538b971bf9e4d84d1060012d0db98b6"

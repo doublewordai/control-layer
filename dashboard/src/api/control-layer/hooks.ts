@@ -46,6 +46,8 @@ import type {
   OrganizationUpdateRequest,
   InviteMemberRequest,
   OrgMemberRole,
+  ProviderDisplayConfigCreateRequest,
+  ProviderDisplayConfigUpdateRequest,
 } from "./types";
 
 // Config hooks
@@ -247,6 +249,61 @@ export function useCreateModel() {
         queryKeys.models.byId(createdModel.id),
         createdModel,
       );
+    },
+  });
+}
+
+export function useProviderDisplayConfigs(options?: { enabled?: boolean }) {
+  const { enabled = true } = options || {};
+  return useQuery({
+    queryKey: queryKeys.providerDisplayConfigs.query(),
+    queryFn: () => dwctlApi.providerDisplayConfigs.list(),
+    enabled,
+  });
+}
+
+export function useCreateProviderDisplayConfig() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (data: ProviderDisplayConfigCreateRequest) =>
+      dwctlApi.providerDisplayConfigs.create(data),
+    onSuccess: (config) => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.providerDisplayConfigs.all });
+      queryClient.setQueryData(
+        queryKeys.providerDisplayConfigs.byKey(config.provider_key),
+        config,
+      );
+    },
+  });
+}
+
+export function useUpdateProviderDisplayConfig() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      providerKey,
+      data,
+    }: {
+      providerKey: string;
+      data: ProviderDisplayConfigUpdateRequest;
+    }) => dwctlApi.providerDisplayConfigs.update(providerKey, data),
+    onSuccess: (config) => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.providerDisplayConfigs.all });
+      queryClient.setQueryData(
+        queryKeys.providerDisplayConfigs.byKey(config.provider_key),
+        config,
+      );
+    },
+  });
+}
+
+export function useDeleteProviderDisplayConfig() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (providerKey: string) => dwctlApi.providerDisplayConfigs.delete(providerKey),
+    onSuccess: (_, providerKey) => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.providerDisplayConfigs.all });
+      queryClient.removeQueries({ queryKey: queryKeys.providerDisplayConfigs.byKey(providerKey) });
     },
   });
 }
@@ -1612,6 +1669,23 @@ export function useRemoveMember() {
       });
       queryClient.invalidateQueries({
         queryKey: queryKeys.organizations.byId(variables.orgId),
+      });
+    },
+  });
+}
+
+export function useLeaveOrganization() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationKey: ["organizations", "leave"],
+    mutationFn: (orgId: string) => dwctlApi.organizations.leave(orgId),
+    onSettled: () => {
+      queryClient.invalidateQueries({
+        queryKey: queryKeys.organizations.all,
+      });
+      queryClient.invalidateQueries({
+        queryKey: queryKeys.users.byId("current"),
       });
     },
   });

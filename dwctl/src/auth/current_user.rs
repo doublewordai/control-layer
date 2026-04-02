@@ -159,7 +159,7 @@ async fn try_proxy_header_auth<P: sqlx_pool_router::PoolProvider + Clone + Send 
         Err(e) => return Some(Err(DbError::from(e).into())),
     };
     let mut user_repo = Users::new(&mut tx);
-    let mut should_create_sample_files = false;
+    let mut is_new_user = false;
 
     // Get or create user with group sync (only if auto_create is enabled)
     let user_result = if config.auth.proxy_header.auto_create_users {
@@ -170,7 +170,7 @@ async fn try_proxy_header_auth<P: sqlx_pool_router::PoolProvider + Clone + Send 
             Ok((user, was_created)) => {
                 // Grant initial credits for newly created users
                 if was_created {
-                    should_create_sample_files = true;
+                    is_new_user = true;
                     let initial_credits = config.credits.initial_credits_for_standard_users;
                     if initial_credits > rust_decimal::Decimal::ZERO && user.roles.contains(&Role::StandardUser) {
                         use crate::db::handlers::credits::Credits;
@@ -185,6 +185,40 @@ async fn try_proxy_header_auth<P: sqlx_pool_router::PoolProvider + Clone + Send 
                         );
                         if let Err(e) = credits_repo.create_transaction(&request).await {
                             return Some(Err(Error::Database(e)));
+                        }
+                    }
+
+                    // Auto-org: join or create organization based on email domain
+                    if let Some(domain) = crate::auth::utils::email_domain(&user.email)
+                        && !crate::auth::utils::is_personal_email_domain(domain)
+                    {
+                        use crate::db::handlers::Organizations;
+                        use crate::db::models::organizations::OrganizationCreateDBRequest;
+
+                        let mut org_repo = Organizations::new(&mut tx);
+                        match org_repo.find_by_domain(domain).await {
+                            Ok(Some(org)) => {
+                                // Org exists — add user as member
+                                if let Err(e) = org_repo.add_member(org.id, user.id, "member").await {
+                                    tracing::warn!("Failed to auto-add user to org {}: {e}", domain);
+                                }
+                            }
+                            Ok(None) => {
+                                // No org for this domain — create one with user as owner
+                                let org_request = OrganizationCreateDBRequest {
+                                    name: domain.to_string(),
+                                    email: user.email.clone(),
+                                    display_name: None,
+                                    avatar_url: None,
+                                    created_by: user.id,
+                                };
+                                if let Err(e) = org_repo.create(&org_request, &config.auth.default_user_roles).await {
+                                    tracing::warn!("Failed to auto-create org for domain {domain}: {e}");
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("Failed to look up org by domain {domain}: {e}");
+                            }
                         }
                     }
                 }
@@ -245,8 +279,11 @@ async fn try_proxy_header_auth<P: sqlx_pool_router::PoolProvider + Clone + Send 
         Err(e) => return Some(Err(DbError::from(e).into())),
     }
 
+    // user.created webhook deliveries are created by the notification poller
+    // via PG LISTEN/NOTIFY on the users table.
+
     // Create sample files after commit so the user and API keys are persisted
-    if should_create_sample_files
+    if is_new_user
         && config.sample_files.enabled
         && config.batches.enabled
         && let Some((ref user, _)) = user_result
@@ -630,7 +667,7 @@ mod tests {
             transactions::TransactionFilters,
             users::{CurrentUser, Role},
         },
-        db::handlers::{Users, repository::Repository},
+        db::handlers::{Organizations, Users, repository::Repository},
         errors::Error,
         test::utils::create_test_config,
         test::utils::require_admin,
@@ -1666,5 +1703,84 @@ mod tests {
         let actual = row.last_login.unwrap();
         let diff = (actual - recent).num_seconds().abs();
         assert!(diff < 2, "last_login should not have been updated (diff: {diff}s)");
+    }
+
+    // ── Auto-org on SSO signup ──────────────────────────────────────────
+
+    #[sqlx::test]
+    async fn test_proxy_header_signup_creates_org_for_business_email(pool: PgPool) {
+        let mut config = create_test_config();
+        config.auth.proxy_header.enabled = true;
+        config.auth.proxy_header.auto_create_users = true;
+
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
+
+        let email = "alice@acme.com";
+        let external_id = "auth0|alice-acme";
+        let mut parts = create_test_parts_with_auth(external_id, email);
+
+        let result = CurrentUser::from_request_parts(&mut parts, &state).await;
+        assert!(result.is_ok());
+        let current_user = result.unwrap();
+
+        // Verify an org was created with username = domain
+        let mut conn = pool.acquire().await.unwrap();
+        let mut org_repo = Organizations::new(&mut conn);
+        let org = org_repo.find_by_domain("acme.com").await.unwrap();
+        assert!(org.is_some(), "Org should have been auto-created for acme.com");
+
+        let org = org.unwrap();
+        assert_eq!(org.username, "acme.com");
+
+        // User should be owner
+        let role = org_repo.get_user_org_role(current_user.id, org.id).await.unwrap();
+        assert_eq!(role, Some("owner".to_string()));
+    }
+
+    #[sqlx::test]
+    async fn test_proxy_header_signup_joins_existing_org(pool: PgPool) {
+        let mut config = create_test_config();
+        config.auth.proxy_header.enabled = true;
+        config.auth.proxy_header.auto_create_users = true;
+
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
+
+        // First user creates the org
+        let mut parts1 = create_test_parts_with_auth("auth0|first", "first@widgets.io");
+        let first = CurrentUser::from_request_parts(&mut parts1, &state).await.unwrap();
+
+        // Second user from same domain should auto-join
+        let mut parts2 = create_test_parts_with_auth("auth0|second", "second@widgets.io");
+        let second = CurrentUser::from_request_parts(&mut parts2, &state).await.unwrap();
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut org_repo = Organizations::new(&mut conn);
+        let org = org_repo.find_by_domain("widgets.io").await.unwrap().unwrap();
+
+        // First user is owner, second is member
+        let first_role = org_repo.get_user_org_role(first.id, org.id).await.unwrap();
+        assert_eq!(first_role, Some("owner".to_string()));
+
+        let second_role = org_repo.get_user_org_role(second.id, org.id).await.unwrap();
+        assert_eq!(second_role, Some("member".to_string()));
+    }
+
+    #[sqlx::test]
+    async fn test_proxy_header_signup_skips_personal_email(pool: PgPool) {
+        let mut config = create_test_config();
+        config.auth.proxy_header.enabled = true;
+        config.auth.proxy_header.auto_create_users = true;
+
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
+
+        let mut parts = create_test_parts_with_auth("auth0|gmail-user", "someone@gmail.com");
+        let result = CurrentUser::from_request_parts(&mut parts, &state).await;
+        assert!(result.is_ok());
+
+        // No org should have been created for gmail.com
+        let mut conn = pool.acquire().await.unwrap();
+        let mut org_repo = Organizations::new(&mut conn);
+        let org = org_repo.find_by_domain("gmail.com").await.unwrap();
+        assert!(org.is_none(), "Should not create org for personal email domain");
     }
 }

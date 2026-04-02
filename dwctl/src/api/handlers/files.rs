@@ -394,6 +394,29 @@ type FileStreamResult = (
     Arc<Mutex<Option<FileUploadError>>>,
 );
 
+fn resolve_upload_stream_result(
+    result: fusillade::FileStreamResult,
+    error_slot: &Arc<Mutex<Option<FileUploadError>>>,
+) -> Result<fusillade::FileId> {
+    match result {
+        fusillade::FileStreamResult::Success(file_id) => Ok(file_id),
+        fusillade::FileStreamResult::Aborted => {
+            let upload_err = match error_slot.lock() {
+                Ok(mut guard) => guard.take(),
+                Err(poisoned) => poisoned.into_inner().take(),
+            };
+            if let Some(upload_err) = upload_err {
+                tracing::warn!("File upload aborted with error: {:?}", upload_err);
+                return Err(upload_err.into_http_error());
+            }
+
+            Err(Error::Internal {
+                operation: "create file: fusillade returned Aborted without an upload error".to_string(),
+            })
+        }
+    }
+}
+
 /// Context for validating and routing requests parsed from file uploads.
 struct FileRequestContext {
     endpoint: String,
@@ -445,7 +468,7 @@ fn create_file_stream(
                     Ok(mut guard) => *guard = Some($error),
                     Err(poisoned) => *poisoned.into_inner() = Some($error),
                 }
-                let _ = tx.send(fusillade::FileStreamItem::Error("aborted".to_string())).await;
+                let _ = tx.send(fusillade::FileStreamItem::Abort).await;
                 return;
             }};
         }
@@ -877,7 +900,7 @@ pub async fn upload_file<P: PoolProvider>(
     );
 
     // Create file via request manager with streaming
-    let created_file_id = state.request_manager.create_file_stream(file_stream).await.map_err(|e| {
+    let created_file_result = state.request_manager.create_file_stream(file_stream).await.map_err(|e| {
         // Check if WE aborted (control-layer error in slot)
         // Handle poisoned mutex gracefully - the data is still valid
         let upload_err = match error_slot.lock() {
@@ -898,6 +921,8 @@ pub async fn upload_file<P: PoolProvider>(
             },
         }
     })?;
+
+    let created_file_id = resolve_upload_stream_result(created_file_result, &error_slot)?;
 
     tracing::debug!("File {} uploaded successfully", created_file_id);
 
@@ -1354,7 +1379,7 @@ pub async fn get_file_content<P: PoolProvider>(
                     .map_err(|e| Error::Internal {
                         operation: format!("get batch status: {}", e),
                     })?;
-                let still_processing = status.pending_requests > 0 || status.in_progress_requests > 0;
+                let still_processing = !status.is_finished();
                 (still_processing, Some(status.completed_requests as usize))
             } else {
                 (false, None)
@@ -1376,7 +1401,7 @@ pub async fn get_file_content<P: PoolProvider>(
                     .map_err(|e| Error::Internal {
                         operation: format!("get batch status: {}", e),
                     })?;
-                let still_processing = status.pending_requests > 0 || status.in_progress_requests > 0;
+                let still_processing = !status.is_finished();
                 (still_processing, Some(status.failed_requests as usize))
             } else {
                 (false, None)
@@ -1768,6 +1793,7 @@ mod tests {
     use crate::db::models::api_keys::ApiKeyPurpose;
     use crate::test::utils::*;
     use sqlx::PgPool;
+    use std::sync::{Arc, Mutex};
     use uuid::Uuid;
 
     #[sqlx::test]
@@ -2759,13 +2785,28 @@ mod tests {
         let batch_id = batch["id"].as_str().expect("Should have id");
         let output_file_id = batch["output_file_id"].as_str().expect("Should have output_file_id");
 
-        // Manually complete all requests by updating their state in the database
         // Extract batch UUID from "batch_xxx" format
         let batch_uuid = batch_id.strip_prefix("batch_").unwrap_or(batch_id);
         let batch_uuid = Uuid::parse_str(batch_uuid).expect("Valid batch UUID");
 
-        // Use unchecked query since fusillade schema is created at runtime
-        // Must set completed_at to satisfy the completed_fields_check constraint
+        // Wait for the underway worker to populate the batch with requests
+        for attempt in 0..200 {
+            let count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM fusillade.requests WHERE batch_id = $1")
+                .bind(batch_uuid)
+                .fetch_one(&pool)
+                .await
+                .expect("Failed to count requests");
+            if count > 0 {
+                break;
+            }
+            assert!(
+                attempt < 199,
+                "Timed out waiting for requests to be populated for batch {batch_uuid}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        // Manually complete all requests
         sqlx::query(
             r#"
             UPDATE fusillade.requests
@@ -3019,10 +3060,23 @@ mod tests {
         let batch_id_str = batch["id"].as_str().expect("Should have id");
         let output_file_id = batch["output_file_id"].as_str().expect("Should have output_file_id");
 
-        // Complete all requests so the output file has content
         let batch_uuid_str = batch_id_str.strip_prefix("batch_").unwrap_or(batch_id_str);
         let batch_uuid = Uuid::parse_str(batch_uuid_str).expect("Valid batch UUID");
 
+        // Wait for the underway worker to populate requests
+        loop {
+            let count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM fusillade.requests WHERE batch_id = $1")
+                .bind(batch_uuid)
+                .fetch_one(&pool)
+                .await
+                .expect("Failed to count requests");
+            if count > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        // Complete all requests so the output file has content
         sqlx::query(
             r#"
             UPDATE fusillade.requests
@@ -3226,6 +3280,43 @@ mod tests {
                 assert!(message.contains("custom_id too long"));
             }
             _ => panic!("Expected BadRequest error"),
+        }
+    }
+
+    #[test]
+    fn test_resolve_upload_stream_result_aborted_maps_error_slot_to_http_error() {
+        let error_slot = Arc::new(Mutex::new(Some(super::FileUploadError::InvalidJson {
+            line: 7,
+            error: "expected value".to_string(),
+        })));
+
+        let err = super::resolve_upload_stream_result(fusillade::FileStreamResult::Aborted, &error_slot)
+            .expect_err("aborted stream should map to an HTTP error");
+
+        match err {
+            crate::errors::Error::BadRequest { message } => {
+                assert!(message.contains("line 7"));
+                assert!(message.contains("expected value"));
+            }
+            other => panic!("Expected BadRequest error, got {other:?}"),
+        }
+
+        let slot = error_slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(slot.is_none(), "error slot should be consumed");
+    }
+
+    #[test]
+    fn test_resolve_upload_stream_result_aborted_without_error_slot_is_internal() {
+        let error_slot = Arc::new(Mutex::new(None));
+
+        let err = super::resolve_upload_stream_result(fusillade::FileStreamResult::Aborted, &error_slot)
+            .expect_err("aborted stream without a control-layer error should be internal");
+
+        match err {
+            crate::errors::Error::Internal { operation } => {
+                assert!(operation.contains("fusillade returned Aborted without an upload error"));
+            }
+            other => panic!("Expected Internal error, got {other:?}"),
         }
     }
 

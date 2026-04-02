@@ -196,7 +196,9 @@ async fn test_cache_shape_batch_escalation_access_for_private_alias(pool: sqlx::
     assert!(pool_has_key(pool_without.value(), SYSTEM_KEY_SECRET));
     assert!(!pool_has_key(pool_without.value(), KEY_BATCH_SECRET));
 
-    let with_escalation = super::load_targets_from_db(&pool, &[alias.clone()], false).await.unwrap();
+    let with_escalation = super::load_targets_from_db(&pool, std::slice::from_ref(&alias), false)
+        .await
+        .unwrap();
     let pool_with = with_escalation.targets.get(&alias).expect("target should exist");
     assert_eq!(pool_keys_len(pool_with.value()), 2, "with escalation batch key should be added");
     assert!(pool_has_key(pool_with.value(), SYSTEM_KEY_SECRET));
@@ -217,15 +219,16 @@ async fn test_cache_shape_composite_pool_strategy_and_fallback(pool: sqlx::PgPoo
     assert!(composite_pool.should_fallback_on_status(503));
     assert!(!composite_pool.should_fallback_on_status(500));
 
-    // Current behavior: composite models require positive balance for non-system keys.
-    // With this fixture (no credits), only the system key is included.
+    // Composite model has no tariff in this fixture, so it's free.
+    // Free models allow group-authorized keys regardless of balance.
+    // User A is in group cache-private-a which has access to this composite.
     assert_eq!(
         pool_keys_len(composite_pool),
-        1,
-        "composite access currently requires positive balance"
+        2,
+        "free composite should include system key and group-authorized keys"
     );
     assert!(pool_has_key(composite_pool, SYSTEM_KEY_SECRET));
-    assert!(!pool_has_key(composite_pool, KEY_A_SECRET));
+    assert!(pool_has_key(composite_pool, KEY_A_SECRET));
     assert!(!pool_has_key(composite_pool, KEY_B_SECRET));
     assert!(!pool_has_key(composite_pool, KEY_BATCH_SECRET));
 
@@ -374,17 +377,10 @@ async fn test_known_issue_composite_invalid_component_endpoint_should_be_skipped
 }
 
 #[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
-#[ignore = "Known issue: composite key visibility lacks the unmetered-model bypass used by regular models"]
-async fn test_known_issue_composite_unmetered_access_should_match_regular_model_policy(pool: sqlx::PgPool) {
-    // Expected behavior:
-    // - For unmetered aliases (no active non-zero tariff), group-authorized keys are allowed
-    //   even when user balance is non-positive.
-    // - Composite and regular aliases follow the same key visibility policy.
-    //
-    // Bug outline:
-    // - Regular-model query includes an "unmetered bypass" for non-positive balances.
-    // - Composite query currently requires positive balance for non-system users.
-    // - This creates policy mismatch: keys visible for regular aliases may be hidden for composites.
+async fn test_composite_unmetered_access_matches_regular_model_policy(pool: sqlx::PgPool) {
+    // For unmetered aliases (no active non-zero tariff), group-authorized keys are allowed
+    // even when user balance is non-positive. Composite and regular aliases follow the same
+    // key visibility policy.
     let targets = super::load_targets_from_db(&pool, &[], false).await.unwrap();
     let composite = targets.targets.get("composite-priority").expect("composite-priority should exist");
     let composite_pool = composite.value();
@@ -437,6 +433,7 @@ async fn test_onwards_config_reloads_on_tariff_change(pool: sqlx::PgPool) {
             created_by: test_user.id,
             model_name: "test-model".to_string(),
             alias: "test-alias".to_string(),
+            display_name: None,
             description: None,
             model_type: None,
             capabilities: None,
@@ -557,6 +554,7 @@ async fn test_batch_api_key_access_to_composite_escalation_target(pool: sqlx::Pg
             created_by: test_user.id,
             model_name: "gpt-4".to_string(),
             alias: "gpt-4-component".to_string(),
+            display_name: None,
             description: None,
             model_type: None,
             capabilities: None,
@@ -593,6 +591,7 @@ async fn test_batch_api_key_access_to_composite_escalation_target(pool: sqlx::Pg
             created_by: test_user.id,
             model_name: "composite-model".to_string(),
             alias: composite_alias.clone(),
+            display_name: None,
             description: Some("Composite escalation target".to_string()),
             model_type: None,
             capabilities: None,
