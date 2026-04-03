@@ -60,7 +60,7 @@ vi.mock("sonner", () => {
   };
 });
 
-// Mock organization context - tests run in personal (non-org) context
+// Mock organization context - defaults to personal (non-org) context and can be overridden per test
 vi.mock("@/contexts", () => ({
   useOrganizationContext: () => mockOrgContext.value,
 }));
