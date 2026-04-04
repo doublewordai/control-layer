@@ -59,7 +59,7 @@ fn validate_icon(icon: Option<&str>) -> Result<()> {
 )]
 pub async fn list_provider_display_configs<P: PoolProvider>(
     State(state): State<AppState<P>>,
-    _: RequiresPermission<resource::Models, operation::ReadAll>,
+    _: RequiresPermission<resource::Models, operation::ReadOwn>,
 ) -> Result<Json<Vec<ProviderDisplayConfigResponse>>> {
     let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut repo = ProviderDisplayConfigs::new(&mut conn);
@@ -114,7 +114,7 @@ pub async fn list_provider_display_configs<P: PoolProvider>(
 pub async fn get_provider_display_config<P: PoolProvider>(
     State(state): State<AppState<P>>,
     Path(provider_key): Path<String>,
-    _: RequiresPermission<resource::Models, operation::ReadAll>,
+    _: RequiresPermission<resource::Models, operation::ReadOwn>,
 ) -> Result<Json<ProviderDisplayConfigResponse>> {
     let provider_key = normalize_provider_key(&provider_key);
     let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
