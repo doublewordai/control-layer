@@ -32,7 +32,7 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Install just
-        uses: extractions/setup-just@v3
+        uses: extractions/setup-just@v4
 
       - name: Run frontend CI pipeline
         id: ci-step
@@ -130,7 +130,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Install just
-        uses: extractions/setup-just@v3
+        uses: extractions/setup-just@v4
 
       - name: Install sqlx-cli and cargo-llvm-cov
         run: |
@@ -338,7 +338,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Install just
-        uses: extractions/setup-just@v3
+        uses: extractions/setup-just@v4
 
       - name: Install pnpm
         uses: pnpm/action-setup@v5
