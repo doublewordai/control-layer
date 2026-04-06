@@ -171,7 +171,7 @@ impl<'c> ProviderDisplayConfigs<'c> {
             SELECT
                 LOWER(BTRIM(dm.metadata->>'provider')) AS provider_key,
                 MIN(BTRIM(dm.metadata->>'provider')) AS display_name,
-                COUNT(*)::BIGINT AS model_count
+                COUNT(DISTINCT dm.id)::BIGINT AS model_count
             FROM deployed_models dm
             JOIN deployment_groups dg ON dg.deployment_id = dm.id
             WHERE
