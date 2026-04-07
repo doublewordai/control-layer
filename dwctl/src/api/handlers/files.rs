@@ -43,6 +43,7 @@ use futures::StreamExt;
 use futures::stream::Stream;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use sqlx::Row;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -441,12 +442,75 @@ pub struct IngestFileInput {
     pub size_bytes: i64,
 }
 
-pub(crate) async fn get_file_ingest_status(pool: &sqlx::PgPool, file_id: Uuid) -> Result<Option<String>> {
-    sqlx::query_scalar::<_, String>("SELECT status FROM file_ingest_jobs WHERE file_id = $1")
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct IngestJobState {
+    pub(crate) status: String,
+    pub(crate) error_message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileApiStatus {
+    status: String,
+    status_details: String,
+}
+
+pub(crate) async fn get_file_ingest_status(pool: &sqlx::PgPool, file_id: Uuid) -> Result<Option<IngestJobState>> {
+    let row = sqlx::query("SELECT status, error_message FROM file_ingest_jobs WHERE file_id = $1")
         .bind(file_id)
         .fetch_optional(pool)
         .await
-        .map_err(|e| Error::Database(e.into()))
+        .map_err(|e| Error::Database(e.into()))?;
+
+    Ok(row.map(|row| IngestJobState {
+        status: row.get("status"),
+        error_message: row.get("error_message"),
+    }))
+}
+
+async fn get_file_ingest_statuses(pool: &sqlx::PgPool, file_ids: &[Uuid]) -> Result<HashMap<Uuid, IngestJobState>> {
+    if file_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let rows = sqlx::query("SELECT file_id, status, error_message FROM file_ingest_jobs WHERE file_id = ANY($1)")
+        .bind(file_ids)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| Error::Database(e.into()))?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            (
+                row.get("file_id"),
+                IngestJobState {
+                    status: row.get("status"),
+                    error_message: row.get("error_message"),
+                },
+            )
+        })
+        .collect())
+}
+
+fn map_ingest_job_to_file_status(ingest_status: Option<&IngestJobState>) -> FileApiStatus {
+    match ingest_status {
+        Some(IngestJobState { status, .. }) if status == "pending" || status == "processing" => FileApiStatus {
+            status: "uploaded".to_string(),
+            status_details: String::new(),
+        },
+        Some(IngestJobState { status, .. }) if status == "processed" => FileApiStatus {
+            status: "processed".to_string(),
+            status_details: String::new(),
+        },
+        Some(IngestJobState { status, error_message }) if status == "failed" => FileApiStatus {
+            status: "error".to_string(),
+            status_details: error_message.clone().unwrap_or_default(),
+        },
+        _ => FileApiStatus {
+            status: "processed".to_string(),
+            status_details: String::new(),
+        },
+    }
 }
 
 async fn set_file_ingest_status(
@@ -1254,6 +1318,7 @@ pub async fn upload_file<P: PoolProvider>(
         Some(fusillade::batch::Purpose::BatchError) => Purpose::BatchError,
         None => Purpose::Batch, // Default to Batch for backwards compatibility
     };
+    let file_status = map_ingest_job_to_file_status(get_file_ingest_status(state.db.read(), created_file_id.0).await?.as_ref());
 
     Ok((
         StatusCode::CREATED,
@@ -1264,6 +1329,8 @@ pub async fn upload_file<P: PoolProvider>(
             created_at: file.created_at.timestamp(),
             filename: file.name,
             purpose: api_purpose,
+            status: file_status.status,
+            status_details: file_status.status_details,
             expires_at: file.expires_at.map(|dt| dt.timestamp()),
             created_by_email: None,
             context_name: None,
@@ -1403,10 +1470,12 @@ pub async fn list_files<P: PoolProvider>(
 
     let first_id = files.first().map(|f| f.id.0.to_string());
     let last_id = files.last().map(|f| f.id.0.to_string());
+    let file_ids: Vec<Uuid> = files.iter().map(|f| f.id.0).collect();
 
     // Resolve creator/context metadata for all returned files.
     // Uses a fresh connection (not held across the fusillade call above).
     let mut read_conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+    let ingest_statuses = get_file_ingest_statuses(state.db.read(), &file_ids).await?;
 
     // Resolve individual creators via api_key_id → api_keys.created_by
     let api_key_ids: Vec<uuid::Uuid> = files
@@ -1475,6 +1544,7 @@ pub async fn list_files<P: PoolProvider>(
                 Some(_) => (Some("Personal".to_string()), Some("personal".to_string())),
                 None => (None, None),
             };
+            let file_status = map_ingest_job_to_file_status(ingest_statuses.get(&f.id.0));
 
             FileResponse {
                 id: f.id.0.to_string(),
@@ -1483,6 +1553,8 @@ pub async fn list_files<P: PoolProvider>(
                 created_at: f.created_at.timestamp(),
                 filename: f.name.clone(),
                 purpose: api_purpose,
+                status: file_status.status,
+                status_details: file_status.status_details,
                 expires_at: f.expires_at.map(|dt| dt.timestamp()),
                 created_by_email,
                 context_name,
@@ -1551,6 +1623,8 @@ pub async fn get_file<P: PoolProvider>(
         Some(fusillade::batch::Purpose::BatchError) => Purpose::BatchError,
         None => Purpose::Batch, // Default to Batch for backwards compatibility
     };
+    let ingest_status = get_file_ingest_status(state.db.read(), file_id).await?;
+    let file_status = map_ingest_job_to_file_status(ingest_status.as_ref());
 
     // Enrich with creator/context metadata (same as list_files)
     let mut read_conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
@@ -1604,6 +1678,8 @@ pub async fn get_file<P: PoolProvider>(
         created_at: file.created_at.timestamp(),
         filename: file.name,
         purpose: api_purpose,
+        status: file_status.status,
+        status_details: file_status.status_details,
         expires_at: file.expires_at.map(|dt| dt.timestamp()),
         created_by_email,
         context_name,
@@ -2145,6 +2221,41 @@ mod tests {
         upload_response.json()
     }
 
+    #[test]
+    fn test_map_ingest_job_to_file_status() {
+        let pending = map_ingest_job_to_file_status(Some(&IngestJobState {
+            status: "pending".to_string(),
+            error_message: None,
+        }));
+        assert_eq!(pending.status, "uploaded");
+        assert_eq!(pending.status_details, "");
+
+        let processing = map_ingest_job_to_file_status(Some(&IngestJobState {
+            status: "processing".to_string(),
+            error_message: None,
+        }));
+        assert_eq!(processing.status, "uploaded");
+        assert_eq!(processing.status_details, "");
+
+        let processed = map_ingest_job_to_file_status(Some(&IngestJobState {
+            status: "processed".to_string(),
+            error_message: None,
+        }));
+        assert_eq!(processed.status, "processed");
+        assert_eq!(processed.status_details, "");
+
+        let failed = map_ingest_job_to_file_status(Some(&IngestJobState {
+            status: "failed".to_string(),
+            error_message: Some("boom".to_string()),
+        }));
+        assert_eq!(failed.status, "error");
+        assert_eq!(failed.status_details, "boom");
+
+        let fallback = map_ingest_job_to_file_status(None);
+        assert_eq!(fallback.status, "processed");
+        assert_eq!(fallback.status_details, "");
+    }
+
     async fn create_batch_for_file(
         app: &axum_test::TestServer,
         user: &crate::api::models::users::UserResponse,
@@ -2521,6 +2632,8 @@ mod tests {
         // Should succeed
         upload_response.assert_status(axum::http::StatusCode::CREATED);
         let file: FileResponse = upload_response.json();
+        assert_eq!(file.status, "processed");
+        assert_eq!(file.status_details, "");
 
         // Verify the file was created - now let's check if metadata was captured
         // We need to query the database or fusillade to verify the metadata was stored
@@ -2534,6 +2647,57 @@ mod tests {
         get_response.assert_status(axum::http::StatusCode::OK);
         let retrieved_file: FileResponse = get_response.json();
         assert_eq!(retrieved_file.purpose, crate::api::models::files::Purpose::Batch);
+        assert_eq!(retrieved_file.status, "processed");
+        assert_eq!(retrieved_file.status_details, "");
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_get_file_uses_failed_ingest_job_status(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        let uploaded = upload_batch_input_file(
+            &app,
+            &user,
+            r#"{"custom_id":"req-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}"#,
+        )
+        .await;
+
+        sqlx::query(
+            r#"
+            INSERT INTO file_ingest_jobs (file_id, object_key, status, error_message, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, NOW(), NOW())
+            ON CONFLICT (file_id) DO UPDATE
+            SET object_key = EXCLUDED.object_key,
+                status = EXCLUDED.status,
+                error_message = EXCLUDED.error_message,
+                updated_at = NOW()
+            "#,
+        )
+        .bind(Uuid::parse_str(&uploaded.id).unwrap())
+        .bind("uploads/test.jsonl")
+        .bind("failed")
+        .bind("line 2: invalid JSON")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let auth = add_auth_headers(&user);
+        let response = app
+            .get(&format!("/ai/v1/files/{}", uploaded.id))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+
+        response.assert_status(axum::http::StatusCode::OK);
+        let file: FileResponse = response.json();
+        assert_eq!(file.status, "error");
+        assert_eq!(file.status_details, "line 2: invalid JSON");
     }
 
     #[sqlx::test]
@@ -4418,6 +4582,8 @@ mod tests {
         let files = body["data"].as_array().unwrap();
         assert!(!files.is_empty(), "Expected at least one personal file");
         for file in files {
+            assert!(file.get("status").is_some(), "status should be present");
+            assert!(file.get("status_details").is_some(), "status_details should be present");
             assert!(
                 file.get("context_name").is_some() && !file["context_name"].is_null(),
                 "context_name should be present even in personal context"

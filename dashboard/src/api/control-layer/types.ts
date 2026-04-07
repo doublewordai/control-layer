@@ -1042,6 +1042,11 @@ export interface FileObject {
     | "vision"
     | "user_data"
     | "evals";
+  status:
+    | "uploaded"
+    | "processed"
+    | "error";
+  status_details: string;
   /** Email of the individual who created this file */
   created_by_email?: string;
   /** "Personal" or org name */

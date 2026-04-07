@@ -78,6 +78,10 @@ pub struct FileResponse {
     #[schema(example = "batch_requests.jsonl")]
     pub filename: String,
     pub purpose: Purpose,
+    #[schema(example = "processed")]
+    pub status: String,
+    #[schema(example = "")]
+    pub status_details: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<i64>, // Unix timestamp
 
