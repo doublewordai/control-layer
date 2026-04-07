@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.33.1](https://github.com/doublewordai/control-layer/compare/v8.33.0...v8.33.1) (2026-04-07)
+
+
+### Bug Fixes
+
+* allow standard users to load provider display configs ([#950](https://github.com/doublewordai/control-layer/issues/950)) ([ae649e6](https://github.com/doublewordai/control-layer/commit/ae649e6bed6eab1633c0b1b5d414512f904c8e9a))
+
 ## [8.33.0](https://github.com/doublewordai/control-layer/compare/v8.32.1...v8.33.0) (2026-04-02)
 
 
