@@ -128,7 +128,8 @@ pub async fn get_or_build_file_content_jsonl<P: PoolProvider>(
     file_id: FileId,
     search: Option<String>,
 ) -> Result<Vec<u8>> {
-    read_or_build_cache_entry(config, *file_id, search.as_deref(), None, || async move {
+    let search_key = search.clone();
+    read_or_build_cache_entry(config, *file_id, search_key.as_deref(), None, || async move {
         let stream = request_manager.get_file_content_stream(file_id, 0, search);
         collect_stream_bytes(stream, serialize_file_content_item).await
     })
@@ -143,10 +144,18 @@ pub async fn get_or_build_batch_results_jsonl<P: PoolProvider>(
     search: Option<String>,
     status: Option<String>,
 ) -> Result<Vec<u8>> {
-    read_or_build_cache_entry(config, *cache_file_id, search.as_deref(), status.as_deref(), || async move {
-        let stream = request_manager.get_batch_results_stream(batch_id, 0, search, status);
-        collect_stream_bytes(stream, |item| serialize_json_line(&item, "batch result")).await
-    })
+    let search_key = search.clone();
+    let status_key = status.clone();
+    read_or_build_cache_entry(
+        config,
+        *cache_file_id,
+        search_key.as_deref(),
+        status_key.as_deref(),
+        || async move {
+            let stream = request_manager.get_batch_results_stream(batch_id, 0, search, status);
+            collect_stream_bytes(stream, |item| serialize_json_line(&item, "batch result")).await
+        },
+    )
     .await
 }
 
@@ -231,7 +240,7 @@ pub fn jsonl_response_from_slice_with_offset(slice: JsonlSlice, offset: usize, i
 
 #[cfg(test)]
 mod tests {
-    use super::{cache_key_hash, slice_jsonl_bytes};
+    use super::{JsonlSlice, cache_key_hash, jsonl_response_from_slice_with_offset, slice_jsonl_bytes};
     use uuid::Uuid;
 
     #[test]
@@ -242,6 +251,17 @@ mod tests {
         let c = cache_key_hash(file_id, Some("   "), Some("  "));
         assert_eq!(a, b);
         assert_eq!(b, c);
+    }
+
+    #[test]
+    fn cache_key_changes_with_search_and_status() {
+        let file_id = Uuid::nil();
+        let base = cache_key_hash(file_id, Some("req"), Some("completed"));
+        let different_search = cache_key_hash(file_id, Some("other"), Some("completed"));
+        let different_status = cache_key_hash(file_id, Some("req"), Some("failed"));
+
+        assert_ne!(base, different_search);
+        assert_ne!(base, different_status);
     }
 
     #[test]
@@ -262,5 +282,46 @@ mod tests {
         assert_eq!(slice.returned_lines, 2);
         assert!(!slice.has_more_pages);
         assert_eq!(String::from_utf8(slice.body).unwrap(), "b\nc\n");
+    }
+
+    #[test]
+    fn slice_jsonl_bytes_handles_empty_and_single_line_payloads() {
+        let empty = slice_jsonl_bytes(b"", 0, Some(10));
+        assert_eq!(empty.total_lines, 0);
+        assert_eq!(empty.returned_lines, 0);
+        assert_eq!(empty.body, Vec::<u8>::new());
+        assert!(!empty.has_more_pages);
+
+        let single = slice_jsonl_bytes(b"{\"id\":1}\n", 0, Some(10));
+        assert_eq!(single.total_lines, 1);
+        assert_eq!(single.returned_lines, 1);
+        assert_eq!(String::from_utf8(single.body).unwrap(), "{\"id\":1}\n");
+        assert!(!single.has_more_pages);
+    }
+
+    #[test]
+    fn slice_jsonl_bytes_returns_empty_page_past_end() {
+        let slice = slice_jsonl_bytes(b"a\nb\n", 5, Some(2));
+        assert_eq!(slice.total_lines, 2);
+        assert_eq!(slice.returned_lines, 0);
+        assert_eq!(slice.body, Vec::<u8>::new());
+        assert!(!slice.has_more_pages);
+    }
+
+    #[test]
+    fn response_with_offset_uses_offset_for_last_line() {
+        let response = jsonl_response_from_slice_with_offset(
+            JsonlSlice {
+                body: Vec::new(),
+                total_lines: 2,
+                returned_lines: 0,
+                has_more_pages: false,
+            },
+            5,
+            false,
+        );
+
+        assert_eq!(response.headers().get("X-Last-Line").unwrap(), "5");
+        assert_eq!(response.headers().get("X-Incomplete").unwrap(), "false");
     }
 }

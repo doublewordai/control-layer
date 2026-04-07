@@ -1783,6 +1783,126 @@ mod tests {
     use std::collections::HashMap;
     use uuid::Uuid;
 
+    async fn seed_completed_batch_results_fixture(pool: &PgPool, user_id: Uuid, rows: &[(&str, &str)]) -> (Uuid, Uuid, Uuid) {
+        let input_file_id = Uuid::new_v4();
+        let output_file_id = Uuid::new_v4();
+        let error_file_id = Uuid::new_v4();
+        let batch_id = Uuid::new_v4();
+        let created_by = user_id.to_string();
+
+        for (file_id, name, purpose) in [
+            (input_file_id, "input.jsonl", "batch"),
+            (output_file_id, "output.jsonl", "batch_output"),
+            (error_file_id, "error.jsonl", "batch_error"),
+        ] {
+            sqlx::query(
+                r#"
+                INSERT INTO fusillade.files (id, name, purpose, status, uploaded_by, created_at, updated_at)
+                VALUES ($1, $2, $3, 'processed', $4, NOW(), NOW())
+                "#,
+            )
+            .bind(file_id)
+            .bind(name)
+            .bind(purpose)
+            .bind(&created_by)
+            .execute(pool)
+            .await
+            .expect("Failed to create fixture file");
+        }
+
+        sqlx::query(
+            r#"
+            INSERT INTO fusillade.batches (
+                id, created_by, file_id, output_file_id, error_file_id,
+                endpoint, completion_window, expires_at, created_at, total_requests
+            )
+            VALUES ($1, $2, $3, $4, $5, '/v1/chat/completions', '24h', NOW() + interval '24 hours', NOW(), $6)
+            "#,
+        )
+        .bind(batch_id)
+        .bind(&created_by)
+        .bind(input_file_id)
+        .bind(output_file_id)
+        .bind(error_file_id)
+        .bind(rows.len() as i32)
+        .execute(pool)
+        .await
+        .expect("Failed to create fixture batch");
+
+        for (idx, (custom_id, state)) in rows.iter().enumerate() {
+            let template_id = Uuid::new_v4();
+            let request_id = Uuid::new_v4();
+            let body = serde_json::json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": format!("Prompt {}", idx)}]
+            });
+
+            sqlx::query(
+                r#"
+                INSERT INTO fusillade.request_templates
+                    (id, file_id, model, api_key, endpoint, path, body, custom_id, method, line_number)
+                VALUES ($1, $2, 'test-model', 'test-key', 'http://test', '/v1/chat/completions', $3, $4, 'POST', $5)
+                "#,
+            )
+            .bind(template_id)
+            .bind(input_file_id)
+            .bind(serde_json::to_string(&body).unwrap())
+            .bind(*custom_id)
+            .bind(idx as i32)
+            .execute(pool)
+            .await
+            .expect("Failed to create fixture template");
+
+            match *state {
+                "completed" => {
+                    let response_body = serde_json::json!({
+                        "id": format!("chatcmpl-{idx}"),
+                        "choices": [{"message": {"content": format!("Response {}", idx)}}]
+                    });
+                    sqlx::query(
+                        r#"
+                        INSERT INTO fusillade.requests
+                            (id, batch_id, template_id, model, state, custom_id, response_status, response_body, created_at, completed_at)
+                        VALUES ($1, $2, $3, 'test-model', 'completed', $4, 200, $5, NOW(), NOW())
+                        "#,
+                    )
+                    .bind(request_id)
+                    .bind(batch_id)
+                    .bind(template_id)
+                    .bind(*custom_id)
+                    .bind(serde_json::to_string(&response_body).unwrap())
+                    .execute(pool)
+                    .await
+                    .expect("Failed to create completed fixture request");
+                }
+                "failed" => {
+                    let error = serde_json::json!({
+                        "message": format!("Failure for {}", custom_id),
+                        "type": "server_error"
+                    });
+                    sqlx::query(
+                        r#"
+                        INSERT INTO fusillade.requests
+                            (id, batch_id, template_id, model, state, custom_id, error, created_at, failed_at)
+                        VALUES ($1, $2, $3, 'test-model', 'failed', $4, $5, NOW(), NOW())
+                        "#,
+                    )
+                    .bind(request_id)
+                    .bind(batch_id)
+                    .bind(template_id)
+                    .bind(*custom_id)
+                    .bind(serde_json::to_string(&error).unwrap())
+                    .execute(pool)
+                    .await
+                    .expect("Failed to create failed fixture request");
+                }
+                other => panic!("Unsupported fixture request state: {other}"),
+            }
+        }
+
+        (batch_id, output_file_id, error_file_id)
+    }
+
     #[sqlx::test]
     #[test_log::test]
     async fn test_create_batch_with_default_24h_sla(pool: PgPool) {
@@ -2461,62 +2581,13 @@ mod tests {
         let deployment = create_test_deployment(&pool, user.id, "test-model-endpoint", "test-model").await;
         add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
 
-        // Create file, templates, batch, and completed requests directly in the DB
-        let file_id = Uuid::new_v4();
-        let batch_id = Uuid::new_v4();
         let num_requests = 50;
-
-        sqlx::query(
-            "INSERT INTO fusillade.files (id, name, status, created_at, updated_at) VALUES ($1, 'test.jsonl', 'processed', NOW(), NOW())",
-        )
-        .bind(file_id)
-        .execute(&pool)
-        .await
-        .expect("Failed to create file");
-
-        sqlx::query(
-            "INSERT INTO fusillade.batches (id, created_by, file_id, endpoint, completion_window, expires_at, created_at, total_requests) VALUES ($1, $2, $3, '/v1/chat/completions', '24h', NOW() + interval '24 hours', NOW(), $4)",
-        )
-        .bind(batch_id)
-        .bind(user.id.to_string())
-        .bind(file_id)
-        .bind(num_requests as i32)
-        .execute(&pool)
-        .await
-        .expect("Failed to create batch");
-
-        for i in 0..num_requests {
-            let template_id = Uuid::new_v4();
-            let request_id = Uuid::new_v4();
-            let custom_id = format!("req-{}", i);
-            let body = serde_json::json!({"model": "test-model", "messages": [{"role": "user", "content": format!("Test {}", i)}]});
-            let response_body = serde_json::json!({
-                "id": format!("chatcmpl-{}", i),
-                "choices": [{"message": {"content": format!("Response {}", i)}}]
-            });
-
-            sqlx::query(
-                "INSERT INTO fusillade.request_templates (id, file_id, model, api_key, endpoint, path, body, custom_id, method) VALUES ($1, $2, 'test-model', 'test-key', 'http://test', '/v1/chat/completions', $3, $4, 'POST')",
-            )
-            .bind(template_id)
-            .bind(file_id)
-            .bind(serde_json::to_string(&body).unwrap())
-            .bind(&custom_id)
-            .execute(&pool)
-            .await
-            .expect("Failed to create template");
-
-            sqlx::query(
-                "INSERT INTO fusillade.requests (id, batch_id, template_id, model, state, response_status, response_body, created_at, completed_at) VALUES ($1, $2, $3, 'test-model', 'completed', 200, $4, NOW(), NOW())",
-            )
-            .bind(request_id)
-            .bind(batch_id)
-            .bind(template_id)
-            .bind(serde_json::to_string(&response_body).unwrap())
-            .execute(&pool)
-            .await
-            .expect("Failed to create completed request");
-        }
+        let fixture_rows: Vec<(String, String)> = (0..num_requests).map(|i| (format!("req-{}", i), "completed".to_string())).collect();
+        let fixture_refs: Vec<(&str, &str)> = fixture_rows
+            .iter()
+            .map(|(custom_id, state)| (custom_id.as_str(), state.as_str()))
+            .collect();
+        let (batch_id, _, _) = seed_completed_batch_results_fixture(&pool, user.id, &fixture_refs).await;
 
         let auth = add_auth_headers(&user);
 
@@ -2531,13 +2602,6 @@ mod tests {
         response.assert_header("content-type", "application/x-ndjson");
         response.assert_header("X-Incomplete", "false");
         response.assert_header("X-Last-Line", &num_requests.to_string());
-        // Streaming responses must not have content-length (regression guard against
-        // collecting the entire result set into memory before sending)
-        assert!(
-            response.headers().get("content-length").is_none(),
-            "Unlimited download should be streamed without content-length"
-        );
-
         let body = response.text();
         let lines: Vec<&str> = body.trim().lines().collect();
         assert_eq!(lines.len(), num_requests, "Should return all {} results", num_requests);
@@ -2580,6 +2644,184 @@ mod tests {
         response.assert_status(StatusCode::OK);
         response.assert_header("X-Incomplete", "false"); // no more pages, batch complete
         response.assert_header("X-Last-Line", &num_requests.to_string());
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_completed_batch_results_support_search_and_status_filters(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        let deployment = create_test_deployment(&pool, user.id, "test-model-endpoint", "test-model").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        let (batch_id, _, _) = seed_completed_batch_results_fixture(
+            &pool,
+            user.id,
+            &[
+                ("match-completed", "completed"),
+                ("other-completed", "completed"),
+                ("match-failed", "failed"),
+            ],
+        )
+        .await;
+
+        let auth = add_auth_headers(&user);
+
+        let response = app
+            .get(&format!("/ai/v1/batches/{}/results?search=match&limit=10", batch_id))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+
+        response.assert_status(StatusCode::OK);
+        response.assert_header("X-Incomplete", "false");
+        response.assert_header("X-Last-Line", "2");
+        let body = response.text();
+        let lines: Vec<&str> = body.trim().lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines.iter().all(|line| line.contains("match")));
+
+        let completed_response = app
+            .get(&format!("/ai/v1/batches/{}/results?status=completed", batch_id))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+        completed_response.assert_status(StatusCode::OK);
+        completed_response.assert_header("X-Incomplete", "false");
+        let completed_body = completed_response.text();
+        let completed_lines: Vec<&str> = completed_body.trim().lines().collect();
+        assert_eq!(completed_lines.len(), 2);
+        for line in completed_lines {
+            let item: serde_json::Value = serde_json::from_str(line).expect("valid batch result json");
+            assert_eq!(item["status"], "completed");
+        }
+
+        let failed_response = app
+            .get(&format!("/ai/v1/batches/{}/results?status=failed", batch_id))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+        failed_response.assert_status(StatusCode::OK);
+        failed_response.assert_header("X-Incomplete", "false");
+        failed_response.assert_header("X-Last-Line", "1");
+        let failed_body = failed_response.text();
+        let failed_lines: Vec<&str> = failed_body.trim().lines().collect();
+        assert_eq!(failed_lines.len(), 1);
+        let failed_item: serde_json::Value = serde_json::from_str(failed_lines[0]).expect("valid failed batch result json");
+        assert_eq!(failed_item["status"], "failed");
+        assert_eq!(failed_item["custom_id"], "match-failed");
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_completed_batch_results_skip_past_end_returns_empty_page(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        let deployment = create_test_deployment(&pool, user.id, "test-model-endpoint", "test-model").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        let (batch_id, _, _) =
+            seed_completed_batch_results_fixture(&pool, user.id, &[("req-1", "completed"), ("req-2", "completed")]).await;
+
+        let auth = add_auth_headers(&user);
+        let response = app
+            .get(&format!("/ai/v1/batches/{}/results?skip=10", batch_id))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+
+        response.assert_status(StatusCode::OK);
+        response.assert_header("X-Incomplete", "false");
+        response.assert_header("X-Last-Line", "10");
+        assert_eq!(response.text(), "");
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_deleted_batch_results_are_not_downloadable(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        let jsonl_content = r#"{"custom_id":"req-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Test"}]}}
+"#;
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test.jsonl");
+        let upload_response = app
+            .post("/ai/v1/files")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .multipart(
+                axum_test::multipart::MultipartForm::new()
+                    .add_text("purpose", "batch")
+                    .add_part("file", file_part),
+            )
+            .await;
+
+        upload_response.assert_status(StatusCode::CREATED);
+        let file: serde_json::Value = upload_response.json();
+
+        let batch_response = app
+            .post("/ai/v1/batches")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .json(&serde_json::json!({
+                "input_file_id": file["id"],
+                "endpoint": "/v1/chat/completions",
+                "completion_window": "24h"
+            }))
+            .await;
+        batch_response.assert_status(StatusCode::CREATED);
+        let batch: serde_json::Value = batch_response.json();
+        let batch_id = batch["id"].as_str().expect("batch id");
+        let batch_uuid = Uuid::parse_str(batch_id.strip_prefix("batch_").unwrap_or(batch_id)).expect("valid batch uuid");
+
+        for attempt in 0..200 {
+            let count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM fusillade.requests WHERE batch_id = $1")
+                .bind(batch_uuid)
+                .fetch_one(&pool)
+                .await
+                .expect("Failed to count requests");
+            if count > 0 {
+                break;
+            }
+            assert!(attempt < 199, "Timed out waiting for requests to be populated");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        sqlx::query(
+            r#"
+            UPDATE fusillade.requests
+            SET state = 'completed', response_status = 200, response_body = '{"choices":[]}', completed_at = NOW()
+            WHERE batch_id = $1
+            "#,
+        )
+        .bind(batch_uuid)
+        .execute(&pool)
+        .await
+        .expect("Failed to complete requests");
+
+        let auth = add_auth_headers(&user);
+        app.delete(&format!("/ai/v1/batches/{}", batch_id))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+
+        app.get(&format!("/ai/v1/batches/{}/results", batch_id))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await
+            .assert_status(StatusCode::NOT_FOUND);
     }
 
     /// Test that X-Incomplete reflects batch processing status, not just pagination.

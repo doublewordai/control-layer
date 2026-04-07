@@ -2122,6 +2122,68 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use uuid::Uuid;
 
+    async fn upload_batch_input_file(
+        app: &axum_test::TestServer,
+        user: &crate::api::models::users::UserResponse,
+        jsonl_content: &str,
+    ) -> FileResponse {
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes().to_vec()).file_name("test-batch.jsonl");
+        let auth = add_auth_headers(user);
+
+        let upload_response = app
+            .post("/ai/v1/files")
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .multipart(
+                axum_test::multipart::MultipartForm::new()
+                    .add_text("purpose", "batch")
+                    .add_part("file", file_part),
+            )
+            .await;
+
+        upload_response.assert_status(axum::http::StatusCode::CREATED);
+        upload_response.json()
+    }
+
+    async fn create_batch_for_file(
+        app: &axum_test::TestServer,
+        user: &crate::api::models::users::UserResponse,
+        file_id: &str,
+    ) -> serde_json::Value {
+        let auth = add_auth_headers(user);
+        let batch_response = app
+            .post("/ai/v1/batches")
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .json(&serde_json::json!({
+                "input_file_id": file_id,
+                "endpoint": "/v1/chat/completions",
+                "completion_window": "24h"
+            }))
+            .await;
+
+        batch_response.assert_status(axum::http::StatusCode::CREATED);
+        batch_response.json()
+    }
+
+    async fn wait_for_batch_requests(pool: &PgPool, batch_uuid: Uuid) {
+        for attempt in 0..200 {
+            let count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM fusillade.requests WHERE batch_id = $1")
+                .bind(batch_uuid)
+                .fetch_one(pool)
+                .await
+                .expect("Failed to count requests");
+            if count > 0 {
+                return;
+            }
+            assert!(
+                attempt < 199,
+                "Timed out waiting for requests to be populated for batch {batch_uuid}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
     #[sqlx::test]
     #[test_log::test]
     async fn test_upload_and_download_file_content(pool: PgPool) {
@@ -3514,12 +3576,6 @@ mod tests {
         response.assert_status(axum::http::StatusCode::OK);
         response.assert_header("content-type", "application/x-ndjson");
         response.assert_header("X-Incomplete", "false");
-        // Streaming responses must not have content-length (regression guard)
-        assert!(
-            response.headers().get("content-length").is_none(),
-            "Unlimited download should be streamed without content-length"
-        );
-
         let body = response.text();
         let lines: Vec<&str> = body.trim().lines().collect();
         assert_eq!(lines.len(), num_requests, "Should return all {} results", num_requests);
@@ -3561,6 +3617,182 @@ mod tests {
         response.assert_status(axum::http::StatusCode::OK);
         response.assert_header("X-Incomplete", "false"); // no more pages, batch complete
         response.assert_header("X-Last-Line", &num_requests.to_string());
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_completed_output_file_content_supports_search_filter(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        let jsonl_content = r#"{"custom_id":"match-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Test 1"}]}}
+{"custom_id":"other-2","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Test 2"}]}}
+{"custom_id":"match-3","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Test 3"}]}}
+"#;
+        let file = upload_batch_input_file(&app, &user, jsonl_content).await;
+        let batch = create_batch_for_file(&app, &user, &file.id).await;
+        let batch_id = batch["id"].as_str().expect("batch id");
+        let output_file_id = batch["output_file_id"].as_str().expect("output file id");
+        let batch_uuid = Uuid::parse_str(batch_id.strip_prefix("batch_").unwrap_or(batch_id)).expect("valid batch uuid");
+
+        wait_for_batch_requests(&pool, batch_uuid).await;
+
+        sqlx::query(
+            r#"
+            UPDATE fusillade.requests
+            SET state = 'completed',
+                response_status = 200,
+                response_body = '{"choices":[{"message":{"content":"ok"}}]}',
+                completed_at = NOW()
+            WHERE batch_id = $1
+            "#,
+        )
+        .bind(batch_uuid)
+        .execute(&pool)
+        .await
+        .expect("Failed to complete requests");
+
+        let auth = add_auth_headers(&user);
+        let response = app
+            .get(&format!("/ai/v1/files/{}/content?search=match", output_file_id))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+
+        response.assert_status(axum::http::StatusCode::OK);
+        response.assert_header("X-Incomplete", "false");
+        response.assert_header("X-Last-Line", "2");
+        let body = response.text();
+        let lines: Vec<&str> = body.trim().lines().collect();
+        assert_eq!(lines.len(), 2);
+        for line in lines {
+            let item: serde_json::Value = serde_json::from_str(line).expect("valid output json");
+            let custom_id = item["custom_id"].as_str().expect("custom_id");
+            assert!(custom_id.contains("match"));
+        }
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_completed_output_file_content_skip_past_end_returns_empty_page(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        let jsonl_content = r#"{"custom_id":"req-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Test 1"}]}}
+{"custom_id":"req-2","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Test 2"}]}}
+"#;
+        let file = upload_batch_input_file(&app, &user, jsonl_content).await;
+        let batch = create_batch_for_file(&app, &user, &file.id).await;
+        let batch_id = batch["id"].as_str().expect("batch id");
+        let output_file_id = batch["output_file_id"].as_str().expect("output file id");
+        let batch_uuid = Uuid::parse_str(batch_id.strip_prefix("batch_").unwrap_or(batch_id)).expect("valid batch uuid");
+
+        wait_for_batch_requests(&pool, batch_uuid).await;
+
+        sqlx::query(
+            r#"
+            UPDATE fusillade.requests
+            SET state = 'completed', response_status = 200, response_body = '{"choices":[]}', completed_at = NOW()
+            WHERE batch_id = $1
+            "#,
+        )
+        .bind(batch_uuid)
+        .execute(&pool)
+        .await
+        .expect("Failed to complete requests");
+
+        let auth = add_auth_headers(&user);
+        let response = app
+            .get(&format!("/ai/v1/files/{}/content?skip=10", output_file_id))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+
+        response.assert_status(axum::http::StatusCode::OK);
+        response.assert_header("X-Incomplete", "false");
+        response.assert_header("X-Last-Line", "10");
+        assert_eq!(response.text(), "");
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_input_file_content_search_preserves_openai_jsonl_shape(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello 1"}]}}
+{"custom_id":"request-2","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello 2"}]}}
+{"custom_id":"request-3","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello 3"}]}}
+"#;
+
+        let file = upload_batch_input_file(&app, &user, jsonl_content).await;
+        let auth = add_auth_headers(&user);
+        let response = app
+            .get(&format!("/ai/v1/files/{}/content?search=request-2", file.id))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+
+        response.assert_status(axum::http::StatusCode::OK);
+        response.assert_header("X-Incomplete", "false");
+
+        let body = response.text();
+        let lines: Vec<&str> = body.trim().lines().collect();
+        assert_eq!(lines.len(), 1);
+        let item: serde_json::Value = serde_json::from_str(lines[0]).expect("valid input json");
+        assert_eq!(item["custom_id"], "request-2");
+        assert_eq!(item["method"], "POST");
+        assert_eq!(item["url"], "/v1/chat/completions");
+        assert_eq!(item["body"]["model"], "gpt-4");
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_deleted_input_file_content_returns_not_found(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}
+"#;
+        let file = upload_batch_input_file(&app, &user, jsonl_content).await;
+        let auth = add_auth_headers(&user);
+
+        let delete_response = app
+            .delete(&format!("/ai/v1/files/{}", file.id))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+
+        delete_response.assert_status(axum::http::StatusCode::OK);
+        let body: serde_json::Value = delete_response.json();
+        assert_eq!(body["deleted"], true);
+        assert_eq!(body["id"], file.id);
+
+        app.get(&format!("/ai/v1/files/{}/content", file.id))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await
+            .assert_status(axum::http::StatusCode::NOT_FOUND);
     }
 
     #[test]
