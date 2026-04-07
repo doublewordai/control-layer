@@ -521,6 +521,9 @@ pub struct StripeConfig {
     /// Custom text displayed for terms of service acceptance during auto top-up setup.
     /// If not set, no terms of service acceptance text is shown.
     pub auto_topup_terms_of_service_text: Option<String>,
+    /// Stripe tax code for auto top-up tax calculations (e.g. "txcd_10000000").
+    /// If not set, falls back to the account-level default tax code in Stripe Tax settings.
+    pub tax_code: Option<String>,
 }
 
 /// Dummy payment configuration for testing.

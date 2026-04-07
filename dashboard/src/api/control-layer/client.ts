@@ -1212,6 +1212,20 @@ const paymentsApi = {
     return response.json();
   },
 
+  async disableAutoTopup(): Promise<void> {
+    const response = await fetch("/admin/api/v1/auto-topup/disable", {
+      method: "POST",
+    });
+
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({}));
+      throw new Error(
+        errorData.message ||
+          `Failed to disable auto top-up: ${response.status}`,
+      );
+    }
+  },
+
 };
 
 // Probes API
