@@ -644,11 +644,7 @@ impl PaymentProvider for StripeProvider {
                 PaymentError::ProviderApi(e.to_string())
             })?;
 
-        tracing::debug!(
-            "Created billing portal session {} for customer {}",
-            session.id,
-            customer_id
-        );
+        tracing::debug!("Created billing portal session {} for customer {}", session.id, customer_id);
 
         // Return the portal session URL
         Ok(session.url)

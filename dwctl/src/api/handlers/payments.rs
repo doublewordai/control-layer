@@ -95,17 +95,12 @@ struct BillingTarget {
 /// In org context: verifies the caller is an org admin/owner, loads the org's
 /// payment details, and returns the org as the target.
 /// Otherwise: returns the caller's own details.
-async fn resolve_billing_target(
-    user: &CurrentUser,
-    conn: &mut sqlx::PgConnection,
-) -> Result<BillingTarget, StatusCode> {
+async fn resolve_billing_target(user: &CurrentUser, conn: &mut sqlx::PgConnection) -> Result<BillingTarget, StatusCode> {
     if let Some(org_id) = user.active_organization {
-        let can_manage = permissions::can_manage_org_resource(user, org_id, conn)
-            .await
-            .map_err(|e| {
-                tracing::error!("Failed to check org permissions: {:?}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
+        let can_manage = permissions::can_manage_org_resource(user, org_id, conn).await.map_err(|e| {
+            tracing::error!("Failed to check org permissions: {:?}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
         if !can_manage {
             return Err(StatusCode::FORBIDDEN);
         }
@@ -440,10 +435,13 @@ pub async fn create_billing_portal_session<P: PoolProvider>(
     let provider = payment_providers::create_provider(payment_config);
 
     // Create billing portal session using the provider trait
-    let portal_url = provider.create_billing_portal_session(&customer_id, &return_url).await.map_err(|e| {
-        tracing::error!("Failed to create billing portal session: {:?}", e);
-        StatusCode::from(e)
-    })?;
+    let portal_url = provider
+        .create_billing_portal_session(&customer_id, &return_url)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to create billing portal session: {:?}", e);
+            StatusCode::from(e)
+        })?;
 
     // Return the portal URL as JSON for the frontend to navigate to
     Ok(Json(json!({
