@@ -833,7 +833,10 @@ pub enum FileStorageBackend {
 #[serde(default, deny_unknown_fields)]
 pub struct ObjectStoreConfig {
     pub provider: ObjectStoreProvider,
-    pub endpoint: String,
+    /// Optional custom endpoint URL.
+    /// Required for `s3_compatible`; usually omitted for `aws_s3`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
     pub bucket: String,
     pub region: String,
     /// Optional static access key. When omitted, the AWS SDK default credential chain is used.
@@ -845,7 +848,10 @@ pub struct ObjectStoreConfig {
     /// Optional session token for static credentials.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_token: Option<String>,
-    pub path_style: bool,
+    /// Optional override for bucket addressing mode.
+    /// Defaults to `false` for `aws_s3` and `true` for `s3_compatible`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path_style: Option<bool>,
     pub prefix: String,
     pub connect_timeout_ms: u64,
     pub request_timeout_ms: u64,
@@ -855,13 +861,13 @@ impl Default for ObjectStoreConfig {
     fn default() -> Self {
         Self {
             provider: ObjectStoreProvider::S3Compatible,
-            endpoint: String::new(),
+            endpoint: None,
             bucket: String::new(),
             region: "us-east-1".to_string(),
             access_key_id: None,
             secret_access_key: None,
             session_token: None,
-            path_style: true,
+            path_style: None,
             prefix: "uploads/".to_string(),
             connect_timeout_ms: 5000,
             request_timeout_ms: 120000,
@@ -869,9 +875,10 @@ impl Default for ObjectStoreConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ObjectStoreProvider {
+    AwsS3,
     S3Compatible,
 }
 
@@ -2018,11 +2025,6 @@ impl Config {
                     operation: "Config validation: batches.files.object_store must be set when storage_backend=object_store.".to_string(),
                 })?;
 
-                if store.endpoint.trim().is_empty() {
-                    return Err(Error::Internal {
-                        operation: "Config validation: batches.files.object_store.endpoint cannot be empty.".to_string(),
-                    });
-                }
                 if store.bucket.trim().is_empty() {
                     return Err(Error::Internal {
                         operation: "Config validation: batches.files.object_store.bucket cannot be empty.".to_string(),
@@ -2031,6 +2033,20 @@ impl Config {
                 if store.region.trim().is_empty() {
                     return Err(Error::Internal {
                         operation: "Config validation: batches.files.object_store.region cannot be empty.".to_string(),
+                    });
+                }
+
+                let endpoint = store.endpoint.as_deref().map(str::trim).filter(|s| !s.is_empty());
+                if store.endpoint.is_some() && endpoint.is_none() {
+                    return Err(Error::Internal {
+                        operation: "Config validation: batches.files.object_store.endpoint cannot be empty.".to_string(),
+                    });
+                }
+
+                if store.provider == ObjectStoreProvider::S3Compatible && endpoint.is_none() {
+                    return Err(Error::Internal {
+                        operation: "Config validation: batches.files.object_store.endpoint must be set for provider=s3_compatible."
+                            .to_string(),
                     });
                 }
 
@@ -2405,7 +2421,7 @@ secret_key: "test-secret-key"
         config.batches.enabled = true;
         config.batches.files.storage_backend = FileStorageBackend::ObjectStore;
         config.batches.files.object_store = Some(ObjectStoreConfig {
-            endpoint: "".to_string(),
+            endpoint: Some("".to_string()),
             bucket: "bucket".to_string(),
             region: "us-east-1".to_string(),
             access_key_id: Some("key".to_string()),
@@ -2426,7 +2442,7 @@ secret_key: "test-secret-key"
         config.batches.enabled = true;
         config.batches.files.storage_backend = FileStorageBackend::ObjectStore;
         config.batches.files.object_store = Some(ObjectStoreConfig {
-            endpoint: "http://localhost:9000".to_string(),
+            endpoint: Some("http://localhost:9000".to_string()),
             bucket: "bucket".to_string(),
             region: "us-east-1".to_string(),
             access_key_id: None,
@@ -2439,6 +2455,49 @@ secret_key: "test-secret-key"
     }
 
     #[test]
+    fn test_aws_s3_allows_missing_endpoint() {
+        let mut config = Config::default();
+        config.auth.native.enabled = true;
+        config.secret_key = Some("test-secret-key".to_string());
+        config.batches.enabled = true;
+        config.batches.files.storage_backend = FileStorageBackend::ObjectStore;
+        config.batches.files.object_store = Some(ObjectStoreConfig {
+            provider: ObjectStoreProvider::AwsS3,
+            endpoint: None,
+            bucket: "bucket".to_string(),
+            region: "eu-west-2".to_string(),
+            ..Default::default()
+        });
+
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_s3_compatible_requires_endpoint() {
+        let mut config = Config::default();
+        config.auth.native.enabled = true;
+        config.secret_key = Some("test-secret-key".to_string());
+        config.batches.enabled = true;
+        config.batches.files.storage_backend = FileStorageBackend::ObjectStore;
+        config.batches.files.object_store = Some(ObjectStoreConfig {
+            provider: ObjectStoreProvider::S3Compatible,
+            endpoint: None,
+            bucket: "bucket".to_string(),
+            region: "us-east-1".to_string(),
+            ..Default::default()
+        });
+
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("endpoint must be set for provider=s3_compatible")
+        );
+    }
+
+    #[test]
     fn test_object_store_rejects_partial_static_credentials() {
         let mut config = Config::default();
         config.auth.native.enabled = true;
@@ -2446,7 +2505,7 @@ secret_key: "test-secret-key"
         config.batches.enabled = true;
         config.batches.files.storage_backend = FileStorageBackend::ObjectStore;
         config.batches.files.object_store = Some(ObjectStoreConfig {
-            endpoint: "http://localhost:9000".to_string(),
+            endpoint: Some("http://localhost:9000".to_string()),
             bucket: "bucket".to_string(),
             region: "us-east-1".to_string(),
             access_key_id: Some("key".to_string()),
@@ -2472,7 +2531,7 @@ secret_key: "test-secret-key"
         config.batches.enabled = true;
         config.batches.files.storage_backend = FileStorageBackend::ObjectStore;
         config.batches.files.object_store = Some(ObjectStoreConfig {
-            endpoint: "http://localhost:9000".to_string(),
+            endpoint: Some("http://localhost:9000".to_string()),
             bucket: "bucket".to_string(),
             region: "us-east-1".to_string(),
             session_token: Some("token".to_string()),

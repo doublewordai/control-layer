@@ -17,14 +17,11 @@ pub struct BlobStorageClient {
     client: Client,
     bucket: String,
     prefix: String,
+    provider: ObjectStoreProvider,
 }
 
 impl BlobStorageClient {
     pub async fn new(config: &ObjectStoreConfig) -> Result<Self> {
-        match config.provider {
-            ObjectStoreProvider::S3Compatible => {}
-        }
-
         let timeout_config = TimeoutConfig::builder()
             .connect_timeout(Duration::from_millis(config.connect_timeout_ms))
             .operation_timeout(Duration::from_millis(config.request_timeout_ms))
@@ -32,8 +29,11 @@ impl BlobStorageClient {
 
         let mut sdk_config = aws_config::defaults(BehaviorVersion::latest())
             .region(RegionProviderChain::first_try(Region::new(config.region.clone())))
-            .endpoint_url(config.endpoint.clone())
             .timeout_config(timeout_config);
+
+        if let Some(endpoint) = normalized_endpoint(config) {
+            sdk_config = sdk_config.endpoint_url(endpoint.to_owned());
+        }
 
         if let Some(creds) = static_credentials(config) {
             sdk_config = sdk_config.credentials_provider(SharedCredentialsProvider::new(creds));
@@ -42,13 +42,14 @@ impl BlobStorageClient {
         let sdk_config = sdk_config.load().await;
 
         let s3_config = aws_sdk_s3::config::Builder::from(&sdk_config)
-            .force_path_style(config.path_style)
+            .force_path_style(effective_path_style(config))
             .build();
 
         Ok(Self {
             client: Client::from_conf(s3_config),
             bucket: config.bucket.clone(),
             prefix: config.prefix.clone(),
+            provider: config.provider,
         })
     }
 
@@ -71,9 +72,7 @@ impl BlobStorageClient {
             .body(body)
             .send()
             .await
-            .map_err(|e| Error::Internal {
-                operation: format!("put object to blob storage: {e}"),
-            })?;
+            .map_err(|e| blob_storage_error("put object to blob storage", self, key, e))?;
         Ok(())
     }
 
@@ -85,9 +84,7 @@ impl BlobStorageClient {
             .key(key)
             .send()
             .await
-            .map_err(|e| Error::Internal {
-                operation: format!("get object from blob storage: {e}"),
-            })?;
+            .map_err(|e| blob_storage_error("get object from blob storage", self, key, e))?;
 
         let bytes = obj.body.collect().await.map_err(|e| Error::Internal {
             operation: format!("read blob object body: {e}"),
@@ -103,20 +100,14 @@ impl BlobStorageClient {
             .key(key)
             .send()
             .await
-            .map_err(|e| Error::Internal {
-                operation: format!("get object from blob storage: {e}"),
-            })
+            .map_err(|e| blob_storage_error("get object from blob storage", self, key, e))
     }
 
     pub async fn get_file_bytes_if_exists(&self, key: &str) -> Result<Option<Vec<u8>>> {
         let obj = match self.client.get_object().bucket(&self.bucket).key(key).send().await {
             Ok(obj) => obj,
             Err(SdkError::ServiceError(err)) if err.err().is_no_such_key() => return Ok(None),
-            Err(e) => {
-                return Err(Error::Internal {
-                    operation: format!("get object from blob storage: {e}"),
-                });
-            }
+            Err(e) => return Err(blob_storage_error("get object from blob storage", self, key, e)),
         };
 
         let bytes = obj.body.collect().await.map_err(|e| Error::Internal {
@@ -135,9 +126,7 @@ impl BlobStorageClient {
             .body(ByteStream::from(bytes))
             .send()
             .await
-            .map_err(|e| Error::Internal {
-                operation: format!("put object to blob storage: {e}"),
-            })?;
+            .map_err(|e| blob_storage_error("put object to blob storage", self, key, e))?;
         Ok(())
     }
 
@@ -148,9 +137,7 @@ impl BlobStorageClient {
             .key(key)
             .send()
             .await
-            .map_err(|e| Error::Internal {
-                operation: format!("delete object from blob storage: {e}"),
-            })?;
+            .map_err(|e| blob_storage_error("delete object from blob storage", self, key, e))?;
         Ok(())
     }
 
@@ -167,7 +154,12 @@ impl BlobStorageClient {
                 .send()
                 .await
                 .map_err(|e| Error::Internal {
-                    operation: format!("list objects from blob storage: {e}"),
+                    operation: format!(
+                        "list objects from blob storage (bucket={}, prefix={}): {}",
+                        self.bucket,
+                        prefix,
+                        classify_sdk_error(&e)
+                    ),
                 })?;
 
             for object in response.contents() {
@@ -206,6 +198,53 @@ fn static_credentials(config: &ObjectStoreConfig) -> Option<Credentials> {
     ))
 }
 
+fn normalized_endpoint(config: &ObjectStoreConfig) -> Option<&str> {
+    config.endpoint.as_deref().map(str::trim).filter(|s| !s.is_empty())
+}
+
+fn effective_path_style(config: &ObjectStoreConfig) -> bool {
+    config.path_style.unwrap_or(match config.provider {
+        ObjectStoreProvider::AwsS3 => false,
+        ObjectStoreProvider::S3Compatible => true,
+    })
+}
+
+fn provider_name(provider: ObjectStoreProvider) -> &'static str {
+    match provider {
+        ObjectStoreProvider::AwsS3 => "aws_s3",
+        ObjectStoreProvider::S3Compatible => "s3_compatible",
+    }
+}
+
+fn classify_sdk_error<E>(error: &SdkError<E>) -> String
+where
+    E: std::fmt::Debug,
+{
+    match error {
+        SdkError::ConstructionFailure(e) => format!("construction failure: {e:?}"),
+        SdkError::TimeoutError(e) => format!("timeout: {e:?}"),
+        SdkError::DispatchFailure(e) => format!("dispatch failure: {e:?}"),
+        SdkError::ResponseError(e) => format!("response error: {e:?}"),
+        SdkError::ServiceError(e) => format!("service error: {:?}", e.err()),
+        _ => error.to_string(),
+    }
+}
+
+fn blob_storage_error<E>(operation: &str, client: &BlobStorageClient, key: &str, error: SdkError<E>) -> Error
+where
+    E: std::fmt::Debug,
+{
+    Error::Internal {
+        operation: format!(
+            "{operation} (bucket={}, key={}, provider={}): {}",
+            client.bucket,
+            key,
+            provider_name(client.provider),
+            classify_sdk_error(&error)
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,13 +254,13 @@ mod tests {
     fn object_store_config() -> ObjectStoreConfig {
         ObjectStoreConfig {
             provider: ObjectStoreProvider::S3Compatible,
-            endpoint: "http://localhost:9000".to_string(),
+            endpoint: Some("http://localhost:9000".to_string()),
             bucket: "bucket".to_string(),
             region: "us-east-1".to_string(),
             access_key_id: None,
             secret_access_key: None,
             session_token: None,
-            path_style: true,
+            path_style: Some(true),
             prefix: "uploads/".to_string(),
             connect_timeout_ms: 1000,
             request_timeout_ms: 1000,
@@ -254,5 +293,50 @@ mod tests {
         config.secret_access_key = Some("secret".to_string());
 
         assert!(static_credentials(&config).is_none());
+    }
+
+    #[test]
+    fn effective_path_style_defaults_to_false_for_aws_s3() {
+        let config = ObjectStoreConfig {
+            provider: ObjectStoreProvider::AwsS3,
+            endpoint: None,
+            path_style: None,
+            ..object_store_config()
+        };
+
+        assert!(!effective_path_style(&config));
+    }
+
+    #[test]
+    fn effective_path_style_defaults_to_true_for_s3_compatible() {
+        let config = ObjectStoreConfig {
+            provider: ObjectStoreProvider::S3Compatible,
+            endpoint: Some("http://localhost:9000".to_string()),
+            path_style: None,
+            ..object_store_config()
+        };
+
+        assert!(effective_path_style(&config));
+    }
+
+    #[test]
+    fn effective_path_style_respects_explicit_override() {
+        let config = ObjectStoreConfig {
+            provider: ObjectStoreProvider::AwsS3,
+            path_style: Some(true),
+            ..object_store_config()
+        };
+
+        assert!(effective_path_style(&config));
+    }
+
+    #[test]
+    fn normalized_endpoint_ignores_blank_values() {
+        let config = ObjectStoreConfig {
+            endpoint: Some("   ".to_string()),
+            ..object_store_config()
+        };
+
+        assert!(normalized_endpoint(&config).is_none());
     }
 }
