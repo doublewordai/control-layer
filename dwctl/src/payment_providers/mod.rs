@@ -8,7 +8,7 @@ use axum::http::StatusCode;
 use rust_decimal::Decimal;
 use sqlx::PgPool;
 
-use crate::{UserId, api::models::users::CurrentUser, config::PaymentConfig};
+use crate::{UserId, config::PaymentConfig};
 
 pub mod dummy;
 pub mod stripe;
@@ -116,6 +116,13 @@ pub struct WebhookEvent {
     pub session_id: Option<String>,
 }
 
+/// The entity paying for a checkout session (individual user or org).
+pub struct CheckoutPayer {
+    pub id: UserId,
+    pub email: String,
+    pub payment_provider_id: Option<String>,
+}
+
 /// Abstract payment provider interface
 ///
 /// Implementors provide payment processing capabilities for different providers
@@ -127,14 +134,14 @@ pub trait PaymentProvider: Send + Sync {
     /// Returns a URL that the user should be redirected to for payment.
     ///
     /// # Arguments
-    /// * `db_pool` - Database connection pool
-    /// * `user` - The authenticated user making the payment
-    /// * `creditee_id` - Optional user ID to credit (for admin granting credits to another user)
+    /// * `payer` - The billing target paying for the checkout (individual or org)
+    /// * `creditee_id` - Optional user ID to credit (for admin granting credits to another user).
+    ///   If None, the payer is also the creditee.
     /// * `cancel_url` - URL to redirect to if payment is cancelled
     /// * `success_url` - URL to redirect to if payment succeeds
     async fn create_checkout_session(
         &self,
-        user: &CurrentUser,
+        payer: &CheckoutPayer,
         creditee_id: Option<&str>,
         cancel_url: &str,
         success_url: &str,
@@ -168,9 +175,9 @@ pub trait PaymentProvider: Send + Sync {
     /// Returns a URL that the user should be redirected to for managing their billing.
     ///
     /// # Arguments
-    /// * `user` - The authenticated user requesting portal access
+    /// * `customer_id` - The payment provider customer ID
     /// * `return_url` - The complete URL to redirect to after the customer is done (e.g., "https://example.com/cost-management")
-    async fn create_billing_portal_session(&self, user: &CurrentUser, return_url: &str) -> Result<String>;
+    async fn create_billing_portal_session(&self, customer_id: &str, return_url: &str) -> Result<String>;
 
     /// Create a checkout session for auto top-up setup
     ///
@@ -178,10 +185,10 @@ pub trait PaymentProvider: Send + Sync {
     /// for future off-session charges. Returns the checkout URL.
     ///
     /// # Arguments
-    /// * `user` - The authenticated user
+    /// * `payer` - The billing target (individual or org)
     /// * `cancel_url` - URL to redirect to if the user cancels
     /// * `success_url` - URL to redirect to on success
-    async fn create_auto_topup_checkout_session(&self, user: &CurrentUser, cancel_url: &str, success_url: &str) -> Result<String>;
+    async fn create_auto_topup_checkout_session(&self, payer: &CheckoutPayer, cancel_url: &str, success_url: &str) -> Result<String>;
 
     /// Validate and process an auto top-up checkout session
     ///

@@ -29,7 +29,12 @@ export function CostManagement() {
   const { isFeatureEnabled, settings } = useSettings();
   const isDemoMode = isFeatureEnabled("demo");
   const { data: config } = useConfig();
-  const { activeOrganizationId } = useOrganizationContext();
+  const { activeOrganizationId, activeOrganization } =
+    useOrganizationContext();
+  const isOrgAdmin =
+    activeOrganization?.role === "owner" ||
+    activeOrganization?.role === "admin";
+  const canManageOrgBilling = !activeOrganizationId || isOrgAdmin;
 
   const [showSuccessModal, setShowSuccessModal] = useState(false);
   const [showCancelledModal, setShowCancelledModal] = useState(false);
@@ -184,7 +189,12 @@ export function CostManagement() {
   };
 
   // Determine add funds configuration
+  // Non-admin org members cannot manage billing, so hide add-funds controls
   const addFundsConfig = (() => {
+    // In an org context, only owners/admins can manage billing.
+    // Personal accounts are unaffected (canManageOrgBilling is always true).
+    if (!canManageOrgBilling) return undefined;
+
     const hasPaymentEnabled = isDemoMode || !!config?.payment_enabled;
     const hasPaymentProvider = !!settings.paymentProviderUrl;
     const hasCustomerId = !!displayUser?.has_payment_provider_id;
@@ -224,12 +234,14 @@ export function CostManagement() {
   })();
 
   const showAutoTopupSection =
-    (isDemoMode || !!config?.payment_enabled) && displayUser && !filterUserId;
+    (isDemoMode || !!config?.payment_enabled) &&
+    displayUser &&
+    (!filterUserId || filterUserId === activeOrganizationId) &&
+    canManageOrgBilling;
 
   const autoTopupElement = showAutoTopupSection ? (
     <AutoTopupSection
       user={displayUser!}
-      userId={currentUser!.id}
       onSuccess={() => {
         refetchCurrentUser();
         refetchDisplayUser();
