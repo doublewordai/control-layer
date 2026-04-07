@@ -14,6 +14,7 @@ use crate::api::models::batches::{
 };
 use crate::api::models::users::CurrentUser;
 use crate::auth::permissions::{RequiresPermission, can_read_all_resources, has_permission, operation, resource};
+use crate::batch_result_cache;
 use crate::db::handlers::{Credits, Users, api_keys::ApiKeys, repository::Repository};
 use crate::db::models::api_keys::ApiKeyPurpose;
 use crate::errors::{Error, Result};
@@ -1053,6 +1054,26 @@ pub async fn get_batch_results<P: PoolProvider>(
     let status = query.status.clone();
     let requested_limit = query.pagination.limit.map(|_| query.pagination.limit() as usize);
 
+    if !still_processing {
+        let cache_file_id = batch.output_file_id.ok_or_else(|| Error::Internal {
+            operation: format!("batch {} missing output_file_id for completed result cache", batch.id),
+        })?;
+        let config = state.current_config();
+        let cached_bytes = batch_result_cache::get_or_build_batch_results_jsonl(
+            config.as_ref(),
+            state.request_manager.as_ref(),
+            fusillade::BatchId(batch_id),
+            cache_file_id,
+            search.clone(),
+            status.clone(),
+        )
+        .await?;
+
+        let slice = batch_result_cache::slice_jsonl_bytes(&cached_bytes, offset, requested_limit);
+        let incomplete = slice.has_more_pages;
+        return Ok(batch_result_cache::jsonl_response_from_slice_with_offset(slice, offset, incomplete));
+    }
+
     if let Some(limit) = requested_limit {
         // Pagination case: buffer only N+1 items to check for more pages
         let results_stream = state
@@ -1269,6 +1290,14 @@ pub async fn delete_batch<P: PoolProvider>(
             resource: "Batch".to_string(),
             id: batch_id_str.clone(),
         });
+    }
+
+    let config = state.current_config();
+    if let Some(output_file_id) = batch.output_file_id {
+        batch_result_cache::invalidate_cached_file_results(config.as_ref(), *output_file_id).await?;
+    }
+    if let Some(error_file_id) = batch.error_file_id {
+        batch_result_cache::invalidate_cached_file_results(config.as_ref(), *error_file_id).await?;
     }
 
     // Delete the batch

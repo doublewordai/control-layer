@@ -142,6 +142,7 @@ fn install_crypto_provider() {
 
 pub mod api;
 pub mod auth;
+mod batch_result_cache;
 mod blob_storage;
 pub mod config;
 mod config_watcher;

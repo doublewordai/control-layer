@@ -13,6 +13,7 @@ use crate::api::models::files::{
 };
 use crate::api::models::users::CurrentUser;
 use crate::auth::permissions::{RequiresPermission, can_read_all_resources, operation, resource};
+use crate::batch_result_cache;
 use crate::blob_storage::BlobStorageClient;
 use crate::config::FileStorageBackend;
 
@@ -73,7 +74,7 @@ fn is_file_owner(current_user: &CurrentUser, uploaded_by: Option<&str>) -> bool 
 /// OpenAI Batch API request format
 /// See: https://platform.openai.com/docs/api-reference/batch
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct OpenAIBatchRequest {
+pub(crate) struct OpenAIBatchRequest {
     custom_id: String,
     method: String,
     url: String,
@@ -237,7 +238,7 @@ impl OpenAIBatchRequest {
     }
 
     /// Transform internal format to OpenAI format
-    fn from_internal(internal: &fusillade::RequestTemplateInput) -> Result<Self> {
+    pub(crate) fn from_internal(internal: &fusillade::RequestTemplateInput) -> Result<Self> {
         // Parse body string to JSON
         let body: serde_json::Value = serde_json::from_str(&internal.body).map_err(|e| Error::Internal {
             operation: format!("Failed to parse stored body as JSON: {}", e),
@@ -1662,8 +1663,8 @@ pub async fn get_file_content<P: PoolProvider>(
     // For BatchOutput and BatchError files, check if the batch is still running
     // (which means more data may be written to this file in the future).
     // Also capture the expected content count for streaming X-Last-Line.
-    let (file_may_receive_more_data, file_content_count) = match file.purpose {
-        Some(fusillade::batch::Purpose::Batch) => (false, None), // Input files: count unknown without query
+    let (file_may_receive_more_data, file_content_count, cacheable_completed_result) = match file.purpose {
+        Some(fusillade::batch::Purpose::Batch) => (false, None, false), // Input files: count unknown without query
         Some(fusillade::batch::Purpose::BatchOutput) => {
             let batch = state
                 .request_manager
@@ -1681,9 +1682,12 @@ pub async fn get_file_content<P: PoolProvider>(
                         operation: format!("get batch status: {}", e),
                     })?;
                 let still_processing = !status.is_finished();
-                (still_processing, Some(status.completed_requests as usize))
+                (still_processing, Some(status.completed_requests as usize), status.is_finished())
             } else {
-                (false, None)
+                return Err(Error::NotFound {
+                    resource: "File".to_string(),
+                    id: file_id_str.clone(),
+                });
             }
         }
         Some(fusillade::batch::Purpose::BatchError) => {
@@ -1703,12 +1707,15 @@ pub async fn get_file_content<P: PoolProvider>(
                         operation: format!("get batch status: {}", e),
                     })?;
                 let still_processing = !status.is_finished();
-                (still_processing, Some(status.failed_requests as usize))
+                (still_processing, Some(status.failed_requests as usize), status.is_finished())
             } else {
-                (false, None)
+                return Err(Error::NotFound {
+                    resource: "File".to_string(),
+                    id: file_id_str.clone(),
+                });
             }
         }
-        None => (false, None), // Shouldn't happen, but assume complete
+        None => (false, None, false), // Shouldn't happen, but assume complete
     };
 
     // Stream the file content as JSONL, starting from offset
@@ -1736,6 +1743,21 @@ pub async fn get_file_content<P: PoolProvider>(
                 .map(|json| format!("{}\n", json))
                 .map_err(|e| fusillade::FusilladeError::Other(anyhow::anyhow!("JSON serialization failed: {}", e))),
         }
+    }
+
+    if cacheable_completed_result {
+        let config = state.current_config();
+        let cached_bytes = batch_result_cache::get_or_build_file_content_jsonl(
+            config.as_ref(),
+            state.request_manager.as_ref(),
+            fusillade::FileId(file_id),
+            search.clone(),
+        )
+        .await?;
+
+        let slice = batch_result_cache::slice_jsonl_bytes(&cached_bytes, offset, requested_limit);
+        let incomplete = slice.has_more_pages;
+        return Ok(batch_result_cache::jsonl_response_from_slice_with_offset(slice, offset, incomplete));
     }
 
     if let Some(limit) = requested_limit {
@@ -1866,6 +1888,9 @@ pub async fn delete_file<P: PoolProvider>(
             id: file_id_str.clone(),
         });
     }
+
+    let config = state.current_config();
+    batch_result_cache::invalidate_cached_file_results(config.as_ref(), file_id).await?;
 
     // Perform the deletion (hard delete - cascades to batches and requests)
     state
@@ -3136,6 +3161,91 @@ mod tests {
             Some("false"),
             "Output file should be complete when batch has no pending/in-progress requests"
         );
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_deleted_batch_output_file_is_no_longer_downloadable(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        let jsonl_content = r#"{"custom_id":"req-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Test"}]}}
+"#;
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test.jsonl");
+        let upload_response = app
+            .post("/ai/v1/files")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .multipart(
+                axum_test::multipart::MultipartForm::new()
+                    .add_text("purpose", "batch")
+                    .add_part("file", file_part),
+            )
+            .await;
+
+        upload_response.assert_status(axum::http::StatusCode::CREATED);
+        let file: FileResponse = upload_response.json();
+
+        let batch_response = app
+            .post("/ai/v1/batches")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .json(&serde_json::json!({
+                "input_file_id": file.id,
+                "endpoint": "/v1/chat/completions",
+                "completion_window": "24h"
+            }))
+            .await;
+
+        batch_response.assert_status(axum::http::StatusCode::CREATED);
+        let batch: serde_json::Value = batch_response.json();
+        let batch_id = batch["id"].as_str().expect("Should have id");
+        let output_file_id = batch["output_file_id"].as_str().expect("Should have output_file_id");
+
+        let batch_uuid = batch_id.strip_prefix("batch_").unwrap_or(batch_id);
+        let batch_uuid = Uuid::parse_str(batch_uuid).expect("Valid batch UUID");
+
+        for attempt in 0..200 {
+            let count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM fusillade.requests WHERE batch_id = $1")
+                .bind(batch_uuid)
+                .fetch_one(&pool)
+                .await
+                .expect("Failed to count requests");
+            if count > 0 {
+                break;
+            }
+            assert!(attempt < 199, "Timed out waiting for requests to be populated");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        sqlx::query(
+            r#"
+            UPDATE fusillade.requests
+            SET state = 'completed', response_status = 200, response_body = '{"choices":[]}', completed_at = NOW()
+            WHERE batch_id = $1
+            "#,
+        )
+        .bind(batch_uuid)
+        .execute(&pool)
+        .await
+        .expect("Failed to complete requests");
+
+        app.delete(&format!("/ai/v1/batches/{}", batch_id))
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await
+            .assert_status(axum::http::StatusCode::NO_CONTENT);
+
+        app.get(&format!("/ai/v1/files/{}/content", output_file_id))
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await
+            .assert_status(axum::http::StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
