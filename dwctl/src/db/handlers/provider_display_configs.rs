@@ -5,6 +5,7 @@ use crate::db::{
         ProviderDisplayConfigUpdateDBRequest,
     },
 };
+use crate::types::UserId;
 use chrono::{DateTime, Utc};
 use sqlx::{FromRow, PgConnection};
 use tracing::instrument;
@@ -145,6 +146,48 @@ impl<'c> ProviderDisplayConfigs<'c> {
             GROUP BY LOWER(BTRIM(metadata->>'provider'))
             ORDER BY MIN(BTRIM(metadata->>'provider'))
             "#
+        )
+        .fetch_all(&mut *self.db)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| {
+                Some(KnownProviderDBResponse {
+                    provider_key: row.provider_key?,
+                    display_name: row.display_name?,
+                    model_count: row.model_count?,
+                })
+            })
+            .collect())
+    }
+
+    /// Like `list_known_providers`, but only counts models the given user can
+    /// access via their group memberships (including the Everyone group).
+    #[instrument(skip(self), fields(%user_id), err)]
+    pub async fn list_known_providers_for_user(&mut self, user_id: UserId) -> Result<Vec<KnownProviderDBResponse>> {
+        let rows = sqlx::query!(
+            r#"
+            SELECT
+                LOWER(BTRIM(dm.metadata->>'provider')) AS provider_key,
+                MIN(BTRIM(dm.metadata->>'provider')) AS display_name,
+                COUNT(DISTINCT dm.id)::BIGINT AS model_count
+            FROM deployed_models dm
+            JOIN deployment_groups dg ON dg.deployment_id = dm.id
+            WHERE
+                dm.deleted = false
+                AND dm.metadata->>'provider' IS NOT NULL
+                AND BTRIM(dm.metadata->>'provider') <> ''
+                AND dg.group_id IN (
+                    SELECT ug.group_id FROM user_groups ug WHERE ug.user_id = $1
+                    UNION
+                    SELECT '00000000-0000-0000-0000-000000000000'::uuid
+                    WHERE $1 != '00000000-0000-0000-0000-000000000000'::uuid
+                )
+            GROUP BY LOWER(BTRIM(dm.metadata->>'provider'))
+            ORDER BY MIN(BTRIM(dm.metadata->>'provider'))
+            "#,
+            user_id
         )
         .fetch_all(&mut *self.db)
         .await?;
