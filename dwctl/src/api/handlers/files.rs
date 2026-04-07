@@ -476,26 +476,8 @@ async fn set_file_ingest_status(
     Ok(())
 }
 
-async fn insert_file_placeholder(pool: &sqlx::PgPool, input: &IngestFileInput, purpose: &str) -> Result<()> {
-    sqlx::query(
-        r#"
-        INSERT INTO fusillade.files (id, name, purpose, size_bytes, status, uploaded_by, api_key_id, created_at, updated_at)
-        VALUES ($1, $2, $3, $4, 'processed', $5, $6, NOW(), NOW())
-        "#,
-    )
-    .bind(input.file_id)
-    .bind(&input.filename)
-    .bind(purpose)
-    .bind(input.size_bytes)
-    .bind(&input.uploaded_by)
-    .bind(input.api_key_id)
-    .execute(pool)
-    .await
-    .map_err(|e| Error::Database(e.into()))?;
-    Ok(())
-}
-
-async fn ingest_blob_to_templates(
+async fn ingest_blob_to_templates<P: sqlx_pool_router::PoolProvider + Clone + Send + Sync + 'static>(
+    request_manager: &fusillade::PostgresRequestManager<P, fusillade::ReqwestHttpClient>,
     db_pool: &sqlx::PgPool,
     config: &crate::config::Config,
     input: &IngestFileInput,
@@ -583,38 +565,10 @@ async fn ingest_blob_to_templates(
         return Err(TaskError::Fatal("File contains no valid request templates".to_string()));
     }
 
-    let mut tx = db_pool
-        .begin()
+    request_manager
+        .populate_file_templates(fusillade::FileId(input.file_id), templates)
         .await
-        .map_err(|e| TaskError::Retryable(format!("begin template ingest tx: {e}")))?;
-
-    for chunk in templates.chunks(config.batches.files.batch_insert_size.max(1)) {
-        for template in chunk {
-            let template_id = Uuid::new_v4();
-            sqlx::query(
-                r#"
-                INSERT INTO fusillade.request_templates (id, file_id, model, api_key, endpoint, path, body, custom_id, method)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-                "#,
-            )
-            .bind(template_id)
-            .bind(input.file_id)
-            .bind(&template.model)
-            .bind(&template.api_key)
-            .bind(&template.endpoint)
-            .bind(&template.path)
-            .bind(&template.body)
-            .bind(&template.custom_id)
-            .bind(&template.method)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| TaskError::Retryable(format!("insert request template: {e}")))?;
-        }
-    }
-
-    tx.commit()
-        .await
-        .map_err(|e| TaskError::Retryable(format!("commit template ingest tx: {e}")))?;
+        .map_err(|e| TaskError::Retryable(format!("populate file templates: {e}")))?;
 
     Ok(())
 }
@@ -631,7 +585,7 @@ pub async fn build_ingest_file_job<P: sqlx_pool_router::PoolProvider + Clone + S
         .state(state)
         .step(|cx, input: IngestFileInput| async move {
             let config = cx.state.config.snapshot();
-            match ingest_blob_to_templates(&cx.state.db_pool, &config, &input).await {
+            match ingest_blob_to_templates(cx.state.request_manager.as_ref(), &cx.state.db_pool, &config, &input).await {
                 Ok(()) => {
                     set_file_ingest_status(&cx.state.db_pool, input.file_id, &input.object_key, "processed", None)
                         .await
@@ -1200,7 +1154,25 @@ pub async fn upload_file<P: PoolProvider>(
             size_bytes: i64::try_from(total_size).unwrap_or(i64::MAX),
         };
 
-        insert_file_placeholder(state.db.write(), &ingest, "batch").await?;
+        state
+            .request_manager
+            .create_file_placeholder(fusillade::FilePlaceholderInput {
+                file_id: fusillade::FileId(file_id),
+                metadata: fusillade::FileMetadata {
+                    filename: Some(ingest.filename.clone()),
+                    description: None,
+                    purpose: Some("batch".to_string()),
+                    expires_after_anchor: None,
+                    expires_after_seconds: None,
+                    size_bytes: Some(ingest.size_bytes),
+                    uploaded_by: Some(ingest.uploaded_by.clone()),
+                    api_key_id: Some(ingest.api_key_id),
+                },
+            })
+            .await
+            .map_err(|e| Error::Internal {
+                operation: format!("create file placeholder: {e}"),
+            })?;
         set_file_ingest_status(state.db.write(), file_id, &object_key, "pending", None).await?;
 
         state
