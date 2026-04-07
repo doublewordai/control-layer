@@ -871,6 +871,8 @@ async fn test_request_logging_disabled(pool: PgPool) {
     underway::run_migrations(&pool).await.expect("Failed to run underway migrations");
     let task_state = TaskState {
         request_manager: request_manager.clone(),
+        db_pool: pool.clone(),
+        config: crate::SharedConfig::new(config.clone()),
     };
     let task_runner = std::sync::Arc::new(
         crate::tasks::TaskRunner::new(pool.clone(), task_state)
@@ -1220,6 +1222,8 @@ async fn test_build_router_with_metrics_disabled(pool: PgPool) {
     underway::run_migrations(&pool).await.expect("Failed to run underway migrations");
     let task_state = crate::tasks::TaskState {
         request_manager: request_manager.clone(),
+        db_pool: pool.clone(),
+        config: crate::SharedConfig::new(config.clone()),
     };
     let task_runner = std::sync::Arc::new(
         crate::tasks::TaskRunner::new(pool.clone(), task_state)
@@ -1261,6 +1265,8 @@ async fn test_build_router_with_metrics_enabled(pool: PgPool) {
     underway::run_migrations(&pool).await.expect("Failed to run underway migrations");
     let task_state = TaskState {
         request_manager: request_manager.clone(),
+        db_pool: pool.clone(),
+        config: crate::SharedConfig::new(config.clone()),
     };
     let task_runner = std::sync::Arc::new(
         crate::tasks::TaskRunner::new(pool.clone(), task_state)

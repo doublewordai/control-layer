@@ -283,6 +283,22 @@ batches:
     # Higher values improve throughput for large files but use more memory
     # Reduce value if you encounter memory spike issues with many concurrent uploads
     batch_insert_size: 5000
+    # Storage backend for upload path:
+    # - postgres: legacy (validate + insert synchronously during upload)
+    # - object_store: write raw JSONL to blob storage then ingest asynchronously
+    storage_backend: postgres
+    # Required when storage_backend=object_store
+    # object_store:
+    #   provider: s3_compatible
+    #   endpoint: "http://localhost:9000"
+    #   bucket: "dwctl-batches"
+    #   region: "us-east-1"
+    #   access_key_id: "minioadmin"
+    #   secret_access_key: "minioadmin"
+    #   path_style: true
+    #   prefix: "uploads/"
+    #   connect_timeout_ms: 5000
+    #   request_timeout_ms: 120000
 
 # Resource limits configuration
 # Controls file size, request count, and concurrency limits to prevent resource exhaustion

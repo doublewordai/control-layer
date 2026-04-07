@@ -42,6 +42,8 @@ pub async fn create_test_app_state_with_config(pool: PgPool, config: crate::conf
     underway::run_migrations(&pool).await.expect("Failed to run underway migrations");
     let task_state = crate::tasks::TaskState {
         request_manager: request_manager.clone(),
+        db_pool: pool.clone(),
+        config: crate::SharedConfig::new(config.clone()),
     };
     let task_runner = std::sync::Arc::new(
         crate::tasks::TaskRunner::new(pool, task_state)
@@ -91,6 +93,8 @@ pub async fn create_test_app_state_with_fusillade(pool: PgPool, config: crate::c
     underway::run_migrations(&pool).await.expect("Failed to run underway migrations");
     let task_state = crate::tasks::TaskState {
         request_manager: request_manager.clone(),
+        db_pool: pool.clone(),
+        config: crate::SharedConfig::new(config.clone()),
     };
     let task_runner = std::sync::Arc::new(
         crate::tasks::TaskRunner::new(pool, task_state)

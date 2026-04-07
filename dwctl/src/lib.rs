@@ -142,6 +142,8 @@ fn install_crypto_provider() {
 
 pub mod api;
 pub mod auth;
+mod batch_result_cache;
+mod blob_storage;
 pub mod config;
 mod config_watcher;
 mod crypto;
@@ -2174,6 +2176,8 @@ async fn setup_background_services(
     // Build the underway task runner for background jobs (batch population, etc.)
     let task_state = tasks::TaskState {
         request_manager: request_manager.clone(),
+        db_pool: pool.clone(),
+        config: SharedConfig::new(config.clone()),
     };
     let task_runner = Arc::new(tasks::TaskRunner::new(underway_pool, task_state).await?);
     for handle in task_runner.start(shutdown_token.clone()) {

@@ -798,6 +798,13 @@ pub struct FilesConfig {
     pub download_buffer_size: usize,
     /// Number of templates to insert in each batch during file upload (default: 5000)
     pub batch_insert_size: usize,
+    /// Storage backend for batch input file uploads.
+    ///
+    /// - "postgres": legacy mode, parse/upload directly into fusillade request_templates.
+    /// - "object_store": write raw JSONL to object storage first, then ingest asynchronously.
+    pub storage_backend: FileStorageBackend,
+    /// Optional object storage configuration (required when storage_backend=object_store).
+    pub object_store: Option<ObjectStoreConfig>,
 }
 
 impl Default for FilesConfig {
@@ -809,8 +816,70 @@ impl Default for FilesConfig {
             upload_buffer_size: 100,
             download_buffer_size: 100,
             batch_insert_size: 5000,
+            storage_backend: FileStorageBackend::Postgres,
+            object_store: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FileStorageBackend {
+    Postgres,
+    ObjectStore,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ObjectStoreConfig {
+    pub provider: ObjectStoreProvider,
+    /// Optional custom endpoint URL.
+    /// Required for `s3_compatible`; usually omitted for `aws_s3`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    pub bucket: String,
+    pub region: String,
+    /// Optional static access key. When omitted, the AWS SDK default credential chain is used.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub access_key_id: Option<String>,
+    /// Optional static secret key. When omitted, the AWS SDK default credential chain is used.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secret_access_key: Option<String>,
+    /// Optional session token for static credentials.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_token: Option<String>,
+    /// Optional override for bucket addressing mode.
+    /// Defaults to `false` for `aws_s3` and `true` for `s3_compatible`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path_style: Option<bool>,
+    pub prefix: String,
+    pub connect_timeout_ms: u64,
+    pub request_timeout_ms: u64,
+}
+
+impl Default for ObjectStoreConfig {
+    fn default() -> Self {
+        Self {
+            provider: ObjectStoreProvider::S3Compatible,
+            endpoint: None,
+            bucket: String::new(),
+            region: "us-east-1".to_string(),
+            access_key_id: None,
+            secret_access_key: None,
+            session_token: None,
+            path_style: None,
+            prefix: "uploads/".to_string(),
+            connect_timeout_ms: 5000,
+            request_timeout_ms: 120000,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ObjectStoreProvider {
+    AwsS3,
+    S3Compatible,
 }
 
 /// Resource limits for protecting system capacity.
@@ -1951,6 +2020,55 @@ impl Config {
                 });
             }
 
+            if self.batches.files.storage_backend == FileStorageBackend::ObjectStore {
+                let store = self.batches.files.object_store.as_ref().ok_or_else(|| Error::Internal {
+                    operation: "Config validation: batches.files.object_store must be set when storage_backend=object_store.".to_string(),
+                })?;
+
+                if store.bucket.trim().is_empty() {
+                    return Err(Error::Internal {
+                        operation: "Config validation: batches.files.object_store.bucket cannot be empty.".to_string(),
+                    });
+                }
+                if store.region.trim().is_empty() {
+                    return Err(Error::Internal {
+                        operation: "Config validation: batches.files.object_store.region cannot be empty.".to_string(),
+                    });
+                }
+
+                let endpoint = store.endpoint.as_deref().map(str::trim).filter(|s| !s.is_empty());
+                if store.endpoint.is_some() && endpoint.is_none() {
+                    return Err(Error::Internal {
+                        operation: "Config validation: batches.files.object_store.endpoint cannot be empty.".to_string(),
+                    });
+                }
+
+                if store.provider == ObjectStoreProvider::S3Compatible && endpoint.is_none() {
+                    return Err(Error::Internal {
+                        operation: "Config validation: batches.files.object_store.endpoint must be set for provider=s3_compatible."
+                            .to_string(),
+                    });
+                }
+
+                let access_key_id = store.access_key_id.as_deref().map(str::trim).filter(|s| !s.is_empty());
+                let secret_access_key = store.secret_access_key.as_deref().map(str::trim).filter(|s| !s.is_empty());
+
+                if access_key_id.is_some() != secret_access_key.is_some() {
+                    return Err(Error::Internal {
+                        operation: "Config validation: batches.files.object_store.access_key_id and secret_access_key must both be set when using static object-store credentials.".to_string(),
+                    });
+                }
+
+                let session_token = store.session_token.as_deref().map(str::trim).filter(|s| !s.is_empty());
+                if session_token.is_some() && access_key_id.is_none() {
+                    return Err(Error::Internal {
+                        operation:
+                            "Config validation: batches.files.object_store.session_token requires access_key_id and secret_access_key."
+                                .to_string(),
+                    });
+                }
+            }
+
             // Validate file size limits are sensible (0 = unlimited is allowed but not recommended)
             // Note: max_file_size is now in limits.files, not batches.files
 
@@ -2274,6 +2392,195 @@ secret_key: "test-secret-key"
         let result = config.validate();
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("upload_buffer_size cannot be 0"));
+    }
+
+    #[test]
+    fn test_object_store_requires_config_when_enabled() {
+        let mut config = Config::default();
+        config.auth.native.enabled = true;
+        config.secret_key = Some("test-secret-key".to_string());
+        config.batches.enabled = true;
+        config.batches.files.storage_backend = FileStorageBackend::ObjectStore;
+        config.batches.files.object_store = None;
+
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("object_store must be set when storage_backend=object_store")
+        );
+    }
+
+    #[test]
+    fn test_object_store_empty_endpoint_rejected() {
+        let mut config = Config::default();
+        config.auth.native.enabled = true;
+        config.secret_key = Some("test-secret-key".to_string());
+        config.batches.enabled = true;
+        config.batches.files.storage_backend = FileStorageBackend::ObjectStore;
+        config.batches.files.object_store = Some(ObjectStoreConfig {
+            endpoint: Some("".to_string()),
+            bucket: "bucket".to_string(),
+            region: "us-east-1".to_string(),
+            access_key_id: Some("key".to_string()),
+            secret_access_key: Some("secret".to_string()),
+            ..Default::default()
+        });
+
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("object_store.endpoint cannot be empty"));
+    }
+
+    #[test]
+    fn test_object_store_allows_default_credential_chain() {
+        let mut config = Config::default();
+        config.auth.native.enabled = true;
+        config.secret_key = Some("test-secret-key".to_string());
+        config.batches.enabled = true;
+        config.batches.files.storage_backend = FileStorageBackend::ObjectStore;
+        config.batches.files.object_store = Some(ObjectStoreConfig {
+            endpoint: Some("http://localhost:9000".to_string()),
+            bucket: "bucket".to_string(),
+            region: "us-east-1".to_string(),
+            access_key_id: None,
+            secret_access_key: None,
+            session_token: None,
+            ..Default::default()
+        });
+
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_aws_s3_allows_missing_endpoint() {
+        let mut config = Config::default();
+        config.auth.native.enabled = true;
+        config.secret_key = Some("test-secret-key".to_string());
+        config.batches.enabled = true;
+        config.batches.files.storage_backend = FileStorageBackend::ObjectStore;
+        config.batches.files.object_store = Some(ObjectStoreConfig {
+            provider: ObjectStoreProvider::AwsS3,
+            endpoint: None,
+            bucket: "bucket".to_string(),
+            region: "eu-west-2".to_string(),
+            ..Default::default()
+        });
+
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_s3_compatible_requires_endpoint() {
+        let mut config = Config::default();
+        config.auth.native.enabled = true;
+        config.secret_key = Some("test-secret-key".to_string());
+        config.batches.enabled = true;
+        config.batches.files.storage_backend = FileStorageBackend::ObjectStore;
+        config.batches.files.object_store = Some(ObjectStoreConfig {
+            provider: ObjectStoreProvider::S3Compatible,
+            endpoint: None,
+            bucket: "bucket".to_string(),
+            region: "us-east-1".to_string(),
+            ..Default::default()
+        });
+
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("endpoint must be set for provider=s3_compatible")
+        );
+    }
+
+    #[test]
+    fn test_object_store_rejects_partial_static_credentials() {
+        let mut config = Config::default();
+        config.auth.native.enabled = true;
+        config.secret_key = Some("test-secret-key".to_string());
+        config.batches.enabled = true;
+        config.batches.files.storage_backend = FileStorageBackend::ObjectStore;
+        config.batches.files.object_store = Some(ObjectStoreConfig {
+            endpoint: Some("http://localhost:9000".to_string()),
+            bucket: "bucket".to_string(),
+            region: "us-east-1".to_string(),
+            access_key_id: Some("key".to_string()),
+            secret_access_key: None,
+            ..Default::default()
+        });
+
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("access_key_id and secret_access_key must both be set")
+        );
+    }
+
+    #[test]
+    fn test_object_store_session_token_requires_static_credentials() {
+        let mut config = Config::default();
+        config.auth.native.enabled = true;
+        config.secret_key = Some("test-secret-key".to_string());
+        config.batches.enabled = true;
+        config.batches.files.storage_backend = FileStorageBackend::ObjectStore;
+        config.batches.files.object_store = Some(ObjectStoreConfig {
+            endpoint: Some("http://localhost:9000".to_string()),
+            bucket: "bucket".to_string(),
+            region: "us-east-1".to_string(),
+            session_token: Some("token".to_string()),
+            ..Default::default()
+        });
+
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("session_token requires access_key_id and secret_access_key")
+        );
+    }
+
+    #[test]
+    fn test_object_store_static_credentials_env_override() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: hello
+batches:
+  enabled: true
+  files:
+    storage_backend: object_store
+    object_store:
+      endpoint: http://localhost:9000
+      bucket: bucket
+      region: us-east-1
+"#,
+            )?;
+            jail.set_env("DWCTL_BATCHES__FILES__OBJECT_STORE__ACCESS_KEY_ID", "env-key");
+            jail.set_env("DWCTL_BATCHES__FILES__OBJECT_STORE__SECRET_ACCESS_KEY", "env-secret");
+
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+
+            let config = Config::load(&args)?;
+            let object_store = config.batches.files.object_store.expect("object_store config should be loaded");
+
+            assert_eq!(object_store.access_key_id.as_deref(), Some("env-key"));
+            assert_eq!(object_store.secret_access_key.as_deref(), Some("env-secret"));
+
+            Ok(())
+        });
     }
 
     #[test]
