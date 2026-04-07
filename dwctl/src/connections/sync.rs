@@ -505,8 +505,8 @@ async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'static>(
 
             // Process complete lines
             while let Some(newline_pos) = line_buf.find('\n') {
-                let line = line_buf[..newline_pos].trim().to_string();
-                line_buf = line_buf[newline_pos + 1..].to_string();
+                let line = line_buf[..newline_pos].trim().to_owned();
+                line_buf.drain(..newline_pos + 1);
 
                 if line.is_empty() {
                     continue;
