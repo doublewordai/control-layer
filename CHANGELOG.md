@@ -1,5 +1,13 @@
 # Changelog
 
+## [8.33.2](https://github.com/doublewordai/control-layer/compare/v8.33.1...v8.33.2) (2026-04-07)
+
+
+### Bug Fixes
+
+* autotopup fixes ([#940](https://github.com/doublewordai/control-layer/issues/940)) ([ab79595](https://github.com/doublewordai/control-layer/commit/ab795952ed0ab73bc402d84ee9b669df34905f27))
+* bump fusillade for new reassembler ([#958](https://github.com/doublewordai/control-layer/issues/958)) ([be5d4aa](https://github.com/doublewordai/control-layer/commit/be5d4aa7ba9f52dda5f2a883863942cca47eb704))
+
 ## [8.33.1](https://github.com/doublewordai/control-layer/compare/v8.33.0...v8.33.1) (2026-04-07)
 
 
