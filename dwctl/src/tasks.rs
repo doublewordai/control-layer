@@ -13,9 +13,9 @@ use sqlx_pool_router::PoolProvider;
 use tokio_util::sync::CancellationToken;
 use underway::Job;
 
+use crate::SharedConfig;
 use crate::api::handlers::batches::{CreateBatchInput, build_create_batch_job};
 use crate::api::handlers::files::{IngestFileInput, build_ingest_file_job};
-use crate::SharedConfig;
 
 /// Shared state available to all task step closures.
 ///

@@ -2010,8 +2010,7 @@ impl Config {
 
             if self.batches.files.storage_backend == FileStorageBackend::ObjectStore {
                 let store = self.batches.files.object_store.as_ref().ok_or_else(|| Error::Internal {
-                    operation: "Config validation: batches.files.object_store must be set when storage_backend=object_store."
-                        .to_string(),
+                    operation: "Config validation: batches.files.object_store must be set when storage_backend=object_store.".to_string(),
                 })?;
 
                 if store.endpoint.trim().is_empty() {

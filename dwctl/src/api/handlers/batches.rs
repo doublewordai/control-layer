@@ -362,14 +362,12 @@ pub async fn create_batch<P: PoolProvider>(
                 });
             }
             "failed" => {
-                let msg = sqlx::query_scalar::<_, Option<String>>(
-                    "SELECT error_message FROM file_ingest_jobs WHERE file_id = $1",
-                )
-                .bind(file_id)
-                .fetch_one(state.db.write())
-                .await
-                .map_err(|e| Error::Database(e.into()))?
-                .unwrap_or_else(|| "File ingestion failed".to_string());
+                let msg = sqlx::query_scalar::<_, Option<String>>("SELECT error_message FROM file_ingest_jobs WHERE file_id = $1")
+                    .bind(file_id)
+                    .fetch_one(state.db.write())
+                    .await
+                    .map_err(|e| Error::Database(e.into()))?
+                    .unwrap_or_else(|| "File ingestion failed".to_string());
                 return Err(Error::BadRequest { message: msg });
             }
             _ => {}

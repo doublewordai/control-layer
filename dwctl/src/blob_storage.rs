@@ -8,7 +8,7 @@ use aws_sdk_s3::config::{Region, timeout::TimeoutConfig};
 use aws_sdk_s3::primitives::ByteStream;
 use uuid::Uuid;
 
-use crate::config::{ObjectStoreProvider, ObjectStoreConfig};
+use crate::config::{ObjectStoreConfig, ObjectStoreProvider};
 use crate::errors::{Error, Result};
 
 #[derive(Clone)]

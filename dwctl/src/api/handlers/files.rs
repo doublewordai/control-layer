@@ -476,11 +476,7 @@ async fn set_file_ingest_status(
     Ok(())
 }
 
-async fn insert_file_placeholder(
-    pool: &sqlx::PgPool,
-    input: &IngestFileInput,
-    purpose: &str,
-) -> Result<()> {
+async fn insert_file_placeholder(pool: &sqlx::PgPool, input: &IngestFileInput, purpose: &str) -> Result<()> {
     sqlx::query(
         r#"
         INSERT INTO fusillade.files (id, name, purpose, size_bytes, status, uploaded_by, api_key_id, created_at, updated_at)
@@ -531,8 +527,8 @@ async fn ingest_blob_to_templates(
         .map_err(|e| TaskError::Retryable(format!("acquire db conn for ingest: {e}")))?;
 
     let mut deployments_repo = Deployments::new(&mut conn);
-    let target_user_id = Uuid::parse_str(&input.uploaded_by)
-        .map_err(|e| TaskError::Fatal(format!("invalid uploaded_by owner id on file ingest: {e}")))?;
+    let target_user_id =
+        Uuid::parse_str(&input.uploaded_by).map_err(|e| TaskError::Fatal(format!("invalid uploaded_by owner id on file ingest: {e}")))?;
     let filter = DeploymentFilter::new(0, i64::MAX)
         .with_accessible_to(target_user_id)
         .with_statuses(vec![ModelStatus::Active])
@@ -561,8 +557,8 @@ async fn ingest_blob_to_templates(
             )));
         }
 
-        let openai_req: OpenAIBatchRequest = serde_json::from_str(trimmed)
-            .map_err(|e| TaskError::Fatal(format!("Invalid JSON on line {}: {}", line_no, e)))?;
+        let openai_req: OpenAIBatchRequest =
+            serde_json::from_str(trimmed).map_err(|e| TaskError::Fatal(format!("Invalid JSON on line {}: {}", line_no, e)))?;
         let template = openai_req
             .to_internal(
                 &input.endpoint,
@@ -644,8 +640,7 @@ pub async fn build_ingest_file_job<P: sqlx_pool_router::PoolProvider + Clone + S
                     To::done()
                 }
                 Err(TaskError::Fatal(msg)) => {
-                    let _ =
-                        set_file_ingest_status(&cx.state.db_pool, input.file_id, &input.object_key, "failed", Some(&msg)).await;
+                    let _ = set_file_ingest_status(&cx.state.db_pool, input.file_id, &input.object_key, "failed", Some(&msg)).await;
                     Err(TaskError::Fatal(msg))
                 }
                 Err(TaskError::Retryable(msg)) => {
@@ -1191,8 +1186,7 @@ pub async fn upload_file<P: PoolProvider>(
         })?;
 
         let object_key = blob.object_key_for_file(file_id);
-        blob.put_file_from_path(&object_key, &tmp_path, "application/x-ndjson")
-            .await?;
+        blob.put_file_from_path(&object_key, &tmp_path, "application/x-ndjson").await?;
         let _ = tokio::fs::remove_file(&tmp_path).await;
 
         let ingest = IngestFileInput {

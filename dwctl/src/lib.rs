@@ -142,11 +142,11 @@ fn install_crypto_provider() {
 
 pub mod api;
 pub mod auth;
+mod blob_storage;
 pub mod config;
 mod config_watcher;
 mod crypto;
 pub mod db;
-mod blob_storage;
 mod email;
 mod error_enrichment;
 pub mod errors;
