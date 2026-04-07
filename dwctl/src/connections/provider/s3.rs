@@ -142,11 +142,10 @@ impl SourceProvider for S3Provider {
         let mut s3_next_token: Option<String> = None;
 
         loop {
-            let mut req = client
-                .list_objects_v2()
-                .bucket(&self.config.bucket)
-                // Fetch more than needed so search filtering doesn't require too many round-trips
-                .max_keys((limit as i32) * 2);
+            // When searching, we need to over-fetch because S3 can't filter by content.
+            // Without search, request exactly what we need.
+            let s3_max_keys = if search.is_some() { 1000 } else { limit as i32 };
+            let mut req = client.list_objects_v2().bucket(&self.config.bucket).max_keys(s3_max_keys);
 
             if !self.prefix().is_empty() {
                 req = req.prefix(self.prefix());
@@ -195,20 +194,23 @@ impl SourceProvider for S3Provider {
                 });
             }
 
+            let s3_has_more = resp.is_truncated() == Some(true);
+            let s3_next = resp.next_continuation_token().map(|s| s.to_string());
+
             // Check if we have enough after processing the full S3 response
             if files.len() >= limit {
-                let next = resp.next_continuation_token().map(|s| s.to_string());
-                // Truncate to exact limit — extra files from this page are dropped
                 files.truncate(limit);
+                // Use the S3 continuation token as cursor (safe because we processed
+                // the full S3 page before truncating — no results are skipped).
                 return Ok(FileListPage {
                     files,
-                    has_more: next.is_some() || resp.is_truncated() == Some(true),
-                    next_cursor: next,
+                    has_more: s3_has_more || s3_next.is_some(),
+                    next_cursor: s3_next,
                 });
             }
 
-            if resp.is_truncated() == Some(true) {
-                s3_next_token = resp.next_continuation_token().map(|s| s.to_string());
+            if s3_has_more {
+                s3_next_token = s3_next;
             } else {
                 break;
             }

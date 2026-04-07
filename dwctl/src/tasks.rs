@@ -87,9 +87,15 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> TaskRunner<P> {
 
         // Wire cross-references. Because all jobs share the same Arc<OnceLock>,
         // setting them here makes them visible to every cloned TaskState.
-        state.ingest_file_job.set(ingest_file_job.clone()).ok();
-        state.activate_batch_job.set(activate_batch_job.clone()).ok();
-        state.create_batch_job.set(create_batch_job.clone()).ok();
+        if state.ingest_file_job.set(ingest_file_job.clone()).is_err() {
+            panic!("ingest_file_job OnceLock already set — double initialization");
+        }
+        if state.activate_batch_job.set(activate_batch_job.clone()).is_err() {
+            panic!("activate_batch_job OnceLock already set — double initialization");
+        }
+        if state.create_batch_job.set(create_batch_job.clone()).is_err() {
+            panic!("create_batch_job OnceLock already set — double initialization");
+        }
 
         Ok(Self {
             create_batch_job,

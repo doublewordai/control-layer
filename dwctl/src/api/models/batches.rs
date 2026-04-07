@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use utoipa::{IntoParams, ToSchema};
 
-use super::dwext::{BatchDwExt, BatchDwExtResponse};
+use super::dwext::BatchDwExtResponse;
 
 /// Batch-level errors
 #[derive(Debug, Serialize, Deserialize, ToSchema, Clone)]
@@ -72,10 +72,6 @@ pub struct CreateBatchRequest {
     /// Optional metadata (up to 16 key-value pairs)
     #[serde(default)]
     pub metadata: Option<HashMap<String, String>>,
-
-    /// Doubleword-specific extensions (source connections, etc.)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub dwext: Option<BatchDwExt>,
 }
 
 /// Request body for retrying specific requests
