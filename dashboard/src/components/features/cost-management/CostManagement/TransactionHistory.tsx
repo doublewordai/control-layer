@@ -308,8 +308,17 @@ export function TransactionHistory({
             <p
               className={`text-sm mt-1 ${filterUserId && filterUserId !== userId ? "text-red-600 font-semibold" : "text-gray-600"}`}
             >
-              Showing transactions for user{" "}
-              <span className="font-medium">{displayUser.email}</span>
+              Showing transactions for{" "}
+              {displayUser.user_type === "organization" ? (
+                <span className="font-medium">
+                  {displayUser.display_name || displayUser.username}
+                </span>
+              ) : (
+                <>
+                  user{" "}
+                  <span className="font-medium">{displayUser.email}</span>
+                </>
+              )}
             </p>
           )}
         </div>
