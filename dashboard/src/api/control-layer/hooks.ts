@@ -1796,13 +1796,10 @@ export function useSyncEntries(connectionId: string, syncId: string) {
   return useQuery({
     queryKey: queryKeys.connections.syncEntries(connectionId, syncId),
     queryFn: () => dwctlApi.connections.listSyncEntries(connectionId, syncId),
-    select: (data) => data.data,
     enabled: !!connectionId && !!syncId,
     refetchInterval: (query) => {
-      // query.state.data is pre-select (raw { data: SyncEntry[] })
       const entries = query.state.data?.data;
-      if (!entries) return 2000; // Haven't loaded yet — keep polling
-      // Poll while any entries are still in progress
+      if (!entries) return 2000;
       if (entries.some((e: { status: string }) => !["activated", "failed", "skipped"].includes(e.status))) {
         return 2000;
       }

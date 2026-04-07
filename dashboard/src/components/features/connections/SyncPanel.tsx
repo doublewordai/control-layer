@@ -107,7 +107,8 @@ function SyncEntryList({
   syncId: string;
   filesExpected: number;
 }) {
-  const { data: entries, isLoading, isFetching } = useSyncEntries(connectionId, syncId);
+  const { data: entriesResponse, isLoading, isFetching } = useSyncEntries(connectionId, syncId);
+  const entries = entriesResponse?.data;
 
   if (isLoading || (isFetching && !entries?.length)) {
     return (
@@ -320,13 +321,12 @@ export function SyncPanel({ connectionId }: { connectionId: string }) {
   const [page, setPage] = useState(0);
 
   // Poll the sync list while any sync is in progress
-  const { data: syncs, isLoading } = useQuery({
+  const { data: syncsResponse, isLoading } = useQuery({
     queryKey: queryKeys.connections.syncs(connectionId),
     queryFn: () => dwctlApi.connections.listSyncs(connectionId),
-    select: (data) => data.data,
     refetchInterval: (query) => {
       const list = query.state.data?.data;
-      if (list?.some((s) => !["completed", "failed", "cancelled"].includes(s.status))) {
+      if (list?.some((s: { status: string }) => !["completed", "failed", "cancelled"].includes(s.status))) {
         return 2000;
       }
       return false;
@@ -341,6 +341,8 @@ export function SyncPanel({ connectionId }: { connectionId: string }) {
       </div>
     );
   }
+
+  const syncs = syncsResponse?.data;
 
   if (!syncs?.length) {
     return (
