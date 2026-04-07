@@ -25,26 +25,21 @@ impl BlobStorageClient {
             ObjectStoreProvider::S3Compatible => {}
         }
 
-        let creds = Credentials::new(
-            config.access_key_id.clone(),
-            config.secret_access_key.clone(),
-            config.session_token.clone(),
-            None,
-            "dwctl-object-store",
-        );
-
         let timeout_config = TimeoutConfig::builder()
             .connect_timeout(Duration::from_millis(config.connect_timeout_ms))
             .operation_timeout(Duration::from_millis(config.request_timeout_ms))
             .build();
 
-        let sdk_config = aws_config::defaults(BehaviorVersion::latest())
+        let mut sdk_config = aws_config::defaults(BehaviorVersion::latest())
             .region(RegionProviderChain::first_try(Region::new(config.region.clone())))
-            .credentials_provider(SharedCredentialsProvider::new(creds))
             .endpoint_url(config.endpoint.clone())
-            .timeout_config(timeout_config)
-            .load()
-            .await;
+            .timeout_config(timeout_config);
+
+        if let Some(creds) = static_credentials(config) {
+            sdk_config = sdk_config.credentials_provider(SharedCredentialsProvider::new(creds));
+        }
+
+        let sdk_config = sdk_config.load().await;
 
         let s3_config = aws_sdk_s3::config::Builder::from(&sdk_config)
             .force_path_style(config.path_style)
@@ -189,5 +184,75 @@ impl BlobStorageClient {
         }
 
         Ok(())
+    }
+}
+
+fn static_credentials(config: &ObjectStoreConfig) -> Option<Credentials> {
+    let access_key_id = config.access_key_id.as_deref().map(str::trim).filter(|s| !s.is_empty())?;
+    let secret_access_key = config.secret_access_key.as_deref().map(str::trim).filter(|s| !s.is_empty())?;
+    let session_token = config
+        .session_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned);
+
+    Some(Credentials::new(
+        access_key_id.to_owned(),
+        secret_access_key.to_owned(),
+        session_token,
+        None,
+        "dwctl-object-store",
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::config::ObjectStoreProvider;
+
+    fn object_store_config() -> ObjectStoreConfig {
+        ObjectStoreConfig {
+            provider: ObjectStoreProvider::S3Compatible,
+            endpoint: "http://localhost:9000".to_string(),
+            bucket: "bucket".to_string(),
+            region: "us-east-1".to_string(),
+            access_key_id: None,
+            secret_access_key: None,
+            session_token: None,
+            path_style: true,
+            prefix: "uploads/".to_string(),
+            connect_timeout_ms: 1000,
+            request_timeout_ms: 1000,
+        }
+    }
+
+    #[test]
+    fn static_credentials_none_without_static_keys() {
+        assert!(static_credentials(&object_store_config()).is_none());
+    }
+
+    #[test]
+    fn static_credentials_build_when_keys_present() {
+        let mut config = object_store_config();
+        config.access_key_id = Some("key".to_string());
+        config.secret_access_key = Some("secret".to_string());
+        config.session_token = Some("token".to_string());
+
+        let creds = static_credentials(&config).expect("static credentials should be built");
+
+        assert_eq!(creds.access_key_id(), "key");
+        assert_eq!(creds.secret_access_key(), "secret");
+        assert_eq!(creds.session_token(), Some("token"));
+    }
+
+    #[test]
+    fn static_credentials_ignore_blank_values() {
+        let mut config = object_store_config();
+        config.access_key_id = Some("   ".to_string());
+        config.secret_access_key = Some("secret".to_string());
+
+        assert!(static_credentials(&config).is_none());
     }
 }

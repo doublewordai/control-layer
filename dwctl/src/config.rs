@@ -836,8 +836,13 @@ pub struct ObjectStoreConfig {
     pub endpoint: String,
     pub bucket: String,
     pub region: String,
-    pub access_key_id: String,
-    pub secret_access_key: String,
+    /// Optional static access key. When omitted, the AWS SDK default credential chain is used.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub access_key_id: Option<String>,
+    /// Optional static secret key. When omitted, the AWS SDK default credential chain is used.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secret_access_key: Option<String>,
+    /// Optional session token for static credentials.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_token: Option<String>,
     pub path_style: bool,
@@ -853,8 +858,8 @@ impl Default for ObjectStoreConfig {
             endpoint: String::new(),
             bucket: String::new(),
             region: "us-east-1".to_string(),
-            access_key_id: String::new(),
-            secret_access_key: String::new(),
+            access_key_id: None,
+            secret_access_key: None,
             session_token: None,
             path_style: true,
             prefix: "uploads/".to_string(),
@@ -2028,14 +2033,22 @@ impl Config {
                         operation: "Config validation: batches.files.object_store.region cannot be empty.".to_string(),
                     });
                 }
-                if store.access_key_id.trim().is_empty() {
+
+                let access_key_id = store.access_key_id.as_deref().map(str::trim).filter(|s| !s.is_empty());
+                let secret_access_key = store.secret_access_key.as_deref().map(str::trim).filter(|s| !s.is_empty());
+
+                if access_key_id.is_some() != secret_access_key.is_some() {
                     return Err(Error::Internal {
-                        operation: "Config validation: batches.files.object_store.access_key_id cannot be empty.".to_string(),
+                        operation: "Config validation: batches.files.object_store.access_key_id and secret_access_key must both be set when using static object-store credentials.".to_string(),
                     });
                 }
-                if store.secret_access_key.trim().is_empty() {
+
+                let session_token = store.session_token.as_deref().map(str::trim).filter(|s| !s.is_empty());
+                if session_token.is_some() && access_key_id.is_none() {
                     return Err(Error::Internal {
-                        operation: "Config validation: batches.files.object_store.secret_access_key cannot be empty.".to_string(),
+                        operation:
+                            "Config validation: batches.files.object_store.session_token requires access_key_id and secret_access_key."
+                                .to_string(),
                     });
                 }
             }
@@ -2395,14 +2408,120 @@ secret_key: "test-secret-key"
             endpoint: "".to_string(),
             bucket: "bucket".to_string(),
             region: "us-east-1".to_string(),
-            access_key_id: "key".to_string(),
-            secret_access_key: "secret".to_string(),
+            access_key_id: Some("key".to_string()),
+            secret_access_key: Some("secret".to_string()),
             ..Default::default()
         });
 
         let result = config.validate();
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("object_store.endpoint cannot be empty"));
+    }
+
+    #[test]
+    fn test_object_store_allows_default_credential_chain() {
+        let mut config = Config::default();
+        config.auth.native.enabled = true;
+        config.secret_key = Some("test-secret-key".to_string());
+        config.batches.enabled = true;
+        config.batches.files.storage_backend = FileStorageBackend::ObjectStore;
+        config.batches.files.object_store = Some(ObjectStoreConfig {
+            endpoint: "http://localhost:9000".to_string(),
+            bucket: "bucket".to_string(),
+            region: "us-east-1".to_string(),
+            access_key_id: None,
+            secret_access_key: None,
+            session_token: None,
+            ..Default::default()
+        });
+
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_object_store_rejects_partial_static_credentials() {
+        let mut config = Config::default();
+        config.auth.native.enabled = true;
+        config.secret_key = Some("test-secret-key".to_string());
+        config.batches.enabled = true;
+        config.batches.files.storage_backend = FileStorageBackend::ObjectStore;
+        config.batches.files.object_store = Some(ObjectStoreConfig {
+            endpoint: "http://localhost:9000".to_string(),
+            bucket: "bucket".to_string(),
+            region: "us-east-1".to_string(),
+            access_key_id: Some("key".to_string()),
+            secret_access_key: None,
+            ..Default::default()
+        });
+
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("access_key_id and secret_access_key must both be set")
+        );
+    }
+
+    #[test]
+    fn test_object_store_session_token_requires_static_credentials() {
+        let mut config = Config::default();
+        config.auth.native.enabled = true;
+        config.secret_key = Some("test-secret-key".to_string());
+        config.batches.enabled = true;
+        config.batches.files.storage_backend = FileStorageBackend::ObjectStore;
+        config.batches.files.object_store = Some(ObjectStoreConfig {
+            endpoint: "http://localhost:9000".to_string(),
+            bucket: "bucket".to_string(),
+            region: "us-east-1".to_string(),
+            session_token: Some("token".to_string()),
+            ..Default::default()
+        });
+
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("session_token requires access_key_id and secret_access_key")
+        );
+    }
+
+    #[test]
+    fn test_object_store_static_credentials_env_override() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: hello
+batches:
+  enabled: true
+  files:
+    storage_backend: object_store
+    object_store:
+      endpoint: http://localhost:9000
+      bucket: bucket
+      region: us-east-1
+"#,
+            )?;
+            jail.set_env("DWCTL_BATCHES__FILES__OBJECT_STORE__ACCESS_KEY_ID", "env-key");
+            jail.set_env("DWCTL_BATCHES__FILES__OBJECT_STORE__SECRET_ACCESS_KEY", "env-secret");
+
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+
+            let config = Config::load(&args)?;
+            let object_store = config.batches.files.object_store.expect("object_store config should be loaded");
+
+            assert_eq!(object_store.access_key_id.as_deref(), Some("env-key"));
+            assert_eq!(object_store.secret_access_key.as_deref(), Some("env-secret"));
+
+            Ok(())
+        });
     }
 
     #[test]
