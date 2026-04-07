@@ -83,7 +83,6 @@ impl BlobStorageClient {
     }
 
     pub async fn get_file_bytes(&self, key: &str) -> Result<Vec<u8>> {
-<<<<<<< HEAD
         let obj = self
             .client
             .get_object()
@@ -94,9 +93,6 @@ impl BlobStorageClient {
             .map_err(|e| Error::Internal {
                 operation: format!("get object from blob storage: {e}"),
             })?;
-=======
-        let obj = self.get_object(key).await?;
->>>>>>> efeaf71b (feat: download files from object storage)
 
         let bytes = obj.body.collect().await.map_err(|e| Error::Internal {
             operation: format!("read blob object body: {e}"),
@@ -104,8 +100,6 @@ impl BlobStorageClient {
 
         Ok(bytes.into_bytes().to_vec())
     }
-<<<<<<< HEAD
-=======
 
     async fn get_object(&self, key: &str) -> Result<aws_sdk_s3::operation::get_object::GetObjectOutput> {
         self.client
@@ -196,5 +190,4 @@ impl BlobStorageClient {
 
         Ok(())
     }
->>>>>>> efeaf71b (feat: download files from object storage)
 }
