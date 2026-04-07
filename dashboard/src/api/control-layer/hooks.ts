@@ -48,7 +48,6 @@ import type {
   OrgMemberRole,
   ConnectionCreateRequest,
   TriggerSyncRequest,
-  ExternalFileListResponse,
   ProviderDisplayConfigCreateRequest,
   ProviderDisplayConfigUpdateRequest,
 } from "./types";

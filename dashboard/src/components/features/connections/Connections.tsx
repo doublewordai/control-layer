@@ -16,12 +16,9 @@ import {
   useDeleteConnection,
   useTestConnection,
   useTriggerSync,
-  useSyncs,
-  useSyncEntries,
 } from "@/api/control-layer/hooks";
-import type { Connection, SyncOperation, SyncEntry } from "@/api/control-layer/types";
+import type { Connection } from "@/api/control-layer/types";
 import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
 import {
   Dialog,
   DialogContent,
@@ -33,23 +30,6 @@ import {
 import { CreateConnectionDialog } from "./CreateConnectionDialog";
 import { SyncPanel } from "./SyncPanel";
 import { FileBrowser } from "./FileBrowser";
-
-function statusBadge(status: string) {
-  const variants: Record<string, string> = {
-    pending: "bg-gray-100 text-gray-700",
-    listing: "bg-blue-100 text-blue-700",
-    ingesting: "bg-yellow-100 text-yellow-700",
-    completing: "bg-yellow-100 text-yellow-700",
-    completed: "bg-green-100 text-green-700",
-    failed: "bg-red-100 text-red-700",
-    cancelled: "bg-gray-100 text-gray-500",
-  };
-  return (
-    <Badge variant="outline" className={variants[status] || "bg-gray-100 text-gray-700"}>
-      {status}
-    </Badge>
-  );
-}
 
 function formatDate(ts: number) {
   return new Date(ts * 1000).toLocaleString();

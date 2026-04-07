@@ -351,10 +351,15 @@ pub async fn trigger_sync<P: PoolProvider>(
         "ai_base_url": ai_base_url,
     });
 
-    let strategy_config = if req.strategy == "select" {
-        Some(serde_json::json!({ "file_keys": req.file_keys, "force": req.force }))
-    } else {
-        None
+    let strategy_config = match req.strategy.as_str() {
+        "select" => Some(serde_json::json!({ "file_keys": req.file_keys, "force": req.force })),
+        _ => {
+            if req.force {
+                Some(serde_json::json!({ "force": true }))
+            } else {
+                None
+            }
+        }
     };
 
     let sync_op = SyncOperations::new(&mut conn)

@@ -108,7 +108,6 @@ const sourceColumn: ColumnDef<Batch> = {
   cell: ({ row }) => {
     const batch = row.original as Batch;
     const source = batch.metadata?.request_source;
-    const externalKey = batch.metadata?.dw_external_key;
 
     if (source === "sync") {
       const sourceName = batch.metadata?.dw_source_name;

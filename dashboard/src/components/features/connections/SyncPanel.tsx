@@ -9,7 +9,7 @@ import {
   Clock,
   SkipForward,
 } from "lucide-react";
-import { useSyncs, useSyncEntries } from "@/api/control-layer/hooks";
+import { useSyncEntries } from "@/api/control-layer/hooks";
 import type { SyncOperation } from "@/api/control-layer/types";
 import { Badge } from "@/components/ui/badge";
 import { useQuery } from "@tanstack/react-query";
