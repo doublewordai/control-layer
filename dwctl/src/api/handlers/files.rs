@@ -1330,12 +1330,14 @@ pub async fn get_file<P: PoolProvider>(
         context_type,
         source: file.source_connection_id.map(|_| "sync".to_string()),
         source_name: if let Some(conn_id) = file.source_connection_id {
-            Connections::new(&mut read_conn)
-                .get_by_id(conn_id)
-                .await
-                .ok()
-                .flatten()
-                .map(|c| c.name)
+            match Connections::new(&mut read_conn).get_by_id(conn_id).await {
+                Ok(Some(conn)) => Some(conn.name),
+                Ok(None) => None,
+                Err(e) => {
+                    tracing::warn!(error = %e, connection_id = %conn_id, "Failed to look up connection name for file");
+                    None
+                }
+            }
         } else {
             None
         },

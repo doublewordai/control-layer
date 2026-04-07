@@ -344,7 +344,8 @@ pub async fn trigger_sync<P: PoolProvider>(
 
     // Build sync config from request + defaults
     let config = state.config.snapshot();
-    let ai_base_url = format!("http://{}:{}/ai", config.host, config.port);
+    let host = if config.host == "0.0.0.0" { "127.0.0.1" } else { &config.host };
+    let ai_base_url = format!("http://{}:{}/ai", host, config.port);
     let sync_config = serde_json::json!({
         "endpoint": req.endpoint.as_deref().unwrap_or(&config.connections.sync.default_endpoint),
         "completion_window": req.completion_window.as_deref().unwrap_or(&config.connections.sync.default_completion_window),
@@ -378,7 +379,6 @@ pub async fn trigger_sync<P: PoolProvider>(
         .task_runner
         .sync_connection_job
         .enqueue(&crate::connections::sync::SyncConnectionInput {
-            sync_operation_id: *sync_op.id.as_bytes(),
             sync_id: sync_op.id,
             connection_id,
         })

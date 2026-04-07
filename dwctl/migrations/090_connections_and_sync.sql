@@ -61,7 +61,7 @@ CREATE TABLE sync_entries (
 -- Dedup: find previously-synced files for this connection
 CREATE INDEX idx_sync_entries_dedup
     ON sync_entries (connection_id, external_key, external_last_modified)
-    WHERE status NOT IN ('failed', 'skipped', 'pending', 'deleted');
+    WHERE status = 'activated';
 
 -- Job lookups: find entries by sync + status
 CREATE INDEX idx_sync_entries_sync_status

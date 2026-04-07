@@ -21,9 +21,6 @@ use uuid::Uuid;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SyncConnectionInput {
-    /// Legacy field kept for backwards compat with underway serialization.
-    #[serde(with = "uuid_bytes")]
-    pub sync_operation_id: [u8; 16],
     pub sync_id: Uuid,
     pub connection_id: Uuid,
 }
@@ -773,29 +770,4 @@ async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + 'static>(
     );
 
     Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Serde helper for UUID as bytes
-// ---------------------------------------------------------------------------
-mod uuid_bytes {
-    use serde::{self, Deserialize, Deserializer, Serializer};
-    use uuid::Uuid;
-
-    pub fn serialize<S>(bytes: &[u8; 16], serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let uuid = Uuid::from_bytes(*bytes);
-        serializer.serialize_str(&uuid.to_string())
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 16], D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        let uuid = Uuid::parse_str(&s).map_err(serde::de::Error::custom)?;
-        Ok(*uuid.as_bytes())
-    }
 }

@@ -136,37 +136,36 @@ function SyncEntryList({
   return (
     <div className="space-y-1">
       {entries.map((entry) => (
-        <div
-          key={entry.id}
-          className="flex items-center justify-between py-1.5 px-2 rounded text-sm hover:bg-muted/50"
-        >
-          <div className="flex items-center gap-2 min-w-0 flex-1">
-            <FileText className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
-            <span className="truncate font-mono text-xs">{entry.external_key}</span>
-          </div>
-          <div className="flex items-center gap-3 shrink-0 ml-3">
-            {entry.template_count != null && (
-              <span className="text-xs text-muted-foreground">
-                {entry.template_count.toLocaleString()} rows
-              </span>
-            )}
-            {entry.external_size_bytes != null && (
-              <span className="text-xs text-muted-foreground">
-                {(entry.external_size_bytes / 1024).toFixed(0)} KB
-              </span>
-            )}
-            <EntryStatusBadge status={entry.status} />
-            {entry.batch_id && (
-              <a
-                href={`/batches?search=${entry.batch_id}`}
-                className="text-xs text-blue-600 hover:underline"
-              >
-                batch
-              </a>
-            )}
+        <div key={entry.id} className="py-1.5 px-2 rounded text-sm hover:bg-muted/50">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2 min-w-0 flex-1">
+              <FileText className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
+              <span className="truncate font-mono text-xs">{entry.external_key}</span>
+            </div>
+            <div className="flex items-center gap-3 shrink-0 ml-3">
+              {entry.template_count != null && (
+                <span className="text-xs text-muted-foreground">
+                  {entry.template_count.toLocaleString()} rows
+                </span>
+              )}
+              {entry.external_size_bytes != null && (
+                <span className="text-xs text-muted-foreground">
+                  {(entry.external_size_bytes / 1024).toFixed(0)} KB
+                </span>
+              )}
+              <EntryStatusBadge status={entry.status} />
+              {entry.batch_id && (
+                <a
+                  href={`/batches?search=${entry.batch_id}`}
+                  className="text-xs text-blue-600 hover:underline"
+                >
+                  batch
+                </a>
+              )}
+            </div>
           </div>
           {entry.error && (
-            <p className="text-xs text-red-500 mt-0.5 ml-6">{entry.error}</p>
+            <p className="text-xs text-red-500 mt-1 ml-6">{entry.error}</p>
           )}
         </div>
       ))}

@@ -510,7 +510,7 @@ impl<'c> SyncEntries<'c> {
               ON se.external_key = input.key
               AND se.external_last_modified IS NOT DISTINCT FROM input.last_modified
             WHERE se.connection_id = $1
-              AND se.status NOT IN ('failed', 'skipped', 'pending', 'deleted')
+              AND se.status = 'activated'
             "#,
             connection_id,
             &keys as &[&str],
