@@ -15,8 +15,7 @@ use underway::Job;
 
 use crate::api::handlers::batches::{CreateBatchInput, build_create_batch_job};
 use crate::connections::sync::{
-    ActivateBatchInput, IngestFileInput, SyncConnectionInput, build_activate_batch_job,
-    build_ingest_file_job, build_sync_connection_job,
+    ActivateBatchInput, IngestFileInput, SyncConnectionInput, build_activate_batch_job, build_ingest_file_job, build_sync_connection_job,
 };
 
 /// Shared state available to all task step closures.

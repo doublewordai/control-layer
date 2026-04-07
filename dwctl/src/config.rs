@@ -1583,21 +1583,13 @@ impl Default for AnalyticsConfig {
 /// External data source connections configuration.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
+#[derive(Default)]
 pub struct ConnectionsConfig {
     /// Encryption key for connection credentials (base64 or 32-byte string).
     /// Falls back to `secret_key` if not set.
     pub encryption_key: Option<String>,
     /// Sync pipeline configuration.
     pub sync: SyncPipelineConfig,
-}
-
-impl Default for ConnectionsConfig {
-    fn default() -> Self {
-        Self {
-            encryption_key: None,
-            sync: SyncPipelineConfig::default(),
-        }
-    }
 }
 
 /// Configuration for the sync ingestion/activation pipeline.

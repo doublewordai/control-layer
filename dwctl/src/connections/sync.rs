@@ -220,9 +220,7 @@ async fn run_sync_connection<P: PoolProvider + Clone + Send + Sync + 'static>(
     // 2. Update sync status to listing
     {
         let mut conn = dwctl.acquire().await?;
-        SyncOperations::new(&mut conn)
-            .update_status(input.sync_id, "listing")
-            .await?;
+        SyncOperations::new(&mut conn).update_status(input.sync_id, "listing").await?;
     }
 
     // 3. Load sync operation to get strategy
@@ -237,9 +235,7 @@ async fn run_sync_connection<P: PoolProvider + Clone + Send + Sync + 'static>(
     // 4. Discover files based on strategy
     let prov = provider::create_provider(&connection.provider, config_json)?;
     let files = match sync_op.strategy.as_str() {
-        "snapshot" => {
-            prov.list_files().await.map_err(|e| anyhow::anyhow!("{e:#}"))?
-        }
+        "snapshot" => prov.list_files().await.map_err(|e| anyhow::anyhow!("{e:#}"))?,
         "select" => {
             let keys: Vec<String> = sync_op
                 .strategy_config
@@ -253,10 +249,7 @@ async fn run_sync_connection<P: PoolProvider + Clone + Send + Sync + 'static>(
             // List from provider to get real metadata (size, last_modified),
             // then filter to only the selected keys.
             let all_files = prov.list_files().await.map_err(|e| anyhow::anyhow!("{e:#}"))?;
-            all_files
-                .into_iter()
-                .filter(|f| key_set.contains(&f.key))
-                .collect()
+            all_files.into_iter().filter(|f| key_set.contains(&f.key)).collect()
         }
         other => anyhow::bail!("unsupported strategy: {other}"),
     };
@@ -299,10 +292,8 @@ async fn run_sync_connection<P: PoolProvider + Clone + Send + Sync + 'static>(
     };
 
     // 6. Create sync_entries for new files
-    let entry_data: Vec<(String, Option<chrono::DateTime<chrono::Utc>>, Option<i64>)> = new_files
-        .iter()
-        .map(|f| (f.key.clone(), f.last_modified, f.size_bytes))
-        .collect();
+    let entry_data: Vec<(String, Option<chrono::DateTime<chrono::Utc>>, Option<i64>)> =
+        new_files.iter().map(|f| (f.key.clone(), f.last_modified, f.size_bytes)).collect();
 
     let entries = {
         let mut conn = dwctl.acquire().await?;
@@ -317,9 +308,7 @@ async fn run_sync_connection<P: PoolProvider + Clone + Send + Sync + 'static>(
         SyncOperations::new(&mut conn)
             .update_counters(input.sync_id, Some(files_found), Some(files_skipped), None, None, None)
             .await?;
-        SyncOperations::new(&mut conn)
-            .update_status(input.sync_id, "ingesting")
-            .await?;
+        SyncOperations::new(&mut conn).update_status(input.sync_id, "ingesting").await?;
     }
 
     // 8. Mark skipped entries
@@ -344,9 +333,7 @@ async fn run_sync_connection<P: PoolProvider + Clone + Send + Sync + 'static>(
     if entries.is_empty() {
         // Nothing to ingest — mark sync as completed
         let mut conn = dwctl.acquire().await?;
-        SyncOperations::new(&mut conn)
-            .update_status(input.sync_id, "completed")
-            .await?;
+        SyncOperations::new(&mut conn).update_status(input.sync_id, "completed").await?;
     }
 
     tracing::info!(
@@ -460,11 +447,7 @@ async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'static>(
         use futures::StreamExt;
 
         // Send metadata first
-        let display_name = external_key
-            .rsplit('/')
-            .next()
-            .unwrap_or(&external_key)
-            .to_string();
+        let display_name = external_key.rsplit('/').next().unwrap_or(&external_key).to_string();
 
         let metadata = fusillade::FileMetadata {
             filename: Some(display_name),
@@ -533,20 +516,9 @@ async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'static>(
                 match serde_json::from_str::<serde_json::Value>(&line) {
                     Ok(parsed) => {
                         let custom_id = parsed.get("custom_id").and_then(|v| v.as_str()).map(|s| s.to_string());
-                        let method = parsed
-                            .get("method")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("POST")
-                            .to_string();
-                        let url = parsed
-                            .get("url")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or(&api_path)
-                            .to_string();
-                        let body = parsed
-                            .get("body")
-                            .map(|v| v.to_string())
-                            .unwrap_or_else(|| "{}".to_string());
+                        let method = parsed.get("method").and_then(|v| v.as_str()).unwrap_or("POST").to_string();
+                        let url = parsed.get("url").and_then(|v| v.as_str()).unwrap_or(&api_path).to_string();
+                        let body = parsed.get("body").map(|v| v.to_string()).unwrap_or_else(|| "{}".to_string());
                         let model = parsed
                             .get("body")
                             .and_then(|b| b.get("model"))
@@ -588,31 +560,31 @@ async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'static>(
 
         // Handle any remaining partial line
         let remaining = line_buf.trim().to_string();
-        if !remaining.is_empty() {
-            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&remaining) {
-                let custom_id = parsed.get("custom_id").and_then(|v| v.as_str()).map(|s| s.to_string());
-                let method = parsed.get("method").and_then(|v| v.as_str()).unwrap_or("POST").to_string();
-                let url = parsed.get("url").and_then(|v| v.as_str()).unwrap_or(&api_path).to_string();
-                let body = parsed.get("body").map(|v| v.to_string()).unwrap_or_else(|| "{}".to_string());
-                let model = parsed
-                    .get("body")
-                    .and_then(|b| b.get("model"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
+        if !remaining.is_empty()
+            && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&remaining)
+        {
+            let custom_id = parsed.get("custom_id").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let method = parsed.get("method").and_then(|v| v.as_str()).unwrap_or("POST").to_string();
+            let url = parsed.get("url").and_then(|v| v.as_str()).unwrap_or(&api_path).to_string();
+            let body = parsed.get("body").map(|v| v.to_string()).unwrap_or_else(|| "{}".to_string());
+            let model = parsed
+                .get("body")
+                .and_then(|b| b.get("model"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
 
-                let template = fusillade::RequestTemplateInput {
-                    custom_id,
-                    endpoint: ai_base_url.clone(),
-                    method,
-                    path: url,
-                    body,
-                    model,
-                    api_key: String::new(),
-                };
-                let _ = tx.send(FileStreamItem::Template(template)).await;
-                template_count += 1;
-            }
+            let template = fusillade::RequestTemplateInput {
+                custom_id,
+                endpoint: ai_base_url.clone(),
+                method,
+                path: url,
+                body,
+                model,
+                api_key: String::new(),
+            };
+            let _ = tx.send(FileStreamItem::Template(template)).await;
+            template_count += 1;
         }
 
         template_count
@@ -718,7 +690,7 @@ async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + 'static>(
     //    Same pattern as create_batch handler:
     //      - key owned by target_user_id (org/user) for billing scope
     //      - created_by on key = individual for per-member attribution
-    let (batch_owner, batch_api_key, api_key_id) = {
+    let (batch_owner, batch_api_key, api_key_id, connection_name) = {
         use crate::db::handlers::api_keys::ApiKeys;
         use crate::db::models::api_keys::ApiKeyPurpose;
 
@@ -728,27 +700,37 @@ async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + 'static>(
             .await?
             .ok_or_else(|| anyhow::anyhow!("connection not found"))?;
 
-        let owner_id = connection.user_id; // org or personal user — drives billing + visibility
-        let triggered_by = sync_op.triggered_by; // individual — drives attribution
+        let owner_id = connection.user_id;
+        let conn_name = connection.name.clone();
+        let triggered_by = sync_op.triggered_by;
 
         let mut conn = dwctl.acquire().await?;
         let (secret, key_id) = ApiKeys::new(&mut conn)
-            .get_or_create_hidden_key_with_id(
-                owner_id,
-                ApiKeyPurpose::Batch,
-                triggered_by,
-            )
+            .get_or_create_hidden_key_with_id(owner_id, ApiKeyPurpose::Batch, triggered_by)
             .await
             .map_err(|e| anyhow::anyhow!("resolve batch API key: {e}"))?;
 
-        (owner_id, secret, key_id)
+        (owner_id, secret, key_id, conn_name)
     };
 
-    // 5. Create batch record
+    // 5. Look up sync entry for external key (for provenance metadata)
+    let external_key = {
+        let mut conn = dwctl.acquire().await?;
+        SyncEntries::new(&mut conn)
+            .get_by_id(input.sync_entry_id)
+            .await?
+            .map(|e| e.external_key)
+            .unwrap_or_default()
+    };
+
+    // 6. Create batch record
     //    created_by = owner (org or user) for visibility scoping — same as normal batch creation
     let metadata = serde_json::json!({
+        "request_source": "sync",
         "dw_source_id": input.connection_id.to_string(),
+        "dw_source_name": connection_name,
         "dw_sync_id": input.sync_id.to_string(),
+        "dw_external_key": external_key,
     });
 
     let batch_input = fusillade::BatchInput {
@@ -782,9 +764,7 @@ async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + 'static>(
     // 6. Update sync entry with batch_id
     {
         let mut conn = dwctl.acquire().await?;
-        SyncEntries::new(&mut conn)
-            .set_activated(input.sync_entry_id, *batch.id)
-            .await?;
+        SyncEntries::new(&mut conn).set_activated(input.sync_entry_id, *batch.id).await?;
         SyncOperations::new(&mut conn)
             .increment_counter(input.sync_id, "batches_created")
             .await?;

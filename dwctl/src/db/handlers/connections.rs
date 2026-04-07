@@ -167,23 +167,15 @@ impl<'c> Connections<'c> {
 
     #[instrument(skip(self), fields(id = %id), err)]
     pub async fn get_by_id(&mut self, id: Uuid) -> Result<Option<Connection>> {
-        let row = sqlx::query_as!(
-            ConnectionRow,
-            "SELECT * FROM connections WHERE id = $1 AND deleted_at IS NULL",
-            id,
-        )
-        .fetch_optional(&mut *self.db)
-        .await?;
+        let row = sqlx::query_as!(ConnectionRow, "SELECT * FROM connections WHERE id = $1 AND deleted_at IS NULL", id,)
+            .fetch_optional(&mut *self.db)
+            .await?;
 
         Ok(row.map(Connection::from))
     }
 
     #[instrument(skip(self), fields(user_id = %user_id), err)]
-    pub async fn list_by_user(
-        &mut self,
-        user_id: Uuid,
-        kind: Option<&str>,
-    ) -> Result<Vec<Connection>> {
+    pub async fn list_by_user(&mut self, user_id: Uuid, kind: Option<&str>) -> Result<Vec<Connection>> {
         let rows = sqlx::query_as!(
             ConnectionRow,
             r#"
@@ -222,23 +214,15 @@ impl<'c> Connections<'c> {
         .execute(&mut *self.db)
         .await?;
 
-        let result = sqlx::query!(
-            "UPDATE connections SET deleted_at = now() WHERE id = $1 AND deleted_at IS NULL",
-            id,
-        )
-        .execute(&mut *self.db)
-        .await?;
+        let result = sqlx::query!("UPDATE connections SET deleted_at = now() WHERE id = $1 AND deleted_at IS NULL", id,)
+            .execute(&mut *self.db)
+            .await?;
 
         Ok(result.rows_affected() > 0)
     }
 
     #[instrument(skip(self, config_encrypted), fields(id = %id), err)]
-    pub async fn update(
-        &mut self,
-        id: Uuid,
-        name: Option<&str>,
-        config_encrypted: Option<&[u8]>,
-    ) -> Result<Connection> {
+    pub async fn update(&mut self, id: Uuid, name: Option<&str>, config_encrypted: Option<&[u8]>) -> Result<Connection> {
         let row = sqlx::query_as!(
             ConnectionRow,
             r#"
@@ -303,13 +287,9 @@ impl<'c> SyncOperations<'c> {
 
     #[instrument(skip(self), fields(id = %id), err)]
     pub async fn get_by_id(&mut self, id: Uuid) -> Result<Option<SyncOperation>> {
-        let row = sqlx::query_as!(
-            SyncOperationRow,
-            "SELECT * FROM sync_operations WHERE id = $1",
-            id,
-        )
-        .fetch_optional(&mut *self.db)
-        .await?;
+        let row = sqlx::query_as!(SyncOperationRow, "SELECT * FROM sync_operations WHERE id = $1", id,)
+            .fetch_optional(&mut *self.db)
+            .await?;
 
         Ok(row.map(SyncOperation::from))
     }
@@ -459,6 +439,7 @@ impl<'c> SyncEntries<'c> {
     }
 
     /// Bulk-insert sync entries for discovered files.
+    #[allow(clippy::type_complexity)]
     #[instrument(skip(self, entries), fields(sync_id = %sync_id, count = entries.len()), err)]
     pub async fn bulk_create(
         &mut self,
@@ -531,10 +512,7 @@ impl<'c> SyncEntries<'c> {
     /// Returns distinct (key, last_modified) pairs. For matching in the frontend,
     /// we return the most recent last_modified per key so it matches S3 listings.
     #[instrument(skip(self), fields(connection_id = %connection_id), err)]
-    pub async fn list_synced_keys(
-        &mut self,
-        connection_id: Uuid,
-    ) -> Result<Vec<(String, Option<DateTime<Utc>>)>> {
+    pub async fn list_synced_keys(&mut self, connection_id: Uuid) -> Result<Vec<(String, Option<DateTime<Utc>>)>> {
         let rows = sqlx::query!(
             r#"
             SELECT external_key, MAX(external_last_modified) AS "last_modified"
@@ -553,25 +531,15 @@ impl<'c> SyncEntries<'c> {
 
     #[instrument(skip(self), fields(id = %id, status = %status), err)]
     pub async fn update_status(&mut self, id: Uuid, status: &str, error: Option<&str>) -> Result<()> {
-        sqlx::query!(
-            "UPDATE sync_entries SET status = $2, error = $3 WHERE id = $1",
-            id,
-            status,
-            error,
-        )
-        .execute(&mut *self.db)
-        .await?;
+        sqlx::query!("UPDATE sync_entries SET status = $2, error = $3 WHERE id = $1", id, status, error,)
+            .execute(&mut *self.db)
+            .await?;
 
         Ok(())
     }
 
     #[instrument(skip(self), fields(id = %id), err)]
-    pub async fn set_ingested(
-        &mut self,
-        id: Uuid,
-        file_id: Uuid,
-        template_count: i32,
-    ) -> Result<()> {
+    pub async fn set_ingested(&mut self, id: Uuid, file_id: Uuid, template_count: i32) -> Result<()> {
         sqlx::query!(
             r#"
             UPDATE sync_entries
@@ -617,13 +585,9 @@ impl<'c> SyncEntries<'c> {
     /// Get entry by ID.
     #[instrument(skip(self), fields(id = %id), err)]
     pub async fn get_by_id(&mut self, id: Uuid) -> Result<Option<SyncEntry>> {
-        let row = sqlx::query_as!(
-            SyncEntryRow,
-            "SELECT * FROM sync_entries WHERE id = $1",
-            id,
-        )
-        .fetch_optional(&mut *self.db)
-        .await?;
+        let row = sqlx::query_as!(SyncEntryRow, "SELECT * FROM sync_entries WHERE id = $1", id,)
+            .fetch_optional(&mut *self.db)
+            .await?;
 
         Ok(row.map(SyncEntry::from))
     }

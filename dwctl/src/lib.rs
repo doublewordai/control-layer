@@ -1277,10 +1277,22 @@ pub async fn build_router(
         .route("/connections", post(api::handlers::connections::create_connection))
         .route("/connections", get(api::handlers::connections::list_connections))
         .route("/connections/{connection_id}", get(api::handlers::connections::get_connection))
-        .route("/connections/{connection_id}", delete(api::handlers::connections::delete_connection))
-        .route("/connections/{connection_id}/test", post(api::handlers::connections::test_connection))
-        .route("/connections/{connection_id}/files", get(api::handlers::connections::list_connection_files))
-        .route("/connections/{connection_id}/synced-keys", get(api::handlers::connections::list_synced_keys))
+        .route(
+            "/connections/{connection_id}",
+            delete(api::handlers::connections::delete_connection),
+        )
+        .route(
+            "/connections/{connection_id}/test",
+            post(api::handlers::connections::test_connection),
+        )
+        .route(
+            "/connections/{connection_id}/files",
+            get(api::handlers::connections::list_connection_files),
+        )
+        .route(
+            "/connections/{connection_id}/synced-keys",
+            get(api::handlers::connections::list_synced_keys),
+        )
         .route("/connections/{connection_id}/sync", post(api::handlers::connections::trigger_sync))
         .route("/connections/{connection_id}/syncs", get(api::handlers::connections::list_syncs))
         .route(

@@ -1048,6 +1048,10 @@ export interface FileObject {
   context_name?: string;
   /** "personal" or "organization" */
   context_type?: string;
+  /** "sync" if ingested from an external connection */
+  source?: string;
+  /** Name of the source connection */
+  source_name?: string;
 }
 
 export interface FileListResponse {

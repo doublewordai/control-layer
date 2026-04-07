@@ -10,12 +10,11 @@ use uuid::Uuid;
 
 use crate::AppState;
 use crate::api::models::connections::{
-    ConnectionListResponse, ConnectionResponse, ConnectionTestResponse, CreateConnectionRequest,
-    ExternalFileListResponse, ExternalFileResponse, ListConnectionsQuery, ListExternalFilesQuery,
-    SyncEntryListResponse, SyncEntryResponse, SyncOperationListResponse,
-    SyncOperationResponse, SyncedKeyResponse, TriggerSyncRequest,
+    ConnectionListResponse, ConnectionResponse, ConnectionTestResponse, CreateConnectionRequest, ExternalFileListResponse,
+    ExternalFileResponse, ListConnectionsQuery, ListExternalFilesQuery, SyncEntryListResponse, SyncEntryResponse,
+    SyncOperationListResponse, SyncOperationResponse, SyncedKeyResponse, TriggerSyncRequest,
 };
-use crate::api::models::users::CurrentUser;
+use crate::auth::permissions::{RequiresPermission, operation, resource};
 use crate::connections::provider::{self, ProviderError};
 use crate::db::handlers::connections::{Connections, SyncEntries, SyncOperations};
 use crate::encryption;
@@ -42,11 +41,22 @@ fn get_encryption_key<P: PoolProvider>(state: &AppState<P>) -> Result<Vec<u8>> {
 
 fn map_provider_error(e: ProviderError) -> Error {
     match e {
-        ProviderError::AuthenticationFailed(msg) => Error::BadRequest { message: format!("authentication failed: {msg}") },
-        ProviderError::AccessDenied(msg) => Error::BadRequest { message: format!("access denied: {msg}") },
-        ProviderError::NotFound(msg) => Error::NotFound { resource: "external file".to_string(), id: msg },
-        ProviderError::InvalidConfig(msg) => Error::BadRequest { message: format!("invalid provider config: {msg}") },
-        ProviderError::Internal(msg) => Error::Internal { operation: format!("provider error: {msg}") },
+        ProviderError::AuthenticationFailed(msg) => Error::BadRequest {
+            message: format!("authentication failed: {msg}"),
+        },
+        ProviderError::AccessDenied(msg) => Error::BadRequest {
+            message: format!("access denied: {msg}"),
+        },
+        ProviderError::NotFound(msg) => Error::NotFound {
+            resource: "external file".to_string(),
+            id: msg,
+        },
+        ProviderError::InvalidConfig(msg) => Error::BadRequest {
+            message: format!("invalid provider config: {msg}"),
+        },
+        ProviderError::Internal(msg) => Error::Internal {
+            operation: format!("provider error: {msg}"),
+        },
     }
 }
 
@@ -68,7 +78,7 @@ fn map_provider_error(e: ProviderError) -> Error {
 #[tracing::instrument(skip_all, fields(user_id = %current_user.id))]
 pub async fn create_connection<P: PoolProvider>(
     State(state): State<AppState<P>>,
-    current_user: CurrentUser,
+    current_user: RequiresPermission<resource::Connections, operation::CreateOwn>,
     Json(req): Json<CreateConnectionRequest>,
 ) -> Result<(StatusCode, Json<ConnectionResponse>)> {
     let kind = req.kind.as_deref().unwrap_or("source");
@@ -98,7 +108,7 @@ pub async fn create_connection<P: PoolProvider>(
     let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let connection = Connections::new(&mut conn)
         .create(
-            target_user_id.into(),
+            target_user_id,
             None, // api_key_id — can be added when API key auth is used
             kind,
             &req.provider,
@@ -122,14 +132,14 @@ pub async fn create_connection<P: PoolProvider>(
 #[tracing::instrument(skip_all, fields(user_id = %current_user.id))]
 pub async fn list_connections<P: PoolProvider>(
     State(state): State<AppState<P>>,
-    current_user: CurrentUser,
+    current_user: RequiresPermission<resource::Connections, operation::ReadOwn>,
     Query(query): Query<ListConnectionsQuery>,
 ) -> Result<Json<ConnectionListResponse>> {
     let target_user_id = current_user.active_organization.unwrap_or(current_user.id);
 
     let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let connections = Connections::new(&mut conn)
-        .list_by_user(target_user_id.into(), query.kind.as_deref())
+        .list_by_user(target_user_id, query.kind.as_deref())
         .await
         .map_err(Error::Database)?;
 
@@ -152,7 +162,7 @@ pub async fn list_connections<P: PoolProvider>(
 pub async fn get_connection<P: PoolProvider>(
     State(state): State<AppState<P>>,
     Path(connection_id): Path<Uuid>,
-    current_user: CurrentUser,
+    current_user: RequiresPermission<resource::Connections, operation::ReadOwn>,
 ) -> Result<Json<ConnectionResponse>> {
     let target_user_id = current_user.active_organization.unwrap_or(current_user.id);
 
@@ -167,7 +177,7 @@ pub async fn get_connection<P: PoolProvider>(
         })?;
 
     // Check ownership
-    if connection.user_id != uuid::Uuid::from(target_user_id) {
+    if connection.user_id != target_user_id {
         return Err(Error::NotFound {
             resource: "Connection".to_string(),
             id: connection_id.to_string(),
@@ -191,7 +201,7 @@ pub async fn get_connection<P: PoolProvider>(
 pub async fn delete_connection<P: PoolProvider>(
     State(state): State<AppState<P>>,
     Path(connection_id): Path<Uuid>,
-    current_user: CurrentUser,
+    current_user: RequiresPermission<resource::Connections, operation::DeleteOwn>,
 ) -> Result<StatusCode> {
     let target_user_id = current_user.active_organization.unwrap_or(current_user.id);
 
@@ -207,7 +217,7 @@ pub async fn delete_connection<P: PoolProvider>(
             id: connection_id.to_string(),
         })?;
 
-    if connection.user_id != uuid::Uuid::from(target_user_id) {
+    if connection.user_id != target_user_id {
         return Err(Error::NotFound {
             resource: "Connection".to_string(),
             id: connection_id.to_string(),
@@ -240,7 +250,7 @@ pub async fn delete_connection<P: PoolProvider>(
 pub async fn test_connection<P: PoolProvider>(
     State(state): State<AppState<P>>,
     Path(connection_id): Path<Uuid>,
-    current_user: CurrentUser,
+    current_user: RequiresPermission<resource::Connections, operation::ReadOwn>,
 ) -> Result<Json<ConnectionTestResponse>> {
     let target_user_id = current_user.active_organization.unwrap_or(current_user.id);
 
@@ -254,7 +264,7 @@ pub async fn test_connection<P: PoolProvider>(
             id: connection_id.to_string(),
         })?;
 
-    if connection.user_id != uuid::Uuid::from(target_user_id) {
+    if connection.user_id != target_user_id {
         return Err(Error::NotFound {
             resource: "Connection".to_string(),
             id: connection_id.to_string(),
@@ -296,7 +306,7 @@ pub async fn test_connection<P: PoolProvider>(
 pub async fn trigger_sync<P: PoolProvider>(
     State(state): State<AppState<P>>,
     Path(connection_id): Path<Uuid>,
-    current_user: CurrentUser,
+    current_user: RequiresPermission<resource::Connections, operation::CreateOwn>,
     Json(req): Json<TriggerSyncRequest>,
 ) -> Result<(StatusCode, Json<SyncOperationResponse>)> {
     let target_user_id = current_user.active_organization.unwrap_or(current_user.id);
@@ -308,7 +318,7 @@ pub async fn trigger_sync<P: PoolProvider>(
         });
     }
 
-    if req.strategy == "select" && req.file_keys.as_ref().map_or(true, |k| k.is_empty()) {
+    if req.strategy == "select" && req.file_keys.as_ref().is_none_or(|k| k.is_empty()) {
         return Err(Error::BadRequest {
             message: "strategy \"select\" requires non-empty file_keys".to_string(),
         });
@@ -325,7 +335,7 @@ pub async fn trigger_sync<P: PoolProvider>(
             id: connection_id.to_string(),
         })?;
 
-    if connection.user_id != uuid::Uuid::from(target_user_id) {
+    if connection.user_id != target_user_id {
         return Err(Error::NotFound {
             resource: "Connection".to_string(),
             id: connection_id.to_string(),
@@ -350,7 +360,7 @@ pub async fn trigger_sync<P: PoolProvider>(
     let sync_op = SyncOperations::new(&mut conn)
         .create(
             connection_id,
-            current_user.id.into(),
+            current_user.id,
             &req.strategy,
             strategy_config.as_ref(),
             &sync_config,
@@ -370,10 +380,7 @@ pub async fn trigger_sync<P: PoolProvider>(
         .await
     {
         // Mark sync as failed if we can't enqueue
-        SyncOperations::new(&mut conn)
-            .update_status(sync_op.id, "failed")
-            .await
-            .ok();
+        SyncOperations::new(&mut conn).update_status(sync_op.id, "failed").await.ok();
         return Err(Error::Internal {
             operation: format!("enqueue sync job: {e}"),
         });
@@ -393,7 +400,7 @@ pub async fn trigger_sync<P: PoolProvider>(
 pub async fn list_syncs<P: PoolProvider>(
     State(state): State<AppState<P>>,
     Path(connection_id): Path<Uuid>,
-    current_user: CurrentUser,
+    current_user: RequiresPermission<resource::Connections, operation::ReadOwn>,
 ) -> Result<Json<SyncOperationListResponse>> {
     let target_user_id = current_user.active_organization.unwrap_or(current_user.id);
 
@@ -408,7 +415,7 @@ pub async fn list_syncs<P: PoolProvider>(
             id: connection_id.to_string(),
         })?;
 
-    if connection.user_id != uuid::Uuid::from(target_user_id) {
+    if connection.user_id != target_user_id {
         return Err(Error::NotFound {
             resource: "Connection".to_string(),
             id: connection_id.to_string(),
@@ -439,7 +446,7 @@ pub async fn list_syncs<P: PoolProvider>(
 pub async fn get_sync<P: PoolProvider>(
     State(state): State<AppState<P>>,
     Path((connection_id, sync_id)): Path<(Uuid, Uuid)>,
-    current_user: CurrentUser,
+    current_user: RequiresPermission<resource::Connections, operation::ReadOwn>,
 ) -> Result<Json<SyncOperationResponse>> {
     let target_user_id = current_user.active_organization.unwrap_or(current_user.id);
 
@@ -455,7 +462,7 @@ pub async fn get_sync<P: PoolProvider>(
             id: connection_id.to_string(),
         })?;
 
-    if connection.user_id != uuid::Uuid::from(target_user_id) {
+    if connection.user_id != target_user_id {
         return Err(Error::NotFound {
             resource: "Connection".to_string(),
             id: connection_id.to_string(),
@@ -485,7 +492,7 @@ pub async fn get_sync<P: PoolProvider>(
 pub async fn list_sync_entries<P: PoolProvider>(
     State(state): State<AppState<P>>,
     Path((connection_id, sync_id)): Path<(Uuid, Uuid)>,
-    current_user: CurrentUser,
+    current_user: RequiresPermission<resource::Connections, operation::ReadOwn>,
 ) -> Result<Json<SyncEntryListResponse>> {
     let target_user_id = current_user.active_organization.unwrap_or(current_user.id);
 
@@ -501,17 +508,14 @@ pub async fn list_sync_entries<P: PoolProvider>(
             id: connection_id.to_string(),
         })?;
 
-    if connection.user_id != uuid::Uuid::from(target_user_id) {
+    if connection.user_id != target_user_id {
         return Err(Error::NotFound {
             resource: "Connection".to_string(),
             id: connection_id.to_string(),
         });
     }
 
-    let entries = SyncEntries::new(&mut conn)
-        .list_by_sync(sync_id)
-        .await
-        .map_err(Error::Database)?;
+    let entries = SyncEntries::new(&mut conn).list_by_sync(sync_id).await.map_err(Error::Database)?;
 
     Ok(Json(SyncEntryListResponse {
         data: entries.into_iter().map(SyncEntryResponse::from).collect(),
@@ -526,7 +530,7 @@ pub async fn list_sync_entries<P: PoolProvider>(
 pub async fn list_synced_keys<P: PoolProvider>(
     State(state): State<AppState<P>>,
     Path(connection_id): Path<Uuid>,
-    current_user: CurrentUser,
+    current_user: RequiresPermission<resource::Connections, operation::ReadOwn>,
 ) -> Result<Json<Vec<SyncedKeyResponse>>> {
     let target_user_id = current_user.active_organization.unwrap_or(current_user.id);
 
@@ -540,7 +544,7 @@ pub async fn list_synced_keys<P: PoolProvider>(
             id: connection_id.to_string(),
         })?;
 
-    if connection.user_id != uuid::Uuid::from(target_user_id) {
+    if connection.user_id != target_user_id {
         return Err(Error::NotFound {
             resource: "Connection".to_string(),
             id: connection_id.to_string(),
@@ -585,7 +589,7 @@ pub async fn list_connection_files<P: PoolProvider>(
     State(state): State<AppState<P>>,
     Path(connection_id): Path<Uuid>,
     Query(query): Query<ListExternalFilesQuery>,
-    current_user: CurrentUser,
+    current_user: RequiresPermission<resource::Connections, operation::ReadOwn>,
 ) -> Result<Json<ExternalFileListResponse>> {
     let target_user_id = current_user.active_organization.unwrap_or(current_user.id);
 
@@ -599,7 +603,7 @@ pub async fn list_connection_files<P: PoolProvider>(
             id: connection_id.to_string(),
         })?;
 
-    if connection.user_id != uuid::Uuid::from(target_user_id) {
+    if connection.user_id != target_user_id {
         return Err(Error::NotFound {
             resource: "Connection".to_string(),
             id: connection_id.to_string(),

@@ -72,9 +72,7 @@ impl SourceProvider for S3Provider {
         let mut continuation_token: Option<String> = None;
 
         loop {
-            let mut req = client
-                .list_objects_v2()
-                .bucket(&self.config.bucket);
+            let mut req = client.list_objects_v2().bucket(&self.config.bucket);
 
             if !self.prefix().is_empty() {
                 req = req.prefix(self.prefix());
@@ -111,21 +109,14 @@ impl SourceProvider for S3Provider {
                     key
                 };
 
-                let display_name = relative_key
-                    .rsplit('/')
-                    .next()
-                    .unwrap_or(relative_key)
-                    .to_string();
+                let display_name = relative_key.rsplit('/').next().unwrap_or(relative_key).to_string();
 
                 files.push(ExternalFile {
                     key: relative_key.to_string(),
-                    size_bytes: obj.size().map(|s| s as i64),
-                    last_modified: obj.last_modified().and_then(|dt| {
-                        chrono::DateTime::from_timestamp(
-                            dt.secs(),
-                            dt.subsec_nanos(),
-                        )
-                    }),
+                    size_bytes: obj.size(),
+                    last_modified: obj
+                        .last_modified()
+                        .and_then(|dt| chrono::DateTime::from_timestamp(dt.secs(), dt.subsec_nanos())),
                     display_name: Some(display_name),
                 });
             }
@@ -164,9 +155,7 @@ impl SourceProvider for S3Provider {
                 req = req.continuation_token(token);
             }
 
-            let resp = req.send().await.map_err(|e| {
-                ProviderError::Internal(format!("{e:#}"))
-            })?;
+            let resp = req.send().await.map_err(|e| ProviderError::Internal(format!("{e:#}")))?;
 
             for obj in resp.contents() {
                 let key: &str = match obj.key() {
@@ -188,24 +177,20 @@ impl SourceProvider for S3Provider {
                 };
 
                 // Apply search filter
-                if let Some(ref q) = search {
-                    if !relative_key.to_lowercase().contains(q) {
-                        continue;
-                    }
+                if let Some(ref q) = search
+                    && !relative_key.to_lowercase().contains(q)
+                {
+                    continue;
                 }
 
-                let display_name = relative_key
-                    .rsplit('/')
-                    .next()
-                    .unwrap_or(relative_key)
-                    .to_string();
+                let display_name = relative_key.rsplit('/').next().unwrap_or(relative_key).to_string();
 
                 files.push(ExternalFile {
                     key: relative_key.to_string(),
-                    size_bytes: obj.size().map(|s| s as i64),
-                    last_modified: obj.last_modified().and_then(|dt| {
-                        chrono::DateTime::from_timestamp(dt.secs(), dt.subsec_nanos())
-                    }),
+                    size_bytes: obj.size(),
+                    last_modified: obj
+                        .last_modified()
+                        .and_then(|dt| chrono::DateTime::from_timestamp(dt.secs(), dt.subsec_nanos())),
                     display_name: Some(display_name),
                 });
 
@@ -294,10 +279,7 @@ impl SourceProvider for S3Provider {
         let client = self.build_client().await?;
 
         // Try to list a single object to verify access
-        let mut req = client
-            .list_objects_v2()
-            .bucket(&self.config.bucket)
-            .max_keys(1);
+        let mut req = client.list_objects_v2().bucket(&self.config.bucket).max_keys(1);
 
         if !self.prefix().is_empty() {
             req = req.prefix(self.prefix());

@@ -14,7 +14,7 @@ use crate::api::models::batches::{
 };
 use crate::api::models::users::CurrentUser;
 use crate::auth::permissions::{RequiresPermission, can_read_all_resources, has_permission, operation, resource};
-use crate::db::handlers::{Credits, Users, api_keys::ApiKeys, repository::Repository};
+use crate::db::handlers::{Connections, Credits, Users, api_keys::ApiKeys, repository::Repository};
 use crate::db::models::api_keys::ApiKeyPurpose;
 use crate::errors::{Error, Result};
 use crate::types::{Operation, Resource};
@@ -122,6 +122,10 @@ fn is_batch_owner(current_user: &CurrentUser, created_by: &str) -> bool {
 /// If `creator_email` is provided, it will be injected into the metadata as `created_by_email`.
 /// This is used to populate the email without storing it in the batch metadata (PII concern).
 fn to_batch_response_with_email(batch: fusillade::Batch, creator_email: Option<&str>) -> BatchResponse {
+    to_batch_response_enriched(batch, creator_email, None)
+}
+
+fn to_batch_response_enriched(batch: fusillade::Batch, creator_email: Option<&str>, source_name: Option<&str>) -> BatchResponse {
     // Convert metadata from serde_json::Value to HashMap<String, String>
     let mut metadata: Option<HashMap<String, String>> = batch.metadata.and_then(|m| {
         m.as_object().map(|obj| {
@@ -136,6 +140,15 @@ fn to_batch_response_with_email(batch: fusillade::Batch, creator_email: Option<&
         metadata
             .get_or_insert_with(HashMap::new)
             .insert("created_by_email".to_string(), email.to_string());
+    }
+
+    // Inject source connection name if this batch has dw_source_id but no dw_source_name
+    if let Some(name) = source_name
+        && let Some(ref mut m) = metadata
+        && m.contains_key("dw_source_id")
+        && !m.contains_key("dw_source_name")
+    {
+        m.insert("dw_source_name".to_string(), name.to_string());
     }
 
     // Determine OpenAI status from request counts
@@ -913,6 +926,16 @@ pub async fn get_batch<P: PoolProvider>(
             .insert("context_type".to_string(), ctype);
     }
 
+    // Inject source connection name for synced batches
+    if let Some(ref mut m) = response.metadata
+        && let Some(source_id_str) = m.get("dw_source_id").cloned()
+        && !m.contains_key("dw_source_name")
+        && let Ok(conn_id) = Uuid::parse_str(&source_id_str)
+        && let Ok(Some(conn)) = Connections::new(&mut read_conn).get_by_id(conn_id).await
+    {
+        m.insert("dw_source_name".to_string(), conn.name);
+    }
+
     Ok(Json(response))
 }
 
@@ -1634,6 +1657,31 @@ pub async fn list_batches<P: PoolProvider>(
     // Collect batch IDs for bulk operations
     let batch_ids: Vec<Uuid> = batches.iter().map(|b| b.id.0).collect();
 
+    // Bulk fetch connection names for synced batches (those with dw_source_id in metadata)
+    let source_conn_ids: Vec<Uuid> = batches
+        .iter()
+        .filter_map(|b| {
+            b.metadata
+                .as_ref()
+                .and_then(|m| m.get("dw_source_id"))
+                .and_then(|v| v.as_str())
+                .and_then(|s| Uuid::parse_str(s).ok())
+        })
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    let connection_names: HashMap<Uuid, String> = if !source_conn_ids.is_empty() {
+        let mut map = HashMap::new();
+        for conn_id in &source_conn_ids {
+            if let Ok(Some(conn)) = Connections::new(&mut read_conn).get_by_id(*conn_id).await {
+                map.insert(*conn_id, conn.name);
+            }
+        }
+        map
+    } else {
+        HashMap::new()
+    };
+
     // Fetch analytics in bulk if requested
     let analytics_map: HashMap<Uuid, BatchAnalytics> = if include_analytics && !batches.is_empty() {
         crate::db::handlers::analytics::get_batches_analytics_bulk(state.db.read(), &batch_ids)
@@ -1701,6 +1749,16 @@ pub async fn list_batches<P: PoolProvider>(
                     .metadata
                     .get_or_insert_with(HashMap::new)
                     .insert("context_type".to_string(), ctype);
+            }
+
+            // Inject source connection name for synced batches
+            if let Some(ref mut m) = response.metadata
+                && let Some(source_id_str) = m.get("dw_source_id").cloned()
+                && !m.contains_key("dw_source_name")
+                && let Ok(conn_id) = Uuid::parse_str(&source_id_str)
+                && let Some(name) = connection_names.get(&conn_id)
+            {
+                m.insert("dw_source_name".to_string(), name.clone());
             }
 
             if include_analytics {

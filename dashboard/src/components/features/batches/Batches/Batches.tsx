@@ -93,13 +93,14 @@ export function Batches({
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const queryClient = useQueryClient();
-  const { userRoles } = useAuthorization();
+  const { userRoles, hasPermission } = useAuthorization();
   const { isOrgContext, activeOrganizationId } = useOrganizationContext();
 
   // Show User column for PlatformManagers (see all batches) or in org context (see org members)
   const isPlatformManager = userRoles.includes("PlatformManager");
   const showUserColumn = isPlatformManager || isOrgContext;
   const showContextColumn = isPlatformManager;
+  const showSourceColumn = hasPermission("connections");
 
   // Member filter:
   // - Org context (all users): show org members dropdown (client-side filtered)
@@ -517,6 +518,7 @@ export function Batches({
     isFileInProgress,
     showUserColumn,
     showContextColumn,
+    showSourceColumn,
   });
 
   const handleBatchClick = (batch: Batch) => {
@@ -537,6 +539,7 @@ export function Batches({
     batchAnalytics: batchAnalyticsMap,
     showUserColumn,
     showContextColumn,
+    showSourceColumn,
   });
 
   // Searchable member filter combobox - shared between batches and files tabs

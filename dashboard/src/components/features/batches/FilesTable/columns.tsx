@@ -12,6 +12,7 @@ import {
   AlertCircle,
   Layers,
   Loader2,
+  Cable,
 } from "lucide-react";
 import { Button } from "../../../ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "../../../ui/tooltip";
@@ -29,6 +30,8 @@ interface ColumnActions {
   showUserColumn?: boolean;
   /** Show the Context column (personal vs org name) */
   showContextColumn?: boolean;
+  /** Show the Source column — gated behind PlatformManager */
+  showSourceColumn?: boolean;
 }
 
 const userColumn: ColumnDef<FileObject> = {
@@ -50,6 +53,28 @@ const userColumn: ColumnDef<FileObject> = {
         <TooltipContent>{email}</TooltipContent>
       </Tooltip>
     );
+  },
+};
+
+const sourceColumn: ColumnDef<FileObject> = {
+  id: "source",
+  header: "Source",
+  cell: ({ row }) => {
+    const file = row.original;
+    if (file.source === "sync") {
+      return (
+        <Tooltip delayDuration={300}>
+          <TooltipTrigger asChild>
+            <span className="inline-flex items-center gap-1 text-xs text-blue-600 cursor-default">
+              <Cable className="w-3 h-3" />
+              S3
+            </span>
+          </TooltipTrigger>
+          <TooltipContent>{file.source_name || "S3 Sync"}</TooltipContent>
+        </Tooltip>
+      );
+    }
+    return <span className="text-xs text-gray-500">Upload</span>;
   },
 };
 
@@ -187,6 +212,7 @@ export const createFileColumns = (
   //     );
   //   },
   // },
+  ...(actions.showSourceColumn ? [sourceColumn] : []),
   {
     accessorKey: "bytes",
     header: ({ column }) => {

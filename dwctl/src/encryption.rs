@@ -73,10 +73,10 @@ pub fn decrypt_json(key_bytes: &[u8], blob: &[u8]) -> Result<serde_json::Value, 
 /// - Otherwise, SHA-256 hash the secret to produce a 32-byte key.
 pub fn derive_encryption_key(secret: &str) -> Result<Vec<u8>, EncryptionError> {
     // Try base64 first — allows users to provide a proper random key
-    if let Ok(bytes) = general_purpose::STANDARD.decode(secret) {
-        if bytes.len() == 32 {
-            return Ok(bytes);
-        }
+    if let Ok(bytes) = general_purpose::STANDARD.decode(secret)
+        && bytes.len() == 32
+    {
+        return Ok(bytes);
     }
     // Try raw bytes
     let bytes = secret.as_bytes();

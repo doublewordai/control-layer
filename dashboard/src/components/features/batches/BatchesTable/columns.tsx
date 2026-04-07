@@ -13,6 +13,7 @@ import {
   DollarSign,
   Eye,
   Trash2,
+  Cable,
 } from "lucide-react";
 import { Button } from "../../../ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "../../../ui/tooltip";
@@ -35,6 +36,8 @@ interface ColumnActions {
   showUserColumn?: boolean;
   /** Show the Context column (personal vs org name) */
   showContextColumn?: boolean;
+  /** Show the Source column (S3/API/UI) — gated behind PlatformManager */
+  showSourceColumn?: boolean;
 }
 
 const getStatusIcon = (status: BatchStatus) => {
@@ -96,6 +99,38 @@ const userColumn: ColumnDef<Batch> = {
         <TooltipContent>{email}</TooltipContent>
       </Tooltip>
     );
+  },
+};
+
+const sourceColumn: ColumnDef<Batch> = {
+  id: "source",
+  header: "Source",
+  cell: ({ row }) => {
+    const batch = row.original as Batch;
+    const source = batch.metadata?.request_source;
+    const externalKey = batch.metadata?.dw_external_key;
+
+    if (source === "sync") {
+      const sourceName = batch.metadata?.dw_source_name;
+      return (
+        <Tooltip delayDuration={300}>
+          <TooltipTrigger asChild>
+            <span className="inline-flex items-center gap-1 text-xs text-blue-600 cursor-default">
+              <Cable className="w-3 h-3" />
+              S3
+            </span>
+          </TooltipTrigger>
+          <TooltipContent>{sourceName || "External sync"}</TooltipContent>
+        </Tooltip>
+      );
+    }
+    if (source === "api") {
+      return <span className="text-xs text-gray-500">API</span>;
+    }
+    if (source === "frontend") {
+      return <span className="text-xs text-gray-500">UI</span>;
+    }
+    return <span className="text-gray-400 text-xs">-</span>;
   },
 };
 
@@ -184,6 +219,7 @@ export const createBatchColumns = (
       );
     },
   },
+  ...(actions.showSourceColumn ? [sourceColumn] : []),
   {
     accessorKey: "completion_window",
     header: "Priority",

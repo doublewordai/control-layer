@@ -98,14 +98,10 @@ pub trait SourceProvider: Send + Sync {
 }
 
 /// Construct a provider from decrypted config JSON.
-pub fn create_provider(
-    provider_type: &str,
-    config: serde_json::Value,
-) -> Result<Box<dyn SourceProvider>, ProviderError> {
+pub fn create_provider(provider_type: &str, config: serde_json::Value) -> Result<Box<dyn SourceProvider>, ProviderError> {
     match provider_type {
         "s3" => {
-            let s3_config: s3::S3Config =
-                serde_json::from_value(config).map_err(|e| ProviderError::InvalidConfig(e.to_string()))?;
+            let s3_config: s3::S3Config = serde_json::from_value(config).map_err(|e| ProviderError::InvalidConfig(e.to_string()))?;
             Ok(Box::new(s3::S3Provider::new(s3_config)))
         }
         other => Err(ProviderError::InvalidConfig(format!("unsupported provider: {other}"))),
