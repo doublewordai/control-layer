@@ -236,7 +236,7 @@ export function CostManagement() {
   const showAutoTopupSection =
     (isDemoMode || !!config?.payment_enabled) &&
     displayUser &&
-    !filterUserId &&
+    (!filterUserId || filterUserId === activeOrganizationId) &&
     canManageOrgBilling;
 
   const autoTopupElement = showAutoTopupSection ? (
