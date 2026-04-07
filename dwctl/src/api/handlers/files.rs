@@ -13,6 +13,8 @@ use crate::api::models::files::{
 };
 use crate::api::models::users::CurrentUser;
 use crate::auth::permissions::{RequiresPermission, can_read_all_resources, operation, resource};
+use crate::blob_storage::BlobStorageClient;
+use crate::config::FileStorageBackend;
 
 use crate::AppState;
 use crate::db::{
@@ -43,6 +45,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
@@ -425,6 +428,247 @@ struct FileRequestContext {
     allowed_url_paths: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IngestFileInput {
+    pub file_id: Uuid,
+    pub object_key: String,
+    pub endpoint: String,
+    pub api_key: String,
+    pub api_key_id: Uuid,
+    pub uploaded_by: String,
+    pub filename: String,
+    pub size_bytes: i64,
+}
+
+pub(crate) async fn get_file_ingest_status(pool: &sqlx::PgPool, file_id: Uuid) -> Result<Option<String>> {
+    sqlx::query_scalar::<_, String>("SELECT status FROM file_ingest_jobs WHERE file_id = $1")
+        .bind(file_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| Error::Database(e.into()))
+}
+
+async fn set_file_ingest_status(
+    pool: &sqlx::PgPool,
+    file_id: Uuid,
+    object_key: &str,
+    status: &str,
+    error_message: Option<&str>,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO file_ingest_jobs (file_id, object_key, status, error_message, created_at, updated_at)
+        VALUES ($1, $2, $3, $4, NOW(), NOW())
+        ON CONFLICT (file_id) DO UPDATE
+        SET object_key = EXCLUDED.object_key,
+            status = EXCLUDED.status,
+            error_message = EXCLUDED.error_message,
+            updated_at = NOW()
+        "#,
+    )
+    .bind(file_id)
+    .bind(object_key)
+    .bind(status)
+    .bind(error_message)
+    .execute(pool)
+    .await
+    .map_err(|e| Error::Database(e.into()))?;
+    Ok(())
+}
+
+async fn insert_file_placeholder(
+    pool: &sqlx::PgPool,
+    input: &IngestFileInput,
+    purpose: &str,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO fusillade.files (id, name, purpose, size_bytes, status, uploaded_by, api_key_id, created_at, updated_at)
+        VALUES ($1, $2, $3, $4, 'processed', $5, $6, NOW(), NOW())
+        "#,
+    )
+    .bind(input.file_id)
+    .bind(&input.filename)
+    .bind(purpose)
+    .bind(input.size_bytes)
+    .bind(&input.uploaded_by)
+    .bind(input.api_key_id)
+    .execute(pool)
+    .await
+    .map_err(|e| Error::Database(e.into()))?;
+    Ok(())
+}
+
+async fn ingest_blob_to_templates(
+    db_pool: &sqlx::PgPool,
+    config: &crate::config::Config,
+    input: &IngestFileInput,
+) -> std::result::Result<(), underway::task::Error> {
+    use underway::task::Error as TaskError;
+
+    let Some(store_config) = config.batches.files.object_store.as_ref() else {
+        return Err(TaskError::Fatal("object store config missing".to_string()));
+    };
+
+    let client = BlobStorageClient::new(store_config)
+        .await
+        .map_err(|e| TaskError::Retryable(format!("init object storage client: {e}")))?;
+
+    set_file_ingest_status(db_pool, input.file_id, &input.object_key, "processing", None)
+        .await
+        .map_err(|e| TaskError::Retryable(format!("set ingest status processing: {e}")))?;
+
+    let bytes = client
+        .get_file_bytes(&input.object_key)
+        .await
+        .map_err(|e| TaskError::Retryable(format!("download blob for ingest: {e}")))?;
+
+    let content = std::str::from_utf8(&bytes).map_err(|e| TaskError::Fatal(format!("Invalid UTF-8 in upload: {e}")))?;
+
+    let mut conn = db_pool
+        .acquire()
+        .await
+        .map_err(|e| TaskError::Retryable(format!("acquire db conn for ingest: {e}")))?;
+
+    let mut deployments_repo = Deployments::new(&mut conn);
+    let target_user_id = Uuid::parse_str(&input.uploaded_by)
+        .map_err(|e| TaskError::Fatal(format!("invalid uploaded_by owner id on file ingest: {e}")))?;
+    let filter = DeploymentFilter::new(0, i64::MAX)
+        .with_accessible_to(target_user_id)
+        .with_statuses(vec![ModelStatus::Active])
+        .with_deleted(false);
+    let accessible_deployments = deployments_repo
+        .list(&filter)
+        .await
+        .map_err(|e| TaskError::Retryable(format!("query accessible deployments for ingest: {e}")))?;
+    let accessible_models: HashMap<String, Option<ModelType>> =
+        accessible_deployments.into_iter().map(|d| (d.alias, d.model_type)).collect();
+    drop(conn);
+
+    let mut templates: Vec<fusillade::RequestTemplateInput> = Vec::new();
+    let mut non_empty_lines: usize = 0;
+    for (idx, line) in content.lines().enumerate() {
+        let line_no = idx + 1;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        non_empty_lines += 1;
+        if config.limits.files.max_requests_per_file > 0 && non_empty_lines > config.limits.files.max_requests_per_file {
+            return Err(TaskError::Fatal(format!(
+                "Line {}: file contains too many requests (>{})",
+                line_no, config.limits.files.max_requests_per_file
+            )));
+        }
+
+        let openai_req: OpenAIBatchRequest = serde_json::from_str(trimmed)
+            .map_err(|e| TaskError::Fatal(format!("Invalid JSON on line {}: {}", line_no, e)))?;
+        let template = openai_req
+            .to_internal(
+                &input.endpoint,
+                input.api_key.clone(),
+                &accessible_models,
+                &config.batches.allowed_url_paths,
+            )
+            .map_err(|e| TaskError::Fatal(format!("Line {}: {}", line_no, e)))?;
+
+        if config.limits.requests.max_body_size > 0 && template.body.len() as u64 > config.limits.requests.max_body_size {
+            return Err(TaskError::Fatal(format!(
+                "Line {}: Request body is {} bytes, exceeds max {} bytes",
+                line_no,
+                template.body.len(),
+                config.limits.requests.max_body_size
+            )));
+        }
+        templates.push(template);
+    }
+
+    if templates.is_empty() {
+        return Err(TaskError::Fatal("File contains no valid request templates".to_string()));
+    }
+
+    let mut tx = db_pool
+        .begin()
+        .await
+        .map_err(|e| TaskError::Retryable(format!("begin template ingest tx: {e}")))?;
+
+    for chunk in templates.chunks(config.batches.files.batch_insert_size.max(1)) {
+        for template in chunk {
+            let template_id = Uuid::new_v4();
+            sqlx::query(
+                r#"
+                INSERT INTO fusillade.request_templates (id, file_id, model, api_key, endpoint, path, body, custom_id, method)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                "#,
+            )
+            .bind(template_id)
+            .bind(input.file_id)
+            .bind(&template.model)
+            .bind(&template.api_key)
+            .bind(&template.endpoint)
+            .bind(&template.path)
+            .bind(&template.body)
+            .bind(&template.custom_id)
+            .bind(&template.method)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| TaskError::Retryable(format!("insert request template: {e}")))?;
+        }
+    }
+
+    tx.commit()
+        .await
+        .map_err(|e| TaskError::Retryable(format!("commit template ingest tx: {e}")))?;
+
+    Ok(())
+}
+
+pub async fn build_ingest_file_job<P: sqlx_pool_router::PoolProvider + Clone + Send + Sync + 'static>(
+    pool: sqlx::PgPool,
+    state: crate::tasks::TaskState<P>,
+) -> anyhow::Result<underway::Job<IngestFileInput, crate::tasks::TaskState<P>>> {
+    use underway::Job;
+    use underway::job::To;
+    use underway::task::Error as TaskError;
+
+    Job::<IngestFileInput, _>::builder()
+        .state(state)
+        .step(|cx, input: IngestFileInput| async move {
+            let config = cx.state.config.snapshot();
+            match ingest_blob_to_templates(&cx.state.db_pool, &config, &input).await {
+                Ok(()) => {
+                    set_file_ingest_status(&cx.state.db_pool, input.file_id, &input.object_key, "processed", None)
+                        .await
+                        .map_err(|e| TaskError::Retryable(format!("set ingest status processed: {e}")))?;
+                    tracing::info!(file_id = %input.file_id, "File ingest completed");
+                    To::done()
+                }
+                Err(TaskError::Fatal(msg)) => {
+                    let _ =
+                        set_file_ingest_status(&cx.state.db_pool, input.file_id, &input.object_key, "failed", Some(&msg)).await;
+                    Err(TaskError::Fatal(msg))
+                }
+                Err(TaskError::Retryable(msg)) => {
+                    let _ = set_file_ingest_status(
+                        &cx.state.db_pool,
+                        input.file_id,
+                        &input.object_key,
+                        "pending",
+                        Some(&format!("retrying after transient error: {msg}")),
+                    )
+                    .await;
+                    Err(TaskError::Retryable(msg))
+                }
+                Err(other) => Err(other),
+            }
+        })
+        .name("ingest-file")
+        .pool(pool)
+        .build()
+        .await
+        .map_err(Into::into)
+}
+
 /// Helper function to create a stream of FileStreamItem from multipart upload
 /// This handles the entire multipart parsing inside the stream
 #[tracing::instrument(skip(multipart, req_ctx), fields(config.max_file_size, config.max_requests_per_file, uploaded_by = ?uploaded_by, endpoint = %req_ctx.endpoint, config.buffer_size))]
@@ -803,7 +1047,7 @@ Each line must be a valid JSON object containing `custom_id`, `method`, `url`, a
         description = "Multipart form with `file` (the JSONL file) and `purpose` (must be `batch`)."
     ),
     responses(
-        (status = 201, description = "File uploaded and validated successfully.", body = FileResponse),
+        (status = 201, description = "File accepted for processing.", body = FileResponse),
         (status = 400, description = "Invalid file format, malformed JSON, missing required fields, etc."),
         (status = 403, description = "Model referenced in the file is not configured or not accessible to your account."),
         (status = 413, description = "File exceeds the maximum allowed size."),
@@ -850,12 +1094,6 @@ pub async fn upload_file<P: PoolProvider>(
         message: format!("Invalid multipart request: {}", e),
     })?;
 
-    let stream_config = FileStreamConfig {
-        max_file_size: config.limits.files.max_file_size,
-        max_requests_per_file: config.limits.files.max_requests_per_file,
-        max_request_body_size: config.limits.requests.max_body_size,
-        buffer_size: config.batches.files.upload_buffer_size,
-    };
     // When in org context, attribute file ownership to the org (not the individual user).
     // Also used for the hidden API key lookup below.
     let target_user_id = current_user.active_organization.unwrap_or(current_user.id);
@@ -886,44 +1124,140 @@ pub async fn upload_file<P: PoolProvider>(
     // drop conn so it isn't persisted for entire upload process
     drop(conn);
 
-    // Create a stream that parses the multipart upload and yields FileStreamItems
-    let (file_stream, error_slot) = create_file_stream(
-        multipart,
-        stream_config,
-        uploaded_by,
-        FileRequestContext {
+    let created_file_id = if config.batches.files.storage_backend == FileStorageBackend::ObjectStore {
+        let object_store_cfg = config.batches.files.object_store.as_ref().ok_or_else(|| Error::Internal {
+            operation: "object store backend selected but no object_store config found".to_string(),
+        })?;
+        let blob = BlobStorageClient::new(object_store_cfg).await?;
+
+        let mut multipart = multipart;
+        let mut filename: Option<String> = None;
+        let mut purpose: Option<String> = None;
+        let mut total_size: u64 = 0;
+        let file_id = Uuid::new_v4();
+        let tmp_path = format!("/tmp/dwctl-upload-{}.jsonl", file_id);
+        let mut tmp_file = tokio::fs::File::create(&tmp_path).await.map_err(|e| Error::Internal {
+            operation: format!("create temp upload file: {e}"),
+        })?;
+        let mut saw_file = false;
+
+        while let Some(field) = multipart.next_field().await.map_err(|e| Error::BadRequest {
+            message: format!("Invalid multipart upload: {}", e),
+        })? {
+            match field.name().unwrap_or("") {
+                "purpose" => {
+                    purpose = Some(field.text().await.unwrap_or_default());
+                }
+                "file" => {
+                    saw_file = true;
+                    filename = field.file_name().map(|s| s.to_string());
+                    let mut field = field;
+                    while let Some(chunk) = field.chunk().await.map_err(|e| Error::BadRequest {
+                        message: format!("Read upload chunk: {e}"),
+                    })? {
+                        total_size = total_size.saturating_add(chunk.len() as u64);
+                        if max_file_size > 0 && total_size > max_file_size {
+                            return Err(Error::PayloadTooLarge {
+                                message: format!("File exceeds the maximum allowed size of {} bytes", max_file_size),
+                            });
+                        }
+                        tmp_file.write_all(&chunk).await.map_err(|e| Error::Internal {
+                            operation: format!("write temp upload bytes: {e}"),
+                        })?;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if !saw_file {
+            return Err(Error::BadRequest {
+                message: "No file field found in multipart upload".to_string(),
+            });
+        }
+        if total_size == 0 {
+            return Err(Error::BadRequest {
+                message: "File contains no valid request templates".to_string(),
+            });
+        }
+        if purpose.as_deref() != Some("batch") {
+            return Err(Error::BadRequest {
+                message: "Invalid purpose. Only 'batch' is supported.".to_string(),
+            });
+        }
+
+        tmp_file.flush().await.map_err(|e| Error::Internal {
+            operation: format!("flush temp upload file: {e}"),
+        })?;
+
+        let object_key = blob.object_key_for_file(file_id);
+        blob.put_file_from_path(&object_key, &tmp_path, "application/x-ndjson")
+            .await?;
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+
+        let ingest = IngestFileInput {
+            file_id,
+            object_key: object_key.clone(),
             endpoint,
             api_key: user_api_key,
-            accessible_models,
-            allowed_url_paths: config.batches.allowed_url_paths.clone(),
-        },
-        Some(api_key_id),
-    );
-
-    // Create file via request manager with streaming
-    let created_file_result = state.request_manager.create_file_stream(file_stream).await.map_err(|e| {
-        // Check if WE aborted (control-layer error in slot)
-        // Handle poisoned mutex gracefully - the data is still valid
-        let upload_err = match error_slot.lock() {
-            Ok(mut guard) => guard.take(),
-            Err(poisoned) => poisoned.into_inner().take(),
+            api_key_id,
+            uploaded_by: uploaded_by.clone().unwrap_or_default(),
+            filename: filename.clone().unwrap_or_else(|| "upload.jsonl".to_string()),
+            size_bytes: i64::try_from(total_size).unwrap_or(i64::MAX),
         };
-        if let Some(upload_err) = upload_err {
-            tracing::warn!("File upload aborted with error: {:?}", upload_err);
-            return upload_err.into_http_error();
-        }
 
-        // Otherwise it's a fusillade error
-        tracing::warn!("Fusillade error during file upload: {:?}", e);
-        match e {
-            fusillade::FusilladeError::ValidationError(msg) => Error::BadRequest { message: msg },
-            _ => Error::Internal {
-                operation: format!("create file: {}", e),
+        insert_file_placeholder(state.db.write(), &ingest, "batch").await?;
+        set_file_ingest_status(state.db.write(), file_id, &object_key, "pending", None).await?;
+
+        state
+            .task_runner
+            .ingest_file_job
+            .enqueue(&ingest)
+            .await
+            .map_err(|e| Error::Internal {
+                operation: format!("enqueue file ingest job: {e}"),
+            })?;
+        file_id.into()
+    } else {
+        let stream_config = FileStreamConfig {
+            max_file_size: config.limits.files.max_file_size,
+            max_requests_per_file: config.limits.files.max_requests_per_file,
+            max_request_body_size: config.limits.requests.max_body_size,
+            buffer_size: config.batches.files.upload_buffer_size,
+        };
+        let (file_stream, error_slot) = create_file_stream(
+            multipart,
+            stream_config,
+            uploaded_by,
+            FileRequestContext {
+                endpoint,
+                api_key: user_api_key,
+                accessible_models,
+                allowed_url_paths: config.batches.allowed_url_paths.clone(),
             },
-        }
-    })?;
+            Some(api_key_id),
+        );
 
-    let created_file_id = resolve_upload_stream_result(created_file_result, &error_slot)?;
+        let created_file_result = state.request_manager.create_file_stream(file_stream).await.map_err(|e| {
+            let upload_err = match error_slot.lock() {
+                Ok(mut guard) => guard.take(),
+                Err(poisoned) => poisoned.into_inner().take(),
+            };
+            if let Some(upload_err) = upload_err {
+                tracing::warn!("File upload aborted with error: {:?}", upload_err);
+                return upload_err.into_http_error();
+            }
+            tracing::warn!("Fusillade error during file upload: {:?}", e);
+            match e {
+                fusillade::FusilladeError::ValidationError(msg) => Error::BadRequest { message: msg },
+                _ => Error::Internal {
+                    operation: format!("create file: {}", e),
+                },
+            }
+        })?;
+
+        resolve_upload_stream_result(created_file_result, &error_slot)?
+    };
 
     tracing::debug!("File {} uploaded successfully", created_file_id);
 

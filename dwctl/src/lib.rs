@@ -146,6 +146,7 @@ pub mod config;
 mod config_watcher;
 mod crypto;
 pub mod db;
+mod blob_storage;
 mod email;
 mod error_enrichment;
 pub mod errors;
@@ -2174,6 +2175,8 @@ async fn setup_background_services(
     // Build the underway task runner for background jobs (batch population, etc.)
     let task_state = tasks::TaskState {
         request_manager: request_manager.clone(),
+        db_pool: pool.clone(),
+        config: SharedConfig::new(config.clone()),
     };
     let task_runner = Arc::new(tasks::TaskRunner::new(underway_pool, task_state).await?);
     for handle in task_runner.start(shutdown_token.clone()) {

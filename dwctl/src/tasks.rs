@@ -14,6 +14,8 @@ use tokio_util::sync::CancellationToken;
 use underway::Job;
 
 use crate::api::handlers::batches::{CreateBatchInput, build_create_batch_job};
+use crate::api::handlers::files::{IngestFileInput, build_ingest_file_job};
+use crate::SharedConfig;
 
 /// Shared state available to all task step closures.
 ///
@@ -22,6 +24,8 @@ use crate::api::handlers::batches::{CreateBatchInput, build_create_batch_job};
 #[derive(Clone)]
 pub struct TaskState<P: PoolProvider + Clone = sqlx_pool_router::DbPools> {
     pub request_manager: Arc<PostgresRequestManager<P, fusillade::ReqwestHttpClient>>,
+    pub db_pool: PgPool,
+    pub config: SharedConfig,
 }
 
 /// Manages underway jobs and worker lifecycle.
@@ -30,6 +34,7 @@ pub struct TaskState<P: PoolProvider + Clone = sqlx_pool_router::DbPools> {
 /// work; the worker processes jobs in the background.
 pub struct TaskRunner<P: PoolProvider + Clone + 'static = sqlx_pool_router::DbPools> {
     pub create_batch_job: Job<CreateBatchInput, TaskState<P>>,
+    pub ingest_file_job: Job<IngestFileInput, TaskState<P>>,
 }
 
 impl<P: PoolProvider + Clone + Send + Sync + 'static> TaskRunner<P> {
@@ -37,8 +42,12 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> TaskRunner<P> {
     ///
     /// Call [`start`] to begin processing.
     pub async fn new(pool: PgPool, state: TaskState<P>) -> Result<Self> {
-        let create_batch_job = build_create_batch_job(pool, state).await?;
-        Ok(Self { create_batch_job })
+        let create_batch_job = build_create_batch_job(pool.clone(), state.clone()).await?;
+        let ingest_file_job = build_ingest_file_job(pool, state).await?;
+        Ok(Self {
+            create_batch_job,
+            ingest_file_job,
+        })
     }
 
     /// Start the underway worker with the given shutdown token.
@@ -48,12 +57,22 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> TaskRunner<P> {
     /// Interrupted tasks are retried on next startup (state tracked in Postgres).
     pub fn start(&self, shutdown_token: CancellationToken) -> Vec<tokio::task::JoinHandle<()>> {
         let mut worker = self.create_batch_job.worker();
-        worker.set_shutdown_token(shutdown_token);
+        worker.set_shutdown_token(shutdown_token.clone());
 
-        vec![tokio::spawn(async move {
-            if let Err(e) = worker.run().await {
-                tracing::error!(error = %e, "Underway worker error");
-            }
-        })]
+        let mut ingest_worker = self.ingest_file_job.worker();
+        ingest_worker.set_shutdown_token(shutdown_token.clone());
+
+        vec![
+            tokio::spawn(async move {
+                if let Err(e) = worker.run().await {
+                    tracing::error!(error = %e, "Underway worker error");
+                }
+            }),
+            tokio::spawn(async move {
+                if let Err(e) = ingest_worker.run().await {
+                    tracing::error!(error = %e, "Underway ingest worker error");
+                }
+            }),
+        ]
     }
 }

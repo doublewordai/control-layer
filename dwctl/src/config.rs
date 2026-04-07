@@ -798,6 +798,13 @@ pub struct FilesConfig {
     pub download_buffer_size: usize,
     /// Number of templates to insert in each batch during file upload (default: 5000)
     pub batch_insert_size: usize,
+    /// Storage backend for batch input file uploads.
+    ///
+    /// - "postgres": legacy mode, parse/upload directly into fusillade request_templates.
+    /// - "object_store": write raw JSONL to object storage first, then ingest asynchronously.
+    pub storage_backend: FileStorageBackend,
+    /// Optional object storage configuration (required when storage_backend=object_store).
+    pub object_store: Option<ObjectStoreConfig>,
 }
 
 impl Default for FilesConfig {
@@ -809,8 +816,58 @@ impl Default for FilesConfig {
             upload_buffer_size: 100,
             download_buffer_size: 100,
             batch_insert_size: 5000,
+            storage_backend: FileStorageBackend::Postgres,
+            object_store: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FileStorageBackend {
+    Postgres,
+    ObjectStore,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ObjectStoreConfig {
+    pub provider: ObjectStoreProvider,
+    pub endpoint: String,
+    pub bucket: String,
+    pub region: String,
+    pub access_key_id: String,
+    pub secret_access_key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_token: Option<String>,
+    pub path_style: bool,
+    pub prefix: String,
+    pub connect_timeout_ms: u64,
+    pub request_timeout_ms: u64,
+}
+
+impl Default for ObjectStoreConfig {
+    fn default() -> Self {
+        Self {
+            provider: ObjectStoreProvider::S3Compatible,
+            endpoint: String::new(),
+            bucket: String::new(),
+            region: "us-east-1".to_string(),
+            access_key_id: String::new(),
+            secret_access_key: String::new(),
+            session_token: None,
+            path_style: true,
+            prefix: "uploads/".to_string(),
+            connect_timeout_ms: 5000,
+            request_timeout_ms: 120000,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ObjectStoreProvider {
+    S3Compatible,
 }
 
 /// Resource limits for protecting system capacity.
@@ -1951,6 +2008,39 @@ impl Config {
                 });
             }
 
+            if self.batches.files.storage_backend == FileStorageBackend::ObjectStore {
+                let store = self.batches.files.object_store.as_ref().ok_or_else(|| Error::Internal {
+                    operation: "Config validation: batches.files.object_store must be set when storage_backend=object_store."
+                        .to_string(),
+                })?;
+
+                if store.endpoint.trim().is_empty() {
+                    return Err(Error::Internal {
+                        operation: "Config validation: batches.files.object_store.endpoint cannot be empty.".to_string(),
+                    });
+                }
+                if store.bucket.trim().is_empty() {
+                    return Err(Error::Internal {
+                        operation: "Config validation: batches.files.object_store.bucket cannot be empty.".to_string(),
+                    });
+                }
+                if store.region.trim().is_empty() {
+                    return Err(Error::Internal {
+                        operation: "Config validation: batches.files.object_store.region cannot be empty.".to_string(),
+                    });
+                }
+                if store.access_key_id.trim().is_empty() {
+                    return Err(Error::Internal {
+                        operation: "Config validation: batches.files.object_store.access_key_id cannot be empty.".to_string(),
+                    });
+                }
+                if store.secret_access_key.trim().is_empty() {
+                    return Err(Error::Internal {
+                        operation: "Config validation: batches.files.object_store.secret_access_key cannot be empty.".to_string(),
+                    });
+                }
+            }
+
             // Validate file size limits are sensible (0 = unlimited is allowed but not recommended)
             // Note: max_file_size is now in limits.files, not batches.files
 
@@ -2274,6 +2364,46 @@ secret_key: "test-secret-key"
         let result = config.validate();
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("upload_buffer_size cannot be 0"));
+    }
+
+    #[test]
+    fn test_object_store_requires_config_when_enabled() {
+        let mut config = Config::default();
+        config.auth.native.enabled = true;
+        config.secret_key = Some("test-secret-key".to_string());
+        config.batches.enabled = true;
+        config.batches.files.storage_backend = FileStorageBackend::ObjectStore;
+        config.batches.files.object_store = None;
+
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("object_store must be set when storage_backend=object_store")
+        );
+    }
+
+    #[test]
+    fn test_object_store_empty_endpoint_rejected() {
+        let mut config = Config::default();
+        config.auth.native.enabled = true;
+        config.secret_key = Some("test-secret-key".to_string());
+        config.batches.enabled = true;
+        config.batches.files.storage_backend = FileStorageBackend::ObjectStore;
+        config.batches.files.object_store = Some(ObjectStoreConfig {
+            endpoint: "".to_string(),
+            bucket: "bucket".to_string(),
+            region: "us-east-1".to_string(),
+            access_key_id: "key".to_string(),
+            secret_access_key: "secret".to_string(),
+            ..Default::default()
+        });
+
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("object_store.endpoint cannot be empty"));
     }
 
     #[test]
