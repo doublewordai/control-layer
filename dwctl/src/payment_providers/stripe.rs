@@ -67,6 +67,8 @@ impl StripeProvider {
         // get the same tax calculation ID back, preventing PaymentIntent conflicts)
         let mut line_item = CreateTaxCalculationLineItems::new(amount_cents);
         line_item.reference = Some("auto_topup".to_string());
+        // When None, Stripe falls back to the account-level default tax code.
+        line_item.tax_code = self.config.tax_code.clone();
 
         let tax_idem_key = IdempotencyKey::new(format!("{}_tax", idempotency_key))
             .map_err(|e| PaymentError::InvalidData(format!("Invalid tax idempotency key: {e}")))?;
@@ -672,6 +674,7 @@ mod tests {
             webhook_secret: "whsec_fake".to_string(),
             enable_invoice_creation: false,
             auto_topup_terms_of_service_text: None,
+            tax_code: None,
         };
         let provider = StripeProvider::from(config);
 
@@ -689,6 +692,7 @@ mod tests {
             webhook_secret: "whsec_fake".to_string(),
             enable_invoice_creation: true,
             auto_topup_terms_of_service_text: None,
+            tax_code: None,
         };
         let provider = StripeProvider::from(config);
 
@@ -723,6 +727,7 @@ mod tests {
             webhook_secret: "whsec_fake".to_string(),
             enable_invoice_creation: false,
             auto_topup_terms_of_service_text: None,
+            tax_code: None,
         };
         let provider = StripeProvider::from(config);
 
