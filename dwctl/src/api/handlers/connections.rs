@@ -478,6 +478,14 @@ pub async fn get_sync<P: PoolProvider>(
             id: sync_id.to_string(),
         })?;
 
+    // Verify the sync belongs to this connection
+    if sync_op.connection_id != connection_id {
+        return Err(Error::NotFound {
+            resource: "SyncOperation".to_string(),
+            id: sync_id.to_string(),
+        });
+    }
+
     Ok(Json(SyncOperationResponse::from(sync_op)))
 }
 
@@ -512,6 +520,22 @@ pub async fn list_sync_entries<P: PoolProvider>(
         return Err(Error::NotFound {
             resource: "Connection".to_string(),
             id: connection_id.to_string(),
+        });
+    }
+
+    // Verify the sync belongs to this connection
+    let sync_op = SyncOperations::new(&mut conn)
+        .get_by_id(sync_id)
+        .await
+        .map_err(Error::Database)?
+        .ok_or_else(|| Error::NotFound {
+            resource: "SyncOperation".to_string(),
+            id: sync_id.to_string(),
+        })?;
+    if sync_op.connection_id != connection_id {
+        return Err(Error::NotFound {
+            resource: "SyncOperation".to_string(),
+            id: sync_id.to_string(),
         });
     }
 
@@ -639,4 +663,404 @@ pub async fn list_connection_files<P: PoolProvider>(
         has_more: page.has_more,
         next_cursor: page.next_cursor,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::http::StatusCode;
+    use sqlx::PgPool;
+
+    use crate::api::models::users::Role;
+    use crate::test::utils::{add_auth_headers, create_test_app, create_test_user_with_roles};
+
+    fn create_connection_body(name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "provider": "s3",
+            "name": name,
+            "config": {
+                "bucket": "test-bucket",
+                "region": "us-east-1",
+                "access_key_id": "AKIAIOSFODNN7EXAMPLE",
+                "secret_access_key": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+                "endpoint_url": "http://localhost:9000"
+            }
+        })
+    }
+
+    // -- CRUD --
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_create_connection(pool: PgPool) {
+        let (app, _bg) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::PlatformManager]).await;
+        let auth = add_auth_headers(&user);
+
+        let resp = app
+            .post("/admin/api/v1/connections")
+            .json(&create_connection_body("test-conn"))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+
+        resp.assert_status(StatusCode::CREATED);
+        let body: serde_json::Value = resp.json();
+        assert_eq!(body["name"], "test-conn");
+        assert_eq!(body["provider"], "s3");
+        assert_eq!(body["kind"], "source");
+        assert!(body["id"].as_str().is_some());
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_create_connection_requires_platform_manager(pool: PgPool) {
+        let (app, _bg) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser]).await;
+        let auth = add_auth_headers(&user);
+
+        let resp = app
+            .post("/admin/api/v1/connections")
+            .json(&create_connection_body("test-conn"))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+
+        resp.assert_status(StatusCode::FORBIDDEN);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_list_connections(pool: PgPool) {
+        let (app, _bg) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::PlatformManager]).await;
+        let auth = add_auth_headers(&user);
+
+        app.post("/admin/api/v1/connections")
+            .json(&create_connection_body("conn-1"))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await
+            .assert_status(StatusCode::CREATED);
+
+        app.post("/admin/api/v1/connections")
+            .json(&create_connection_body("conn-2"))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await
+            .assert_status(StatusCode::CREATED);
+
+        let resp = app
+            .get("/admin/api/v1/connections")
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+
+        resp.assert_status_ok();
+        let body: serde_json::Value = resp.json();
+        assert_eq!(body["data"].as_array().unwrap().len(), 2);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_get_connection(pool: PgPool) {
+        let (app, _bg) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::PlatformManager]).await;
+        let auth = add_auth_headers(&user);
+
+        let created: serde_json::Value = app
+            .post("/admin/api/v1/connections")
+            .json(&create_connection_body("my-conn"))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await
+            .json();
+        let id = created["id"].as_str().unwrap();
+
+        let resp = app
+            .get(&format!("/admin/api/v1/connections/{id}"))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+
+        resp.assert_status_ok();
+        let body: serde_json::Value = resp.json();
+        assert_eq!(body["name"], "my-conn");
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_delete_connection(pool: PgPool) {
+        let (app, _bg) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::PlatformManager]).await;
+        let auth = add_auth_headers(&user);
+
+        let created: serde_json::Value = app
+            .post("/admin/api/v1/connections")
+            .json(&create_connection_body("to-delete"))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await
+            .json();
+        let id = created["id"].as_str().unwrap();
+
+        app.delete(&format!("/admin/api/v1/connections/{id}"))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+
+        // Verify gone
+        app.get(&format!("/admin/api/v1/connections/{id}"))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await
+            .assert_status(StatusCode::NOT_FOUND);
+    }
+
+    // -- Ownership isolation --
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_connection_not_visible_to_other_user(pool: PgPool) {
+        let (app, _bg) = create_test_app(pool.clone(), false).await;
+        let user_a = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::PlatformManager]).await;
+        let user_b = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::PlatformManager]).await;
+        let auth_a = add_auth_headers(&user_a);
+        let auth_b = add_auth_headers(&user_b);
+
+        let created: serde_json::Value = app
+            .post("/admin/api/v1/connections")
+            .json(&create_connection_body("user-a-conn"))
+            .add_header(&auth_a[0].0, &auth_a[0].1)
+            .add_header(&auth_a[1].0, &auth_a[1].1)
+            .await
+            .json();
+        let id = created["id"].as_str().unwrap();
+
+        // User B cannot see it
+        app.get(&format!("/admin/api/v1/connections/{id}"))
+            .add_header(&auth_b[0].0, &auth_b[0].1)
+            .add_header(&auth_b[1].0, &auth_b[1].1)
+            .await
+            .assert_status(StatusCode::NOT_FOUND);
+
+        // User B list is empty
+        let list: serde_json::Value = app
+            .get("/admin/api/v1/connections")
+            .add_header(&auth_b[0].0, &auth_b[0].1)
+            .add_header(&auth_b[1].0, &auth_b[1].1)
+            .await
+            .json();
+        assert_eq!(list["data"].as_array().unwrap().len(), 0);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_cannot_delete_other_users_connection(pool: PgPool) {
+        let (app, _bg) = create_test_app(pool.clone(), false).await;
+        let user_a = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::PlatformManager]).await;
+        let user_b = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::PlatformManager]).await;
+        let auth_a = add_auth_headers(&user_a);
+        let auth_b = add_auth_headers(&user_b);
+
+        let created: serde_json::Value = app
+            .post("/admin/api/v1/connections")
+            .json(&create_connection_body("private"))
+            .add_header(&auth_a[0].0, &auth_a[0].1)
+            .add_header(&auth_a[1].0, &auth_a[1].1)
+            .await
+            .json();
+        let id = created["id"].as_str().unwrap();
+
+        app.delete(&format!("/admin/api/v1/connections/{id}"))
+            .add_header(&auth_b[0].0, &auth_b[0].1)
+            .add_header(&auth_b[1].0, &auth_b[1].1)
+            .await
+            .assert_status(StatusCode::NOT_FOUND);
+    }
+
+    // -- Sync scoping --
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_trigger_sync(pool: PgPool) {
+        let (app, _bg) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::PlatformManager]).await;
+        let auth = add_auth_headers(&user);
+
+        let conn: serde_json::Value = app
+            .post("/admin/api/v1/connections")
+            .json(&create_connection_body("sync-test"))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await
+            .json();
+        let conn_id = conn["id"].as_str().unwrap();
+
+        let resp = app
+            .post(&format!("/admin/api/v1/connections/{conn_id}/sync"))
+            .json(&serde_json::json!({"strategy": "snapshot"}))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+
+        resp.assert_status(StatusCode::ACCEPTED);
+        let body: serde_json::Value = resp.json();
+        assert_eq!(body["status"], "pending");
+        assert_eq!(body["strategy"], "snapshot");
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_get_sync_cross_connection_rejected(pool: PgPool) {
+        let (app, _bg) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::PlatformManager]).await;
+        let auth = add_auth_headers(&user);
+
+        let conn_a: serde_json::Value = app
+            .post("/admin/api/v1/connections")
+            .json(&create_connection_body("conn-a"))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await
+            .json();
+        let conn_b: serde_json::Value = app
+            .post("/admin/api/v1/connections")
+            .json(&create_connection_body("conn-b"))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await
+            .json();
+
+        let conn_a_id = conn_a["id"].as_str().unwrap();
+        let conn_b_id = conn_b["id"].as_str().unwrap();
+
+        // Sync on conn_a
+        let sync: serde_json::Value = app
+            .post(&format!("/admin/api/v1/connections/{conn_a_id}/sync"))
+            .json(&serde_json::json!({"strategy": "snapshot"}))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await
+            .json();
+        let sync_id = sync["id"].as_str().unwrap();
+
+        // Access via conn_b URL — rejected
+        app.get(&format!("/admin/api/v1/connections/{conn_b_id}/syncs/{sync_id}"))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await
+            .assert_status(StatusCode::NOT_FOUND);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_list_sync_entries_cross_connection_rejected(pool: PgPool) {
+        let (app, _bg) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::PlatformManager]).await;
+        let auth = add_auth_headers(&user);
+
+        let conn_a: serde_json::Value = app
+            .post("/admin/api/v1/connections")
+            .json(&create_connection_body("conn-a"))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await
+            .json();
+        let conn_b: serde_json::Value = app
+            .post("/admin/api/v1/connections")
+            .json(&create_connection_body("conn-b"))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await
+            .json();
+
+        let conn_a_id = conn_a["id"].as_str().unwrap();
+        let conn_b_id = conn_b["id"].as_str().unwrap();
+
+        let sync: serde_json::Value = app
+            .post(&format!("/admin/api/v1/connections/{conn_a_id}/sync"))
+            .json(&serde_json::json!({"strategy": "snapshot"}))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await
+            .json();
+        let sync_id = sync["id"].as_str().unwrap();
+
+        // Entries via conn_b — rejected
+        app.get(&format!("/admin/api/v1/connections/{conn_b_id}/syncs/{sync_id}/entries"))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await
+            .assert_status(StatusCode::NOT_FOUND);
+    }
+
+    // -- Validation --
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_create_connection_invalid_provider(pool: PgPool) {
+        let (app, _bg) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::PlatformManager]).await;
+        let auth = add_auth_headers(&user);
+
+        app.post("/admin/api/v1/connections")
+            .json(&serde_json::json!({
+                "provider": "bigquery",
+                "name": "bad",
+                "config": {}
+            }))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await
+            .assert_status(StatusCode::BAD_REQUEST);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_trigger_sync_invalid_strategy(pool: PgPool) {
+        let (app, _bg) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::PlatformManager]).await;
+        let auth = add_auth_headers(&user);
+
+        let conn: serde_json::Value = app
+            .post("/admin/api/v1/connections")
+            .json(&create_connection_body("strat-test"))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await
+            .json();
+        let conn_id = conn["id"].as_str().unwrap();
+
+        app.post(&format!("/admin/api/v1/connections/{conn_id}/sync"))
+            .json(&serde_json::json!({"strategy": "invalid"}))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await
+            .assert_status(StatusCode::BAD_REQUEST);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_select_strategy_requires_file_keys(pool: PgPool) {
+        let (app, _bg) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::PlatformManager]).await;
+        let auth = add_auth_headers(&user);
+
+        let conn: serde_json::Value = app
+            .post("/admin/api/v1/connections")
+            .json(&create_connection_body("select-test"))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await
+            .json();
+        let conn_id = conn["id"].as_str().unwrap();
+
+        app.post(&format!("/admin/api/v1/connections/{conn_id}/sync"))
+            .json(&serde_json::json!({"strategy": "select"}))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await
+            .assert_status(StatusCode::BAD_REQUEST);
+    }
 }

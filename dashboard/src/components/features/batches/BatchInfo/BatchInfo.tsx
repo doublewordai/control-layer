@@ -57,8 +57,7 @@ const BatchInfo: React.FC = () => {
 
   // TODO: this role check is inconsistent with other components
   // that use useAuthorization => hasPermission. We should standardise.
-  const { userRoles } = useAuthorization();
-  const { hasPermission } = useAuthorization();
+  const { userRoles, hasPermission } = useAuthorization();
   const hasRequestsPermission = userRoles.some(
     (role) => role === "RequestViewer",
   );

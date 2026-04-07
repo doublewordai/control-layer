@@ -1159,13 +1159,10 @@ pub async fn list_files<P: PoolProvider>(
         .into_iter()
         .collect();
     let connection_names: std::collections::HashMap<uuid::Uuid, String> = if !source_conn_ids.is_empty() {
-        let mut conn_name_map = std::collections::HashMap::new();
-        for conn_id in &source_conn_ids {
-            if let Ok(Some(conn)) = Connections::new(&mut read_conn).get_by_id(*conn_id).await {
-                conn_name_map.insert(*conn_id, conn.name);
-            }
-        }
-        conn_name_map
+        Connections::new(&mut read_conn)
+            .get_names_by_ids(&source_conn_ids)
+            .await
+            .map_err(Error::Database)?
     } else {
         std::collections::HashMap::new()
     };

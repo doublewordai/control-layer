@@ -174,6 +174,19 @@ impl<'c> Connections<'c> {
         Ok(row.map(Connection::from))
     }
 
+    /// Bulk fetch connection names by IDs. Returns a map of id → name.
+    #[instrument(skip(self, ids), fields(count = ids.len()), err)]
+    pub async fn get_names_by_ids(&mut self, ids: &[Uuid]) -> Result<std::collections::HashMap<Uuid, String>> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let rows = sqlx::query!("SELECT id, name FROM connections WHERE id = ANY($1) AND deleted_at IS NULL", ids,)
+            .fetch_all(&mut *self.db)
+            .await?;
+
+        Ok(rows.into_iter().map(|r| (r.id, r.name)).collect())
+    }
+
     #[instrument(skip(self), fields(user_id = %user_id), err)]
     pub async fn list_by_user(&mut self, user_id: Uuid, kind: Option<&str>) -> Result<Vec<Connection>> {
         let rows = sqlx::query_as!(
@@ -459,7 +472,8 @@ impl<'c> SyncEntries<'c> {
             SyncEntryRow,
             r#"
             INSERT INTO sync_entries (sync_id, connection_id, external_key, external_last_modified, external_size_bytes)
-            SELECT $1, $2, unnest($3::text[]), unnest($4::timestamptz[]), unnest($5::bigint[])
+            SELECT $1, $2, t.key, t.last_modified, t.size_bytes
+            FROM unnest($3::text[], $4::timestamptz[], $5::bigint[]) AS t(key, last_modified, size_bytes)
             RETURNING *
             "#,
             sync_id,
@@ -490,13 +504,13 @@ impl<'c> SyncEntries<'c> {
 
         let rows = sqlx::query!(
             r#"
-            SELECT external_key, external_last_modified
-            FROM sync_entries
-            WHERE connection_id = $1
-              AND status NOT IN ('failed', 'skipped', 'pending', 'deleted')
-              AND (external_key, external_last_modified) IN (
-                  SELECT unnest($2::text[]), unnest($3::timestamptz[])
-              )
+            SELECT se.external_key, se.external_last_modified
+            FROM sync_entries se
+            INNER JOIN unnest($2::text[], $3::timestamptz[]) AS input(key, last_modified)
+              ON se.external_key = input.key
+              AND se.external_last_modified IS NOT DISTINCT FROM input.last_modified
+            WHERE se.connection_id = $1
+              AND se.status NOT IN ('failed', 'skipped', 'pending', 'deleted')
             "#,
             connection_id,
             &keys as &[&str],

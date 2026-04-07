@@ -1671,13 +1671,10 @@ pub async fn list_batches<P: PoolProvider>(
         .into_iter()
         .collect();
     let connection_names: HashMap<Uuid, String> = if !source_conn_ids.is_empty() {
-        let mut map = HashMap::new();
-        for conn_id in &source_conn_ids {
-            if let Ok(Some(conn)) = Connections::new(&mut read_conn).get_by_id(*conn_id).await {
-                map.insert(*conn_id, conn.name);
-            }
-        }
-        map
+        Connections::new(&mut read_conn)
+            .get_names_by_ids(&source_conn_ids)
+            .await
+            .map_err(Error::Database)?
     } else {
         HashMap::new()
     };

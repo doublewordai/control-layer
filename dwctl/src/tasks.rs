@@ -42,11 +42,14 @@ pub struct TaskState<P: PoolProvider + Clone = sqlx_pool_router::DbPools> {
 ///
 /// Built once at startup, stored in `AppState`. Handlers use it to enqueue
 /// work; the worker processes jobs in the background.
+///
+/// Each job is stored as `Arc<Job<...>>` so the same instance is used for
+/// both enqueueing (via cross-job references in TaskState) and running workers.
 pub struct TaskRunner<P: PoolProvider + Clone + 'static = sqlx_pool_router::DbPools> {
-    pub create_batch_job: Job<CreateBatchInput, TaskState<P>>,
-    pub sync_connection_job: Job<SyncConnectionInput, TaskState<P>>,
-    pub ingest_file_job: Job<IngestFileInput, TaskState<P>>,
-    pub activate_batch_job: Job<ActivateBatchInput, TaskState<P>>,
+    pub create_batch_job: Arc<Job<CreateBatchInput, TaskState<P>>>,
+    pub sync_connection_job: Arc<Job<SyncConnectionInput, TaskState<P>>>,
+    pub ingest_file_job: Arc<Job<IngestFileInput, TaskState<P>>>,
+    pub activate_batch_job: Arc<Job<ActivateBatchInput, TaskState<P>>>,
 }
 
 impl<P: PoolProvider + Clone + Send + Sync + 'static> TaskRunner<P> {
@@ -54,21 +57,19 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> TaskRunner<P> {
     ///
     /// Call [`start`] to begin processing.
     pub async fn new(pool: PgPool, mut state: TaskState<P>) -> Result<Self> {
-        // First pass: build jobs so we can get Arc references for cross-job enqueueing.
-        let ingest_arc = Arc::new(build_ingest_file_job(pool.clone(), state.clone()).await?);
-        let activate_arc = Arc::new(build_activate_batch_job(pool.clone(), state.clone()).await?);
-        let create_batch_arc = Arc::new(build_create_batch_job(pool.clone(), state.clone()).await?);
+        // Build each job once, wrap in Arc for shared ownership between
+        // TaskState (for cross-job enqueueing) and TaskRunner (for workers).
+        let create_batch_job = Arc::new(build_create_batch_job(pool.clone(), state.clone()).await?);
+        let ingest_file_job = Arc::new(build_ingest_file_job(pool.clone(), state.clone()).await?);
+        let activate_batch_job = Arc::new(build_activate_batch_job(pool.clone(), state.clone()).await?);
 
-        // Wire up cross-references so jobs can enqueue each other.
-        state.ingest_file_job = Some(ingest_arc.clone());
-        state.activate_batch_job = Some(activate_arc.clone());
-        state.create_batch_job = Some(create_batch_arc.clone());
+        // Wire cross-references so jobs can enqueue each other.
+        state.ingest_file_job = Some(ingest_file_job.clone());
+        state.activate_batch_job = Some(activate_batch_job.clone());
+        state.create_batch_job = Some(create_batch_job.clone());
 
-        // Second pass: rebuild with cross-references wired up.
-        let create_batch_job = build_create_batch_job(pool.clone(), state.clone()).await?;
-        let sync_connection_job = build_sync_connection_job(pool.clone(), state.clone()).await?;
-        let ingest_file_job = build_ingest_file_job(pool.clone(), state.clone()).await?;
-        let activate_batch_job = build_activate_batch_job(pool.clone(), state).await?;
+        // SyncConnectionJob needs the wired state, so build it last.
+        let sync_connection_job = Arc::new(build_sync_connection_job(pool, state).await?);
 
         Ok(Self {
             create_batch_job,
@@ -86,7 +87,6 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> TaskRunner<P> {
     pub fn start(&self, shutdown_token: CancellationToken) -> Vec<tokio::task::JoinHandle<()>> {
         let mut handles = Vec::new();
 
-        // Create batch worker
         let mut create_batch_worker = self.create_batch_job.worker();
         create_batch_worker.set_shutdown_token(shutdown_token.clone());
         handles.push(tokio::spawn(async move {
@@ -95,7 +95,6 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> TaskRunner<P> {
             }
         }));
 
-        // Sync connection worker
         let mut sync_worker = self.sync_connection_job.worker();
         sync_worker.set_shutdown_token(shutdown_token.clone());
         handles.push(tokio::spawn(async move {
@@ -104,7 +103,6 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> TaskRunner<P> {
             }
         }));
 
-        // Ingest file worker
         let mut ingest_worker = self.ingest_file_job.worker();
         ingest_worker.set_shutdown_token(shutdown_token.clone());
         handles.push(tokio::spawn(async move {
@@ -113,7 +111,6 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> TaskRunner<P> {
             }
         }));
 
-        // Activate batch worker
         let mut activate_worker = self.activate_batch_job.worker();
         activate_worker.set_shutdown_token(shutdown_token);
         handles.push(tokio::spawn(async move {

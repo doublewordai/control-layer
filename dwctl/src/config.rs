@@ -1596,30 +1596,17 @@ pub struct ConnectionsConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SyncPipelineConfig {
-    /// Maximum number of concurrent file ingestion jobs (default: 4).
-    pub max_concurrent_ingestions: usize,
-    /// Whether batch activation should respect SLA capacity reservations (default: true).
-    /// Set to false to activate batches immediately without capacity checks.
-    pub respect_capacity_reservations: bool,
     /// Default completion window for sync-created batches (default: "24h").
     pub default_completion_window: String,
     /// Default endpoint for sync-created batches (default: "/v1/chat/completions").
     pub default_endpoint: String,
-    /// Backoff in milliseconds when no capacity is available (default: 5000).
-    pub activation_retry_backoff_ms: u64,
-    /// Maximum activation retry attempts before failing (default: 720 = ~1hr at 5s).
-    pub activation_max_retries: u32,
 }
 
 impl Default for SyncPipelineConfig {
     fn default() -> Self {
         Self {
-            max_concurrent_ingestions: 4,
-            respect_capacity_reservations: true,
             default_completion_window: "24h".to_string(),
             default_endpoint: "/v1/chat/completions".to_string(),
-            activation_retry_backoff_ms: 5000,
-            activation_max_retries: 720,
         }
     }
 }
