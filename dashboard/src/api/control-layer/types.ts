@@ -346,7 +346,7 @@ export interface ApiKey {
   id: string;
   name: string;
   description?: string;
-  purpose: ApiKeyPurpose; // Purpose of the key: platform (for /admin/api/*) or inference (for /ai/*)
+  purpose: ApiKeyPurpose; // Purpose of the key; see ApiKeyPurpose for allowed values
   created_at: string; // ISO 8601 timestamp
   last_used?: string; // ISO 8601 timestamp
   requests_per_second?: number | null; // Rate limiting: requests per second
