@@ -4,7 +4,7 @@
 //! work. Job definitions live alongside their handlers (e.g. batch population
 //! is defined in `api::handlers::batches`); this module wires them together.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::Result;
 use fusillade::PostgresRequestManager;
@@ -22,26 +22,46 @@ use crate::connections::sync::{
 ///
 /// Generic over pool provider so it works with both `DbPools` (production)
 /// and `TestDbPools` (tests).
+///
+/// A lazily-initialized, shared job reference. Set once after all jobs are
+/// built; visible to every cloned `TaskState` via the shared `Arc<OnceLock>`.
+type JobRef<I, P> = Arc<OnceLock<Arc<Job<I, TaskState<P>>>>>;
+
+/// Cross-job references use `Arc<OnceLock<...>>` so they can be set once after
+/// all jobs are built, and all cloned TaskState instances see the same value.
 #[derive(Clone)]
 pub struct TaskState<P: PoolProvider + Clone = sqlx_pool_router::DbPools> {
     pub request_manager: Arc<PostgresRequestManager<P, fusillade::ReqwestHttpClient>>,
     /// dwctl database pool — for querying connections, sync_operations, sync_entries.
-    /// Separate from request_manager which uses the fusillade database.
     pub dwctl_pool: PgPool,
     /// Encryption key for decrypting connection credentials inside jobs.
     pub encryption_key: Option<Vec<u8>>,
     /// Reference to the IngestFileJob so SyncConnectionJob can enqueue it.
-    pub ingest_file_job: Option<Arc<Job<IngestFileInput, TaskState<P>>>>,
+    pub ingest_file_job: JobRef<IngestFileInput, P>,
     /// Reference to the ActivateBatchJob so IngestFileJob can enqueue it.
-    pub activate_batch_job: Option<Arc<Job<ActivateBatchInput, TaskState<P>>>>,
+    pub activate_batch_job: JobRef<ActivateBatchInput, P>,
     /// Reference to the CreateBatchInput job so ActivateBatchJob can enqueue populate.
-    pub create_batch_job: Option<Arc<Job<CreateBatchInput, TaskState<P>>>>,
+    pub create_batch_job: JobRef<CreateBatchInput, P>,
+}
+
+impl<P: PoolProvider + Clone> TaskState<P> {
+    /// Get the ingest file job, panics if not initialized.
+    pub fn get_ingest_file_job(&self) -> &Arc<Job<IngestFileInput, TaskState<P>>> {
+        self.ingest_file_job.get().expect("ingest_file_job not initialized")
+    }
+
+    /// Get the activate batch job, panics if not initialized.
+    pub fn get_activate_batch_job(&self) -> &Arc<Job<ActivateBatchInput, TaskState<P>>> {
+        self.activate_batch_job.get().expect("activate_batch_job not initialized")
+    }
+
+    /// Get the create batch job, panics if not initialized.
+    pub fn get_create_batch_job(&self) -> &Arc<Job<CreateBatchInput, TaskState<P>>> {
+        self.create_batch_job.get().expect("create_batch_job not initialized")
+    }
 }
 
 /// Manages underway jobs and worker lifecycle.
-///
-/// Built once at startup, stored in `AppState`. Handlers use it to enqueue
-/// work; the worker processes jobs in the background.
 ///
 /// Each job is stored as `Arc<Job<...>>` so the same instance is used for
 /// both enqueueing (via cross-job references in TaskState) and running workers.
@@ -55,21 +75,21 @@ pub struct TaskRunner<P: PoolProvider + Clone + 'static = sqlx_pool_router::DbPo
 impl<P: PoolProvider + Clone + Send + Sync + 'static> TaskRunner<P> {
     /// Build the task runner, registering all job types.
     ///
-    /// Call [`start`] to begin processing.
-    pub async fn new(pool: PgPool, mut state: TaskState<P>) -> Result<Self> {
-        // Build each job once, wrap in Arc for shared ownership between
-        // TaskState (for cross-job enqueueing) and TaskRunner (for workers).
+    /// All jobs share a single TaskState with `Arc<OnceLock>` cross-references
+    /// that are set after construction, so every cloned copy sees the same jobs.
+    pub async fn new(pool: PgPool, state: TaskState<P>) -> Result<Self> {
+        // Build all jobs with the shared state. The OnceLock fields are empty
+        // at this point, but all jobs hold Arc clones of the same OnceLocks.
         let create_batch_job = Arc::new(build_create_batch_job(pool.clone(), state.clone()).await?);
         let ingest_file_job = Arc::new(build_ingest_file_job(pool.clone(), state.clone()).await?);
         let activate_batch_job = Arc::new(build_activate_batch_job(pool.clone(), state.clone()).await?);
+        let sync_connection_job = Arc::new(build_sync_connection_job(pool, state.clone()).await?);
 
-        // Wire cross-references so jobs can enqueue each other.
-        state.ingest_file_job = Some(ingest_file_job.clone());
-        state.activate_batch_job = Some(activate_batch_job.clone());
-        state.create_batch_job = Some(create_batch_job.clone());
-
-        // SyncConnectionJob needs the wired state, so build it last.
-        let sync_connection_job = Arc::new(build_sync_connection_job(pool, state).await?);
+        // Wire cross-references. Because all jobs share the same Arc<OnceLock>,
+        // setting them here makes them visible to every cloned TaskState.
+        state.ingest_file_job.set(ingest_file_job.clone()).ok();
+        state.activate_batch_job.set(activate_batch_job.clone()).ok();
+        state.create_batch_job.set(create_batch_job.clone()).ok();
 
         Ok(Self {
             create_batch_job,
@@ -80,10 +100,6 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> TaskRunner<P> {
     }
 
     /// Start the underway worker with the given shutdown token.
-    ///
-    /// The worker stops when the token is cancelled — either explicitly via
-    /// [`BackgroundServices::shutdown`] or automatically via its `DropGuard`.
-    /// Interrupted tasks are retried on next startup (state tracked in Postgres).
     pub fn start(&self, shutdown_token: CancellationToken) -> Vec<tokio::task::JoinHandle<()>> {
         let mut handles = Vec::new();
 

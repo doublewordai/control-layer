@@ -318,9 +318,7 @@ async fn run_sync_connection<P: PoolProvider + Clone + Send + Sync + 'static>(
     // 9. Enqueue IngestFileJob for each new entry
     for entry in &entries {
         state
-            .ingest_file_job
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("ingest_file_job not configured"))?
+            .get_ingest_file_job()
             .enqueue(&IngestFileInput {
                 sync_id: input.sync_id,
                 sync_entry_id: entry.id,
@@ -500,8 +498,10 @@ async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'static>(
                     valid
                 }
             };
-            // Keep only the incomplete trailing bytes
-            utf8_buf = utf8_buf[valid_up_to..].to_vec();
+            // Keep only the incomplete trailing bytes (reuse buffer)
+            if valid_up_to > 0 {
+                utf8_buf.drain(..valid_up_to);
+            }
 
             // Process complete lines
             while let Some(newline_pos) = line_buf.find('\n') {
@@ -611,9 +611,7 @@ async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'static>(
 
             // 8. Enqueue ActivateBatchJob
             state
-                .activate_batch_job
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("activate_batch_job not configured"))?
+                .get_activate_batch_job()
                 .enqueue(&ActivateBatchInput {
                     sync_id: input.sync_id,
                     sync_entry_id: input.sync_entry_id,
@@ -752,9 +750,7 @@ async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + 'static>(
 
     // 5. Enqueue the existing batch populate job
     state
-        .create_batch_job
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("create_batch_job not configured"))?
+        .get_create_batch_job()
         .enqueue(&crate::api::handlers::batches::CreateBatchInput {
             batch_id: *batch.id,
             file_id: input.file_id,

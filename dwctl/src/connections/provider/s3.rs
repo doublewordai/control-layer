@@ -193,16 +193,18 @@ impl SourceProvider for S3Provider {
                         .and_then(|dt| chrono::DateTime::from_timestamp(dt.secs(), dt.subsec_nanos())),
                     display_name: Some(display_name),
                 });
+            }
 
-                if files.len() >= limit {
-                    // We have enough — use the next continuation token as our cursor
-                    let next = resp.next_continuation_token().map(|s| s.to_string());
-                    return Ok(FileListPage {
-                        files,
-                        has_more: next.is_some() || resp.is_truncated() == Some(true),
-                        next_cursor: next,
-                    });
-                }
+            // Check if we have enough after processing the full S3 response
+            if files.len() >= limit {
+                let next = resp.next_continuation_token().map(|s| s.to_string());
+                // Truncate to exact limit — extra files from this page are dropped
+                files.truncate(limit);
+                return Ok(FileListPage {
+                    files,
+                    has_more: next.is_some() || resp.is_truncated() == Some(true),
+                    next_cursor: next,
+                });
             }
 
             if resp.is_truncated() == Some(true) {

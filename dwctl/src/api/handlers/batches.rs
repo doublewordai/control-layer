@@ -126,29 +126,60 @@ fn to_batch_response_with_email(batch: fusillade::Batch, creator_email: Option<&
 }
 
 fn to_batch_response_enriched(batch: fusillade::Batch, creator_email: Option<&str>, source_name: Option<&str>) -> BatchResponse {
-    // Convert metadata from serde_json::Value to HashMap<String, String>
-    let mut metadata: Option<HashMap<String, String>> = batch.metadata.and_then(|m| {
-        m.as_object().map(|obj| {
-            obj.iter()
-                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                .collect()
-        })
-    });
+    use crate::api::models::dwext::BatchDwExtResponse;
 
-    // Inject created_by_email into metadata if we have it
-    if let Some(email) = creator_email {
-        metadata
-            .get_or_insert_with(HashMap::new)
-            .insert("created_by_email".to_string(), email.to_string());
+    // Convert metadata from serde_json::Value to HashMap<String, String>
+    let raw_metadata: HashMap<String, String> = batch
+        .metadata
+        .and_then(|m| {
+            m.as_object().map(|obj| {
+                obj.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect()
+            })
+        })
+        .unwrap_or_default();
+
+    // Build dwext from dw_* metadata keys + optional source_name override
+    let request_source = raw_metadata.get("request_source").cloned();
+    let mut dwext = BatchDwExtResponse {
+        source: request_source.clone(),
+        source_id: raw_metadata.get("dw_source_id").cloned(),
+        source_name: raw_metadata
+            .get("dw_source_name")
+            .cloned()
+            .or_else(|| source_name.map(|s| s.to_string())),
+        source_file: raw_metadata.get("dw_external_key").cloned(),
+        sync_id: raw_metadata.get("dw_sync_id").cloned(),
+    };
+
+    // If source_name was provided and dwext didn't have it, inject it
+    if let Some(name) = source_name
+        && dwext.source_name.is_none()
+    {
+        dwext.source_name = Some(name.to_string());
     }
 
-    // Inject source connection name if this batch has dw_source_id but no dw_source_name
-    if let Some(name) = source_name
-        && let Some(ref mut m) = metadata
-        && m.contains_key("dw_source_id")
-        && !m.contains_key("dw_source_name")
-    {
-        m.insert("dw_source_name".to_string(), name.to_string());
+    // Build user-facing metadata: filter out internal keys (dw_*, request_source, created_by, etc.)
+    let internal_keys = [
+        "dw_source_id",
+        "dw_source_name",
+        "dw_sync_id",
+        "dw_external_key",
+        "request_source",
+        "created_by",
+        "created_by_email",
+        "context_name",
+        "context_type",
+    ];
+    let mut metadata: HashMap<String, String> = raw_metadata
+        .into_iter()
+        .filter(|(k, _)| !internal_keys.contains(&k.as_str()))
+        .collect();
+
+    // Inject created_by_email into metadata for backwards compatibility
+    if let Some(email) = creator_email {
+        metadata.insert("created_by_email".to_string(), email.to_string());
     }
 
     // Determine OpenAI status from request counts
@@ -249,8 +280,9 @@ fn to_batch_response_enriched(batch: fusillade::Batch, creator_email: Option<&st
             completed: batch.completed_requests,
             failed: batch.failed_requests,
         },
-        metadata,
+        metadata: if metadata.is_empty() { None } else { Some(metadata) },
         analytics: None,
+        dwext: if dwext.is_empty() { None } else { Some(dwext) },
     }
 }
 
@@ -905,7 +937,27 @@ pub async fn get_batch<P: PoolProvider>(
         (None, None)
     };
 
-    let mut response = to_batch_response_with_email(batch, None);
+    // Resolve source connection name if this batch is from a sync
+    let source_name = if let Some(conn_id) = batch
+        .metadata
+        .as_ref()
+        .and_then(|m| m.get("dw_source_id"))
+        .and_then(|v| v.as_str())
+        .and_then(|s| Uuid::parse_str(s).ok())
+    {
+        match Connections::new(&mut read_conn).get_by_id(conn_id).await {
+            Ok(Some(conn)) => Some(conn.name),
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!(error = %e, connection_id = %conn_id, "Failed to look up connection name");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let mut response = to_batch_response_enriched(batch, None, source_name.as_deref());
 
     if let Some(email) = created_by_email {
         response
@@ -924,16 +976,6 @@ pub async fn get_batch<P: PoolProvider>(
             .metadata
             .get_or_insert_with(HashMap::new)
             .insert("context_type".to_string(), ctype);
-    }
-
-    // Inject source connection name for synced batches
-    if let Some(ref mut m) = response.metadata
-        && let Some(source_id_str) = m.get("dw_source_id").cloned()
-        && !m.contains_key("dw_source_name")
-        && let Ok(conn_id) = Uuid::parse_str(&source_id_str)
-        && let Ok(Some(conn)) = Connections::new(&mut read_conn).get_by_id(conn_id).await
-    {
-        m.insert("dw_source_name".to_string(), conn.name);
     }
 
     Ok(Json(response))
@@ -1726,7 +1768,17 @@ pub async fn list_batches<P: PoolProvider>(
                 None => (None, None),
             };
 
-            let mut response = to_batch_response_with_email(batch, None);
+            // Resolve source connection name from the bulk-fetched map
+            let source_name: Option<&str> = batch
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("dw_source_id"))
+                .and_then(|v| v.as_str())
+                .and_then(|s| Uuid::parse_str(s).ok())
+                .and_then(|conn_id| connection_names.get(&conn_id))
+                .map(|s| s.as_str());
+
+            let mut response = to_batch_response_enriched(batch, None, source_name);
 
             // Inject enriched creator/context info into metadata
             if let Some(email) = created_by_email {
@@ -1746,16 +1798,6 @@ pub async fn list_batches<P: PoolProvider>(
                     .metadata
                     .get_or_insert_with(HashMap::new)
                     .insert("context_type".to_string(), ctype);
-            }
-
-            // Inject source connection name for synced batches
-            if let Some(ref mut m) = response.metadata
-                && let Some(source_id_str) = m.get("dw_source_id").cloned()
-                && !m.contains_key("dw_source_name")
-                && let Ok(conn_id) = Uuid::parse_str(&source_id_str)
-                && let Some(name) = connection_names.get(&conn_id)
-            {
-                m.insert("dw_source_name".to_string(), name.clone());
             }
 
             if include_analytics {

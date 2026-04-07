@@ -310,6 +310,18 @@ batches:
 #     # Default: 10MB (10485760)
 #     max_body_size: 10485760
 
+# External data source connections (S3, etc.)
+# Allows users to connect external storage and sync files for batch processing.
+connections:
+  # Encryption key for connection credentials. Any string works (hashed to 32 bytes).
+  # Falls back to secret_key if not set. Set independently for production use.
+  encryption_key: null
+  sync:
+    # Default completion window for sync-created batches.
+    default_completion_window: "24h"
+    # Default endpoint for sync-created batches.
+    default_endpoint: "/v1/chat/completions"
+
 # Onwards AI proxy configuration
 # Controls behavior of the onwards routing layer for AI proxy requests
 onwards:

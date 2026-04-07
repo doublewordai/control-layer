@@ -391,7 +391,7 @@ impl<'c> SyncOperations<'c> {
             "files_ingested" => "UPDATE sync_operations SET files_ingested = files_ingested + 1 WHERE id = $1",
             "files_failed" => "UPDATE sync_operations SET files_failed = files_failed + 1 WHERE id = $1",
             "batches_created" => "UPDATE sync_operations SET batches_created = batches_created + 1 WHERE id = $1",
-            _ => return Err(DbError::Other(anyhow::anyhow!("unknown counter field: {field}"))),
+            _ => return Err(DbError::Other(anyhow::anyhow!("unknown counter field: {}", field))),
         };
 
         sqlx::query(query).bind(id).execute(&mut *self.db).await?;
@@ -532,7 +532,7 @@ impl<'c> SyncEntries<'c> {
             SELECT external_key, MAX(external_last_modified) AS "last_modified"
             FROM sync_entries
             WHERE connection_id = $1
-              AND status NOT IN ('failed', 'skipped', 'pending', 'deleted')
+              AND status = 'activated'
             GROUP BY external_key
             "#,
             connection_id,

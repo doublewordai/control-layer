@@ -968,23 +968,23 @@ const BatchInfo: React.FC = () => {
               </Card>
 
               {/* Source Card — shown when batch was created from a sync */}
-              {hasConnectionsPermission && batch.metadata?.request_source === "sync" && (
+              {hasConnectionsPermission && batch.dwext?.source === "sync" && (
                 <Card className="p-0 gap-0 rounded-lg">
                   <CardHeader className="px-6 pt-5 pb-4">
                     <CardTitle>Source</CardTitle>
                   </CardHeader>
                   <CardContent className="px-6 pb-6 pt-0">
                     <div className="space-y-2">
-                      {batch.metadata?.dw_source_name && (
+                      {batch.dwext?.source_name && (
                         <div>
                           <p className="text-sm text-gray-600 mb-1">Connection</p>
-                          <p className="text-sm font-medium">{batch.metadata.dw_source_name}</p>
+                          <p className="text-sm font-medium">{batch.dwext.source_name}</p>
                         </div>
                       )}
-                      {batch.metadata?.dw_external_key && (
+                      {batch.dwext?.source_file && (
                         <div>
                           <p className="text-sm text-gray-600 mb-1">External File</p>
-                          <p className="text-sm font-medium font-mono">{batch.metadata.dw_external_key}</p>
+                          <p className="text-sm font-medium font-mono">{batch.dwext.source_file}</p>
                         </div>
                       )}
                     </div>
@@ -992,10 +992,10 @@ const BatchInfo: React.FC = () => {
                 </Card>
               )}
 
-              {/* Metadata Card — filter out internal dw_ keys */}
+              {/* Metadata Card — user metadata only (internal keys filtered server-side) */}
               {batch.metadata && (() => {
                 const userMetadata = Object.entries(batch.metadata).filter(
-                  ([key]) => !key.startsWith("dw_") && !["request_source", "created_by", "created_by_email", "context_name", "context_type"].includes(key),
+                  ([key]) => !["created_by_email", "context_name", "context_type"].includes(key),
                 );
                 return userMetadata.length > 0 ? (
                   <Card className="p-0 gap-0 rounded-lg">

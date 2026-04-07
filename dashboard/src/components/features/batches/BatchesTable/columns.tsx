@@ -107,10 +107,9 @@ const sourceColumn: ColumnDef<Batch> = {
   header: "Source",
   cell: ({ row }) => {
     const batch = row.original as Batch;
-    const source = batch.metadata?.request_source;
+    const source = batch.dwext?.source;
 
     if (source === "sync") {
-      const sourceName = batch.metadata?.dw_source_name;
       return (
         <Tooltip delayDuration={300}>
           <TooltipTrigger asChild>
@@ -119,7 +118,7 @@ const sourceColumn: ColumnDef<Batch> = {
               S3
             </span>
           </TooltipTrigger>
-          <TooltipContent>{sourceName || "External sync"}</TooltipContent>
+          <TooltipContent>{batch.dwext?.source_name || "External sync"}</TooltipContent>
         </Tooltip>
       );
     }

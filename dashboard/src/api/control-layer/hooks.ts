@@ -1824,6 +1824,7 @@ export function useConnectionFiles(
     queryKey: queryKeys.connections.files(connectionId, {
       search: options?.search,
       cursor: options?.cursor,
+      limit: options?.limit,
     }),
     queryFn: () => dwctlApi.connections.listFiles(connectionId, options),
     enabled: !!connectionId,

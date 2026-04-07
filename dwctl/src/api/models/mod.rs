@@ -8,6 +8,7 @@ pub mod batches;
 pub mod connections;
 pub mod daemons;
 pub mod deployments;
+pub mod dwext;
 pub mod files;
 pub mod groups;
 pub mod inference_endpoints;

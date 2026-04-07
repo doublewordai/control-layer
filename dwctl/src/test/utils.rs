@@ -44,9 +44,9 @@ pub async fn create_test_app_state_with_config(pool: PgPool, config: crate::conf
         request_manager: request_manager.clone(),
         dwctl_pool: pool.clone(),
         encryption_key: None,
-        ingest_file_job: None,
-        activate_batch_job: None,
-        create_batch_job: None,
+        ingest_file_job: Arc::new(std::sync::OnceLock::new()),
+        activate_batch_job: Arc::new(std::sync::OnceLock::new()),
+        create_batch_job: Arc::new(std::sync::OnceLock::new()),
     };
     let task_runner = std::sync::Arc::new(
         crate::tasks::TaskRunner::new(pool, task_state)
@@ -98,9 +98,9 @@ pub async fn create_test_app_state_with_fusillade(pool: PgPool, config: crate::c
         request_manager: request_manager.clone(),
         dwctl_pool: pool.clone(),
         encryption_key: None,
-        ingest_file_job: None,
-        activate_batch_job: None,
-        create_batch_job: None,
+        ingest_file_job: Arc::new(std::sync::OnceLock::new()),
+        activate_batch_job: Arc::new(std::sync::OnceLock::new()),
+        create_batch_job: Arc::new(std::sync::OnceLock::new()),
     };
     let task_runner = std::sync::Arc::new(
         crate::tasks::TaskRunner::new(pool, task_state)

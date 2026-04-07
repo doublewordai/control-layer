@@ -1170,11 +1170,25 @@ export interface Batch {
   cancelling_at?: number | null;
   cancelled_at?: number | null;
   request_counts: BatchRequestCounts;
-  /** Metadata includes: created_by, created_by_email, request_source, context_name, context_type */
   metadata?: Record<string, string>;
   usage?: BatchUsage;
   /** Included when requesting with include=analytics */
   analytics?: BatchAnalytics;
+  /** Doubleword-specific extensions (source provenance, etc.) */
+  dwext?: BatchDwExt;
+}
+
+export interface BatchDwExt {
+  /** How the batch was created: "api", "frontend", or "sync" */
+  source?: string;
+  /** Name of the source connection (when source = "sync") */
+  source_name?: string;
+  /** Source connection ID */
+  source_id?: string;
+  /** Original external file key */
+  source_file?: string;
+  /** Sync operation ID */
+  sync_id?: string;
 }
 
 export interface BatchListResponse {

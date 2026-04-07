@@ -169,7 +169,7 @@ export const queryKeys = {
     sync: (connectionId: string, syncId: string) => ["connections", connectionId, "syncs", syncId] as const,
     syncEntries: (connectionId: string, syncId: string) =>
       ["connections", connectionId, "syncs", syncId, "entries"] as const,
-    files: (connectionId: string, options?: { search?: string; cursor?: string }) =>
+    files: (connectionId: string, options?: { search?: string; cursor?: string; limit?: number }) =>
       ["connections", connectionId, "files", options] as const,
   },
 } as const;
