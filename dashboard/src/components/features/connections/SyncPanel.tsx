@@ -253,7 +253,7 @@ function SyncRow({
               {newFiles > 0 && (
                 <div className="space-y-2">
                   <ProgressBar
-                    label="Files Ingested"
+                    label="Files Processed"
                     value={s.files_ingested + s.files_failed}
                     max={newFiles}
                     colorClass={s.files_failed > 0 ? "bg-yellow-400/70" : "bg-blue-400/70"}

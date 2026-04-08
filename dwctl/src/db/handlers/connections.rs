@@ -374,6 +374,7 @@ impl<'c> SyncOperations<'c> {
                 files_failed = COALESCE($5, files_failed),
                 batches_created = COALESCE($6, batches_created)
             WHERE id = $1
+              AND status != 'deleted'
             "#,
             id,
             files_found,

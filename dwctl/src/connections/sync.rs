@@ -163,9 +163,9 @@ pub async fn build_activate_batch_job<P: PoolProvider + Clone + Send + Sync + 's
                         let _ = crate::db::handlers::connections::SyncEntries::new(&mut conn)
                             .update_status(input.sync_entry_id, "failed", Some(&e.to_string()))
                             .await;
-                        let _ = crate::db::handlers::connections::SyncOperations::new(&mut conn)
-                            .increment_counter(input.sync_id, "files_failed")
-                            .await;
+                        // Don't increment files_failed here — the file was already
+                        // counted as files_ingested. Entry status is set to 'failed'
+                        // which is sufficient for try_complete to determine final status.
                         let _ = crate::db::handlers::connections::SyncOperations::new(&mut conn)
                             .try_complete(input.sync_id)
                             .await;
@@ -545,6 +545,25 @@ async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'static>(
                             continue;
                         }
 
+                        // Validate custom_id doesn't contain control characters
+                        if let Some(ref cid) = custom_id
+                            && cid.chars().any(|c| c.is_control())
+                        {
+                            tracing::warn!(line_num = line_number, "Skipping line with control characters in custom_id");
+                            continue;
+                        }
+
+                        // Strip `priority` from body if present and re-serialize
+                        let body = if let Ok(mut body_val) = serde_json::from_str::<serde_json::Value>(&body) {
+                            if body_val.as_object_mut().is_some_and(|o| o.remove("priority").is_some()) {
+                                serde_json::to_string(&body_val).unwrap_or(body)
+                            } else {
+                                body
+                            }
+                        } else {
+                            body
+                        };
+
                         let template = fusillade::RequestTemplateInput {
                             custom_id,
                             endpoint: ai_base_url.clone(),
@@ -597,11 +616,26 @@ async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'static>(
                 .unwrap_or("")
                 .to_string();
 
+            // Validate custom_id doesn't contain control characters
+            let custom_id_valid = custom_id.as_ref().is_none_or(|cid| !cid.chars().any(|c| c.is_control()));
+
             let valid = matches!(method.as_str(), "POST" | "GET" | "PUT" | "PATCH" | "DELETE")
                 && !model.is_empty()
-                && body.len() <= 10 * 1024 * 1024;
+                && body.len() <= 10 * 1024 * 1024
+                && custom_id_valid;
 
             if valid {
+                // Strip `priority` from body if present and re-serialize
+                let body = if let Ok(mut body_val) = serde_json::from_str::<serde_json::Value>(&body) {
+                    if body_val.as_object_mut().is_some_and(|o| o.remove("priority").is_some()) {
+                        serde_json::to_string(&body_val).unwrap_or(body)
+                    } else {
+                        body
+                    }
+                } else {
+                    body
+                };
+
                 let template = fusillade::RequestTemplateInput {
                     custom_id,
                     endpoint: ai_base_url.clone(),
@@ -731,7 +765,6 @@ async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + 'static>(
         let conn_name = connection.name.clone();
         let triggered_by = sync_op.triggered_by;
 
-        let mut conn = dwctl.acquire().await?;
         let (secret, key_id) = ApiKeys::new(&mut conn)
             .get_or_create_hidden_key_with_id(owner_id, ApiKeyPurpose::Batch, triggered_by)
             .await
