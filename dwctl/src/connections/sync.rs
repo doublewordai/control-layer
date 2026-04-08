@@ -515,15 +515,12 @@ async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'static>(
                 let line = line_buf[cursor..newline_pos].trim();
                 cursor = newline_pos + 1;
 
-                // Borrow the trimmed line as &str for parsing; only allocate if needed
-                let line = line.to_owned();
-
                 if line.is_empty() {
                     continue;
                 }
 
                 // Parse as OpenAI batch request format
-                match serde_json::from_str::<serde_json::Value>(&line) {
+                match serde_json::from_str::<serde_json::Value>(line) {
                     Ok(parsed) => {
                         let custom_id = parsed.get("custom_id").and_then(|v| v.as_str()).map(|s| s.to_string());
                         let method = parsed.get("method").and_then(|v| v.as_str()).unwrap_or("POST").to_string();

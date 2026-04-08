@@ -268,13 +268,13 @@ impl SourceProvider for S3Provider {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, ProviderError>>(16);
         tokio::spawn(async move {
             let mut reader = tokio::io::BufReader::new(reader);
+            let mut buf = vec![0u8; 64 * 1024]; // Reused 64KB buffer
             loop {
-                let mut buf = vec![0u8; 64 * 1024]; // 64KB chunks
                 match reader.read(&mut buf).await {
                     Ok(0) => break, // EOF
                     Ok(n) => {
-                        buf.truncate(n);
-                        if tx.send(Ok(Bytes::from(buf))).await.is_err() {
+                        // Copy only the bytes read — avoids moving the reusable buffer
+                        if tx.send(Ok(Bytes::copy_from_slice(&buf[..n]))).await.is_err() {
                             break;
                         }
                     }
