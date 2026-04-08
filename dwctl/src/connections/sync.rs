@@ -512,7 +512,7 @@ async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'static>(
                 }
                 line_number += 1;
 
-                // Parse as OpenAI batch request format
+                // Parse as OpenAI batch request format with validation
                 match serde_json::from_str::<serde_json::Value>(line) {
                     Ok(parsed) => {
                         let custom_id = parsed.get("custom_id").and_then(|v| v.as_str()).map(|s| s.to_string());
@@ -525,6 +525,25 @@ async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'static>(
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
                             .to_string();
+
+                        // Validate method (same allowlist as file upload)
+                        if !matches!(method.as_str(), "POST" | "GET" | "PUT" | "PATCH" | "DELETE") {
+                            tracing::warn!(line_num = line_number, method = %method, "Skipping line with invalid HTTP method");
+                            continue;
+                        }
+
+                        // Validate model is present
+                        if model.is_empty() {
+                            tracing::warn!(line_num = line_number, "Skipping line with missing model field");
+                            continue;
+                        }
+
+                        // Validate body size (10MB default limit)
+                        const MAX_BODY_SIZE: usize = 10 * 1024 * 1024;
+                        if body.len() > MAX_BODY_SIZE {
+                            tracing::warn!(line_num = line_number, body_size = body.len(), "Skipping line with oversized body");
+                            continue;
+                        }
 
                         let template = fusillade::RequestTemplateInput {
                             custom_id,
