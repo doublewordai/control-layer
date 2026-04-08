@@ -434,6 +434,7 @@ mod tests {
             id: Uuid::new_v4(),
             model_name: "test-model".to_string(),
             alias: "test-alias".to_string(),
+            display_name: None,
             description: None,
             model_type: None,
             capabilities: None,

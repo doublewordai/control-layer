@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { setupServer } from "msw/node";
+import { http, HttpResponse } from "msw";
 import type { ReactNode } from "react";
 import {
   describe,
@@ -15,6 +16,39 @@ import {
   type Mock,
 } from "vitest";
 
+const mockOrgContext = vi.hoisted(() => ({
+  value: {
+    activeOrganizationId: null as string | null,
+    activeOrganization: null,
+    isOrgContext: false,
+    setActiveOrganization: async () => {},
+  },
+}));
+
+const mockStorage = vi.hoisted(() => {
+  const store = new Map<string, string>();
+  const storage = {
+    getItem: (key: string) => store.get(key) ?? null,
+    setItem: (key: string, value: string) => {
+      store.set(key, value);
+    },
+    removeItem: (key: string) => {
+      store.delete(key);
+    },
+    clear: () => {
+      store.clear();
+    },
+  };
+
+  Object.defineProperty(globalThis, "localStorage", {
+    value: storage,
+    configurable: true,
+    writable: true,
+  });
+
+  return storage;
+});
+
 // Mock sonner module - use factory function to avoid hoisting issues
 vi.mock("sonner", () => {
   return {
@@ -26,14 +60,9 @@ vi.mock("sonner", () => {
   };
 });
 
-// Mock organization context - tests run in personal (non-org) context
+// Mock organization context - defaults to personal (non-org) context and can be overridden per test
 vi.mock("@/contexts", () => ({
-  useOrganizationContext: () => ({
-    activeOrganizationId: null,
-    activeOrganization: null,
-    isOrgContext: false,
-    setActiveOrganization: vi.fn(),
-  }),
+  useOrganizationContext: () => mockOrgContext.value,
 }));
 
 import { ApiKeys } from "./ApiKeys";
@@ -47,6 +76,13 @@ beforeAll(() => server.listen({ onUnhandledRequest: "error" }));
 afterEach(() => {
   server.resetHandlers();
   vi.clearAllMocks();
+  mockStorage.clear();
+  mockOrgContext.value = {
+    activeOrganizationId: null,
+    activeOrganization: null,
+    isOrgContext: false,
+    setActiveOrganization: async () => {},
+  };
 });
 afterAll(() => server.close());
 
@@ -171,6 +207,74 @@ describe("API Keys Component - Functional Tests", () => {
       // Should show the key name and API key
       expect(screen.getByText("Test API Key")).toBeInTheDocument();
       expect(screen.getByText(/save this key/i)).toBeInTheDocument();
+    });
+
+    it("submits realtime purpose when a platform manager selects Inference in org context", async () => {
+      const user = userEvent.setup();
+      const orgId = "org-test-123";
+      let capturedUserId: string | undefined;
+      let capturedBody: Record<string, unknown> | undefined;
+
+      mockOrgContext.value = {
+        activeOrganizationId: orgId,
+        activeOrganization: null,
+        isOrgContext: true,
+        setActiveOrganization: async () => {},
+      };
+
+      server.use(
+        http.post("/admin/api/v1/users/:userId/api-keys", async ({ params, request }) => {
+          capturedUserId = params.userId as string;
+          capturedBody = (await request.json()) as Record<string, unknown>;
+
+          return HttpResponse.json(
+            {
+              id: "created-key-id",
+              name: capturedBody.name,
+              description: capturedBody.description,
+              purpose: capturedBody.purpose,
+              created_at: new Date().toISOString(),
+              key: "sk-test-created-key",
+            },
+            { status: 201 },
+          );
+        }),
+      );
+
+      const { container } = render(<ApiKeys />, { wrapper: createWrapper() });
+
+      await waitFor(() => {
+        expect(
+          within(container).getByRole("heading", { name: /api keys/i }),
+        ).toBeInTheDocument();
+      });
+
+      await user.click(
+        within(container).getByRole("button", { name: /create new api key/i }),
+      );
+
+      await waitFor(() => {
+        expect(screen.getByRole("dialog")).toBeInTheDocument();
+      });
+
+      await user.type(screen.getByLabelText(/name/i), "Org Inference Key");
+      await user.click(screen.getByRole("button", { name: /advanced settings/i }));
+
+      await user.click(screen.getByLabelText(/purpose/i));
+      await user.click(screen.getByRole("option", { name: /platform/i }));
+
+      await user.click(screen.getByLabelText(/purpose/i));
+      await user.click(screen.getByRole("option", { name: /^inference/i }));
+
+      await user.click(screen.getByRole("button", { name: /create key/i }));
+
+      await waitFor(() => {
+        expect(capturedUserId).toBe(orgId);
+        expect(capturedBody).toMatchObject({
+          name: "Org Inference Key",
+          purpose: "realtime",
+        });
+      });
     });
 
     it("validates required name field", async () => {
@@ -461,6 +565,75 @@ describe("API Keys Component - Functional Tests", () => {
           ).not.toBeInTheDocument();
         });
       }
+    });
+
+    it("removes the deleted API key from the table without a manual refresh", async () => {
+      const user = userEvent.setup();
+      let apiKeys = [
+        {
+          id: "key-1",
+          name: "CI/CD Pipeline",
+          description: "Automated testing and evaluation pipeline",
+          created_at: "2025-04-01T10:00:00Z",
+        },
+        {
+          id: "key-2",
+          name: "Batch Processing - Production",
+          description: "Production batch job submissions",
+          created_at: "2025-05-15T09:15:00Z",
+        },
+      ];
+
+      server.use(
+        http.get("/admin/api/v1/users/:userId/api-keys", ({ request }) => {
+          const url = new URL(request.url);
+          const skip = parseInt(url.searchParams.get("skip") || "0", 10);
+          const limit = parseInt(url.searchParams.get("limit") || "10", 10);
+
+          return HttpResponse.json({
+            data: apiKeys.slice(skip, skip + limit),
+            total_count: apiKeys.length,
+            skip,
+            limit,
+          });
+        }),
+        http.delete("/admin/api/v1/users/:userId/api-keys/:keyId", ({ params }) => {
+          apiKeys = apiKeys.filter((apiKey) => apiKey.id !== params.keyId);
+          return HttpResponse.json(null, { status: 204 });
+        }),
+      );
+
+      const { container } = render(<ApiKeys />, { wrapper: createWrapper() });
+
+      await waitFor(() => {
+        expect(
+          within(container).getByRole("heading", { name: /api keys/i }),
+        ).toBeInTheDocument();
+      });
+
+      const keyName = screen.getByText("CI/CD Pipeline");
+      expect(keyName).toBeInTheDocument();
+
+      const keyRow = keyName.closest("tr");
+      expect(keyRow).not.toBeNull();
+
+      await user.click(within(keyRow!).getByRole("button"));
+
+      await waitFor(() => {
+        expect(
+          screen.getByRole("heading", { name: /delete api key/i }),
+        ).toBeInTheDocument();
+      });
+
+      await user.click(
+        screen.getByRole("button", {
+          name: /delete api key/i,
+        }),
+      );
+
+      await waitFor(() => {
+        expect(screen.queryByText("CI/CD Pipeline")).not.toBeInTheDocument();
+      });
     });
   });
 

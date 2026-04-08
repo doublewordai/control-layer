@@ -825,7 +825,8 @@ pub async fn upload_file<P: PoolProvider>(
         None
     };
 
-    let max_file_size = state.config.limits.files.max_file_size;
+    let config = state.current_config();
+    let max_file_size = config.limits.files.max_file_size;
 
     // Early rejection based on Content-Length header (if present)
     // This avoids streaming a large file only to reject it later.
@@ -850,10 +851,10 @@ pub async fn upload_file<P: PoolProvider>(
     })?;
 
     let stream_config = FileStreamConfig {
-        max_file_size: state.config.limits.files.max_file_size,
-        max_requests_per_file: state.config.limits.files.max_requests_per_file,
-        max_request_body_size: state.config.limits.requests.max_body_size,
-        buffer_size: state.config.batches.files.upload_buffer_size,
+        max_file_size: config.limits.files.max_file_size,
+        max_requests_per_file: config.limits.files.max_requests_per_file,
+        max_request_body_size: config.limits.requests.max_body_size,
+        buffer_size: config.batches.files.upload_buffer_size,
     };
     // When in org context, attribute file ownership to the org (not the individual user).
     // Also used for the hidden API key lookup below.
@@ -870,7 +871,7 @@ pub async fn upload_file<P: PoolProvider>(
         .map_err(Error::Database)?;
 
     // Construct batch execution endpoint (where fusillade will send requests)
-    let endpoint = format!("http://{}:{}/ai", state.config.host, state.config.port);
+    let endpoint = format!("http://{}:{}/ai", config.host, config.port);
 
     // Query models accessible to the user for validation during file parsing
     let mut deployments_repo = Deployments::new(&mut conn);
@@ -894,7 +895,7 @@ pub async fn upload_file<P: PoolProvider>(
             endpoint,
             api_key: user_api_key,
             accessible_models,
-            allowed_url_paths: state.config.batches.allowed_url_paths.clone(),
+            allowed_url_paths: config.batches.allowed_url_paths.clone(),
         },
         Some(api_key_id),
     );

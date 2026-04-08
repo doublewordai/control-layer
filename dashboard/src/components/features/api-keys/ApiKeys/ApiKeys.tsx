@@ -494,7 +494,7 @@ export const ApiKeys: React.FC = () => {
                             </SelectValue>
                           </SelectTrigger>
                           <SelectContent>
-                            <SelectItem value="inference">
+                            <SelectItem value="realtime">
                               <div className="flex flex-col gap-0.5">
                                 <span>Inference</span>
                                 <span className="text-xs text-muted-foreground">

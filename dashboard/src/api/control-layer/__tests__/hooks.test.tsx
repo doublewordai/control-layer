@@ -23,6 +23,7 @@ import {
   useAddModelToGroup,
   useTransactions,
   useAddFunds,
+  useDeleteApiKey,
 } from "../hooks";
 
 // Setup MSW server
@@ -458,6 +459,38 @@ describe("User Hooks", () => {
         queryKey: ["models"],
       });
       expect(invalidateQueriesSpy).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  describe("API Key Mutations", () => {
+    it("should invalidate the correct API key list prefix after deletion", async () => {
+      const queryClient = new QueryClient({
+        defaultOptions: { queries: { retry: false } },
+      });
+
+      const invalidateQueriesSpy = vi.spyOn(queryClient, "invalidateQueries");
+
+      const wrapper = ({ children }: { children: ReactNode }) => (
+        <QueryClientProvider client={queryClient}>
+          {children}
+        </QueryClientProvider>
+      );
+
+      const userId = "current";
+      const keyId = "key-1";
+
+      const { result } = renderHook(() => useDeleteApiKey(), { wrapper });
+
+      result.current.mutate({ keyId, userId });
+
+      await waitFor(() => {
+        expect(result.current.isSuccess).toBe(true);
+      });
+
+      expect(invalidateQueriesSpy).toHaveBeenCalledWith({
+        queryKey: ["apiKeys", "query", userId],
+        refetchType: "active",
+      });
     });
   });
 });

@@ -107,16 +107,16 @@ export function CreateOrganizationModal({
               />
             </div>
             <div className="grid gap-2">
-              <Label htmlFor="name">Slug</Label>
+              <Label htmlFor="name">Domain</Label>
               <Input
                 id="name"
-                placeholder="acme-corp"
+                placeholder="acme.com"
                 value={name}
                 onChange={(e) => setName(e.target.value)}
                 required
               />
               <p className="text-xs text-muted-foreground">
-                Unique identifier (lowercase, hyphens allowed)
+                Your company's email domain (e.g. acme.com)
               </p>
             </div>
             {isPlatformManager && (
@@ -139,7 +139,7 @@ export function CreateOrganizationModal({
               </div>
             )}
             <div className="grid gap-2">
-              <Label htmlFor="email">Email</Label>
+              <Label htmlFor="email">Contact Email</Label>
               <Input
                 id="email"
                 type="email"

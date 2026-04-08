@@ -43,9 +43,10 @@ use crate::{
 )]
 #[tracing::instrument(skip_all)]
 pub async fn get_registration_info<P: PoolProvider>(State(state): State<AppState<P>>) -> Result<Json<RegistrationInfo>, Error> {
+    let config = state.current_config();
     Ok(Json(RegistrationInfo {
-        enabled: state.config.auth.native.enabled && state.config.auth.native.allow_registration,
-        message: if state.config.auth.native.enabled && state.config.auth.native.allow_registration {
+        enabled: config.auth.native.enabled && config.auth.native.allow_registration,
+        message: if config.auth.native.enabled && config.auth.native.allow_registration {
             "Registration is enabled".to_string()
         } else {
             "Registration is disabled".to_string()
@@ -74,22 +75,23 @@ pub async fn register<P: PoolProvider>(
     State(state): State<AppState<P>>,
     Json(request): Json<RegisterRequest>,
 ) -> Result<RegisterResponse, Error> {
+    let config = state.current_config();
     // Check if native auth is enabled
-    if !state.config.auth.native.enabled {
+    if !config.auth.native.enabled {
         return Err(Error::BadRequest {
             message: "Native authentication is disabled".to_string(),
         });
     }
 
     // Check if registration is allowed
-    if !state.config.auth.native.allow_registration {
+    if !config.auth.native.allow_registration {
         return Err(Error::BadRequest {
             message: "User registration is disabled".to_string(),
         });
     }
 
     // Validate password length
-    let password_config = &state.config.auth.native.password;
+    let password_config = &config.auth.native.password;
     if request.password.len() < password_config.min_length {
         return Err(Error::BadRequest {
             message: format!("Password must be at least {} characters", password_config.min_length),
@@ -136,7 +138,7 @@ pub async fn register<P: PoolProvider>(
         display_name,
         avatar_url: None,
         is_admin: false,
-        roles: state.config.auth.default_user_roles.clone(),
+        roles: config.auth.default_user_roles.clone(),
         auth_source: "native".to_string(),
         password_hash: Some(password_hash),
         external_user_id: None,
@@ -145,7 +147,7 @@ pub async fn register<P: PoolProvider>(
     let created_user = user_repo.create(&create_request).await?;
 
     // Give initial credits to standard users if configured
-    let initial_credits = state.config.credits.initial_credits_for_standard_users;
+    let initial_credits = config.credits.initial_credits_for_standard_users;
     if initial_credits > rust_decimal::Decimal::ZERO && create_request.roles.contains(&Role::StandardUser) {
         let mut credits_repo = Credits::new(&mut tx);
         let request = CreditTransactionCreateDBRequest::admin_grant(
@@ -163,7 +165,7 @@ pub async fn register<P: PoolProvider>(
     // via PG LISTEN/NOTIFY on the users table.
 
     // Create sample files for new user if enabled (non-blocking, failures are logged)
-    if state.config.sample_files.enabled && state.config.batches.enabled {
+    if config.sample_files.enabled && config.batches.enabled {
         let user_id = created_user.id;
         let state_clone = state.clone();
         tokio::spawn(async move {
@@ -177,10 +179,10 @@ pub async fn register<P: PoolProvider>(
     let current_user = CurrentUser::from(created_user);
 
     // Create session token
-    let token = session::create_session_token(&current_user, &state.config)?;
+    let token = session::create_session_token(&current_user, &config)?;
 
     // Set session cookie
-    let cookie = create_session_cookie(&token, &state.config);
+    let cookie = create_session_cookie(&token, &config);
 
     let auth_response = AuthResponse {
         user: user_response,
@@ -198,6 +200,7 @@ pub async fn register<P: PoolProvider>(
 pub async fn create_sample_files_for_new_user<P: PoolProvider>(state: &AppState<P>, user_id: Uuid) -> Result<(), Error> {
     use crate::db::handlers::deployments::DeploymentFilter;
     use crate::sample_files;
+    let config = state.current_config();
 
     let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
 
@@ -217,7 +220,7 @@ pub async fn create_sample_files_for_new_user<P: PoolProvider>(state: &AppState<
     let accessible_deployments = deployments_repo.list(&filter).await.map_err(Error::Database)?;
 
     // Construct batch execution endpoint
-    let endpoint = format!("http://{}:{}/ai", state.config.host, state.config.port);
+    let endpoint = format!("http://{}:{}/ai", config.host, config.port);
 
     // Create sample files using the sample_files module
     let created_files = sample_files::create_sample_files_for_user(
@@ -226,7 +229,7 @@ pub async fn create_sample_files_for_new_user<P: PoolProvider>(state: &AppState<
         &api_key,
         &endpoint,
         &accessible_deployments,
-        &state.config.sample_files,
+        &config.sample_files,
     )
     .await?;
 
@@ -254,9 +257,10 @@ pub async fn create_sample_files_for_new_user<P: PoolProvider>(state: &AppState<
 )]
 #[tracing::instrument(skip_all)]
 pub async fn get_login_info<P: PoolProvider>(State(state): State<AppState<P>>) -> Result<Json<LoginInfo>, Error> {
+    let config = state.current_config();
     Ok(Json(LoginInfo {
-        enabled: state.config.auth.native.enabled,
-        message: if state.config.auth.native.enabled {
+        enabled: config.auth.native.enabled,
+        message: if config.auth.native.enabled {
             "Native login is enabled".to_string()
         } else {
             "Native login is disabled".to_string()
@@ -281,8 +285,9 @@ pub async fn get_login_info<P: PoolProvider>(State(state): State<AppState<P>>) -
 )]
 #[tracing::instrument(skip_all)]
 pub async fn login<P: PoolProvider>(State(state): State<AppState<P>>, Json(request): Json<LoginRequest>) -> Result<LoginResponse, Error> {
+    let config = state.current_config();
     // Check if native auth is enabled
-    if !state.config.auth.native.enabled {
+    if !config.auth.native.enabled {
         return Err(Error::BadRequest {
             message: "Native authentication is disabled".to_string(),
         });
@@ -323,10 +328,10 @@ pub async fn login<P: PoolProvider>(State(state): State<AppState<P>>, Json(reque
     let current_user = CurrentUser::from(user);
 
     // Create session token
-    let token = session::create_session_token(&current_user, &state.config)?;
+    let token = session::create_session_token(&current_user, &config)?;
 
     // Set session cookie
-    let cookie = create_session_cookie(&token, &state.config);
+    let cookie = create_session_cookie(&token, &config);
 
     let auth_response = AuthResponse {
         user: user_response,
@@ -350,7 +355,8 @@ pub async fn login<P: PoolProvider>(State(state): State<AppState<P>>, Json(reque
 )]
 #[tracing::instrument(skip_all)]
 pub async fn logout<P: PoolProvider>(State(state): State<AppState<P>>) -> Result<LogoutResponse, Error> {
-    let session_config = &state.config.auth.native.session;
+    let config = state.current_config();
+    let session_config = &config.auth.native.session;
     let secure = if session_config.cookie_secure { "; Secure" } else { "" };
 
     // Domain attribute for cross-subdomain cookies
@@ -404,8 +410,9 @@ pub async fn request_password_reset<P: PoolProvider>(
     State(state): State<AppState<P>>,
     Json(request): Json<PasswordResetRequest>,
 ) -> Result<Json<PasswordResetResponse>, Error> {
+    let config = state.current_config();
     // Check if native auth is enabled
-    if !state.config.auth.native.enabled {
+    if !config.auth.native.enabled {
         return Err(Error::BadRequest {
             message: "Native authentication is disabled".to_string(),
         });
@@ -425,10 +432,10 @@ pub async fn request_password_reset<P: PoolProvider>(
     {
         // Only send reset email for native auth users (have password_hash)
         // Create reset token
-        let (raw_token, token) = token_repo.create_for_user(user.id, &state.config).await?;
+        let (raw_token, token) = token_repo.create_for_user(user.id, &config).await?;
 
         // Send email with token ID
-        let email_service = EmailService::new(&state.config)?;
+        let email_service = EmailService::new(&config)?;
         email_service
             .send_password_reset_email(&user.email, user.display_name.as_deref(), &token.id, &raw_token)
             .await?;
@@ -461,15 +468,16 @@ pub async fn confirm_password_reset<P: PoolProvider>(
     Path(token_id): Path<Uuid>,
     Json(request): Json<PasswordResetConfirmRequest>,
 ) -> Result<Json<PasswordResetResponse>, Error> {
+    let config = state.current_config();
     // Check if native auth is enabled
-    if !state.config.auth.native.enabled {
+    if !config.auth.native.enabled {
         return Err(Error::BadRequest {
             message: "Native authentication is disabled".to_string(),
         });
     }
 
     // Validate password length
-    let password_config = &state.config.auth.native.password;
+    let password_config = &config.auth.native.password;
     if request.new_password.len() < password_config.min_length {
         return Err(Error::BadRequest {
             message: format!("Password must be at least {} characters", password_config.min_length),
@@ -567,8 +575,9 @@ pub async fn change_password<P: PoolProvider>(
     current_user: CurrentUser,
     Json(request): Json<ChangePasswordRequest>,
 ) -> Result<Json<AuthSuccessResponse>, Error> {
+    let config = state.current_config();
     // Check if native auth is enabled
-    if !state.config.auth.native.enabled {
+    if !config.auth.native.enabled {
         return Err(Error::BadRequest {
             message: "Native authentication is disabled".to_string(),
         });
@@ -603,7 +612,7 @@ pub async fn change_password<P: PoolProvider>(
     }
 
     // Validate new password length
-    let password_config = &state.config.auth.native.password;
+    let password_config = &config.auth.native.password;
     if request.new_password.len() < password_config.min_length {
         return Err(Error::BadRequest {
             message: format!("Password must be at least {} characters", password_config.min_length),

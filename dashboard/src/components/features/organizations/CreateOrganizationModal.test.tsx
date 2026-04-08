@@ -39,8 +39,8 @@ describe("CreateOrganizationModal", () => {
     expect(
       within(dialog).getByLabelText("Organization Name"),
     ).toBeInTheDocument();
-    expect(within(dialog).getByLabelText("Slug")).toBeInTheDocument();
-    expect(within(dialog).getByLabelText("Email")).toBeInTheDocument();
+    expect(within(dialog).getByLabelText("Domain")).toBeInTheDocument();
+    expect(within(dialog).getByLabelText("Contact Email")).toBeInTheDocument();
     expect(
       within(dialog).getByRole("button", { name: /create/i }),
     ).toBeInTheDocument();
@@ -85,9 +85,9 @@ describe("CreateOrganizationModal", () => {
       const dialog = screen.getByRole("dialog");
 
       // Fill required fields
-      await user.type(within(dialog).getByLabelText("Slug"), "new-org");
+      await user.type(within(dialog).getByLabelText("Domain"), "new-org");
       await user.type(
-        within(dialog).getByLabelText("Email"),
+        within(dialog).getByLabelText("Contact Email"),
         "admin@new-org.com",
       );
       await user.type(

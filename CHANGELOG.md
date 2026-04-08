@@ -1,5 +1,50 @@
 # Changelog
 
+## [8.33.3](https://github.com/doublewordai/control-layer/compare/v8.33.2...v8.33.3) (2026-04-08)
+
+
+### Bug Fixes
+
+* allow standard users to read all provider display configs ([#959](https://github.com/doublewordai/control-layer/issues/959)) ([8b9ae4e](https://github.com/doublewordai/control-layer/commit/8b9ae4e5e12e1f2acd8334eaccc8aaa04116ca1c))
+
+## [8.33.2](https://github.com/doublewordai/control-layer/compare/v8.33.1...v8.33.2) (2026-04-07)
+
+
+### Bug Fixes
+
+* autotopup fixes ([#940](https://github.com/doublewordai/control-layer/issues/940)) ([ab79595](https://github.com/doublewordai/control-layer/commit/ab795952ed0ab73bc402d84ee9b669df34905f27))
+* bump fusillade for new reassembler ([#958](https://github.com/doublewordai/control-layer/issues/958)) ([be5d4aa](https://github.com/doublewordai/control-layer/commit/be5d4aa7ba9f52dda5f2a883863942cca47eb704))
+
+## [8.33.1](https://github.com/doublewordai/control-layer/compare/v8.33.0...v8.33.1) (2026-04-07)
+
+
+### Bug Fixes
+
+* allow standard users to load provider display configs ([#950](https://github.com/doublewordai/control-layer/issues/950)) ([ae649e6](https://github.com/doublewordai/control-layer/commit/ae649e6bed6eab1633c0b1b5d414512f904c8e9a))
+
+## [8.33.0](https://github.com/doublewordai/control-layer/compare/v8.32.1...v8.33.0) (2026-04-02)
+
+
+### Features
+
+* add live reload for config.yaml ([#879](https://github.com/doublewordai/control-layer/issues/879)) ([7394715](https://github.com/doublewordai/control-layer/commit/73947151b95b8ca403eff6a33f8b851573516543))
+* add provider display configuration to model catalog ([#945](https://github.com/doublewordai/control-layer/issues/945)) ([ad14021](https://github.com/doublewordai/control-layer/commit/ad14021f92c7b6c13cad14b7f06b7dfdd6ad9ebd))
+
+## [8.32.1](https://github.com/doublewordai/control-layer/compare/v8.32.0...v8.32.1) (2026-03-31)
+
+
+### Bug Fixes
+
+* update personal domain list ([#943](https://github.com/doublewordai/control-layer/issues/943)) ([b29cd0a](https://github.com/doublewordai/control-layer/commit/b29cd0a7a1ada44ceec50467a8dbc9c08efd046e))
+
+## [8.32.0](https://github.com/doublewordai/control-layer/compare/v8.31.1...v8.32.0) (2026-03-31)
+
+
+### Features
+
+* org auto-enrollment ([#938](https://github.com/doublewordai/control-layer/issues/938)) ([2563db3](https://github.com/doublewordai/control-layer/commit/2563db35e29c20027b18fa27436ab5778a8e7ec9))
+* self serve orgs ([#936](https://github.com/doublewordai/control-layer/issues/936)) ([ab8b48f](https://github.com/doublewordai/control-layer/commit/ab8b48fcc9edc52ba9c17983ee7338aaba71675c))
+
 ## [8.31.1](https://github.com/doublewordai/control-layer/compare/v8.31.0...v8.31.1) (2026-03-31)
 
 
