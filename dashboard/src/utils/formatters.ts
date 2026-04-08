@@ -176,13 +176,13 @@ export function getTariffDisplayName(
 ): string {
   if (apiKeyPurpose === "realtime") return "Realtime";
   if (apiKeyPurpose === "batch") {
-    if (completionWindow === "1h") return "Priority";
-    return "Standard"; // 24h or any other batch window
+    if (completionWindow === "1h") return "Async";
+    return "Batch"; // 24h or any other batch window
   }
   return "Realtime"; // fallback for null/undefined purpose
 }
 
-/** Tariff sort order for consistent display: Realtime → Priority → Standard */
+/** Tariff sort order for consistent display: Realtime → Async → Batch */
 const TARIFF_SORT_ORDER: Record<string, number> = {
   realtime: 0,
   "batch:1h": 1,

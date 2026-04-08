@@ -138,7 +138,7 @@ export const ModelTariffTable: React.FC<ModelTariffTableProps> = ({
 
     // Batch tariffs must have a completion_window
     if (formData.api_key_purpose === "batch" && !formData.completion_window) {
-      newErrors.completion_window = "Priority is required for batch tariffs";
+      newErrors.completion_window = "Completion window is required for batch tariffs";
     }
 
     setErrors(newErrors);
@@ -355,7 +355,7 @@ export const ModelTariffTable: React.FC<ModelTariffTableProps> = ({
                   <SelectTrigger
                     className={`w-full ${errors.completion_window ? "border-red-500" : ""}`}
                   >
-                    <SelectValue placeholder="Select Priority" />
+                    <SelectValue placeholder="Select completion window" />
                   </SelectTrigger>
                   <SelectContent>
                     {availableSLAs.map((sla) => (
@@ -489,7 +489,7 @@ export const ModelTariffTable: React.FC<ModelTariffTableProps> = ({
               <TableHead className="w-[180px]">Name</TableHead>
               <TableHead className="w-20">Input (per 1M)</TableHead>
               <TableHead className="w-20">Output (per 1M)</TableHead>
-              <TableHead className="w-20">Priority</TableHead>
+              <TableHead className="w-20">Window</TableHead>
               <TableHead className="w-20">Valid From</TableHead>
               <TableHead className="w-20">Actions</TableHead>
             </TableRow>
@@ -539,7 +539,7 @@ export const ModelTariffTable: React.FC<ModelTariffTableProps> = ({
                     onChange={(e) =>
                       setFormData({ ...formData, name: e.target.value })
                     }
-                    placeholder="e.g., Standard Pricing"
+                    placeholder="e.g., Batch pricing"
                     className={errors.name ? "border-red-500" : ""}
                   />
                   {errors.name && (
@@ -602,7 +602,7 @@ export const ModelTariffTable: React.FC<ModelTariffTableProps> = ({
                         <SelectTrigger
                           className={`w-full ${errors.completion_window ? "border-red-500" : ""}`}
                         >
-                          <SelectValue placeholder="Select Priority" />
+                          <SelectValue placeholder="Select completion window" />
                         </SelectTrigger>
                         <SelectContent>
                           {availableSLAs.map((sla) => (
@@ -653,7 +653,7 @@ export const ModelTariffTable: React.FC<ModelTariffTableProps> = ({
 
       <p className="text-sm text-gray-500">
         Prices are in dollars per million tokens. Different purposes allow you
-        to charge different rates for realtime, batch, and playground usage.
+        to charge different rates for Realtime, Batch, and playground usage.
       </p>
     </div>
   );
