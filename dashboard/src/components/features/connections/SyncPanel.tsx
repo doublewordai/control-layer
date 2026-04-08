@@ -198,7 +198,6 @@ function SyncRow({
 
   const s = liveSync ?? sync;
   const sTerminal = ["completed", "failed", "cancelled"].includes(s.status);
-  const filesProcessed = s.files_ingested + s.files_failed + s.files_skipped;
   const newFiles = s.files_found - s.files_skipped;
 
   return (
