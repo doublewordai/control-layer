@@ -202,10 +202,10 @@ pub async fn delete_connection<P: PoolProvider>(
 ) -> Result<StatusCode> {
     let target_user_id = current_user.active_organization.unwrap_or(current_user.id);
 
-    let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
+    let mut tx = state.db.write().begin().await.map_err(|e| Error::Database(e.into()))?;
 
     // Verify ownership before deleting
-    let connection = Connections::new(&mut conn)
+    let connection = Connections::new(&mut tx)
         .get_by_id(connection_id)
         .await
         .map_err(Error::Database)?
@@ -221,10 +221,12 @@ pub async fn delete_connection<P: PoolProvider>(
         });
     }
 
-    Connections::new(&mut conn)
+    Connections::new(&mut tx)
         .soft_delete(connection_id)
         .await
         .map_err(Error::Database)?;
+
+    tx.commit().await.map_err(|e| Error::Database(e.into()))?;
 
     Ok(StatusCode::NO_CONTENT)
 }

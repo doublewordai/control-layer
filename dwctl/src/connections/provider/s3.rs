@@ -81,6 +81,9 @@ impl SourceProvider for S3Provider {
         let client = self.build_client().await?;
         let mut files = Vec::new();
         let mut continuation_token: Option<String> = None;
+        // Safety limit to prevent unbounded memory growth on large buckets.
+        // Sync will process up to this many files; remaining files are discovered on re-sync.
+        const MAX_FILES: usize = 100_000;
 
         loop {
             let mut req = client.list_objects_v2().bucket(&self.config.bucket);
@@ -130,6 +133,15 @@ impl SourceProvider for S3Provider {
                         .and_then(|dt| chrono::DateTime::from_timestamp(dt.secs(), dt.subsec_nanos())),
                     display_name: Some(display_name),
                 });
+            }
+
+            if files.len() >= MAX_FILES {
+                tracing::warn!(
+                    bucket = %self.config.bucket,
+                    files_found = files.len(),
+                    "Reached safety limit of {MAX_FILES} files — remaining files will be discovered on re-sync"
+                );
+                break;
             }
 
             if resp.is_truncated() == Some(true) {

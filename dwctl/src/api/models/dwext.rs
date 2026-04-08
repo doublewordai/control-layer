@@ -8,16 +8,6 @@
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-/// Doubleword extension fields for batch creation requests.
-///
-/// Passed as `"dwext": { ... }` at the top level of `POST /v1/batches`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
-pub struct BatchDwExt {
-    /// Source connection ID — when creating a batch from an external connection sync.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_id: Option<String>,
-}
-
 /// Doubleword extension fields on batch responses.
 ///
 /// Returned as `"dwext": { ... }` at the top level of batch objects.

@@ -353,9 +353,13 @@ async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'static>(
     // 1. Mark entry as ingesting
     {
         let mut conn = dwctl.acquire().await?;
-        SyncEntries::new(&mut conn)
+        let updated = SyncEntries::new(&mut conn)
             .update_status(input.sync_entry_id, "ingesting", None)
             .await?;
+        if !updated {
+            tracing::info!(sync_entry_id = %input.sync_entry_id, "Sync entry deleted, skipping ingestion");
+            return Ok(());
+        }
     }
 
     // 2. Load connection and build provider
