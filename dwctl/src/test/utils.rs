@@ -242,6 +242,10 @@ pub fn create_test_config() -> crate::config::Config {
                 },
                 ..Default::default()
             },
+            sync_workers: crate::config::SyncWorkersConfig {
+                enabled: false,
+                ..Default::default()
+            },
             ..Default::default()
         },
         email: crate::config::EmailConfig {

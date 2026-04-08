@@ -311,6 +311,9 @@ pub async fn trigger_sync<P: PoolProvider>(
 ) -> Result<(StatusCode, Json<SyncOperationResponse>)> {
     let target_user_id = current_user.active_organization.unwrap_or(current_user.id);
 
+    // Fail fast if encryption key is not available — the sync job will need it
+    get_encryption_key(&state)?;
+
     // Validate strategy
     if !matches!(req.strategy.as_str(), "snapshot" | "select") {
         return Err(Error::BadRequest {

@@ -99,15 +99,18 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> TaskRunner<P> {
 
         // Wire weak cross-references. All jobs share the same Arc<OnceLock>,
         // so setting them here makes them visible to every cloned TaskState.
-        if state.ingest_file_job.set(Arc::downgrade(&ingest_file_job)).is_err() {
-            panic!("ingest_file_job OnceLock already set — double initialization");
-        }
-        if state.activate_batch_job.set(Arc::downgrade(&activate_batch_job)).is_err() {
-            panic!("activate_batch_job OnceLock already set — double initialization");
-        }
-        if state.create_batch_job.set(Arc::downgrade(&create_batch_job)).is_err() {
-            panic!("create_batch_job OnceLock already set — double initialization");
-        }
+        state
+            .ingest_file_job
+            .set(Arc::downgrade(&ingest_file_job))
+            .map_err(|_| anyhow::anyhow!("ingest_file_job OnceLock already set — double initialization"))?;
+        state
+            .activate_batch_job
+            .set(Arc::downgrade(&activate_batch_job))
+            .map_err(|_| anyhow::anyhow!("activate_batch_job OnceLock already set — double initialization"))?;
+        state
+            .create_batch_job
+            .set(Arc::downgrade(&create_batch_job))
+            .map_err(|_| anyhow::anyhow!("create_batch_job OnceLock already set — double initialization"))?;
 
         Ok(Self {
             create_batch_job,

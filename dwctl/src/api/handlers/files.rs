@@ -1158,7 +1158,7 @@ pub async fn list_files<P: PoolProvider>(
         .collect::<std::collections::HashSet<_>>()
         .into_iter()
         .collect();
-    let connection_names: std::collections::HashMap<uuid::Uuid, String> = if !source_conn_ids.is_empty() {
+    let connection_info: std::collections::HashMap<uuid::Uuid, (String, uuid::Uuid)> = if !source_conn_ids.is_empty() {
         Connections::new(&mut read_conn)
             .get_names_by_ids(&source_conn_ids)
             .await
@@ -1206,7 +1206,9 @@ pub async fn list_files<P: PoolProvider>(
                 context_name,
                 context_type,
                 source: f.source_connection_id.map(|_| "sync".to_string()),
-                source_name: f.source_connection_id.and_then(|id| connection_names.get(&id).cloned()),
+                source_name: f
+                    .source_connection_id
+                    .and_then(|id| connection_info.get(&id).map(|(name, _)| name.clone())),
             }
         })
         .collect();

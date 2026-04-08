@@ -1717,7 +1717,7 @@ pub async fn list_batches<P: PoolProvider>(
         .collect::<std::collections::HashSet<_>>()
         .into_iter()
         .collect();
-    let connection_names: HashMap<Uuid, String> = if !source_conn_ids.is_empty() {
+    let connection_info: HashMap<Uuid, (String, Uuid)> = if !source_conn_ids.is_empty() {
         Connections::new(&mut read_conn)
             .get_names_by_ids(&source_conn_ids)
             .await
@@ -1787,8 +1787,12 @@ pub async fn list_batches<P: PoolProvider>(
                     .and_then(|m| m.get("dw_source_id"))
                     .and_then(|v| v.as_str())
                     .and_then(|s| Uuid::parse_str(s).ok())
-                    .and_then(|conn_id| connection_names.get(&conn_id))
-                    .map(|s| s.as_str())
+                    .and_then(|conn_id| {
+                        // Verify connection is owned by the batch creator
+                        let batch_owner = Uuid::parse_str(&batch.created_by).ok()?;
+                        let (name, owner) = connection_info.get(&conn_id)?;
+                        if *owner == batch_owner { Some(name.as_str()) } else { None }
+                    })
             } else {
                 None
             };

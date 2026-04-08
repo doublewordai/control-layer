@@ -174,17 +174,20 @@ impl<'c> Connections<'c> {
         Ok(row.map(Connection::from))
     }
 
-    /// Bulk fetch connection names by IDs. Returns a map of id → name.
+    /// Bulk fetch connection names and owners by IDs. Returns a map of id → (name, user_id).
     #[instrument(skip(self, ids), fields(count = ids.len()), err)]
-    pub async fn get_names_by_ids(&mut self, ids: &[Uuid]) -> Result<std::collections::HashMap<Uuid, String>> {
+    pub async fn get_names_by_ids(&mut self, ids: &[Uuid]) -> Result<std::collections::HashMap<Uuid, (String, Uuid)>> {
         if ids.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
-        let rows = sqlx::query!("SELECT id, name FROM connections WHERE id = ANY($1) AND deleted_at IS NULL", ids,)
-            .fetch_all(&mut *self.db)
-            .await?;
+        let rows = sqlx::query!(
+            "SELECT id, name, user_id FROM connections WHERE id = ANY($1) AND deleted_at IS NULL",
+            ids,
+        )
+        .fetch_all(&mut *self.db)
+        .await?;
 
-        Ok(rows.into_iter().map(|r| (r.id, r.name)).collect())
+        Ok(rows.into_iter().map(|r| (r.id, (r.name, r.user_id))).collect())
     }
 
     #[instrument(skip(self), fields(user_id = %user_id), err)]
