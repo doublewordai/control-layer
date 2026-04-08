@@ -444,18 +444,6 @@ function ModelRow({
         </TableCell>
         <TableCell className="text-right pr-3 lg:pr-6">
           <div className="flex items-center justify-end gap-1.5">
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={(e) => {
-                e.stopPropagation();
-                onApiClick();
-              }}
-              className="text-xs h-7 px-2 text-gray-500 hover:text-gray-700 hover:bg-gray-100"
-            >
-              <Code className="h-3.5 w-3.5" />
-              <span className="hidden lg:inline ml-1">API</span>
-            </Button>
             {playgroundAvailable && (
               <Button
                 variant="outline"
@@ -471,6 +459,18 @@ function ModelRow({
                 Try it &rarr;
               </Button>
             )}
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={(e) => {
+                e.stopPropagation();
+                onApiClick();
+              }}
+              className="text-xs h-7 px-2 text-gray-500 hover:text-gray-700 hover:bg-gray-100"
+            >
+              <Code className="h-3.5 w-3.5" />
+              <span className="hidden lg:inline ml-1">API</span>
+            </Button>
           </div>
         </TableCell>
       </TableRow>

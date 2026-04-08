@@ -29,7 +29,11 @@ import type {
   ModelDisplayCategory,
   TrafficRoutingRule,
 } from "../../../../api/control-layer";
-import { useAuthorization, isPlaygroundDenied } from "../../../../utils";
+import {
+  useAuthorization,
+  isPlaygroundDenied,
+  getTariffDisplayName,
+} from "../../../../utils";
 import {
   ApiExamples,
   AccessManagementModal,
@@ -2157,7 +2161,10 @@ const ModelInfo: React.FC = () => {
                                 >
                                   <div className="flex items-center gap-2 mb-2">
                                     <p className="font-medium text-sm">
-                                      {tariff.name}
+                                      {getTariffDisplayName(
+                                        tariff.api_key_purpose,
+                                        tariff.completion_window,
+                                      )}
                                     </p>
                                     <span className="text-xs text-gray-500 ml-auto">
                                       Valid from{" "}

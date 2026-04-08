@@ -67,8 +67,8 @@ const COMPLETION_WINDOWS: Record<
   string,
   { label: string; icon: typeof Clock; sort: number }
 > = {
-  "1h": { label: "High", icon: Zap, sort: 0 },
-  "24h": { label: "Standard", icon: Clock, sort: 1 },
+  "1h": { label: "Async", icon: Zap, sort: 0 },
+  "24h": { label: "Batch", icon: Clock, sort: 1 },
 };
 
 const formatReleaseDate = (dateStr: string): string => {
