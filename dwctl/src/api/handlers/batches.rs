@@ -142,23 +142,16 @@ fn to_batch_response_enriched(batch: fusillade::Batch, creator_email: Option<&st
 
     // Build dwext from dw_* metadata keys + optional source_name override
     let request_source = raw_metadata.get("request_source").cloned();
-    let mut dwext = BatchDwExtResponse {
+    let dwext = BatchDwExtResponse {
         source: request_source.clone(),
         source_id: raw_metadata.get("dw_source_id").cloned(),
-        source_name: raw_metadata
-            .get("dw_source_name")
-            .cloned()
-            .or_else(|| source_name.map(|s| s.to_string())),
+        // Prefer resolved name from DB (reflects renames) over stored metadata
+        source_name: source_name
+            .map(|s| s.to_string())
+            .or_else(|| raw_metadata.get("dw_source_name").cloned()),
         source_file: raw_metadata.get("dw_external_key").cloned(),
         sync_id: raw_metadata.get("dw_sync_id").cloned(),
     };
-
-    // If source_name was provided and dwext didn't have it, inject it
-    if let Some(name) = source_name
-        && dwext.source_name.is_none()
-    {
-        dwext.source_name = Some(name.to_string());
-    }
 
     // Build user-facing metadata: filter out internal keys (dw_*, request_source, created_by, etc.)
     let internal_keys = [
@@ -937,21 +930,31 @@ pub async fn get_batch<P: PoolProvider>(
         (None, None)
     };
 
-    // Resolve source connection name if this batch is from a sync
-    let source_name = if let Some(conn_id) = batch
+    // Resolve source connection name — only for sync-created batches, scoped to batch owner
+    let is_sync = batch
         .metadata
         .as_ref()
-        .and_then(|m| m.get("dw_source_id"))
+        .and_then(|m| m.get("request_source"))
         .and_then(|v| v.as_str())
-        .and_then(|s| Uuid::parse_str(s).ok())
-    {
-        match Connections::new(&mut read_conn).get_by_id(conn_id).await {
-            Ok(Some(conn)) => Some(conn.name),
-            Ok(None) => None,
-            Err(e) => {
-                tracing::warn!(error = %e, connection_id = %conn_id, "Failed to look up connection name");
-                None
+        == Some("sync");
+    let source_name = if is_sync {
+        if let Some(conn_id) = batch
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("dw_source_id"))
+            .and_then(|v| v.as_str())
+            .and_then(|s| Uuid::parse_str(s).ok())
+        {
+            match Connections::new(&mut read_conn).get_by_id(conn_id).await {
+                Ok(Some(conn)) if conn.user_id == Uuid::parse_str(&batch.created_by).unwrap_or_default() => Some(conn.name),
+                Ok(_) => None, // Connection not found or not owned by batch owner
+                Err(e) => {
+                    tracing::warn!(error = %e, connection_id = %conn_id, "Failed to look up connection name");
+                    None
+                }
             }
+        } else {
+            None
         }
     } else {
         None
@@ -1699,9 +1702,11 @@ pub async fn list_batches<P: PoolProvider>(
     // Collect batch IDs for bulk operations
     let batch_ids: Vec<Uuid> = batches.iter().map(|b| b.id.0).collect();
 
-    // Bulk fetch connection names for synced batches (those with dw_source_id in metadata)
+    // Bulk fetch connection names for sync-created batches only, scoped to batch owners.
+    // Only consider batches where request_source == "sync" to prevent metadata injection.
     let source_conn_ids: Vec<Uuid> = batches
         .iter()
+        .filter(|b| b.metadata.as_ref().and_then(|m| m.get("request_source")).and_then(|v| v.as_str()) == Some("sync"))
         .filter_map(|b| {
             b.metadata
                 .as_ref()
@@ -1768,15 +1773,25 @@ pub async fn list_batches<P: PoolProvider>(
                 None => (None, None),
             };
 
-            // Resolve source connection name from the bulk-fetched map
-            let source_name: Option<&str> = batch
+            // Resolve source connection name — only for sync-created batches
+            let is_sync = batch
                 .metadata
                 .as_ref()
-                .and_then(|m| m.get("dw_source_id"))
+                .and_then(|m| m.get("request_source"))
                 .and_then(|v| v.as_str())
-                .and_then(|s| Uuid::parse_str(s).ok())
-                .and_then(|conn_id| connection_names.get(&conn_id))
-                .map(|s| s.as_str());
+                == Some("sync");
+            let source_name: Option<&str> = if is_sync {
+                batch
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| m.get("dw_source_id"))
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| Uuid::parse_str(s).ok())
+                    .and_then(|conn_id| connection_names.get(&conn_id))
+                    .map(|s| s.as_str())
+            } else {
+                None
+            };
 
             let mut response = to_batch_response_enriched(batch, None, source_name);
 

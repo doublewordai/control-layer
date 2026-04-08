@@ -208,11 +208,12 @@ impl SourceProvider for S3Provider {
             let s3_has_more = resp.is_truncated() == Some(true);
             let s3_next = resp.next_continuation_token().map(|s| s.to_string());
 
-            // Check if we have enough after processing the full S3 response
+            // When not searching, we requested exactly `limit` keys from S3,
+            // so files.len() <= limit and no results are skipped.
+            // When searching, we may have more matches than `limit` in one S3 page.
+            // Rather than truncating (which would drop results), return all matches
+            // from this page. The frontend handles variable page sizes gracefully.
             if files.len() >= limit {
-                files.truncate(limit);
-                // Use the S3 continuation token as cursor (safe because we processed
-                // the full S3 page before truncating — no results are skipped).
                 return Ok(FileListPage {
                     files,
                     has_more: s3_has_more || s3_next.is_some(),

@@ -53,7 +53,7 @@ export function FileBrowser({ connectionId }: { connectionId: string }) {
     limit: PAGE_SIZE,
   });
 
-  const files = data?.data ?? [];
+  const files = useMemo(() => data?.data ?? [], [data]);
 
   const { data: syncedKeys, isFetching: isFetchingSynced } = useSyncedKeys(connectionId);
   const syncMutation = useTriggerSync();
