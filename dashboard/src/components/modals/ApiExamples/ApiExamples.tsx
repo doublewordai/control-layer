@@ -539,10 +539,10 @@ chatCompletion();`;
                   {model && !isRealtimeDenied(model) && (
                     <ToggleGroupItem
                       value="realtime"
-                      aria-label="realtime API usage"
+                      aria-label="Realtime API usage"
                       className="px-5 py-1.5"
                     >
-                      realtime
+                      Realtime
                     </ToggleGroupItem>
                   )}
                 </ToggleGroup>
@@ -666,8 +666,8 @@ chatCompletion();`;
                       />
                       <span className="w-[100px]">
                         {completionWindow === "high"
-                          ? "async"
-                          : "batch"}
+                          ? "Async"
+                          : "Batch"}
                       </span>
                     </label>
                   )}

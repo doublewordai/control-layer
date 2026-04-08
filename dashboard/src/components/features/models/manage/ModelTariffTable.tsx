@@ -56,8 +56,8 @@ const EMPTY_FORM: TariffFormData = {
 };
 
 const API_KEY_PURPOSE_LABELS: Record<TariffApiKeyPurpose | "none", string> = {
-  realtime: "realtime",
-  batch: "batch",
+  realtime: "Realtime",
+  batch: "Batch",
   playground: "Playground",
   none: "None (fallback)",
 };
@@ -539,7 +539,7 @@ export const ModelTariffTable: React.FC<ModelTariffTableProps> = ({
                     onChange={(e) =>
                       setFormData({ ...formData, name: e.target.value })
                     }
-                    placeholder="e.g., batch pricing"
+                    placeholder="e.g., Batch pricing"
                     className={errors.name ? "border-red-500" : ""}
                   />
                   {errors.name && (
@@ -653,7 +653,7 @@ export const ModelTariffTable: React.FC<ModelTariffTableProps> = ({
 
       <p className="text-sm text-gray-500">
         Prices are in dollars per million tokens. Different purposes allow you
-        to charge different rates for realtime, batch, and playground usage.
+        to charge different rates for Realtime, Batch, and playground usage.
       </p>
     </div>
   );

@@ -67,8 +67,8 @@ const COMPLETION_WINDOWS: Record<
   string,
   { label: string; icon: typeof Clock; sort: number }
 > = {
-  "1h": { label: "async", icon: Zap, sort: 0 },
-  "24h": { label: "batch", icon: Clock, sort: 1 },
+  "1h": { label: "Async", icon: Zap, sort: 0 },
+  "24h": { label: "Batch", icon: Clock, sort: 1 },
 };
 
 const formatReleaseDate = (dateStr: string): string => {
@@ -721,7 +721,7 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                                 }[] = [
                                   {
                                     key: "realtime",
-                                    label: "realtime",
+                                    label: "Realtime",
                                     icon: Radio,
                                     denied: realtimeDenied,
                                     deniedMessage: "Synchronous API access is unavailable for this model",
