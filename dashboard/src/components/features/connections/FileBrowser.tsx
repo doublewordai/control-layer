@@ -219,6 +219,7 @@ export function FileBrowser({ connectionId }: { connectionId: string }) {
     if (data?.next_cursor) {
       setCursors((prev) => [...prev, currentCursor ?? ""]);
       setCurrentCursor(data.next_cursor);
+      setSelected(new Set());
     }
   };
 
@@ -229,11 +230,13 @@ export function FileBrowser({ connectionId }: { connectionId: string }) {
       setCurrentCursor(prevCursor || undefined);
       return next;
     });
+    setSelected(new Set());
   };
 
   const resetPagination = () => {
     setCursors([]);
     setCurrentCursor(undefined);
+    setSelected(new Set());
   };
 
   return (

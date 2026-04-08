@@ -1375,6 +1375,8 @@ pub struct BackgroundServicesConfig {
     pub pool_metrics: PoolMetricsSamplerConfig,
     /// Configuration for batch completion notifications (email + webhooks)
     pub notifications: NotificationsConfig,
+    /// Configuration for connection sync workers (file ingestion, batch activation)
+    pub sync_workers: SyncWorkersConfig,
 }
 
 /// Database pool metrics sampling configuration.
@@ -1610,6 +1612,40 @@ impl Default for SyncPipelineConfig {
         Self {
             default_completion_window: "24h".to_string(),
             default_endpoint: "/v1/chat/completions".to_string(),
+        }
+    }
+}
+
+/// Configuration for connection sync background workers.
+///
+/// Controls whether sync workers run on this instance and how many concurrent
+/// workers process each stage of the pipeline.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SyncWorkersConfig {
+    /// Enable sync workers on this instance (default: true).
+    /// Set to false for API-only replicas that should not process sync jobs.
+    /// Jobs are still enqueued to Postgres and picked up by other replicas.
+    pub enabled: bool,
+    /// Number of concurrent file ingestion workers (default: 4).
+    /// Controls how many files are streamed from S3 and written to fusillade
+    /// simultaneously. Higher values increase throughput but use more memory.
+    pub ingest_workers: usize,
+    /// Number of concurrent batch activation workers (default: 1).
+    /// Kept low to avoid overwhelming capacity reservation checks.
+    pub activate_workers: usize,
+    /// Number of sync discovery workers (default: 1).
+    /// Typically only one is needed since discovery is fast.
+    pub sync_workers: usize,
+}
+
+impl Default for SyncWorkersConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            ingest_workers: 4,
+            activate_workers: 1,
+            sync_workers: 1,
         }
     }
 }

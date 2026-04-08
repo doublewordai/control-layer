@@ -415,3 +415,11 @@ background_services:
   # When disabled, all instances run as leader (useful for single-instance deployments)
   leader_election:
     enabled: true # Default: true
+
+  # External connection sync workers - process file ingestion and batch activation jobs.
+  # Set enabled: false for API-only replicas (jobs queue in Postgres for other replicas).
+  sync_workers:
+    enabled: true # Default: true
+    ingest_workers: 4 # Concurrent file ingestion workers
+    activate_workers: 1 # Batch activation workers (low to avoid capacity contention)
+    sync_workers: 1 # Sync discovery workers
