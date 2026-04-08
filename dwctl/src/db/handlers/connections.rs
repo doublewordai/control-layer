@@ -303,9 +303,13 @@ impl<'c> SyncOperations<'c> {
 
     #[instrument(skip(self), fields(id = %id), err)]
     pub async fn get_by_id(&mut self, id: Uuid) -> Result<Option<SyncOperation>> {
-        let row = sqlx::query_as!(SyncOperationRow, "SELECT * FROM sync_operations WHERE id = $1", id,)
-            .fetch_optional(&mut *self.db)
-            .await?;
+        let row = sqlx::query_as!(
+            SyncOperationRow,
+            "SELECT * FROM sync_operations WHERE id = $1 AND status != 'deleted'",
+            id,
+        )
+        .fetch_optional(&mut *self.db)
+        .await?;
 
         Ok(row.map(SyncOperation::from))
     }
@@ -314,7 +318,7 @@ impl<'c> SyncOperations<'c> {
     pub async fn list_by_connection(&mut self, connection_id: Uuid) -> Result<Vec<SyncOperation>> {
         let rows = sqlx::query_as!(
             SyncOperationRow,
-            "SELECT * FROM sync_operations WHERE connection_id = $1 ORDER BY created_at DESC",
+            "SELECT * FROM sync_operations WHERE connection_id = $1 AND status != 'deleted' ORDER BY created_at DESC",
             connection_id,
         )
         .fetch_all(&mut *self.db)

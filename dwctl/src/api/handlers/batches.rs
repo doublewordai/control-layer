@@ -937,7 +937,7 @@ pub async fn get_batch<P: PoolProvider>(
             .and_then(|s| Uuid::parse_str(s).ok())
         {
             match Connections::new(&mut read_conn).get_by_id(conn_id).await {
-                Ok(Some(conn)) if conn.user_id == Uuid::parse_str(&batch.created_by).unwrap_or_default() => Some(conn.name),
+                Ok(Some(conn)) if Uuid::parse_str(&batch.created_by).is_ok_and(|owner| conn.user_id == owner) => Some(conn.name),
                 Ok(_) => None, // Connection not found or not owned by batch owner
                 Err(e) => {
                     tracing::warn!(error = %e, connection_id = %conn_id, "Failed to look up connection name");

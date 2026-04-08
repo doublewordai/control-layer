@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT * FROM sync_operations WHERE connection_id = $1 ORDER BY created_at DESC",
+  "query": "SELECT * FROM sync_operations WHERE id = $1 AND status != 'deleted'",
   "describe": {
     "columns": [
       {
@@ -108,5 +108,5 @@
       false
     ]
   },
-  "hash": "cac4bb47e85df8aa279861339672c67681ab186ca890ce1dfef0d21588e2b07a"
+  "hash": "1c0a1db88321c9a22ea64397adb5e61966fa348ba6c0de5bc94bbde87d80aba3"
 }
