@@ -145,8 +145,8 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> TaskRunner<P> {
             return handles;
         }
 
-        // Sync discovery workers
-        for i in 0..sync_config.sync_workers.max(1) {
+        // Sync discovery workers (0 = disabled)
+        for i in 0..sync_config.sync_workers {
             let mut worker = self.sync_connection_job.worker();
             worker.set_shutdown_token(shutdown_token.clone());
             handles.push(tokio::spawn(async move {
@@ -156,8 +156,8 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> TaskRunner<P> {
             }));
         }
 
-        // File ingestion workers
-        for i in 0..sync_config.ingest_workers.max(1) {
+        // File ingestion workers (0 = disabled)
+        for i in 0..sync_config.ingest_workers {
             let mut worker = self.ingest_file_job.worker();
             worker.set_shutdown_token(shutdown_token.clone());
             handles.push(tokio::spawn(async move {
@@ -168,7 +168,8 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> TaskRunner<P> {
         }
 
         // Batch activation workers
-        for i in 0..sync_config.activate_workers.max(1) {
+        // Batch activation workers (0 = disabled)
+        for i in 0..sync_config.activate_workers {
             let mut worker = self.activate_batch_job.worker();
             worker.set_shutdown_token(shutdown_token.clone());
             handles.push(tokio::spawn(async move {

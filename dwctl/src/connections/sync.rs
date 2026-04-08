@@ -150,13 +150,9 @@ pub async fn build_activate_batch_job<P: PoolProvider + Clone + Send + Sync + 's
                     }
                     To::done()
                 }
-                Err(e) if e.to_string().contains("insufficient capacity") => {
-                    tracing::info!(
-                        sync_entry_id = %input.sync_entry_id,
-                        "No capacity for batch activation, will retry"
-                    );
-                    Err(TaskError::Retryable(e.to_string()))
-                }
+                // TODO: when capacity reservation is implemented, return
+                // TaskError::Retryable for capacity errors using a typed error
+                // (not string matching) so activation retries with backoff.
                 Err(e) => {
                     tracing::error!(
                         sync_entry_id = %input.sync_entry_id,
@@ -398,7 +394,7 @@ async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'static>(
         .sync_config
         .get("ai_base_url")
         .and_then(|v| v.as_str())
-        .unwrap_or("http://0.0.0.0:3001/ai")
+        .unwrap_or("http://127.0.0.1:3001/ai")
         .to_string();
 
     // 4. Resolve file ownership — connection.user_id owns the file,
