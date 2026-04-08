@@ -2230,8 +2230,8 @@ async fn setup_background_services(
         create_batch_job: Arc::new(std::sync::OnceLock::new()),
     };
     let task_runner = Arc::new(tasks::TaskRunner::new(underway_pool, task_state).await?);
-    for handle in task_runner.start(shutdown_token.clone(), &config.background_services.sync_workers) {
-        background_tasks.spawn("underway-worker", async move { handle.await.map_err(|e| anyhow::anyhow!("{}", e)) });
+    for (name, handle) in task_runner.start(shutdown_token.clone(), &config.background_services.sync_workers) {
+        background_tasks.spawn(name, async move { handle.await.map_err(|e| anyhow::anyhow!("{}", e)) });
     }
 
     let (background_tasks, task_names) = background_tasks.into_parts();

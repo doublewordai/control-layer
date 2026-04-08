@@ -85,6 +85,19 @@ pub async fn create_connection<P: PoolProvider>(
         });
     }
 
+    // Validate name
+    let name = req.name.trim();
+    if name.is_empty() {
+        return Err(Error::BadRequest {
+            message: "Connection name must not be empty".to_string(),
+        });
+    }
+    if name.len() > 255 {
+        return Err(Error::BadRequest {
+            message: "Connection name must not exceed 255 characters".to_string(),
+        });
+    }
+
     // Validate provider type
     if !matches!(req.provider.as_str(), "s3") {
         return Err(Error::BadRequest {
@@ -111,7 +124,7 @@ pub async fn create_connection<P: PoolProvider>(
         .map_err(Error::Database)?;
 
     let connection = Connections::new(&mut conn)
-        .create(target_user_id, Some(api_key_id), kind, &req.provider, &req.name, &encrypted)
+        .create(target_user_id, Some(api_key_id), kind, &req.provider, name, &encrypted)
         .await
         .map_err(Error::Database)?;
 

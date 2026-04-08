@@ -130,18 +130,21 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> TaskRunner<P> {
         &self,
         shutdown_token: CancellationToken,
         sync_config: &crate::config::SyncWorkersConfig,
-    ) -> Vec<tokio::task::JoinHandle<()>> {
-        let mut handles = Vec::new();
+    ) -> Vec<(&'static str, tokio::task::JoinHandle<()>)> {
+        let mut handles: Vec<(&'static str, tokio::task::JoinHandle<()>)> = Vec::new();
 
         // Batch creation worker always runs (1 worker) — handles both
         // API-triggered and sync-triggered batch population.
         let mut create_batch_worker = self.create_batch_job.worker();
         create_batch_worker.set_shutdown_token(shutdown_token.clone());
-        handles.push(tokio::spawn(async move {
-            if let Err(e) = create_batch_worker.run().await {
-                tracing::error!(error = %e, "Create-batch worker error");
-            }
-        }));
+        handles.push((
+            "create-batch-worker",
+            tokio::spawn(async move {
+                if let Err(e) = create_batch_worker.run().await {
+                    tracing::error!(error = %e, "Create-batch worker error");
+                }
+            }),
+        ));
 
         if !sync_config.enabled {
             tracing::info!("Sync workers disabled on this instance");
@@ -152,33 +155,42 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> TaskRunner<P> {
         for i in 0..sync_config.sync_workers {
             let mut worker = self.sync_connection_job.worker();
             worker.set_shutdown_token(shutdown_token.clone());
-            handles.push(tokio::spawn(async move {
-                if let Err(e) = worker.run().await {
-                    tracing::error!(error = %e, worker = i, "Sync-connection worker error");
-                }
-            }));
+            handles.push((
+                "sync-discovery-worker",
+                tokio::spawn(async move {
+                    if let Err(e) = worker.run().await {
+                        tracing::error!(error = %e, worker = i, "Sync-connection worker error");
+                    }
+                }),
+            ));
         }
 
         // File ingestion workers (0 = disabled)
         for i in 0..sync_config.ingest_workers {
             let mut worker = self.ingest_file_job.worker();
             worker.set_shutdown_token(shutdown_token.clone());
-            handles.push(tokio::spawn(async move {
-                if let Err(e) = worker.run().await {
-                    tracing::error!(error = %e, worker = i, "Ingest-file worker error");
-                }
-            }));
+            handles.push((
+                "ingest-file-worker",
+                tokio::spawn(async move {
+                    if let Err(e) = worker.run().await {
+                        tracing::error!(error = %e, worker = i, "Ingest-file worker error");
+                    }
+                }),
+            ));
         }
 
         // Batch activation workers (0 = disabled)
         for i in 0..sync_config.activate_workers {
             let mut worker = self.activate_batch_job.worker();
             worker.set_shutdown_token(shutdown_token.clone());
-            handles.push(tokio::spawn(async move {
-                if let Err(e) = worker.run().await {
-                    tracing::error!(error = %e, worker = i, "Activate-batch worker error");
-                }
-            }));
+            handles.push((
+                "activate-batch-worker",
+                tokio::spawn(async move {
+                    if let Err(e) = worker.run().await {
+                        tracing::error!(error = %e, worker = i, "Activate-batch worker error");
+                    }
+                }),
+            ));
         }
 
         tracing::info!(
