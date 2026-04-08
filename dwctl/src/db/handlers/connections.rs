@@ -420,7 +420,7 @@ impl<'c> SyncOperations<'c> {
                 COUNT(*) FILTER (WHERE status IN ('activated', 'failed', 'skipped')) AS "terminal!",
                 COUNT(*) FILTER (WHERE status = 'failed') AS "failed!"
             FROM sync_entries
-            WHERE sync_id = $1
+            WHERE sync_id = $1 AND status != 'deleted'
             "#,
             sync_id,
         )

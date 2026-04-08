@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT\n                COUNT(*) AS \"total!\",\n                COUNT(*) FILTER (WHERE status IN ('activated', 'failed', 'skipped')) AS \"terminal!\",\n                COUNT(*) FILTER (WHERE status = 'failed') AS \"failed!\"\n            FROM sync_entries\n            WHERE sync_id = $1\n            ",
+  "query": "\n            SELECT\n                COUNT(*) AS \"total!\",\n                COUNT(*) FILTER (WHERE status IN ('activated', 'failed', 'skipped')) AS \"terminal!\",\n                COUNT(*) FILTER (WHERE status = 'failed') AS \"failed!\"\n            FROM sync_entries\n            WHERE sync_id = $1 AND status != 'deleted'\n            ",
   "describe": {
     "columns": [
       {
@@ -30,5 +30,5 @@
       null
     ]
   },
-  "hash": "800354e7727a236e62be8d04cd1d3839d5320886c32f507da1d766b0659a5916"
+  "hash": "0e215df9d7463521a86f80ec1d62b892241d16f4af046d5da090dcfab1b1d8e8"
 }
