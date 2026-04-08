@@ -1586,9 +1586,8 @@ impl Default for AnalyticsConfig {
 }
 
 /// External data source connections configuration.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
-#[derive(Default)]
 pub struct ConnectionsConfig {
     /// Encryption key for connection credentials (base64 or 32-byte string).
     /// Falls back to `secret_key` if not set.

@@ -288,6 +288,9 @@ where
     pub task_runner: Arc<tasks::TaskRunner<P>>,
     /// Resource limiters for protecting system capacity.
     pub limiters: limits::Limiters,
+    /// Encryption key for connection credentials, derived once at startup.
+    /// `None` means connections encryption is unavailable.
+    pub connections_encryption_key: Option<Vec<u8>>,
 }
 
 impl<P> AppState<P>
@@ -1648,6 +1651,8 @@ pub struct BackgroundServices {
     shutdown_token: tokio_util::sync::CancellationToken,
     // Pub so that we can disarm it if we want to
     pub drop_guard: Option<tokio_util::sync::DropGuard>,
+    /// Connections encryption key, derived once at startup.
+    connections_encryption_key: Option<Vec<u8>>,
 }
 
 impl BackgroundServices {
@@ -2219,7 +2224,7 @@ async fn setup_background_services(
     let task_state = tasks::TaskState {
         request_manager: request_manager.clone(),
         dwctl_pool: pool.clone(),
-        encryption_key,
+        encryption_key: encryption_key.clone(),
         ingest_file_job: Arc::new(std::sync::OnceLock::new()),
         activate_batch_job: Arc::new(std::sync::OnceLock::new()),
         create_batch_job: Arc::new(std::sync::OnceLock::new()),
@@ -2243,6 +2248,7 @@ async fn setup_background_services(
         task_names,
         shutdown_token,
         drop_guard: Some(drop_guard),
+        connections_encryption_key: encryption_key.clone(),
     })
 }
 
@@ -2387,6 +2393,7 @@ impl Application {
             .task_runner(bg_services.task_runner.clone())
             .maybe_outlet_db(outlet_pools.clone())
             .limiters(limiters)
+            .maybe_connections_encryption_key(bg_services.connections_encryption_key.clone())
             .build();
 
         if let Some(config_path) = config_path {

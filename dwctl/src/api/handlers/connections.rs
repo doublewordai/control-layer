@@ -24,24 +24,16 @@ use crate::errors::{Error, Result};
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Derive the connections encryption key from config.
+/// Get the connections encryption key derived at startup.
 ///
-/// Uses the same logic as startup (reject empty/whitespace). Note: key changes
-/// via hot-reload will affect new encryptions but not existing background jobs
-/// which use the key fixed at startup. A restart is required for key changes
-/// to take full effect.
+/// Uses the same key as background sync jobs (stored in AppState at startup).
+/// This ensures API encryption and job decryption always use the same key.
+/// A restart is required for encryption key changes to take effect.
 fn get_encryption_key<P: PoolProvider>(state: &AppState<P>) -> Result<Vec<u8>> {
-    let config = state.config.snapshot();
-    let secret = config
-        .connections
-        .encryption_key
-        .as_deref()
-        .or(config.secret_key.as_deref())
-        .filter(|s| !s.trim().is_empty())
-        .ok_or_else(|| Error::Internal {
-            operation: "connections encryption key not configured".to_string(),
-        })?;
-    Ok(encryption::derive_encryption_key(secret.trim()))
+    state.connections_encryption_key.clone().ok_or_else(|| Error::BadRequest {
+        message: "Connections are not available — encryption key not configured. Set secret_key or connections.encryption_key and restart."
+            .to_string(),
+    })
 }
 
 fn map_provider_error(e: ProviderError) -> Error {
@@ -259,34 +251,38 @@ pub async fn test_connection<P: PoolProvider>(
 ) -> Result<Json<ConnectionTestResponse>> {
     let target_user_id = current_user.active_organization.unwrap_or(current_user.id);
 
-    let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
-    let connection = Connections::new(&mut conn)
-        .get_by_id(connection_id)
-        .await
-        .map_err(Error::Database)?
-        .ok_or_else(|| Error::NotFound {
-            resource: "Connection".to_string(),
-            id: connection_id.to_string(),
+    // Fetch and decrypt connection config in a short DB scope, then release before network I/O
+    let (connection_provider, decrypted_config) = {
+        let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+        let connection = Connections::new(&mut conn)
+            .get_by_id(connection_id)
+            .await
+            .map_err(Error::Database)?
+            .ok_or_else(|| Error::NotFound {
+                resource: "Connection".to_string(),
+                id: connection_id.to_string(),
+            })?;
+
+        if connection.user_id != target_user_id {
+            return Err(Error::NotFound {
+                resource: "Connection".to_string(),
+                id: connection_id.to_string(),
+            });
+        }
+
+        let key = get_encryption_key(&state)?;
+        let config = encryption::decrypt_json(&key, &connection.config_encrypted).map_err(|e| Error::Internal {
+            operation: format!("decrypt config: {e}"),
         })?;
+        (connection.provider, config)
+    }; // DB connection released here
 
-    if connection.user_id != target_user_id {
-        return Err(Error::NotFound {
-            resource: "Connection".to_string(),
-            id: connection_id.to_string(),
-        });
-    }
-
-    let key = get_encryption_key(&state)?;
-    let config = encryption::decrypt_json(&key, &connection.config_encrypted).map_err(|e| Error::Internal {
-        operation: format!("decrypt config: {e}"),
-    })?;
-
-    let prov = provider::create_provider(&connection.provider, config).map_err(map_provider_error)?;
+    let prov = provider::create_provider(&connection_provider, decrypted_config).map_err(map_provider_error)?;
     let result = prov.test_connection().await.map_err(map_provider_error)?;
 
     Ok(Json(ConnectionTestResponse {
         ok: result.ok,
-        provider: connection.provider,
+        provider: connection_provider,
         message: result.message,
         scope: result.scope,
     }))
@@ -630,29 +626,33 @@ pub async fn list_connection_files<P: PoolProvider>(
 ) -> Result<Json<ExternalFileListResponse>> {
     let target_user_id = current_user.active_organization.unwrap_or(current_user.id);
 
-    let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
-    let connection = Connections::new(&mut conn)
-        .get_by_id(connection_id)
-        .await
-        .map_err(Error::Database)?
-        .ok_or_else(|| Error::NotFound {
-            resource: "Connection".to_string(),
-            id: connection_id.to_string(),
+    // Fetch and decrypt in a short DB scope, then release before S3 listing
+    let (connection_provider, decrypted_config) = {
+        let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+        let connection = Connections::new(&mut conn)
+            .get_by_id(connection_id)
+            .await
+            .map_err(Error::Database)?
+            .ok_or_else(|| Error::NotFound {
+                resource: "Connection".to_string(),
+                id: connection_id.to_string(),
+            })?;
+
+        if connection.user_id != target_user_id {
+            return Err(Error::NotFound {
+                resource: "Connection".to_string(),
+                id: connection_id.to_string(),
+            });
+        }
+
+        let key = get_encryption_key(&state)?;
+        let config = encryption::decrypt_json(&key, &connection.config_encrypted).map_err(|e| Error::Internal {
+            operation: format!("decrypt config: {e}"),
         })?;
+        (connection.provider, config)
+    }; // DB connection released here
 
-    if connection.user_id != target_user_id {
-        return Err(Error::NotFound {
-            resource: "Connection".to_string(),
-            id: connection_id.to_string(),
-        });
-    }
-
-    let key = get_encryption_key(&state)?;
-    let config = encryption::decrypt_json(&key, &connection.config_encrypted).map_err(|e| Error::Internal {
-        operation: format!("decrypt config: {e}"),
-    })?;
-
-    let prov = provider::create_provider(&connection.provider, config).map_err(map_provider_error)?;
+    let prov = provider::create_provider(&connection_provider, decrypted_config).map_err(map_provider_error)?;
     let page = prov
         .list_files_paged(provider::ListFilesOptions {
             limit: query.limit,
