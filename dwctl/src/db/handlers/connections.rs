@@ -335,7 +335,7 @@ impl<'c> SyncOperations<'c> {
                 status = $2,
                 started_at = COALESCE($3, started_at),
                 completed_at = COALESCE($4, completed_at)
-            WHERE id = $1
+            WHERE id = $1 AND status != 'deleted'
             "#,
             id,
             status,
@@ -386,11 +386,11 @@ impl<'c> SyncOperations<'c> {
     pub async fn increment_counter(&mut self, id: Uuid, field: &str) -> Result<()> {
         // Use dynamic SQL safely — field is validated against an allowlist.
         let query = match field {
-            "files_found" => "UPDATE sync_operations SET files_found = files_found + 1 WHERE id = $1",
-            "files_skipped" => "UPDATE sync_operations SET files_skipped = files_skipped + 1 WHERE id = $1",
-            "files_ingested" => "UPDATE sync_operations SET files_ingested = files_ingested + 1 WHERE id = $1",
-            "files_failed" => "UPDATE sync_operations SET files_failed = files_failed + 1 WHERE id = $1",
-            "batches_created" => "UPDATE sync_operations SET batches_created = batches_created + 1 WHERE id = $1",
+            "files_found" => "UPDATE sync_operations SET files_found = files_found + 1 WHERE id = $1 AND status != 'deleted'",
+            "files_skipped" => "UPDATE sync_operations SET files_skipped = files_skipped + 1 WHERE id = $1 AND status != 'deleted'",
+            "files_ingested" => "UPDATE sync_operations SET files_ingested = files_ingested + 1 WHERE id = $1 AND status != 'deleted'",
+            "files_failed" => "UPDATE sync_operations SET files_failed = files_failed + 1 WHERE id = $1 AND status != 'deleted'",
+            "batches_created" => "UPDATE sync_operations SET batches_created = batches_created + 1 WHERE id = $1 AND status != 'deleted'",
             _ => return Err(DbError::Other(anyhow::anyhow!("unknown counter field: {}", field))),
         };
 
@@ -427,7 +427,7 @@ impl<'c> SyncOperations<'c> {
         let final_status = if row.failed == row.total { "failed" } else { "completed" };
 
         sqlx::query!(
-            "UPDATE sync_operations SET status = $2, completed_at = now() WHERE id = $1 AND completed_at IS NULL",
+            "UPDATE sync_operations SET status = $2, completed_at = now() WHERE id = $1 AND completed_at IS NULL AND status != 'deleted'",
             sync_id,
             final_status,
         )
@@ -545,9 +545,14 @@ impl<'c> SyncEntries<'c> {
 
     #[instrument(skip(self), fields(id = %id, status = %status), err)]
     pub async fn update_status(&mut self, id: Uuid, status: &str, error: Option<&str>) -> Result<()> {
-        sqlx::query!("UPDATE sync_entries SET status = $2, error = $3 WHERE id = $1", id, status, error,)
-            .execute(&mut *self.db)
-            .await?;
+        sqlx::query!(
+            "UPDATE sync_entries SET status = $2, error = $3 WHERE id = $1 AND status != 'deleted'",
+            id,
+            status,
+            error,
+        )
+        .execute(&mut *self.db)
+        .await?;
 
         Ok(())
     }
@@ -558,7 +563,7 @@ impl<'c> SyncEntries<'c> {
             r#"
             UPDATE sync_entries
             SET status = 'ingested', file_id = $2, template_count = $3
-            WHERE id = $1
+            WHERE id = $1 AND status != 'deleted'
             "#,
             id,
             file_id,
@@ -573,7 +578,7 @@ impl<'c> SyncEntries<'c> {
     #[instrument(skip(self), fields(id = %id), err)]
     pub async fn set_activated(&mut self, id: Uuid, batch_id: Uuid) -> Result<()> {
         sqlx::query!(
-            "UPDATE sync_entries SET status = 'activated', batch_id = $2 WHERE id = $1",
+            "UPDATE sync_entries SET status = 'activated', batch_id = $2 WHERE id = $1 AND status != 'deleted'",
             id,
             batch_id,
         )

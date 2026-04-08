@@ -457,6 +457,7 @@ async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'static>(
 
         let mut line_buf = String::new();
         let mut template_count: i32 = 0;
+        let mut line_number: u64 = 0;
         let mut stream = byte_stream;
         // Buffer for incomplete UTF-8 sequences split across chunk boundaries.
         let mut utf8_buf: Vec<u8> = Vec::new();
@@ -514,6 +515,7 @@ async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'static>(
                 if line.is_empty() {
                     continue;
                 }
+                line_number += 1;
 
                 // Parse as OpenAI batch request format
                 match serde_json::from_str::<serde_json::Value>(line) {
@@ -545,7 +547,7 @@ async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'static>(
                         template_count += 1;
                     }
                     Err(e) => {
-                        tracing::warn!(line_num = template_count + 1, error = %e, "Skipping invalid JSONL line");
+                        tracing::warn!(line_num = line_number, error = %e, "Skipping invalid JSONL line");
                         // Continue — invalid lines will show as missing templates
                     }
                 }
