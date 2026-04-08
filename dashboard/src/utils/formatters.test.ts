@@ -309,25 +309,25 @@ describe("formatters", () => {
   });
 
   describe("getTariffDisplayName", () => {
-    it("should return Realtime for realtime purpose", () => {
-      expect(getTariffDisplayName("realtime", null)).toBe("Realtime");
+    it("should return realtime for realtime purpose", () => {
+      expect(getTariffDisplayName("realtime", null)).toBe("realtime");
     });
 
-    it("should return Priority for batch with 1h window", () => {
-      expect(getTariffDisplayName("batch", "1h")).toBe("Priority");
+    it("should return async for batch with 1h window", () => {
+      expect(getTariffDisplayName("batch", "1h")).toBe("async");
     });
 
-    it("should return Standard for batch with 24h window", () => {
-      expect(getTariffDisplayName("batch", "24h")).toBe("Standard");
+    it("should return batch for batch with 24h window", () => {
+      expect(getTariffDisplayName("batch", "24h")).toBe("batch");
     });
 
-    it("should return Standard for batch with other windows", () => {
-      expect(getTariffDisplayName("batch", "12h")).toBe("Standard");
+    it("should return batch for batch with other windows", () => {
+      expect(getTariffDisplayName("batch", "12h")).toBe("batch");
     });
 
-    it("should default to Realtime for null/undefined purpose", () => {
-      expect(getTariffDisplayName(null, null)).toBe("Realtime");
-      expect(getTariffDisplayName(undefined, undefined)).toBe("Realtime");
+    it("should default to realtime for null/undefined purpose", () => {
+      expect(getTariffDisplayName(null, null)).toBe("realtime");
+      expect(getTariffDisplayName(undefined, undefined)).toBe("realtime");
     });
   });
 
@@ -353,7 +353,7 @@ describe("formatters", () => {
       expect(result[0].api_key_purpose).toBe("realtime");
     });
 
-    it("should sort: Realtime → Priority → Standard", () => {
+    it("should sort: realtime → async → batch", () => {
       const tariffs = [
         { api_key_purpose: "batch", completion_window: "24h", is_active: true },
         { api_key_purpose: "batch", completion_window: "1h", is_active: true },
