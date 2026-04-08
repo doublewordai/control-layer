@@ -399,15 +399,10 @@ async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'static>(
 
     // 4. Resolve file ownership — connection.user_id owns the file,
     //    and we use the triggering user's hidden batch key for member attribution.
+    //    Reuse the connection loaded in step 2 (no extra DB round trip).
     let (file_owner, file_api_key_id) = {
         use crate::db::handlers::api_keys::ApiKeys;
         use crate::db::models::api_keys::ApiKeyPurpose;
-
-        let mut conn = dwctl.acquire().await?;
-        let connection = crate::db::handlers::connections::Connections::new(&mut conn)
-            .get_by_id(input.connection_id)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("connection not found"))?;
 
         let owner_id = connection.user_id;
         let triggered_by = sync_op.triggered_by;
@@ -612,7 +607,7 @@ async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'static>(
             //    via FileMetadata during create_file_stream)
             let mut conn = dwctl.acquire().await?;
             SyncEntries::new(&mut conn)
-                .set_ingested(input.sync_entry_id, *file_id, template_count)
+                .set_ingested(input.sync_entry_id, file_id.0, template_count)
                 .await?;
             SyncOperations::new(&mut conn)
                 .increment_counter(input.sync_id, "files_ingested")
@@ -625,7 +620,7 @@ async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'static>(
                     sync_id: input.sync_id,
                     sync_entry_id: input.sync_entry_id,
                     connection_id: input.connection_id,
-                    file_id: *file_id,
+                    file_id: file_id.0,
                     template_count,
                 })
                 .await?;
