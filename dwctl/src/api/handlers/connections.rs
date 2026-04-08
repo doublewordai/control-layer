@@ -24,6 +24,12 @@ use crate::errors::{Error, Result};
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Derive the connections encryption key from config.
+///
+/// Uses the same logic as startup (reject empty/whitespace). Note: key changes
+/// via hot-reload will affect new encryptions but not existing background jobs
+/// which use the key fixed at startup. A restart is required for key changes
+/// to take full effect.
 fn get_encryption_key<P: PoolProvider>(state: &AppState<P>) -> Result<Vec<u8>> {
     let config = state.config.snapshot();
     let secret = config
@@ -31,6 +37,7 @@ fn get_encryption_key<P: PoolProvider>(state: &AppState<P>) -> Result<Vec<u8>> {
         .encryption_key
         .as_deref()
         .or(config.secret_key.as_deref())
+        .filter(|s| !s.trim().is_empty())
         .ok_or_else(|| Error::Internal {
             operation: "connections encryption key not configured".to_string(),
         })?;
