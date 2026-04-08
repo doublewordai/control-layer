@@ -523,7 +523,9 @@ async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'static>(
                     Ok(parsed) => {
                         let custom_id = parsed.get("custom_id").and_then(|v| v.as_str()).map(|s| s.to_string());
                         let method = parsed.get("method").and_then(|v| v.as_str()).unwrap_or("POST").to_string();
-                        let url = parsed.get("url").and_then(|v| v.as_str()).unwrap_or(&api_path).to_string();
+                        // Always use the configured endpoint — ignore per-line url to prevent
+                        // targeting unsupported/internal paths (consistent with batch-level routing).
+                        let url = api_path.clone();
                         let body = parsed.get("body").map(|v| v.to_string()).unwrap_or_else(|| "{}".to_string());
                         let model = parsed
                             .get("body")

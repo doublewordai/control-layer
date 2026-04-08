@@ -39,7 +39,7 @@ CREATE TABLE sync_operations (
 );
 
 CREATE INDEX idx_sync_operations_connection ON sync_operations (connection_id);
-CREATE INDEX idx_sync_operations_status ON sync_operations (status) WHERE status NOT IN ('completed', 'failed', 'cancelled');
+CREATE INDEX idx_sync_operations_status ON sync_operations (status) WHERE status NOT IN ('completed', 'failed', 'cancelled', 'deleted');
 
 -- Sync entries: one per external file per sync operation
 CREATE TABLE sync_entries (
