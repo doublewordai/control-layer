@@ -4,11 +4,10 @@ use crate::AppState;
 use crate::api::models::provider_display_configs::{
     CreateProviderDisplayConfig, ProviderDisplayConfigResponse, UpdateProviderDisplayConfig,
 };
-use crate::auth::permissions::{RequiresPermission, can_read_all_resources, operation, resource};
+use crate::auth::permissions::{RequiresPermission, operation, resource};
 use crate::db::handlers::ProviderDisplayConfigs;
 use crate::db::models::provider_display_configs::{ProviderDisplayConfigCreateDBRequest, ProviderDisplayConfigUpdateDBRequest};
 use crate::errors::{Error, Result};
-use crate::types::Resource;
 use axum::{
     Json,
     extract::{Path, State},
@@ -60,30 +59,13 @@ fn validate_icon(icon: Option<&str>) -> Result<()> {
 )]
 pub async fn list_provider_display_configs<P: PoolProvider>(
     State(state): State<AppState<P>>,
-    current_user: RequiresPermission<resource::Models, operation::ReadOwn>,
+    _: RequiresPermission<resource::Models, operation::ReadOwn>,
 ) -> Result<Json<Vec<ProviderDisplayConfigResponse>>> {
     let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut repo = ProviderDisplayConfigs::new(&mut conn);
 
-    let can_read_all = can_read_all_resources(&current_user, Resource::Models);
-    let known = if can_read_all {
-        repo.list_known_providers().await?
-    } else {
-        let target_user_id = current_user.active_organization.unwrap_or(current_user.id);
-        repo.list_known_providers_for_user(target_user_id).await?
-    };
-
-    // For standard users, only return configs that have accessible models
-    let configs = if can_read_all {
-        repo.list().await?
-    } else {
-        let known_keys: std::collections::HashSet<_> = known.iter().map(|k| k.provider_key.clone()).collect();
-        repo.list()
-            .await?
-            .into_iter()
-            .filter(|c| known_keys.contains(&c.provider_key))
-            .collect()
-    };
+    let known = repo.list_known_providers().await?;
+    let configs = repo.list().await?;
 
     let config_map: HashMap<_, _> = configs.into_iter().map(|config| (config.provider_key.clone(), config)).collect();
     let known_map: HashMap<_, _> = known
@@ -332,21 +314,31 @@ mod tests {
 
     #[sqlx::test]
     #[test_log::test]
-    async fn test_standard_user_only_sees_accessible_providers(pool: PgPool) {
+    async fn test_standard_user_can_read_all_provider_display_configs(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
         let user = create_test_user(&pool, Role::StandardUser).await;
 
-        // Create models for two different providers
+        // Create one deployed provider and one config-only provider.
         let anthropic_model = create_model_with_provider(&pool, "claude-3", "Anthropic", admin.id).await;
-        let _openai_model = create_model_with_provider(&pool, "gpt-4", "OpenAI", admin.id).await;
-
-        // Create a group and add only the Anthropic model
         let group = create_test_group(&pool).await;
         add_deployment_to_group(&pool, anthropic_model, group.id, admin.id).await;
         add_user_to_group(&pool, user.id, group.id).await;
+        sqlx::query!(
+            r#"
+            INSERT INTO provider_display_configs (provider_key, display_name, icon, created_by)
+            VALUES ($1, $2, $3, $4)
+            "#,
+            "openai",
+            "OpenAI",
+            Some("openai"),
+            admin.id
+        )
+        .execute(&pool)
+        .await
+        .expect("Failed to create provider display config");
 
-        // Standard user should only see the Anthropic provider
+        // Standard users should be able to read both deployed and config-only providers.
         let headers = add_auth_headers(&user);
         let response = app
             .get("/admin/api/v1/provider-display-configs")
@@ -357,8 +349,8 @@ mod tests {
         response.assert_status_ok();
         let providers: Vec<ProviderDisplayConfigResponse> = response.json();
         let provider_keys: Vec<&str> = providers.iter().map(|p| p.provider_key.as_str()).collect();
-        assert!(provider_keys.contains(&"anthropic"), "Should see accessible provider");
-        assert!(!provider_keys.contains(&"openai"), "Should NOT see inaccessible provider");
+        assert!(provider_keys.contains(&"anthropic"), "Should see deployed provider");
+        assert!(provider_keys.contains(&"openai"), "Should see config-only provider");
     }
 
     #[sqlx::test]
