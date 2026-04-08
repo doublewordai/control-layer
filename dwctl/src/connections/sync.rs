@@ -480,7 +480,7 @@ async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'static>(
 
             // Decode as much valid UTF-8 as possible, keeping incomplete
             // trailing bytes for the next chunk.
-            let valid_up_to = match std::str::from_utf8(&utf8_buf) {
+            let drain_up_to = match std::str::from_utf8(&utf8_buf) {
                 Ok(s) => {
                     line_buf.push_str(s);
                     utf8_buf.len()
@@ -492,18 +492,31 @@ async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'static>(
                         let s = unsafe { std::str::from_utf8_unchecked(&utf8_buf[..valid]) };
                         line_buf.push_str(s);
                     }
-                    valid
+                    if let Some(error_len) = e.error_len() {
+                        // Genuinely invalid bytes (not incomplete) — skip them
+                        // to avoid infinite loop. Replace with U+FFFD.
+                        line_buf.push(char::REPLACEMENT_CHARACTER);
+                        valid + error_len
+                    } else {
+                        // Incomplete sequence at end — wait for more data
+                        valid
+                    }
                 }
             };
-            // Keep only the incomplete trailing bytes (reuse buffer)
-            if valid_up_to > 0 {
-                utf8_buf.drain(..valid_up_to);
+            if drain_up_to > 0 {
+                utf8_buf.drain(..drain_up_to);
             }
 
-            // Process complete lines
-            while let Some(newline_pos) = line_buf.find('\n') {
-                let line = line_buf[..newline_pos].trim().to_owned();
-                line_buf.drain(..newline_pos + 1);
+            // Process complete lines using a cursor to avoid O(n²) drain per line.
+            // We scan for newlines by offset, then compact once after the loop.
+            let mut cursor = 0;
+            while let Some(rel_pos) = line_buf[cursor..].find('\n') {
+                let newline_pos = cursor + rel_pos;
+                let line = line_buf[cursor..newline_pos].trim();
+                cursor = newline_pos + 1;
+
+                // Borrow the trimmed line as &str for parsing; only allocate if needed
+                let line = line.to_owned();
 
                 if line.is_empty() {
                     continue;
@@ -543,6 +556,10 @@ async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'static>(
                         // Continue — invalid lines will show as missing templates
                     }
                 }
+            }
+            // Compact: remove all processed lines in one operation
+            if cursor > 0 {
+                line_buf.drain(..cursor);
             }
         }
 

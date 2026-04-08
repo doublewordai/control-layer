@@ -27,7 +27,18 @@ pub struct S3Provider {
 }
 
 impl S3Provider {
-    pub fn new(config: S3Config) -> Self {
+    pub fn new(mut config: S3Config) -> Self {
+        // Normalize prefix: ensure it ends with '/' if non-empty
+        if let Some(ref mut prefix) = config.prefix {
+            let trimmed = prefix.trim().to_string();
+            if trimmed.is_empty() {
+                config.prefix = None;
+            } else if !trimmed.ends_with('/') {
+                *prefix = format!("{trimmed}/");
+            } else {
+                *prefix = trimmed;
+            }
+        }
         Self { config }
     }
 
