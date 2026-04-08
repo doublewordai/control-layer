@@ -311,7 +311,7 @@ async fn run_sync_connection<P: PoolProvider + Clone + Send + Sync + 'static>(
     // 9. Enqueue IngestFileJob for each new entry
     for entry in &entries {
         state
-            .get_ingest_file_job()
+            .get_ingest_file_job()?
             .enqueue(&IngestFileInput {
                 sync_id: input.sync_id,
                 sync_entry_id: entry.id,
@@ -640,7 +640,7 @@ async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'static>(
 
             // 8. Enqueue ActivateBatchJob
             state
-                .get_activate_batch_job()
+                .get_activate_batch_job()?
                 .enqueue(&ActivateBatchInput {
                     sync_id: input.sync_id,
                     sync_entry_id: input.sync_entry_id,
@@ -746,8 +746,8 @@ async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + 'static>(
         SyncEntries::new(&mut conn)
             .get_by_id(input.sync_entry_id)
             .await?
-            .map(|e| e.external_key)
-            .unwrap_or_default()
+            .ok_or_else(|| anyhow::anyhow!("sync entry not found: {}", input.sync_entry_id))?
+            .external_key
     };
 
     // 6. Create batch record
@@ -779,7 +779,7 @@ async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + 'static>(
 
     // 5. Enqueue the existing batch populate job
     state
-        .get_create_batch_job()
+        .get_create_batch_job()?
         .enqueue(&crate::api::handlers::batches::CreateBatchInput {
             batch_id: *batch.id,
             file_id: input.file_id,

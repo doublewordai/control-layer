@@ -34,9 +34,7 @@ fn get_encryption_key<P: PoolProvider>(state: &AppState<P>) -> Result<Vec<u8>> {
         .ok_or_else(|| Error::Internal {
             operation: "connections encryption key not configured".to_string(),
         })?;
-    encryption::derive_encryption_key(secret).map_err(|e| Error::Internal {
-        operation: format!("invalid encryption key: {e}"),
-    })
+    Ok(encryption::derive_encryption_key(secret))
 }
 
 fn map_provider_error(e: ProviderError) -> Error {

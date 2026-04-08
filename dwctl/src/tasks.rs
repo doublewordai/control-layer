@@ -47,31 +47,31 @@ pub struct TaskState<P: PoolProvider + Clone = sqlx_pool_router::DbPools> {
 }
 
 impl<P: PoolProvider + Clone> TaskState<P> {
-    /// Get the ingest file job, panics if not initialized or if TaskRunner was dropped.
-    pub fn get_ingest_file_job(&self) -> Arc<Job<IngestFileInput, TaskState<P>>> {
+    /// Get the ingest file job. Returns Err if not initialized or TaskRunner was dropped.
+    pub fn get_ingest_file_job(&self) -> anyhow::Result<Arc<Job<IngestFileInput, TaskState<P>>>> {
         self.ingest_file_job
             .get()
-            .expect("ingest_file_job not initialized")
+            .ok_or_else(|| anyhow::anyhow!("ingest_file_job not initialized"))?
             .upgrade()
-            .expect("ingest_file_job was dropped (TaskRunner gone)")
+            .ok_or_else(|| anyhow::anyhow!("ingest_file_job dropped (TaskRunner gone)"))
     }
 
     /// Get the activate batch job.
-    pub fn get_activate_batch_job(&self) -> Arc<Job<ActivateBatchInput, TaskState<P>>> {
+    pub fn get_activate_batch_job(&self) -> anyhow::Result<Arc<Job<ActivateBatchInput, TaskState<P>>>> {
         self.activate_batch_job
             .get()
-            .expect("activate_batch_job not initialized")
+            .ok_or_else(|| anyhow::anyhow!("activate_batch_job not initialized"))?
             .upgrade()
-            .expect("activate_batch_job was dropped (TaskRunner gone)")
+            .ok_or_else(|| anyhow::anyhow!("activate_batch_job dropped (TaskRunner gone)"))
     }
 
     /// Get the create batch job.
-    pub fn get_create_batch_job(&self) -> Arc<Job<CreateBatchInput, TaskState<P>>> {
+    pub fn get_create_batch_job(&self) -> anyhow::Result<Arc<Job<CreateBatchInput, TaskState<P>>>> {
         self.create_batch_job
             .get()
-            .expect("create_batch_job not initialized")
+            .ok_or_else(|| anyhow::anyhow!("create_batch_job not initialized"))?
             .upgrade()
-            .expect("create_batch_job was dropped (TaskRunner gone)")
+            .ok_or_else(|| anyhow::anyhow!("create_batch_job dropped (TaskRunner gone)"))
     }
 }
 

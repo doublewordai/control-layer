@@ -71,22 +71,23 @@ pub fn decrypt_json(key_bytes: &[u8], blob: &[u8]) -> Result<serde_json::Value, 
 /// - If the secret is a valid base64 string that decodes to exactly 32 bytes, use it directly.
 /// - If the secret is exactly 32 raw bytes, use it directly.
 /// - Otherwise, SHA-256 hash the secret to produce a 32-byte key.
-pub fn derive_encryption_key(secret: &str) -> Result<Vec<u8>, EncryptionError> {
+///
+/// This function is infallible — any non-empty string produces a valid key.
+pub fn derive_encryption_key(secret: &str) -> Vec<u8> {
     // Try base64 first — allows users to provide a proper random key
     if let Ok(bytes) = general_purpose::STANDARD.decode(secret)
         && bytes.len() == 32
     {
-        return Ok(bytes);
+        return bytes;
     }
     // Try raw bytes
     let bytes = secret.as_bytes();
     if bytes.len() == 32 {
-        return Ok(bytes.to_vec());
+        return bytes.to_vec();
     }
     // Fall back to SHA-256 to derive a 32-byte key from any-length secret
     use sha2::{Digest, Sha256};
-    let hash = Sha256::digest(bytes);
-    Ok(hash.to_vec())
+    Sha256::digest(bytes).to_vec()
 }
 
 fn parse_key(key_bytes: &[u8]) -> Result<Key<Aes256Gcm>, EncryptionError> {
