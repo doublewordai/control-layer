@@ -666,8 +666,8 @@ chatCompletion();`;
                       />
                       <span className="w-[100px]">
                         {completionWindow === "high"
-                          ? "High priority"
-                          : "Standard priority"}
+                          ? "Async"
+                          : "Batch"}
                       </span>
                     </label>
                   )}
