@@ -1,0 +1,112 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT * FROM sync_operations WHERE connection_id = $1 ORDER BY created_at DESC",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "connection_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "status",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "strategy",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 4,
+        "name": "strategy_config",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 5,
+        "name": "files_found",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 6,
+        "name": "files_skipped",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 7,
+        "name": "files_ingested",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 8,
+        "name": "files_failed",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 9,
+        "name": "batches_created",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 10,
+        "name": "error_summary",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 11,
+        "name": "triggered_by",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 12,
+        "name": "sync_config",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 13,
+        "name": "started_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 14,
+        "name": "completed_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 15,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      true,
+      true,
+      false
+    ]
+  },
+  "hash": "cac4bb47e85df8aa279861339672c67681ab186ca890ce1dfef0d21588e2b07a"
+}

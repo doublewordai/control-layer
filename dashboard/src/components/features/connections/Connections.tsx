@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 import {
   Cable,
   Plus,
@@ -42,9 +42,9 @@ function CollapsibleSection({
   children,
 }: {
   title: string;
-  icon?: React.ReactNode;
+  icon?: ReactNode;
   defaultOpen?: boolean;
-  children: React.ReactNode;
+  children: ReactNode;
 }) {
   const [open, setOpen] = useState(defaultOpen);
   return (
