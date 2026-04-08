@@ -170,7 +170,6 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> TaskRunner<P> {
             }));
         }
 
-        // Batch activation workers
         // Batch activation workers (0 = disabled)
         for i in 0..sync_config.activate_workers {
             let mut worker = self.activate_batch_job.worker();

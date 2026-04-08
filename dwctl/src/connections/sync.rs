@@ -581,10 +581,10 @@ async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'static>(
             }
         }
 
-        // Handle any remaining partial line
-        let remaining = line_buf.trim().to_string();
+        // Handle any remaining partial line (same validation as main loop)
+        let remaining = line_buf.trim();
         if !remaining.is_empty()
-            && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&remaining)
+            && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(remaining)
         {
             let custom_id = parsed.get("custom_id").and_then(|v| v.as_str()).map(|s| s.to_string());
             let method = parsed.get("method").and_then(|v| v.as_str()).unwrap_or("POST").to_string();
@@ -597,17 +597,23 @@ async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'static>(
                 .unwrap_or("")
                 .to_string();
 
-            let template = fusillade::RequestTemplateInput {
-                custom_id,
-                endpoint: ai_base_url.clone(),
-                method,
-                path: url,
-                body,
-                model,
-                api_key: String::new(),
-            };
-            let _ = tx.send(FileStreamItem::Template(template)).await;
-            template_count += 1;
+            let valid = matches!(method.as_str(), "POST" | "GET" | "PUT" | "PATCH" | "DELETE")
+                && !model.is_empty()
+                && body.len() <= 10 * 1024 * 1024;
+
+            if valid {
+                let template = fusillade::RequestTemplateInput {
+                    custom_id,
+                    endpoint: ai_base_url.clone(),
+                    method,
+                    path: url,
+                    body,
+                    model,
+                    api_key: String::new(),
+                };
+                let _ = tx.send(FileStreamItem::Template(template)).await;
+                template_count += 1;
+            }
         }
 
         template_count
@@ -617,7 +623,7 @@ async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'static>(
     let rx_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
     let result = state.request_manager.create_file_stream(rx_stream).await;
 
-    let template_count = producer.await.unwrap_or(0);
+    let template_count = producer.await.map_err(|e| anyhow::anyhow!("producer task panicked: {e}"))?;
 
     match result {
         Ok(fusillade::FileStreamResult::Success(file_id)) => {

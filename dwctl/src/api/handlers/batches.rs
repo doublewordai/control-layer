@@ -153,18 +153,9 @@ fn to_batch_response_enriched(batch: fusillade::Batch, creator_email: Option<&st
         sync_id: raw_metadata.get("dw_sync_id").cloned(),
     };
 
-    // Build user-facing metadata: filter out internal keys (dw_*, request_source, created_by, etc.)
-    let internal_keys = [
-        "dw_source_id",
-        "dw_source_name",
-        "dw_sync_id",
-        "dw_external_key",
-        "request_source",
-        "created_by",
-        "created_by_email",
-        "context_name",
-        "context_type",
-    ];
+    // Build user-facing metadata: filter out internal dw_* keys.
+    // Keep request_source, created_by_email, context_name, context_type for backwards compat.
+    let internal_keys = ["dw_source_id", "dw_source_name", "dw_sync_id", "dw_external_key", "created_by"];
     let mut metadata: HashMap<String, String> = raw_metadata
         .into_iter()
         .filter(|(k, _)| !internal_keys.contains(&k.as_str()))
