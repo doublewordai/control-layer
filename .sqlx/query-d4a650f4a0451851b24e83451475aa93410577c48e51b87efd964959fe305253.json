@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, name FROM connections WHERE id = ANY($1) AND deleted_at IS NULL",
+  "query": "SELECT id, name, user_id FROM connections WHERE id = ANY($1) AND deleted_at IS NULL",
   "describe": {
     "columns": [
       {
@@ -12,6 +12,11 @@
         "ordinal": 1,
         "name": "name",
         "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "user_id",
+        "type_info": "Uuid"
       }
     ],
     "parameters": {
@@ -21,8 +26,9 @@
     },
     "nullable": [
       false,
+      false,
       false
     ]
   },
-  "hash": "a7702d5118c7977163cf63539b01818bc24024c2f2c3dea5630ee27fe13402dd"
+  "hash": "d4a650f4a0451851b24e83451475aa93410577c48e51b87efd964959fe305253"
 }
