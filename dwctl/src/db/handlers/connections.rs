@@ -551,9 +551,10 @@ impl<'c> SyncEntries<'c> {
         Ok(rows.into_iter().map(|r| (r.external_key, r.last_modified)).collect())
     }
 
+    /// Returns true if the row was updated, false if it was already deleted.
     #[instrument(skip(self), fields(id = %id, status = %status), err)]
-    pub async fn update_status(&mut self, id: Uuid, status: &str, error: Option<&str>) -> Result<()> {
-        sqlx::query!(
+    pub async fn update_status(&mut self, id: Uuid, status: &str, error: Option<&str>) -> Result<bool> {
+        let result = sqlx::query!(
             "UPDATE sync_entries SET status = $2, error = $3 WHERE id = $1 AND status != 'deleted'",
             id,
             status,
@@ -562,12 +563,13 @@ impl<'c> SyncEntries<'c> {
         .execute(&mut *self.db)
         .await?;
 
-        Ok(())
+        Ok(result.rows_affected() > 0)
     }
 
+    /// Returns true if the row was updated, false if it was already deleted.
     #[instrument(skip(self), fields(id = %id), err)]
-    pub async fn set_ingested(&mut self, id: Uuid, file_id: Uuid, template_count: i32) -> Result<()> {
-        sqlx::query!(
+    pub async fn set_ingested(&mut self, id: Uuid, file_id: Uuid, template_count: i32) -> Result<bool> {
+        let result = sqlx::query!(
             r#"
             UPDATE sync_entries
             SET status = 'ingested', file_id = $2, template_count = $3
@@ -580,7 +582,7 @@ impl<'c> SyncEntries<'c> {
         .execute(&mut *self.db)
         .await?;
 
-        Ok(())
+        Ok(result.rows_affected() > 0)
     }
 
     #[instrument(skip(self), fields(id = %id), err)]

@@ -667,9 +667,14 @@ async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'static>(
             //    (source_connection_id and source_external_key are already set
             //    via FileMetadata during create_file_stream)
             let mut conn = dwctl.acquire().await?;
-            SyncEntries::new(&mut conn)
+            let updated = SyncEntries::new(&mut conn)
                 .set_ingested(input.sync_entry_id, file_id.0, template_count)
                 .await?;
+            if !updated {
+                // Entry was soft-deleted mid-sync — abort without creating a batch
+                tracing::info!(sync_entry_id = %input.sync_entry_id, "Sync entry deleted during ingestion, skipping activation");
+                return Ok(());
+            }
             SyncOperations::new(&mut conn)
                 .increment_counter(input.sync_id, "files_ingested")
                 .await?;
@@ -713,12 +718,16 @@ async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + 'static>(
 
     let dwctl = &state.dwctl_pool;
 
-    // 1. Mark entry as activating
+    // 1. Mark entry as activating — abort if entry was soft-deleted
     {
         let mut conn = dwctl.acquire().await?;
-        SyncEntries::new(&mut conn)
+        let updated = SyncEntries::new(&mut conn)
             .update_status(input.sync_entry_id, "activating", None)
             .await?;
+        if !updated {
+            tracing::info!(sync_entry_id = %input.sync_entry_id, "Sync entry deleted, skipping batch activation");
+            return Ok(());
+        }
     }
 
     // 2. Load sync config

@@ -2206,7 +2206,7 @@ async fn setup_background_services(
 
     // Build the underway task runner for background jobs (batch population, sync pipeline, etc.)
     let encryption_key = match config.connections.encryption_key.as_deref().or(config.secret_key.as_deref()) {
-        Some(secret) if !secret.trim().is_empty() => Some(encryption::derive_encryption_key(secret)),
+        Some(secret) if !secret.trim().is_empty() => Some(encryption::derive_encryption_key(secret.trim())),
         Some(_) => {
             tracing::warn!("Encryption key is empty/whitespace — connection features will be unavailable");
             None
