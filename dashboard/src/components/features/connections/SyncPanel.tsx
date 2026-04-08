@@ -254,14 +254,14 @@ function SyncRow({
                 <div className="space-y-2">
                   <ProgressBar
                     label="Files Processed"
-                    value={s.files_ingested + s.files_failed}
+                    value={Math.min(s.files_ingested + s.files_failed, newFiles)}
                     max={newFiles}
                     colorClass={s.files_failed > 0 ? "bg-yellow-400/70" : "bg-blue-400/70"}
                   />
                   <ProgressBar
                     label="Batches Created"
                     value={s.batches_created}
-                    max={newFiles > 0 ? newFiles - s.files_failed : 0}
+                    max={s.files_ingested}
                     colorClass="bg-green-400/70"
                   />
                 </div>

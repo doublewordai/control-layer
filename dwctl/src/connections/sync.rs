@@ -163,9 +163,9 @@ pub async fn build_activate_batch_job<P: PoolProvider + Clone + Send + Sync + 's
                         let _ = crate::db::handlers::connections::SyncEntries::new(&mut conn)
                             .update_status(input.sync_entry_id, "failed", Some(&e.to_string()))
                             .await;
-                        // Don't increment files_failed here — the file was already
-                        // counted as files_ingested. Entry status is set to 'failed'
-                        // which is sufficient for try_complete to determine final status.
+                        let _ = crate::db::handlers::connections::SyncOperations::new(&mut conn)
+                            .increment_counter(input.sync_id, "files_failed")
+                            .await;
                         let _ = crate::db::handlers::connections::SyncOperations::new(&mut conn)
                             .try_complete(input.sync_id)
                             .await;
@@ -241,6 +241,8 @@ async fn run_sync_connection<P: PoolProvider + Clone + Send + Sync + 'static>(
 
             // List from provider to get real metadata (size, last_modified),
             // then filter to only the selected keys.
+            // TODO(perf): For large buckets, this full listing is O(bucket_size).
+            // Consider using HeadObject per key or a batched metadata call instead.
             let all_files = prov.list_files().await.map_err(|e| anyhow::anyhow!("{e:#}"))?;
             all_files.into_iter().filter(|f| key_set.contains(&f.key)).collect()
         }
