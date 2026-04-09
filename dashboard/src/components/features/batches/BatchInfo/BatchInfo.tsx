@@ -620,7 +620,7 @@ const BatchInfo: React.FC = () => {
                             <h4 className="text-sm font-medium text-gray-900 mb-3">
                               Token Usage
                             </h4>
-                            <div className="grid grid-cols-3 gap-4">
+                            <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
                               <div className="text-center p-3 rounded-lg">
                                 <p className="text-2xl font-bold">
                                   {analytics.total_prompt_tokens.toLocaleString()}
@@ -635,6 +635,14 @@ const BatchInfo: React.FC = () => {
                                 </p>
                                 <p className="text-xs text-gray-600 mt-1">
                                   Completion Tokens
+                                </p>
+                              </div>
+                              <div className="text-center p-3 rounded-lg">
+                                <p className="text-2xl font-bold">
+                                  {(analytics.total_reasoning_tokens ?? 0).toLocaleString()}
+                                </p>
+                                <p className="text-xs text-gray-600 mt-1">
+                                  Reasoning Tokens
                                 </p>
                               </div>
                               <div className="text-center p-3 rounded-lg">

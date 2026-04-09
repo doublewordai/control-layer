@@ -789,6 +789,7 @@ pub async fn get_batch_analytics(pool: &PgPool, batch_id: &Uuid) -> Result<Batch
             COUNT(*) as "total_requests!",
             COALESCE(SUM(prompt_tokens), 0) as "total_prompt_tokens!",
             COALESCE(SUM(completion_tokens), 0) as "total_completion_tokens!",
+            COALESCE(SUM(reasoning_tokens), 0) as "total_reasoning_tokens!",
             COALESCE(SUM(total_tokens), 0) as "total_tokens!",
             AVG(duration_ms) as "avg_duration_ms",
             AVG(duration_to_first_byte_ms) as "avg_ttfb_ms",
@@ -803,10 +804,12 @@ pub async fn get_batch_analytics(pool: &PgPool, batch_id: &Uuid) -> Result<Batch
     .fetch_one(pool)
     .await?;
 
+    let reasoning = metrics.total_reasoning_tokens.to_i64().unwrap_or(0);
     Ok(BatchAnalytics {
         total_requests: metrics.total_requests,
         total_prompt_tokens: metrics.total_prompt_tokens.to_i64().unwrap_or(0),
         total_completion_tokens: metrics.total_completion_tokens.to_i64().unwrap_or(0),
+        total_reasoning_tokens: if reasoning > 0 { Some(reasoning) } else { None },
         total_tokens: metrics.total_tokens.to_i64().unwrap_or(0),
         avg_duration_ms: metrics.avg_duration_ms.and_then(|d| d.to_f64()),
         avg_ttfb_ms: metrics.avg_ttfb_ms.and_then(|d| d.to_f64()),
@@ -829,6 +832,7 @@ pub async fn get_batches_analytics_bulk(pool: &PgPool, batch_ids: &[Uuid]) -> Re
             COUNT(*) as "total_requests!",
             COALESCE(SUM(prompt_tokens), 0) as "total_prompt_tokens!",
             COALESCE(SUM(completion_tokens), 0) as "total_completion_tokens!",
+            COALESCE(SUM(reasoning_tokens), 0) as "total_reasoning_tokens!",
             COALESCE(SUM(total_tokens), 0) as "total_tokens!",
             AVG(duration_ms) as "avg_duration_ms",
             AVG(duration_to_first_byte_ms) as "avg_ttfb_ms",
@@ -848,12 +852,14 @@ pub async fn get_batches_analytics_bulk(pool: &PgPool, batch_ids: &[Uuid]) -> Re
     let mut result = HashMap::new();
     for row in rows {
         if let Some(batch_id) = row.fusillade_batch_id {
+            let reasoning = row.total_reasoning_tokens.to_i64().unwrap_or(0);
             result.insert(
                 batch_id,
                 BatchAnalytics {
                     total_requests: row.total_requests,
                     total_prompt_tokens: row.total_prompt_tokens.to_i64().unwrap_or(0),
                     total_completion_tokens: row.total_completion_tokens.to_i64().unwrap_or(0),
+                    total_reasoning_tokens: if reasoning > 0 { Some(reasoning) } else { None },
                     total_tokens: row.total_tokens.to_i64().unwrap_or(0),
                     avg_duration_ms: row.avg_duration_ms.and_then(|d: Decimal| d.to_f64()),
                     avg_ttfb_ms: row.avg_ttfb_ms.and_then(|d: Decimal| d.to_f64()),
@@ -869,6 +875,7 @@ pub async fn get_batches_analytics_bulk(pool: &PgPool, batch_ids: &[Uuid]) -> Re
             total_requests: 0,
             total_prompt_tokens: 0,
             total_completion_tokens: 0,
+            total_reasoning_tokens: None,
             total_tokens: 0,
             avg_duration_ms: None,
             avg_ttfb_ms: None,
@@ -891,6 +898,7 @@ struct HttpAnalyticsRow {
     pub duration_ms: Option<i64>,
     pub prompt_tokens: Option<i64>,
     pub completion_tokens: Option<i64>,
+    pub reasoning_tokens: i64,
     pub total_tokens: Option<i64>,
     pub response_type: Option<String>,
     pub fusillade_batch_id: Option<Uuid>,
@@ -924,6 +932,7 @@ pub async fn list_http_analytics(
             duration_ms,
             prompt_tokens,
             completion_tokens,
+            reasoning_tokens,
             total_tokens,
             response_type,
             fusillade_batch_id,
@@ -981,6 +990,11 @@ pub async fn list_http_analytics(
             duration_ms: row.duration_ms,
             prompt_tokens: row.prompt_tokens,
             completion_tokens: row.completion_tokens,
+            reasoning_tokens: if row.reasoning_tokens > 0 {
+                Some(row.reasoning_tokens)
+            } else {
+                None
+            },
             total_tokens: row.total_tokens,
             response_type: row.response_type,
             fusillade_batch_id: row.fusillade_batch_id,
@@ -1668,6 +1682,7 @@ mod tests {
         duration_to_first_byte_ms: Option<f64>,
         prompt_tokens: i64,
         completion_tokens: i64,
+        reasoning_tokens: i64,
         input_price_per_token: Option<f64>,
         output_price_per_token: Option<f64>,
     }
@@ -1682,9 +1697,9 @@ mod tests {
             INSERT INTO http_analytics (
                 instance_id, correlation_id, timestamp, uri, method, status_code,
                 duration_ms, duration_to_first_byte_ms, model, prompt_tokens,
-                completion_tokens, total_tokens, fusillade_batch_id, fusillade_request_id,
+                completion_tokens, reasoning_tokens, total_tokens, fusillade_batch_id, fusillade_request_id,
                 input_price_per_token, output_price_per_token
-            ) VALUES ($1, $2, $3, '/ai/chat/completions', 'POST', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+            ) VALUES ($1, $2, $3, '/ai/chat/completions', 'POST', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
             "#,
             Uuid::new_v4(),
             1i64,
@@ -1695,6 +1710,7 @@ mod tests {
             data.model,
             data.prompt_tokens,
             data.completion_tokens,
+            data.reasoning_tokens,
             data.prompt_tokens + data.completion_tokens,
             data.fusillade_batch_id,
             data.fusillade_request_id,
@@ -1724,6 +1740,7 @@ mod tests {
                 duration_to_first_byte_ms: Some(50.0),
                 prompt_tokens: 100,
                 completion_tokens: 50,
+                reasoning_tokens: 20,
                 input_price_per_token: Some(0.00001),  // $0.00001 per token
                 output_price_per_token: Some(0.00003), // $0.00003 per token
             },
@@ -1735,6 +1752,7 @@ mod tests {
         assert_eq!(result.total_requests, 1);
         assert_eq!(result.total_prompt_tokens, 100);
         assert_eq!(result.total_completion_tokens, 50);
+        assert_eq!(result.total_reasoning_tokens, Some(20));
         assert_eq!(result.total_tokens, 150);
         assert_eq!(result.avg_duration_ms, Some(150.0));
         assert_eq!(result.avg_ttfb_ms, Some(50.0));
@@ -1763,6 +1781,7 @@ mod tests {
                 duration_to_first_byte_ms: Some(30.0),
                 prompt_tokens: 50,
                 completion_tokens: 25,
+                reasoning_tokens: 10,
                 input_price_per_token: Some(0.00001),
                 output_price_per_token: Some(0.00003),
             },
@@ -1781,6 +1800,7 @@ mod tests {
                 duration_to_first_byte_ms: Some(70.0),
                 prompt_tokens: 100,
                 completion_tokens: 50,
+                reasoning_tokens: 20,
                 input_price_per_token: Some(0.00001),
                 output_price_per_token: Some(0.00003),
             },
@@ -1799,6 +1819,7 @@ mod tests {
                 duration_to_first_byte_ms: Some(40.0),
                 prompt_tokens: 75,
                 completion_tokens: 35,
+                reasoning_tokens: 5,
                 input_price_per_token: Some(0.00002),
                 output_price_per_token: Some(0.00004),
             },
@@ -1810,6 +1831,7 @@ mod tests {
         assert_eq!(result.total_requests, 3);
         assert_eq!(result.total_prompt_tokens, 225); // 50 + 100 + 75
         assert_eq!(result.total_completion_tokens, 110); // 25 + 50 + 35
+        assert_eq!(result.total_reasoning_tokens, Some(35)); // 10 + 20 + 5
         assert_eq!(result.total_tokens, 335); // 75 + 150 + 110
 
         // Average duration: (100 + 200 + 150) / 3 = 150.0
@@ -1863,6 +1885,7 @@ mod tests {
                 duration_to_first_byte_ms: Some(30.0),
                 prompt_tokens: 50,
                 completion_tokens: 25,
+                reasoning_tokens: 0,
                 input_price_per_token: Some(0.00001),
                 output_price_per_token: Some(0.00003),
             },
@@ -1882,6 +1905,7 @@ mod tests {
                 duration_to_first_byte_ms: Some(40.0),
                 prompt_tokens: 100,
                 completion_tokens: 50,
+                reasoning_tokens: 0,
                 input_price_per_token: Some(0.00001),
                 output_price_per_token: Some(0.00003),
             },
@@ -1917,6 +1941,7 @@ mod tests {
                 duration_to_first_byte_ms: None, // No TTFB
                 prompt_tokens: 50,
                 completion_tokens: 25,
+                reasoning_tokens: 0,
                 input_price_per_token: None,  // No input price
                 output_price_per_token: None, // No output price
             },
@@ -1957,6 +1982,7 @@ mod tests {
                 duration_to_first_byte_ms: Some(30.0),
                 prompt_tokens: 50,
                 completion_tokens: 25,
+                reasoning_tokens: 0,
                 input_price_per_token: Some(0.00001),
                 output_price_per_token: Some(0.00003),
             },
@@ -1975,6 +2001,7 @@ mod tests {
                 duration_to_first_byte_ms: Some(45.0),
                 prompt_tokens: 75,
                 completion_tokens: 30,
+                reasoning_tokens: 0,
                 input_price_per_token: Some(0.00001),
                 output_price_per_token: Some(0.00003),
             },
@@ -1994,6 +2021,7 @@ mod tests {
                 duration_to_first_byte_ms: Some(40.0),
                 prompt_tokens: 100,
                 completion_tokens: 50,
+                reasoning_tokens: 0,
                 input_price_per_token: Some(0.00001),
                 output_price_per_token: Some(0.00003),
             },
@@ -2037,6 +2065,7 @@ mod tests {
                 duration_to_first_byte_ms: Some(20.0),
                 prompt_tokens: 50,
                 completion_tokens: 25,
+                reasoning_tokens: 0,
                 input_price_per_token: Some(0.00001),
                 output_price_per_token: Some(0.00003),
             },
@@ -2056,6 +2085,7 @@ mod tests {
                 duration_to_first_byte_ms: Some(10.0),
                 prompt_tokens: 100,
                 completion_tokens: 50,
+                reasoning_tokens: 0,
                 input_price_per_token: Some(0.000001),
                 output_price_per_token: Some(0.000002),
             },
@@ -2073,6 +2103,7 @@ mod tests {
                 duration_to_first_byte_ms: Some(15.0),
                 prompt_tokens: 200,
                 completion_tokens: 100,
+                reasoning_tokens: 0,
                 input_price_per_token: Some(0.000001),
                 output_price_per_token: Some(0.000002),
             },

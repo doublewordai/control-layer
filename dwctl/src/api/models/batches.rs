@@ -198,6 +198,11 @@ pub struct BatchAnalytics {
     #[schema(example = 25000)]
     pub total_completion_tokens: i64,
 
+    /// Total reasoning tokens across all requests
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = 12000)]
+    pub total_reasoning_tokens: Option<i64>,
+
     /// Total tokens (prompt + completion) across all requests
     #[schema(example = 75000)]
     pub total_tokens: i64,

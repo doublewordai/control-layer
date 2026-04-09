@@ -843,15 +843,23 @@ async fn test_request_logging_enabled(pool: PgPool) {
     // Make a test request to /ai/ endpoint which should be logged
     let _ = server.get("/ai/v1/models").await;
 
-    tokio::task::yield_now().await;
-    let result = repository
-        .query(RequestFilter {
-            method: Some("GET".into()),
-            ..Default::default()
-        })
-        .await
-        .expect("Should be able to query requests");
-    assert!(result.len() == 1);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    let result = loop {
+        let result = repository
+            .query(RequestFilter {
+                method: Some("GET".into()),
+                ..Default::default()
+            })
+            .await
+            .expect("Should be able to query requests");
+
+        if result.len() == 1 || tokio::time::Instant::now() >= deadline {
+            break result;
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    };
+    assert_eq!(result.len(), 1, "Request should be logged after async write-through completes");
 }
 
 #[sqlx::test]

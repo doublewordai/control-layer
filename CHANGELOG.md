@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.35.0](https://github.com/doublewordai/control-layer/compare/v8.34.0...v8.35.0) (2026-04-09)
+
+
+### Features
+
+* expose reasoning token analytics ([#939](https://github.com/doublewordai/control-layer/issues/939)) ([070fbaa](https://github.com/doublewordai/control-layer/commit/070fbaaf3a5166e56390fb8ac780dd9ab4e8817e))
+
 ## [8.34.0](https://github.com/doublewordai/control-layer/compare/v8.33.4...v8.34.0) (2026-04-09)
 
 

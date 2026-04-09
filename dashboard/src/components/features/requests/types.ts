@@ -11,6 +11,7 @@ export interface RequestsEntry {
   duration_ms?: number;
   prompt_tokens?: number;
   completion_tokens?: number;
+  reasoning_tokens?: number;
   total_tokens?: number;
   response_type?: string;
   fusillade_batch_id?: string;
