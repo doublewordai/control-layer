@@ -46,7 +46,6 @@ export default function BatchResults({
   const [modalContentType, setModalContentType] = useState<
     "input" | "response"
   >("input");
-
   // Search state with debounce for server-side filtering
   const [searchInput, setSearchInput] = useState("");
   const debouncedSearch = useDebounce(searchInput, 300);
@@ -225,7 +224,12 @@ export default function BatchResults({
       />
 
       {/* Content Modal */}
-      <Dialog open={contentModalOpen} onOpenChange={setContentModalOpen}>
+      <Dialog
+        open={contentModalOpen}
+        onOpenChange={(open) => {
+          setContentModalOpen(open);
+        }}
+      >
         <DialogContent className="sm:max-w-4xl max-h-[80vh] flex flex-col">
           <DialogHeader>
             <DialogTitle>
@@ -258,14 +262,18 @@ export default function BatchResults({
                   content = selectedResult.response_body;
                 }
 
-                return content ? (
-                  <CodeBlock language="json">
-                    {JSON.stringify(content, null, 2)}
-                  </CodeBlock>
-                ) : (
-                  <p className="text-gray-500 text-sm p-4">
-                    No content available
-                  </p>
+                return (
+                  <div className="space-y-4">
+                    {content ? (
+                      <CodeBlock language="json">
+                        {JSON.stringify(content, null, 2)}
+                      </CodeBlock>
+                    ) : (
+                      <p className="text-gray-500 text-sm p-4">
+                        No content available
+                      </p>
+                    )}
+                  </div>
                 );
               })()}
           </div>

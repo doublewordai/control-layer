@@ -90,6 +90,7 @@ pub struct HttpAnalyticsRow {
     pub duration_to_first_byte_ms: Option<i64>,
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
+    pub reasoning_tokens: i64,
     pub total_tokens: i64,
     pub response_type: String,
     pub user_id: Option<Uuid>,
@@ -131,6 +132,7 @@ pub struct UsageMetrics {
     pub duration_to_first_byte_ms: Option<i64>,
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
+    pub reasoning_tokens: i64,
     pub total_tokens: i64,
     pub response_type: String,
     pub server_address: String,
@@ -369,6 +371,7 @@ impl UsageMetrics {
             duration_to_first_byte_ms: Some(response_data.duration_to_first_byte.as_millis() as i64),
             prompt_tokens: response_metrics.prompt_tokens,
             completion_tokens: response_metrics.completion_tokens,
+            reasoning_tokens: response_metrics.reasoning_tokens,
             total_tokens: response_metrics.total_tokens,
             response_type: response_metrics.response_type,
             server_address: config.host.clone(),
@@ -409,9 +412,23 @@ impl Auth {
 struct TokenMetrics {
     prompt_tokens: i64,
     completion_tokens: i64,
+    reasoning_tokens: i64,
     total_tokens: i64,
     response_type: String,
     response_model: Option<String>,
+}
+
+fn extract_completion_reasoning_tokens(usage: &async_openai::types::chat::CompletionUsage) -> i64 {
+    usage
+        .completion_tokens_details
+        .as_ref()
+        .and_then(|d| d.reasoning_tokens)
+        .map(|t| t as i64)
+        .unwrap_or(0)
+}
+
+fn extract_response_reasoning_tokens(usage: &async_openai::types::responses::ResponseUsage) -> i64 {
+    usage.output_tokens_details.reasoning_tokens as i64
 }
 
 impl From<&AiResponse> for TokenMetrics {
@@ -422,6 +439,7 @@ impl From<&AiResponse> for TokenMetrics {
                     Self {
                         prompt_tokens: usage.prompt_tokens as i64,
                         completion_tokens: usage.completion_tokens as i64,
+                        reasoning_tokens: extract_completion_reasoning_tokens(usage),
                         total_tokens: usage.total_tokens as i64,
                         response_type: "chat_completion".to_string(),
                         response_model: Some(response.model.clone()),
@@ -430,6 +448,7 @@ impl From<&AiResponse> for TokenMetrics {
                     Self {
                         prompt_tokens: 0,
                         completion_tokens: 0,
+                        reasoning_tokens: 0,
                         total_tokens: 0,
                         response_type: "chat_completion".to_string(),
                         response_model: Some(response.model.clone()),
@@ -454,6 +473,7 @@ impl From<&AiResponse> for TokenMetrics {
                         Self {
                             prompt_tokens: usage.prompt_tokens as i64,
                             completion_tokens: usage.completion_tokens as i64,
+                            reasoning_tokens: extract_completion_reasoning_tokens(usage),
                             total_tokens: usage.total_tokens as i64,
                             response_type: "chat_completion_stream".to_string(),
                             response_model: model,
@@ -463,6 +483,7 @@ impl From<&AiResponse> for TokenMetrics {
                         Self {
                             prompt_tokens: 0,
                             completion_tokens: 0,
+                            reasoning_tokens: 0,
                             total_tokens: 0,
                             response_type: "chat_completion_stream".to_string(),
                             response_model: model,
@@ -472,6 +493,7 @@ impl From<&AiResponse> for TokenMetrics {
                     Self {
                         prompt_tokens: 0,
                         completion_tokens: 0,
+                        reasoning_tokens: 0,
                         total_tokens: 0,
                         response_type: "chat_completion_stream".to_string(),
                         response_model: model,
@@ -494,6 +516,7 @@ impl From<&AiResponse> for TokenMetrics {
                         Self {
                             prompt_tokens: usage.prompt_tokens as i64,
                             completion_tokens: usage.completion_tokens as i64,
+                            reasoning_tokens: extract_completion_reasoning_tokens(usage),
                             total_tokens: usage.total_tokens as i64,
                             response_type: "completion_stream".to_string(),
                             response_model: model,
@@ -502,6 +525,7 @@ impl From<&AiResponse> for TokenMetrics {
                         Self {
                             prompt_tokens: 0,
                             completion_tokens: 0,
+                            reasoning_tokens: 0,
                             total_tokens: 0,
                             response_type: "completion_stream".to_string(),
                             response_model: model,
@@ -511,6 +535,7 @@ impl From<&AiResponse> for TokenMetrics {
                     Self {
                         prompt_tokens: 0,
                         completion_tokens: 0,
+                        reasoning_tokens: 0,
                         total_tokens: 0,
                         response_type: "completion_stream".to_string(),
                         response_model: model,
@@ -522,6 +547,7 @@ impl From<&AiResponse> for TokenMetrics {
                     Self {
                         prompt_tokens: usage.prompt_tokens as i64,
                         completion_tokens: usage.completion_tokens as i64,
+                        reasoning_tokens: extract_completion_reasoning_tokens(usage),
                         total_tokens: usage.total_tokens as i64,
                         response_type: "completion".to_string(),
                         response_model: Some(response.model.clone()),
@@ -530,6 +556,7 @@ impl From<&AiResponse> for TokenMetrics {
                     Self {
                         prompt_tokens: 0,
                         completion_tokens: 0,
+                        reasoning_tokens: 0,
                         total_tokens: 0,
                         response_type: "completion".to_string(),
                         response_model: Some(response.model.clone()),
@@ -541,6 +568,7 @@ impl From<&AiResponse> for TokenMetrics {
                 Self {
                     prompt_tokens: usage.prompt_tokens as i64,
                     completion_tokens: 0, // Embeddings don't have completion tokens
+                    reasoning_tokens: 0,
                     total_tokens: usage.total_tokens as i64,
                     response_type: "embeddings".to_string(),
                     response_model: Some(response.model.clone()),
@@ -551,6 +579,7 @@ impl From<&AiResponse> for TokenMetrics {
                 Self {
                     prompt_tokens: usage.prompt_tokens as i64,
                     completion_tokens: 0, // Embeddings don't have completion tokens
+                    reasoning_tokens: 0,
                     total_tokens: usage.total_tokens as i64,
                     response_type: "base64_embeddings".to_string(),
                     response_model: Some(response.model.clone()),
@@ -561,6 +590,7 @@ impl From<&AiResponse> for TokenMetrics {
                     Self {
                         prompt_tokens: usage.input_tokens as i64,
                         completion_tokens: usage.output_tokens as i64,
+                        reasoning_tokens: extract_response_reasoning_tokens(usage),
                         total_tokens: usage.total_tokens as i64,
                         response_type: "response".to_string(),
                         response_model: Some(response.model.clone()),
@@ -569,6 +599,7 @@ impl From<&AiResponse> for TokenMetrics {
                     Self {
                         prompt_tokens: 0,
                         completion_tokens: 0,
+                        reasoning_tokens: 0,
                         total_tokens: 0,
                         response_type: "response".to_string(),
                         response_model: Some(response.model.clone()),
@@ -591,6 +622,7 @@ impl From<&AiResponse> for TokenMetrics {
                     Self {
                         prompt_tokens: usage.input_tokens as i64,
                         completion_tokens: usage.output_tokens as i64,
+                        reasoning_tokens: extract_response_reasoning_tokens(usage),
                         total_tokens: usage.total_tokens as i64,
                         response_type: "response_stream".to_string(),
                         response_model: model,
@@ -599,6 +631,7 @@ impl From<&AiResponse> for TokenMetrics {
                     Self {
                         prompt_tokens: 0,
                         completion_tokens: 0,
+                        reasoning_tokens: 0,
                         total_tokens: 0,
                         response_type: "response_stream".to_string(),
                         response_model: model,
@@ -608,6 +641,7 @@ impl From<&AiResponse> for TokenMetrics {
             AiResponse::Other(_) => Self {
                 prompt_tokens: 0,
                 completion_tokens: 0,
+                reasoning_tokens: 0,
                 total_tokens: 0,
                 response_type: "other".to_string(),
                 response_model: None,
@@ -1197,6 +1231,7 @@ mod tests {
         assert_eq!(metrics.duration_ms, 500);
         assert_eq!(metrics.prompt_tokens, 15);
         assert_eq!(metrics.completion_tokens, 25);
+        assert_eq!(metrics.reasoning_tokens, 0);
         assert_eq!(metrics.total_tokens, 40);
         assert_eq!(metrics.response_type, "chat_completion");
     }
@@ -1258,8 +1293,65 @@ mod tests {
 
         assert_eq!(metrics.prompt_tokens, 8);
         assert_eq!(metrics.completion_tokens, 12);
+        assert_eq!(metrics.reasoning_tokens, 0);
         assert_eq!(metrics.total_tokens, 20);
         assert_eq!(metrics.response_type, "chat_completion_stream");
+    }
+
+    #[test]
+    fn test_analytics_metrics_extract_chat_reasoning_tokens() {
+        let instance_id = Uuid::new_v4();
+        let request_json = r#"{"model": "gpt-5", "messages": [{"role": "user", "content": "hello"}]}"#;
+        let request_data = RequestData {
+            correlation_id: 12345,
+            timestamp: SystemTime::now(),
+            method: Method::POST,
+            uri: "/v1/chat/completions".parse::<Uri>().unwrap(),
+            headers: HashMap::new(),
+            body: Some(Bytes::from(request_json)),
+            trace_id: None,
+            span_id: None,
+        };
+
+        let response_data = ResponseData {
+            correlation_id: 12345,
+            timestamp: SystemTime::now(),
+            status: StatusCode::OK,
+            headers: HashMap::new(),
+            body: None,
+            duration: Duration::from_millis(500),
+            duration_to_first_byte: Duration::from_millis(50),
+        };
+
+        let chat_response: CreateChatCompletionResponse = serde_json::from_value(serde_json::json!({
+            "id": "chatcmpl-123",
+            "object": "chat.completion",
+            "created": 1677652288,
+            "model": "gpt-5",
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 15,
+                "completion_tokens": 25,
+                "total_tokens": 40,
+                "completion_tokens_details": {
+                    "reasoning_tokens": 11
+                }
+            }
+        }))
+        .unwrap();
+
+        let parsed_response = AiResponse::ChatCompletions(chat_response);
+        let metrics = UsageMetrics::extract(
+            instance_id,
+            &request_data,
+            &response_data,
+            &parsed_response,
+            &crate::test::utils::create_test_config(),
+        );
+
+        assert_eq!(metrics.reasoning_tokens, 11);
+        assert_eq!(metrics.completion_tokens, 25);
+        assert_eq!(metrics.total_tokens, 40);
     }
 
     #[test]
@@ -1501,10 +1593,35 @@ mod tests {
                 let usage = resp.usage.expect("usage should be present");
                 assert_eq!(usage.input_tokens, 15);
                 assert_eq!(usage.output_tokens, 25);
+                assert_eq!(usage.output_tokens_details.reasoning_tokens, 0);
                 assert_eq!(usage.total_tokens, 40);
             }
             _ => panic!("expected AiResponse::Responses"),
         }
+    }
+
+    #[test]
+    fn test_analytics_metrics_extract_responses_reasoning_tokens() {
+        let instance_id = Uuid::new_v4();
+        let request_data = responses_request_data(None);
+        let response_data = responses_response_data(
+            r#"{"id":"resp_123","object":"response","created_at":1234567890,"model":"gpt-4o","status":"completed","output":[],"usage":{"input_tokens":15,"input_tokens_details":{"cached_tokens":0},"output_tokens":25,"output_tokens_details":{"reasoning_tokens":9},"total_tokens":40}}"#
+                .to_string(),
+        );
+
+        let parsed_response = parse_ai_response(&request_data, &response_data).unwrap();
+        let metrics = UsageMetrics::extract(
+            instance_id,
+            &request_data,
+            &response_data,
+            &parsed_response,
+            &crate::test::utils::create_test_config(),
+        );
+
+        assert_eq!(metrics.reasoning_tokens, 9);
+        assert_eq!(metrics.completion_tokens, 25);
+        assert_eq!(metrics.total_tokens, 40);
+        assert_eq!(metrics.response_type, "response");
     }
 
     #[test]

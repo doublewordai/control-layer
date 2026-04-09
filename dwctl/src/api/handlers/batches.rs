@@ -3682,4 +3682,343 @@ mod tests {
             );
         }
     }
+
+    /// Test that batch results correctly include reasoning tokens in response bodies
+    /// when the upstream model returns thinking/reasoning token usage.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_batch_results_with_reasoning_tokens(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        let deployment = create_test_deployment(&pool, user.id, "thinking-model-endpoint", "thinking-model").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        let file_id = Uuid::new_v4();
+        let batch_id = Uuid::new_v4();
+
+        sqlx::query(
+            "INSERT INTO fusillade.files (id, name, status, created_at, updated_at) VALUES ($1, 'thinking-test.jsonl', 'processed', NOW(), NOW())",
+        )
+        .bind(file_id)
+        .execute(&pool)
+        .await
+        .expect("Failed to create file");
+
+        sqlx::query(
+            "INSERT INTO fusillade.batches (id, created_by, file_id, endpoint, completion_window, expires_at, created_at, total_requests) VALUES ($1, $2, $3, '/v1/chat/completions', '24h', NOW() + interval '24 hours', NOW(), 3)",
+        )
+        .bind(batch_id)
+        .bind(user.id.to_string())
+        .bind(file_id)
+        .execute(&pool)
+        .await
+        .expect("Failed to create batch");
+
+        // Three requests with different reasoning token amounts
+        let thinking_responses = vec![
+            (
+                "req-think-1",
+                serde_json::json!({
+                    "id": "chatcmpl-think-1",
+                    "object": "chat.completion",
+                    "model": "thinking-model",
+                    "choices": [{"index": 0, "message": {"role": "assistant", "content": "The capital of France is Paris."}, "finish_reason": "stop"}],
+                    "usage": {
+                        "prompt_tokens": 22,
+                        "completion_tokens": 891,
+                        "total_tokens": 913,
+                        "completion_tokens_details": {
+                            "reasoning_tokens": 733,
+                            "audio_tokens": 0,
+                            "image_tokens": 0
+                        },
+                        "prompt_tokens_details": {
+                            "audio_tokens": 0,
+                            "cached_tokens": 0,
+                            "cache_write_tokens": 0,
+                            "video_tokens": 0
+                        }
+                    }
+                }),
+            ),
+            (
+                "req-think-2",
+                serde_json::json!({
+                    "id": "chatcmpl-think-2",
+                    "object": "chat.completion",
+                    "model": "thinking-model",
+                    "choices": [{"index": 0, "message": {"role": "assistant", "content": "Quantum entanglement is..."}, "finish_reason": "stop"}],
+                    "usage": {
+                        "prompt_tokens": 20,
+                        "completion_tokens": 2101,
+                        "total_tokens": 2121,
+                        "completion_tokens_details": {
+                            "reasoning_tokens": 1412,
+                            "audio_tokens": 0,
+                            "image_tokens": 0
+                        },
+                        "prompt_tokens_details": {
+                            "audio_tokens": 0,
+                            "cached_tokens": 0,
+                            "cache_write_tokens": 0,
+                            "video_tokens": 0
+                        }
+                    }
+                }),
+            ),
+            (
+                "req-think-3",
+                serde_json::json!({
+                    "id": "chatcmpl-think-3",
+                    "object": "chat.completion",
+                    "model": "thinking-model",
+                    "choices": [{"index": 0, "message": {"role": "assistant", "content": "The ocean is vast..."}, "finish_reason": "stop"}],
+                    "usage": {
+                        "prompt_tokens": 18,
+                        "completion_tokens": 1813,
+                        "total_tokens": 1831,
+                        "completion_tokens_details": {
+                            "reasoning_tokens": 1735,
+                            "audio_tokens": 0,
+                            "image_tokens": 0
+                        },
+                        "prompt_tokens_details": {
+                            "audio_tokens": 0,
+                            "cached_tokens": 0,
+                            "cache_write_tokens": 0,
+                            "video_tokens": 0
+                        }
+                    }
+                }),
+            ),
+        ];
+
+        for (custom_id, response_body) in &thinking_responses {
+            let template_id = Uuid::new_v4();
+            let request_id = Uuid::new_v4();
+            let body = serde_json::json!({"model": "thinking-model", "messages": [{"role": "user", "content": "Test"}], "thinking": {"type": "enabled", "budget_tokens": 4096}});
+
+            sqlx::query(
+                "INSERT INTO fusillade.request_templates (id, file_id, model, api_key, endpoint, path, body, custom_id, method) VALUES ($1, $2, 'thinking-model', 'test-key', 'http://test', '/v1/chat/completions', $3, $4, 'POST')",
+            )
+            .bind(template_id)
+            .bind(file_id)
+            .bind(serde_json::to_string(&body).unwrap())
+            .bind(*custom_id)
+            .execute(&pool)
+            .await
+            .expect("Failed to create template");
+
+            sqlx::query(
+                "INSERT INTO fusillade.requests (id, batch_id, template_id, model, state, response_status, response_body, created_at, completed_at) VALUES ($1, $2, $3, 'thinking-model', 'completed', 200, $4, NOW(), NOW())",
+            )
+            .bind(request_id)
+            .bind(batch_id)
+            .bind(template_id)
+            .bind(serde_json::to_string(response_body).unwrap())
+            .execute(&pool)
+            .await
+            .expect("Failed to create completed request");
+        }
+
+        let auth = add_auth_headers(&user);
+
+        // Fetch results and verify reasoning tokens are preserved in response bodies
+        let response = app
+            .get(&format!("/ai/v1/batches/{}/results", batch_id))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+
+        response.assert_status(StatusCode::OK);
+        response.assert_header("content-type", "application/x-ndjson");
+        response.assert_header("X-Incomplete", "false");
+
+        let body = response.text();
+        let lines: Vec<&str> = body.trim().lines().collect();
+        assert_eq!(lines.len(), 3, "Should return all 3 thinking results");
+
+        let mut total_prompt = 0i64;
+        let mut total_completion = 0i64;
+        let mut total_reasoning = 0i64;
+        let mut total_tokens = 0i64;
+
+        for line in &lines {
+            let item: serde_json::Value = serde_json::from_str(line).expect("Each line should be valid JSON");
+            assert_eq!(item["status"].as_str().unwrap(), "completed");
+
+            let response_body = &item["response_body"];
+            let usage = &response_body["usage"];
+
+            // Verify usage fields exist
+            assert!(usage["prompt_tokens"].is_number(), "prompt_tokens should be present");
+            assert!(usage["completion_tokens"].is_number(), "completion_tokens should be present");
+            assert!(usage["total_tokens"].is_number(), "total_tokens should be present");
+
+            // Verify reasoning tokens in completion_tokens_details
+            let details = &usage["completion_tokens_details"];
+            assert!(
+                details["reasoning_tokens"].is_number(),
+                "reasoning_tokens should be present in completion_tokens_details"
+            );
+
+            let prompt = usage["prompt_tokens"].as_i64().unwrap();
+            let completion = usage["completion_tokens"].as_i64().unwrap();
+            let reasoning = details["reasoning_tokens"].as_i64().unwrap();
+            let total = usage["total_tokens"].as_i64().unwrap();
+
+            // Reasoning tokens should be a subset of completion tokens
+            assert!(
+                reasoning <= completion,
+                "reasoning_tokens ({}) should be <= completion_tokens ({})",
+                reasoning,
+                completion
+            );
+            // Total = prompt + completion (reasoning is subset, not additive)
+            assert_eq!(total, prompt + completion, "total_tokens should equal prompt + completion");
+
+            total_prompt += prompt;
+            total_completion += completion;
+            total_reasoning += reasoning;
+            total_tokens += total;
+        }
+
+        // Verify aggregate totals match expected values
+        assert_eq!(total_prompt, 60, "Total prompt tokens should be 60");
+        assert_eq!(total_completion, 4805, "Total completion tokens should be 4805");
+        assert_eq!(total_reasoning, 3880, "Total reasoning tokens should be 3880");
+        assert_eq!(total_tokens, 4865, "Total tokens should be 4865");
+    }
+
+    /// Test that batch analytics correctly aggregates reasoning tokens from http_analytics
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_batch_analytics_with_reasoning_tokens(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        let deployment = create_test_deployment(&pool, user.id, "thinking-analytics-endpoint", "thinking-model").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        // Upload a batch file
+        let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"thinking-model","messages":[{"role":"user","content":"Hello"}],"thinking":{"type":"enabled","budget_tokens":4096}}}"#;
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("thinking-test.jsonl");
+        let multipart = axum_test::multipart::MultipartForm::new()
+            .add_part("file", file_part)
+            .add_part("purpose", axum_test::multipart::Part::text("batch"));
+        let upload_resp = app
+            .post("/ai/v1/files")
+            .multipart(multipart)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        upload_resp.assert_status(StatusCode::CREATED);
+        let file: serde_json::Value = upload_resp.json();
+        let file_id = file["id"].as_str().unwrap();
+
+        // Create batch
+        let create_req = CreateBatchRequest {
+            input_file_id: file_id.to_string(),
+            endpoint: "/v1/chat/completions".to_string(),
+            completion_window: "24h".to_string(),
+            metadata: None,
+        };
+
+        let create_resp = app
+            .post("/ai/v1/batches")
+            .json(&create_req)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        create_resp.assert_status(StatusCode::CREATED);
+        let batch: serde_json::Value = create_resp.json();
+        let batch_id = batch["id"].as_str().unwrap();
+        let batch_uuid = Uuid::parse_str(batch_id).unwrap();
+
+        // Insert analytics rows with reasoning tokens directly into http_analytics
+        let analytics_data = vec![(22i64, 891i64, 733i64, 913i64), (20, 2101, 1412, 2121), (18, 1813, 1735, 1831)];
+
+        for (prompt, completion, reasoning, total) in &analytics_data {
+            sqlx::query!(
+                r#"
+                INSERT INTO http_analytics (
+                    instance_id, correlation_id, timestamp, uri, method, status_code,
+                    duration_ms, model, prompt_tokens, completion_tokens, reasoning_tokens,
+                    total_tokens, fusillade_batch_id
+                ) VALUES ($1, $2, NOW(), '/ai/v1/chat/completions', 'POST', 200,
+                    100, 'thinking-model', $3, $4, $5, $6, $7)
+                "#,
+                Uuid::new_v4(),
+                (rand::random::<u64>() >> 1) as i64,
+                prompt,
+                completion,
+                reasoning,
+                total,
+                batch_uuid,
+            )
+            .execute(&pool)
+            .await
+            .expect("Failed to insert analytics data");
+        }
+
+        let auth = add_auth_headers(&user);
+
+        // Fetch analytics and verify reasoning tokens are aggregated correctly
+        let analytics_resp = app
+            .get(&format!("/ai/v1/batches/{}/analytics", batch_id))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+        analytics_resp.assert_status(StatusCode::OK);
+        let analytics: serde_json::Value = analytics_resp.json();
+
+        assert_eq!(
+            analytics["total_prompt_tokens"].as_i64().unwrap(),
+            60,
+            "Aggregated prompt tokens should be 60"
+        );
+        assert_eq!(
+            analytics["total_completion_tokens"].as_i64().unwrap(),
+            4805,
+            "Aggregated completion tokens should be 4805"
+        );
+        assert_eq!(
+            analytics["total_reasoning_tokens"].as_i64().unwrap(),
+            3880,
+            "Aggregated reasoning tokens should be 3880"
+        );
+        assert_eq!(
+            analytics["total_tokens"].as_i64().unwrap(),
+            4865,
+            "Aggregated total tokens should be 4865"
+        );
+        assert_eq!(analytics["total_requests"].as_i64().unwrap(), 3, "Should have 3 analytics records");
+
+        // Also verify via include=analytics on the list endpoint
+        let list_resp = app
+            .get("/ai/v1/batches?include=analytics")
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+        list_resp.assert_status_ok();
+        let list_body: serde_json::Value = list_resp.json();
+        let batches = list_body["data"].as_array().unwrap();
+        let our_batch = batches
+            .iter()
+            .find(|b| b["id"].as_str().unwrap() == batch_id)
+            .expect("Our batch should be in the list");
+
+        let list_analytics = &our_batch["analytics"];
+        assert!(list_analytics.is_object(), "analytics should be present with include=analytics");
+        assert_eq!(
+            list_analytics["total_reasoning_tokens"].as_i64().unwrap(),
+            3880,
+            "Reasoning tokens should match in list analytics"
+        );
+    }
 }

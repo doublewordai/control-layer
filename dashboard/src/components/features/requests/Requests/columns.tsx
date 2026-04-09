@@ -146,6 +146,7 @@ export const createRequestColumns = (): ColumnDef<RequestsEntry>[] => [
       const request = row.original;
       const promptTokens = request.prompt_tokens;
       const completionTokens = request.completion_tokens;
+      const reasoningTokens = request.reasoning_tokens;
 
       if (promptTokens === undefined && completionTokens === undefined) {
         return <span className="text-gray-400">-</span>;
@@ -162,6 +163,7 @@ export const createRequestColumns = (): ColumnDef<RequestsEntry>[] => [
             <div className="text-xs">
               <div>Prompt: {promptTokens?.toLocaleString() ?? "-"}</div>
               <div>Completion: {completionTokens?.toLocaleString() ?? "-"}</div>
+              <div>Reasoning: {reasoningTokens?.toLocaleString() ?? "-"}</div>
             </div>
           </TooltipContent>
         </Tooltip>

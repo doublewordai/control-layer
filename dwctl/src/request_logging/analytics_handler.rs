@@ -230,6 +230,7 @@ impl RequestHandler for AnalyticsHandler {
                 duration_to_first_byte_ms: metrics.duration_to_first_byte_ms,
                 prompt_tokens: metrics.prompt_tokens,
                 completion_tokens: metrics.completion_tokens,
+                reasoning_tokens: metrics.reasoning_tokens,
                 total_tokens: metrics.total_tokens,
                 response_type: metrics.response_type,
                 server_address: metrics.server_address,

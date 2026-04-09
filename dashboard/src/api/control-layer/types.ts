@@ -602,6 +602,7 @@ export interface AnalyticsEntry {
   duration_ms?: number;
   prompt_tokens?: number;
   completion_tokens?: number;
+  reasoning_tokens?: number;
   total_tokens?: number;
   response_type?: string;
   fusillade_batch_id?: string;
@@ -1303,6 +1304,7 @@ export interface BatchAnalytics {
   total_requests: number;
   total_prompt_tokens: number;
   total_completion_tokens: number;
+  total_reasoning_tokens?: number | null;
   total_tokens: number;
   avg_duration_ms?: number | null;
   avg_ttfb_ms?: number | null;
