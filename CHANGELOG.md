@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.33.4](https://github.com/doublewordai/control-layer/compare/v8.33.3...v8.33.4) (2026-04-09)
+
+
+### Bug Fixes
+
+* update cost names ([#963](https://github.com/doublewordai/control-layer/issues/963)) ([a671cde](https://github.com/doublewordai/control-layer/commit/a671cde8a491cecc3832b9c27e2a5ad9c810a70d))
+
 ## [8.33.3](https://github.com/doublewordai/control-layer/compare/v8.33.2...v8.33.3) (2026-04-08)
 
 
