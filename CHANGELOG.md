@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.34.0](https://github.com/doublewordai/control-layer/compare/v8.33.4...v8.34.0) (2026-04-09)
+
+
+### Features
+
+* external connections ([#956](https://github.com/doublewordai/control-layer/issues/956)) ([61df97b](https://github.com/doublewordai/control-layer/commit/61df97b20e7895d9f01224b9d37a222400abcb35))
+
 ## [8.33.4](https://github.com/doublewordai/control-layer/compare/v8.33.3...v8.33.4) (2026-04-09)
 
 
