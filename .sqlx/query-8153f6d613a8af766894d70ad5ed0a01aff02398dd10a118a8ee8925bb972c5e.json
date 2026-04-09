@@ -1,0 +1,34 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT external_key, MAX(external_last_modified) AS \"last_modified\",\n                   -- Use the most recent terminal status per key\n                   (ARRAY_AGG(status ORDER BY updated_at DESC))[1] AS \"status!\"\n            FROM sync_entries\n            WHERE connection_id = $1\n              AND status IN ('activated', 'failed')\n            GROUP BY external_key\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "external_key",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "last_modified",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 2,
+        "name": "status!",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      null,
+      null
+    ]
+  },
+  "hash": "8153f6d613a8af766894d70ad5ed0a01aff02398dd10a118a8ee8925bb972c5e"
+}

@@ -67,6 +67,16 @@
         "ordinal": 12,
         "name": "updated_at",
         "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 13,
+        "name": "skipped_lines",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 14,
+        "name": "validation_errors",
+        "type_info": "Jsonb"
       }
     ],
     "parameters": {
@@ -91,7 +101,9 @@
       true,
       true,
       false,
-      false
+      false,
+      false,
+      true
     ]
   },
   "hash": "4db70866e8d5b5d5519daf941211865849b4857f9f981cbd056f718300b26df2"

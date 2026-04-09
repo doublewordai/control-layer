@@ -1470,6 +1470,10 @@ export interface SyncEntry {
   batch_id?: string | null;
   template_count?: number | null;
   error?: string | null;
+  /** Lines that couldn't be parsed as JSON (garbled) */
+  skipped_lines?: number;
+  /** Per-line validation errors for parseable-but-invalid lines */
+  validation_errors?: Array<{ line: number; error: string }> | null;
   created_at: number;
   updated_at: number;
 }
@@ -1498,6 +1502,8 @@ export interface TriggerSyncRequest {
 export interface SyncedKey {
   key: string;
   last_modified?: number | null;
+  /** "activated" or "failed" */
+  status: string;
 }
 
 // ===== ORGANIZATION TYPES =====

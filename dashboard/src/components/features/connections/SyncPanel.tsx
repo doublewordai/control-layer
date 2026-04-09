@@ -146,6 +146,12 @@ function SyncEntryList({
               {entry.template_count != null && (
                 <span className="text-xs text-muted-foreground">
                   {entry.template_count.toLocaleString()} rows
+                  {(entry.skipped_lines ?? 0) > 0 && (
+                    <span className="text-amber-600"> ({entry.skipped_lines} skipped)</span>
+                  )}
+                  {entry.validation_errors && entry.validation_errors.length > 0 && (
+                    <span className="text-amber-600"> ({entry.validation_errors.length} invalid)</span>
+                  )}
                 </span>
               )}
               {entry.external_size_bytes != null && (
@@ -154,18 +160,37 @@ function SyncEntryList({
                 </span>
               )}
               <EntryStatusBadge status={entry.status} />
-              {entry.batch_id && (
+              {entry.batch_id ? (
                 <a
                   href={`/batches?search=${entry.batch_id}`}
-                  className="text-xs text-blue-600 hover:underline"
+                  className="text-xs text-blue-600 hover:underline w-10"
                 >
                   batch
                 </a>
+              ) : (
+                <span className="w-10" />
               )}
             </div>
           </div>
           {entry.error && (
             <p className="text-xs text-red-500 mt-1 ml-6">{entry.error}</p>
+          )}
+          {(entry.skipped_lines ?? 0) > 0 && (
+            <p className="text-xs text-amber-600 mt-1 ml-6">
+              {entry.skipped_lines} line{entry.skipped_lines !== 1 ? "s" : ""} could not be parsed (invalid JSON)
+            </p>
+          )}
+          {entry.validation_errors && entry.validation_errors.length > 0 && (
+            <details className="mt-1 ml-6">
+              <summary className="text-xs text-amber-600 cursor-pointer">
+                {entry.validation_errors.length} line{entry.validation_errors.length !== 1 ? "s" : ""} failed validation
+              </summary>
+              <ul className="text-xs text-muted-foreground mt-1 space-y-0.5 ml-2 max-h-40 overflow-y-auto">
+                {entry.validation_errors.map((ve, i) => (
+                  <li key={i}>Line {ve.line}: {ve.error}</li>
+                ))}
+              </ul>
+            </details>
           )}
         </div>
       ))}

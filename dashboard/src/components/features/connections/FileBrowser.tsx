@@ -7,6 +7,7 @@ import {
   Search,
   RefreshCw,
   CheckCircle2,
+  XCircle,
 } from "lucide-react";
 import { toast } from "sonner";
 import { useConnectionFiles, useSyncedKeys, useTriggerSync } from "@/api/control-layer/hooks";
@@ -94,14 +95,12 @@ export function FileBrowser({ connectionId }: { connectionId: string }) {
     }
   }, [syncedKeys, syncingKeys, files]);
 
-  // Track synced keys with their last_modified timestamps.
-  // A file is "synced" if its key exists and last_modified matches.
-  // A file is "modified" if its key exists but last_modified is newer.
+  // Track synced keys with their last_modified timestamps and status.
   const syncedKeyMap = useMemo(() => {
-    const map = new Map<string, number | null>();
+    const map = new Map<string, { lastModified: number | null; status: string }>();
     if (syncedKeys) {
       for (const sk of syncedKeys) {
-        map.set(sk.key, sk.last_modified ?? null);
+        map.set(sk.key, { lastModified: sk.last_modified ?? null, status: sk.status });
       }
     }
     return map;
@@ -109,12 +108,15 @@ export function FileBrowser({ connectionId }: { connectionId: string }) {
 
   const isSyncing = (file: ExternalFile) => syncingKeys.has(file.key);
 
-  const getStatus = (file: ExternalFile): "synced" | "modified" | "syncing" | "new" => {
+  const getStatus = (file: ExternalFile): "synced" | "failed" | "modified" | "syncing" | "new" => {
     // Syncing takes priority — user just triggered this
     if (isSyncing(file)) return "syncing";
-    if (!syncedKeyMap.has(file.key)) return "new";
+    const entry = syncedKeyMap.get(file.key);
+    if (!entry) return "new";
+    // Check if the sync failed
+    if (entry.status === "failed") return "failed";
     // Key was synced — check if it's been modified since
-    const syncedTs = syncedKeyMap.get(file.key);
+    const syncedTs = entry.lastModified;
     const fileTs = file.last_modified ?? null;
     if (syncedTs != null && fileTs != null && fileTs > syncedTs) return "modified";
     return "synced";
@@ -368,6 +370,11 @@ export function FileBrowser({ connectionId }: { connectionId: string }) {
                       <span className="inline-flex items-center gap-1 text-xs text-green-600">
                         <CheckCircle2 className="h-3 w-3" />
                         Synced
+                      </span>
+                    ) : status === "failed" ? (
+                      <span className="inline-flex items-center gap-1 text-xs text-red-500">
+                        <XCircle className="h-3 w-3" />
+                        Failed
                       </span>
                     ) : status === "syncing" ? (
                       <span className="inline-flex items-center gap-1 text-xs text-blue-500">

@@ -53,6 +53,11 @@ pub struct SyncEntry {
     pub batch_id: Option<Uuid>,
     pub template_count: Option<i32>,
     pub error: Option<String>,
+    /// Number of lines that couldn't be parsed as JSON (tier 1 — garbled lines).
+    pub skipped_lines: i32,
+    /// Per-line validation errors for parseable-but-invalid lines (tier 2).
+    /// Schema: [{"line": 3, "error": "missing model field"}, ...]
+    pub validation_errors: Option<serde_json::Value>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

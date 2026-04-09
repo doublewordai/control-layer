@@ -453,11 +453,13 @@ async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'static>(
         };
 
         if tx.send(FileStreamItem::Metadata(metadata)).await.is_err() {
-            return 0i32;
+            return (0i32, 0i32, Vec::new());
         }
 
         let mut line_buf = String::new();
         let mut template_count: i32 = 0;
+        let mut skipped_lines: i32 = 0;
+        let mut validation_errors: Vec<(i32, String)> = Vec::new();
         let mut line_number: u64 = 0;
         let mut stream = byte_stream;
         // Buffer for incomplete UTF-8 sequences split across chunk boundaries.
@@ -469,7 +471,7 @@ async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'static>(
                 Err(e) => {
                     tracing::error!(error = %e, "Error reading from provider stream");
                     let _ = tx.send(FileStreamItem::Abort).await;
-                    return template_count;
+                    return (template_count, skipped_lines, validation_errors);
                 }
             };
 
@@ -518,7 +520,10 @@ async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'static>(
                 }
                 line_number += 1;
 
-                // Parse as OpenAI batch request format with validation
+                // Three-tier error handling:
+                // Tier 1: non-JSON → skip entirely (garbled line)
+                // Tier 2: JSON but invalid → still ingest as template, record error
+                // Tier 3: valid → ingest normally
                 match serde_json::from_str::<serde_json::Value>(line) {
                     Ok(parsed) => {
                         let custom_id = parsed.get("custom_id").and_then(|v| v.as_str()).map(|s| s.to_string());
@@ -534,31 +539,29 @@ async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'static>(
                             .unwrap_or("")
                             .to_string();
 
-                        // Validate method (same allowlist as file upload)
+                        // Collect validation errors (tier 2) — still ingest the template
+                        let mut line_error: Option<String> = None;
+
                         if !matches!(method.as_str(), "POST" | "GET" | "PUT" | "PATCH" | "DELETE") {
-                            tracing::warn!(line_num = line_number, method = %method, "Skipping line with invalid HTTP method");
-                            continue;
+                            line_error = Some(format!("invalid HTTP method: {method}"));
+                        } else if model.is_empty() {
+                            line_error = Some("missing model field in body".to_string());
+                        } else {
+                            const MAX_BODY_SIZE: usize = 10 * 1024 * 1024;
+                            if body.len() > MAX_BODY_SIZE {
+                                line_error = Some(format!("oversized body: {} bytes", body.len()));
+                            }
                         }
-
-                        // Validate model is present
-                        if model.is_empty() {
-                            tracing::warn!(line_num = line_number, "Skipping line with missing model field");
-                            continue;
-                        }
-
-                        // Validate body size (10MB default limit)
-                        const MAX_BODY_SIZE: usize = 10 * 1024 * 1024;
-                        if body.len() > MAX_BODY_SIZE {
-                            tracing::warn!(line_num = line_number, body_size = body.len(), "Skipping line with oversized body");
-                            continue;
-                        }
-
-                        // Validate custom_id doesn't contain control characters
-                        if let Some(ref cid) = custom_id
+                        if line_error.is_none()
+                            && let Some(ref cid) = custom_id
                             && cid.chars().any(|c| c.is_control())
                         {
-                            tracing::warn!(line_num = line_number, "Skipping line with control characters in custom_id");
-                            continue;
+                            line_error = Some("control characters in custom_id".to_string());
+                        }
+
+                        if let Some(ref err) = line_error {
+                            tracing::warn!(line_num = line_number, error = %err, "Validation error (tier 2), ingesting template with error");
+                            validation_errors.push((line_number as i32, err.clone()));
                         }
 
                         // Strip `priority` from body if present and re-serialize
@@ -583,13 +586,14 @@ async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'static>(
                         };
 
                         if tx.send(FileStreamItem::Template(template)).await.is_err() {
-                            return template_count;
+                            return (template_count, skipped_lines, validation_errors);
                         }
                         template_count += 1;
                     }
                     Err(e) => {
-                        tracing::warn!(line_num = line_number, error = %e, "Skipping invalid JSONL line");
-                        // Continue — invalid lines will show as missing templates
+                        // Tier 1: garbled line — not valid JSON at all
+                        tracing::warn!(line_num = line_number, error = %e, "Skipping non-JSON line (tier 1)");
+                        skipped_lines += 1;
                     }
                 }
             }
@@ -608,73 +612,109 @@ async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'static>(
             }
         }
 
-        // Handle any remaining partial line (same validation as main loop)
+        // Handle any remaining partial line (same three-tier handling as main loop)
         let remaining = line_buf.trim();
-        if !remaining.is_empty()
-            && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(remaining)
-        {
-            let custom_id = parsed.get("custom_id").and_then(|v| v.as_str()).map(|s| s.to_string());
-            let method = parsed.get("method").and_then(|v| v.as_str()).unwrap_or("POST").to_string();
-            let url = parsed.get("url").and_then(|v| v.as_str()).unwrap_or(&api_path).to_string();
-            let body = parsed.get("body").map(|v| v.to_string()).unwrap_or_else(|| "{}".to_string());
-            let model = parsed
-                .get("body")
-                .and_then(|b| b.get("model"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
+        if !remaining.is_empty() {
+            line_number += 1;
+            match serde_json::from_str::<serde_json::Value>(remaining) {
+                Ok(parsed) => {
+                    let custom_id = parsed.get("custom_id").and_then(|v| v.as_str()).map(|s| s.to_string());
+                    let method = parsed.get("method").and_then(|v| v.as_str()).unwrap_or("POST").to_string();
+                    let url = api_path.clone();
+                    let body = parsed.get("body").map(|v| v.to_string()).unwrap_or_else(|| "{}".to_string());
+                    let model = parsed
+                        .get("body")
+                        .and_then(|b| b.get("model"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
 
-            // Validate custom_id doesn't contain control characters
-            let custom_id_valid = custom_id.as_ref().is_none_or(|cid| !cid.chars().any(|c| c.is_control()));
+                    let mut line_error: Option<String> = None;
 
-            let valid = matches!(method.as_str(), "POST" | "GET" | "PUT" | "PATCH" | "DELETE")
-                && !model.is_empty()
-                && body.len() <= 10 * 1024 * 1024
-                && custom_id_valid;
+                    if !matches!(method.as_str(), "POST" | "GET" | "PUT" | "PATCH" | "DELETE") {
+                        line_error = Some(format!("invalid HTTP method: {method}"));
+                    } else if model.is_empty() {
+                        line_error = Some("missing model field in body".to_string());
+                    } else {
+                        const MAX_BODY_SIZE: usize = 10 * 1024 * 1024;
+                        if body.len() > MAX_BODY_SIZE {
+                            line_error = Some(format!("oversized body: {} bytes", body.len()));
+                        }
+                    }
+                    if line_error.is_none()
+                        && let Some(ref cid) = custom_id
+                        && cid.chars().any(|c| c.is_control())
+                    {
+                        line_error = Some("control characters in custom_id".to_string());
+                    }
 
-            if valid {
-                // Strip `priority` from body if present and re-serialize
-                let body = if let Ok(mut body_val) = serde_json::from_str::<serde_json::Value>(&body) {
-                    if body_val.as_object_mut().is_some_and(|o| o.remove("priority").is_some()) {
-                        serde_json::to_string(&body_val).unwrap_or(body)
+                    if let Some(ref err) = line_error {
+                        validation_errors.push((line_number as i32, err.clone()));
+                    }
+
+                    // Strip `priority` from body if present and re-serialize
+                    let body = if let Ok(mut body_val) = serde_json::from_str::<serde_json::Value>(&body) {
+                        if body_val.as_object_mut().is_some_and(|o| o.remove("priority").is_some()) {
+                            serde_json::to_string(&body_val).unwrap_or(body)
+                        } else {
+                            body
+                        }
                     } else {
                         body
-                    }
-                } else {
-                    body
-                };
+                    };
 
-                let template = fusillade::RequestTemplateInput {
-                    custom_id,
-                    endpoint: ai_base_url.clone(),
-                    method,
-                    path: url,
-                    body,
-                    model,
-                    api_key: String::new(),
-                };
-                let _ = tx.send(FileStreamItem::Template(template)).await;
-                template_count += 1;
+                    let template = fusillade::RequestTemplateInput {
+                        custom_id,
+                        endpoint: ai_base_url.clone(),
+                        method,
+                        path: url,
+                        body,
+                        model,
+                        api_key: String::new(),
+                    };
+                    let _ = tx.send(FileStreamItem::Template(template)).await;
+                    template_count += 1;
+                }
+                Err(_) => {
+                    // Tier 1: garbled trailing line
+                    skipped_lines += 1;
+                }
             }
         }
 
-        template_count
+        (template_count, skipped_lines, validation_errors)
     });
 
     // 6. Feed the stream into fusillade's create_file_stream
     let rx_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
     let result = state.request_manager.create_file_stream(rx_stream).await;
 
-    let template_count = producer.await.map_err(|e| anyhow::anyhow!("producer task panicked: {e}"))?;
+    let (template_count, skipped_lines, validation_errors) = producer.await.map_err(|e| anyhow::anyhow!("producer task panicked: {e}"))?;
 
     match result {
         Ok(fusillade::FileStreamResult::Success(file_id)) => {
-            // 7. Update sync entry with internal file_id and template count
-            //    (source_connection_id and source_external_key are already set
-            //    via FileMetadata during create_file_stream)
+            // 7. Update sync entry with internal file_id, template count,
+            //    skipped lines, and validation errors
+            let validation_errors_json = if validation_errors.is_empty() {
+                None
+            } else {
+                Some(serde_json::json!(
+                    validation_errors
+                        .iter()
+                        .map(|(line, err)| { serde_json::json!({"line": line, "error": err}) })
+                        .collect::<Vec<_>>()
+                ))
+            };
+
             let mut conn = dwctl.acquire().await?;
             let updated = SyncEntries::new(&mut conn)
-                .set_ingested(input.sync_entry_id, file_id.0, template_count)
+                .set_ingested(
+                    input.sync_entry_id,
+                    file_id.0,
+                    template_count,
+                    skipped_lines,
+                    validation_errors_json.as_ref(),
+                )
                 .await?;
             if !updated {
                 // Entry was soft-deleted mid-sync — abort without creating a batch
@@ -684,6 +724,28 @@ async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'static>(
             SyncOperations::new(&mut conn)
                 .increment_counter(input.sync_id, "files_ingested")
                 .await?;
+
+            // If no valid templates were created, mark entry as failed — don't create an empty batch
+            if template_count == 0 {
+                SyncEntries::new(&mut conn)
+                    .update_status(
+                        input.sync_entry_id,
+                        "failed",
+                        Some("No valid requests found in file — all lines were invalid or unparseable"),
+                    )
+                    .await?;
+                SyncOperations::new(&mut conn)
+                    .increment_counter(input.sync_id, "files_failed")
+                    .await?;
+                let _ = SyncOperations::new(&mut conn).try_complete(input.sync_id).await;
+                tracing::info!(
+                    sync_entry_id = %input.sync_entry_id,
+                    skipped_lines,
+                    validation_errors = validation_errors.len(),
+                    "File has no valid requests, marked as failed"
+                );
+                return Ok(());
+            }
 
             // 8. Enqueue ActivateBatchJob
             state
@@ -701,6 +763,8 @@ async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'static>(
                 sync_entry_id = %input.sync_entry_id,
                 file_id = %file_id,
                 template_count,
+                skipped_lines,
+                validation_error_count = validation_errors.len(),
                 "File ingested"
             );
 
@@ -790,15 +854,15 @@ async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + 'static>(
         (owner_id, secret, key_id, conn_name)
     };
 
-    // 5. Look up sync entry for external key (for provenance metadata)
-    let external_key = {
+    // 5. Look up sync entry for external key and validation errors (for provenance metadata)
+    let sync_entry = {
         let mut conn = dwctl.acquire().await?;
         SyncEntries::new(&mut conn)
             .get_by_id(input.sync_entry_id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("sync entry not found: {}", input.sync_entry_id))?
-            .external_key
     };
+    let external_key = sync_entry.external_key.clone();
 
     // 6. Create batch record
     //    created_by = owner (org or user) for visibility scoping — same as normal batch creation
@@ -827,19 +891,59 @@ async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + 'static>(
         .await
         .map_err(|e| anyhow::anyhow!("create batch record: {e}"))?;
 
-    // 5. Enqueue the existing batch populate job
-    state
-        .get_create_batch_job()?
-        .enqueue(&crate::api::handlers::batches::CreateBatchInput {
-            batch_id: *batch.id,
-            file_id: input.file_id,
-        })
-        .await?;
+    let batch_id = *batch.id;
 
-    // 6. Update sync entry with batch_id
+    // 7. Populate batch synchronously (instead of enqueuing async job) so we
+    //    can immediately fail requests that had validation errors during ingest.
+    state
+        .request_manager
+        .populate_batch(fusillade::BatchId(batch_id), fusillade::FileId(input.file_id))
+        .await
+        .map_err(|e| anyhow::anyhow!("populate batch: {e}"))?;
+
+    // 8. Fail requests whose templates came from invalid lines (tier 2 errors)
+    if let Some(errors) = &sync_entry.validation_errors
+        && let Ok(error_lines) = serde_json::from_value::<Vec<serde_json::Value>>(errors.clone())
+    {
+        let line_numbers: Vec<i32> = error_lines
+            .iter()
+            .filter_map(|e| e.get("line").and_then(|l| l.as_i64()).map(|l| l as i32))
+            .collect();
+
+        if !line_numbers.is_empty() {
+            let fusillade_pool = state.request_manager.pool();
+
+            // Find template IDs by line number
+            let template_ids: Vec<Uuid> =
+                sqlx::query_scalar("SELECT id FROM request_templates WHERE file_id = $1 AND line_number = ANY($2)")
+                    .bind(input.file_id)
+                    .bind(&line_numbers)
+                    .fetch_all(fusillade_pool)
+                    .await?;
+
+            if !template_ids.is_empty() {
+                let rows = sqlx::query(
+                    "UPDATE requests SET state = 'failed', error = $1, failed_at = NOW() WHERE batch_id = $2 AND template_id = ANY($3) AND state = 'pending'",
+                )
+                .bind("Request failed validation during ingestion — check sync entry for details")
+                .bind(batch_id)
+                .bind(&template_ids)
+                .execute(fusillade_pool)
+                .await?;
+
+                tracing::info!(
+                    batch_id = %batch_id,
+                    failed_count = rows.rows_affected(),
+                    "Failed invalid requests from tier 2 validation errors"
+                );
+            }
+        }
+    }
+
+    // 9. Update sync entry with batch_id
     {
         let mut conn = dwctl.acquire().await?;
-        SyncEntries::new(&mut conn).set_activated(input.sync_entry_id, *batch.id).await?;
+        SyncEntries::new(&mut conn).set_activated(input.sync_entry_id, batch_id).await?;
         SyncOperations::new(&mut conn)
             .increment_counter(input.sync_id, "batches_created")
             .await?;
@@ -847,7 +951,7 @@ async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + 'static>(
 
     tracing::info!(
         sync_entry_id = %input.sync_entry_id,
-        batch_id = %batch.id,
+        batch_id = %batch_id,
         "Batch activated"
     );
 

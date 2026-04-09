@@ -118,8 +118,10 @@ export function Connections() {
       <div className="flex items-center justify-between mb-6">
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">Connections</h1>
-          <p className="text-sm text-muted-foreground mt-1">
+          <p className="text-sm text-muted-foreground mt-1 max-w-xl">
             Connect external data sources to sync files and create batches automatically.
+            Use Sync to ingest all new files at once, or browse and select individual files.
+            Files are synced once and skipped on subsequent syncs unless modified in the source.
           </p>
         </div>
         <Button
