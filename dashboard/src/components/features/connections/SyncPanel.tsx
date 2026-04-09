@@ -187,7 +187,7 @@ function SyncEntryList({
               </summary>
               <ul className="text-xs text-muted-foreground mt-1 space-y-0.5 ml-2 max-h-40 overflow-y-auto">
                 {entry.validation_errors.map((ve, i) => (
-                  <li key={i}>Line {ve.line}: {ve.error}</li>
+                  <li key={i}>{ve.line != null ? `Line ${ve.line}: ` : ""}{ve.error}</li>
                 ))}
               </ul>
             </details>

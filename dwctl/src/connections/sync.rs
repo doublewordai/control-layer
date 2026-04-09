@@ -343,7 +343,7 @@ async fn run_sync_connection<P: PoolProvider + Clone + Send + Sync + 'static>(
     Ok(())
 }
 
-async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'static>(
+pub(crate) async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'static>(
     state: &TaskState<P>,
     input: &IngestFileInput,
 ) -> anyhow::Result<()> {
@@ -713,19 +713,10 @@ async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'static>(
             let validation_errors_json = if validation_error_indices.is_empty() {
                 None
             } else {
-                let mut errors: Vec<serde_json::Value> = validation_errors
+                let errors: Vec<serde_json::Value> = validation_errors
                     .iter()
                     .map(|(idx, line, err)| serde_json::json!({"template_index": idx, "line": line, "error": err}))
                     .collect();
-                // If capped, append a summary entry so the UI knows errors were truncated.
-                let total = validation_error_indices.len();
-                if total > errors.len() {
-                    errors.push(serde_json::json!({
-                        "template_index": null,
-                        "line": null,
-                        "error": format!("... and {} more validation errors", total - errors.len())
-                    }));
-                }
                 Some(serde_json::json!(errors))
             };
 
@@ -803,7 +794,7 @@ async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'static>(
     }
 }
 
-async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + 'static>(
+pub(crate) async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + 'static>(
     state: &TaskState<P>,
     input: &ActivateBatchInput,
 ) -> anyhow::Result<()> {
@@ -979,4 +970,307 @@ async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + 'static>(
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test::utils::{create_test_config, create_test_user};
+    use fusillade::{FileMetadata, FileStreamItem, RequestTemplateInput, Storage};
+    use sqlx::PgPool;
+
+    /// Helper: create a TaskState backed by a real fusillade schema (for create_file_stream, etc.)
+    async fn setup_task_state(pool: PgPool) -> crate::tasks::TaskState<sqlx_pool_router::TestDbPools> {
+        use sqlx::Executor;
+        use sqlx::postgres::PgConnectOptions;
+
+        pool.execute("CREATE SCHEMA IF NOT EXISTS fusillade")
+            .await
+            .expect("create fusillade schema");
+
+        let base_opts: PgConnectOptions = pool.connect_options().as_ref().clone();
+        let fusillade_pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(4)
+            .min_connections(0)
+            .connect_with(base_opts.options([("search_path", "fusillade")]))
+            .await
+            .expect("fusillade pool");
+
+        fusillade::migrator().run(&fusillade_pool).await.expect("fusillade migrations");
+
+        let fusillade_test_pools = sqlx_pool_router::TestDbPools::new(fusillade_pool)
+            .await
+            .expect("fusillade test pools");
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(fusillade_test_pools, Default::default()));
+
+        crate::tasks::TaskState {
+            request_manager,
+            dwctl_pool: pool,
+            encryption_key: None,
+            ingest_file_job: std::sync::Arc::new(std::sync::OnceLock::new()),
+            activate_batch_job: std::sync::Arc::new(std::sync::OnceLock::new()),
+            create_batch_job: std::sync::Arc::new(std::sync::OnceLock::new()),
+        }
+    }
+
+    /// Helper: insert a minimal connection row (no real provider, just DB presence).
+    async fn insert_test_connection(pool: &PgPool, user_id: Uuid) -> Uuid {
+        let id = Uuid::new_v4();
+        sqlx::query!(
+            r#"INSERT INTO connections (id, user_id, kind, provider, name, config_encrypted)
+               VALUES ($1, $2, 'source', 'test', 'test-conn', '\x00')"#,
+            id,
+            user_id,
+        )
+        .execute(pool)
+        .await
+        .expect("insert connection");
+        id
+    }
+
+    /// Helper: insert a sync_operation row.
+    async fn insert_test_sync_op(pool: &PgPool, connection_id: Uuid, triggered_by: Uuid) -> Uuid {
+        let id = Uuid::new_v4();
+        sqlx::query!(
+            r#"INSERT INTO sync_operations (id, connection_id, status, strategy, triggered_by, sync_config)
+               VALUES ($1, $2, 'running', 'select', $3, $4)"#,
+            id,
+            connection_id,
+            triggered_by,
+            serde_json::json!({"endpoint": "/v1/chat/completions", "completion_window": "24h"}),
+        )
+        .execute(pool)
+        .await
+        .expect("insert sync_op");
+        id
+    }
+
+    /// Helper: insert a sync_entry row.
+    async fn insert_test_sync_entry(pool: &PgPool, sync_id: Uuid, connection_id: Uuid, external_key: &str) -> Uuid {
+        let id = Uuid::new_v4();
+        sqlx::query!(
+            r#"INSERT INTO sync_entries (id, sync_id, connection_id, external_key, status)
+               VALUES ($1, $2, $3, $4, 'ingested')"#,
+            id,
+            sync_id,
+            connection_id,
+            external_key,
+        )
+        .execute(pool)
+        .await
+        .expect("insert sync_entry");
+        id
+    }
+
+    /// Feed templates through create_file_stream and return the file ID.
+    async fn create_test_file<P: sqlx_pool_router::PoolProvider + Clone + Send + Sync + 'static>(
+        state: &crate::tasks::TaskState<P>,
+        owner_id: Uuid,
+        templates: Vec<RequestTemplateInput>,
+    ) -> Uuid {
+        let mut items = vec![FileStreamItem::Metadata(FileMetadata {
+            filename: Some("test.jsonl".to_string()),
+            purpose: Some("batch".to_string()),
+            uploaded_by: Some(owner_id.to_string()),
+            ..Default::default()
+        })];
+        for t in templates {
+            items.push(FileStreamItem::Template(t));
+        }
+        match state
+            .request_manager
+            .create_file_stream(futures::stream::iter(items))
+            .await
+            .expect("create_file_stream")
+        {
+            fusillade::FileStreamResult::Success(file_id) => file_id.0,
+            other => panic!("unexpected file stream result: {other:?}"),
+        }
+    }
+
+    fn valid_template(model: &str) -> RequestTemplateInput {
+        RequestTemplateInput {
+            custom_id: None,
+            endpoint: "http://127.0.0.1:3001/ai".to_string(),
+            method: "POST".to_string(),
+            path: "/v1/chat/completions".to_string(),
+            body: serde_json::json!({"model": model, "messages": [{"role": "user", "content": "hi"}]}).to_string(),
+            model: model.to_string(),
+            api_key: String::new(),
+        }
+    }
+
+    fn invalid_template_missing_model() -> RequestTemplateInput {
+        RequestTemplateInput {
+            custom_id: None,
+            endpoint: "http://127.0.0.1:3001/ai".to_string(),
+            method: "POST".to_string(),
+            path: "/v1/chat/completions".to_string(),
+            body: "{}".to_string(),
+            model: String::new(), // empty — tier 2 error
+            api_key: String::new(),
+        }
+    }
+
+    /// Integration test: simulates a JSONL file with all 3 tiers and verifies that
+    /// the activate step correctly marks tier-2 requests as failed.
+    ///
+    /// Simulated file lines:
+    ///   Line 1: valid JSON (tier 3) → template 0 → pending
+    ///   Line 2: garbled non-JSON (tier 1) → skipped, no template
+    ///   Line 3: valid JSON missing model (tier 2) → template 1 → should be failed
+    ///   Line 4: valid JSON (tier 3) → template 2 → pending
+    ///   Line 5: valid JSON missing model (tier 2) → template 3 → should be failed
+    ///
+    /// After activation, templates 1 and 3 should be "failed"; templates 0 and 2 "pending".
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_three_tier_ingestion_and_activation(pool: PgPool) {
+        // -- Setup --
+        let state = setup_task_state(pool.clone()).await;
+        let config = create_test_config();
+        let _app_state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
+
+        let user = create_test_user(&pool, crate::api::models::users::Role::PlatformManager).await;
+        let user_id = user.id;
+
+        let connection_id = insert_test_connection(&pool, user_id).await;
+        let sync_id = insert_test_sync_op(&pool, connection_id, user_id).await;
+        let entry_id = insert_test_sync_entry(&pool, sync_id, connection_id, "data/test.jsonl").await;
+
+        // -- Simulate the 3-tier producer output --
+        // Tier 1 (garbled line) is skipped by the producer and never becomes a template.
+        // We simulate the *result* of the producer: 4 templates, 2 of which are tier-2 invalid.
+        let templates = vec![
+            valid_template("gpt-4"),          // template 0 (file line 1) — tier 3
+            invalid_template_missing_model(), // template 1 (file line 3) — tier 2
+            valid_template("gpt-4"),          // template 2 (file line 4) — tier 3
+            invalid_template_missing_model(), // template 3 (file line 5) — tier 2
+        ];
+
+        let file_id = create_test_file(&state, user_id, templates).await;
+
+        // Store validation errors on the sync entry (simulating what run_ingest_file writes).
+        let skipped_lines: i32 = 1; // 1 garbled line
+        let validation_errors_json = serde_json::json!([
+            {"template_index": 1, "line": 3, "error": "missing model field in body"},
+            {"template_index": 3, "line": 5, "error": "missing model field in body"},
+        ]);
+        sqlx::query!(
+            r#"UPDATE sync_entries SET file_id = $2, template_count = 4,
+               skipped_lines = $3, validation_errors = $4
+               WHERE id = $1"#,
+            entry_id,
+            file_id,
+            skipped_lines,
+            validation_errors_json,
+        )
+        .execute(&pool)
+        .await
+        .expect("update sync_entry");
+
+        // -- Run activate --
+        let input = ActivateBatchInput {
+            sync_id,
+            sync_entry_id: entry_id,
+            connection_id,
+            file_id,
+            template_count: 4,
+            validation_error_indices: vec![1, 3], // template indices 1 and 3 are tier-2 errors
+        };
+
+        run_activate_batch(&state, &input).await.expect("run_activate_batch");
+
+        // -- Verify results --
+        // Find the batch that was created
+        let sync_entry = sqlx::query_as::<_, (Uuid, String)>("SELECT batch_id, status FROM sync_entries WHERE id = $1")
+            .bind(entry_id)
+            .fetch_one(&pool)
+            .await
+            .expect("fetch sync_entry");
+        assert_eq!(sync_entry.1, "activated", "sync entry should be activated");
+        let batch_id = fusillade::BatchId(sync_entry.0);
+
+        let requests = state
+            .request_manager
+            .get_batch_requests(batch_id)
+            .await
+            .expect("get_batch_requests");
+
+        assert_eq!(requests.len(), 4, "should have 4 requests total");
+
+        let mut pending_count = 0;
+        let mut failed_count = 0;
+        for req in &requests {
+            match req {
+                fusillade::AnyRequest::Pending(_) => pending_count += 1,
+                fusillade::AnyRequest::Failed(_) => failed_count += 1,
+                other => panic!("unexpected request state: {}", other.variant()),
+            }
+        }
+
+        assert_eq!(pending_count, 2, "2 valid requests should be pending");
+        assert_eq!(failed_count, 2, "2 invalid requests should be failed");
+    }
+
+    /// Verify that skipped_lines and validation_errors are stored correctly in
+    /// the sync_entry after ingestion (simulated producer output → DB).
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_validation_errors_stored_correctly(pool: PgPool) {
+        let state = setup_task_state(pool.clone()).await;
+
+        let user = create_test_user(&pool, crate::api::models::users::Role::PlatformManager).await;
+        let user_id = user.id;
+
+        let connection_id = insert_test_connection(&pool, user_id).await;
+        let sync_id = insert_test_sync_op(&pool, connection_id, user_id).await;
+        let entry_id = insert_test_sync_entry(&pool, sync_id, connection_id, "data/test.jsonl").await;
+
+        let templates = vec![valid_template("gpt-4"), invalid_template_missing_model(), valid_template("gpt-4")];
+        let file_id = create_test_file(&state, user_id, templates).await;
+
+        // Simulate what run_ingest_file does: update sync_entry with skipped/errors
+        let skipped_lines: i32 = 2;
+        let validation_errors_json = serde_json::json!([
+            {"template_index": 1, "line": 4, "error": "missing model field in body"},
+        ]);
+
+        {
+            use crate::db::handlers::connections::SyncEntries;
+
+            let mut conn = pool.acquire().await.expect("acquire conn");
+            let updated = SyncEntries::new(&mut conn)
+                .set_ingested(
+                    entry_id,
+                    file_id,
+                    3, // template_count
+                    skipped_lines,
+                    Some(&validation_errors_json),
+                )
+                .await
+                .expect("set_ingested");
+            assert!(updated, "set_ingested should return true");
+        }
+
+        // Read back and verify
+        let row = sqlx::query!(
+            "SELECT status, skipped_lines, validation_errors, template_count, file_id FROM sync_entries WHERE id = $1",
+            entry_id,
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read sync_entry");
+
+        assert_eq!(row.status, "ingested");
+        assert_eq!(row.skipped_lines, 2);
+        assert_eq!(row.template_count.unwrap(), 3);
+        assert_eq!(row.file_id.unwrap(), file_id);
+
+        let errors: Vec<serde_json::Value> = serde_json::from_value(row.validation_errors.unwrap()).expect("parse validation_errors");
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0]["template_index"], 1);
+        assert_eq!(errors[0]["line"], 4);
+        assert_eq!(errors[0]["error"], "missing model field in body");
+    }
 }
