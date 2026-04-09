@@ -3954,7 +3954,7 @@ mod tests {
                     100, 'thinking-model', $3, $4, $5, $6, $7)
                 "#,
                 Uuid::new_v4(),
-                rand::random::<i64>().abs(),
+                (rand::random::<u64>() >> 1) as i64,
                 prompt,
                 completion,
                 reasoning,
