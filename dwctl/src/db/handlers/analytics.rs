@@ -804,11 +804,12 @@ pub async fn get_batch_analytics(pool: &PgPool, batch_id: &Uuid) -> Result<Batch
     .fetch_one(pool)
     .await?;
 
+    let reasoning = metrics.total_reasoning_tokens.to_i64().unwrap_or(0);
     Ok(BatchAnalytics {
         total_requests: metrics.total_requests,
         total_prompt_tokens: metrics.total_prompt_tokens.to_i64().unwrap_or(0),
         total_completion_tokens: metrics.total_completion_tokens.to_i64().unwrap_or(0),
-        total_reasoning_tokens: Some(metrics.total_reasoning_tokens.to_i64().unwrap_or(0)),
+        total_reasoning_tokens: if reasoning > 0 { Some(reasoning) } else { None },
         total_tokens: metrics.total_tokens.to_i64().unwrap_or(0),
         avg_duration_ms: metrics.avg_duration_ms.and_then(|d| d.to_f64()),
         avg_ttfb_ms: metrics.avg_ttfb_ms.and_then(|d| d.to_f64()),
@@ -851,13 +852,14 @@ pub async fn get_batches_analytics_bulk(pool: &PgPool, batch_ids: &[Uuid]) -> Re
     let mut result = HashMap::new();
     for row in rows {
         if let Some(batch_id) = row.fusillade_batch_id {
+            let reasoning = row.total_reasoning_tokens.to_i64().unwrap_or(0);
             result.insert(
                 batch_id,
                 BatchAnalytics {
                     total_requests: row.total_requests,
                     total_prompt_tokens: row.total_prompt_tokens.to_i64().unwrap_or(0),
                     total_completion_tokens: row.total_completion_tokens.to_i64().unwrap_or(0),
-                    total_reasoning_tokens: Some(row.total_reasoning_tokens.to_i64().unwrap_or(0)),
+                    total_reasoning_tokens: if reasoning > 0 { Some(reasoning) } else { None },
                     total_tokens: row.total_tokens.to_i64().unwrap_or(0),
                     avg_duration_ms: row.avg_duration_ms.and_then(|d: Decimal| d.to_f64()),
                     avg_ttfb_ms: row.avg_ttfb_ms.and_then(|d: Decimal| d.to_f64()),
@@ -873,7 +875,7 @@ pub async fn get_batches_analytics_bulk(pool: &PgPool, batch_ids: &[Uuid]) -> Re
             total_requests: 0,
             total_prompt_tokens: 0,
             total_completion_tokens: 0,
-            total_reasoning_tokens: Some(0),
+            total_reasoning_tokens: None,
             total_tokens: 0,
             avg_duration_ms: None,
             avg_ttfb_ms: None,
@@ -896,7 +898,7 @@ struct HttpAnalyticsRow {
     pub duration_ms: Option<i64>,
     pub prompt_tokens: Option<i64>,
     pub completion_tokens: Option<i64>,
-    pub reasoning_tokens: Option<i64>,
+    pub reasoning_tokens: i64,
     pub total_tokens: Option<i64>,
     pub response_type: Option<String>,
     pub fusillade_batch_id: Option<Uuid>,
@@ -988,7 +990,11 @@ pub async fn list_http_analytics(
             duration_ms: row.duration_ms,
             prompt_tokens: row.prompt_tokens,
             completion_tokens: row.completion_tokens,
-            reasoning_tokens: row.reasoning_tokens,
+            reasoning_tokens: if row.reasoning_tokens > 0 {
+                Some(row.reasoning_tokens)
+            } else {
+                None
+            },
             total_tokens: row.total_tokens,
             response_type: row.response_type,
             fusillade_batch_id: row.fusillade_batch_id,

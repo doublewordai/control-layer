@@ -3689,14 +3689,11 @@ mod tests {
     #[test_log::test]
     async fn test_batch_results_with_reasoning_tokens(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
-        let user =
-            create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
         let group = create_test_group(&pool).await;
         add_user_to_group(&pool, user.id, group.id).await;
 
-        let deployment =
-            create_test_deployment(&pool, user.id, "thinking-model-endpoint", "thinking-model")
-                .await;
+        let deployment = create_test_deployment(&pool, user.id, "thinking-model-endpoint", "thinking-model").await;
         add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
 
         let file_id = Uuid::new_v4();
@@ -3850,26 +3847,16 @@ mod tests {
         let mut total_tokens = 0i64;
 
         for line in &lines {
-            let item: serde_json::Value =
-                serde_json::from_str(line).expect("Each line should be valid JSON");
+            let item: serde_json::Value = serde_json::from_str(line).expect("Each line should be valid JSON");
             assert_eq!(item["status"].as_str().unwrap(), "completed");
 
             let response_body = &item["response_body"];
             let usage = &response_body["usage"];
 
             // Verify usage fields exist
-            assert!(
-                usage["prompt_tokens"].is_number(),
-                "prompt_tokens should be present"
-            );
-            assert!(
-                usage["completion_tokens"].is_number(),
-                "completion_tokens should be present"
-            );
-            assert!(
-                usage["total_tokens"].is_number(),
-                "total_tokens should be present"
-            );
+            assert!(usage["prompt_tokens"].is_number(), "prompt_tokens should be present");
+            assert!(usage["completion_tokens"].is_number(), "completion_tokens should be present");
+            assert!(usage["total_tokens"].is_number(), "total_tokens should be present");
 
             // Verify reasoning tokens in completion_tokens_details
             let details = &usage["completion_tokens_details"];
@@ -3891,11 +3878,7 @@ mod tests {
                 completion
             );
             // Total = prompt + completion (reasoning is subset, not additive)
-            assert_eq!(
-                total,
-                prompt + completion,
-                "total_tokens should equal prompt + completion"
-            );
+            assert_eq!(total, prompt + completion, "total_tokens should equal prompt + completion");
 
             total_prompt += prompt;
             total_completion += completion;
@@ -3905,14 +3888,8 @@ mod tests {
 
         // Verify aggregate totals match expected values
         assert_eq!(total_prompt, 60, "Total prompt tokens should be 60");
-        assert_eq!(
-            total_completion, 4805,
-            "Total completion tokens should be 4805"
-        );
-        assert_eq!(
-            total_reasoning, 3880,
-            "Total reasoning tokens should be 3880"
-        );
+        assert_eq!(total_completion, 4805, "Total completion tokens should be 4805");
+        assert_eq!(total_reasoning, 3880, "Total reasoning tokens should be 3880");
         assert_eq!(total_tokens, 4865, "Total tokens should be 4865");
     }
 
@@ -3921,20 +3898,16 @@ mod tests {
     #[test_log::test]
     async fn test_batch_analytics_with_reasoning_tokens(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
-        let user =
-            create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
         let group = create_test_group(&pool).await;
         add_user_to_group(&pool, user.id, group.id).await;
 
-        let deployment =
-            create_test_deployment(&pool, user.id, "thinking-analytics-endpoint", "thinking-model")
-                .await;
+        let deployment = create_test_deployment(&pool, user.id, "thinking-analytics-endpoint", "thinking-model").await;
         add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
 
         // Upload a batch file
         let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"thinking-model","messages":[{"role":"user","content":"Hello"}],"thinking":{"type":"enabled","budget_tokens":4096}}}"#;
-        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes())
-            .file_name("thinking-test.jsonl");
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("thinking-test.jsonl");
         let multipart = axum_test::multipart::MultipartForm::new()
             .add_part("file", file_part)
             .add_part("purpose", axum_test::multipart::Part::text("batch"));
@@ -3968,11 +3941,7 @@ mod tests {
         let batch_uuid = Uuid::parse_str(batch_id).unwrap();
 
         // Insert analytics rows with reasoning tokens directly into http_analytics
-        let analytics_data = vec![
-            (22i64, 891i64, 733i64, 913i64),
-            (20, 2101, 1412, 2121),
-            (18, 1813, 1735, 1831),
-        ];
+        let analytics_data = vec![(22i64, 891i64, 733i64, 913i64), (20, 2101, 1412, 2121), (18, 1813, 1735, 1831)];
 
         for (prompt, completion, reasoning, total) in &analytics_data {
             sqlx::query!(
@@ -4028,11 +3997,7 @@ mod tests {
             4865,
             "Aggregated total tokens should be 4865"
         );
-        assert_eq!(
-            analytics["total_requests"].as_i64().unwrap(),
-            3,
-            "Should have 3 analytics records"
-        );
+        assert_eq!(analytics["total_requests"].as_i64().unwrap(), 3, "Should have 3 analytics records");
 
         // Also verify via include=analytics on the list endpoint
         let list_resp = app
@@ -4049,10 +4014,7 @@ mod tests {
             .expect("Our batch should be in the list");
 
         let list_analytics = &our_batch["analytics"];
-        assert!(
-            list_analytics.is_object(),
-            "analytics should be present with include=analytics"
-        );
+        assert!(list_analytics.is_object(), "analytics should be present with include=analytics");
         assert_eq!(
             list_analytics["total_reasoning_tokens"].as_i64().unwrap(),
             3880,
