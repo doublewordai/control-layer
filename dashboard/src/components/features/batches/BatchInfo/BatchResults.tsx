@@ -22,11 +22,6 @@ import {
   DialogDescription,
 } from "../../../ui/dialog";
 import { CodeBlock } from "../../../ui/code-block";
-import {
-  Collapsible,
-  CollapsibleContent,
-  CollapsibleTrigger,
-} from "../../../ui/collapsible";
 import { createBatchResultsColumns } from "./batch-results-columns";
 import type { BatchStatus } from "../../../../api/control-layer/types";
 
@@ -51,8 +46,6 @@ export default function BatchResults({
   const [modalContentType, setModalContentType] = useState<
     "input" | "response"
   >("input");
-  const [showReasoningArtifact, setShowReasoningArtifact] = useState(false);
-
   // Search state with debounce for server-side filtering
   const [searchInput, setSearchInput] = useState("");
   const debouncedSearch = useDebounce(searchInput, 300);
@@ -109,7 +102,6 @@ export default function BatchResults({
   ) => {
     setSelectedResult(result);
     setModalContentType(contentType);
-    setShowReasoningArtifact(false);
     setContentModalOpen(true);
   };
 
@@ -236,9 +228,6 @@ export default function BatchResults({
         open={contentModalOpen}
         onOpenChange={(open) => {
           setContentModalOpen(open);
-          if (!open) {
-            setShowReasoningArtifact(false);
-          }
         }}
       >
         <DialogContent className="sm:max-w-4xl max-h-[80vh] flex flex-col">
@@ -284,41 +273,6 @@ export default function BatchResults({
                         No content available
                       </p>
                     )}
-                    {modalContentType === "response" &&
-                      selectedResult.reasoning_artifact && (
-                        <Collapsible
-                          open={showReasoningArtifact}
-                          onOpenChange={setShowReasoningArtifact}
-                        >
-                          <div className="rounded-md border border-gray-200 p-3 space-y-3">
-                            <div className="flex items-center justify-between gap-4">
-                              <div>
-                                <p className="text-sm font-medium text-gray-700">
-                                  Reasoning Artifact
-                                </p>
-                                <p className="text-xs text-gray-500">
-                                  Hidden by default. Expand to inspect the
-                                  captured reasoning payload.
-                                </p>
-                              </div>
-                              <CollapsibleTrigger className="text-sm text-blue-600 hover:text-blue-700">
-                                {showReasoningArtifact
-                                  ? "Hide reasoning"
-                                  : "Show reasoning"}
-                              </CollapsibleTrigger>
-                            </div>
-                            <CollapsibleContent>
-                              <CodeBlock language="json">
-                                {JSON.stringify(
-                                  selectedResult.reasoning_artifact,
-                                  null,
-                                  2,
-                                )}
-                              </CodeBlock>
-                            </CollapsibleContent>
-                          </div>
-                        </Collapsible>
-                      )}
                   </div>
                 );
               })()}

@@ -1330,8 +1330,6 @@ export interface BatchResultItem {
   input_body: Record<string, unknown>;
   /** Full response object (choices, usage, etc.) for completed requests */
   response_body: Record<string, unknown> | null;
-  /** Separately captured reasoning artifact for completed requests */
-  reasoning_artifact?: Record<string, unknown> | null;
   /** Error message for failed requests */
   error: string | null;
   /** Current status of the request */
