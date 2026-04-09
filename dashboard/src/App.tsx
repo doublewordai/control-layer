@@ -162,6 +162,11 @@ const AcceptInvite = lazy(() =>
     default: m.AcceptInvite,
   })),
 );
+const Connections = lazy(() =>
+  import("./components/features/connections").then((m) => ({
+    default: m.Connections,
+  })),
+);
 
 // Loading component for lazy-loaded routes
 function RouteLoader() {
@@ -583,6 +588,18 @@ function AppRoutes() {
               <ProtectedRoute path="/system">
                 <Suspense fallback={<RouteLoader />}>
                   <System />
+                </Suspense>
+              </ProtectedRoute>
+            </AppLayout>
+          }
+        />
+        <Route
+          path="/connections"
+          element={
+            <AppLayout>
+              <ProtectedRoute path="/connections">
+                <Suspense fallback={<RouteLoader />}>
+                  <Connections />
                 </Suspense>
               </ProtectedRoute>
             </AppLayout>

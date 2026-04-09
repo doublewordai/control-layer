@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use utoipa::{IntoParams, ToSchema};
 
+use super::dwext::BatchDwExtResponse;
+
 /// Batch-level errors
 #[derive(Debug, Serialize, Deserialize, ToSchema, Clone)]
 #[schema(example = json!({
@@ -166,6 +168,10 @@ pub struct BatchResponse {
     /// Aggregated analytics metrics (only included when requested via `include=analytics`)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub analytics: Option<BatchAnalytics>,
+
+    /// Doubleword-specific extensions (source provenance, etc.)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dwext: Option<BatchDwExtResponse>,
 }
 
 /// Aggregated analytics metrics for batch requests

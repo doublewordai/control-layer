@@ -61,6 +61,9 @@ pub mod resource {
     #[derive(Default)]
     pub struct Webhooks;
 
+    #[derive(Default)]
+    pub struct Connections;
+
     // Convert type-level markers to enum values using Into
     impl From<Users> for Resource {
         fn from(_: Users) -> Resource {
@@ -158,6 +161,11 @@ pub mod resource {
     impl From<ToolSources> for Resource {
         fn from(_: ToolSources) -> Resource {
             Resource::ToolSources
+        }
+    }
+    impl From<Connections> for Resource {
+        fn from(_: Connections) -> Resource {
+            Resource::Connections
         }
     }
 }

@@ -78,6 +78,14 @@ import type {
   UpdateMemberRoleRequest,
   SetActiveOrganizationResponse,
   ModelListResponse,
+  Connection,
+  ConnectionCreateRequest,
+  ConnectionTestResponse,
+  SyncOperation,
+  SyncEntry,
+  TriggerSyncRequest,
+  ExternalFileListResponse,
+  SyncedKey,
   ProviderDisplayConfig,
   ProviderDisplayConfigCreateRequest,
   ProviderDisplayConfigUpdateRequest,
@@ -1988,6 +1996,118 @@ const supportApi = {
   },
 };
 
+const connectionsApi = {
+  async list(kind?: string): Promise<{ data: Connection[] }> {
+    const params = kind ? `?kind=${kind}` : "";
+    const response = await fetch(`/admin/api/v1/connections${params}`);
+    if (!response.ok) {
+      throw new ApiError(response.status, "Failed to fetch connections");
+    }
+    return response.json();
+  },
+
+  async get(connectionId: string): Promise<Connection> {
+    const response = await fetch(`/admin/api/v1/connections/${connectionId}`);
+    if (!response.ok) {
+      throw new ApiError(response.status, "Failed to fetch connection");
+    }
+    return response.json();
+  },
+
+  async create(data: ConnectionCreateRequest): Promise<Connection> {
+    const response = await fetch("/admin/api/v1/connections", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data),
+    });
+    if (!response.ok) {
+      const error = await response.text();
+      throw new ApiError(response.status, `Failed to create connection: ${error}`);
+    }
+    return response.json();
+  },
+
+  async delete(connectionId: string): Promise<void> {
+    const response = await fetch(`/admin/api/v1/connections/${connectionId}`, {
+      method: "DELETE",
+    });
+    if (!response.ok) {
+      throw new ApiError(response.status, "Failed to delete connection");
+    }
+  },
+
+  async test(connectionId: string): Promise<ConnectionTestResponse> {
+    const response = await fetch(`/admin/api/v1/connections/${connectionId}/test`, {
+      method: "POST",
+    });
+    if (!response.ok) {
+      throw new ApiError(response.status, "Failed to test connection");
+    }
+    return response.json();
+  },
+
+  async triggerSync(connectionId: string, data: TriggerSyncRequest): Promise<SyncOperation> {
+    const response = await fetch(`/admin/api/v1/connections/${connectionId}/sync`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data),
+    });
+    if (!response.ok) {
+      const error = await response.text();
+      throw new ApiError(response.status, `Failed to trigger sync: ${error}`);
+    }
+    return response.json();
+  },
+
+  async listSyncs(connectionId: string): Promise<{ data: SyncOperation[] }> {
+    const response = await fetch(`/admin/api/v1/connections/${connectionId}/syncs`);
+    if (!response.ok) {
+      throw new ApiError(response.status, "Failed to fetch syncs");
+    }
+    return response.json();
+  },
+
+  async getSync(connectionId: string, syncId: string): Promise<SyncOperation> {
+    const response = await fetch(`/admin/api/v1/connections/${connectionId}/syncs/${syncId}`);
+    if (!response.ok) {
+      throw new ApiError(response.status, "Failed to fetch sync");
+    }
+    return response.json();
+  },
+
+  async listSyncEntries(connectionId: string, syncId: string): Promise<{ data: SyncEntry[] }> {
+    const response = await fetch(`/admin/api/v1/connections/${connectionId}/syncs/${syncId}/entries`);
+    if (!response.ok) {
+      throw new ApiError(response.status, "Failed to fetch sync entries");
+    }
+    return response.json();
+  },
+
+  async listSyncedKeys(connectionId: string): Promise<SyncedKey[]> {
+    const response = await fetch(`/admin/api/v1/connections/${connectionId}/synced-keys`);
+    if (!response.ok) {
+      throw new ApiError(response.status, "Failed to fetch synced keys");
+    }
+    return response.json();
+  },
+
+  async listFiles(
+    connectionId: string,
+    options?: { limit?: number; cursor?: string; search?: string },
+  ): Promise<ExternalFileListResponse> {
+    const params = new URLSearchParams();
+    if (options?.limit) params.set("limit", String(options.limit));
+    if (options?.cursor) params.set("cursor", options.cursor);
+    if (options?.search) params.set("search", options.search);
+    const qs = params.toString() ? `?${params.toString()}` : "";
+    const response = await fetch(`/admin/api/v1/connections/${connectionId}/files${qs}`);
+    if (!response.ok) {
+      throw new ApiError(response.status, "Failed to fetch files");
+    }
+    return response.json();
+  },
+};
+
 // Main nested API object
 export const dwctlApi = {
   users: userApi,
@@ -2008,4 +2128,5 @@ export const dwctlApi = {
   usage: usageApi,
   organizations: organizationsApi,
   support: supportApi,
+  connections: connectionsApi,
 };

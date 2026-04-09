@@ -2065,6 +2065,7 @@ mod tests {
             email: Default::default(),
             onwards: Default::default(),
             onboarding_url: None,
+            connections: Default::default(),
         };
         crate::seed_database(&config.model_sources, &pool).await.unwrap();
 
