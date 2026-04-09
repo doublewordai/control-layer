@@ -57,10 +57,11 @@ const BatchInfo: React.FC = () => {
 
   // TODO: this role check is inconsistent with other components
   // that use useAuthorization => hasPermission. We should standardise.
-  const { userRoles } = useAuthorization();
+  const { userRoles, hasPermission } = useAuthorization();
   const hasRequestsPermission = userRoles.some(
     (role) => role === "RequestViewer",
   );
+  const hasConnectionsPermission = hasPermission("connections");
 
   // Get tab from URL or default to "details"
   const tabFromUrl = searchParams.get("tab");
@@ -966,26 +967,56 @@ const BatchInfo: React.FC = () => {
                 </CardContent>
               </Card>
 
-              {/* Metadata Card */}
-              {batch.metadata && Object.keys(batch.metadata).length > 0 && (
+              {/* Source Card — shown when batch was created from a sync */}
+              {hasConnectionsPermission && batch.dwext?.source === "sync" && (
                 <Card className="p-0 gap-0 rounded-lg">
                   <CardHeader className="px-6 pt-5 pb-4">
-                    <CardTitle>Metadata</CardTitle>
+                    <CardTitle>Source</CardTitle>
                   </CardHeader>
                   <CardContent className="px-6 pb-6 pt-0">
                     <div className="space-y-2">
-                      {Object.entries(batch.metadata).map(([key, value]) => (
-                        <div key={key}>
-                          <p className="text-sm text-gray-600 mb-1">{key}</p>
-                          <p className="text-sm font-medium wrap-break-words">
-                            {value}
-                          </p>
+                      {batch.dwext?.source_name && (
+                        <div>
+                          <p className="text-sm text-gray-600 mb-1">Connection</p>
+                          <p className="text-sm font-medium">{batch.dwext.source_name}</p>
                         </div>
-                      ))}
+                      )}
+                      {batch.dwext?.source_file && (
+                        <div>
+                          <p className="text-sm text-gray-600 mb-1">External File</p>
+                          <p className="text-sm font-medium font-mono">{batch.dwext.source_file}</p>
+                        </div>
+                      )}
                     </div>
                   </CardContent>
                 </Card>
               )}
+
+              {/* Metadata Card — user metadata only (internal keys filtered server-side) */}
+              {batch.metadata && (() => {
+                const userMetadata = Object.entries(batch.metadata).filter(
+                  ([key]) => !["created_by_email", "context_name", "context_type"].includes(key),
+                );
+                return userMetadata.length > 0 ? (
+                  <Card className="p-0 gap-0 rounded-lg">
+                    <CardHeader className="px-6 pt-5 pb-4">
+                      <CardTitle>Metadata</CardTitle>
+                    </CardHeader>
+                    <CardContent className="px-6 pb-6 pt-0">
+                      <div className="space-y-2">
+                        {userMetadata.map(([key, value]) => (
+                          <div key={key}>
+                            <p className="text-sm text-gray-600 mb-1">{key}</p>
+                            <p className="text-sm font-medium wrap-break-words">
+                              {value}
+                            </p>
+                          </div>
+                        ))}
+                      </div>
+                    </CardContent>
+                  </Card>
+                ) : null;
+              })()}
             </div>
           </div>
         </TabsContent>

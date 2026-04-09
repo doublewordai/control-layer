@@ -1048,6 +1048,10 @@ export interface FileObject {
   context_name?: string;
   /** "personal" or "organization" */
   context_type?: string;
+  /** "sync" if ingested from an external connection */
+  source?: string;
+  /** Name of the source connection */
+  source_name?: string;
 }
 
 export interface FileListResponse {
@@ -1166,11 +1170,25 @@ export interface Batch {
   cancelling_at?: number | null;
   cancelled_at?: number | null;
   request_counts: BatchRequestCounts;
-  /** Metadata includes: created_by, created_by_email, request_source, context_name, context_type */
   metadata?: Record<string, string>;
   usage?: BatchUsage;
   /** Included when requesting with include=analytics */
   analytics?: BatchAnalytics;
+  /** Doubleword-specific extensions (source provenance, etc.) */
+  dwext?: BatchDwExt;
+}
+
+export interface BatchDwExt {
+  /** How the batch was created: "api", "frontend", or "sync" */
+  source?: string;
+  /** Name of the source connection (when source = "sync") */
+  source_name?: string;
+  /** Source connection ID */
+  source_id?: string;
+  /** Original external file key */
+  source_file?: string;
+  /** Sync operation ID */
+  sync_id?: string;
 }
 
 export interface BatchListResponse {
@@ -1400,6 +1418,86 @@ export interface WebhookUpdateRequest {
   enabled?: boolean;
   event_types?: string[] | null;
   description?: string | null;
+}
+
+// ===== CONNECTION TYPES =====
+
+export interface Connection {
+  id: string;
+  kind: string;
+  provider: string;
+  name: string;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface ConnectionCreateRequest {
+  provider: string;
+  name: string;
+  config: Record<string, unknown>;
+  kind?: string;
+}
+
+export interface ConnectionTestResponse {
+  ok: boolean;
+  provider: string;
+  message?: string | null;
+  scope?: Record<string, unknown> | null;
+}
+
+export interface SyncOperation {
+  id: string;
+  connection_id: string;
+  status: string;
+  strategy: string;
+  files_found: number;
+  files_skipped: number;
+  files_ingested: number;
+  files_failed: number;
+  batches_created: number;
+  error_summary?: unknown | null;
+  started_at?: number | null;
+  completed_at?: number | null;
+  created_at: number;
+}
+
+export interface SyncEntry {
+  id: string;
+  external_key: string;
+  external_size_bytes?: number | null;
+  status: string;
+  file_id?: string | null;
+  batch_id?: string | null;
+  template_count?: number | null;
+  error?: string | null;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface ExternalFileListResponse {
+  data: ExternalFile[];
+  has_more: boolean;
+  next_cursor?: string | null;
+}
+
+export interface ExternalFile {
+  key: string;
+  size_bytes?: number | null;
+  last_modified?: number | null;
+  display_name?: string | null;
+}
+
+export interface TriggerSyncRequest {
+  strategy?: string;
+  file_keys?: string[];
+  endpoint?: string;
+  completion_window?: string;
+  force?: boolean;
+}
+
+export interface SyncedKey {
+  key: string;
+  last_modified?: number | null;
 }
 
 // ===== ORGANIZATION TYPES =====

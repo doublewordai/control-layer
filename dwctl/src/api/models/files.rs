@@ -92,6 +92,14 @@ pub struct FileResponse {
     /// Context type: "personal" or "organization"
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_type: Option<String>,
+
+    /// Source: "sync" if ingested from an external connection, absent for uploaded files
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+
+    /// Name of the source connection (e.g. "prod-s3-inputs")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_name: Option<String>,
 }
 
 /// Object type - always "file"

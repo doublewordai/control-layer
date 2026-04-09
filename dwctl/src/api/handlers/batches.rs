@@ -14,7 +14,7 @@ use crate::api::models::batches::{
 };
 use crate::api::models::users::CurrentUser;
 use crate::auth::permissions::{RequiresPermission, can_read_all_resources, has_permission, operation, resource};
-use crate::db::handlers::{Credits, Users, api_keys::ApiKeys, repository::Repository};
+use crate::db::handlers::{Connections, Credits, Users, api_keys::ApiKeys, repository::Repository};
 use crate::db::models::api_keys::ApiKeyPurpose;
 use crate::errors::{Error, Result};
 use crate::types::{Operation, Resource};
@@ -122,20 +122,48 @@ fn is_batch_owner(current_user: &CurrentUser, created_by: &str) -> bool {
 /// If `creator_email` is provided, it will be injected into the metadata as `created_by_email`.
 /// This is used to populate the email without storing it in the batch metadata (PII concern).
 fn to_batch_response_with_email(batch: fusillade::Batch, creator_email: Option<&str>) -> BatchResponse {
-    // Convert metadata from serde_json::Value to HashMap<String, String>
-    let mut metadata: Option<HashMap<String, String>> = batch.metadata.and_then(|m| {
-        m.as_object().map(|obj| {
-            obj.iter()
-                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                .collect()
-        })
-    });
+    to_batch_response_enriched(batch, creator_email, None)
+}
 
-    // Inject created_by_email into metadata if we have it
+fn to_batch_response_enriched(batch: fusillade::Batch, creator_email: Option<&str>, source_name: Option<&str>) -> BatchResponse {
+    use crate::api::models::dwext::BatchDwExtResponse;
+
+    // Convert metadata from serde_json::Value to HashMap<String, String>
+    let raw_metadata: HashMap<String, String> = batch
+        .metadata
+        .and_then(|m| {
+            m.as_object().map(|obj| {
+                obj.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect()
+            })
+        })
+        .unwrap_or_default();
+
+    // Build dwext from dw_* metadata keys + optional source_name override
+    let request_source = raw_metadata.get("request_source").cloned();
+    let dwext = BatchDwExtResponse {
+        source: request_source.clone(),
+        source_id: raw_metadata.get("dw_source_id").cloned(),
+        // Prefer resolved name from DB (reflects renames) over stored metadata
+        source_name: source_name
+            .map(|s| s.to_string())
+            .or_else(|| raw_metadata.get("dw_source_name").cloned()),
+        source_file: raw_metadata.get("dw_external_key").cloned(),
+        sync_id: raw_metadata.get("dw_sync_id").cloned(),
+    };
+
+    // Build user-facing metadata: filter out internal dw_* keys.
+    // Keep request_source, created_by_email, context_name, context_type for backwards compat.
+    let internal_keys = ["dw_source_id", "dw_source_name", "dw_sync_id", "dw_external_key", "created_by"];
+    let mut metadata: HashMap<String, String> = raw_metadata
+        .into_iter()
+        .filter(|(k, _)| !internal_keys.contains(&k.as_str()))
+        .collect();
+
+    // Inject created_by_email into metadata for backwards compatibility
     if let Some(email) = creator_email {
-        metadata
-            .get_or_insert_with(HashMap::new)
-            .insert("created_by_email".to_string(), email.to_string());
+        metadata.insert("created_by_email".to_string(), email.to_string());
     }
 
     // Determine OpenAI status from request counts
@@ -236,8 +264,9 @@ fn to_batch_response_with_email(batch: fusillade::Batch, creator_email: Option<&
             completed: batch.completed_requests,
             failed: batch.failed_requests,
         },
-        metadata,
+        metadata: if metadata.is_empty() { None } else { Some(metadata) },
         analytics: None,
+        dwext: if dwext.is_empty() { None } else { Some(dwext) },
     }
 }
 
@@ -892,7 +921,37 @@ pub async fn get_batch<P: PoolProvider>(
         (None, None)
     };
 
-    let mut response = to_batch_response_with_email(batch, None);
+    // Resolve source connection name — only for sync-created batches, scoped to batch owner
+    let is_sync = batch
+        .metadata
+        .as_ref()
+        .and_then(|m| m.get("request_source"))
+        .and_then(|v| v.as_str())
+        == Some("sync");
+    let source_name = if is_sync {
+        if let Some(conn_id) = batch
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("dw_source_id"))
+            .and_then(|v| v.as_str())
+            .and_then(|s| Uuid::parse_str(s).ok())
+        {
+            match Connections::new(&mut read_conn).get_by_id(conn_id).await {
+                Ok(Some(conn)) if Uuid::parse_str(&batch.created_by).is_ok_and(|owner| conn.user_id == owner) => Some(conn.name),
+                Ok(_) => None, // Connection not found or not owned by batch owner
+                Err(e) => {
+                    tracing::warn!(error = %e, connection_id = %conn_id, "Failed to look up connection name");
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let mut response = to_batch_response_enriched(batch, None, source_name.as_deref());
 
     if let Some(email) = created_by_email {
         response
@@ -1634,6 +1693,30 @@ pub async fn list_batches<P: PoolProvider>(
     // Collect batch IDs for bulk operations
     let batch_ids: Vec<Uuid> = batches.iter().map(|b| b.id.0).collect();
 
+    // Bulk fetch connection names for sync-created batches only, scoped to batch owners.
+    // Only consider batches where request_source == "sync" to prevent metadata injection.
+    let source_conn_ids: Vec<Uuid> = batches
+        .iter()
+        .filter(|b| b.metadata.as_ref().and_then(|m| m.get("request_source")).and_then(|v| v.as_str()) == Some("sync"))
+        .filter_map(|b| {
+            b.metadata
+                .as_ref()
+                .and_then(|m| m.get("dw_source_id"))
+                .and_then(|v| v.as_str())
+                .and_then(|s| Uuid::parse_str(s).ok())
+        })
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    let connection_info: HashMap<Uuid, (String, Uuid)> = if !source_conn_ids.is_empty() {
+        Connections::new(&mut read_conn)
+            .get_names_by_ids(&source_conn_ids)
+            .await
+            .map_err(Error::Database)?
+    } else {
+        HashMap::new()
+    };
+
     // Fetch analytics in bulk if requested
     let analytics_map: HashMap<Uuid, BatchAnalytics> = if include_analytics && !batches.is_empty() {
         crate::db::handlers::analytics::get_batches_analytics_bulk(state.db.read(), &batch_ids)
@@ -1681,7 +1764,31 @@ pub async fn list_batches<P: PoolProvider>(
                 None => (None, None),
             };
 
-            let mut response = to_batch_response_with_email(batch, None);
+            // Resolve source connection name — only for sync-created batches
+            let is_sync = batch
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("request_source"))
+                .and_then(|v| v.as_str())
+                == Some("sync");
+            let source_name: Option<&str> = if is_sync {
+                batch
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| m.get("dw_source_id"))
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| Uuid::parse_str(s).ok())
+                    .and_then(|conn_id| {
+                        // Verify connection is owned by the batch creator
+                        let batch_owner = Uuid::parse_str(&batch.created_by).ok()?;
+                        let (name, owner) = connection_info.get(&conn_id)?;
+                        if *owner == batch_owner { Some(name.as_str()) } else { None }
+                    })
+            } else {
+                None
+            };
+
+            let mut response = to_batch_response_enriched(batch, None, source_name);
 
             // Inject enriched creator/context info into metadata
             if let Some(email) = created_by_email {

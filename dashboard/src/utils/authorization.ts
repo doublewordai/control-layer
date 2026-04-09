@@ -17,7 +17,8 @@ export type PagePermission =
   | "manage-groups"
   | "manage-models"
   | "batches"
-  | "usage";
+  | "usage"
+  | "connections";
 
 // Define which roles can access which pages
 const ROLE_PERMISSIONS: Record<Role, PagePermission[]> = {
@@ -37,6 +38,7 @@ const ROLE_PERMISSIONS: Record<Role, PagePermission[]> = {
     "manage-models",
     "batches",
     "usage",
+    "connections",
   ],
   StandardUser: [
     "models",
@@ -86,6 +88,7 @@ export const ROUTE_PERMISSIONS: Record<string, PagePermission> = {
   "/profile": "profile",
   "/batches": "batches",
   "/usage": "usage",
+  "/connections": "connections",
 };
 
 /**

@@ -119,6 +119,7 @@ pub enum Resource {
     System,
     Organizations,
     ToolSources,
+    Connections,
 }
 
 // Permission types for authorization

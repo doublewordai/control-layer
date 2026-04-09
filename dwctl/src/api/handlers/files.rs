@@ -17,6 +17,7 @@ use crate::auth::permissions::{RequiresPermission, can_read_all_resources, opera
 use crate::AppState;
 use crate::db::{
     handlers::api_keys::ApiKeys,
+    handlers::connections::Connections,
     handlers::deployments::{DeploymentFilter, Deployments},
     handlers::repository::Repository,
     handlers::tariffs::Tariffs,
@@ -967,6 +968,8 @@ pub async fn upload_file<P: PoolProvider>(
             created_by_email: None,
             context_name: None,
             context_type: None,
+            source: file.source_connection_id.map(|_| "sync".to_string()),
+            source_name: None, // Upload response — no connection lookup needed
         }),
     ))
 }
@@ -1148,6 +1151,22 @@ pub async fn list_files<P: PoolProvider>(
         std::collections::HashMap::new()
     };
 
+    // Bulk fetch connection names for synced files
+    let source_conn_ids: Vec<uuid::Uuid> = files
+        .iter()
+        .filter_map(|f| f.source_connection_id)
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    let connection_info: std::collections::HashMap<uuid::Uuid, (String, uuid::Uuid)> = if !source_conn_ids.is_empty() {
+        Connections::new(&mut read_conn)
+            .get_names_by_ids(&source_conn_ids)
+            .await
+            .map_err(Error::Database)?
+    } else {
+        std::collections::HashMap::new()
+    };
+
     let data: Vec<FileResponse> = files
         .iter()
         .map(|f| {
@@ -1186,6 +1205,10 @@ pub async fn list_files<P: PoolProvider>(
                 created_by_email,
                 context_name,
                 context_type,
+                source: f.source_connection_id.map(|_| "sync".to_string()),
+                source_name: f
+                    .source_connection_id
+                    .and_then(|id| connection_info.get(&id).map(|(name, _)| name.clone())),
             }
         })
         .collect();
@@ -1307,6 +1330,19 @@ pub async fn get_file<P: PoolProvider>(
         created_by_email,
         context_name,
         context_type,
+        source: file.source_connection_id.map(|_| "sync".to_string()),
+        source_name: if let Some(conn_id) = file.source_connection_id {
+            match Connections::new(&mut read_conn).get_by_id(conn_id).await {
+                Ok(Some(conn)) => Some(conn.name),
+                Ok(None) => None,
+                Err(e) => {
+                    tracing::warn!(error = %e, connection_id = %conn_id, "Failed to look up connection name for file");
+                    None
+                }
+            }
+        } else {
+            None
+        },
     }))
 }
 

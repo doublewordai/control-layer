@@ -19,7 +19,7 @@ embedded-db = ["dep:postgresql_embedded"]
 
 [dependencies]
 axum = { version = "0.8", features = ["multipart"] }
-fusillade = { version = "14.2.2" }
+fusillade = { version = "15.0.0" }
 tokio = { version = "1.0", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = "0.7"
@@ -146,6 +146,9 @@ multer = "3.1.0"
 ctor = "0.6"
 hmac = "0.12.1"
 sha2 = "0.10.9"
+# AWS SDK for S3 source connections
+aws-sdk-s3 = "1.21"
+aws-credential-types = "1.1"
 
 [dev-dependencies]
 axum-test = { version = "18.4.1" }

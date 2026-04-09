@@ -144,9 +144,11 @@ pub mod api;
 pub mod auth;
 pub mod config;
 mod config_watcher;
+pub mod connections;
 mod crypto;
 pub mod db;
 mod email;
+pub mod encryption;
 mod error_enrichment;
 pub mod errors;
 mod leader_election;
@@ -286,6 +288,9 @@ where
     pub task_runner: Arc<tasks::TaskRunner<P>>,
     /// Resource limiters for protecting system capacity.
     pub limiters: limits::Limiters,
+    /// Encryption key for connection credentials, derived once at startup.
+    /// `None` means connections encryption is unavailable.
+    pub connections_encryption_key: Option<Vec<u8>>,
 }
 
 impl<P> AppState<P>
@@ -1271,6 +1276,36 @@ pub async fn build_router(
         .route(
             "/groups/{id}/tool-sources/{source_id}",
             delete(api::handlers::tool_sources::detach_tool_source_from_group),
+        )
+        // Connections (external data sources)
+        .route("/connections", post(api::handlers::connections::create_connection))
+        .route("/connections", get(api::handlers::connections::list_connections))
+        .route("/connections/{connection_id}", get(api::handlers::connections::get_connection))
+        .route(
+            "/connections/{connection_id}",
+            delete(api::handlers::connections::delete_connection),
+        )
+        .route(
+            "/connections/{connection_id}/test",
+            post(api::handlers::connections::test_connection),
+        )
+        .route(
+            "/connections/{connection_id}/files",
+            get(api::handlers::connections::list_connection_files),
+        )
+        .route(
+            "/connections/{connection_id}/synced-keys",
+            get(api::handlers::connections::list_synced_keys),
+        )
+        .route("/connections/{connection_id}/sync", post(api::handlers::connections::trigger_sync))
+        .route("/connections/{connection_id}/syncs", get(api::handlers::connections::list_syncs))
+        .route(
+            "/connections/{connection_id}/syncs/{sync_id}",
+            get(api::handlers::connections::get_sync),
+        )
+        .route(
+            "/connections/{connection_id}/syncs/{sync_id}/entries",
+            get(api::handlers::connections::list_sync_entries),
         );
 
     let api_routes_with_state = api_routes.with_state(state.clone());
@@ -1616,6 +1651,8 @@ pub struct BackgroundServices {
     shutdown_token: tokio_util::sync::CancellationToken,
     // Pub so that we can disarm it if we want to
     pub drop_guard: Option<tokio_util::sync::DropGuard>,
+    /// Connections encryption key, derived once at startup.
+    connections_encryption_key: Option<Vec<u8>>,
 }
 
 impl BackgroundServices {
@@ -2172,13 +2209,29 @@ async fn setup_background_services(
         None
     };
 
-    // Build the underway task runner for background jobs (batch population, etc.)
+    // Build the underway task runner for background jobs (batch population, sync pipeline, etc.)
+    let encryption_key = match config.connections.encryption_key.as_deref().or(config.secret_key.as_deref()) {
+        Some(secret) if !secret.trim().is_empty() => Some(encryption::derive_encryption_key(secret.trim())),
+        Some(_) => {
+            tracing::warn!("Encryption key is empty/whitespace — connection features will be unavailable");
+            None
+        }
+        None => {
+            tracing::info!("No encryption key configured for connections (set secret_key or connections.encryption_key)");
+            None
+        }
+    };
     let task_state = tasks::TaskState {
         request_manager: request_manager.clone(),
+        dwctl_pool: pool.clone(),
+        encryption_key: encryption_key.clone(),
+        ingest_file_job: Arc::new(std::sync::OnceLock::new()),
+        activate_batch_job: Arc::new(std::sync::OnceLock::new()),
+        create_batch_job: Arc::new(std::sync::OnceLock::new()),
     };
     let task_runner = Arc::new(tasks::TaskRunner::new(underway_pool, task_state).await?);
-    for handle in task_runner.start(shutdown_token.clone()) {
-        background_tasks.spawn("underway-worker", async move { handle.await.map_err(|e| anyhow::anyhow!("{}", e)) });
+    for (name, handle) in task_runner.start(shutdown_token.clone(), &config.background_services.sync_workers) {
+        background_tasks.spawn(name, async move { handle.await.map_err(|e| anyhow::anyhow!("{}", e)) });
     }
 
     let (background_tasks, task_names) = background_tasks.into_parts();
@@ -2195,6 +2248,7 @@ async fn setup_background_services(
         task_names,
         shutdown_token,
         drop_guard: Some(drop_guard),
+        connections_encryption_key: encryption_key.clone(),
     })
 }
 
@@ -2339,6 +2393,7 @@ impl Application {
             .task_runner(bg_services.task_runner.clone())
             .maybe_outlet_db(outlet_pools.clone())
             .limiters(limiters)
+            .maybe_connections_encryption_key(bg_services.connections_encryption_key.clone())
             .build();
 
         if let Some(config_path) = config_path {

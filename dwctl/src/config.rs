@@ -182,6 +182,9 @@ pub struct Config {
     pub onboarding_url: Option<String>,
     /// Email address where support requests are sent (default: "support@doubleword.ai")
     pub support_email: String,
+    /// External data source connections configuration
+    #[serde(default)]
+    pub connections: ConnectionsConfig,
 }
 
 /// Individual pool configuration with all SQLx parameters.
@@ -1372,6 +1375,8 @@ pub struct BackgroundServicesConfig {
     pub pool_metrics: PoolMetricsSamplerConfig,
     /// Configuration for batch completion notifications (email + webhooks)
     pub notifications: NotificationsConfig,
+    /// Configuration for connection sync workers (file ingestion, batch activation)
+    pub sync_workers: SyncWorkersConfig,
 }
 
 /// Database pool metrics sampling configuration.
@@ -1580,6 +1585,70 @@ impl Default for AnalyticsConfig {
     }
 }
 
+/// External data source connections configuration.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ConnectionsConfig {
+    /// Encryption key for connection credentials (base64 or 32-byte string).
+    /// Falls back to `secret_key` if not set.
+    pub encryption_key: Option<String>,
+    /// Sync pipeline configuration.
+    pub sync: SyncPipelineConfig,
+}
+
+/// Configuration for the sync ingestion/activation pipeline.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SyncPipelineConfig {
+    /// Default completion window for sync-created batches (default: "24h").
+    pub default_completion_window: String,
+    /// Default endpoint for sync-created batches (default: "/v1/chat/completions").
+    pub default_endpoint: String,
+}
+
+impl Default for SyncPipelineConfig {
+    fn default() -> Self {
+        Self {
+            default_completion_window: "24h".to_string(),
+            default_endpoint: "/v1/chat/completions".to_string(),
+        }
+    }
+}
+
+/// Configuration for connection sync background workers.
+///
+/// Controls whether sync workers run on this instance and how many concurrent
+/// workers process each stage of the pipeline.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SyncWorkersConfig {
+    /// Enable sync workers on this instance (default: true).
+    /// Set to false for API-only replicas that should not process sync jobs.
+    /// Jobs are still enqueued to Postgres and picked up by other replicas.
+    pub enabled: bool,
+    /// Number of concurrent file ingestion workers (default: 4).
+    /// Controls how many files are streamed from S3 and written to fusillade
+    /// simultaneously. Higher values increase throughput but use more memory.
+    pub ingest_workers: usize,
+    /// Number of concurrent batch activation workers (default: 1).
+    /// Kept low to avoid overwhelming capacity reservation checks.
+    pub activate_workers: usize,
+    /// Number of sync discovery workers (default: 1).
+    /// Typically only one is needed since discovery is fast.
+    pub sync_workers: usize,
+}
+
+impl Default for SyncWorkersConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            ingest_workers: 4,
+            activate_workers: 1,
+            sync_workers: 1,
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -1611,6 +1680,7 @@ impl Default for Config {
             onwards: OnwardsConfig::default(),
             onboarding_url: None,
             support_email: "support@doubleword.ai".to_string(),
+            connections: ConnectionsConfig::default(),
         }
     }
 }
