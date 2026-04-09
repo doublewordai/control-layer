@@ -113,12 +113,12 @@ export function FileBrowser({ connectionId }: { connectionId: string }) {
     if (isSyncing(file)) return "syncing";
     const entry = syncedKeyMap.get(file.key);
     if (!entry) return "new";
-    // Check if the sync failed
-    if (entry.status === "failed") return "failed";
-    // Key was synced — check if it's been modified since
+    // Check if file has been modified since last sync (whether it succeeded or failed)
     const syncedTs = entry.lastModified;
     const fileTs = file.last_modified ?? null;
     if (syncedTs != null && fileTs != null && fileTs > syncedTs) return "modified";
+    // Terminal states
+    if (entry.status === "failed") return "failed";
     return "synced";
   };
 

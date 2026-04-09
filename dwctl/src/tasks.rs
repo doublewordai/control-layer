@@ -152,7 +152,7 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> TaskRunner<P> {
         }
 
         // Sync discovery workers (0 = disabled)
-        for i in 0..sync_config.sync_workers {
+        for i in 0..sync_config.discovery_workers {
             let mut worker = self.sync_connection_job.worker();
             worker.set_shutdown_token(shutdown_token.clone());
             handles.push((
@@ -194,7 +194,7 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> TaskRunner<P> {
         }
 
         tracing::info!(
-            sync_workers = sync_config.sync_workers,
+            sync_workers = sync_config.discovery_workers,
             ingest_workers = sync_config.ingest_workers,
             activate_workers = sync_config.activate_workers,
             "Sync workers started"

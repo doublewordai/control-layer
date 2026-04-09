@@ -1635,7 +1635,7 @@ pub struct SyncWorkersConfig {
     pub activate_workers: usize,
     /// Number of sync discovery workers (default: 1).
     /// Typically only one is needed since discovery is fast.
-    pub sync_workers: usize,
+    pub discovery_workers: usize,
 }
 
 impl Default for SyncWorkersConfig {
@@ -1644,7 +1644,7 @@ impl Default for SyncWorkersConfig {
             enabled: true,
             ingest_workers: 4,
             activate_workers: 1,
-            sync_workers: 1,
+            discovery_workers: 1,
         }
     }
 }

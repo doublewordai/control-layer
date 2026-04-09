@@ -534,9 +534,9 @@ impl<'c> SyncEntries<'c> {
         Ok(rows.into_iter().map(|r| (r.external_key, r.external_last_modified)).collect())
     }
 
-    /// Get all successfully-synced keys for a connection (for UI status display).
-    /// Returns distinct (key, last_modified) pairs. For matching in the frontend,
-    /// we return the most recent last_modified per key so it matches S3 listings.
+    /// Get all terminal sync entries for a connection (for UI status display).
+    /// Returns (key, last_modified, status) where status is 'activated' or 'failed'.
+    /// The frontend uses this to show Synced/Failed/Modified states in the file browser.
     #[instrument(skip(self), fields(connection_id = %connection_id), err)]
     #[allow(clippy::type_complexity)]
     pub async fn list_synced_keys(&mut self, connection_id: Uuid) -> Result<Vec<(String, Option<DateTime<Utc>>, String)>> {

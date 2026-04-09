@@ -721,10 +721,6 @@ async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'static>(
                 tracing::info!(sync_entry_id = %input.sync_entry_id, "Sync entry deleted during ingestion, skipping activation");
                 return Ok(());
             }
-            SyncOperations::new(&mut conn)
-                .increment_counter(input.sync_id, "files_ingested")
-                .await?;
-
             // If no valid templates were created, mark entry as failed — don't create an empty batch
             if template_count == 0 {
                 SyncEntries::new(&mut conn)
@@ -746,6 +742,10 @@ async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'static>(
                 );
                 return Ok(());
             }
+
+            SyncOperations::new(&mut conn)
+                .increment_counter(input.sync_id, "files_ingested")
+                .await?;
 
             // 8. Enqueue ActivateBatchJob
             state
@@ -895,11 +895,18 @@ async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + 'static>(
 
     // 7. Populate batch synchronously (instead of enqueuing async job) so we
     //    can immediately fail requests that had validation errors during ingest.
-    state
+    if let Err(e) = state
         .request_manager
         .populate_batch(fusillade::BatchId(batch_id), fusillade::FileId(input.file_id))
         .await
-        .map_err(|e| anyhow::anyhow!("populate batch: {e}"))?;
+    {
+        // Mark batch as failed (same as build_create_batch_job error handling)
+        let _ = state
+            .request_manager
+            .mark_batch_failed(fusillade::BatchId(batch_id), &e.to_string())
+            .await;
+        anyhow::bail!("populate batch: {e}");
+    }
 
     // 8. Fail requests whose templates came from invalid lines (tier 2 errors)
     if let Some(errors) = &sync_entry.validation_errors
