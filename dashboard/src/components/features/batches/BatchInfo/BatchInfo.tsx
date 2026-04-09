@@ -637,14 +637,16 @@ const BatchInfo: React.FC = () => {
                                   Completion Tokens
                                 </p>
                               </div>
-                              <div className="text-center p-3 rounded-lg">
-                                <p className="text-2xl font-bold">
-                                  {(analytics.total_reasoning_tokens ?? 0).toLocaleString()}
-                                </p>
-                                <p className="text-xs text-gray-600 mt-1">
-                                  Reasoning Tokens
-                                </p>
-                              </div>
+                              {(analytics.total_reasoning_tokens ?? 0) > 0 && (
+                                <div className="text-center p-3 rounded-lg">
+                                  <p className="text-2xl font-bold">
+                                    {(analytics.total_reasoning_tokens ?? 0).toLocaleString()}
+                                  </p>
+                                  <p className="text-xs text-gray-600 mt-1">
+                                    Reasoning Tokens
+                                  </p>
+                                </div>
+                              )}
                               <div className="text-center p-3 rounded-lg">
                                 <p className="text-2xl font-bold text-gray-900">
                                   {analytics.total_tokens.toLocaleString()}
