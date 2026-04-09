@@ -124,12 +124,12 @@ export function FileBrowser({ connectionId }: { connectionId: string }) {
 
   const isSynced = (file: ExternalFile) => getStatus(file) === "synced";
 
-  // "New" and "modified" files can be synced without force
+  // "New", "modified", and "failed" files can be synced (failed uses force for dedup bypass)
   const selectedSyncableKeys = [...selected].filter((key) => {
     const file = files.find((f) => f.key === key);
     if (!file) return false;
     const s = getStatus(file);
-    return s === "new" || s === "modified";
+    return s === "new" || s === "modified" || s === "failed";
   });
   // Already-synced (unchanged) files need force to re-sync
   const selectedSyncedKeys = [...selected].filter((key) => {
@@ -164,30 +164,35 @@ export function FileBrowser({ connectionId }: { connectionId: string }) {
   }, [queryClient, connectionId]);
 
   const handleSyncNew = async () => {
-    const newKeys = [...selected].filter((key) => {
+    const syncableKeys = [...selected].filter((key) => {
       const file = files.find((f) => f.key === key);
       if (!file) return false;
       const s = getStatus(file);
-      return s === "new" || s === "modified";
+      return s === "new" || s === "modified" || s === "failed";
     });
-    if (newKeys.length === 0) {
+    if (syncableKeys.length === 0) {
       toast.info("All selected files are already synced");
       return;
     }
+    // Force is needed when retrying failed files (harmless for new/modified)
+    const needsForce = syncableKeys.some((key) => {
+      const file = files.find((f) => f.key === key);
+      return file && getStatus(file) === "failed";
+    });
     // Optimistically mark as syncing
-    setSyncingKeys((prev) => new Set([...prev, ...newKeys]));
+    setSyncingKeys((prev) => new Set([...prev, ...syncableKeys]));
     try {
       await syncMutation.mutateAsync({
         connectionId,
-        data: { strategy: "select", file_keys: newKeys },
+        data: { strategy: "select", file_keys: syncableKeys, ...(needsForce && { force: true }) },
       });
-      toast.success(`Syncing ${newKeys.length} file${newKeys.length !== 1 ? "s" : ""}`);
+      toast.success(`Syncing ${syncableKeys.length} file${syncableKeys.length !== 1 ? "s" : ""}`);
       setSelected(new Set());
     } catch {
       // Revert optimistic status
       setSyncingKeys((prev) => {
         const next = new Set(prev);
-        for (const k of newKeys) next.delete(k);
+        for (const k of syncableKeys) next.delete(k);
         return next;
       });
       toast.error("Failed to trigger sync");
