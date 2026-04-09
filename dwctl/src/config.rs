@@ -1635,6 +1635,7 @@ pub struct SyncWorkersConfig {
     pub activate_workers: usize,
     /// Number of sync discovery workers (default: 1).
     /// Typically only one is needed since discovery is fast.
+    #[serde(alias = "sync_workers")]
     pub discovery_workers: usize,
 }
 

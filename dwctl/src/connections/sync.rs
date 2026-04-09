@@ -459,7 +459,8 @@ async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'static>(
         let mut line_buf = String::new();
         let mut template_count: i32 = 0;
         let mut skipped_lines: i32 = 0;
-        let mut validation_errors: Vec<(i32, String)> = Vec::new();
+        // (template_index, file_line, error) — template_index matches request_templates.line_number
+        let mut validation_errors: Vec<(i32, u64, String)> = Vec::new();
         let mut line_number: u64 = 0;
         let mut stream = byte_stream;
         // Buffer for incomplete UTF-8 sequences split across chunk boundaries.
@@ -561,7 +562,7 @@ async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'static>(
 
                         if let Some(ref err) = line_error {
                             tracing::warn!(line_num = line_number, error = %err, "Validation error (tier 2), ingesting template with error");
-                            validation_errors.push((line_number as i32, err.clone()));
+                            validation_errors.push((template_count, line_number, err.clone()));
                         }
 
                         // Strip `priority` from body if present and re-serialize
@@ -649,7 +650,7 @@ async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'static>(
                     }
 
                     if let Some(ref err) = line_error {
-                        validation_errors.push((line_number as i32, err.clone()));
+                        validation_errors.push((template_count, line_number, err.clone()));
                     }
 
                     // Strip `priority` from body if present and re-serialize
@@ -701,7 +702,7 @@ async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'static>(
                 Some(serde_json::json!(
                     validation_errors
                         .iter()
-                        .map(|(line, err)| { serde_json::json!({"line": line, "error": err}) })
+                        .map(|(idx, line, err)| { serde_json::json!({"template_index": idx, "line": line, "error": err}) })
                         .collect::<Vec<_>>()
                 ))
             };
@@ -914,7 +915,7 @@ async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + 'static>(
     {
         let line_numbers: Vec<i32> = error_lines
             .iter()
-            .filter_map(|e| e.get("line").and_then(|l| l.as_i64()).map(|l| l as i32))
+            .filter_map(|e| e.get("template_index").and_then(|l| l.as_i64()).map(|l| l as i32))
             .collect();
 
         if !line_numbers.is_empty() {

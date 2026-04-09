@@ -194,7 +194,7 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> TaskRunner<P> {
         }
 
         tracing::info!(
-            sync_workers = sync_config.discovery_workers,
+            discovery_workers = sync_config.discovery_workers,
             ingest_workers = sync_config.ingest_workers,
             activate_workers = sync_config.activate_workers,
             "Sync workers started"
