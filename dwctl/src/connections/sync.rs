@@ -162,18 +162,21 @@ pub async fn build_activate_batch_job<P: PoolProvider + Clone + Send + Sync + 's
                     To::done()
                 }
                 Err(e) => {
-                    let is_retryable = e
+                    // Only explicitly-classified Fatal errors permanently fail the
+                    // sync entry. Everything else (including bare anyhow/sqlx errors)
+                    // is treated as retryable so transient DB/network issues recover.
+                    let is_fatal = e
                         .downcast_ref::<ActivateError>()
-                        .is_some_and(|ae| matches!(ae, ActivateError::Retryable(_)));
+                        .is_some_and(|ae| matches!(ae, ActivateError::Fatal(_)));
 
                     tracing::error!(
                         sync_entry_id = %input.sync_entry_id,
-                        retryable = is_retryable,
+                        retryable = !is_fatal,
                         error = %e,
                         "ActivateBatchJob failed"
                     );
 
-                    if is_retryable {
+                    if !is_fatal {
                         return Err(TaskError::Retryable(e.to_string()));
                     }
 
