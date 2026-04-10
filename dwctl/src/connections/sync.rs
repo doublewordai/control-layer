@@ -51,9 +51,6 @@ pub struct ActivateBatchInput {
     pub connection_id: Uuid,
     pub file_id: Uuid,
     pub template_count: i32,
-    /// 0-based template indices that had tier-2 validation errors.
-    /// Passed directly from ingest to avoid re-parsing capped JSON.
-    pub validation_error_indices: Vec<i32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -475,18 +472,16 @@ pub(crate) async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'sta
         };
 
         if tx.send(FileStreamItem::Metadata(metadata)).await.is_err() {
-            return (0i32, 0i32, Vec::new(), Vec::new());
+            return (0i32, 0i32, Vec::new());
         }
 
         let mut line_buf = String::new();
         let mut template_count: i32 = 0;
         let mut skipped_lines: i32 = 0;
         // (template_index, file_line, error) — template_index matches request_templates.line_number
-        // Detailed errors are capped for storage/display; template indices are always
-        // collected so the activate step can fail the correct requests.
+        // Capped to avoid unbounded memory/DB row growth on large garbled files.
         const MAX_VALIDATION_ERRORS: usize = 1000;
         let mut validation_errors: Vec<(i32, u64, String)> = Vec::new();
-        let mut validation_error_indices: Vec<i32> = Vec::new();
         let mut line_number: u64 = 0;
         let mut stream = byte_stream;
         // Buffer for incomplete UTF-8 sequences split across chunk boundaries.
@@ -498,7 +493,7 @@ pub(crate) async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'sta
                 Err(e) => {
                     tracing::error!(error = %e, "Error reading from provider stream");
                     let _ = tx.send(FileStreamItem::Abort).await;
-                    return (template_count, skipped_lines, validation_errors, validation_error_indices);
+                    return (template_count, skipped_lines, validation_errors);
                 }
             };
 
@@ -588,7 +583,6 @@ pub(crate) async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'sta
 
                         if let Some(ref err) = line_error {
                             tracing::warn!(line_num = line_number, error = %err, "Validation error (tier 2), ingesting template with error");
-                            validation_error_indices.push(template_count);
                             if validation_errors.len() < MAX_VALIDATION_ERRORS {
                                 validation_errors.push((template_count, line_number, err.clone()));
                             }
@@ -616,7 +610,7 @@ pub(crate) async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'sta
                         };
 
                         if tx.send(FileStreamItem::Template(template)).await.is_err() {
-                            return (template_count, skipped_lines, validation_errors, validation_error_indices);
+                            return (template_count, skipped_lines, validation_errors);
                         }
                         template_count += 1;
                     }
@@ -680,7 +674,6 @@ pub(crate) async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'sta
 
                     if let Some(ref err) = line_error {
                         tracing::warn!(line_num = line_number, error = %err, "Validation error (tier 2), ingesting template with error");
-                        validation_error_indices.push(template_count);
                         if validation_errors.len() < MAX_VALIDATION_ERRORS {
                             validation_errors.push((template_count, line_number, err.clone()));
                         }
@@ -709,28 +702,28 @@ pub(crate) async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'sta
                     let _ = tx.send(FileStreamItem::Template(template)).await;
                     template_count += 1;
                 }
-                Err(_) => {
+                Err(err) => {
                     // Tier 1: garbled trailing line
+                    tracing::warn!(line_num = line_number, error = %err, "Skipping non-JSON line (tier 1)");
                     skipped_lines += 1;
                 }
             }
         }
 
-        (template_count, skipped_lines, validation_errors, validation_error_indices)
+        (template_count, skipped_lines, validation_errors)
     });
 
     // 6. Feed the stream into fusillade's create_file_stream
     let rx_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
     let result = state.request_manager.create_file_stream(rx_stream).await;
 
-    let (template_count, skipped_lines, validation_errors, validation_error_indices) =
-        producer.await.map_err(|e| anyhow::anyhow!("producer task panicked: {e}"))?;
+    let (template_count, skipped_lines, validation_errors) = producer.await.map_err(|e| anyhow::anyhow!("producer task panicked: {e}"))?;
 
     match result {
         Ok(fusillade::FileStreamResult::Success(file_id)) => {
             // 7. Update sync entry with internal file_id, template count,
             //    skipped lines, and validation errors
-            let validation_errors_json = if validation_error_indices.is_empty() {
+            let validation_errors_json = if validation_errors.is_empty() {
                 None
             } else {
                 let errors: Vec<serde_json::Value> = validation_errors
@@ -790,7 +783,6 @@ pub(crate) async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'sta
                     connection_id: input.connection_id,
                     file_id: file_id.0,
                     template_count,
-                    validation_error_indices,
                 })
                 .await?;
 
@@ -890,6 +882,7 @@ pub(crate) async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + '
     };
 
     // 5. Look up sync entry for external key (used in batch provenance metadata below)
+    //    and validation errors (for tier-2 failure marking after populate).
     let sync_entry = {
         let mut conn = dwctl.acquire().await?;
         SyncEntries::new(&mut conn)
@@ -899,34 +892,48 @@ pub(crate) async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + '
     };
     let external_key = sync_entry.external_key.clone();
 
-    // 6. Create batch record
-    //    created_by = owner (org or user) for visibility scoping — same as normal batch creation
-    let metadata = serde_json::json!({
-        "request_source": "sync",
-        "dw_source_id": input.connection_id.to_string(),
-        "dw_source_name": connection_name,
-        "dw_sync_id": input.sync_id.to_string(),
-        "dw_external_key": external_key,
-    });
+    // 6. Create or reuse batch record.
+    //    On retries (transient failure after create_batch_record), reuse the batch_id
+    //    already persisted on the sync entry to avoid orphaned/duplicate batches.
+    let batch_id = if let Some(existing) = sync_entry.batch_id {
+        tracing::info!(batch_id = %existing, "Reusing batch from previous attempt");
+        existing
+    } else {
+        let metadata = serde_json::json!({
+            "request_source": "sync",
+            "dw_source_id": input.connection_id.to_string(),
+            "dw_source_name": connection_name,
+            "dw_sync_id": input.sync_id.to_string(),
+            "dw_external_key": external_key,
+        });
 
-    let batch_input = fusillade::BatchInput {
-        file_id: fusillade::FileId(input.file_id),
-        endpoint,
-        completion_window,
-        metadata: Some(metadata),
-        created_by: Some(batch_owner.to_string()),
-        api_key_id: Some(api_key_id),
-        api_key: Some(batch_api_key),
-        total_requests: Some(input.template_count as i64),
+        let batch_input = fusillade::BatchInput {
+            file_id: fusillade::FileId(input.file_id),
+            endpoint,
+            completion_window,
+            metadata: Some(metadata),
+            created_by: Some(batch_owner.to_string()),
+            api_key_id: Some(api_key_id),
+            api_key: Some(batch_api_key),
+            total_requests: Some(input.template_count as i64),
+        };
+
+        let batch = state
+            .request_manager
+            .create_batch_record(batch_input)
+            .await
+            .map_err(|e| anyhow::anyhow!("create batch record: {e}"))?;
+
+        let bid = *batch.id;
+
+        // Persist batch_id immediately so retries reuse this batch
+        let mut conn = dwctl.acquire().await?;
+        sqlx::query!("UPDATE sync_entries SET batch_id = $2 WHERE id = $1", input.sync_entry_id, bid,)
+            .execute(&mut *conn)
+            .await?;
+
+        bid
     };
-
-    let batch = state
-        .request_manager
-        .create_batch_record(batch_input)
-        .await
-        .map_err(|e| anyhow::anyhow!("create batch record: {e}"))?;
-
-    let batch_id = *batch.id;
 
     // 7. Populate batch synchronously (instead of enqueuing async job) so we
     //    can immediately fail requests that had validation errors during ingest.
@@ -959,37 +966,48 @@ pub(crate) async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + '
     }
 
     // 8. Fail requests whose templates came from invalid lines (tier 2 errors).
-    //    Indices are passed directly from ingest (not re-parsed from the capped JSON).
-    if !input.validation_error_indices.is_empty() {
-        let fusillade_pool = state.request_manager.pool();
+    //    Read template_index values from the stored validation_errors JSON (capped
+    //    at 1000 during ingest) so nothing large passes through the job payload.
+    if let Some(errors) = &sync_entry.validation_errors
+        && let Ok(error_list) = serde_json::from_value::<Vec<serde_json::Value>>(errors.clone())
+    {
+        let error_indices: Vec<i32> = error_list
+            .iter()
+            .filter_map(|e| e.get("template_index").and_then(|l| l.as_i64()).map(|l| l as i32))
+            .collect();
 
-        // Find template IDs by line number (0-based template index)
-        let template_ids: Vec<Uuid> =
-            sqlx::query_scalar("SELECT id FROM fusillade.request_templates WHERE file_id = $1 AND line_number = ANY($2)")
-                .bind(input.file_id)
-                .bind(&input.validation_error_indices)
-                .fetch_all(fusillade_pool)
-                .await?;
+        if !error_indices.is_empty() {
+            let fusillade_pool = state.request_manager.pool();
 
-        if !template_ids.is_empty() {
-            let rows = sqlx::query(
-                "UPDATE fusillade.requests SET state = 'failed', error = $1, failed_at = NOW() WHERE batch_id = $2 AND template_id = ANY($3) AND state = 'pending'",
-            )
-            .bind("Request failed validation during ingestion — check sync entry for details")
-            .bind(batch_id)
-            .bind(&template_ids)
-            .execute(fusillade_pool)
-            .await?;
+            let template_ids: Vec<Uuid> =
+                sqlx::query_scalar("SELECT id FROM fusillade.request_templates WHERE file_id = $1 AND line_number = ANY($2)")
+                    .bind(input.file_id)
+                    .bind(&error_indices)
+                    .fetch_all(fusillade_pool)
+                    .await
+                    .map_err(|e| ActivateError::Retryable(format!("query templates: {e}")))?;
 
-            tracing::info!(
-                batch_id = %batch_id,
-                failed_count = rows.rows_affected(),
-                "Failed invalid requests from tier 2 validation errors"
-            );
+            if !template_ids.is_empty() {
+                let rows = sqlx::query(
+                    "UPDATE fusillade.requests SET state = 'failed', error = $1, failed_at = NOW() WHERE batch_id = $2 AND template_id = ANY($3) AND state = 'pending'",
+                )
+                .bind("Request failed validation during ingestion — check sync entry for details")
+                .bind(batch_id)
+                .bind(&template_ids)
+                .execute(fusillade_pool)
+                .await
+                .map_err(|e| ActivateError::Retryable(format!("fail invalid requests: {e}")))?;
+
+                tracing::info!(
+                    batch_id = %batch_id,
+                    failed_count = rows.rows_affected(),
+                    "Failed invalid requests from tier 2 validation errors"
+                );
+            }
         }
     }
 
-    // 9. Update sync entry with batch_id
+    // 9. Update sync entry with batch_id and activated status
     {
         let mut conn = dwctl.acquire().await?;
         SyncEntries::new(&mut conn).set_activated(input.sync_entry_id, batch_id).await?;
@@ -1211,7 +1229,6 @@ mod tests {
             connection_id,
             file_id,
             template_count: 4,
-            validation_error_indices: vec![1, 3], // template indices 1 and 3 are tier-2 errors
         };
 
         run_activate_batch(&state, &input).await.expect("run_activate_batch");

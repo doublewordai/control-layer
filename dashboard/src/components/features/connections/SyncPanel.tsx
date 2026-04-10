@@ -150,7 +150,7 @@ function SyncEntryList({
                     <span className="text-amber-600"> ({entry.skipped_lines} skipped)</span>
                   )}
                   {entry.validation_errors && entry.validation_errors.length > 0 && (
-                    <span className="text-amber-600"> ({entry.validation_errors.length} invalid)</span>
+                    <span className="text-amber-600"> ({entry.validation_errors.length >= 1000 ? "1000+" : entry.validation_errors.length} invalid)</span>
                   )}
                 </span>
               )}
@@ -183,7 +183,9 @@ function SyncEntryList({
           {entry.validation_errors && entry.validation_errors.length > 0 && (
             <details className="mt-1 ml-6">
               <summary className="text-xs text-amber-600 cursor-pointer">
-                {entry.validation_errors.length} line{entry.validation_errors.length !== 1 ? "s" : ""} failed validation
+                {entry.validation_errors.length >= 1000
+                  ? "1000+ lines failed validation (showing first 1000)"
+                  : `${entry.validation_errors.length} line${entry.validation_errors.length !== 1 ? "s" : ""} failed validation`}
               </summary>
               <ul className="text-xs text-muted-foreground mt-1 space-y-0.5 ml-2 max-h-40 overflow-y-auto">
                 {entry.validation_errors.map((ve, i) => (
