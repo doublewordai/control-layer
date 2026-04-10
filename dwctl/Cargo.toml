@@ -146,6 +146,7 @@ multer = "3.1.0"
 ctor = "0.9"
 hmac = "0.13.0"
 sha2 = "0.11.0"
+hex = "0.4.3"
 # AWS SDK for S3 source connections
 aws-sdk-s3 = "1.21"
 aws-credential-types = "1.1"
