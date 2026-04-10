@@ -33,6 +33,7 @@ import {
   useAuthorization,
   isPlaygroundDenied,
   getTariffDisplayName,
+  copyToClipboard,
 } from "../../../../utils";
 import {
   ApiExamples,
@@ -558,11 +559,11 @@ const ModelInfo: React.FC = () => {
                         type="button"
                         className="shrink-0 p-1 text-gray-400 hover:text-gray-600 transition-colors"
                         aria-label="Copy model alias"
-                        onClick={() => {
-                          navigator.clipboard.writeText(model.alias).then(() => {
+                        onClick={async () => {
+                          if (await copyToClipboard(model.alias)) {
                             setAliasCopied(true);
                             setTimeout(() => setAliasCopied(false), 1500);
-                          });
+                          }
                         }}
                       >
                         {aliasCopied ? (

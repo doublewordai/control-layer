@@ -22,7 +22,7 @@ import type {
   ModelSortField,
   SortDirection,
 } from "../../../../api/control-layer/types";
-import { useAuthorization } from "../../../../utils";
+import { useAuthorization, copyToClipboard } from "../../../../utils";
 import {
   formatContextLength,
   formatTariffPrice,
@@ -326,12 +326,12 @@ function ModelRow({
                   type="button"
                   className="shrink-0 p-0.5 text-gray-400 hover:text-gray-600 transition-colors"
                   aria-label="Copy model alias"
-                  onClick={(e) => {
+                  onClick={async (e) => {
                     e.stopPropagation();
-                    navigator.clipboard.writeText(model.alias).then(() => {
+                    if (await copyToClipboard(model.alias)) {
                       setCopied(true);
                       setTimeout(() => setCopied(false), 1500);
-                    });
+                    }
                   }}
                 >
                   {copied ? (
