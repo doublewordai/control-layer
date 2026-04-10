@@ -15,6 +15,17 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// Typed error for classifying activate-batch failures.
+/// Fatal errors (e.g. validation) permanently fail the sync entry;
+/// transient errors are retried by underway.
+#[derive(Debug, thiserror::Error)]
+enum ActivateError {
+    #[error("{0}")]
+    Fatal(String),
+    #[error("{0}")]
+    Retryable(String),
+}
+
 // ---------------------------------------------------------------------------
 // Job input types (serialized to Postgres by underway)
 // ---------------------------------------------------------------------------
@@ -153,15 +164,23 @@ pub async fn build_activate_batch_job<P: PoolProvider + Clone + Send + Sync + 's
                     }
                     To::done()
                 }
-                // TODO: when capacity reservation is implemented, return
-                // TaskError::Retryable for capacity errors using a typed error
-                // (not string matching) so activation retries with backoff.
                 Err(e) => {
+                    let is_retryable = e
+                        .downcast_ref::<ActivateError>()
+                        .is_some_and(|ae| matches!(ae, ActivateError::Retryable(_)));
+
                     tracing::error!(
                         sync_entry_id = %input.sync_entry_id,
+                        retryable = is_retryable,
                         error = %e,
                         "ActivateBatchJob failed"
                     );
+
+                    if is_retryable {
+                        return Err(TaskError::Retryable(e.to_string()));
+                    }
+
+                    // Fatal — mark entry as failed and update sync counters
                     if let Ok(mut conn) = cx.state.dwctl_pool.acquire().await {
                         let _ = crate::db::handlers::connections::SyncEntries::new(&mut conn)
                             .update_status(input.sync_entry_id, "failed", Some(&e.to_string()))
@@ -869,7 +888,7 @@ pub(crate) async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + '
         (owner_id, secret, key_id, conn_name)
     };
 
-    // 5. Look up sync entry for external key and validation errors (for provenance metadata)
+    // 5. Look up sync entry for external key (used in batch provenance metadata below)
     let sync_entry = {
         let mut conn = dwctl.acquire().await?;
         SyncEntries::new(&mut conn)
@@ -910,17 +929,27 @@ pub(crate) async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + '
 
     // 7. Populate batch synchronously (instead of enqueuing async job) so we
     //    can immediately fail requests that had validation errors during ingest.
+    //    Error handling mirrors build_create_batch_job: validation errors are
+    //    fatal (mark batch failed), other errors bubble up as retryable so
+    //    the underway job wrapper can retry on transient failures.
     if let Err(e) = state
         .request_manager
         .populate_batch(fusillade::BatchId(batch_id), fusillade::FileId(input.file_id))
         .await
     {
-        // Mark batch as failed (same as build_create_batch_job error handling)
-        let _ = state
-            .request_manager
-            .mark_batch_failed(fusillade::BatchId(batch_id), &e.to_string())
-            .await;
-        anyhow::bail!("populate batch: {e}");
+        return Err(match &e {
+            fusillade::FusilladeError::ValidationError(_) => {
+                let _ = state
+                    .request_manager
+                    .mark_batch_failed(fusillade::BatchId(batch_id), &e.to_string())
+                    .await;
+                ActivateError::Fatal(format!("populate batch: {e}")).into()
+            }
+            _ => {
+                // Don't mark batch as permanently failed — let underway retry
+                ActivateError::Retryable(format!("populate batch: {e}")).into()
+            }
+        });
     }
 
     // 8. Fail requests whose templates came from invalid lines (tier 2 errors).

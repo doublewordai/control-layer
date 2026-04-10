@@ -542,13 +542,14 @@ impl<'c> SyncEntries<'c> {
     pub async fn list_synced_keys(&mut self, connection_id: Uuid) -> Result<Vec<(String, Option<DateTime<Utc>>, String)>> {
         let rows = sqlx::query!(
             r#"
-            SELECT external_key, MAX(external_last_modified) AS "last_modified",
-                   -- Use the most recent terminal status per key
-                   (ARRAY_AGG(status ORDER BY updated_at DESC))[1] AS "status!"
+            SELECT DISTINCT ON (external_key)
+                   external_key,
+                   external_last_modified AS "last_modified",
+                   status AS "status!"
             FROM sync_entries
             WHERE connection_id = $1
               AND status IN ('activated', 'failed')
-            GROUP BY external_key
+            ORDER BY external_key, external_last_modified DESC NULLS LAST, updated_at DESC
             "#,
             connection_id,
         )
