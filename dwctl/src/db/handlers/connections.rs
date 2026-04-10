@@ -85,6 +85,8 @@ impl From<SyncOperationRow> for SyncOperation {
     }
 }
 
+/// Maps to `sync_entries` table columns in schema order
+/// (090_connections_and_sync.sql + 093_add_sync_entry_validation.sql).
 #[derive(Debug, Clone, FromRow)]
 struct SyncEntryRow {
     pub id: Uuid,
@@ -98,10 +100,11 @@ struct SyncEntryRow {
     pub batch_id: Option<Uuid>,
     pub template_count: Option<i32>,
     pub error: Option<String>,
-    pub skipped_lines: i32,
-    pub validation_errors: Option<serde_json::Value>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    // Added by migration 093 (appended after original columns)
+    pub skipped_lines: i32,
+    pub validation_errors: Option<serde_json::Value>,
 }
 
 impl From<SyncEntryRow> for SyncEntry {
