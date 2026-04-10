@@ -163,12 +163,12 @@ function SyncEntryList({
               {entry.batch_id ? (
                 <a
                   href={`/batches?search=${entry.batch_id}`}
-                  className="text-xs text-blue-600 hover:underline w-10"
+                  className="text-xs text-blue-600 hover:underline inline-block w-10"
                 >
                   batch
                 </a>
               ) : (
-                <span className="w-10" />
+                <span className="inline-block w-10" />
               )}
             </div>
           </div>

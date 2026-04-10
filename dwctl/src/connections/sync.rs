@@ -727,7 +727,9 @@ pub(crate) async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'sta
                         model,
                         api_key: String::new(),
                     };
-                    let _ = tx.send(FileStreamItem::Template(template)).await;
+                    if tx.send(FileStreamItem::Template(template)).await.is_err() {
+                        return (template_count, skipped_lines, validation_errors);
+                    }
                     template_count += 1;
                 }
                 Err(err) => {
