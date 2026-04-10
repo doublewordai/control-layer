@@ -597,15 +597,21 @@ pub(crate) async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'sta
                             }
                         }
 
-                        // Strip `priority` from body if present and re-serialize
-                        let body = if let Ok(mut body_val) = serde_json::from_str::<serde_json::Value>(&body) {
-                            if body_val.as_object_mut().is_some_and(|o| o.remove("priority").is_some()) {
-                                serde_json::to_string(&body_val).unwrap_or(body)
+                        // For tier-2 errors, scrub the body to avoid storing large/invalid
+                        // payloads — the template exists only so it becomes a failed request.
+                        let body = if line_error.is_some() {
+                            "{}".to_string()
+                        } else {
+                            // Strip `priority` from body if present and re-serialize
+                            if let Ok(mut body_val) = serde_json::from_str::<serde_json::Value>(&body) {
+                                if body_val.as_object_mut().is_some_and(|o| o.remove("priority").is_some()) {
+                                    serde_json::to_string(&body_val).unwrap_or(body)
+                                } else {
+                                    body
+                                }
                             } else {
                                 body
                             }
-                        } else {
-                            body
                         };
 
                         let template = fusillade::RequestTemplateInput {
@@ -696,15 +702,20 @@ pub(crate) async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'sta
                         }
                     }
 
-                    // Strip `priority` from body if present and re-serialize
-                    let body = if let Ok(mut body_val) = serde_json::from_str::<serde_json::Value>(&body) {
-                        if body_val.as_object_mut().is_some_and(|o| o.remove("priority").is_some()) {
-                            serde_json::to_string(&body_val).unwrap_or(body)
+                    // For tier-2 errors, scrub the body to avoid storing large/invalid payloads
+                    let body = if line_error.is_some() {
+                        "{}".to_string()
+                    } else {
+                        // Strip `priority` from body if present and re-serialize
+                        if let Ok(mut body_val) = serde_json::from_str::<serde_json::Value>(&body) {
+                            if body_val.as_object_mut().is_some_and(|o| o.remove("priority").is_some()) {
+                                serde_json::to_string(&body_val).unwrap_or(body)
+                            } else {
+                                body
+                            }
                         } else {
                             body
                         }
-                    } else {
-                        body
                     };
 
                     let template = fusillade::RequestTemplateInput {
@@ -1046,7 +1057,7 @@ pub(crate) async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + '
     //    Read template_index values from the stored validation_errors JSON (capped
     //    at 1000 during ingest) so nothing large passes through the job payload.
     if let Some(errors) = &sync_entry.validation_errors
-        && let Ok(error_list) = serde_json::from_value::<Vec<serde_json::Value>>(errors.clone())
+        && let Some(error_list) = errors.as_array()
     {
         let error_indices: Vec<i32> = error_list
             .iter()
