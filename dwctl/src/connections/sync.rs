@@ -679,6 +679,7 @@ pub(crate) async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'sta
                     }
 
                     if let Some(ref err) = line_error {
+                        tracing::warn!(line_num = line_number, error = %err, "Validation error (tier 2), ingesting template with error");
                         validation_error_indices.push(template_count);
                         if validation_errors.len() < MAX_VALIDATION_ERRORS {
                             validation_errors.push((template_count, line_number, err.clone()));
@@ -939,11 +940,16 @@ pub(crate) async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + '
     {
         return Err(match &e {
             fusillade::FusilladeError::ValidationError(_) => {
-                let _ = state
+                if let Err(mark_err) = state
                     .request_manager
                     .mark_batch_failed(fusillade::BatchId(batch_id), &e.to_string())
-                    .await;
-                ActivateError::Fatal(format!("populate batch: {e}")).into()
+                    .await
+                {
+                    tracing::error!(batch_id = %batch_id, error = %mark_err, "Failed to mark batch as failed after validation error");
+                    ActivateError::Retryable(format!("mark_batch_failed: {mark_err}")).into()
+                } else {
+                    ActivateError::Fatal(format!("populate batch: {e}")).into()
+                }
             }
             _ => {
                 // Don't mark batch as permanently failed — let underway retry
@@ -1005,7 +1011,7 @@ pub(crate) async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + '
 mod tests {
     use super::*;
     use crate::test::utils::{create_test_config, create_test_user};
-    use fusillade::{FileMetadata, FileStreamItem, RequestTemplateInput, Storage};
+    use fusillade::{FileMetadata, FileStreamItem, RequestTemplateInput, Storage as _};
     use sqlx::PgPool;
 
     /// Helper: create a TaskState backed by a real fusillade schema (for create_file_stream, etc.)
