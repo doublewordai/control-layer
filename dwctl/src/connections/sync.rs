@@ -865,7 +865,7 @@ pub(crate) async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + '
         SyncOperations::new(&mut conn)
             .get_by_id(input.sync_id)
             .await?
-            .ok_or_else(|| anyhow::anyhow!("sync operation not found"))?
+            .ok_or_else(|| ActivateError::Fatal("sync operation not found".into()))?
     };
 
     let endpoint = sync_op
@@ -899,7 +899,7 @@ pub(crate) async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + '
         let connection = crate::db::handlers::connections::Connections::new(&mut conn)
             .get_by_id(input.connection_id)
             .await?
-            .ok_or_else(|| anyhow::anyhow!("connection not found"))?;
+            .ok_or_else(|| ActivateError::Fatal("connection not found".into()))?;
 
         let owner_id = connection.user_id;
         let conn_name = connection.name.clone();
@@ -920,7 +920,7 @@ pub(crate) async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + '
         SyncEntries::new(&mut conn)
             .get_by_id(input.sync_entry_id)
             .await?
-            .ok_or_else(|| anyhow::anyhow!("sync entry not found: {}", input.sync_entry_id))?
+            .ok_or_else(|| ActivateError::Fatal(format!("sync entry not found: {}", input.sync_entry_id)))?
     };
     let external_key = sync_entry.external_key.clone();
 
@@ -958,15 +958,40 @@ pub(crate) async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + '
 
         let bid = *batch.id;
 
-        // Persist batch_id immediately so retries reuse this batch
-        let mut conn = dwctl.acquire().await?;
-        sqlx::query!(
-            "UPDATE sync_entries SET batch_id = $2 WHERE id = $1 AND status != 'deleted'",
-            input.sync_entry_id,
-            bid,
-        )
-        .execute(&mut *conn)
-        .await?;
+        // Persist batch_id immediately so retries reuse this batch instead of
+        // creating duplicates. Retry the UPDATE to avoid orphaned batches if the
+        // persist fails transiently after create_batch_record succeeded.
+        let mut persist_err = None;
+        for attempt in 0..3 {
+            match dwctl.acquire().await {
+                Ok(mut conn) => {
+                    match sqlx::query!(
+                        "UPDATE sync_entries SET batch_id = $2 WHERE id = $1 AND status != 'deleted'",
+                        input.sync_entry_id,
+                        bid,
+                    )
+                    .execute(&mut *conn)
+                    .await
+                    {
+                        Ok(_) => {
+                            persist_err = None;
+                            break;
+                        }
+                        Err(e) => {
+                            tracing::warn!(attempt, error = %e, "Failed to persist batch_id on sync entry, retrying");
+                            persist_err = Some(e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(attempt, error = %e, "Failed to acquire conn for batch_id persist, retrying");
+                    persist_err = Some(e);
+                }
+            }
+        }
+        if let Some(e) = persist_err {
+            anyhow::bail!("persist batch_id on sync entry after 3 attempts: {e}");
+        }
 
         bid
     };
