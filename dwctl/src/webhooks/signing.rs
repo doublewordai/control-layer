@@ -8,7 +8,7 @@
 //! See: <https://www.standardwebhooks.com/>
 
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 
 type HmacSha256 = Hmac<Sha256>;
