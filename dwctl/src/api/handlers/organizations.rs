@@ -38,7 +38,7 @@ const MAX_ORGS_PER_USER: i64 = 3;
 fn hash_invite_token(token: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(token.as_bytes());
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 const VALID_ROLES: [&str; 3] = ["owner", "admin", "member"];
