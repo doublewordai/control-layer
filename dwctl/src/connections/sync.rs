@@ -973,7 +973,16 @@ pub(crate) async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + '
                     .execute(&mut *conn)
                     .await
                     {
-                        Ok(_) => {
+                        Ok(result) => {
+                            if result.rows_affected() == 0 {
+                                // Sync entry was soft-deleted — mark batch failed to avoid orphan
+                                tracing::info!(sync_entry_id = %input.sync_entry_id, batch_id = %bid, "Sync entry deleted during activation, failing orphaned batch");
+                                let _ = state
+                                    .request_manager
+                                    .mark_batch_failed(fusillade::BatchId(bid), "sync entry deleted during activation")
+                                    .await;
+                                return Ok(());
+                            }
                             persist_err = None;
                             break;
                         }
