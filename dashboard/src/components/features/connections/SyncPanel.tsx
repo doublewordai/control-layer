@@ -149,7 +149,7 @@ function SyncEntryList({
                   {(entry.skipped_lines ?? 0) > 0 && (
                     <span className="text-amber-600"> ({entry.skipped_lines} skipped)</span>
                   )}
-                  {entry.validation_errors && entry.validation_errors.length > 0 && (
+                  {Array.isArray(entry.validation_errors) && entry.validation_errors.length > 0 && (
                     <span className="text-amber-600"> ({entry.validation_errors.length >= 1000 ? "1000+" : entry.validation_errors.length} invalid)</span>
                   )}
                 </span>
@@ -180,7 +180,7 @@ function SyncEntryList({
               {entry.skipped_lines} line{entry.skipped_lines !== 1 ? "s" : ""} could not be parsed (invalid JSON)
             </p>
           )}
-          {entry.validation_errors && entry.validation_errors.length > 0 && (
+          {Array.isArray(entry.validation_errors) && entry.validation_errors.length > 0 && (
             <details className="mt-1 ml-6">
               <summary className="text-xs text-amber-600 cursor-pointer">
                 {entry.validation_errors.length >= 1000

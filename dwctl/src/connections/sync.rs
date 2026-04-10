@@ -657,6 +657,8 @@ pub(crate) async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'sta
                 Ok(parsed) => {
                     let custom_id = parsed.get("custom_id").and_then(|v| v.as_str()).map(|s| s.to_string());
                     let method = parsed.get("method").and_then(|v| v.as_str()).unwrap_or("POST").to_string();
+                    // Always use the configured endpoint — ignore per-line url to prevent
+                    // targeting unsupported/internal paths (consistent with batch-level routing).
                     let url = api_path.clone();
                     let body = parsed.get("body").map(|v| v.to_string()).unwrap_or_else(|| "{}".to_string());
                     let model = parsed
@@ -999,6 +1001,11 @@ pub(crate) async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + '
             }
         }
         if let Some(e) = persist_err {
+            // Clean up the orphaned batch before returning
+            let _ = state
+                .request_manager
+                .mark_batch_failed(fusillade::BatchId(bid), "failed to persist batch_id on sync entry")
+                .await;
             anyhow::bail!("persist batch_id on sync entry after 3 attempts: {e}");
         }
 
