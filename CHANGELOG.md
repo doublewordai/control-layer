@@ -1,5 +1,17 @@
 # Changelog
 
+## [8.36.0](https://github.com/doublewordai/control-layer/compare/v8.35.1...v8.36.0) (2026-04-10)
+
+
+### Features
+
+* more transparent and intuitive handling of errors in ingested jsonl ([#967](https://github.com/doublewordai/control-layer/issues/967)) ([a9a7365](https://github.com/doublewordai/control-layer/commit/a9a7365afd45a03c87ba7c8107dc555fd0a2f440))
+
+
+### Bug Fixes
+
+* missed an index migration ([#975](https://github.com/doublewordai/control-layer/issues/975)) ([9643080](https://github.com/doublewordai/control-layer/commit/9643080edb66bd6f5446c229ca65937a6dcb2a72))
+
 ## [8.35.1](https://github.com/doublewordai/control-layer/compare/v8.35.0...v8.35.1) (2026-04-10)
 
 
