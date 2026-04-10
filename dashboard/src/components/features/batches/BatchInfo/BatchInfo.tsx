@@ -265,6 +265,7 @@ const BatchInfo: React.FC = () => {
             100,
         )
       : 0;
+  const reasoningTokens = analytics?.total_reasoning_tokens ?? 0;
 
   const description = batch.metadata?.batch_description;
 
@@ -637,10 +638,10 @@ const BatchInfo: React.FC = () => {
                                   Completion Tokens
                                 </p>
                               </div>
-                              {(analytics.total_reasoning_tokens ?? 0) > 0 && (
+                              {reasoningTokens > 0 && (
                                 <div className="text-center p-3 rounded-lg">
                                   <p className="text-2xl font-bold">
-                                    {(analytics.total_reasoning_tokens ?? 0).toLocaleString()}
+                                    {reasoningTokens.toLocaleString()}
                                   </p>
                                   <p className="text-xs text-gray-600 mt-1">
                                     Reasoning Tokens
