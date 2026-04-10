@@ -23,7 +23,7 @@ jobs:
 
     steps:
       - name: React to comment
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         with:
           script: |
             await github.rest.reactions.createForIssueComment({
@@ -35,7 +35,7 @@ jobs:
 
       - name: Get PR details
         id: pr
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         with:
           script: |
             const pr = await github.rest.pulls.get({
@@ -78,7 +78,7 @@ jobs:
           sbom: true
 
       - name: Dispatch to internal
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         with:
           github-token: ${{ secrets.DEPLOY_PAT }}
           script: |
@@ -96,7 +96,7 @@ jobs:
 
       - name: Comment with status
         if: success()
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         with:
           script: |
             const tag = '${{ steps.tag.outputs.tag }}';
@@ -109,7 +109,7 @@ jobs:
 
       - name: Comment on failure
         if: failure()
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         with:
           script: |
             await github.rest.issues.createComment({
