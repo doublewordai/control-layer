@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.35.1](https://github.com/doublewordai/control-layer/compare/v8.35.0...v8.35.1) (2026-04-10)
+
+
+### Bug Fixes
+
+* hide reasoning tokens if zero ([#970](https://github.com/doublewordai/control-layer/issues/970)) ([f647cd9](https://github.com/doublewordai/control-layer/commit/f647cd9a70fc5f9ce74a8d184adf1291ceb9118d))
+
 ## [8.35.0](https://github.com/doublewordai/control-layer/compare/v8.34.0...v8.35.0) (2026-04-09)
 
 
