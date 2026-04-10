@@ -107,6 +107,9 @@ pub struct SyncEntryResponse {
     pub batch_id: Option<String>,
     pub template_count: Option<i32>,
     pub error: Option<String>,
+    pub skipped_lines: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub validation_errors: Option<serde_json::Value>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -124,6 +127,8 @@ pub struct SyncEntryListResponse {
 pub struct SyncedKeyResponse {
     pub key: String,
     pub last_modified: Option<i64>,
+    /// "activated" or "failed"
+    pub status: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -201,6 +206,8 @@ impl From<crate::db::models::connections::SyncEntry> for SyncEntryResponse {
             batch_id: e.batch_id.map(|id| id.to_string()),
             template_count: e.template_count,
             error: e.error,
+            skipped_lines: e.skipped_lines,
+            validation_errors: e.validation_errors,
             created_at: e.created_at.timestamp(),
             updated_at: e.updated_at.timestamp(),
         }

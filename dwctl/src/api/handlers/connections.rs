@@ -607,9 +607,10 @@ pub async fn list_synced_keys<P: PoolProvider>(
     Ok(Json(
         synced
             .into_iter()
-            .map(|(key, last_modified)| SyncedKeyResponse {
+            .map(|(key, last_modified, status)| SyncedKeyResponse {
                 key,
                 last_modified: last_modified.map(|dt| dt.timestamp()),
+                status,
             })
             .collect(),
     ))

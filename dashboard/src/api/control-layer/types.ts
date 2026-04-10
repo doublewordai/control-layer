@@ -1472,6 +1472,16 @@ export interface SyncEntry {
   batch_id?: string | null;
   template_count?: number | null;
   error?: string | null;
+  /** Lines that couldn't be parsed as JSON (garbled) */
+  skipped_lines?: number;
+  /** Per-line validation errors for parseable-but-invalid lines (capped at 1000) */
+  validation_errors?: Array<{
+    /** 0-based index into ingested templates (internal use) */
+    template_index: number;
+    /** 1-based source file line number */
+    line: number;
+    error: string;
+  }> | null;
   created_at: number;
   updated_at: number;
 }
@@ -1500,6 +1510,8 @@ export interface TriggerSyncRequest {
 export interface SyncedKey {
   key: string;
   last_modified?: number | null;
+  /** "activated" or "failed" */
+  status: string;
 }
 
 // ===== ORGANIZATION TYPES =====

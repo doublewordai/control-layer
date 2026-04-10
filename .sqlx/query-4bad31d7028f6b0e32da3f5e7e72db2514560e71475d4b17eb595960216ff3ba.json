@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE sync_entries\n            SET status = 'ingested', file_id = $2, template_count = $3,\n                skipped_lines = $4, validation_errors = $5\n            WHERE id = $1 AND status != 'deleted'\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Int4",
+        "Int4",
+        "Jsonb"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "4bad31d7028f6b0e32da3f5e7e72db2514560e71475d4b17eb595960216ff3ba"
+}

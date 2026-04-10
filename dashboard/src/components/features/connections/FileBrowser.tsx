@@ -7,6 +7,7 @@ import {
   Search,
   RefreshCw,
   CheckCircle2,
+  XCircle,
 } from "lucide-react";
 import { toast } from "sonner";
 import { useConnectionFiles, useSyncedKeys, useTriggerSync } from "@/api/control-layer/hooks";
@@ -94,14 +95,12 @@ export function FileBrowser({ connectionId }: { connectionId: string }) {
     }
   }, [syncedKeys, syncingKeys, files]);
 
-  // Track synced keys with their last_modified timestamps.
-  // A file is "synced" if its key exists and last_modified matches.
-  // A file is "modified" if its key exists but last_modified is newer.
+  // Track synced keys with their last_modified timestamps and status.
   const syncedKeyMap = useMemo(() => {
-    const map = new Map<string, number | null>();
+    const map = new Map<string, { lastModified: number | null; status: string }>();
     if (syncedKeys) {
       for (const sk of syncedKeys) {
-        map.set(sk.key, sk.last_modified ?? null);
+        map.set(sk.key, { lastModified: sk.last_modified ?? null, status: sk.status });
       }
     }
     return map;
@@ -109,25 +108,28 @@ export function FileBrowser({ connectionId }: { connectionId: string }) {
 
   const isSyncing = (file: ExternalFile) => syncingKeys.has(file.key);
 
-  const getStatus = (file: ExternalFile): "synced" | "modified" | "syncing" | "new" => {
+  const getStatus = (file: ExternalFile): "synced" | "failed" | "modified" | "syncing" | "new" => {
     // Syncing takes priority — user just triggered this
     if (isSyncing(file)) return "syncing";
-    if (!syncedKeyMap.has(file.key)) return "new";
-    // Key was synced — check if it's been modified since
-    const syncedTs = syncedKeyMap.get(file.key);
+    const entry = syncedKeyMap.get(file.key);
+    if (!entry) return "new";
+    // Check if file has been modified since last sync (whether it succeeded or failed)
+    const syncedTs = entry.lastModified;
     const fileTs = file.last_modified ?? null;
     if (syncedTs != null && fileTs != null && fileTs > syncedTs) return "modified";
+    // Terminal states
+    if (entry.status === "failed") return "failed";
     return "synced";
   };
 
   const isSynced = (file: ExternalFile) => getStatus(file) === "synced";
 
-  // "New" and "modified" files can be synced without force
+  // "New", "modified", and "failed" files can be synced (failed uses force for dedup bypass)
   const selectedSyncableKeys = [...selected].filter((key) => {
     const file = files.find((f) => f.key === key);
     if (!file) return false;
     const s = getStatus(file);
-    return s === "new" || s === "modified";
+    return s === "new" || s === "modified" || s === "failed";
   });
   // Already-synced (unchanged) files need force to re-sync
   const selectedSyncedKeys = [...selected].filter((key) => {
@@ -162,30 +164,35 @@ export function FileBrowser({ connectionId }: { connectionId: string }) {
   }, [queryClient, connectionId]);
 
   const handleSyncNew = async () => {
-    const newKeys = [...selected].filter((key) => {
+    const syncableKeys = [...selected].filter((key) => {
       const file = files.find((f) => f.key === key);
       if (!file) return false;
       const s = getStatus(file);
-      return s === "new" || s === "modified";
+      return s === "new" || s === "modified" || s === "failed";
     });
-    if (newKeys.length === 0) {
+    if (syncableKeys.length === 0) {
       toast.info("All selected files are already synced");
       return;
     }
+    // Force is needed when retrying failed files (harmless for new/modified)
+    const needsForce = syncableKeys.some((key) => {
+      const file = files.find((f) => f.key === key);
+      return file && getStatus(file) === "failed";
+    });
     // Optimistically mark as syncing
-    setSyncingKeys((prev) => new Set([...prev, ...newKeys]));
+    setSyncingKeys((prev) => new Set([...prev, ...syncableKeys]));
     try {
       await syncMutation.mutateAsync({
         connectionId,
-        data: { strategy: "select", file_keys: newKeys },
+        data: { strategy: "select", file_keys: syncableKeys, ...(needsForce && { force: true }) },
       });
-      toast.success(`Syncing ${newKeys.length} file${newKeys.length !== 1 ? "s" : ""}`);
+      toast.success(`Syncing ${syncableKeys.length} file${syncableKeys.length !== 1 ? "s" : ""}`);
       setSelected(new Set());
     } catch {
       // Revert optimistic status
       setSyncingKeys((prev) => {
         const next = new Set(prev);
-        for (const k of newKeys) next.delete(k);
+        for (const k of syncableKeys) next.delete(k);
         return next;
       });
       toast.error("Failed to trigger sync");
@@ -368,6 +375,11 @@ export function FileBrowser({ connectionId }: { connectionId: string }) {
                       <span className="inline-flex items-center gap-1 text-xs text-green-600">
                         <CheckCircle2 className="h-3 w-3" />
                         Synced
+                      </span>
+                    ) : status === "failed" ? (
+                      <span className="inline-flex items-center gap-1 text-xs text-red-500">
+                        <XCircle className="h-3 w-3" />
+                        Failed
                       </span>
                     ) : status === "syncing" ? (
                       <span className="inline-flex items-center gap-1 text-xs text-blue-500">

@@ -85,6 +85,8 @@ impl From<SyncOperationRow> for SyncOperation {
     }
 }
 
+/// Maps to `sync_entries` table columns in schema order
+/// (090_connections_and_sync.sql + 093_add_sync_entry_validation.sql).
 #[derive(Debug, Clone, FromRow)]
 struct SyncEntryRow {
     pub id: Uuid,
@@ -100,6 +102,9 @@ struct SyncEntryRow {
     pub error: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    // Added by migration 093 (appended after original columns)
+    pub skipped_lines: i32,
+    pub validation_errors: Option<serde_json::Value>,
 }
 
 impl From<SyncEntryRow> for SyncEntry {
@@ -116,6 +121,8 @@ impl From<SyncEntryRow> for SyncEntry {
             batch_id: r.batch_id,
             template_count: r.template_count,
             error: r.error,
+            skipped_lines: r.skipped_lines,
+            validation_errors: r.validation_errors,
             created_at: r.created_at,
             updated_at: r.updated_at,
         }
@@ -518,7 +525,7 @@ impl<'c> SyncEntries<'c> {
               ON se.external_key = input.key
               AND se.external_last_modified IS NOT DISTINCT FROM input.last_modified
             WHERE se.connection_id = $1
-              AND se.status = 'activated'
+              AND se.status IN ('activated', 'failed')
             "#,
             connection_id,
             &keys as &[&str],
@@ -530,25 +537,29 @@ impl<'c> SyncEntries<'c> {
         Ok(rows.into_iter().map(|r| (r.external_key, r.external_last_modified)).collect())
     }
 
-    /// Get all successfully-synced keys for a connection (for UI status display).
-    /// Returns distinct (key, last_modified) pairs. For matching in the frontend,
-    /// we return the most recent last_modified per key so it matches S3 listings.
+    /// Get all terminal sync entries for a connection (for UI status display).
+    /// Returns (key, last_modified, status) where status is 'activated' or 'failed'.
+    /// The frontend uses this to show Synced/Failed/Modified states in the file browser.
     #[instrument(skip(self), fields(connection_id = %connection_id), err)]
-    pub async fn list_synced_keys(&mut self, connection_id: Uuid) -> Result<Vec<(String, Option<DateTime<Utc>>)>> {
+    #[allow(clippy::type_complexity)]
+    pub async fn list_synced_keys(&mut self, connection_id: Uuid) -> Result<Vec<(String, Option<DateTime<Utc>>, String)>> {
         let rows = sqlx::query!(
             r#"
-            SELECT external_key, MAX(external_last_modified) AS "last_modified"
+            SELECT DISTINCT ON (external_key)
+                   external_key,
+                   external_last_modified AS "last_modified",
+                   status AS "status!"
             FROM sync_entries
             WHERE connection_id = $1
-              AND status = 'activated'
-            GROUP BY external_key
+              AND status IN ('activated', 'failed')
+            ORDER BY external_key, external_last_modified DESC NULLS LAST, updated_at DESC
             "#,
             connection_id,
         )
         .fetch_all(&mut *self.db)
         .await?;
 
-        Ok(rows.into_iter().map(|r| (r.external_key, r.last_modified)).collect())
+        Ok(rows.into_iter().map(|r| (r.external_key, r.last_modified, r.status)).collect())
     }
 
     /// Returns true if the row was updated, false if it was already deleted.
@@ -567,17 +578,27 @@ impl<'c> SyncEntries<'c> {
     }
 
     /// Returns true if the row was updated, false if it was already deleted.
-    #[instrument(skip(self), fields(id = %id), err)]
-    pub async fn set_ingested(&mut self, id: Uuid, file_id: Uuid, template_count: i32) -> Result<bool> {
+    #[instrument(skip(self, validation_errors), fields(id = %id), err)]
+    pub async fn set_ingested(
+        &mut self,
+        id: Uuid,
+        file_id: Uuid,
+        template_count: i32,
+        skipped_lines: i32,
+        validation_errors: Option<&serde_json::Value>,
+    ) -> Result<bool> {
         let result = sqlx::query!(
             r#"
             UPDATE sync_entries
-            SET status = 'ingested', file_id = $2, template_count = $3
+            SET status = 'ingested', file_id = $2, template_count = $3,
+                skipped_lines = $4, validation_errors = $5
             WHERE id = $1 AND status != 'deleted'
             "#,
             id,
             file_id,
             template_count,
+            skipped_lines,
+            validation_errors,
         )
         .execute(&mut *self.db)
         .await?;

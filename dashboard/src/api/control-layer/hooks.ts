@@ -1825,6 +1825,7 @@ export function useSyncedKeys(connectionId: string) {
     queryKey: [...queryKeys.connections.all, connectionId, "synced-keys"],
     queryFn: () => dwctlApi.connections.listSyncedKeys(connectionId),
     enabled: !!connectionId,
+    staleTime: 0, // Always refetch on mount (e.g. navigating back to the page)
   });
 }
 
@@ -1840,7 +1841,7 @@ export function useConnectionFiles(
     }),
     queryFn: () => dwctlApi.connections.listFiles(connectionId, options),
     enabled: !!connectionId,
-    // Keep previous page visible while loading next page
+    staleTime: 0, // Always refetch on mount
     placeholderData: keepPreviousData,
   });
 }
