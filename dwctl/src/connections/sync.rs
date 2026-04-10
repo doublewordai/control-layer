@@ -481,6 +481,8 @@ pub(crate) async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'sta
         // (template_index, file_line, error) — template_index matches request_templates.line_number
         // Capped to avoid unbounded memory/DB row growth on large garbled files.
         const MAX_VALIDATION_ERRORS: usize = 1000;
+        /// Number of per-line warnings to emit before switching to debug level.
+        const MAX_LINE_WARNINGS: i32 = 10;
         let mut validation_errors: Vec<(i32, u64, String)> = Vec::new();
         let mut line_number: u64 = 0;
         let mut stream = byte_stream;
@@ -582,7 +584,11 @@ pub(crate) async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'sta
                         }
 
                         if let Some(ref err) = line_error {
-                            tracing::warn!(line_num = line_number, error = %err, "Validation error (tier 2), ingesting template with error");
+                            if validation_errors.len() < MAX_LINE_WARNINGS as usize {
+                                tracing::warn!(line_num = line_number, error = %err, "Validation error (tier 2), ingesting template with error");
+                            } else {
+                                tracing::debug!(line_num = line_number, error = %err, "Validation error (tier 2), ingesting template with error");
+                            }
                             if validation_errors.len() < MAX_VALIDATION_ERRORS {
                                 validation_errors.push((template_count, line_number, err.clone()));
                             }
@@ -616,7 +622,11 @@ pub(crate) async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'sta
                     }
                     Err(e) => {
                         // Tier 1: garbled line — not valid JSON at all
-                        tracing::warn!(line_num = line_number, error = %e, "Skipping non-JSON line (tier 1)");
+                        if skipped_lines < MAX_LINE_WARNINGS {
+                            tracing::warn!(line_num = line_number, error = %e, "Skipping non-JSON line (tier 1)");
+                        } else {
+                            tracing::debug!(line_num = line_number, error = %e, "Skipping non-JSON line (tier 1)");
+                        }
                         skipped_lines += 1;
                     }
                 }
@@ -673,7 +683,9 @@ pub(crate) async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'sta
                     }
 
                     if let Some(ref err) = line_error {
-                        tracing::warn!(line_num = line_number, error = %err, "Validation error (tier 2), ingesting template with error");
+                        if validation_errors.len() < MAX_LINE_WARNINGS as usize {
+                            tracing::warn!(line_num = line_number, error = %err, "Validation error (tier 2), ingesting template with error");
+                        }
                         if validation_errors.len() < MAX_VALIDATION_ERRORS {
                             validation_errors.push((template_count, line_number, err.clone()));
                         }
@@ -704,10 +716,27 @@ pub(crate) async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'sta
                 }
                 Err(err) => {
                     // Tier 1: garbled trailing line
-                    tracing::warn!(line_num = line_number, error = %err, "Skipping non-JSON line (tier 1)");
+                    if skipped_lines < MAX_LINE_WARNINGS {
+                        tracing::warn!(line_num = line_number, error = %err, "Skipping non-JSON line (tier 1)");
+                    }
                     skipped_lines += 1;
                 }
             }
+        }
+
+        // Emit per-file summaries for throttled warnings
+        if skipped_lines > MAX_LINE_WARNINGS {
+            tracing::warn!(
+                skipped_lines,
+                "File had non-JSON lines (tier 1) — first {MAX_LINE_WARNINGS} logged individually"
+            );
+        }
+        let total_validation_errors = validation_errors.len() as i32;
+        if total_validation_errors > MAX_LINE_WARNINGS {
+            tracing::warn!(
+                total_validation_errors,
+                "File had validation errors (tier 2) — first {MAX_LINE_WARNINGS} logged individually"
+            );
         }
 
         (template_count, skipped_lines, validation_errors)
@@ -928,9 +957,13 @@ pub(crate) async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + '
 
         // Persist batch_id immediately so retries reuse this batch
         let mut conn = dwctl.acquire().await?;
-        sqlx::query!("UPDATE sync_entries SET batch_id = $2 WHERE id = $1", input.sync_entry_id, bid,)
-            .execute(&mut *conn)
-            .await?;
+        sqlx::query!(
+            "UPDATE sync_entries SET batch_id = $2 WHERE id = $1 AND status != 'deleted'",
+            input.sync_entry_id,
+            bid,
+        )
+        .execute(&mut *conn)
+        .await?;
 
         bid
     };
