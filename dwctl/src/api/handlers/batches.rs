@@ -3140,7 +3140,7 @@ mod tests {
             .await;
         // Should not get 400 for unsupported completion_window
         assert_ne!(
-            resp.status(),
+            resp.status_code(),
             StatusCode::BAD_REQUEST,
             "PlatformManager should be able to use arbitrary completion windows, got: {}",
             resp.text()
