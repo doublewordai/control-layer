@@ -1178,6 +1178,15 @@ pub struct DaemonConfig {
     /// 0.0 = pure user-fairness, 1.0 = pure deadline urgency. Default: 0.5.
     #[serde(default = "default_urgency_weight", deserialize_with = "deserialize_urgency_weight")]
     pub urgency_weight: f64,
+
+    /// When true, the daemon injects a deadline-derived priority hint into
+    /// each outbound request body at `nvext.agent_hints.priority` (NVIDIA
+    /// Dynamo's unified priority extension; `i32`, where higher values mean
+    /// "more important" at the API layer and Dynamo normalizes per backend).
+    /// The injected value is the negated Unix timestamp of the batch SLA
+    /// deadline so earlier deadlines produce larger numbers. Default: false.
+    #[serde(default)]
+    pub inject_deadline_priority: bool,
 }
 
 fn default_urgency_weight() -> f64 {
@@ -1240,6 +1249,7 @@ impl Default for DaemonConfig {
             purge_throttle_ms: 100,
             streamable_endpoints: Vec::new(),
             urgency_weight: default_urgency_weight(),
+            inject_deadline_priority: false,
         }
     }
 }
@@ -1294,6 +1304,7 @@ impl DaemonConfig {
             purge_throttle_ms: self.purge_throttle_ms,
             streamable_endpoints: self.streamable_endpoints.clone(),
             urgency_weight: self.urgency_weight,
+            inject_deadline_priority: self.inject_deadline_priority,
             ..Default::default()
         }
     }

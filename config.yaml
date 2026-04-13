@@ -397,6 +397,13 @@ background_services:
       - /v1/completions
       - /v1/responses
 
+    # Inject a deadline-derived priority hint into outbound request bodies at
+    # `nvext.agent_hints.priority` (NVIDIA Dynamo's unified priority extension;
+    # i32, higher = more important; Dynamo normalizes per backend). The value
+    # is the negated Unix timestamp of the batch SLA deadline so earlier
+    # deadlines produce larger numbers.
+    # inject_deadline_priority: false
+
   # Batch completion notifications (emails + webhooks)
   # notifications:
   #   poll_interval: 30s                # How often to poll for completed batches

@@ -1,5 +1,20 @@
 # Changelog
 
+## [8.37.1](https://github.com/doublewordai/control-layer/compare/v8.37.0...v8.37.1) (2026-04-13)
+
+
+### Bug Fixes
+
+* document dynamo nvext.agent_hints.priority injection path ([#984](https://github.com/doublewordai/control-layer/issues/984)) ([cf613b0](https://github.com/doublewordai/control-layer/commit/cf613b0d90cf1a224bbaa817e22640bb0452c28c))
+
+## [8.37.0](https://github.com/doublewordai/control-layer/compare/v8.36.0...v8.37.0) (2026-04-13)
+
+
+### Features
+
+* allow platform managers to use any batch completion window ([#978](https://github.com/doublewordai/control-layer/issues/978)) ([5ac8ef5](https://github.com/doublewordai/control-layer/commit/5ac8ef5de021d67092b3952e3f45a5425083237e))
+* wire fusillade deadline-priority injection into batch_daemon config ([#980](https://github.com/doublewordai/control-layer/issues/980)) ([f653871](https://github.com/doublewordai/control-layer/commit/f65387119bc11c9632ecf5f3d49185335c877fea))
+
 ## [8.36.0](https://github.com/doublewordai/control-layer/compare/v8.35.1...v8.36.0) (2026-04-10)
 
 
