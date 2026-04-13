@@ -34,6 +34,7 @@ import { useAuth } from "../../../contexts/auth";
 import { useSettings, useOrganizationContext } from "../../../contexts";
 import { SupportRequestModal } from "../../modals";
 import { CreateOrganizationModal } from "../../features/organizations/CreateOrganizationModal";
+import { RouteErrorBoundary } from "../../common";
 import type { FeatureFlags } from "../../../contexts/settings/types";
 import onwardsLogo from "../../../assets/onwards-logo.svg";
 import {
@@ -490,7 +491,9 @@ export function AppLayout({ children }: { children: React.ReactNode }) {
               )}
             </div>
           </header>
-          <main className="flex-1">{children}</main>
+          <main className="flex-1">
+            <RouteErrorBoundary>{children}</RouteErrorBoundary>
+          </main>
         </SidebarInset>
       </div>
 
