@@ -552,7 +552,7 @@ export const Profile: React.FC = () => {
                         const isPlatformManagerSelected =
                           roles.includes("PlatformManager");
                         const isSubsetRole =
-                          role === "BatchAPIUser" || role === "BillingManager";
+                          role === "BatchAPIUser" || role === "BillingManager" || role === "ConnectionsUser";
                         const isDisabled =
                           role === "StandardUser" ||
                           (isPlatformManagerSelected && isSubsetRole);

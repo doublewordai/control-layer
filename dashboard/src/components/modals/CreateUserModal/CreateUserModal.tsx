@@ -229,7 +229,7 @@ export const CreateUserModal: React.FC<CreateUserModalProps> = ({
                 const isPlatformManagerSelected =
                   formData.roles.includes("PlatformManager");
                 const isSubsetRole =
-                  role === "BatchAPIUser" || role === "BillingManager";
+                  role === "BatchAPIUser" || role === "BillingManager" || role === "ConnectionsUser";
                 const isDisabled =
                   role === "StandardUser" ||
                   createUserMutation.isPending ||

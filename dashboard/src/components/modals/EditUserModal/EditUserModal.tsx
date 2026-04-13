@@ -170,7 +170,7 @@ export const EditUserModal: React.FC<EditUserModalProps> = ({
                   const isPlatformManagerSelected =
                     formData.roles.includes("PlatformManager");
                   const isSubsetRole =
-                    role === "BatchAPIUser" || role === "BillingManager";
+                    role === "BatchAPIUser" || role === "BillingManager" || role === "ConnectionsUser";
                   const isDisabled =
                     role === "StandardUser" ||
                     (isPlatformManagerSelected && isSubsetRole);
