@@ -71,14 +71,9 @@ const ROLE_PERMISSIONS: Record<Role, PagePermission[]> = {
     "usage",
   ],
   ConnectionsUser: [
-    "models",
-    "api-keys",
-    "cost-management",
-    "profile",
     "connections",
     "batches",
-    "my-organization",
-    "usage",
+    "profile",
   ],
 };
 

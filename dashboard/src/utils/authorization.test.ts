@@ -39,18 +39,25 @@ describe("hasPermission", () => {
   });
 
   it("handles ConnectionsUser role correctly", () => {
+    // ConnectionsUser only grants connections + batches + profile
     expect(hasPermission(["ConnectionsUser"], "connections")).toBe(true);
     expect(hasPermission(["ConnectionsUser"], "batches")).toBe(true);
-    expect(hasPermission(["ConnectionsUser"], "api-keys")).toBe(true);
-    expect(hasPermission(["ConnectionsUser"], "models")).toBe(true);
+    expect(hasPermission(["ConnectionsUser"], "profile")).toBe(true);
+    // Other pages come from StandardUser, not ConnectionsUser
+    expect(hasPermission(["ConnectionsUser"], "api-keys")).toBe(false);
+    expect(hasPermission(["ConnectionsUser"], "models")).toBe(false);
     expect(hasPermission(["ConnectionsUser"], "analytics")).toBe(false);
     expect(hasPermission(["ConnectionsUser"], "users-groups")).toBe(false);
-    expect(hasPermission(["ConnectionsUser"], "endpoints")).toBe(false);
   });
 
   it("ConnectionsUser combined with StandardUser grants both permission sets", () => {
+    // Roles are additive — StandardUser brings models/api-keys/playground,
+    // ConnectionsUser adds connections/batches
     expect(
       hasPermission(["StandardUser", "ConnectionsUser"], "connections"),
+    ).toBe(true);
+    expect(
+      hasPermission(["StandardUser", "ConnectionsUser"], "models"),
     ).toBe(true);
     expect(
       hasPermission(["StandardUser", "ConnectionsUser"], "playground"),
