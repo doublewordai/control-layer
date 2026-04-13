@@ -382,6 +382,20 @@ pub fn role_has_permission(role: &Role, resource: Resource, operation: Operation
                     | (Resource::Batches, Operation::DeleteOwn) // Can delete own batches
             )
         }
+        Role::ConnectionsUser => {
+            // Connections User can manage their own external data source connections
+            // and trigger syncs. This role is typically given IN ADDITION to StandardUser.
+            // Synced files create batches, so this role also grants batch/file read access.
+            matches!(
+                (resource, operation),
+                (Resource::Connections, Operation::CreateOwn)  // Can create own connections
+                    | (Resource::Connections, Operation::ReadOwn)   // Can read own connections
+                    | (Resource::Connections, Operation::UpdateOwn) // Can update own connections
+                    | (Resource::Connections, Operation::DeleteOwn) // Can delete own connections
+                    | (Resource::Files, Operation::ReadOwn)         // Can read own files (created by sync)
+                    | (Resource::Batches, Operation::ReadOwn) // Can read own batches (created by sync)
+            )
+        }
     }
 }
 

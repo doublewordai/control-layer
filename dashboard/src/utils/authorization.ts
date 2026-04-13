@@ -70,6 +70,16 @@ const ROLE_PERMISSIONS: Record<Role, PagePermission[]> = {
     "my-organization",
     "usage",
   ],
+  ConnectionsUser: [
+    "models",
+    "api-keys",
+    "cost-management",
+    "profile",
+    "connections",
+    "batches",
+    "my-organization",
+    "usage",
+  ],
 };
 
 // Map route paths to permissions
