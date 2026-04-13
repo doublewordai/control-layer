@@ -11,9 +11,15 @@ import { identifyUser } from "./telemetry";
  * choose their own identity strategy in the bootstrap layer.
  */
 export function TelemetryIdentity() {
-  const { user, isAuthenticated } = useAuth();
+  const { user, isAuthenticated, isLoading } = useAuth();
 
   useEffect(() => {
+    // Don't emit identity events while the auth check is still in flight —
+    // otherwise every page load fires a spurious "clear identity" that can
+    // mis-attribute startup errors as anonymous.
+    if (isLoading) {
+      return;
+    }
     if (!isAuthenticated || !user) {
       identifyUser(null);
       return;
@@ -22,7 +28,7 @@ export function TelemetryIdentity() {
       roles: user.roles,
       auth_source: user.auth_source,
     });
-  }, [isAuthenticated, user]);
+  }, [isAuthenticated, isLoading, user]);
 
   return null;
 }

@@ -168,9 +168,10 @@ export function identifyUser(
 }
 
 /**
- * Attach global context (build SHA, environment, route, ...) that should be
- * included with every subsequent telemetry event. Callers should prefer this
- * over passing context to every `captureException` call.
+ * Emit a context event carrying global attributes (build SHA, environment,
+ * etc.). Subscribers are responsible for caching this context and merging it
+ * into subsequent telemetry payloads — the facade itself is stateless and does
+ * not automatically attach context to later dispatches.
  */
 export function setTelemetryContext(context: Record<string, unknown>): void {
   dispatch({ type: "context", payload: { context } });

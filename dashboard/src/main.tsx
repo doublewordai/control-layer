@@ -9,8 +9,8 @@ import "./index.css";
 import App from "./App.tsx";
 import { captureException, setTelemetryContext } from "./lib/telemetry";
 
-// Seed global telemetry context with the build identity so every subsequent
-// report is correlated with a specific deploy.
+// Emit the build identity as a context event. Telemetry subscribers should
+// cache this and merge it into subsequent reports for deploy correlation.
 setTelemetryContext({
   build_sha: import.meta.env.VITE_BUILD_SHA ?? "unknown",
   environment: import.meta.env.MODE,
