@@ -39,11 +39,11 @@ describe("hasPermission", () => {
   });
 
   it("handles ConnectionsUser role correctly", () => {
-    // ConnectionsUser only grants connections + batches + profile
+    // ConnectionsUser only grants connections + batches
     expect(hasPermission(["ConnectionsUser"], "connections")).toBe(true);
     expect(hasPermission(["ConnectionsUser"], "batches")).toBe(true);
-    expect(hasPermission(["ConnectionsUser"], "profile")).toBe(true);
-    // Other pages come from StandardUser, not ConnectionsUser
+    // Everything else comes from StandardUser, not ConnectionsUser
+    expect(hasPermission(["ConnectionsUser"], "profile")).toBe(false);
     expect(hasPermission(["ConnectionsUser"], "api-keys")).toBe(false);
     expect(hasPermission(["ConnectionsUser"], "models")).toBe(false);
     expect(hasPermission(["ConnectionsUser"], "analytics")).toBe(false);
@@ -80,7 +80,6 @@ describe("canAccessRoute", () => {
   it("allows ConnectionsUser to access /connections and /batches", () => {
     expect(canAccessRoute(["ConnectionsUser"], "/connections")).toBe(true);
     expect(canAccessRoute(["ConnectionsUser"], "/batches")).toBe(true);
-    expect(canAccessRoute(["ConnectionsUser"], "/profile")).toBe(true);
   });
 
   it("denies ConnectionsUser access to admin routes", () => {

@@ -73,7 +73,6 @@ const ROLE_PERMISSIONS: Record<Role, PagePermission[]> = {
   ConnectionsUser: [
     "connections",
     "batches",
-    "profile",
   ],
 };
 
