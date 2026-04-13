@@ -310,9 +310,7 @@ pub async fn create_batch<P: PoolProvider>(
     // completion window that humantime can parse. Everyone else is restricted
     // to the configured allowed values.
     let can_use_any_window = has_permission(&current_user, Resource::Batches, Operation::CreateAll);
-    if !can_use_any_window
-        && !config.batches.allowed_completion_windows.contains(&req.completion_window)
-    {
+    if !can_use_any_window && !config.batches.allowed_completion_windows.contains(&req.completion_window) {
         let allowed: Vec<&str> = config.batches.allowed_completion_windows.iter().map(|w| w.as_str()).collect();
 
         return Err(Error::BadRequest {
