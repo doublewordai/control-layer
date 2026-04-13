@@ -4,6 +4,11 @@ type AnyComponent = ComponentType<any>;
 
 const RELOAD_KEY = "dashboard-chunk-reload-attempted";
 
+// In-memory fallback guard for environments where sessionStorage is completely
+// unavailable (Safari private mode, restrictive CSP). Without this, storageGet
+// always returns null and storageSet is a no-op, creating an infinite reload loop.
+let reloadAttempted = false;
+
 // sessionStorage can throw SecurityError in Safari private mode and some
 // restrictive CSP environments even when `typeof sessionStorage !== "undefined"`.
 // These helpers swallow those errors so the retry/reload logic never crashes.
@@ -49,18 +54,22 @@ export function lazyWithRetry<T extends AnyComponent>(
   return lazy(async () => {
     try {
       const mod = await factory();
+      reloadAttempted = false;
       storageRemove(RELOAD_KEY);
       return mod;
     } catch (initialError) {
       try {
         const mod = await factory();
+        reloadAttempted = false;
         storageRemove(RELOAD_KEY);
         return mod;
       } catch (retryError) {
         if (
           typeof window !== "undefined" &&
+          !reloadAttempted &&
           !storageGet(RELOAD_KEY)
         ) {
+          reloadAttempted = true;
           storageSet(RELOAD_KEY, "1");
           window.location.reload();
           // Return a never-resolving promise so Suspense keeps showing its
