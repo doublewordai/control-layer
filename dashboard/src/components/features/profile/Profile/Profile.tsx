@@ -26,7 +26,7 @@ import {
 } from "../../../ui";
 import { Input } from "../../../ui/input";
 import { Button } from "../../../ui/button";
-import { AVAILABLE_ROLES, getRoleDisplayName } from "../../../../utils/roles";
+import { AVAILABLE_ROLES, SUBSET_ROLES, getRoleDisplayName } from "../../../../utils/roles";
 import type { Role } from "../../../../api/control-layer/types";
 import { dwctlApi } from "../../../../api/control-layer/client";
 import { ApiError } from "../../../../api/control-layer/errors";
@@ -551,8 +551,7 @@ export const Profile: React.FC = () => {
                       {AVAILABLE_ROLES.map((role) => {
                         const isPlatformManagerSelected =
                           roles.includes("PlatformManager");
-                        const isSubsetRole =
-                          role === "BatchAPIUser" || role === "BillingManager" || role === "ConnectionsUser";
+                        const isSubsetRole = SUBSET_ROLES.includes(role);
                         const isDisabled =
                           role === "StandardUser" ||
                           (isPlatformManagerSelected && isSubsetRole);

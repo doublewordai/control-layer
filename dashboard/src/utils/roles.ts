@@ -10,6 +10,14 @@ export const AVAILABLE_ROLES: Role[] = [
   "ConnectionsUser",
 ];
 
+// Roles whose permissions are a subset of PlatformManager.
+// Used to auto-select/disable these checkboxes when PM is selected.
+export const SUBSET_ROLES: Role[] = [
+  "BatchAPIUser",
+  "BillingManager",
+  "ConnectionsUser",
+];
+
 // Roles available for editing in user management forms (excludes StandardUser)
 export const EDITABLE_ROLES: Role[] = [
   "PlatformManager",

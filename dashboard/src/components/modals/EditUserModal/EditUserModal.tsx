@@ -2,7 +2,7 @@ import React, { useState } from "react";
 import { User, Info } from "lucide-react";
 import { useUpdateUser } from "../../../api/control-layer";
 import type { Role } from "../../../api/control-layer/types";
-import { AVAILABLE_ROLES, getRoleDisplayName } from "../../../utils/roles";
+import { AVAILABLE_ROLES, SUBSET_ROLES, getRoleDisplayName } from "../../../utils/roles";
 import {
   Dialog,
   DialogContent,
@@ -169,8 +169,7 @@ export const EditUserModal: React.FC<EditUserModalProps> = ({
                 {AVAILABLE_ROLES.map((role) => {
                   const isPlatformManagerSelected =
                     formData.roles.includes("PlatformManager");
-                  const isSubsetRole =
-                    role === "BatchAPIUser" || role === "BillingManager" || role === "ConnectionsUser";
+                  const isSubsetRole = SUBSET_ROLES.includes(role);
                   const isDisabled =
                     role === "StandardUser" ||
                     (isPlatformManagerSelected && isSubsetRole);

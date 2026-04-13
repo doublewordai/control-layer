@@ -139,7 +139,8 @@
                       "REQUESTVIEWER",
                       "STANDARDUSER",
                       "BILLINGMANAGER",
-                      "BATCHAPIUSER"
+                      "BATCHAPIUSER",
+                      "CONNECTIONSUSER"
                     ]
                   }
                 }
