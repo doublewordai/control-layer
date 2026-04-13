@@ -1178,6 +1178,15 @@ pub struct DaemonConfig {
     /// 0.0 = pure user-fairness, 1.0 = pure deadline urgency. Default: 0.5.
     #[serde(default = "default_urgency_weight", deserialize_with = "deserialize_urgency_weight")]
     pub urgency_weight: f64,
+
+    /// When true, the daemon injects a `priority` field into each outbound
+    /// request body equal to the Unix timestamp (seconds) of the batch SLA
+    /// deadline. Smaller values = more urgent. Requires inference backends
+    /// configured with lower-priority-first scheduling (vLLM's default
+    /// priority queue; SGLang launched with
+    /// `--schedule-low-priority-values-first`). Default: false.
+    #[serde(default)]
+    pub inject_deadline_priority: bool,
 }
 
 fn default_urgency_weight() -> f64 {
@@ -1240,6 +1249,7 @@ impl Default for DaemonConfig {
             purge_throttle_ms: 100,
             streamable_endpoints: Vec::new(),
             urgency_weight: default_urgency_weight(),
+            inject_deadline_priority: false,
         }
     }
 }
@@ -1294,6 +1304,7 @@ impl DaemonConfig {
             purge_throttle_ms: self.purge_throttle_ms,
             streamable_endpoints: self.streamable_endpoints.clone(),
             urgency_weight: self.urgency_weight,
+            inject_deadline_priority: self.inject_deadline_priority,
             ..Default::default()
         }
     }
