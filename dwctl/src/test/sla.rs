@@ -153,6 +153,7 @@ async fn test_route_at_claim_time_escalation(pool: PgPool) {
         purge_throttle_ms: 100,
         streamable_endpoints: vec![],
         urgency_weight: 0.0,
+        inject_deadline_priority: false,
     };
 
     config.background_services.onwards_sync.enabled = true;
@@ -414,6 +415,7 @@ async fn test_no_escalation_when_not_near_expiry(pool: PgPool) {
         purge_throttle_ms: 100,
         streamable_endpoints: vec![],
         urgency_weight: 0.0,
+        inject_deadline_priority: false,
     };
 
     config.background_services.onwards_sync.enabled = true;
