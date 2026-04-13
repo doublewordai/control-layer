@@ -77,6 +77,8 @@ export const Profile: React.FC = () => {
         "Billing Managers can view and manage cost information and user credit balances.",
       BatchAPIUser:
         "Batch API Users can upload, view, and delete their own files for use with the Batch API.",
+      ConnectionsUser:
+        "Connections Users can create and manage external data source connections, sync files, and view resulting batches.",
     };
     return descriptions[role];
   };

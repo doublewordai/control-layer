@@ -664,6 +664,52 @@ mod tests {
     }
 
     #[test]
+    fn test_connections_user_role() {
+        let conn_user = create_user_with_roles(vec![Role::ConnectionsUser], false);
+
+        // Should have connection management permissions
+        assert!(has_permission(&conn_user, Resource::Connections, Operation::CreateOwn));
+        assert!(has_permission(&conn_user, Resource::Connections, Operation::ReadOwn));
+        assert!(has_permission(&conn_user, Resource::Connections, Operation::UpdateOwn));
+        assert!(has_permission(&conn_user, Resource::Connections, Operation::DeleteOwn));
+
+        // Should have read access to files and batches (created by sync)
+        assert!(has_permission(&conn_user, Resource::Files, Operation::ReadOwn));
+        assert!(has_permission(&conn_user, Resource::Batches, Operation::ReadOwn));
+
+        // Should NOT have broad access
+        assert!(!has_permission(&conn_user, Resource::Connections, Operation::ReadAll));
+        assert!(!has_permission(&conn_user, Resource::Files, Operation::CreateOwn));
+        assert!(!has_permission(&conn_user, Resource::Batches, Operation::CreateOwn));
+        assert!(!has_permission(&conn_user, Resource::ApiKeys, Operation::CreateOwn));
+        assert!(!has_permission(&conn_user, Resource::Models, Operation::ReadOwn));
+        assert!(!has_permission(&conn_user, Resource::Requests, Operation::ReadAll));
+        assert!(!has_permission(&conn_user, Resource::Users, Operation::ReadAll));
+    }
+
+    #[test]
+    fn test_connections_user_with_standard_user() {
+        // Typical combination: StandardUser + ConnectionsUser
+        let user = create_user_with_roles(vec![Role::StandardUser, Role::ConnectionsUser], false);
+
+        // Should have StandardUser permissions
+        assert!(has_permission(&user, Resource::ApiKeys, Operation::CreateOwn));
+        assert!(has_permission(&user, Resource::Models, Operation::ReadOwn));
+        assert!(has_permission(&user, Resource::Users, Operation::ReadOwn));
+
+        // And ConnectionsUser permissions
+        assert!(has_permission(&user, Resource::Connections, Operation::CreateOwn));
+        assert!(has_permission(&user, Resource::Connections, Operation::ReadOwn));
+        assert!(has_permission(&user, Resource::Connections, Operation::DeleteOwn));
+        assert!(has_permission(&user, Resource::Files, Operation::ReadOwn));
+        assert!(has_permission(&user, Resource::Batches, Operation::ReadOwn));
+
+        // But still not admin-level permissions
+        assert!(!has_permission(&user, Resource::Connections, Operation::ReadAll));
+        assert!(!has_permission(&user, Resource::Users, Operation::CreateAll));
+    }
+
+    #[test]
     fn test_system_resource_permissions() {
         let admin = create_user_with_roles(vec![Role::StandardUser], true);
         let pm = create_user_with_roles(vec![Role::PlatformManager], false);

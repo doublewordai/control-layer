@@ -37,6 +37,25 @@ describe("hasPermission", () => {
     expect(hasPermission(["BatchAPIUser"], "api-keys")).toBe(true);
     expect(hasPermission(["BatchAPIUser"], "analytics")).toBe(false);
   });
+
+  it("handles ConnectionsUser role correctly", () => {
+    expect(hasPermission(["ConnectionsUser"], "connections")).toBe(true);
+    expect(hasPermission(["ConnectionsUser"], "batches")).toBe(true);
+    expect(hasPermission(["ConnectionsUser"], "api-keys")).toBe(true);
+    expect(hasPermission(["ConnectionsUser"], "models")).toBe(true);
+    expect(hasPermission(["ConnectionsUser"], "analytics")).toBe(false);
+    expect(hasPermission(["ConnectionsUser"], "users-groups")).toBe(false);
+    expect(hasPermission(["ConnectionsUser"], "endpoints")).toBe(false);
+  });
+
+  it("ConnectionsUser combined with StandardUser grants both permission sets", () => {
+    expect(
+      hasPermission(["StandardUser", "ConnectionsUser"], "connections"),
+    ).toBe(true);
+    expect(
+      hasPermission(["StandardUser", "ConnectionsUser"], "playground"),
+    ).toBe(true);
+  });
 });
 
 describe("canAccessRoute", () => {
@@ -49,6 +68,19 @@ describe("canAccessRoute", () => {
   it("returns false for routes user does not have permission to access", () => {
     expect(canAccessRoute(["StandardUser"], "/users-groups")).toBe(false);
     expect(canAccessRoute(["StandardUser"], "/analytics")).toBe(false);
+  });
+
+  it("allows ConnectionsUser to access /connections and /batches", () => {
+    expect(canAccessRoute(["ConnectionsUser"], "/connections")).toBe(true);
+    expect(canAccessRoute(["ConnectionsUser"], "/batches")).toBe(true);
+    expect(canAccessRoute(["ConnectionsUser"], "/profile")).toBe(true);
+  });
+
+  it("denies ConnectionsUser access to admin routes", () => {
+    expect(canAccessRoute(["ConnectionsUser"], "/users-groups")).toBe(false);
+    expect(canAccessRoute(["ConnectionsUser"], "/analytics")).toBe(false);
+    expect(canAccessRoute(["ConnectionsUser"], "/endpoints")).toBe(false);
+    expect(canAccessRoute(["ConnectionsUser"], "/settings")).toBe(false);
   });
 
   it("returns true for unknown routes (no permission required)", () => {
