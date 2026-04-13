@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.37.1](https://github.com/doublewordai/control-layer/compare/v8.37.0...v8.37.1) (2026-04-13)
+
+
+### Bug Fixes
+
+* document dynamo nvext.agent_hints.priority injection path ([#984](https://github.com/doublewordai/control-layer/issues/984)) ([cf613b0](https://github.com/doublewordai/control-layer/commit/cf613b0d90cf1a224bbaa817e22640bb0452c28c))
+
 ## [8.37.0](https://github.com/doublewordai/control-layer/compare/v8.36.0...v8.37.0) (2026-04-13)
 
 
