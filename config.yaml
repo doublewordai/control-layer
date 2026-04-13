@@ -397,6 +397,14 @@ background_services:
       - /v1/completions
       - /v1/responses
 
+    # Inject a `priority` field into outbound request bodies, set to the Unix
+    # timestamp of the batch SLA deadline (smaller = more urgent). Requires
+    # inference backends configured for lower-priority-first scheduling
+    # (vLLM's default priority queue; SGLang with
+    # `--schedule-low-priority-values-first`). Backends without priority
+    # scheduling enabled simply ignore the field.
+    # inject_deadline_priority: false
+
   # Batch completion notifications (emails + webhooks)
   # notifications:
   #   poll_interval: 30s                # How often to poll for completed batches
