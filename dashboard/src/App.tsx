@@ -16,6 +16,8 @@ import { SettingsProvider, useSettings, OrganizationProvider } from "./contexts"
 import { AuthProvider, useAuth } from "./contexts/auth";
 import { useAuthorization } from "./utils";
 import { useRegistrationInfo } from "./api/control-layer/hooks";
+import { captureException } from "./lib/telemetry";
+import { TelemetryIdentity } from "./lib/TelemetryIdentity";
 
 // Error boundary to catch and display React render errors
 class ErrorBoundary extends Component<
@@ -28,6 +30,10 @@ class ErrorBoundary extends Component<
   }
   componentDidCatch(error: Error, info: React.ErrorInfo) {
     console.error("React ErrorBoundary caught:", error, info.componentStack);
+    captureException(error, {
+      source: "react-error-boundary",
+      componentStack: info.componentStack ?? undefined,
+    });
   }
   render() {
     if (this.state.error) {
@@ -616,6 +622,7 @@ function App() {
       <QueryClientProvider client={queryClient}>
         <SettingsProvider>
           <AuthProvider>
+            <TelemetryIdentity />
             <OrganizationProvider>
               <AppRoutes />
             </OrganizationProvider>
