@@ -4,6 +4,31 @@ type AnyComponent = ComponentType<any>;
 
 const RELOAD_KEY = "dashboard-chunk-reload-attempted";
 
+// sessionStorage can throw SecurityError in Safari private mode and some
+// restrictive CSP environments even when `typeof sessionStorage !== "undefined"`.
+// These helpers swallow those errors so the retry/reload logic never crashes.
+function storageGet(key: string): string | null {
+  try {
+    return sessionStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+function storageSet(key: string, value: string): void {
+  try {
+    sessionStorage.setItem(key, value);
+  } catch {
+    // storage unavailable — reload guard will be skipped
+  }
+}
+function storageRemove(key: string): void {
+  try {
+    sessionStorage.removeItem(key);
+  } catch {
+    // storage unavailable — no-op
+  }
+}
+
 /**
  * Wraps `React.lazy` with resilience for failed dynamic imports.
  *
@@ -24,24 +49,19 @@ export function lazyWithRetry<T extends AnyComponent>(
   return lazy(async () => {
     try {
       const mod = await factory();
-      if (typeof sessionStorage !== "undefined") {
-        sessionStorage.removeItem(RELOAD_KEY);
-      }
+      storageRemove(RELOAD_KEY);
       return mod;
     } catch (initialError) {
       try {
         const mod = await factory();
-        if (typeof sessionStorage !== "undefined") {
-          sessionStorage.removeItem(RELOAD_KEY);
-        }
+        storageRemove(RELOAD_KEY);
         return mod;
       } catch (retryError) {
         if (
           typeof window !== "undefined" &&
-          typeof sessionStorage !== "undefined" &&
-          !sessionStorage.getItem(RELOAD_KEY)
+          !storageGet(RELOAD_KEY)
         ) {
-          sessionStorage.setItem(RELOAD_KEY, "1");
+          storageSet(RELOAD_KEY, "1");
           window.location.reload();
           // Return a never-resolving promise so Suspense keeps showing its
           // fallback until the reload takes effect, rather than surfacing the
