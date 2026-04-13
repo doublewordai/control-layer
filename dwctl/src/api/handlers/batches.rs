@@ -306,8 +306,13 @@ pub async fn create_batch<P: PoolProvider>(
     Json(req): Json<CreateBatchRequest>,
 ) -> Result<(StatusCode, Json<BatchResponse>)> {
     let config = state.current_config();
-    // Validate completion_window against configured allowed values
-    if !config.batches.allowed_completion_windows.contains(&req.completion_window) {
+    // Users with Batches::CreateAll (PlatformManager, admins) can use any
+    // completion window that humantime can parse. Everyone else is restricted
+    // to the configured allowed values.
+    let can_use_any_window = has_permission(&current_user, Resource::Batches, Operation::CreateAll);
+    if !can_use_any_window
+        && !config.batches.allowed_completion_windows.contains(&req.completion_window)
+    {
         let allowed: Vec<&str> = config.batches.allowed_completion_windows.iter().map(|w| w.as_str()).collect();
 
         return Err(Error::BadRequest {
@@ -448,22 +453,24 @@ pub async fn create_batch<P: PoolProvider>(
             })?
     };
 
-    // Check per-model batch completion window restrictions
-    for (alias, allowed_windows) in &batch_model_info.allowed_windows {
-        if !allowed_windows.contains(&req.completion_window) {
-            if allowed_windows.is_empty() {
+    // Check per-model batch completion window restrictions (skipped for elevated users)
+    if !can_use_any_window {
+        for (alias, allowed_windows) in &batch_model_info.allowed_windows {
+            if !allowed_windows.contains(&req.completion_window) {
+                if allowed_windows.is_empty() {
+                    return Err(Error::BadRequest {
+                        message: format!("Model '{}' does not support batch processing.", alias),
+                    });
+                }
                 return Err(Error::BadRequest {
-                    message: format!("Model '{}' does not support batch processing.", alias),
+                    message: format!(
+                        "Model '{}' does not support completion window '{}'. Allowed: {}",
+                        alias,
+                        req.completion_window,
+                        allowed_windows.join(", ")
+                    ),
                 });
             }
-            return Err(Error::BadRequest {
-                message: format!(
-                    "Model '{}' does not support completion window '{}'. Allowed: {}",
-                    alias,
-                    req.completion_window,
-                    allowed_windows.join(", ")
-                ),
-            });
         }
     }
 
@@ -3088,6 +3095,56 @@ mod tests {
         resp.assert_status(StatusCode::BAD_REQUEST);
         let error_text = resp.text();
         assert!(error_text.contains("Unsupported completion_window"));
+    }
+
+    /// Test that PlatformManager can use completion windows not in the allowed list
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_platform_manager_can_use_any_completion_window(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::PlatformManager]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}"#;
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test-batch.jsonl");
+        let multipart = axum_test::multipart::MultipartForm::new()
+            .add_part("file", file_part)
+            .add_part("purpose", axum_test::multipart::Part::text("batch"));
+        let upload_resp = app
+            .post("/ai/v1/files")
+            .multipart(multipart)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        upload_resp.assert_status(StatusCode::CREATED);
+        let file: serde_json::Value = upload_resp.json();
+        let file_id = file["id"].as_str().unwrap();
+
+        // "0s" is not in allowed_completion_windows but PlatformManager should bypass
+        let create_req = CreateBatchRequest {
+            input_file_id: file_id.to_string(),
+            endpoint: "/v1/chat/completions".to_string(),
+            completion_window: "0s".to_string(),
+            metadata: None,
+        };
+
+        let resp = app
+            .post("/ai/v1/batches")
+            .json(&create_req)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        // Should not get 400 for unsupported completion_window
+        assert_ne!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "PlatformManager should be able to use arbitrary completion windows, got: {}",
+            resp.text()
+        );
     }
 
     /// Test that relaxation factor of 0.0 blocks all batches for that window
