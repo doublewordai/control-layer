@@ -78,14 +78,13 @@ const ApiExamplesModal: React.FC<ApiExamplesModalProps> = ({
 
   const allModels = modelsData?.data ?? [];
 
-  // Resolve the active model — either from prop or user selection
+  // Resolve the active model from user selection (initialModel only sets the default)
   const model: Model | null = useMemo(() => {
-    if (initialModel) return initialModel;
     if (selectedModelId) {
       return allModels.find((m) => m.id === selectedModelId) || null;
     }
     return null;
-  }, [initialModel, selectedModelId, allModels]);
+  }, [selectedModelId, allModels]);
 
   // Sync selectedModelId when initialModel changes
   React.useEffect(() => {
