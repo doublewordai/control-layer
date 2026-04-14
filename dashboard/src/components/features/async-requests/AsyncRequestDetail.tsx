@@ -1,14 +1,23 @@
 import { useParams, useNavigate, Link } from "react-router-dom";
+import { ArrowLeft } from "lucide-react";
 import { useAsyncRequest } from "../../../api/control-layer/hooks";
-import { cn } from "../../../lib/utils";
 
-const statusStyles: Record<string, string> = {
-  completed: "bg-green-500/10 text-green-400",
-  failed: "bg-red-500/10 text-red-400",
-  processing: "bg-blue-500/10 text-blue-400",
-  claimed: "bg-blue-500/10 text-blue-400",
-  pending: "bg-yellow-500/10 text-yellow-400",
-  canceled: "bg-gray-500/10 text-gray-400",
+const getStatusColor = (status: string): string => {
+  switch (status) {
+    case "completed":
+      return "bg-green-100 text-green-800";
+    case "failed":
+      return "bg-red-100 text-red-800";
+    case "processing":
+    case "claimed":
+      return "bg-blue-100 text-blue-800";
+    case "pending":
+      return "bg-yellow-100 text-yellow-800";
+    case "canceled":
+      return "bg-gray-100 text-gray-800";
+    default:
+      return "bg-gray-100 text-gray-800";
+  }
 };
 
 const statusLabels: Record<string, string> = {
@@ -49,7 +58,7 @@ function parseResponseBody(responseBody: string | null): string | null {
 }
 
 function formatDuration(ms: number | null): string {
-  if (!ms) return "—";
+  if (!ms) return "-";
   const seconds = Math.round(ms / 1000);
   if (seconds < 60) return `${seconds}s`;
   const minutes = Math.floor(seconds / 60);
@@ -58,9 +67,9 @@ function formatDuration(ms: number | null): string {
 }
 
 const roleColors: Record<string, string> = {
-  system: "text-purple-400",
-  user: "text-blue-400",
-  assistant: "text-green-400",
+  system: "text-doubleword-purple",
+  user: "text-blue-700",
+  assistant: "text-green-700",
 };
 
 export function AsyncRequestDetail() {
@@ -70,10 +79,10 @@ export function AsyncRequestDetail() {
 
   if (isLoading) {
     return (
-      <div className="p-6">
+      <div className="py-4 px-6">
         <div className="animate-pulse space-y-4">
-          <div className="h-8 w-48 bg-muted rounded" />
-          <div className="h-64 bg-muted rounded" />
+          <div className="h-8 w-48 bg-doubleword-neutral-100 rounded" />
+          <div className="h-64 bg-doubleword-neutral-100 rounded" />
         </div>
       </div>
     );
@@ -81,8 +90,8 @@ export function AsyncRequestDetail() {
 
   if (!request) {
     return (
-      <div className="p-6">
-        <p className="text-muted-foreground">Request not found.</p>
+      <div className="py-4 px-6">
+        <p className="text-doubleword-neutral-600">Request not found.</p>
       </div>
     );
   }
@@ -95,45 +104,43 @@ export function AsyncRequestDetail() {
   return (
     <div className="h-full">
       {/* Header */}
-      <div className="flex items-center gap-3 border-b px-6 py-4">
+      <div className="flex items-center gap-4 border-b border-doubleword-border px-6 py-4">
         <button
           onClick={() => navigate("/async")}
-          className="text-sm text-muted-foreground hover:text-foreground"
+          className="p-2 text-doubleword-neutral-600 hover:bg-doubleword-neutral-100 rounded-lg transition-colors shrink-0"
+          aria-label="Back to Async"
         >
-          ← Back
+          <ArrowLeft className="w-5 h-5" />
         </button>
-        <div className="h-4 w-px bg-border" />
-        <h1 className="text-lg font-semibold">Request Detail</h1>
-        <span
-          className={cn(
-            "inline-flex items-center rounded px-2 py-0.5 text-xs font-medium",
-            statusStyles[status] || "bg-gray-500/10 text-gray-400",
-          )}
-        >
-          {displayStatus}
-        </span>
+        <div className="flex items-center gap-3">
+          <h1 className="text-2xl font-bold text-doubleword-neutral-900">
+            Request Detail
+          </h1>
+          <span
+            className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${getStatusColor(status)}`}
+          >
+            {displayStatus}
+          </span>
+        </div>
       </div>
 
       {/* Two column layout */}
-      <div className="flex h-[calc(100%-57px)]">
+      <div className="flex h-[calc(100%-65px)]">
         {/* Left: Input/Output */}
-        <div className="flex-1 overflow-auto border-r p-6 space-y-6">
+        <div className="flex-1 overflow-auto border-r border-doubleword-border p-6 space-y-6">
           <div>
-            <h3 className="text-xs uppercase tracking-wide text-muted-foreground mb-3">
+            <h3 className="text-xs uppercase tracking-wide font-medium text-doubleword-neutral-600 mb-3">
               Input
             </h3>
-            <div className="rounded-lg border bg-muted/30 p-4 space-y-3">
+            <div className="rounded-lg border border-doubleword-border bg-doubleword-background-secondary p-4 space-y-3">
               {messages.map((msg, i) => (
                 <div key={i}>
                   <span
-                    className={cn(
-                      "text-[10px] uppercase tracking-wide font-medium block mb-1",
-                      roleColors[msg.role] || "text-gray-400",
-                    )}
+                    className={`text-[10px] uppercase tracking-wide font-medium block mb-1 ${roleColors[msg.role] || "text-doubleword-neutral-600"}`}
                   >
                     {msg.role}
                   </span>
-                  <p className="text-sm leading-relaxed whitespace-pre-wrap">
+                  <p className="text-sm leading-relaxed whitespace-pre-wrap text-doubleword-text-primary">
                     {msg.content}
                   </p>
                 </div>
@@ -142,30 +149,30 @@ export function AsyncRequestDetail() {
           </div>
 
           <div>
-            <h3 className="text-xs uppercase tracking-wide text-muted-foreground mb-3">
+            <h3 className="text-xs uppercase tracking-wide font-medium text-doubleword-neutral-600 mb-3">
               Output
             </h3>
-            <div className="rounded-lg border bg-muted/30 p-4">
+            <div className="rounded-lg border border-doubleword-border bg-doubleword-background-secondary p-4">
               {status === "completed" && responseContent ? (
                 <div>
-                  <span className="text-[10px] uppercase tracking-wide font-medium text-green-400 block mb-1">
+                  <span className="text-[10px] uppercase tracking-wide font-medium text-green-700 block mb-1">
                     Assistant
                   </span>
-                  <p className="text-sm leading-relaxed whitespace-pre-wrap">
+                  <p className="text-sm leading-relaxed whitespace-pre-wrap text-doubleword-text-primary">
                     {responseContent}
                   </p>
                 </div>
               ) : status === "failed" ? (
                 <div>
-                  <span className="text-[10px] uppercase tracking-wide font-medium text-red-400 block mb-1">
+                  <span className="text-[10px] uppercase tracking-wide font-medium text-red-700 block mb-1">
                     Error
                   </span>
-                  <p className="text-sm text-red-400">
+                  <p className="text-sm text-red-700">
                     {request.error || "Request failed"}
                   </p>
                 </div>
               ) : (
-                <p className="text-sm text-muted-foreground">
+                <p className="text-sm text-doubleword-neutral-600">
                   Waiting for response...
                 </p>
               )}
@@ -175,28 +182,27 @@ export function AsyncRequestDetail() {
 
         {/* Right: Metadata sidebar */}
         <div className="w-64 flex-shrink-0 overflow-auto p-6">
-          <h3 className="text-xs uppercase tracking-wide text-muted-foreground mb-4">
+          <h3 className="text-xs uppercase tracking-wide font-medium text-doubleword-neutral-600 mb-4">
             Details
           </h3>
 
           <div className="space-y-4">
             <MetadataField label="Status">
               <span
-                className={cn(
-                  "inline-flex items-center rounded px-2 py-0.5 text-xs font-medium",
-                  statusStyles[status] || "bg-gray-500/10 text-gray-400",
-                )}
+                className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${getStatusColor(status)}`}
               >
                 {displayStatus}
               </span>
             </MetadataField>
 
             <MetadataField label="Model">
-              <span className="text-sm">{request.model}</span>
+              <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-blue-100 text-blue-800">
+                {request.model}
+              </span>
             </MetadataField>
 
             <MetadataField label="Created">
-              <span className="text-sm">
+              <span className="text-sm text-doubleword-neutral-900">
                 {new Date(request.created_at).toLocaleString(undefined, {
                   month: "short",
                   day: "numeric",
@@ -207,17 +213,17 @@ export function AsyncRequestDetail() {
             </MetadataField>
 
             <MetadataField label="Duration">
-              <span className="text-sm">
+              <span className="text-sm text-doubleword-neutral-900">
                 {formatDuration(request.duration_ms)}
               </span>
             </MetadataField>
           </div>
 
-          <div className="my-4 h-px bg-border" />
+          <div className="my-4 h-px bg-doubleword-border" />
 
           <Link
             to={`/batches/${request.batch_id}`}
-            className="text-xs text-indigo-400 hover:underline"
+            className="text-xs text-doubleword-primary hover:underline"
           >
             View related batch →
           </Link>
@@ -236,7 +242,7 @@ function MetadataField({
 }) {
   return (
     <div>
-      <div className="text-xs text-muted-foreground mb-1">{label}</div>
+      <div className="text-xs text-doubleword-neutral-600 mb-1">{label}</div>
       {children}
     </div>
   );

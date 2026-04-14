@@ -130,7 +130,7 @@ export const createBatchColumns = (
       return (
         <span
           className={cn(
-            "inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium",
+            "inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium",
             isAsync
               ? "bg-amber-100 text-amber-800"
               : "bg-indigo-100 text-indigo-800",
@@ -146,7 +146,7 @@ export const createBatchColumns = (
     header: "Completion Window",
     cell: ({ row }) => {
       const window = row.getValue("completion_window") as string;
-      return <span className="text-sm text-gray-500">{window}</span>;
+      return <span className="text-sm text-doubleword-neutral-900">{window}</span>;
     },
   },
   {

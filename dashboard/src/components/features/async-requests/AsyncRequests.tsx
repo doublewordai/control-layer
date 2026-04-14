@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { Code, Play, X, Filter } from "lucide-react";
+import { Code, Play, X, Filter, Clock } from "lucide-react";
 import { type ColumnDef } from "@tanstack/react-table";
 import { Button } from "../../ui/button";
 import { DataTable } from "../../ui/data-table";
@@ -22,15 +22,23 @@ import { CreateAsyncModal } from "../../modals/CreateAsyncModal/CreateAsyncModal
 import { ApiExamples } from "../../modals";
 import { useBootstrapContent } from "../../../hooks/use-bootstrap-content";
 import { useServerPagination } from "../../../hooks/useServerPagination";
-import { cn } from "../../../lib/utils";
 
-const statusStyles: Record<string, string> = {
-  completed: "bg-green-500/10 text-green-400",
-  failed: "bg-red-500/10 text-red-400",
-  processing: "bg-blue-500/10 text-blue-400",
-  claimed: "bg-blue-500/10 text-blue-400",
-  pending: "bg-yellow-500/10 text-yellow-400",
-  canceled: "bg-gray-500/10 text-gray-400",
+const getStatusColor = (status: string): string => {
+  switch (status) {
+    case "completed":
+      return "bg-green-100 text-green-800";
+    case "failed":
+      return "bg-red-100 text-red-800";
+    case "processing":
+    case "claimed":
+      return "bg-blue-100 text-blue-800";
+    case "pending":
+      return "bg-yellow-100 text-yellow-800";
+    case "canceled":
+      return "bg-gray-100 text-gray-800";
+    default:
+      return "bg-gray-100 text-gray-800";
+  }
 };
 
 const statusLabels: Record<string, string> = {
@@ -41,22 +49,12 @@ const statusLabels: Record<string, string> = {
 };
 
 function formatDuration(ms: number | null): string {
-  if (!ms) return "—";
+  if (!ms) return "-";
   const seconds = Math.round(ms / 1000);
   if (seconds < 60) return `${seconds}s`;
   const minutes = Math.floor(seconds / 60);
   const remainingSeconds = seconds % 60;
   return `${minutes}m ${remainingSeconds}s`;
-}
-
-function formatTokens(
-  prompt: number | null,
-  completion: number | null,
-): string {
-  if (prompt == null && completion == null) return "—";
-  const p = prompt?.toLocaleString() ?? "—";
-  const c = completion?.toLocaleString() ?? "—";
-  return `${p} / ${c}`;
 }
 
 const columns: ColumnDef<AsyncRequest>[] = [
@@ -66,7 +64,7 @@ const columns: ColumnDef<AsyncRequest>[] = [
     cell: ({ row }) => {
       const timestamp = row.getValue("created_at") as string;
       return (
-        <span className="text-gray-500">
+        <span className="text-sm text-doubleword-neutral-900">
           {new Date(timestamp).toLocaleString(undefined, {
             month: "short",
             day: "numeric",
@@ -80,7 +78,11 @@ const columns: ColumnDef<AsyncRequest>[] = [
   {
     accessorKey: "model",
     header: "Model",
-    cell: ({ row }) => <span>{row.getValue("model")}</span>,
+    cell: ({ row }) => (
+      <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-blue-100 text-blue-800 max-w-full truncate">
+        {row.getValue("model")}
+      </span>
+    ),
   },
   {
     accessorKey: "status",
@@ -89,10 +91,7 @@ const columns: ColumnDef<AsyncRequest>[] = [
       const status = row.getValue("status") as string;
       return (
         <span
-          className={cn(
-            "inline-flex items-center rounded px-2 py-0.5 text-xs font-medium",
-            statusStyles[status] || "bg-gray-500/10 text-gray-400",
-          )}
+          className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${getStatusColor(status)}`}
         >
           {statusLabels[status] || status}
         </span>
@@ -102,29 +101,27 @@ const columns: ColumnDef<AsyncRequest>[] = [
   {
     id: "tokens",
     header: "Tokens",
-    cell: ({ row }) => (
-      <span className="text-gray-500 text-xs tabular-nums">
-        {formatTokens(
-          row.original.prompt_tokens,
-          row.original.completion_tokens,
-        )}
-      </span>
-    ),
+    cell: ({ row }) => {
+      const prompt = row.original.prompt_tokens;
+      const completion = row.original.completion_tokens;
+      if (prompt == null && completion == null) {
+        return <span className="text-sm text-doubleword-neutral-600">-</span>;
+      }
+      return (
+        <span className="text-sm text-doubleword-neutral-900 tabular-nums cursor-help">
+          {(prompt ?? 0).toLocaleString()} / {(completion ?? 0).toLocaleString()}
+        </span>
+      );
+    },
   },
   {
     id: "duration",
     header: "Duration",
     cell: ({ row }) => (
-      <span className="text-gray-500">
+      <div className="flex items-center gap-1 text-sm text-doubleword-neutral-900">
+        <Clock className="w-3 h-3" />
         {formatDuration(row.original.duration_ms)}
-      </span>
-    ),
-  },
-  {
-    id: "actions",
-    header: "",
-    cell: () => (
-      <span className="text-gray-500 cursor-pointer text-xs">View →</span>
+      </div>
     ),
   },
 ];
@@ -159,18 +156,18 @@ export function AsyncRequests() {
   const requests = data?.data ?? [];
   const totalCount = data?.total_count ?? 0;
 
-  // Bootstrap banner content comes from a trusted server-side source (bootstrap.js),
-  // same pattern as Batches page — not user-supplied content.
   return (
     <div className="py-4 px-6">
-      <div className="mb-6 flex items-center justify-between">
+      <div className="mb-4 flex flex-col sm:flex-row sm:items-end sm:justify-between gap-4">
         <div>
-          <h1 className="text-3xl font-bold">Async</h1>
-          <p className="text-neutral-600 mt-1">
+          <h1 className="text-3xl font-bold text-doubleword-neutral-900">
+            Async
+          </h1>
+          <p className="text-doubleword-neutral-600 mt-1">
             View and manage async requests
           </p>
         </div>
-        <div className="flex gap-2">
+        <div className="flex items-center gap-2">
           <Button variant="outline" onClick={() => setShowApiExamples(true)}>
             <Code className="mr-2 h-4 w-4" />
             API
@@ -182,6 +179,7 @@ export function AsyncRequests() {
         </div>
       </div>
 
+      {/* Bootstrap banner - content from trusted server-side source (bootstrap.js) */}
       {bootstrapBanner.content && !bootstrapBanner.isClosed && (
         <div className="relative mb-6">
           <div
@@ -202,6 +200,7 @@ export function AsyncRequests() {
         data={requests}
         isLoading={isLoading}
         onRowClick={(row) => navigate(`/async/${row.id}`)}
+        showColumnToggle={true}
         pageSize={pagination.pageSize}
         minRows={pagination.pageSize}
         rowHeight="40px"
@@ -277,6 +276,19 @@ export function AsyncRequests() {
                 <SelectItem value="100">100</SelectItem>
               </SelectContent>
             </Select>
+          </div>
+        }
+        emptyState={
+          <div className="text-center py-12">
+            <div className="p-4 bg-doubleword-neutral-100 rounded-full w-16 h-16 mx-auto mb-4 flex items-center justify-center">
+              <Play className="w-8 h-8 text-doubleword-neutral-600" />
+            </div>
+            <h3 className="text-lg font-medium text-doubleword-neutral-900 mb-2">
+              No async requests found
+            </h3>
+            <p className="text-doubleword-neutral-600">
+              Create your first async request to get started
+            </p>
           </div>
         }
       />
