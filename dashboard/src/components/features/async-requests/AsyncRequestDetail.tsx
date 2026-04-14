@@ -215,24 +215,12 @@ export function AsyncRequestDetail() {
 
           <div className="my-4 h-px bg-border" />
 
-          <h3 className="text-xs uppercase tracking-wide text-muted-foreground mb-4">
-            Batch
-          </h3>
-
-          <div className="space-y-4">
-            <MetadataField label="Batch ID">
-              <Link
-                to={`/batches/${request.batch_id}`}
-                className="text-xs font-mono text-indigo-400 hover:underline"
-              >
-                {request.batch_id.slice(0, 12)}...
-              </Link>
-            </MetadataField>
-
-            <MetadataField label="Completion Window">
-              <span className="text-sm">{request.completion_window}</span>
-            </MetadataField>
-          </div>
+          <Link
+            to={`/batches/${request.batch_id}`}
+            className="text-xs text-indigo-400 hover:underline"
+          >
+            View related batch →
+          </Link>
         </div>
       </div>
     </div>
