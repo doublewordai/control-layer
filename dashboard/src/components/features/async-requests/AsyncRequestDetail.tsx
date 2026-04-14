@@ -1,8 +1,11 @@
+import { useState } from "react";
 import { useParams, useNavigate, Link } from "react-router-dom";
-import { ArrowLeft, Clock } from "lucide-react";
+import { ArrowLeft, Clock, Copy, Check } from "lucide-react";
 import { useAsyncRequest } from "../../../api/control-layer/hooks";
 import { Card, CardContent, CardHeader, CardTitle } from "../../ui/card";
+import { CodeBlock } from "../../ui/code-block";
 import { formatTimestamp } from "../../../utils";
+import { toast } from "sonner";
 
 const getStatusColor = (status: string): string => {
   switch (status) {
@@ -29,36 +32,6 @@ const statusLabels: Record<string, string> = {
   canceled: "cancelled",
 };
 
-interface ParsedMessage {
-  role: string;
-  content: string;
-}
-
-function parseRequestBody(body: string): ParsedMessage[] {
-  try {
-    const parsed = JSON.parse(body);
-    if (parsed.body?.messages) return parsed.body.messages;
-    if (parsed.messages) return parsed.messages;
-    return [{ role: "user", content: body }];
-  } catch {
-    return [{ role: "user", content: body }];
-  }
-}
-
-function parseResponseBody(responseBody: string | null): string | null {
-  if (!responseBody) return null;
-  try {
-    const parsed = JSON.parse(responseBody);
-    const message = parsed.body?.choices?.[0]?.message?.content;
-    if (message) return message;
-    const directMessage = parsed.choices?.[0]?.message?.content;
-    if (directMessage) return directMessage;
-    return responseBody;
-  } catch {
-    return responseBody;
-  }
-}
-
 function formatDuration(ms: number | null): string {
   if (!ms) return "-";
   const seconds = Math.round(ms / 1000);
@@ -74,11 +47,36 @@ function formatCost(cost: number): string {
   return `$${cost.toFixed(2)}`;
 }
 
-const roleColors: Record<string, string> = {
-  system: "text-doubleword-purple",
-  user: "text-blue-700",
-  assistant: "text-green-700",
-};
+function prettyJson(raw: string): string {
+  try {
+    return JSON.stringify(JSON.parse(raw), null, 2);
+  } catch {
+    return raw;
+  }
+}
+
+function CopyButton({ text, label }: { text: string; label?: string }) {
+  const [copied, setCopied] = useState(false);
+  const handleCopy = async () => {
+    await navigator.clipboard.writeText(text);
+    setCopied(true);
+    toast.success(label ? `${label} copied` : "Copied to clipboard");
+    setTimeout(() => setCopied(false), 2000);
+  };
+  return (
+    <button
+      onClick={handleCopy}
+      className="flex items-center gap-1 px-2 py-1 text-xs text-gray-500 hover:text-gray-700 hover:bg-gray-100 rounded transition-colors"
+    >
+      {copied ? (
+        <Check className="w-3 h-3" />
+      ) : (
+        <Copy className="w-3 h-3" />
+      )}
+      {copied ? "Copied!" : "Copy"}
+    </button>
+  );
+}
 
 export function AsyncRequestDetail() {
   const { requestId } = useParams<{ requestId: string }>();
@@ -104,10 +102,12 @@ export function AsyncRequestDetail() {
     );
   }
 
-  const messages = parseRequestBody(request.body);
-  const responseContent = parseResponseBody(request.response_body);
   const status = request.status;
   const displayStatus = statusLabels[status] || status;
+  const inputJson = prettyJson(request.body);
+  const outputJson = request.response_body
+    ? prettyJson(request.response_body)
+    : null;
 
   return (
     <div className="py-4 px-6">
@@ -139,53 +139,38 @@ export function AsyncRequestDetail() {
         </div>
       </div>
 
-      {/* Grid layout matching batch details */}
+      {/* Grid layout */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         {/* Left column - Input/Output */}
         <div className="lg:col-span-2 space-y-6">
           {/* Input Card */}
           <Card className="p-0 gap-0 rounded-lg">
-            <CardHeader className="px-6 pt-5 pb-4">
+            <CardHeader className="flex w-full justify-between px-6 pt-5 pb-4">
               <CardTitle>Input</CardTitle>
+              <CopyButton text={inputJson} label="Input JSON" />
             </CardHeader>
             <CardContent className="px-6 pb-6 pt-0">
-              <div className="space-y-3">
-                {messages.map((msg, i) => (
-                  <div key={i}>
-                    <span
-                      className={`text-[10px] uppercase tracking-wide font-medium block mb-1 ${roleColors[msg.role] || "text-doubleword-neutral-600"}`}
-                    >
-                      {msg.role}
-                    </span>
-                    <p className="text-sm leading-relaxed whitespace-pre-wrap text-doubleword-text-primary">
-                      {msg.content}
-                    </p>
-                  </div>
-                ))}
+              <div className="rounded-lg overflow-hidden border border-doubleword-border">
+                <CodeBlock language="json">{inputJson}</CodeBlock>
               </div>
             </CardContent>
           </Card>
 
           {/* Output Card */}
           <Card className="p-0 gap-0 rounded-lg">
-            <CardHeader className="px-6 pt-5 pb-4">
+            <CardHeader className="flex w-full justify-between px-6 pt-5 pb-4">
               <CardTitle>Output</CardTitle>
+              {outputJson && (
+                <CopyButton text={outputJson} label="Output JSON" />
+              )}
             </CardHeader>
             <CardContent className="px-6 pb-6 pt-0">
-              {status === "completed" && responseContent ? (
-                <div>
-                  <span className="text-[10px] uppercase tracking-wide font-medium text-green-700 block mb-1">
-                    Assistant
-                  </span>
-                  <p className="text-sm leading-relaxed whitespace-pre-wrap text-doubleword-text-primary">
-                    {responseContent}
-                  </p>
+              {status === "completed" && outputJson ? (
+                <div className="rounded-lg overflow-hidden border border-doubleword-border">
+                  <CodeBlock language="json">{outputJson}</CodeBlock>
                 </div>
               ) : status === "failed" ? (
-                <div>
-                  <span className="text-[10px] uppercase tracking-wide font-medium text-red-700 block mb-1">
-                    Error
-                  </span>
+                <div className="rounded-lg border border-red-200 bg-red-50 p-4">
                   <p className="text-sm text-red-700">
                     {request.error || "Request failed"}
                   </p>
@@ -207,38 +192,36 @@ export function AsyncRequestDetail() {
               <CardTitle>Timeline</CardTitle>
             </CardHeader>
             <CardContent className="px-6 pb-6 pt-0">
-              <div className="space-y-4">
-                <div className="grid grid-cols-2 gap-4">
+              <div className="space-y-3">
+                <div>
+                  <p className="text-sm text-gray-600 mb-1">Created</p>
+                  <p className="text-sm font-medium">
+                    {formatTimestamp(request.created_at)}
+                  </p>
+                </div>
+                {request.completed_at && (
                   <div>
-                    <p className="text-sm text-gray-600 mb-1">Created</p>
+                    <p className="text-sm text-gray-600 mb-1">Completed</p>
                     <p className="text-sm font-medium">
-                      {formatTimestamp(request.created_at)}
+                      {formatTimestamp(request.completed_at)}
                     </p>
                   </div>
-                  {request.completed_at && (
-                    <div>
-                      <p className="text-sm text-gray-600 mb-1">Completed</p>
-                      <p className="text-sm font-medium">
-                        {formatTimestamp(request.completed_at)}
-                      </p>
-                    </div>
-                  )}
-                  {request.failed_at && (
-                    <div>
-                      <p className="text-sm text-gray-600 mb-1">Failed</p>
-                      <p className="text-sm font-medium">
-                        {formatTimestamp(request.failed_at)}
-                      </p>
-                    </div>
-                  )}
-                </div>
+                )}
+                {request.failed_at && (
+                  <div>
+                    <p className="text-sm text-gray-600 mb-1">Failed</p>
+                    <p className="text-sm font-medium">
+                      {formatTimestamp(request.failed_at)}
+                    </p>
+                  </div>
+                )}
                 {request.duration_ms != null && (
-                  <div className="border-t pt-4">
+                  <div className="border-t border-doubleword-border-light pt-3">
                     <div className="flex items-center gap-1 text-sm text-gray-600 mb-1">
                       <Clock className="w-3 h-3" />
                       Duration
                     </div>
-                    <p className="text-2xl font-bold text-doubleword-neutral-900">
+                    <p className="text-lg font-bold text-doubleword-neutral-900">
                       {formatDuration(request.duration_ms)}
                     </p>
                   </div>
@@ -254,67 +237,46 @@ export function AsyncRequestDetail() {
                 <CardTitle>Metrics</CardTitle>
               </CardHeader>
               <CardContent className="px-6 pb-6 pt-0">
-                <div className="space-y-6">
-                  {/* Token Usage */}
-                  {request.total_tokens != null && (
-                    <div>
-                      <h4 className="text-sm font-medium text-gray-900 mb-3">
-                        Token Usage
-                      </h4>
-                      <div className="grid grid-cols-2 gap-4">
-                        <div className="text-center p-3 rounded-lg">
-                          <p className="text-2xl font-bold">
-                            {(request.prompt_tokens ?? 0).toLocaleString()}
-                          </p>
-                          <p className="text-xs text-gray-600 mt-1">
-                            Prompt Tokens
-                          </p>
-                        </div>
-                        <div className="text-center p-3 rounded-lg">
-                          <p className="text-2xl font-bold">
-                            {(request.completion_tokens ?? 0).toLocaleString()}
-                          </p>
-                          <p className="text-xs text-gray-600 mt-1">
-                            Completion Tokens
-                          </p>
-                        </div>
-                        {request.reasoning_tokens != null &&
-                          request.reasoning_tokens > 0 && (
-                            <div className="text-center p-3 rounded-lg">
-                              <p className="text-2xl font-bold">
-                                {request.reasoning_tokens.toLocaleString()}
-                              </p>
-                              <p className="text-xs text-gray-600 mt-1">
-                                Reasoning Tokens
-                              </p>
-                            </div>
-                          )}
-                        <div className="text-center p-3 rounded-lg">
-                          <p className="text-2xl font-bold text-gray-900">
-                            {request.total_tokens.toLocaleString()}
-                          </p>
-                          <p className="text-xs text-gray-600 mt-1">
-                            Total Tokens
-                          </p>
-                        </div>
-                      </div>
+                <div className="space-y-2">
+                  {request.prompt_tokens != null && (
+                    <div className="flex justify-between text-sm">
+                      <span className="text-gray-600">Prompt</span>
+                      <span className="font-medium tabular-nums">
+                        {request.prompt_tokens.toLocaleString()}
+                      </span>
                     </div>
                   )}
-
-                  {/* Cost */}
-                  {request.total_cost != null && request.total_cost > 0 && (
-                    <div className="border-t pt-6">
-                      <h4 className="text-sm font-medium text-gray-900 mb-3">
-                        Cost
-                      </h4>
-                      <div className="p-4 rounded-lg text-center">
-                        <p className="text-3xl font-bold text-green-700">
-                          {formatCost(request.total_cost)}
-                        </p>
-                        <p className="text-xs text-gray-600 mt-1">
-                          Total Cost
-                        </p>
+                  {request.completion_tokens != null && (
+                    <div className="flex justify-between text-sm">
+                      <span className="text-gray-600">Completion</span>
+                      <span className="font-medium tabular-nums">
+                        {request.completion_tokens.toLocaleString()}
+                      </span>
+                    </div>
+                  )}
+                  {request.reasoning_tokens != null &&
+                    request.reasoning_tokens > 0 && (
+                      <div className="flex justify-between text-sm">
+                        <span className="text-gray-600">Reasoning</span>
+                        <span className="font-medium tabular-nums">
+                          {request.reasoning_tokens.toLocaleString()}
+                        </span>
                       </div>
+                    )}
+                  {request.total_tokens != null && (
+                    <div className="flex justify-between text-sm font-medium border-t border-doubleword-border-light pt-2 mt-2">
+                      <span>Total tokens</span>
+                      <span className="tabular-nums">
+                        {request.total_tokens.toLocaleString()}
+                      </span>
+                    </div>
+                  )}
+                  {request.total_cost != null && request.total_cost > 0 && (
+                    <div className="flex justify-between text-sm border-t border-doubleword-border-light pt-2 mt-2">
+                      <span className="text-gray-600">Cost</span>
+                      <span className="font-medium text-green-700">
+                        {formatCost(request.total_cost)}
+                      </span>
                     </div>
                   )}
                 </div>
@@ -336,10 +298,12 @@ export function AsyncRequestDetail() {
                   </span>
                 </div>
                 <div>
-                  <p className="text-sm text-gray-600 mb-1">Completion Window</p>
+                  <p className="text-sm text-gray-600 mb-1">
+                    Completion Window
+                  </p>
                   <p className="font-medium">{request.completion_window}</p>
                 </div>
-                <div className="border-t pt-4">
+                <div className="border-t border-doubleword-border-light pt-4">
                   <Link
                     to={`/batches/${request.batch_id}`}
                     className="text-sm text-doubleword-neutral-600 hover:text-doubleword-neutral-900 hover:underline"
