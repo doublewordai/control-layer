@@ -7,6 +7,7 @@ import { DataTable } from "../../ui/data-table";
 import { useAsyncRequests } from "../../../api/control-layer/hooks";
 import type { AsyncRequest } from "../../../api/control-layer/types";
 import { CreateAsyncModal } from "../../modals/CreateAsyncModal/CreateAsyncModal";
+import { ApiExamples } from "../../modals";
 import { useBootstrapContent } from "../../../hooks/use-bootstrap-content";
 import { cn } from "../../../lib/utils";
 
@@ -114,6 +115,7 @@ const columns: ColumnDef<AsyncRequest>[] = [
 export function AsyncRequests() {
   const navigate = useNavigate();
   const [createModalOpen, setCreateModalOpen] = useState(false);
+  const [showApiExamples, setShowApiExamples] = useState(false);
   const bootstrapBanner = useBootstrapContent();
   const { data, isLoading } = useAsyncRequests({
     completion_window: "1h",
@@ -130,7 +132,7 @@ export function AsyncRequests() {
       <div className="mb-6 flex items-center justify-between">
         <h1 className="text-3xl font-bold">Async</h1>
         <div className="flex gap-2">
-          <Button variant="outline" onClick={() => {}}>
+          <Button variant="outline" onClick={() => setShowApiExamples(true)}>
             <Code className="mr-2 h-4 w-4" />
             API
           </Button>
@@ -167,6 +169,12 @@ export function AsyncRequests() {
         isOpen={createModalOpen}
         onClose={() => setCreateModalOpen(false)}
         onSuccess={() => setCreateModalOpen(false)}
+      />
+
+      <ApiExamples
+        isOpen={showApiExamples}
+        onClose={() => setShowApiExamples(false)}
+        model={null}
       />
     </div>
   );
