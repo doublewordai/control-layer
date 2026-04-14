@@ -379,108 +379,6 @@ const BatchInfo: React.FC = () => {
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
             {/* Main Content */}
             <div className="lg:col-span-2 space-y-6">
-              {/* Associated Files Card */}
-              <Card className="p-0 gap-0 rounded-lg">
-                <CardHeader className="px-6 pt-5 pb-4">
-                  <CardTitle>Associated Files</CardTitle>
-                </CardHeader>
-                <CardContent className="px-6 pb-6 pt-0">
-                  <div className="space-y-2">
-                    {batch.input_file_id ? (
-                      <div className="flex items-center gap-2 p-2 bg-gray-50 rounded">
-                        <FileInput className="w-4 h-4 text-gray-600" />
-                        <div className="flex-1 min-w-0">
-                          <p className="text-sm font-medium text-gray-700">
-                            Input File
-                          </p>
-                          <p className="text-xs text-gray-500 font-mono truncate">
-                            {batch.input_file_id}
-                          </p>
-                        </div>
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          onClick={() =>
-                            navigate(
-                              `/batches/files/${batch.input_file_id}/content?from=/batches/${batchId}`,
-                            )
-                          }
-                          className="shrink-0"
-                        >
-                          View
-                        </Button>
-                      </div>
-                    ) : (
-                      <div className="flex items-center gap-2 p-2 bg-gray-100 rounded">
-                        <FileInput className="w-4 h-4 text-gray-400" />
-                        <div className="flex-1 min-w-0">
-                          <p className="text-sm font-medium text-gray-500">
-                            Input File
-                          </p>
-                          <p className="text-xs text-gray-400">
-                            Source file has been deleted
-                          </p>
-                        </div>
-                      </div>
-                    )}
-
-                    {batch.output_file_id &&
-                      batch.request_counts.completed > 0 && (
-                        <div className="flex items-center gap-2 p-2 bg-green-50 rounded">
-                          <FileCheck className="w-4 h-4 text-green-600" />
-                          <div className="flex-1 min-w-0">
-                            <p className="text-sm font-medium text-gray-700">
-                              Output File
-                            </p>
-                            <p className="text-xs text-gray-500 font-mono truncate">
-                              {batch.output_file_id}
-                            </p>
-                          </div>
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            onClick={() =>
-                              navigate(
-                                `/batches/files/${batch.output_file_id}/content?from=/batches/${batchId}`,
-                              )
-                            }
-                            className="shrink-0"
-                          >
-                            View
-                          </Button>
-                        </div>
-                      )}
-
-                    {batch.error_file_id &&
-                      batch.request_counts.failed > 0 && (
-                        <div className="flex items-center gap-2 p-2 bg-red-50 rounded">
-                          <AlertCircle className="w-4 h-4 text-red-600" />
-                          <div className="flex-1 min-w-0">
-                            <p className="text-sm font-medium text-gray-700">
-                              Error File
-                            </p>
-                            <p className="text-xs text-gray-500 font-mono truncate">
-                              {batch.error_file_id}
-                            </p>
-                          </div>
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            onClick={() =>
-                              navigate(
-                                `/batches/files/${batch.error_file_id}/content?from=/batches/${batchId}`,
-                              )
-                            }
-                            className="shrink-0"
-                          >
-                            View
-                          </Button>
-                        </div>
-                      )}
-                  </div>
-                </CardContent>
-              </Card>
-
               {/* Progress Card - hide when queued or in terminal states */}
               {!isQueued &&
                 batch.status !== "validating" &&
@@ -590,6 +488,55 @@ const BatchInfo: React.FC = () => {
                     </CardContent>
                   </Card>
                 )}
+
+              {/* Associated Files Card */}
+              <Card className="p-0 gap-0 rounded-lg">
+                <CardHeader className="px-6 pt-5 pb-4">
+                  <CardTitle>Associated Files</CardTitle>
+                </CardHeader>
+                <CardContent className="px-6 pb-6 pt-0">
+                  <div className="space-y-2">
+                    {batch.input_file_id ? (
+                      <div className="flex items-center gap-2 p-2 bg-gray-50 rounded">
+                        <FileInput className="w-4 h-4 text-gray-600" />
+                        <div className="flex-1 min-w-0">
+                          <p className="text-sm font-medium text-gray-700">Input File</p>
+                          <p className="text-xs text-gray-500 font-mono truncate">{batch.input_file_id}</p>
+                        </div>
+                        <Button variant="ghost" size="sm" onClick={() => navigate(`/batches/files/${batch.input_file_id}/content?from=/batches/${batchId}`)} className="shrink-0">View</Button>
+                      </div>
+                    ) : (
+                      <div className="flex items-center gap-2 p-2 bg-gray-100 rounded">
+                        <FileInput className="w-4 h-4 text-gray-400" />
+                        <div className="flex-1 min-w-0">
+                          <p className="text-sm font-medium text-gray-500">Input File</p>
+                          <p className="text-xs text-gray-400">Source file has been deleted</p>
+                        </div>
+                      </div>
+                    )}
+                    {batch.output_file_id && batch.request_counts.completed > 0 && (
+                      <div className="flex items-center gap-2 p-2 bg-green-50 rounded">
+                        <FileCheck className="w-4 h-4 text-green-600" />
+                        <div className="flex-1 min-w-0">
+                          <p className="text-sm font-medium text-gray-700">Output File</p>
+                          <p className="text-xs text-gray-500 font-mono truncate">{batch.output_file_id}</p>
+                        </div>
+                        <Button variant="ghost" size="sm" onClick={() => navigate(`/batches/files/${batch.output_file_id}/content?from=/batches/${batchId}`)} className="shrink-0">View</Button>
+                      </div>
+                    )}
+                    {batch.error_file_id && batch.request_counts.failed > 0 && (
+                      <div className="flex items-center gap-2 p-2 bg-red-50 rounded">
+                        <AlertCircle className="w-4 h-4 text-red-600" />
+                        <div className="flex-1 min-w-0">
+                          <p className="text-sm font-medium text-gray-700">Error File</p>
+                          <p className="text-xs text-gray-500 font-mono truncate">{batch.error_file_id}</p>
+                        </div>
+                        <Button variant="ghost" size="sm" onClick={() => navigate(`/batches/files/${batch.error_file_id}/content?from=/batches/${batchId}`)} className="shrink-0">View</Button>
+                      </div>
+                    )}
+                  </div>
+                </CardContent>
+              </Card>
 
               {/* Retry Failed Requests */}
               {batch &&
@@ -724,31 +671,13 @@ const BatchInfo: React.FC = () => {
                   <CardTitle>Timeline</CardTitle>
                 </CardHeader>
                 <CardContent className="px-6 pb-6 pt-0">
-                  <div className="space-y-4">
+                  <div className="space-y-3">
                     <div>
                       <p className="text-sm text-gray-600 mb-1">Created</p>
                       <p className="text-sm font-medium">
                         {formatTimestamp(batch.created_at)}
                       </p>
                     </div>
-
-                    {batch.in_progress_at && (
-                      <div>
-                        <p className="text-sm text-gray-600 mb-1">Started</p>
-                        <p className="text-sm font-medium">
-                          {formatTimestamp(batch.in_progress_at)}
-                        </p>
-                      </div>
-                    )}
-
-                    {batch.finalizing_at && (
-                      <div>
-                        <p className="text-sm text-gray-600 mb-1">Finalizing</p>
-                        <p className="text-sm font-medium">
-                          {formatTimestamp(batch.finalizing_at)}
-                        </p>
-                      </div>
-                    )}
 
                     {batch.completed_at && (
                       <div>
@@ -768,37 +697,8 @@ const BatchInfo: React.FC = () => {
                       </div>
                     )}
 
-                    {batch.cancelled_at && (
-                      <div>
-                        <p className="text-sm text-gray-600 mb-1">Cancelled</p>
-                        <p className="text-sm font-medium">
-                          {formatTimestamp(batch.cancelled_at)}
-                        </p>
-                      </div>
-                    )}
-
-                    {/* TODO: Enable when backend expiration enforcement is implemented */}
-                    {/* {batch.expired_at && (
-                      <div>
-                        <p className="text-sm text-gray-600 mb-1">Expired</p>
-                        <p className="text-sm font-medium">
-                          {formatTimestamp(batch.expired_at)}
-                        </p>
-                      </div>
-                    )}
-
-                    {batch.expires_at && !batch.expired_at && (
-                      <div>
-                        <p className="text-sm text-gray-600 mb-1">Expires</p>
-                        <p className="text-sm font-medium">
-                          {formatTimestamp(batch.expires_at)}
-                        </p>
-                      </div>
-                    )} */}
-
-                    {/* Duration */}
                     {batch.in_progress_at && batch.completed_at && (
-                      <div className="border-t pt-4">
+                      <div className="border-t border-doubleword-border-light pt-3">
                         <p className="text-sm text-gray-600 mb-1">Duration</p>
                         <p className="text-sm font-medium">
                           {formatDuration(
@@ -808,25 +708,6 @@ const BatchInfo: React.FC = () => {
                         </p>
                       </div>
                     )}
-                    {/*
-                    {analytics && analytics.avg_ttfb_ms && (
-                      <div>
-                        <p className="text-sm text-gray-600 mb-1">Avg TTFB</p>
-                        <p className="text-sm font-medium">
-                          {analytics.avg_ttfb_ms.toFixed(0)}ms
-                        </p>
-                      </div>
-                    )}
-
-                    {analytics && analytics.avg_duration_ms && (
-                      <div>
-                        <p className="text-sm text-gray-600 mb-1">Avg Duration</p>
-                        <p className="text-sm font-medium">
-                          {analytics.avg_duration_ms.toFixed(0)}ms
-                        </p>
-                      </div>
-                    )}
-                    */}
                   </div>
                 </CardContent>
               </Card>
