@@ -1,8 +1,9 @@
 import { useState } from "react";
 import { useParams, useNavigate, Link } from "react-router-dom";
-import { ArrowLeft, Copy, Check } from "lucide-react";
+import { ArrowLeft, Copy, Check, ChevronRight } from "lucide-react";
 import { useAsyncRequest } from "../../../api/control-layer/hooks";
 import { Card, CardContent, CardHeader, CardTitle } from "../../ui/card";
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "../../ui/collapsible";
 import { CodeBlock } from "../../ui/code-block";
 import { formatTimestamp } from "../../../utils";
 import { toast } from "sonner";
@@ -143,18 +144,25 @@ export function AsyncRequestDetail() {
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         {/* Left column - Input/Output */}
         <div className="lg:col-span-2 space-y-6">
-          {/* Input Card */}
-          <Card className="p-0 gap-0 rounded-lg">
-            <CardHeader className="flex w-full justify-between px-6 pt-5 pb-4">
-              <CardTitle>Input</CardTitle>
-              <CopyButton text={inputJson} label="Input JSON" />
-            </CardHeader>
-            <CardContent className="px-6 pb-6 pt-0">
-              <div className="rounded-lg overflow-hidden border border-doubleword-border">
-                <CodeBlock language="json" variant="light">{inputJson}</CodeBlock>
-              </div>
-            </CardContent>
-          </Card>
+          {/* Input Card — collapsed by default */}
+          <Collapsible defaultOpen={false}>
+            <Card className="p-0 gap-0 rounded-lg">
+              <CardHeader className="flex w-full justify-between px-6 pt-5 pb-4">
+                <CollapsibleTrigger className="flex items-center gap-2 group cursor-pointer">
+                  <ChevronRight className="w-4 h-4 text-gray-400 transition-transform group-data-[state=open]:rotate-90" />
+                  <CardTitle>Input</CardTitle>
+                </CollapsibleTrigger>
+                <CopyButton text={inputJson} label="Input JSON" />
+              </CardHeader>
+              <CollapsibleContent>
+                <CardContent className="px-6 pb-6 pt-0">
+                  <div className="rounded-lg overflow-hidden border border-doubleword-border">
+                    <CodeBlock language="json" variant="light">{inputJson}</CodeBlock>
+                  </div>
+                </CardContent>
+              </CollapsibleContent>
+            </Card>
+          </Collapsible>
 
           {/* Output Card */}
           <Card className="p-0 gap-0 rounded-lg">
