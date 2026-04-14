@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.38.0](https://github.com/doublewordai/control-layer/compare/v8.37.1...v8.38.0) (2026-04-14)
+
+
+### Features
+
+* connections role for gating feature ([#981](https://github.com/doublewordai/control-layer/issues/981)) ([5ce28e2](https://github.com/doublewordai/control-layer/commit/5ce28e212fa7a52299e4328451210079a4f30757))
+
 ## [8.37.1](https://github.com/doublewordai/control-layer/compare/v8.37.0...v8.37.1) (2026-04-13)
 
 
