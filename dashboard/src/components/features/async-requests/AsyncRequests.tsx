@@ -1,11 +1,23 @@
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { Code, Play, X } from "lucide-react";
+import { Code, Play, X, Filter } from "lucide-react";
 import { type ColumnDef } from "@tanstack/react-table";
 import { Button } from "../../ui/button";
 import { DataTable } from "../../ui/data-table";
+import { Switch } from "../../ui/switch";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "../../ui/select";
+import { DateTimeRangeSelector } from "../../ui/date-time-range-selector";
 import { useAsyncRequests } from "../../../api/control-layer/hooks";
-import type { AsyncRequest } from "../../../api/control-layer/types";
+import type {
+  AsyncRequest,
+  AsyncRequestStatus,
+} from "../../../api/control-layer/types";
 import { CreateAsyncModal } from "../../modals/CreateAsyncModal/CreateAsyncModal";
 import { ApiExamples } from "../../modals";
 import { useBootstrapContent } from "../../../hooks/use-bootstrap-content";
@@ -34,6 +46,16 @@ function formatDuration(ms: number | null): string {
   const minutes = Math.floor(seconds / 60);
   const remainingSeconds = seconds % 60;
   return `${minutes}m ${remainingSeconds}s`;
+}
+
+function formatTokens(
+  prompt: number | null,
+  completion: number | null,
+): string {
+  if (prompt == null && completion == null) return "—";
+  const p = prompt?.toLocaleString() ?? "—";
+  const c = completion?.toLocaleString() ?? "—";
+  return `${p} / ${c}`;
 }
 
 const columns: ColumnDef<AsyncRequest>[] = [
@@ -79,20 +101,14 @@ const columns: ColumnDef<AsyncRequest>[] = [
   {
     id: "tokens",
     header: "Tokens",
-    cell: ({ row }) => {
-      if (row.original.status !== "completed")
-        return <span className="text-gray-600">—</span>;
-      return <span className="text-gray-500">—</span>;
-    },
-  },
-  {
-    id: "cost",
-    header: "Cost",
-    cell: ({ row }) => {
-      if (row.original.status !== "completed")
-        return <span className="text-gray-600">—</span>;
-      return <span className="text-gray-500">—</span>;
-    },
+    cell: ({ row }) => (
+      <span className="text-gray-500 text-xs tabular-nums">
+        {formatTokens(
+          row.original.prompt_tokens,
+          row.original.completion_tokens,
+        )}
+      </span>
+    ),
   },
   {
     id: "duration",
@@ -117,10 +133,24 @@ export function AsyncRequests() {
   const [createModalOpen, setCreateModalOpen] = useState(false);
   const [showApiExamples, setShowApiExamples] = useState(false);
   const bootstrapBanner = useBootstrapContent();
+
+  // Filters
+  const [statusFilter, setStatusFilter] = useState<
+    AsyncRequestStatus | "all"
+  >("all");
+  const [sortActiveFirst, setSortActiveFirst] = useState(true);
+  const [dateRange, setDateRange] = useState<
+    { from: Date; to: Date } | undefined
+  >(undefined);
+  const [pageSize, setPageSize] = useState(20);
+
   const { data, isLoading } = useAsyncRequests({
     completion_window: "1h",
-    active_first: true,
-    limit: 50,
+    active_first: sortActiveFirst || undefined,
+    status: statusFilter !== "all" ? statusFilter : undefined,
+    created_after: dateRange?.from.toISOString(),
+    created_before: dateRange?.to.toISOString(),
+    limit: pageSize,
   });
 
   const requests = data?.data ?? [];
@@ -130,7 +160,12 @@ export function AsyncRequests() {
   return (
     <div className="py-4 px-6">
       <div className="mb-6 flex items-center justify-between">
-        <h1 className="text-3xl font-bold">Async</h1>
+        <div>
+          <h1 className="text-3xl font-bold">Async</h1>
+          <p className="text-neutral-600 mt-1">
+            View and manage async requests
+          </p>
+        </div>
         <div className="flex gap-2">
           <Button variant="outline" onClick={() => setShowApiExamples(true)}>
             <Code className="mr-2 h-4 w-4" />
@@ -163,6 +198,63 @@ export function AsyncRequests() {
         data={requests}
         isLoading={isLoading}
         onRowClick={(row) => navigate(`/async/${row.id}`)}
+        pageSize={pageSize}
+        minRows={pageSize}
+        rowHeight="40px"
+        headerActions={
+          <div className="flex items-center gap-2 flex-wrap">
+            <div className="flex items-center gap-1.5">
+              <Switch
+                id="active-first-async"
+                checked={sortActiveFirst}
+                onCheckedChange={setSortActiveFirst}
+              />
+              <label
+                htmlFor="active-first-async"
+                className="text-sm text-gray-600 cursor-pointer select-none"
+              >
+                Active first
+              </label>
+            </div>
+            <Select
+              value={statusFilter}
+              onValueChange={(v) =>
+                setStatusFilter(v as AsyncRequestStatus | "all")
+              }
+            >
+              <SelectTrigger className="w-[140px] h-9">
+                <div className="flex items-center gap-1.5">
+                  <Filter className="w-3.5 h-3.5 text-gray-500" />
+                  <SelectValue />
+                </div>
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">All statuses</SelectItem>
+                <SelectItem value="pending">Queued</SelectItem>
+                <SelectItem value="processing">Running</SelectItem>
+                <SelectItem value="completed">Completed</SelectItem>
+                <SelectItem value="failed">Failed</SelectItem>
+                <SelectItem value="canceled">Cancelled</SelectItem>
+              </SelectContent>
+            </Select>
+            <DateTimeRangeSelector value={dateRange} onChange={setDateRange} />
+            <span className="text-sm text-gray-600">Rows:</span>
+            <Select
+              value={pageSize.toString()}
+              onValueChange={(v) => setPageSize(Number(v))}
+            >
+              <SelectTrigger className="w-20 h-9">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="10">10</SelectItem>
+                <SelectItem value="20">20</SelectItem>
+                <SelectItem value="50">50</SelectItem>
+                <SelectItem value="100">100</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+        }
       />
 
       <CreateAsyncModal

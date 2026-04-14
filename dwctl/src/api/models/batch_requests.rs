@@ -22,6 +22,15 @@ pub struct ListBatchRequestsQuery {
     /// Filter by model
     pub model: Option<String>,
 
+    /// Filter by batch creator (user ID or org ID)
+    pub member_id: Option<uuid::Uuid>,
+
+    /// Filter to requests created after this timestamp
+    pub created_after: Option<DateTime<Utc>>,
+
+    /// Filter to requests created before this timestamp
+    pub created_before: Option<DateTime<Utc>>,
+
     /// Sort active requests first (default: true)
     pub active_first: Option<bool>,
 }
@@ -39,6 +48,8 @@ pub struct BatchRequestSummary {
     pub failed_at: Option<DateTime<Utc>>,
     pub duration_ms: Option<f64>,
     pub response_status: Option<i16>,
+    pub prompt_tokens: Option<i64>,
+    pub completion_tokens: Option<i64>,
 }
 
 /// Full batch request detail including input/output

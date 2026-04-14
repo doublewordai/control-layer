@@ -1612,6 +1612,8 @@ export interface AsyncRequest {
   failed_at: string | null;
   duration_ms: number | null;
   response_status: number | null;
+  prompt_tokens: number | null;
+  completion_tokens: number | null;
 }
 
 export interface AsyncRequestDetail extends AsyncRequest {
@@ -1628,5 +1630,8 @@ export interface AsyncRequestsListQuery {
   completion_window?: string;
   status?: string;
   model?: string;
+  member_id?: string;
+  created_after?: string;
+  created_before?: string;
   active_first?: boolean;
 }

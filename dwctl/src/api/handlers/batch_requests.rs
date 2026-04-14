@@ -64,11 +64,12 @@ pub async fn list_batch_requests<P: PoolProvider>(
     let can_read_all = can_read_all_resources(&current_user, Resource::Batches);
     let active_first = query.active_first.unwrap_or(true);
 
-    // Build ownership filter
-    let created_by_filter: Option<String> = if can_read_all {
+    // Build ownership filter — member_id overrides for PMs, otherwise own batches
+    let created_by_filter: Option<String> = if let Some(member_id) = query.member_id {
+        Some(member_id.to_string())
+    } else if can_read_all {
         None
     } else {
-        // Filter to batches owned by this user or their active org
         Some(
             current_user
                 .active_organization
@@ -90,12 +91,16 @@ pub async fn list_batch_requests<P: PoolProvider>(
           AND ($2::text IS NULL OR b.completion_window = $2)
           AND ($3::text IS NULL OR r.state = $3)
           AND ($4::text IS NULL OR r.model = $4)
+          AND ($5::timestamptz IS NULL OR r.created_at >= $5)
+          AND ($6::timestamptz IS NULL OR r.created_at <= $6)
         "#,
     )
     .bind(created_by_filter.as_deref())
     .bind(query.completion_window.as_deref())
     .bind(query.status.as_deref())
     .bind(query.model.as_deref())
+    .bind(query.created_after)
+    .bind(query.created_before)
     .fetch_one(pool)
     .await
     .map_err(|e| Error::Database(e.into()))?;
@@ -122,7 +127,9 @@ pub async fn list_batch_requests<P: PoolProvider>(
                     THEN EXTRACT(EPOCH FROM (r.completed_at - r.started_at)) * 1000
                     ELSE NULL
                 END)::float8 as duration_ms,
-                r.response_status
+                r.response_status,
+                (r.response_body::jsonb -> 'usage' ->> 'prompt_tokens')::bigint as prompt_tokens,
+                (r.response_body::jsonb -> 'usage' ->> 'completion_tokens')::bigint as completion_tokens
             FROM fusillade.requests r
             JOIN fusillade.batches b ON r.batch_id = b.id
             WHERE b.deleted_at IS NULL
@@ -130,14 +137,18 @@ pub async fn list_batch_requests<P: PoolProvider>(
               AND ($2::text IS NULL OR b.completion_window = $2)
               AND ($3::text IS NULL OR r.state = $3)
               AND ($4::text IS NULL OR r.model = $4)
+              AND ($5::timestamptz IS NULL OR r.created_at >= $5)
+              AND ($6::timestamptz IS NULL OR r.created_at <= $6)
             ORDER BY {order_clause}
-            LIMIT $5 OFFSET $6
+            LIMIT $7 OFFSET $8
             "#
     ))
     .bind(created_by_filter.as_deref())
     .bind(query.completion_window.as_deref())
     .bind(query.status.as_deref())
     .bind(query.model.as_deref())
+    .bind(query.created_after)
+    .bind(query.created_before)
     .bind(limit)
     .bind(skip)
     .fetch_all(pool)

@@ -2119,6 +2119,11 @@ const asyncRequestsApi = {
       params.set("completion_window", options.completion_window);
     if (options?.status) params.set("status", options.status);
     if (options?.model) params.set("model", options.model);
+    if (options?.member_id) params.set("member_id", options.member_id);
+    if (options?.created_after)
+      params.set("created_after", options.created_after);
+    if (options?.created_before)
+      params.set("created_before", options.created_before);
     if (options?.active_first !== undefined)
       params.set("active_first", options.active_first.toString());
 
