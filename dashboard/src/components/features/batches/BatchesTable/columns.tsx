@@ -11,6 +11,8 @@ import {
   FileCheck,
   Eye,
   Trash2,
+  Box,
+  Zap,
 } from "lucide-react";
 import { Button } from "../../../ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "../../../ui/tooltip";
@@ -30,6 +32,8 @@ interface ColumnActions {
   onRowClick?: (batch: Batch) => void;
   /** Show the User column (PlatformManagers or org context) */
   showUserColumn?: boolean;
+  /** Show the Type column (hidden when "Batch only" filter is on) */
+  showTypeColumn?: boolean;
 }
 
 const getStatusIcon = (status: BatchStatus) => {
@@ -120,19 +124,34 @@ export const createBatchColumns = (
     },
   },
   ...(actions.showUserColumn ? [userColumn] : []),
-  {
-    id: "type",
-    header: "Type",
-    cell: ({ row }) => {
-      const batch = row.original as Batch;
-      const isAsync = batch.completion_window === "1h";
-      return (
-        <span className="text-sm text-doubleword-neutral-900">
-          {isAsync ? "async" : "batch"}
-        </span>
-      );
-    },
-  },
+  ...(actions.showTypeColumn !== false
+    ? [
+        {
+          id: "type",
+          header: "Type",
+          cell: ({ row }: { row: { original: Batch } }) => {
+            const batch = row.original;
+            const isAsync = batch.completion_window === "1h";
+            return (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <span className="inline-flex text-doubleword-neutral-600">
+                    {isAsync ? (
+                      <Zap className="h-4 w-4" />
+                    ) : (
+                      <Box className="h-4 w-4" />
+                    )}
+                  </span>
+                </TooltipTrigger>
+                <TooltipContent side="top">
+                  {isAsync ? "Async" : "Batch"}
+                </TooltipContent>
+              </Tooltip>
+            );
+          },
+        } as ColumnDef<Batch>,
+      ]
+    : []),
   {
     accessorKey: "completion_window",
     header: "Completion Window",

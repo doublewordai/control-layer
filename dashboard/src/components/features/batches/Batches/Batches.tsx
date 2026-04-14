@@ -531,6 +531,7 @@ export function Batches({
     getInputFile,
     onRowClick: handleBatchClick,
     showUserColumn,
+    showTypeColumn: !hideAsync,
   });
 
   // Searchable member filter combobox - shared between batches and files tabs
