@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { Code, Play, X, Filter, Clock, DollarSign } from "lucide-react";
+import { Code, Play, X, Filter, Clock, DollarSign, Check, ChevronsUpDown } from "lucide-react";
 import { type ColumnDef } from "@tanstack/react-table";
 import { Button } from "../../ui/button";
 import { DataTable } from "../../ui/data-table";
@@ -19,7 +19,15 @@ import {
 } from "../../ui/select";
 import { DateTimeRangeSelector } from "../../ui/date-time-range-selector";
 import { Popover, PopoverContent, PopoverTrigger } from "../../ui/popover";
-import { Checkbox } from "../../ui/checkbox";
+import {
+  Command,
+  CommandEmpty,
+  CommandGroup,
+  CommandInput,
+  CommandItem,
+  CommandList,
+} from "../../ui/command";
+import { cn } from "../../../lib/utils";
 import { useAsyncRequests, useModels } from "../../../api/control-layer/hooks";
 import { useAuthorization } from "../../../utils/authorization";
 import type {
@@ -77,7 +85,10 @@ const userColumn: ColumnDef<AsyncRequest> = {
   },
 };
 
-function createColumns(showUserColumn: boolean): ColumnDef<AsyncRequest>[] {
+function createColumns(
+  showUserColumn: boolean,
+  modelDisplayNames?: Map<string, string>,
+): ColumnDef<AsyncRequest>[] {
   return [
   {
     accessorKey: "created_at",
@@ -97,7 +108,7 @@ function createColumns(showUserColumn: boolean): ColumnDef<AsyncRequest>[] {
     header: "Model",
     cell: ({ row }) => (
       <span className="text-sm text-doubleword-neutral-900 truncate max-w-[160px] block">
-        {row.getValue("model")}
+        {modelDisplayNames?.get(row.getValue("model") as string) || row.getValue("model")}
       </span>
     ),
   },
@@ -211,17 +222,18 @@ export function AsyncRequests() {
     { from: Date; to: Date } | undefined
   >(undefined);
 
-  // Models for filter
+  // Models for filter and display
   const { data: modelsData } = useModels({ accessible: true, limit: 100 });
-  const modelOptions = (modelsData?.data ?? []).map((m) => ({
-    value: m.alias,
-    label: m.alias,
-  }));
+  const allModels = modelsData?.data ?? [];
+  const modelDisplayNames = new Map(
+    allModels.map((m) => [m.alias, m.display_name || m.alias]),
+  );
+  const [modelPopoverOpen, setModelPopoverOpen] = useState(false);
 
   // Server-side offset pagination
   const pagination = useServerPagination({ defaultPageSize: 10 });
 
-  const columns = createColumns(isPlatformManager);
+  const columns = createColumns(isPlatformManager, modelDisplayNames);
 
   const { data, isLoading } = useAsyncRequests({
     completion_window: "1h",
@@ -332,53 +344,71 @@ export function AsyncRequests() {
                 <SelectItem value="canceled">Cancelled</SelectItem>
               </SelectContent>
             </Select>
-            <Popover>
+            <Popover open={modelPopoverOpen} onOpenChange={setModelPopoverOpen}>
               <PopoverTrigger asChild>
-                <Button variant="outline" className="h-9 gap-1.5">
-                  <Filter className="w-3.5 h-3.5 text-gray-500" />
-                  {modelFilter.length > 0
-                    ? `${modelFilter.length} model${modelFilter.length > 1 ? "s" : ""}`
-                    : "All models"}
+                <Button
+                  variant="outline"
+                  role="combobox"
+                  aria-expanded={modelPopoverOpen}
+                  className="h-9 justify-between font-normal"
+                >
+                  <div className="flex items-center gap-1.5 truncate">
+                    <Filter className="w-3.5 h-3.5 shrink-0 text-gray-500" />
+                    <span className="truncate">
+                      {modelFilter.length > 0
+                        ? modelFilter.map((m) => modelDisplayNames.get(m) || m).join(", ")
+                        : "All models"}
+                    </span>
+                  </div>
+                  <ChevronsUpDown className="ml-1 h-3.5 w-3.5 shrink-0 opacity-50" />
                 </Button>
               </PopoverTrigger>
-              <PopoverContent className="w-56 p-2" align="start">
-                <div className="space-y-1 max-h-48 overflow-y-auto">
-                  {modelOptions.map((m) => (
-                    <label
-                      key={m.value}
-                      className="flex items-center gap-2 px-2 py-1.5 rounded hover:bg-gray-50 cursor-pointer text-sm"
-                    >
-                      <Checkbox
-                        checked={modelFilter.includes(m.value)}
-                        onCheckedChange={(checked) => {
-                          setModelFilter((prev) =>
-                            checked
-                              ? [...prev, m.value]
-                              : prev.filter((v) => v !== m.value),
-                          );
+              <PopoverContent className="w-[280px] p-0" align="start">
+                <Command>
+                  <CommandInput placeholder="Search models..." />
+                  <CommandList>
+                    <CommandEmpty>No models found.</CommandEmpty>
+                    <CommandGroup>
+                      <CommandItem
+                        value="all-models"
+                        onSelect={() => {
+                          setModelFilter([]);
                           pagination.handleReset();
                         }}
-                      />
-                      {m.label}
-                    </label>
-                  ))}
-                  {modelOptions.length === 0 && (
-                    <p className="text-xs text-gray-500 px-2 py-1">
-                      No models available
-                    </p>
-                  )}
-                </div>
-                {modelFilter.length > 0 && (
-                  <button
-                    className="w-full text-xs text-gray-500 hover:text-gray-700 pt-2 mt-1 border-t"
-                    onClick={() => {
-                      setModelFilter([]);
-                      pagination.handleReset();
-                    }}
-                  >
-                    Clear all
-                  </button>
-                )}
+                      >
+                        <Check
+                          className={cn(
+                            "mr-2 h-4 w-4",
+                            modelFilter.length === 0 ? "opacity-100" : "opacity-0",
+                          )}
+                        />
+                        All models
+                      </CommandItem>
+                      {allModels.map((m) => (
+                        <CommandItem
+                          key={m.id}
+                          value={m.display_name || m.alias}
+                          onSelect={() => {
+                            setModelFilter((prev) =>
+                              prev.includes(m.alias)
+                                ? prev.filter((v) => v !== m.alias)
+                                : [...prev, m.alias],
+                            );
+                            pagination.handleReset();
+                          }}
+                        >
+                          <Check
+                            className={cn(
+                              "mr-2 h-4 w-4",
+                              modelFilter.includes(m.alias) ? "opacity-100" : "opacity-0",
+                            )}
+                          />
+                          {m.display_name || m.alias}
+                        </CommandItem>
+                      ))}
+                    </CommandGroup>
+                  </CommandList>
+                </Command>
               </PopoverContent>
             </Popover>
             <DateTimeRangeSelector
