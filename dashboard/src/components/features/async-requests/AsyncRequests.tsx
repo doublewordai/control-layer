@@ -8,18 +8,7 @@ import { useAsyncRequests } from "../../../api/control-layer/hooks";
 import type { AsyncRequest } from "../../../api/control-layer/types";
 import { CreateAsyncModal } from "../../modals/CreateAsyncModal/CreateAsyncModal";
 import { ApiExamples } from "../../modals";
-import { Combobox } from "../../ui/combobox";
-import { Label } from "../../ui/label";
-import {
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogTitle,
-  DialogDescription,
-} from "../../ui/dialog";
-import { useModels } from "../../../api/control-layer/hooks";
 import { useBootstrapContent } from "../../../hooks/use-bootstrap-content";
-import type { Model } from "../../../api/control-layer/types";
 import { cn } from "../../../lib/utils";
 
 const statusStyles: Record<string, string> = {
@@ -126,15 +115,8 @@ const columns: ColumnDef<AsyncRequest>[] = [
 export function AsyncRequests() {
   const navigate = useNavigate();
   const [createModalOpen, setCreateModalOpen] = useState(false);
-  const [showApiModelPicker, setShowApiModelPicker] = useState(false);
-  const [apiExamplesModel, setApiExamplesModel] = useState<Model | null>(null);
+  const [showApiExamples, setShowApiExamples] = useState(false);
   const bootstrapBanner = useBootstrapContent();
-  const { data: modelsData } = useModels({
-    accessible: true,
-    model_type: "CHAT",
-    limit: 100,
-  });
-  const models = modelsData?.data ?? [];
   const { data, isLoading } = useAsyncRequests({
     completion_window: "1h",
     active_first: true,
@@ -150,7 +132,7 @@ export function AsyncRequests() {
       <div className="mb-6 flex items-center justify-between">
         <h1 className="text-3xl font-bold">Async</h1>
         <div className="flex gap-2">
-          <Button variant="outline" onClick={() => setShowApiModelPicker(true)}>
+          <Button variant="outline" onClick={() => setShowApiExamples(true)}>
             <Code className="mr-2 h-4 w-4" />
             API
           </Button>
@@ -189,50 +171,10 @@ export function AsyncRequests() {
         onSuccess={() => setCreateModalOpen(false)}
       />
 
-      {/* Model picker for API examples */}
-      <Dialog
-        open={showApiModelPicker && !apiExamplesModel}
-        onOpenChange={(open) => {
-          if (!open) setShowApiModelPicker(false);
-        }}
-      >
-        <DialogContent className="sm:max-w-sm">
-          <DialogHeader>
-            <DialogTitle>API Examples</DialogTitle>
-            <DialogDescription>
-              Select a model to see API examples
-            </DialogDescription>
-          </DialogHeader>
-          <div className="space-y-2">
-            <Label>Model</Label>
-            <Combobox
-              options={models.map((m) => ({
-                value: m.id,
-                label: m.alias,
-                description:
-                  m.model_name !== m.alias ? m.model_name : undefined,
-              }))}
-              value=""
-              onValueChange={(id) => {
-                const selected = models.find((m) => m.id === id) || null;
-                setApiExamplesModel(selected);
-              }}
-              placeholder="Select a model..."
-              searchPlaceholder="Search models..."
-              emptyMessage="No models found."
-              className="w-full"
-            />
-          </div>
-        </DialogContent>
-      </Dialog>
-
       <ApiExamples
-        isOpen={!!apiExamplesModel}
-        onClose={() => {
-          setApiExamplesModel(null);
-          setShowApiModelPicker(false);
-        }}
-        model={apiExamplesModel}
+        isOpen={showApiExamples}
+        onClose={() => setShowApiExamples(false)}
+        defaultTab="async"
       />
     </div>
   );
