@@ -6,12 +6,8 @@ import {
   FileCheck,
   AlertCircle,
   Clock,
-  CheckCircle,
-  XCircle,
-  Ban,
   Loader2,
   RotateCcw,
-  Timer,
   ExternalLink,
   Info,
   List,
@@ -24,7 +20,6 @@ import {
   useRetryBatch,
 } from "../../../../api/control-layer/hooks";
 import { Card, CardContent, CardHeader, CardTitle } from "../../../ui/card";
-import { Badge } from "../../../ui/badge";
 import { Button } from "../../../ui/button";
 import { Skeleton } from "../../../ui/skeleton";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "../../../ui/tabs";
@@ -164,72 +159,32 @@ const BatchInfo: React.FC = () => {
     batch.request_counts.failed === 0;
 
   const getStatusBadge = (status: BatchStatus) => {
-    // Handle queued state
-    if (isQueued) {
-      return (
-        <Badge variant="secondary" className="flex items-center gap-1 w-fit">
-          <Clock className="w-3 h-3 text-gray-500" />
-          Queued
-        </Badge>
-      );
-    }
-
-    const statusConfig: Record<
-      BatchStatus,
-      {
-        label: string;
-        variant: "default" | "destructive" | "outline" | "secondary";
-        icon: React.ReactNode;
-      }
-    > = {
-      validating: {
-        label: "Validating",
-        variant: "secondary",
-        icon: <Loader2 className="w-3 h-3 animate-spin" />,
-      },
-      in_progress: {
-        label: "In Progress",
-        variant: "default",
-        icon: <Timer className="w-3 h-3" />,
-      },
-      finalizing: {
-        label: "Finalizing",
-        variant: "secondary",
-        icon: <Loader2 className="w-3 h-3 animate-spin" />,
-      },
-      completed: {
-        label: "Completed",
-        variant: "outline",
-        icon: <CheckCircle className="w-3 h-3 text-green-600" />,
-      },
-      failed: {
-        label: "Failed",
-        variant: "destructive",
-        icon: <XCircle className="w-3 h-3" />,
-      },
-      expired: {
-        label: "Expired",
-        variant: "outline",
-        icon: <Clock className="w-3 h-3 text-gray-500" />,
-      },
-      cancelling: {
-        label: "Cancelling",
-        variant: "secondary",
-        icon: <Loader2 className="w-3 h-3 animate-spin" />,
-      },
-      cancelled: {
-        label: "Cancelled",
-        variant: "outline",
-        icon: <Ban className="w-3 h-3 text-gray-500" />,
-      },
+    const statusColors: Record<string, string> = {
+      validating: "bg-yellow-100 text-yellow-800",
+      in_progress: "bg-blue-100 text-blue-800",
+      finalizing: "bg-blue-100 text-blue-800",
+      completed: "bg-green-100 text-green-800",
+      failed: "bg-red-100 text-red-800",
+      expired: "bg-orange-100 text-orange-800",
+      cancelling: "bg-gray-100 text-gray-800",
+      cancelled: "bg-gray-100 text-gray-800",
     };
 
-    const config = statusConfig[status];
+    const statusLabels: Record<string, string> = {
+      in_progress: "in progress",
+    };
+
+    const displayStatus = isQueued ? "queued" : (statusLabels[status] || status);
+    const colorClass = isQueued
+      ? "bg-gray-100 text-gray-700"
+      : (statusColors[status] || "bg-gray-100 text-gray-800");
+
     return (
-      <Badge variant={config.variant} className="flex items-center gap-1 w-fit">
-        {config.icon}
-        {config.label}
-      </Badge>
+      <span
+        className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${colorClass}`}
+      >
+        {displayStatus}
+      </span>
     );
   };
 
