@@ -18,7 +18,9 @@ import {
   SelectValue,
 } from "../../ui/select";
 import { DateTimeRangeSelector } from "../../ui/date-time-range-selector";
-import { useAsyncRequests } from "../../../api/control-layer/hooks";
+import { Combobox } from "../../ui/combobox";
+import { useAsyncRequests, useModels } from "../../../api/control-layer/hooks";
+import { useAuthorization } from "../../../utils/authorization";
 import type {
   AsyncRequest,
   AsyncRequestStatus,
@@ -60,7 +62,22 @@ function formatCost(cost: number): string {
   return `$${cost.toFixed(2)}`;
 }
 
-const columns: ColumnDef<AsyncRequest>[] = [
+const userColumn: ColumnDef<AsyncRequest> = {
+  id: "user",
+  header: "User",
+  cell: ({ row }) => {
+    const email = row.original.created_by_email;
+    if (!email) return <span className="text-sm text-doubleword-neutral-600">-</span>;
+    return (
+      <span className="text-sm text-gray-700 truncate max-w-[120px] block cursor-default" title={email}>
+        {email}
+      </span>
+    );
+  },
+};
+
+function createColumns(showUserColumn: boolean): ColumnDef<AsyncRequest>[] {
+  return [
   {
     accessorKey: "created_at",
     header: "Created",
@@ -73,6 +90,7 @@ const columns: ColumnDef<AsyncRequest>[] = [
       );
     },
   },
+  ...(showUserColumn ? [userColumn] : []),
   {
     accessorKey: "model",
     header: "Model",
@@ -172,29 +190,43 @@ const columns: ColumnDef<AsyncRequest>[] = [
     },
   },
 ];
+}
 
 export function AsyncRequests() {
   const navigate = useNavigate();
   const [createModalOpen, setCreateModalOpen] = useState(false);
   const [showApiExamples, setShowApiExamples] = useState(false);
   const bootstrapBanner = useBootstrapContent();
+  const { hasPermission } = useAuthorization();
+  const isPlatformManager = hasPermission("manage-models");
 
   // Filters
   const [statusFilter, setStatusFilter] = useState<
     AsyncRequestStatus | "all"
   >("all");
+  const [modelFilter, setModelFilter] = useState<string>("");
   const [sortActiveFirst, setSortActiveFirst] = useState(true);
   const [dateRange, setDateRange] = useState<
     { from: Date; to: Date } | undefined
   >(undefined);
 
+  // Models for filter
+  const { data: modelsData } = useModels({ accessible: true, limit: 100 });
+  const modelOptions = (modelsData?.data ?? []).map((m) => ({
+    value: m.alias,
+    label: m.alias,
+  }));
+
   // Server-side offset pagination
   const pagination = useServerPagination({ defaultPageSize: 10 });
+
+  const columns = createColumns(isPlatformManager);
 
   const { data, isLoading } = useAsyncRequests({
     completion_window: "1h",
     active_first: sortActiveFirst || undefined,
     status: statusFilter !== "all" ? statusFilter : undefined,
+    model: modelFilter || undefined,
     created_after: dateRange?.from.toISOString(),
     created_before: dateRange?.to.toISOString(),
     ...pagination.queryParams,
@@ -215,13 +247,13 @@ export function AsyncRequests() {
           </p>
         </div>
         <div className="flex items-center gap-2">
-          <Button variant="outline" onClick={() => setShowApiExamples(true)}>
-            <Code className="mr-2 h-4 w-4" />
-            API
-          </Button>
           <Button variant="outline" onClick={() => setCreateModalOpen(true)}>
             <Play className="w-4 h-4 mr-2" />
             Create Async
+          </Button>
+          <Button variant="outline" onClick={() => setShowApiExamples(true)}>
+            <Code className="h-4 w-4 text-blue-500" />
+            API
           </Button>
         </div>
       </div>
@@ -299,6 +331,19 @@ export function AsyncRequests() {
                 <SelectItem value="canceled">Cancelled</SelectItem>
               </SelectContent>
             </Select>
+            <Combobox
+              options={modelOptions}
+              value={modelFilter}
+              onValueChange={(v) => {
+                setModelFilter(v);
+                pagination.handleReset();
+              }}
+              placeholder="All models"
+              searchPlaceholder="Search models..."
+              emptyMessage="No models found."
+              className="w-[160px]"
+              allowClear
+            />
             <DateTimeRangeSelector
               value={dateRange}
               onChange={(range) => {

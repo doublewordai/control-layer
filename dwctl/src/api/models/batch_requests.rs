@@ -53,6 +53,7 @@ pub struct BatchRequestSummary {
     pub reasoning_tokens: Option<i64>,
     pub total_tokens: Option<i64>,
     pub total_cost: Option<f64>,
+    pub created_by_email: Option<String>,
 }
 
 /// Full batch request detail including input/output

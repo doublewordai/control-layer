@@ -132,10 +132,12 @@ pub async fn list_batch_requests<P: PoolProvider>(
                 ha.completion_tokens,
                 ha.reasoning_tokens,
                 ha.total_tokens,
-                ha.total_cost::float8 as total_cost
+                ha.total_cost::float8 as total_cost,
+                u.email as created_by_email
             FROM fusillade.requests r
             JOIN fusillade.batches b ON r.batch_id = b.id
             LEFT JOIN http_analytics ha ON ha.fusillade_request_id = r.id
+            LEFT JOIN users u ON u.id::text = b.created_by
             WHERE b.deleted_at IS NULL
               AND ($1::text IS NULL OR b.created_by = $1)
               AND ($2::text IS NULL OR b.completion_window = $2)

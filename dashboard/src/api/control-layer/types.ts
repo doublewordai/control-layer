@@ -1617,6 +1617,7 @@ export interface AsyncRequest {
   reasoning_tokens: number | null;
   total_tokens: number | null;
   total_cost: number | null;
+  created_by_email: string | null;
 }
 
 export interface AsyncRequestDetail extends AsyncRequest {
