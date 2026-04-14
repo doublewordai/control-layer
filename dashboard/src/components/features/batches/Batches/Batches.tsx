@@ -51,7 +51,6 @@ import {
 import { dwctlApi } from "../../../../api/control-layer/client";
 import type { FileObject, Batch } from "../types";
 import type {
-  BatchAnalytics,
   BatchStatus,
 } from "../../../../api/control-layer/types";
 import { useServerCursorPagination } from "../../../../hooks/useServerCursorPagination";
@@ -99,6 +98,7 @@ export function Batches({
   // Show User column for PlatformManagers (see all batches) or in org context (see org members)
   const isPlatformManager = userRoles.includes("PlatformManager");
   const showUserColumn = isPlatformManager || isOrgContext;
+  // Context and Source columns are used by the file table only
   const showContextColumn = isPlatformManager;
   const showSourceColumn = hasPermission("connections");
 
@@ -297,17 +297,6 @@ export function Batches({
 
     return result;
   }, [batches, batchFileFilter]);
-
-  // Create a map of batch ID to analytics for easy lookup (analytics are now embedded in batch response)
-  const batchAnalyticsMap = React.useMemo(() => {
-    const map = new Map<string, BatchAnalytics>();
-    batches.forEach((batch) => {
-      if (batch.analytics) {
-        map.set(batch.id, batch.analytics);
-      }
-    });
-    return map;
-  }, [batches]);
 
   // Prefetch next page for files - only if user has already started paginating
   useEffect(() => {
@@ -536,10 +525,7 @@ export function Batches({
     onViewFile: handleViewFileRequests,
     getInputFile,
     onRowClick: handleBatchClick,
-    batchAnalytics: batchAnalyticsMap,
     showUserColumn,
-    showContextColumn,
-    showSourceColumn,
   });
 
   // Searchable member filter combobox - shared between batches and files tabs
@@ -651,7 +637,7 @@ export function Batches({
           {/* Left: Title */}
           <div className="shrink-0">
             <h1 className="text-3xl font-bold text-doubleword-neutral-900">
-              {activeTab === "batches" ? "Batch Requests" : "Batch Files"}
+              {activeTab === "batches" ? "Batches" : "Batch Files"}
             </h1>
             <p className="text-doubleword-neutral-600 mt-1">
               {activeTab === "batches"
@@ -759,7 +745,6 @@ export function Batches({
             pageSize={batchesPagination.pageSize}
             minRows={batchesPagination.pageSize}
             rowHeight="40px"
-            initialColumnVisibility={{ id: false }}
             onRowClick={handleBatchClick}
             isLoading={batchesLoading}
             emptyState={
