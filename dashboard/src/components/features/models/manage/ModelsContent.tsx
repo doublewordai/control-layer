@@ -62,6 +62,7 @@ import {
 import { StatusRow } from "./StatusRow";
 import { Markdown } from "../../../ui/markdown";
 import { isBatchDenied, isPlaygroundDenied, isRealtimeDenied } from "../../../../utils/modelAccess";
+import { copyToClipboard } from "../../../../utils/clipboard";
 
 const COMPLETION_WINDOWS: Record<
   string,
@@ -86,12 +87,12 @@ const CopyableModelName: React.FC<{
     if (el) setTruncated(el.scrollWidth > el.clientWidth);
   }, []);
 
-  const handleCopy = (e: React.MouseEvent) => {
+  const handleCopy = async (e: React.MouseEvent) => {
     e.stopPropagation();
-    navigator.clipboard.writeText(alias).then(() => {
+    if (await copyToClipboard(alias)) {
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
-    });
+    }
   };
 
   const title = (
