@@ -156,7 +156,8 @@ export function CreateAsyncModal({
         // Build JSONL and upload as file
         const jsonl = buildJsonl();
         const blob = new Blob([jsonl], { type: "application/jsonl" });
-        const file = new File([blob], "async-requests.jsonl", {
+        const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+        const file = new File([blob], `async-requests-${timestamp}.jsonl`, {
           type: "application/jsonl",
         });
 
