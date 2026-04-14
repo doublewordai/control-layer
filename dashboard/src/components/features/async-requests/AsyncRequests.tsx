@@ -18,7 +18,8 @@ import {
   SelectValue,
 } from "../../ui/select";
 import { DateTimeRangeSelector } from "../../ui/date-time-range-selector";
-import { Combobox } from "../../ui/combobox";
+import { Popover, PopoverContent, PopoverTrigger } from "../../ui/popover";
+import { Checkbox } from "../../ui/checkbox";
 import { useAsyncRequests, useModels } from "../../../api/control-layer/hooks";
 import { useAuthorization } from "../../../utils/authorization";
 import type {
@@ -204,7 +205,7 @@ export function AsyncRequests() {
   const [statusFilter, setStatusFilter] = useState<
     AsyncRequestStatus | "all"
   >("all");
-  const [modelFilter, setModelFilter] = useState<string>("");
+  const [modelFilter, setModelFilter] = useState<string[]>([]);
   const [sortActiveFirst, setSortActiveFirst] = useState(true);
   const [dateRange, setDateRange] = useState<
     { from: Date; to: Date } | undefined
@@ -226,7 +227,7 @@ export function AsyncRequests() {
     completion_window: "1h",
     active_first: sortActiveFirst || undefined,
     status: statusFilter !== "all" ? statusFilter : undefined,
-    model: modelFilter || undefined,
+    model: modelFilter.length > 0 ? modelFilter.join(",") : undefined,
     created_after: dateRange?.from.toISOString(),
     created_before: dateRange?.to.toISOString(),
     ...pagination.queryParams,
@@ -252,7 +253,7 @@ export function AsyncRequests() {
             Create Async
           </Button>
           <Button variant="outline" onClick={() => setShowApiExamples(true)}>
-            <Code className="h-4 w-4 text-blue-500" />
+            <Code className="h-4 w-4" />
             API
           </Button>
         </div>
@@ -331,19 +332,55 @@ export function AsyncRequests() {
                 <SelectItem value="canceled">Cancelled</SelectItem>
               </SelectContent>
             </Select>
-            <Combobox
-              options={modelOptions}
-              value={modelFilter}
-              onValueChange={(v) => {
-                setModelFilter(v);
-                pagination.handleReset();
-              }}
-              placeholder="All models"
-              searchPlaceholder="Search models..."
-              emptyMessage="No models found."
-              className="w-[160px]"
-              allowClear
-            />
+            <Popover>
+              <PopoverTrigger asChild>
+                <Button variant="outline" className="h-9 gap-1.5">
+                  <Filter className="w-3.5 h-3.5 text-gray-500" />
+                  {modelFilter.length > 0
+                    ? `${modelFilter.length} model${modelFilter.length > 1 ? "s" : ""}`
+                    : "All models"}
+                </Button>
+              </PopoverTrigger>
+              <PopoverContent className="w-56 p-2" align="start">
+                <div className="space-y-1 max-h-48 overflow-y-auto">
+                  {modelOptions.map((m) => (
+                    <label
+                      key={m.value}
+                      className="flex items-center gap-2 px-2 py-1.5 rounded hover:bg-gray-50 cursor-pointer text-sm"
+                    >
+                      <Checkbox
+                        checked={modelFilter.includes(m.value)}
+                        onCheckedChange={(checked) => {
+                          setModelFilter((prev) =>
+                            checked
+                              ? [...prev, m.value]
+                              : prev.filter((v) => v !== m.value),
+                          );
+                          pagination.handleReset();
+                        }}
+                      />
+                      {m.label}
+                    </label>
+                  ))}
+                  {modelOptions.length === 0 && (
+                    <p className="text-xs text-gray-500 px-2 py-1">
+                      No models available
+                    </p>
+                  )}
+                </div>
+                {modelFilter.length > 0 && (
+                  <button
+                    className="w-full text-xs text-gray-500 hover:text-gray-700 pt-2 mt-1 border-t"
+                    onClick={() => {
+                      setModelFilter([]);
+                      pagination.handleReset();
+                    }}
+                  >
+                    Clear all
+                  </button>
+                )}
+              </PopoverContent>
+            </Popover>
             <DateTimeRangeSelector
               value={dateRange}
               onChange={(range) => {

@@ -78,6 +78,12 @@ pub async fn list_batch_requests<P: PoolProvider>(
         )
     };
 
+    // Parse comma-separated model filter into array for ANY() matching
+    let model_filter: Option<Vec<String>> = query
+        .model
+        .as_ref()
+        .map(|m| m.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect());
+
     let pool = state.db.read();
 
     // Count query
@@ -90,7 +96,7 @@ pub async fn list_batch_requests<P: PoolProvider>(
           AND ($1::text IS NULL OR b.created_by = $1)
           AND ($2::text IS NULL OR b.completion_window = $2)
           AND ($3::text IS NULL OR r.state = $3)
-          AND ($4::text IS NULL OR r.model = $4)
+          AND ($4::text[] IS NULL OR r.model = ANY($4))
           AND ($5::timestamptz IS NULL OR r.created_at >= $5)
           AND ($6::timestamptz IS NULL OR r.created_at <= $6)
         "#,
@@ -98,7 +104,7 @@ pub async fn list_batch_requests<P: PoolProvider>(
     .bind(created_by_filter.as_deref())
     .bind(query.completion_window.as_deref())
     .bind(query.status.as_deref())
-    .bind(query.model.as_deref())
+    .bind(model_filter.as_deref())
     .bind(query.created_after)
     .bind(query.created_before)
     .fetch_one(pool)
@@ -142,7 +148,7 @@ pub async fn list_batch_requests<P: PoolProvider>(
               AND ($1::text IS NULL OR b.created_by = $1)
               AND ($2::text IS NULL OR b.completion_window = $2)
               AND ($3::text IS NULL OR r.state = $3)
-              AND ($4::text IS NULL OR r.model = $4)
+              AND ($4::text[] IS NULL OR r.model = ANY($4))
               AND ($5::timestamptz IS NULL OR r.created_at >= $5)
               AND ($6::timestamptz IS NULL OR r.created_at <= $6)
             ORDER BY {order_clause}
@@ -152,7 +158,7 @@ pub async fn list_batch_requests<P: PoolProvider>(
     .bind(created_by_filter.as_deref())
     .bind(query.completion_window.as_deref())
     .bind(query.status.as_deref())
-    .bind(query.model.as_deref())
+    .bind(model_filter.as_deref())
     .bind(query.created_after)
     .bind(query.created_before)
     .bind(limit)
