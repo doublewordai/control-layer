@@ -1,4 +1,4 @@
-import { useState, useCallback, useMemo } from "react";
+import { useState, useCallback, useMemo, useEffect } from "react";
 import { AlertCircle, Upload } from "lucide-react";
 import {
   Dialog,
@@ -17,7 +17,9 @@ import {
   useCreateBatch,
   useUploadFileWithProgress,
   useModels,
+  useFiles,
 } from "../../../api/control-layer/hooks";
+import { useDebounce } from "../../../hooks/useDebounce";
 import { toast } from "sonner";
 import { useQueryClient } from "@tanstack/react-query";
 
@@ -40,7 +42,11 @@ export function CreateAsyncModal({
 
   // Upload state
   const [fileToUpload, setFileToUpload] = useState<File | null>(null);
+  const [selectedFileId, setSelectedFileId] = useState<string | null>(null);
   const [dragActive, setDragActive] = useState(false);
+  const [fileSearchQuery, setFileSearchQuery] = useState<string>("");
+  const debouncedFileSearch = useDebounce(fileSearchQuery, 300);
+  const [hasLoadedFiles, setHasLoadedFiles] = useState(false);
 
   // Shared state
   const [error, setError] = useState<string | null>(null);
@@ -48,6 +54,28 @@ export function CreateAsyncModal({
 
   const createBatchMutation = useCreateBatch();
   const uploadMutation = useUploadFileWithProgress();
+
+  // Fetch existing batch files for the upload tab
+  const { data: filesResponse } = useFiles({
+    purpose: "batch",
+    limit: 20,
+    search: debouncedFileSearch.trim() || undefined,
+    own: true,
+    enabled: isOpen && activeTab === "upload",
+  });
+  const availableFiles = filesResponse?.data || [];
+
+  useEffect(() => {
+    if (availableFiles.length > 0 && !hasLoadedFiles) {
+      setHasLoadedFiles(true);
+    }
+  }, [availableFiles.length, hasLoadedFiles]);
+
+  const fileOptions = availableFiles.map((file) => ({
+    value: file.id,
+    label: file.filename,
+  }));
+
   const { data: modelsData } = useModels({
     accessible: true,
     model_type: "CHAT",
@@ -121,20 +149,24 @@ export function CreateAsyncModal({
         });
         fileId = uploadedFile.id;
       } else {
-        if (!fileToUpload) {
-          setError("Please select a file");
+        if (selectedFileId) {
+          // Use existing file
+          fileId = selectedFileId;
+        } else if (fileToUpload) {
+          // Upload new file
+          const uploadedFile = await uploadMutation.mutateAsync({
+            data: {
+              file: fileToUpload,
+              purpose: "batch",
+            },
+            onProgress: () => {},
+          });
+          fileId = uploadedFile.id;
+        } else {
+          setError("Please select or upload a file");
           setIsSubmitting(false);
           return;
         }
-
-        const uploadedFile = await uploadMutation.mutateAsync({
-          data: {
-            file: fileToUpload,
-            purpose: "batch",
-          },
-          onProgress: () => {},
-        });
-        fileId = uploadedFile.id;
       }
 
       const endpoint = "/v1/chat/completions";
@@ -170,6 +202,9 @@ export function CreateAsyncModal({
     setModel("");
     setPrompts("");
     setFileToUpload(null);
+    setSelectedFileId(null);
+    setFileSearchQuery("");
+    setHasLoadedFiles(false);
     setError(null);
     setActiveTab("compose");
   };
@@ -250,7 +285,41 @@ export function CreateAsyncModal({
             </div>
           </TabsContent>
 
-          <TabsContent value="upload" className="mt-4">
+          <TabsContent value="upload" className="mt-4 space-y-4">
+            {/* Existing file picker */}
+            {(availableFiles.length > 0 || hasLoadedFiles) && (
+              <>
+                <div className="space-y-2">
+                  <Label>Select an existing file</Label>
+                  <Combobox
+                    options={fileOptions}
+                    value={selectedFileId || ""}
+                    onValueChange={(value) => {
+                      setSelectedFileId(value);
+                      setFileToUpload(null);
+                      setError(null);
+                    }}
+                    onSearchChange={setFileSearchQuery}
+                    placeholder="Select an existing file..."
+                    searchPlaceholder="Search files..."
+                    emptyMessage="No files found."
+                    className="w-full"
+                  />
+                </div>
+
+                <div className="relative py-1">
+                  <div className="absolute inset-0 flex items-center">
+                    <span className="w-full border-t" />
+                  </div>
+                  <div className="relative flex justify-center text-xs uppercase">
+                    <span className="bg-background px-2 text-muted-foreground">
+                      Or
+                    </span>
+                  </div>
+                </div>
+              </>
+            )}
+
             {/* Drop zone */}
             <div
               className={`border-2 border-dashed rounded-lg p-12 text-center cursor-pointer transition-colors ${
@@ -267,7 +336,10 @@ export function CreateAsyncModal({
                 setDragActive(false);
               }}
               onDragOver={(e) => e.preventDefault()}
-              onDrop={handleDrop}
+              onDrop={(e) => {
+                handleDrop(e);
+                setSelectedFileId(null);
+              }}
               onClick={() =>
                 document.getElementById("async-file-input")?.click()
               }
@@ -277,7 +349,10 @@ export function CreateAsyncModal({
                 type="file"
                 accept=".jsonl"
                 className="hidden"
-                onChange={handleFileChange}
+                onChange={(e) => {
+                  handleFileChange(e);
+                  setSelectedFileId(null);
+                }}
               />
               {fileToUpload ? (
                 <div className="space-y-1">
@@ -332,7 +407,7 @@ export function CreateAsyncModal({
                 disabled={
                   isSubmitting ||
                   (activeTab === "compose" && (requestCount === 0 || !model)) ||
-                  (activeTab === "upload" && !fileToUpload)
+                  (activeTab === "upload" && !fileToUpload && !selectedFileId)
                 }
               >
                 {isSubmitting ? "Creating..." : "Create"}

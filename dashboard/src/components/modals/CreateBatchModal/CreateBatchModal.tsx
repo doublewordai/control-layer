@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useCallback } from "react";
+import { useState, useEffect, useCallback } from "react";
 import {
   Play,
   AlertCircle,
@@ -20,13 +20,6 @@ import { Button } from "../../ui/button";
 import { Label } from "../../ui/label";
 import { Input } from "../../ui/input";
 import { Combobox } from "../../ui/combobox";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "../../ui/select";
 import {
   useCreateBatch,
   useFiles,
@@ -71,8 +64,7 @@ export function CreateBatchModal({
   );
   const [expirationSeconds, setExpirationSeconds] = useState<number>(2592000); // 30 days default
   const [endpoint, setEndpoint] = useState<string>("/v1/chat/completions");
-  const [completionWindow, setCompletionWindow] =
-    useState<string>("24h");
+  const completionWindow = "24h";
   const [description, setDescription] = useState<string>("");
   const [error, setError] = useState<string | null>(null);
   const [dragActive, setDragActive] = useState(false);
@@ -89,10 +81,6 @@ export function CreateBatchModal({
 
   // Fetch config to get available completion windows
   const { data: config } = useConfig();
-  const availableWindows = useMemo(
-    () => config?.batches?.allowed_completion_windows || ["24h"],
-    [config?.batches?.allowed_completion_windows],
-  );
 
 
   // Fetch available files for combobox (only input files with purpose "batch")
@@ -120,15 +108,6 @@ export function CreateBatchModal({
     completionWindow,
   );
 
-  // Update default when available windows change
-  useEffect(() => {
-    if (
-      availableWindows.length > 0 &&
-      !availableWindows.includes(completionWindow)
-    ) {
-      setCompletionWindow(availableWindows[0]);
-    }
-  }, [availableWindows, completionWindow]);
 
   // Detect endpoint from a JSONL text string (reads first request's url field)
   const detectEndpointFromJsonl = useCallback((text: string): string => {
@@ -324,7 +303,6 @@ export function CreateBatchModal({
       setSelectedFileId(null);
       setFileToUpload(null);
       setEndpoint("/v1/chat/completions");
-      setCompletionWindow(availableWindows[0] || "24h");
       setDescription("");
       setExpirationSeconds(2592000);
       setFilename("");
@@ -345,7 +323,6 @@ export function CreateBatchModal({
     setSelectedFileId(preselectedFile?.id || null);
     setFileToUpload(null);
     setEndpoint("/v1/chat/completions");
-    setCompletionWindow(availableWindows[0] || "24h");
     setDescription("");
     setExpirationSeconds(2592000);
     setFilename("");
@@ -627,29 +604,10 @@ export function CreateBatchModal({
               </p>
             </div>
 
-            {/* Priority Selection */}
-            <div className="space-y-2">
-              <Label htmlFor="completion-window">Priority</Label>
-              <Select
-                value={completionWindow}
-                onValueChange={setCompletionWindow}
-                disabled={isPending}
-              >
-                <SelectTrigger id="completion-window">
-                  <SelectValue>{completionWindow}</SelectValue>
-                </SelectTrigger>
-                <SelectContent>
-                  {availableWindows.map((window) => (
-                    <SelectItem key={window} value={window}>
-                      {window}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-              <p className="text-xs text-gray-500">
-                Select the maximum time allowed for batch completion
-              </p>
-            </div>
+            {/* Completion Window Note */}
+            <p className="text-xs text-muted-foreground">
+              Batches are submitted with a 24h completion window
+            </p>
 
             {/* Cost Estimate */}
             {(selectedFileId || fileToUpload) && (
