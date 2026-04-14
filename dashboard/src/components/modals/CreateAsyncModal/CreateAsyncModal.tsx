@@ -10,6 +10,7 @@ import {
 } from "../../ui/dialog";
 import { Button } from "../../ui/button";
 import { Label } from "../../ui/label";
+import { Input } from "../../ui/input";
 import { Textarea } from "../../ui/textarea";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "../../ui/tabs";
 import { Combobox } from "../../ui/combobox";
@@ -39,6 +40,8 @@ export function CreateAsyncModal({
   // Compose state
   const [model, setModel] = useState<string>("");
   const [prompts, setPrompts] = useState<string>("");
+  const [temperature, setTemperature] = useState<string>("0.7");
+  const [maxTokens, setMaxTokens] = useState<string>("4096");
 
   // Upload state
   const [fileToUpload, setFileToUpload] = useState<File | null>(null);
@@ -78,7 +81,6 @@ export function CreateAsyncModal({
 
   const { data: modelsData } = useModels({
     accessible: true,
-    model_type: "CHAT",
     limit: 100,
   });
   const queryClient = useQueryClient();
@@ -93,6 +95,11 @@ export function CreateAsyncModal({
     [modelsData?.data],
   );
 
+  const allModels = modelsData?.data ?? [];
+  const selectedModel = allModels.find((m) => m.alias === model);
+  const isEmbeddingsModel =
+    selectedModel?.model_type?.toUpperCase() === "EMBEDDINGS";
+
   const promptLines = prompts
     .split("\n")
     .filter((line) => line.trim().length > 0);
@@ -100,6 +107,17 @@ export function CreateAsyncModal({
 
   const buildJsonl = useCallback((): string => {
     const lines = promptLines.map((prompt, index) => {
+      if (isEmbeddingsModel) {
+        return JSON.stringify({
+          custom_id: `req-${index + 1}`,
+          method: "POST",
+          url: "/v1/embeddings",
+          body: {
+            model,
+            input: prompt.trim(),
+          },
+        });
+      }
       return JSON.stringify({
         custom_id: `req-${index + 1}`,
         method: "POST",
@@ -107,12 +125,14 @@ export function CreateAsyncModal({
         body: {
           model,
           messages: [{ role: "user", content: prompt.trim() }],
+          temperature: parseFloat(temperature) || 0.7,
+          max_tokens: parseInt(maxTokens) || 4096,
         },
       });
     });
 
     return lines.join("\n");
-  }, [promptLines, model]);
+  }, [promptLines, model, isEmbeddingsModel, temperature, maxTokens]);
 
   const handleSubmit = async () => {
     setError(null);
@@ -169,7 +189,9 @@ export function CreateAsyncModal({
         }
       }
 
-      const endpoint = "/v1/chat/completions";
+      const endpoint = isEmbeddingsModel
+        ? "/v1/embeddings"
+        : "/v1/chat/completions";
 
       await createBatchMutation.mutateAsync({
         input_file_id: fileId,
@@ -201,6 +223,8 @@ export function CreateAsyncModal({
   const resetForm = () => {
     setModel("");
     setPrompts("");
+    setTemperature("0.7");
+    setMaxTokens("4096");
     setFileToUpload(null);
     setSelectedFileId(null);
     setFileSearchQuery("");
@@ -283,6 +307,32 @@ export function CreateAsyncModal({
                 rows={6}
               />
             </div>
+
+            {/* Parameters - only for non-embedding models */}
+            {!isEmbeddingsModel && model && (
+              <div className="flex gap-4">
+                <div className="flex-1 space-y-2">
+                  <Label>Temperature</Label>
+                  <Input
+                    type="number"
+                    min="0"
+                    max="2"
+                    step="0.1"
+                    value={temperature}
+                    onChange={(e) => setTemperature(e.target.value)}
+                  />
+                </div>
+                <div className="flex-1 space-y-2">
+                  <Label>Max Tokens</Label>
+                  <Input
+                    type="number"
+                    min="1"
+                    value={maxTokens}
+                    onChange={(e) => setMaxTokens(e.target.value)}
+                  />
+                </div>
+              </div>
+            )}
           </TabsContent>
 
           <TabsContent value="upload" className="mt-4 space-y-4">
