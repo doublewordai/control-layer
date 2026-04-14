@@ -156,6 +156,7 @@ export function Batches({
 
   // Batch-specific filters
   const [statusFilter, setStatusFilter] = useState<BatchStatus | "all">("all");
+  const [hideAsync, setHideAsync] = useState(true);
   const [sortActiveFirst, setSortActiveFirst] = useState(true);
   const [dateRange, setDateRange] = useState<
     { from: Date; to: Date } | undefined
@@ -270,11 +271,15 @@ export function Batches({
   });
 
   // Process batches response - remove extra item used for hasMore detection
-  const batchesData = batchesResponse?.data || [];
-  const batchesHasMore = batchesData.length > batchesPagination.pageSize;
+  const batchesRaw = batchesResponse?.data || [];
+  // Filter out async (1h) batches when toggle is on
+  const batchesFiltered = hideAsync
+    ? batchesRaw.filter((b) => b.completion_window !== "1h")
+    : batchesRaw;
+  const batchesHasMore = batchesFiltered.length > batchesPagination.pageSize;
   const batches = batchesHasMore
-    ? batchesData.slice(0, batchesPagination.pageSize)
-    : batchesData;
+    ? batchesFiltered.slice(0, batchesPagination.pageSize)
+    : batchesFiltered;
 
   // Process files response - remove extra item used for hasMore detection
   const filesData = filesResponse?.data || [];
@@ -791,6 +796,22 @@ export function Batches({
                     className="text-sm text-gray-600 cursor-pointer select-none"
                   >
                     Active first
+                  </label>
+                </div>
+                <div className="flex items-center gap-1.5">
+                  <Switch
+                    id="hide-async"
+                    checked={hideAsync}
+                    onCheckedChange={(checked) => {
+                      setHideAsync(checked);
+                      batchesPagination.handleFirstPage();
+                    }}
+                  />
+                  <label
+                    htmlFor="hide-async"
+                    className="text-sm text-gray-600 cursor-pointer select-none"
+                  >
+                    Hide async
                   </label>
                 </div>
                 {memberFilterCombobox}
