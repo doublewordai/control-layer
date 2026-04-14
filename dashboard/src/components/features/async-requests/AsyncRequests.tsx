@@ -1,12 +1,13 @@
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { Code } from "lucide-react";
+import { Code, X } from "lucide-react";
 import { type ColumnDef } from "@tanstack/react-table";
 import { Button } from "../../ui/button";
 import { DataTable } from "../../ui/data-table";
 import { useAsyncRequests } from "../../../api/control-layer/hooks";
 import type { AsyncRequest } from "../../../api/control-layer/types";
 import { CreateAsyncModal } from "../../modals/CreateAsyncModal/CreateAsyncModal";
+import { useBootstrapContent } from "../../../hooks/use-bootstrap-content";
 import { cn } from "../../../lib/utils";
 
 const statusStyles: Record<string, string> = {
@@ -113,6 +114,7 @@ const columns: ColumnDef<AsyncRequest>[] = [
 export function AsyncRequests() {
   const navigate = useNavigate();
   const [createModalOpen, setCreateModalOpen] = useState(false);
+  const bootstrapBanner = useBootstrapContent();
   const { data, isLoading } = useAsyncRequests({
     completion_window: "1h",
     active_first: true,
@@ -121,20 +123,35 @@ export function AsyncRequests() {
 
   const requests = data?.data ?? [];
 
+  // Bootstrap banner content comes from a trusted server-side source (bootstrap.js),
+  // same pattern as Batches page — not user-supplied content.
   return (
-    <div className="p-6">
+    <div className="py-4 px-6">
       <div className="mb-6 flex items-center justify-between">
         <h1 className="text-3xl font-bold">Async</h1>
         <div className="flex gap-2">
-          <Button variant="outline" size="sm">
+          <Button variant="outline" onClick={() => {}}>
             <Code className="mr-2 h-4 w-4" />
             API
           </Button>
-          <Button size="sm" onClick={() => setCreateModalOpen(true)}>
-            + New
-          </Button>
+          <Button onClick={() => setCreateModalOpen(true)}>Create</Button>
         </div>
       </div>
+
+      {bootstrapBanner.content && !bootstrapBanner.isClosed && (
+        <div className="relative mb-6">
+          <div
+            dangerouslySetInnerHTML={{ __html: bootstrapBanner.content }}
+          />
+          <button
+            onClick={bootstrapBanner.close}
+            className="absolute top-3 right-3 rounded-sm opacity-50 transition-opacity hover:opacity-100 focus:ring-2 focus:ring-ring focus:ring-offset-2 focus:outline-hidden"
+            aria-label="Close banner"
+          >
+            <X className="h-4 w-4 text-doubleword-neutral-600" />
+          </button>
+        </div>
+      )}
 
       <DataTable
         columns={columns}
