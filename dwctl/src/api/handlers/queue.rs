@@ -19,6 +19,31 @@ use crate::{
     errors::Error,
 };
 
+/// Strict duration parser for `/demand` window entries.
+///
+/// Unlike [`parse_window_to_seconds`] — which is forgiving on purpose for
+/// the batch API (zero/negative/malformed input defaults to 24h) — this
+/// returns `None` for anything malformed so the handler can reject the
+/// request with 400. Zero is accepted; it's a meaningful lower bound
+/// (`0s:1h` = "strictly future 0..1h").
+fn parse_demand_duration(raw: &str) -> Option<i64> {
+    let s = raw.trim();
+    let (digits, mult): (&str, i64) = if let Some(d) = s.strip_suffix('h') {
+        (d, 3600)
+    } else if let Some(d) = s.strip_suffix('m') {
+        (d, 60)
+    } else if let Some(d) = s.strip_suffix('s') {
+        (d, 1)
+    } else {
+        return None;
+    };
+    let n: i64 = digits.parse().ok()?;
+    if n < 0 {
+        return None;
+    }
+    n.checked_mul(mult)
+}
+
 /// Nested map of pending request counts: model -> window_label -> count
 type PendingCountsByModelAndWindow = HashMap<String, HashMap<String, i64>>;
 
@@ -34,22 +59,30 @@ pub struct DemandQuery {
 
 /// Parse one entry from the `window=` query list.
 ///
-/// Returns `(label, start_secs, end_secs)`. Shorthand `<end>` returns
+/// Returns `Ok(None)` for an empty (skipped) entry, `Ok(Some(...))` for a
+/// valid entry, or `Err` for malformed input. Shorthand `<end>` returns
 /// `start = None` (no lower bound, including overdue — matches the legacy
 /// `<= now + N` behaviour of `/pending-request-counts`). Explicit
 /// `<start>:<end>` returns `start = Some(...)` and enforces the lower bound
 /// strictly. The label is the caller's raw input so scouter can send
 /// `window=1h,24h` and still match `"1h"` / `"24h"` keys on the response.
-fn parse_demand_window(raw: &str) -> Option<(String, Option<i64>, i64)> {
+fn parse_demand_window(raw: &str) -> Result<Option<(String, Option<i64>, i64)>, String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        return None;
+        return Ok(None);
     }
     let (start_secs, end_secs) = match trimmed.split_once(':') {
-        Some((start, end)) => (Some(parse_window_to_seconds(start)), parse_window_to_seconds(end)),
-        None => (None, parse_window_to_seconds(trimmed)),
+        Some((start, end)) => {
+            let s = parse_demand_duration(start).ok_or_else(|| format!("malformed window start in {:?}", trimmed))?;
+            let e = parse_demand_duration(end).ok_or_else(|| format!("malformed window end in {:?}", trimmed))?;
+            (Some(s), e)
+        }
+        None => {
+            let e = parse_demand_duration(trimmed).ok_or_else(|| format!("malformed window {:?}", trimmed))?;
+            (None, e)
+        }
     };
-    Some((trimmed.to_string(), start_secs, end_secs))
+    Ok(Some((trimmed.to_string(), start_secs, end_secs)))
 }
 
 /// Get pending, claimed, and processing request counts grouped by model and completion window
@@ -139,7 +172,15 @@ pub async fn get_demand<P: PoolProvider>(
     Query(params): Query<DemandQuery>,
     _: RequiresPermission<resource::System, operation::ReadAll>,
 ) -> Result<Json<PendingCountsByModelAndWindow>, Error> {
-    let windows: Vec<(String, Option<i64>, i64)> = params.window.split(',').filter_map(parse_demand_window).collect();
+    let windows: Vec<(String, Option<i64>, i64)> = params
+        .window
+        .split(',')
+        .map(parse_demand_window)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|message| Error::BadRequest { message })?
+        .into_iter()
+        .flatten()
+        .collect();
 
     if windows.is_empty() {
         return Err(Error::BadRequest {
@@ -275,5 +316,35 @@ mod tests {
         response.assert_status_ok();
         let counts: HashMap<String, HashMap<String, i64>> = response.json();
         assert_eq!(counts.len(), 0, "no pending requests exist in a clean database");
+    }
+
+    #[sqlx::test]
+    async fn test_demand_accepts_zero_start(pool: PgPool) {
+        // `0s:1h` must parse `0s` as zero seconds (not coerce to 24h like
+        // the lenient batch-window parser does). Regression guard.
+        let (server, _bg): (TestServer, _) = create_test_app(pool.clone(), false).await;
+        let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+
+        let response = server
+            .get("/admin/api/v1/monitoring/demand?window=0s:1h")
+            .add_header(&add_auth_headers(&admin)[0].0, &add_auth_headers(&admin)[0].1)
+            .add_header(&add_auth_headers(&admin)[1].0, &add_auth_headers(&admin)[1].1)
+            .await;
+        response.assert_status_ok();
+    }
+
+    #[sqlx::test]
+    async fn test_demand_rejects_malformed_window(pool: PgPool) {
+        let (server, _bg): (TestServer, _) = create_test_app(pool.clone(), false).await;
+        let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+
+        for bad in ["window=foo", "window=1x", "window=1h,bad", "window=-1h:1h"] {
+            let response = server
+                .get(&format!("/admin/api/v1/monitoring/demand?{}", bad))
+                .add_header(&add_auth_headers(&admin)[0].0, &add_auth_headers(&admin)[0].1)
+                .add_header(&add_auth_headers(&admin)[1].0, &add_auth_headers(&admin)[1].1)
+                .await;
+            response.assert_status(axum::http::StatusCode::BAD_REQUEST);
+        }
     }
 }
