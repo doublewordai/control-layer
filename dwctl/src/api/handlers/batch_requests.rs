@@ -142,7 +142,14 @@ pub async fn list_batch_requests<P: PoolProvider>(
                 u.email as created_by_email
             FROM fusillade.requests r
             JOIN fusillade.batches b ON r.batch_id = b.id
-            LEFT JOIN http_analytics ha ON ha.fusillade_request_id = r.id
+            LEFT JOIN LATERAL (
+                SELECT ha2.prompt_tokens, ha2.completion_tokens, ha2.reasoning_tokens,
+                       ha2.total_tokens, ha2.total_cost
+                FROM http_analytics ha2
+                WHERE ha2.fusillade_request_id = r.id
+                ORDER BY ha2.timestamp DESC
+                LIMIT 1
+            ) ha ON true
             LEFT JOIN users u ON u.id::text = b.created_by
             WHERE b.deleted_at IS NULL
               AND ($1::text IS NULL OR b.created_by = $1)
@@ -225,7 +232,14 @@ pub async fn get_batch_request<P: PoolProvider>(
         FROM fusillade.requests r
         JOIN fusillade.batches b ON r.batch_id = b.id
         LEFT JOIN fusillade.request_templates t ON r.template_id = t.id
-        LEFT JOIN http_analytics ha ON ha.fusillade_request_id = r.id
+        LEFT JOIN LATERAL (
+            SELECT ha2.prompt_tokens, ha2.completion_tokens, ha2.reasoning_tokens,
+                   ha2.total_tokens, ha2.total_cost
+            FROM http_analytics ha2
+            WHERE ha2.fusillade_request_id = r.id
+            ORDER BY ha2.timestamp DESC
+            LIMIT 1
+        ) ha ON true
         WHERE r.id = $1 AND b.deleted_at IS NULL
         "#,
     )
