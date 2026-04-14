@@ -189,7 +189,7 @@ export function AsyncRequests() {
   >(undefined);
 
   // Server-side offset pagination
-  const pagination = useServerPagination({ defaultPageSize: 20 });
+  const pagination = useServerPagination({ defaultPageSize: 10 });
 
   const { data, isLoading } = useAsyncRequests({
     completion_window: "1h",

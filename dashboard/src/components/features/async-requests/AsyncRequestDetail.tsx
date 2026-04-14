@@ -79,6 +79,28 @@ function CopyButton({ text, label }: { text: string; label?: string }) {
   );
 }
 
+function CopyIconButton({ value }: { value: string }) {
+  const [copied, setCopied] = useState(false);
+  const handleCopy = async () => {
+    await navigator.clipboard.writeText(value);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 1500);
+  };
+  return (
+    <button
+      onClick={handleCopy}
+      className="shrink-0 p-1 text-gray-400 hover:text-gray-600 transition-colors"
+      aria-label="Copy to clipboard"
+    >
+      {copied ? (
+        <Check className="h-4 w-4 text-green-600" />
+      ) : (
+        <Copy className="h-4 w-4" />
+      )}
+    </button>
+  );
+}
+
 export function AsyncRequestDetail() {
   const { requestId } = useParams<{ requestId: string }>();
   const navigate = useNavigate();
@@ -127,9 +149,10 @@ export function AsyncRequestDetail() {
               Request Detail
             </h1>
             <div className="flex items-center gap-2 mt-1">
-              <p className="text-doubleword-neutral-600 font-mono text-sm">
+              <span className="flex items-center gap-1 text-doubleword-neutral-600 font-mono text-sm">
                 {request.id}
-              </p>
+                <CopyIconButton value={request.id} />
+              </span>
               <span
                 className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${getStatusColor(status)}`}
               >

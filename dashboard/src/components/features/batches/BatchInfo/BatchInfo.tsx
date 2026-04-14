@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useCallback } from "react";
 import { useParams, useNavigate, useSearchParams } from "react-router-dom";
 import {
   ArrowLeft,
@@ -9,6 +9,8 @@ import {
   Loader2,
   RotateCcw,
   ExternalLink,
+  Copy,
+  Check,
   Info,
   List,
   Download,
@@ -270,9 +272,10 @@ const BatchInfo: React.FC = () => {
                       : "Batch Details"}
                   </h1>
                   <div className="flex items-center gap-2 mt-1">
-                    <p className="text-doubleword-neutral-600 font-mono text-sm">
+                    <span className="flex items-center gap-1 text-doubleword-neutral-600 font-mono text-sm">
                       {batch.id}
-                    </p>
+                      <CopyIconButton value={batch.id} />
+                    </span>
                     {getStatusBadge(batch.status)}
                   </div>
                   {description && (
@@ -967,5 +970,27 @@ const BatchInfo: React.FC = () => {
     </div>
   );
 };
+
+function CopyIconButton({ value }: { value: string }) {
+  const [copied, setCopied] = useState(false);
+  const handleCopy = useCallback(async () => {
+    await navigator.clipboard.writeText(value);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 1500);
+  }, [value]);
+  return (
+    <button
+      onClick={handleCopy}
+      className="shrink-0 p-1 text-gray-400 hover:text-gray-600 transition-colors"
+      aria-label="Copy to clipboard"
+    >
+      {copied ? (
+        <Check className="h-4 w-4 text-green-600" />
+      ) : (
+        <Copy className="h-4 w-4" />
+      )}
+    </button>
+  );
+}
 
 export default BatchInfo;
