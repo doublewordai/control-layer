@@ -1134,7 +1134,7 @@ export function useBatchAnalytics(id: string) {
 }
 
 // Deprecated: Batch request viewing disabled - would need to fetch/merge output and error files
-// export function useBatchRequests(
+// export function useAsyncRequests(
 //   id: string,
 //   options?: BatchRequestsListQuery,
 // ) {
@@ -1843,5 +1843,58 @@ export function useConnectionFiles(
     enabled: !!connectionId,
     staleTime: 0, // Always refetch on mount
     placeholderData: keepPreviousData,
+  });
+}
+
+// === Batch Requests (individual requests within batches) ===
+
+export function useAsyncRequests(
+  options?: import("./types").AsyncRequestsListQuery & { enabled?: boolean },
+) {
+  const { enabled, ...queryOptions } = options || {};
+
+  return useQuery({
+    queryKey: ["asyncRequests", queryOptions],
+    queryFn: () => dwctlApi.asyncRequests.list(queryOptions),
+    enabled,
+    refetchOnMount: "always" as const,
+    refetchInterval: (query: {
+      state: {
+        data?: import("./types").PaginatedResponse<
+          import("./types").AsyncRequest
+        >;
+      };
+    }) => {
+      const requests = query.state.data?.data;
+      if (
+        requests?.some((r: import("./types").AsyncRequest) =>
+          ["pending", "claimed", "processing"].includes(r.status),
+        )
+      ) {
+        return 2000;
+      }
+      return false;
+    },
+  });
+}
+
+export function useAsyncRequest(id: string | undefined) {
+  return useQuery({
+    queryKey: ["asyncRequests", "detail", id],
+    queryFn: () => dwctlApi.asyncRequests.get(id!),
+    enabled: !!id,
+    refetchOnMount: "always" as const,
+    refetchInterval: (query: {
+      state: { data?: import("./types").AsyncRequestDetail };
+    }) => {
+      const request = query.state.data;
+      if (
+        request &&
+        ["pending", "claimed", "processing"].includes(request.status)
+      ) {
+        return 2000;
+      }
+      return false;
+    },
   });
 }

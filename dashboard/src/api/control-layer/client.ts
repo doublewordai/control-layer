@@ -2108,6 +2108,42 @@ const connectionsApi = {
   },
 };
 
+const asyncRequestsApi = {
+  async list(
+    options?: import("./types").AsyncRequestsListQuery,
+  ): Promise<import("./types").PaginatedResponse<import("./types").AsyncRequest>> {
+    const params = new URLSearchParams();
+    if (options?.skip) params.set("skip", options.skip.toString());
+    if (options?.limit) params.set("limit", options.limit.toString());
+    if (options?.completion_window)
+      params.set("completion_window", options.completion_window);
+    if (options?.status) params.set("status", options.status);
+    if (options?.model) params.set("model", options.model);
+    if (options?.active_first !== undefined)
+      params.set("active_first", options.active_first.toString());
+
+    const response = await fetch(
+      `/admin/api/v1/batches/requests${params.toString() ? "?" + params.toString() : ""}`,
+    );
+    if (!response.ok) {
+      throw new Error(`Failed to fetch batch requests: ${response.status}`);
+    }
+    return response.json();
+  },
+
+  async get(
+    id: string,
+  ): Promise<import("./types").AsyncRequestDetail> {
+    const response = await fetch(
+      `/admin/api/v1/batches/requests/${id}`,
+    );
+    if (!response.ok) {
+      throw new Error(`Failed to fetch batch request: ${response.status}`);
+    }
+    return response.json();
+  },
+};
+
 // Main nested API object
 export const dwctlApi = {
   users: userApi,
@@ -2129,4 +2165,5 @@ export const dwctlApi = {
   organizations: organizationsApi,
   support: supportApi,
   connections: connectionsApi,
+  asyncRequests: asyncRequestsApi,
 };

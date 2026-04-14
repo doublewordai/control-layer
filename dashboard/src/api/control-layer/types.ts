@@ -1591,3 +1591,42 @@ export interface SetActiveOrganizationRequest {
 export interface SetActiveOrganizationResponse {
   active_organization_id: string | null;
 }
+
+// === Async Requests (individual requests within batches, for async page) ===
+
+export type AsyncRequestStatus =
+  | "pending"
+  | "claimed"
+  | "processing"
+  | "completed"
+  | "failed"
+  | "canceled";
+
+export interface AsyncRequest {
+  id: string;
+  batch_id: string;
+  model: string;
+  status: AsyncRequestStatus;
+  created_at: string;
+  completed_at: string | null;
+  failed_at: string | null;
+  duration_ms: number | null;
+  response_status: number | null;
+}
+
+export interface AsyncRequestDetail extends AsyncRequest {
+  body: string;
+  response_body: string | null;
+  error: string | null;
+  completion_window: string;
+  batch_created_by: string;
+}
+
+export interface AsyncRequestsListQuery {
+  skip?: number;
+  limit?: number;
+  completion_window?: string;
+  status?: string;
+  model?: string;
+  active_first?: boolean;
+}
