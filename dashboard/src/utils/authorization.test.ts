@@ -37,6 +37,32 @@ describe("hasPermission", () => {
     expect(hasPermission(["BatchAPIUser"], "api-keys")).toBe(true);
     expect(hasPermission(["BatchAPIUser"], "analytics")).toBe(false);
   });
+
+  it("handles ConnectionsUser role correctly", () => {
+    // ConnectionsUser only grants connections + batches
+    expect(hasPermission(["ConnectionsUser"], "connections")).toBe(true);
+    expect(hasPermission(["ConnectionsUser"], "batches")).toBe(true);
+    // Everything else comes from StandardUser, not ConnectionsUser
+    expect(hasPermission(["ConnectionsUser"], "profile")).toBe(false);
+    expect(hasPermission(["ConnectionsUser"], "api-keys")).toBe(false);
+    expect(hasPermission(["ConnectionsUser"], "models")).toBe(false);
+    expect(hasPermission(["ConnectionsUser"], "analytics")).toBe(false);
+    expect(hasPermission(["ConnectionsUser"], "users-groups")).toBe(false);
+  });
+
+  it("ConnectionsUser combined with StandardUser grants both permission sets", () => {
+    // Roles are additive — StandardUser brings models/api-keys/playground,
+    // ConnectionsUser adds connections/batches
+    expect(
+      hasPermission(["StandardUser", "ConnectionsUser"], "connections"),
+    ).toBe(true);
+    expect(
+      hasPermission(["StandardUser", "ConnectionsUser"], "models"),
+    ).toBe(true);
+    expect(
+      hasPermission(["StandardUser", "ConnectionsUser"], "playground"),
+    ).toBe(true);
+  });
 });
 
 describe("canAccessRoute", () => {
@@ -49,6 +75,18 @@ describe("canAccessRoute", () => {
   it("returns false for routes user does not have permission to access", () => {
     expect(canAccessRoute(["StandardUser"], "/users-groups")).toBe(false);
     expect(canAccessRoute(["StandardUser"], "/analytics")).toBe(false);
+  });
+
+  it("allows ConnectionsUser to access /connections and /batches", () => {
+    expect(canAccessRoute(["ConnectionsUser"], "/connections")).toBe(true);
+    expect(canAccessRoute(["ConnectionsUser"], "/batches")).toBe(true);
+  });
+
+  it("denies ConnectionsUser access to admin routes", () => {
+    expect(canAccessRoute(["ConnectionsUser"], "/users-groups")).toBe(false);
+    expect(canAccessRoute(["ConnectionsUser"], "/analytics")).toBe(false);
+    expect(canAccessRoute(["ConnectionsUser"], "/endpoints")).toBe(false);
+    expect(canAccessRoute(["ConnectionsUser"], "/settings")).toBe(false);
   });
 
   it("returns true for unknown routes (no permission required)", () => {

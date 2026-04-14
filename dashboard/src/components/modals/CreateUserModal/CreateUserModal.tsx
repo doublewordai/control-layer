@@ -2,7 +2,7 @@ import React, { useState } from "react";
 import { Info } from "lucide-react";
 import { useCreateUser } from "../../../api/control-layer";
 import type { Role } from "../../../api/control-layer/types";
-import { AVAILABLE_ROLES, getRoleDisplayName } from "../../../utils/roles";
+import { AVAILABLE_ROLES, SUBSET_ROLES, getRoleDisplayName } from "../../../utils/roles";
 import {
   Dialog,
   DialogContent,
@@ -113,6 +113,8 @@ export const CreateUserModal: React.FC<CreateUserModalProps> = ({
         "Billing Managers can view and manage cost information and user credit balances.",
       BatchAPIUser:
         "Batch API Users can upload, view, and delete their own files for use with the Batch API.",
+      ConnectionsUser:
+        "Connections Users can create and manage external data source connections, sync files, and view resulting batches.",
     };
     return descriptions[role];
   };
@@ -226,8 +228,7 @@ export const CreateUserModal: React.FC<CreateUserModalProps> = ({
               {AVAILABLE_ROLES.map((role) => {
                 const isPlatformManagerSelected =
                   formData.roles.includes("PlatformManager");
-                const isSubsetRole =
-                  role === "BatchAPIUser" || role === "BillingManager";
+                const isSubsetRole = SUBSET_ROLES.includes(role);
                 const isDisabled =
                   role === "StandardUser" ||
                   createUserMutation.isPending ||
