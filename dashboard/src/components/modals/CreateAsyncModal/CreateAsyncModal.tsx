@@ -1,4 +1,4 @@
-import { useState, useCallback } from "react";
+import { useState, useCallback, useMemo } from "react";
 import { AlertCircle, Upload } from "lucide-react";
 import {
   Dialog,
@@ -10,16 +10,9 @@ import {
 } from "../../ui/dialog";
 import { Button } from "../../ui/button";
 import { Label } from "../../ui/label";
-import { Input } from "../../ui/input";
 import { Textarea } from "../../ui/textarea";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "../../ui/tabs";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "../../ui/select";
+import { Combobox } from "../../ui/combobox";
 import {
   useCreateBatch,
   useUploadFileWithProgress,
@@ -43,10 +36,7 @@ export function CreateAsyncModal({
 
   // Compose state
   const [model, setModel] = useState<string>("");
-  const [systemPrompt, setSystemPrompt] = useState<string>("");
   const [prompts, setPrompts] = useState<string>("");
-  const [temperature, setTemperature] = useState<string>("0.7");
-  const [maxTokens, setMaxTokens] = useState<string>("4096");
 
   // Upload state
   const [fileToUpload, setFileToUpload] = useState<File | null>(null);
@@ -58,10 +48,22 @@ export function CreateAsyncModal({
 
   const createBatchMutation = useCreateBatch();
   const uploadMutation = useUploadFileWithProgress();
-  const { data: modelsData } = useModels();
+  const { data: modelsData } = useModels({
+    accessible: true,
+    model_type: "CHAT",
+    limit: 100,
+  });
   const queryClient = useQueryClient();
 
-  const models = modelsData?.data ?? [];
+  const modelOptions = useMemo(
+    () =>
+      (modelsData?.data ?? []).map((m) => ({
+        value: m.alias,
+        label: m.alias,
+        description: m.model_name !== m.alias ? m.model_name : undefined,
+      })),
+    [modelsData?.data],
+  );
 
   const promptLines = prompts
     .split("\n")
@@ -70,27 +72,19 @@ export function CreateAsyncModal({
 
   const buildJsonl = useCallback((): string => {
     const lines = promptLines.map((prompt, index) => {
-      const messages: Array<{ role: string; content: string }> = [];
-      if (systemPrompt.trim()) {
-        messages.push({ role: "system", content: systemPrompt.trim() });
-      }
-      messages.push({ role: "user", content: prompt.trim() });
-
       return JSON.stringify({
         custom_id: `req-${index + 1}`,
         method: "POST",
         url: "/v1/chat/completions",
         body: {
           model,
-          messages,
-          temperature: parseFloat(temperature) || 0.7,
-          max_tokens: parseInt(maxTokens) || 4096,
+          messages: [{ role: "user", content: prompt.trim() }],
         },
       });
     });
 
     return lines.join("\n");
-  }, [promptLines, model, systemPrompt, temperature, maxTokens]);
+  }, [promptLines, model]);
 
   const handleSubmit = async () => {
     setError(null);
@@ -143,7 +137,6 @@ export function CreateAsyncModal({
         fileId = uploadedFile.id;
       }
 
-      // Detect endpoint from the file
       const endpoint = "/v1/chat/completions";
 
       await createBatchMutation.mutateAsync({
@@ -156,10 +149,8 @@ export function CreateAsyncModal({
         `Async request${requestCount > 1 ? "s" : ""} created successfully`,
       );
 
-      // Invalidate batch requests query
       queryClient.invalidateQueries({ queryKey: ["asyncRequests"] });
 
-      // Reset form
       resetForm();
       onSuccess();
       onClose();
@@ -177,10 +168,7 @@ export function CreateAsyncModal({
 
   const resetForm = () => {
     setModel("");
-    setSystemPrompt("");
     setPrompts("");
-    setTemperature("0.7");
-    setMaxTokens("4096");
     setFileToUpload(null);
     setError(null);
     setActiveTab("compose");
@@ -234,33 +222,14 @@ export function CreateAsyncModal({
             {/* Model selector */}
             <div className="space-y-2">
               <Label>Model</Label>
-              <Select value={model} onValueChange={setModel}>
-                <SelectTrigger>
-                  <SelectValue placeholder="Select a model" />
-                </SelectTrigger>
-                <SelectContent>
-                  {models.map((m) => (
-                    <SelectItem key={m.id} value={m.alias}>
-                      {m.alias}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </div>
-
-            {/* System prompt */}
-            <div className="space-y-2">
-              <Label>
-                System{" "}
-                <span className="text-muted-foreground font-normal">
-                  (optional)
-                </span>
-              </Label>
-              <Textarea
-                placeholder="You are a helpful assistant..."
-                value={systemPrompt}
-                onChange={(e) => setSystemPrompt(e.target.value)}
-                rows={2}
+              <Combobox
+                options={modelOptions}
+                value={model}
+                onValueChange={setModel}
+                placeholder="Select a model..."
+                searchPlaceholder="Search models..."
+                emptyMessage="No models found."
+                className="w-full"
               />
             </div>
 
@@ -276,32 +245,8 @@ export function CreateAsyncModal({
                 placeholder="Enter your prompts, one per line..."
                 value={prompts}
                 onChange={(e) => setPrompts(e.target.value)}
-                rows={5}
+                rows={6}
               />
-            </div>
-
-            {/* Parameters */}
-            <div className="flex gap-4">
-              <div className="flex-1 space-y-2">
-                <Label>Temperature</Label>
-                <Input
-                  type="number"
-                  min="0"
-                  max="2"
-                  step="0.1"
-                  value={temperature}
-                  onChange={(e) => setTemperature(e.target.value)}
-                />
-              </div>
-              <div className="flex-1 space-y-2">
-                <Label>Max Tokens</Label>
-                <Input
-                  type="number"
-                  min="1"
-                  value={maxTokens}
-                  onChange={(e) => setMaxTokens(e.target.value)}
-                />
-              </div>
             </div>
           </TabsContent>
 
