@@ -156,7 +156,7 @@ export function Batches({
 
   // Batch-specific filters
   const [statusFilter, setStatusFilter] = useState<BatchStatus | "all">("all");
-  const [hideAsync, setHideAsync] = useState(true);
+  const [hideAsync, setHideAsync] = useState(false);
   const [sortActiveFirst, setSortActiveFirst] = useState(true);
   const [dateRange, setDateRange] = useState<
     { from: Date; to: Date } | undefined
@@ -811,7 +811,7 @@ export function Batches({
                     htmlFor="hide-async"
                     className="text-sm text-gray-600 cursor-pointer select-none"
                   >
-                    Hide async
+                    Batch only
                   </label>
                 </div>
                 {memberFilterCombobox}
