@@ -34,17 +34,20 @@ pub struct DemandQuery {
 
 /// Parse one entry from the `window=` query list.
 ///
-/// Returns `(label, start_secs, end_secs)`. The label is the caller's raw
-/// input so scouter can send `window=1h,24h` and still match `"1h"` /
-/// `"24h"` keys on the response.
-fn parse_demand_window(raw: &str) -> Option<(String, i64, i64)> {
+/// Returns `(label, start_secs, end_secs)`. Shorthand `<end>` returns
+/// `start = None` (no lower bound, including overdue — matches the legacy
+/// `<= now + N` behaviour of `/pending-request-counts`). Explicit
+/// `<start>:<end>` returns `start = Some(...)` and enforces the lower bound
+/// strictly. The label is the caller's raw input so scouter can send
+/// `window=1h,24h` and still match `"1h"` / `"24h"` keys on the response.
+fn parse_demand_window(raw: &str) -> Option<(String, Option<i64>, i64)> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return None;
     }
     let (start_secs, end_secs) = match trimmed.split_once(':') {
-        Some((start, end)) => (parse_window_to_seconds(start), parse_window_to_seconds(end)),
-        None => (0, parse_window_to_seconds(trimmed)),
+        Some((start, end)) => (Some(parse_window_to_seconds(start)), parse_window_to_seconds(end)),
+        None => (None, parse_window_to_seconds(trimmed)),
     };
     Some((trimmed.to_string(), start_secs, end_secs))
 }
@@ -79,7 +82,7 @@ pub async fn get_pending_request_counts<P: PoolProvider>(
         .batches
         .allowed_completion_windows
         .iter()
-        .map(|window| (window.clone(), 0i64, parse_window_to_seconds(window)))
+        .map(|window| (window.clone(), None, parse_window_to_seconds(window)))
         .collect::<Vec<_>>();
     let states = vec!["pending".to_string(), "claimed".to_string(), "processing".to_string()]; // Include claimed and processing to get a more complete picture of queue depth
     let model_filter: Vec<String> = Vec::new();
@@ -136,7 +139,7 @@ pub async fn get_demand<P: PoolProvider>(
     Query(params): Query<DemandQuery>,
     _: RequiresPermission<resource::System, operation::ReadAll>,
 ) -> Result<Json<PendingCountsByModelAndWindow>, Error> {
-    let windows: Vec<(String, i64, i64)> = params.window.split(',').filter_map(parse_demand_window).collect();
+    let windows: Vec<(String, Option<i64>, i64)> = params.window.split(',').filter_map(parse_demand_window).collect();
 
     if windows.is_empty() {
         return Err(Error::BadRequest {
