@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useParams, useNavigate, Link } from "react-router-dom";
-import { ArrowLeft, Clock, Copy, Check } from "lucide-react";
+import { ArrowLeft, Copy, Check } from "lucide-react";
 import { useAsyncRequest } from "../../../api/control-layer/hooks";
 import { Card, CardContent, CardHeader, CardTitle } from "../../ui/card";
 import { CodeBlock } from "../../ui/code-block";
@@ -151,7 +151,7 @@ export function AsyncRequestDetail() {
             </CardHeader>
             <CardContent className="px-6 pb-6 pt-0">
               <div className="rounded-lg overflow-hidden border border-doubleword-border">
-                <CodeBlock language="json">{inputJson}</CodeBlock>
+                <CodeBlock language="json" variant="light">{inputJson}</CodeBlock>
               </div>
             </CardContent>
           </Card>
@@ -167,7 +167,7 @@ export function AsyncRequestDetail() {
             <CardContent className="px-6 pb-6 pt-0">
               {status === "completed" && outputJson ? (
                 <div className="rounded-lg overflow-hidden border border-doubleword-border">
-                  <CodeBlock language="json">{outputJson}</CodeBlock>
+                  <CodeBlock language="json" variant="light">{outputJson}</CodeBlock>
                 </div>
               ) : status === "failed" ? (
                 <div className="rounded-lg border border-red-200 bg-red-50 p-4">
@@ -217,11 +217,8 @@ export function AsyncRequestDetail() {
                 )}
                 {request.duration_ms != null && (
                   <div className="border-t border-doubleword-border-light pt-3">
-                    <div className="flex items-center gap-1 text-sm text-gray-600 mb-1">
-                      <Clock className="w-3 h-3" />
-                      Duration
-                    </div>
-                    <p className="text-lg font-bold text-doubleword-neutral-900">
+                    <p className="text-sm text-gray-600 mb-1">Duration</p>
+                    <p className="text-sm font-medium">
                       {formatDuration(request.duration_ms)}
                     </p>
                   </div>

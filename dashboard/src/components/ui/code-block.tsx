@@ -4,6 +4,7 @@ import javascript from "react-syntax-highlighter/dist/esm/languages/hljs/javascr
 import bash from "react-syntax-highlighter/dist/esm/languages/hljs/bash";
 import json from "react-syntax-highlighter/dist/esm/languages/hljs/json";
 import oneDark from "react-syntax-highlighter/dist/esm/styles/hljs/atom-one-dark";
+import oneLight from "react-syntax-highlighter/dist/esm/styles/hljs/atom-one-light";
 
 // Register only the languages we need
 SyntaxHighlighter.registerLanguage("python", python);
@@ -15,14 +16,20 @@ interface CodeBlockProps {
   language: "python" | "javascript" | "bash" | "json";
   children: string;
   className?: string;
+  variant?: "dark" | "light";
 }
 
-export function CodeBlock({ language, children, className }: CodeBlockProps) {
+export function CodeBlock({
+  language,
+  children,
+  className,
+  variant = "dark",
+}: CodeBlockProps) {
   return (
     <div style={{ maxWidth: "100%", overflow: "auto" }}>
       <SyntaxHighlighter
         language={language}
-        style={oneDark}
+        style={variant === "light" ? oneLight : oneDark}
         customStyle={{
           margin: 0,
           borderRadius: 0,
@@ -30,6 +37,7 @@ export function CodeBlock({ language, children, className }: CodeBlockProps) {
           maxWidth: "100%",
           overflowX: "auto",
           padding: "1rem",
+          ...(variant === "light" && { background: "transparent" }),
         }}
         className={className}
         wrapLongLines={false}

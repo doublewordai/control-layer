@@ -104,7 +104,7 @@ describe("BatchInfo", () => {
 
     renderBatchInfo();
 
-    expect(screen.queryByText("Reasoning Tokens")).not.toBeInTheDocument();
+    expect(screen.queryByText("Reasoning")).not.toBeInTheDocument();
   });
 
   it("hides the reasoning token card when the total is undefined", () => {
@@ -120,7 +120,7 @@ describe("BatchInfo", () => {
 
     renderBatchInfo();
 
-    expect(screen.queryByText("Reasoning Tokens")).not.toBeInTheDocument();
+    expect(screen.queryByText("Reasoning")).not.toBeInTheDocument();
   });
 
   it("shows the reasoning token card when the total is positive", () => {
@@ -137,7 +137,7 @@ describe("BatchInfo", () => {
 
     renderBatchInfo();
 
-    expect(screen.getByText("Reasoning Tokens")).toBeInTheDocument();
+    expect(screen.getByText("Reasoning")).toBeInTheDocument();
     expect(screen.getByText("42")).toBeInTheDocument();
   });
 });
