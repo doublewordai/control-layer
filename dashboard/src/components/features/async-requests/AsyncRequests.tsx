@@ -21,6 +21,7 @@ import type {
 import { CreateAsyncModal } from "../../modals/CreateAsyncModal/CreateAsyncModal";
 import { ApiExamples } from "../../modals";
 import { useBootstrapContent } from "../../../hooks/use-bootstrap-content";
+import { useServerPagination } from "../../../hooks/useServerPagination";
 import { cn } from "../../../lib/utils";
 
 const statusStyles: Record<string, string> = {
@@ -142,7 +143,9 @@ export function AsyncRequests() {
   const [dateRange, setDateRange] = useState<
     { from: Date; to: Date } | undefined
   >(undefined);
-  const [pageSize, setPageSize] = useState(20);
+
+  // Server-side offset pagination
+  const pagination = useServerPagination({ defaultPageSize: 20 });
 
   const { data, isLoading } = useAsyncRequests({
     completion_window: "1h",
@@ -150,10 +153,11 @@ export function AsyncRequests() {
     status: statusFilter !== "all" ? statusFilter : undefined,
     created_after: dateRange?.from.toISOString(),
     created_before: dateRange?.to.toISOString(),
-    limit: pageSize,
+    ...pagination.queryParams,
   });
 
   const requests = data?.data ?? [];
+  const totalCount = data?.total_count ?? 0;
 
   // Bootstrap banner content comes from a trusted server-side source (bootstrap.js),
   // same pattern as Batches page — not user-supplied content.
@@ -198,16 +202,27 @@ export function AsyncRequests() {
         data={requests}
         isLoading={isLoading}
         onRowClick={(row) => navigate(`/async/${row.id}`)}
-        pageSize={pageSize}
-        minRows={pageSize}
+        pageSize={pagination.pageSize}
+        minRows={pagination.pageSize}
         rowHeight="40px"
+        paginationMode="server"
+        serverPagination={{
+          page: pagination.page,
+          pageSize: pagination.pageSize,
+          totalItems: totalCount,
+          onPageChange: pagination.handlePageChange,
+          onPageSizeChange: pagination.handlePageSizeChange,
+        }}
         headerActions={
           <div className="flex items-center gap-2 flex-wrap">
             <div className="flex items-center gap-1.5">
               <Switch
                 id="active-first-async"
                 checked={sortActiveFirst}
-                onCheckedChange={setSortActiveFirst}
+                onCheckedChange={(checked) => {
+                  setSortActiveFirst(checked);
+                  pagination.handleReset();
+                }}
               />
               <label
                 htmlFor="active-first-async"
@@ -218,9 +233,10 @@ export function AsyncRequests() {
             </div>
             <Select
               value={statusFilter}
-              onValueChange={(v) =>
-                setStatusFilter(v as AsyncRequestStatus | "all")
-              }
+              onValueChange={(v) => {
+                setStatusFilter(v as AsyncRequestStatus | "all");
+                pagination.handleReset();
+              }}
             >
               <SelectTrigger className="w-[140px] h-9">
                 <div className="flex items-center gap-1.5">
@@ -237,22 +253,13 @@ export function AsyncRequests() {
                 <SelectItem value="canceled">Cancelled</SelectItem>
               </SelectContent>
             </Select>
-            <DateTimeRangeSelector value={dateRange} onChange={setDateRange} />
-            <span className="text-sm text-gray-600">Rows:</span>
-            <Select
-              value={pageSize.toString()}
-              onValueChange={(v) => setPageSize(Number(v))}
-            >
-              <SelectTrigger className="w-20 h-9">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="10">10</SelectItem>
-                <SelectItem value="20">20</SelectItem>
-                <SelectItem value="50">50</SelectItem>
-                <SelectItem value="100">100</SelectItem>
-              </SelectContent>
-            </Select>
+            <DateTimeRangeSelector
+              value={dateRange}
+              onChange={(range) => {
+                setDateRange(range);
+                pagination.handleReset();
+              }}
+            />
           </div>
         }
       />
