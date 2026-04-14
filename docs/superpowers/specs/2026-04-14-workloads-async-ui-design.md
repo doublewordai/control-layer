@@ -83,7 +83,7 @@ A flat chronological list of individual requests from batches with `completion_w
 
 ### Behavior
 
-- **Data source:** `GET /admin/api/v1/requests` (new endpoint, see Section 6)
+- **Data source:** `GET /admin/api/v1/batches/requests` (new endpoint, see Section 6)
 - **Active-first sorting:** Running/queued requests float to top with subtle blue background highlight
 - **Auto-refresh:** Polls every 2s when active requests exist (same pattern as batch page)
 - **Pagination:** Offset-based, matching admin API pattern
@@ -167,9 +167,9 @@ Metrics in the sidebar can be expanded later with more detail.
 
 ## 6. Backend: New Admin Endpoint
 
-### `GET /admin/api/v1/requests`
+### `GET /admin/api/v1/batches/requests`
 
-Lists individual requests from fusillade, joining against batches to get metadata.
+Lists individual batch requests from fusillade, joining against batches to get metadata.
 
 **Query parameters:**
 
@@ -206,7 +206,7 @@ Lists individual requests from fusillade, joining against batches to get metadat
 }
 ```
 
-### `GET /admin/api/v1/requests/:id`
+### `GET /admin/api/v1/batches/requests/:id`
 
 Returns full request detail including input messages and output response.
 
