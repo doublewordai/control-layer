@@ -299,9 +299,7 @@ export function AsyncRequestDetail() {
               <div className="space-y-4">
                 <div>
                   <p className="text-sm text-gray-600 mb-1">Model</p>
-                  <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-blue-100 text-blue-800">
-                    {request.model}
-                  </span>
+                  <p className="font-medium text-sm">{request.model}</p>
                 </div>
                 <div>
                   <p className="text-sm text-gray-600 mb-1">

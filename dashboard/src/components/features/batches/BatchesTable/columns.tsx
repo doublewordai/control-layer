@@ -19,7 +19,6 @@ import {
   formatLongDuration,
   formatNumber,
 } from "../../../../utils";
-import { cn } from "../../../../lib/utils";
 import type { Batch, BatchStatus } from "../types";
 
 interface ColumnActions {
@@ -128,14 +127,7 @@ export const createBatchColumns = (
       const batch = row.original as Batch;
       const isAsync = batch.completion_window === "1h";
       return (
-        <span
-          className={cn(
-            "inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium",
-            isAsync
-              ? "bg-amber-100 text-amber-800"
-              : "bg-indigo-100 text-indigo-800",
-          )}
-        >
+        <span className="text-sm text-doubleword-neutral-900">
           {isAsync ? "async" : "batch"}
         </span>
       );

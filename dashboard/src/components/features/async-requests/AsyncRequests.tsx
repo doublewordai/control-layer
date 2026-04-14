@@ -96,7 +96,7 @@ function createColumns(showUserColumn: boolean): ColumnDef<AsyncRequest>[] {
     accessorKey: "model",
     header: "Model",
     cell: ({ row }) => (
-      <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-blue-100 text-blue-800 max-w-full truncate">
+      <span className="text-sm text-doubleword-neutral-900 truncate max-w-[160px] block">
         {row.getValue("model")}
       </span>
     ),
