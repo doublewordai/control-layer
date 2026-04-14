@@ -1614,6 +1614,9 @@ export interface AsyncRequest {
   response_status: number | null;
   prompt_tokens: number | null;
   completion_tokens: number | null;
+  reasoning_tokens: number | null;
+  total_tokens: number | null;
+  total_cost: number | null;
 }
 
 export interface AsyncRequestDetail extends AsyncRequest {

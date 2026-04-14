@@ -128,10 +128,14 @@ pub async fn list_batch_requests<P: PoolProvider>(
                     ELSE NULL
                 END)::float8 as duration_ms,
                 r.response_status,
-                (r.response_body::jsonb -> 'usage' ->> 'prompt_tokens')::bigint as prompt_tokens,
-                (r.response_body::jsonb -> 'usage' ->> 'completion_tokens')::bigint as completion_tokens
+                ha.prompt_tokens,
+                ha.completion_tokens,
+                ha.reasoning_tokens,
+                ha.total_tokens,
+                ha.total_cost::float8 as total_cost
             FROM fusillade.requests r
             JOIN fusillade.batches b ON r.batch_id = b.id
+            LEFT JOIN http_analytics ha ON ha.fusillade_request_id = r.id
             WHERE b.deleted_at IS NULL
               AND ($1::text IS NULL OR b.created_by = $1)
               AND ($2::text IS NULL OR b.completion_window = $2)
@@ -200,6 +204,11 @@ pub async fn get_batch_request<P: PoolProvider>(
                 ELSE NULL
             END)::float8 as duration_ms,
             r.response_status,
+            ha.prompt_tokens,
+            ha.completion_tokens,
+            ha.reasoning_tokens,
+            ha.total_tokens,
+            ha.total_cost::float8 as total_cost,
             COALESCE(t.body, '') as body,
             r.response_body,
             r.error,
@@ -208,6 +217,7 @@ pub async fn get_batch_request<P: PoolProvider>(
         FROM fusillade.requests r
         JOIN fusillade.batches b ON r.batch_id = b.id
         LEFT JOIN fusillade.request_templates t ON r.template_id = t.id
+        LEFT JOIN http_analytics ha ON ha.fusillade_request_id = r.id
         WHERE r.id = $1 AND b.deleted_at IS NULL
         "#,
     )

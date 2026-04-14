@@ -50,6 +50,9 @@ pub struct BatchRequestSummary {
     pub response_status: Option<i16>,
     pub prompt_tokens: Option<i64>,
     pub completion_tokens: Option<i64>,
+    pub reasoning_tokens: Option<i64>,
+    pub total_tokens: Option<i64>,
+    pub total_cost: Option<f64>,
 }
 
 /// Full batch request detail including input/output
@@ -65,6 +68,11 @@ pub struct BatchRequestDetail {
     pub failed_at: Option<DateTime<Utc>>,
     pub duration_ms: Option<f64>,
     pub response_status: Option<i16>,
+    pub prompt_tokens: Option<i64>,
+    pub completion_tokens: Option<i64>,
+    pub reasoning_tokens: Option<i64>,
+    pub total_tokens: Option<i64>,
+    pub total_cost: Option<f64>,
     pub body: String,
     pub response_body: Option<String>,
     pub error: Option<String>,

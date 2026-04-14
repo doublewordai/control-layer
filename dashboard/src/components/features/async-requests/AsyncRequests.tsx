@@ -1,10 +1,15 @@
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { Code, Play, X, Filter, Clock } from "lucide-react";
+import { Code, Play, X, Filter, Clock, DollarSign } from "lucide-react";
 import { type ColumnDef } from "@tanstack/react-table";
 import { Button } from "../../ui/button";
 import { DataTable } from "../../ui/data-table";
 import { Switch } from "../../ui/switch";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "../../ui/tooltip";
 import {
   Select,
   SelectContent,
@@ -22,6 +27,7 @@ import { CreateAsyncModal } from "../../modals/CreateAsyncModal/CreateAsyncModal
 import { ApiExamples } from "../../modals";
 import { useBootstrapContent } from "../../../hooks/use-bootstrap-content";
 import { useServerPagination } from "../../../hooks/useServerPagination";
+import { formatTimestamp, formatLongDuration } from "../../../utils";
 
 const getStatusColor = (status: string): string => {
   switch (status) {
@@ -48,13 +54,10 @@ const statusLabels: Record<string, string> = {
   canceled: "cancelled",
 };
 
-function formatDuration(ms: number | null): string {
-  if (!ms) return "-";
-  const seconds = Math.round(ms / 1000);
-  if (seconds < 60) return `${seconds}s`;
-  const minutes = Math.floor(seconds / 60);
-  const remainingSeconds = seconds % 60;
-  return `${minutes}m ${remainingSeconds}s`;
+function formatCost(cost: number): string {
+  if (cost < 0.0001) return `$${cost.toFixed(6)}`;
+  if (cost < 0.01) return `$${cost.toFixed(4)}`;
+  return `$${cost.toFixed(2)}`;
 }
 
 const columns: ColumnDef<AsyncRequest>[] = [
@@ -65,12 +68,7 @@ const columns: ColumnDef<AsyncRequest>[] = [
       const timestamp = row.getValue("created_at") as string;
       return (
         <span className="text-sm text-doubleword-neutral-900">
-          {new Date(timestamp).toLocaleString(undefined, {
-            month: "short",
-            day: "numeric",
-            hour: "numeric",
-            minute: "2-digit",
-          })}
+          {formatTimestamp(timestamp)}
         </span>
       );
     },
@@ -102,14 +100,54 @@ const columns: ColumnDef<AsyncRequest>[] = [
     id: "tokens",
     header: "Tokens",
     cell: ({ row }) => {
-      const prompt = row.original.prompt_tokens;
-      const completion = row.original.completion_tokens;
-      if (prompt == null && completion == null) {
+      const { prompt_tokens, completion_tokens, reasoning_tokens, total_tokens } =
+        row.original;
+      if (total_tokens == null) {
         return <span className="text-sm text-doubleword-neutral-600">-</span>;
       }
       return (
-        <span className="text-sm text-doubleword-neutral-900 tabular-nums cursor-help">
-          {(prompt ?? 0).toLocaleString()} / {(completion ?? 0).toLocaleString()}
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <span className="text-sm text-doubleword-neutral-900 tabular-nums cursor-help">
+              {total_tokens.toLocaleString()}
+            </span>
+          </TooltipTrigger>
+          <TooltipContent side="top" className="text-xs space-y-1">
+            <div className="flex justify-between gap-4">
+              <span className="text-muted-foreground">Prompt</span>
+              <span className="tabular-nums">{(prompt_tokens ?? 0).toLocaleString()}</span>
+            </div>
+            <div className="flex justify-between gap-4">
+              <span className="text-muted-foreground">Completion</span>
+              <span className="tabular-nums">{(completion_tokens ?? 0).toLocaleString()}</span>
+            </div>
+            {reasoning_tokens != null && reasoning_tokens > 0 && (
+              <div className="flex justify-between gap-4">
+                <span className="text-muted-foreground">Reasoning</span>
+                <span className="tabular-nums">{reasoning_tokens.toLocaleString()}</span>
+              </div>
+            )}
+            <div className="flex justify-between gap-4 border-t pt-1 mt-1 font-medium">
+              <span>Total</span>
+              <span className="tabular-nums">{total_tokens.toLocaleString()}</span>
+            </div>
+          </TooltipContent>
+        </Tooltip>
+      );
+    },
+  },
+  {
+    id: "cost",
+    header: "Cost",
+    cell: ({ row }) => {
+      const cost = row.original.total_cost;
+      if (cost == null) {
+        return <span className="text-sm text-doubleword-neutral-600">-</span>;
+      }
+      return (
+        <span className="text-sm text-green-700 font-medium flex items-center gap-1">
+          <DollarSign className="w-3 h-3" />
+          {formatCost(cost).slice(1)}
         </span>
       );
     },
@@ -117,12 +155,16 @@ const columns: ColumnDef<AsyncRequest>[] = [
   {
     id: "duration",
     header: "Duration",
-    cell: ({ row }) => (
-      <div className="flex items-center gap-1 text-sm text-doubleword-neutral-900">
-        <Clock className="w-3 h-3" />
-        {formatDuration(row.original.duration_ms)}
-      </div>
-    ),
+    cell: ({ row }) => {
+      const ms = row.original.duration_ms;
+      if (!ms) return <span className="text-sm text-doubleword-neutral-600">-</span>;
+      return (
+        <div className="flex items-center gap-1 text-sm text-doubleword-neutral-900">
+          <Clock className="w-3 h-3" />
+          {formatLongDuration(ms)}
+        </div>
+      );
+    },
   },
 ];
 

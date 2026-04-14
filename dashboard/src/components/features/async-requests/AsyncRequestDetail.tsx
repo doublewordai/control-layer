@@ -66,6 +66,12 @@ function formatDuration(ms: number | null): string {
   return `${minutes}m ${remainingSeconds}s`;
 }
 
+function formatCost(cost: number): string {
+  if (cost < 0.0001) return `$${cost.toFixed(6)}`;
+  if (cost < 0.01) return `$${cost.toFixed(4)}`;
+  return `$${cost.toFixed(2)}`;
+}
+
 const roleColors: Record<string, string> = {
   system: "text-doubleword-purple",
   user: "text-blue-700",
@@ -187,6 +193,12 @@ export function AsyncRequestDetail() {
           </h3>
 
           <div className="space-y-4">
+            <MetadataField label="Request ID">
+              <span className="font-mono text-xs text-doubleword-neutral-700 break-all">
+                {request.id}
+              </span>
+            </MetadataField>
+
             <MetadataField label="Status">
               <span
                 className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${getStatusColor(status)}`}
@@ -203,12 +215,7 @@ export function AsyncRequestDetail() {
 
             <MetadataField label="Created">
               <span className="text-sm text-doubleword-neutral-900">
-                {new Date(request.created_at).toLocaleString(undefined, {
-                  month: "short",
-                  day: "numeric",
-                  hour: "numeric",
-                  minute: "2-digit",
-                })}
+                {new Date(request.created_at).toLocaleString()}
               </span>
             </MetadataField>
 
@@ -219,11 +226,64 @@ export function AsyncRequestDetail() {
             </MetadataField>
           </div>
 
+          {/* Token Metrics */}
+          {request.total_tokens != null && (
+            <>
+              <div className="my-4 h-px bg-doubleword-border" />
+
+              <h3 className="text-xs uppercase tracking-wide font-medium text-doubleword-neutral-600 mb-4">
+                Tokens
+              </h3>
+
+              <div className="space-y-3">
+                <div className="flex justify-between text-sm">
+                  <span className="text-doubleword-neutral-600">Prompt</span>
+                  <span className="text-doubleword-neutral-900 tabular-nums">
+                    {(request.prompt_tokens ?? 0).toLocaleString()}
+                  </span>
+                </div>
+                <div className="flex justify-between text-sm">
+                  <span className="text-doubleword-neutral-600">Completion</span>
+                  <span className="text-doubleword-neutral-900 tabular-nums">
+                    {(request.completion_tokens ?? 0).toLocaleString()}
+                  </span>
+                </div>
+                {request.reasoning_tokens != null && request.reasoning_tokens > 0 && (
+                  <div className="flex justify-between text-sm">
+                    <span className="text-doubleword-neutral-600">Reasoning</span>
+                    <span className="text-doubleword-neutral-900 tabular-nums">
+                      {request.reasoning_tokens.toLocaleString()}
+                    </span>
+                  </div>
+                )}
+                <div className="flex justify-between text-sm font-medium border-t border-doubleword-border-light pt-2">
+                  <span className="text-doubleword-neutral-900">Total</span>
+                  <span className="text-doubleword-neutral-900 tabular-nums">
+                    {request.total_tokens.toLocaleString()}
+                  </span>
+                </div>
+              </div>
+            </>
+          )}
+
+          {/* Cost */}
+          {request.total_cost != null && (
+            <>
+              <div className="my-4 h-px bg-doubleword-border" />
+
+              <MetadataField label="Cost">
+                <span className="text-sm font-medium text-green-700">
+                  {formatCost(request.total_cost)}
+                </span>
+              </MetadataField>
+            </>
+          )}
+
           <div className="my-4 h-px bg-doubleword-border" />
 
           <Link
             to={`/batches/${request.batch_id}`}
-            className="text-xs text-doubleword-primary hover:underline"
+            className="text-xs text-doubleword-neutral-600 hover:text-doubleword-neutral-900 hover:underline"
           >
             View related batch →
           </Link>
