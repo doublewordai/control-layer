@@ -6,7 +6,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "../../ui/card";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "../../ui/collapsible";
 import { CodeBlock } from "../../ui/code-block";
 import { formatTimestamp } from "../../../utils";
-import { toast } from "sonner";
+
 
 const getStatusColor = (status: string): string => {
   switch (status) {
@@ -56,28 +56,6 @@ function prettyJson(raw: string): string {
   }
 }
 
-function CopyButton({ text, label }: { text: string; label?: string }) {
-  const [copied, setCopied] = useState(false);
-  const handleCopy = async () => {
-    await navigator.clipboard.writeText(text);
-    setCopied(true);
-    toast.success(label ? `${label} copied` : "Copied to clipboard");
-    setTimeout(() => setCopied(false), 2000);
-  };
-  return (
-    <button
-      onClick={handleCopy}
-      className="flex items-center gap-1 px-2 py-1 text-xs text-gray-500 hover:text-gray-700 hover:bg-gray-100 rounded transition-colors"
-    >
-      {copied ? (
-        <Check className="w-3 h-3" />
-      ) : (
-        <Copy className="w-3 h-3" />
-      )}
-      {copied ? "Copied!" : "Copy"}
-    </button>
-  );
-}
 
 function CopyIconButton({ value }: { value: string }) {
   const [copied, setCopied] = useState(false);
@@ -175,7 +153,7 @@ export function AsyncRequestDetail() {
                   <ChevronRight className="w-4 h-4 text-gray-400 transition-transform group-data-[state=open]:rotate-90" />
                   <CardTitle>Input</CardTitle>
                 </CollapsibleTrigger>
-                <CopyButton text={inputJson} label="Input JSON" />
+                <CopyIconButton value={inputJson} />
               </CardHeader>
               <CollapsibleContent>
                 <CardContent className="px-6 pb-6 pt-0">
@@ -192,7 +170,7 @@ export function AsyncRequestDetail() {
             <CardHeader className="flex w-full justify-between px-6 pt-5 pb-4">
               <CardTitle>Output</CardTitle>
               {outputJson && (
-                <CopyButton text={outputJson} label="Output JSON" />
+                <CopyIconButton value={outputJson} />
               )}
             </CardHeader>
             <CardContent className="px-6 pb-6 pt-0">
