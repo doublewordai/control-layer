@@ -1245,6 +1245,7 @@ pub async fn build_router(
             "/monitoring/pending-request-counts",
             get(api::handlers::queue::get_pending_request_counts),
         )
+        .route("/monitoring/demand", get(api::handlers::queue::get_demand))
         // Tool sources CRUD
         .route("/tool-sources", get(api::handlers::tool_sources::list_tool_sources))
         .route("/tool-sources", post(api::handlers::tool_sources::create_tool_source))

@@ -2,3 +2,8 @@
 members = ["dwctl"]
 resolver = "2"
 
+# TODO(demand-endpoint): remove once fusillade releases the
+# `get_pending_request_counts_by_model_and_window` signature (doublewordai/fusillade#217).
+[patch.crates-io]
+fusillade = { path = "../fusillade" }
+

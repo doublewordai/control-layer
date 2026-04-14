@@ -472,7 +472,7 @@ pub async fn create_batch<P: PoolProvider>(
         }
     }
 
-    let windows = vec![(req.completion_window.clone(), parse_window_to_seconds(&req.completion_window))];
+    let windows = vec![(req.completion_window.clone(), 0i64, parse_window_to_seconds(&req.completion_window))];
     let states = vec!["pending".to_string(), "claimed".to_string(), "processing".to_string()];
 
     let model_throughputs = batch_model_info.throughputs;
@@ -689,7 +689,7 @@ async fn reserve_capacity_for_batch<P: PoolProvider>(
     file_model_counts: &HashMap<String, i64>,
     model_throughputs: &HashMap<String, f32>,
     model_ids_by_alias: &HashMap<String, Uuid>,
-    windows: &[(String, i64)],
+    windows: &[(String, i64, i64)],
     states: &[String],
     model_filter: &[String],
     relaxation_factor: f32,
@@ -733,7 +733,7 @@ async fn reserve_capacity_for_batch<P: PoolProvider>(
     // Fetch pending counts AFTER locks to avoid stale snapshots
     let pending_counts = state
         .request_manager
-        .get_pending_request_counts_by_model_and_completion_window(windows, states, model_filter, true)
+        .get_pending_request_counts_by_model_and_window(windows, states, model_filter, true)
         .await
         .map_err(|e| Error::Internal {
             operation: format!("get pending counts: {}", e),
@@ -2796,7 +2796,7 @@ mod tests {
         let model_throughputs = HashMap::from([(alias.clone(), 1000.0_f32)]);
         let model_ids_by_alias = HashMap::from([(alias.clone(), model_id)]);
 
-        let windows = vec![("24h".to_string(), super::parse_window_to_seconds("24h"))];
+        let windows = vec![("24h".to_string(), 0i64, super::parse_window_to_seconds("24h"))];
         let states = vec!["pending".to_string(), "claimed".to_string(), "processing".to_string()];
         let model_filter = vec![alias.clone()];
 
@@ -2858,7 +2858,7 @@ mod tests {
         let model_throughputs = HashMap::from([(alias.clone(), 0.0_f32)]);
         let model_ids_by_alias = HashMap::from([(alias.clone(), model_id)]);
 
-        let windows = vec![("1h".to_string(), super::parse_window_to_seconds("1h"))];
+        let windows = vec![("1h".to_string(), 0i64, super::parse_window_to_seconds("1h"))];
         let states = vec!["pending".to_string(), "claimed".to_string(), "processing".to_string()];
         let model_filter = vec![alias.clone()];
 
@@ -3219,7 +3219,7 @@ mod tests {
         let file_model_counts = HashMap::from([(alias.clone(), 5_i64)]);
         let model_throughputs = HashMap::from([(alias.clone(), 0.001_f32)]);
         let model_ids_by_alias = HashMap::from([(alias.clone(), model_id)]);
-        let windows = vec![("1h".to_string(), super::parse_window_to_seconds("1h"))];
+        let windows = vec![("1h".to_string(), 0i64, super::parse_window_to_seconds("1h"))];
         let states = vec!["pending".to_string(), "claimed".to_string(), "processing".to_string()];
         let model_filter = vec![alias.clone()];
 
@@ -3286,7 +3286,7 @@ mod tests {
         let model_filter = vec![alias.clone()];
 
         // 1h window — strict (factor defaults to 1.0), 5 > 3.6, rejected
-        let windows_1h = vec![("1h".to_string(), super::parse_window_to_seconds("1h"))];
+        let windows_1h = vec![("1h".to_string(), 0i64, super::parse_window_to_seconds("1h"))];
         let err = super::reserve_capacity_for_batch(
             &state,
             "1h",
@@ -3303,7 +3303,7 @@ mod tests {
         assert!(matches!(err, Error::TooManyRequests { .. }), "1h should be rejected — not relaxed");
 
         // 24h window — factor=10.0, effective capacity = 86400 * 0.001 * 10 = 864, accepted
-        let windows_24h = vec![("24h".to_string(), super::parse_window_to_seconds("24h"))];
+        let windows_24h = vec![("24h".to_string(), 0i64, super::parse_window_to_seconds("24h"))];
         let reservation_ids = super::reserve_capacity_for_batch(
             &state,
             "24h",
