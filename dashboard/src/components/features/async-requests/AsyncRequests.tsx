@@ -102,7 +102,10 @@ const columns: ColumnDef<AsyncRequest>[] = [
     cell: ({ row }) => {
       const { prompt_tokens, completion_tokens, reasoning_tokens, total_tokens } =
         row.original;
-      if (prompt_tokens == null && completion_tokens == null) {
+      if (
+        (prompt_tokens == null && completion_tokens == null) ||
+        (prompt_tokens === 0 && completion_tokens === 0)
+      ) {
         return <span className="text-sm text-doubleword-neutral-600">-</span>;
       }
       return (
