@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { Code, X } from "lucide-react";
+import { Code, Play, X } from "lucide-react";
 import { type ColumnDef } from "@tanstack/react-table";
 import { Button } from "../../ui/button";
 import { DataTable } from "../../ui/data-table";
@@ -134,7 +134,10 @@ export function AsyncRequests() {
             <Code className="mr-2 h-4 w-4" />
             API
           </Button>
-          <Button onClick={() => setCreateModalOpen(true)}>Create</Button>
+          <Button variant="outline" onClick={() => setCreateModalOpen(true)}>
+            <Play className="w-4 h-4 mr-2" />
+            Create Async
+          </Button>
         </div>
       </div>
 
