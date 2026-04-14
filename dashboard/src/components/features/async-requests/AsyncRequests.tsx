@@ -102,14 +102,14 @@ const columns: ColumnDef<AsyncRequest>[] = [
     cell: ({ row }) => {
       const { prompt_tokens, completion_tokens, reasoning_tokens, total_tokens } =
         row.original;
-      if (total_tokens == null) {
+      if (prompt_tokens == null && completion_tokens == null) {
         return <span className="text-sm text-doubleword-neutral-600">-</span>;
       }
       return (
         <Tooltip>
           <TooltipTrigger asChild>
             <span className="text-sm text-doubleword-neutral-900 tabular-nums cursor-help">
-              {total_tokens.toLocaleString()}
+              {(prompt_tokens ?? 0).toLocaleString()} / {(completion_tokens ?? 0).toLocaleString()}
             </span>
           </TooltipTrigger>
           <TooltipContent side="top" className="text-xs space-y-1">
@@ -127,10 +127,12 @@ const columns: ColumnDef<AsyncRequest>[] = [
                 <span className="tabular-nums">{reasoning_tokens.toLocaleString()}</span>
               </div>
             )}
-            <div className="flex justify-between gap-4 border-t pt-1 mt-1 font-medium">
-              <span>Total</span>
-              <span className="tabular-nums">{total_tokens.toLocaleString()}</span>
-            </div>
+            {total_tokens != null && (
+              <div className="flex justify-between gap-4 border-t pt-1 mt-1 font-medium">
+                <span>Total</span>
+                <span className="tabular-nums">{total_tokens.toLocaleString()}</span>
+              </div>
+            )}
           </TooltipContent>
         </Tooltip>
       );
