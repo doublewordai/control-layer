@@ -1224,6 +1224,11 @@ pub async fn build_router(
         .route("/session/organization", post(api::handlers::organizations::set_active_organization))
         // Support requests
         .route("/support/requests", post(api::handlers::support::submit_support_request))
+        .route("/batches/requests", get(api::handlers::batch_requests::list_batch_requests))
+        .route(
+            "/batches/requests/{request_id}",
+            get(api::handlers::batch_requests::get_batch_request),
+        )
         .route("/requests", get(api::handlers::requests::list_requests))
         .route("/requests/aggregate", get(api::handlers::requests::aggregate_requests))
         .route("/requests/aggregate-by-user", get(api::handlers::requests::aggregate_by_user))
