@@ -1,7 +1,10 @@
 import { useState } from "react";
 import { useParams, useNavigate, Link } from "react-router-dom";
-import { ArrowLeft, Copy, Check, ChevronRight } from "lucide-react";
-import { useAsyncRequest } from "../../../api/control-layer/hooks";
+import { ArrowLeft, Copy, Check, ChevronRight, RotateCcw } from "lucide-react";
+import { useAsyncRequest, useRetryBatchRequests } from "../../../api/control-layer/hooks";
+import { Button } from "../../ui/button";
+import { toast } from "sonner";
+import { useQueryClient } from "@tanstack/react-query";
 import { Card, CardContent, CardHeader, CardTitle } from "../../ui/card";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "../../ui/collapsible";
 import { CodeBlock } from "../../ui/code-block";
@@ -139,6 +142,9 @@ export function AsyncRequestDetail() {
             </div>
           </div>
         </div>
+        {status === "failed" && (
+          <RetryButton batchId={request.batch_id} requestId={request.id} />
+        )}
       </div>
 
       {/* Grid layout */}
@@ -321,5 +327,32 @@ export function AsyncRequestDetail() {
         </div>
       </div>
     </div>
+  );
+}
+
+function RetryButton({ batchId, requestId }: { batchId: string; requestId: string }) {
+  const retryMutation = useRetryBatchRequests();
+  const queryClient = useQueryClient();
+
+  const handleRetry = async () => {
+    try {
+      await retryMutation.mutateAsync({ batchId, requestIds: [requestId] });
+      queryClient.invalidateQueries({ queryKey: ["asyncRequests"] });
+      queryClient.invalidateQueries({ queryKey: ["asyncRequests", "detail", requestId] });
+      toast.success("Request queued for retry");
+    } catch {
+      toast.error("Failed to retry request");
+    }
+  };
+
+  return (
+    <Button
+      variant="outline"
+      onClick={handleRetry}
+      disabled={retryMutation.isPending}
+    >
+      <RotateCcw className={`h-4 w-4 mr-2 ${retryMutation.isPending ? "animate-spin" : ""}`} />
+      {retryMutation.isPending ? "Retrying..." : "Retry"}
+    </Button>
   );
 }
