@@ -21,6 +21,7 @@ import {
   Check,
   Cable,
   Plus,
+  Zap,
 } from "lucide-react";
 import {
   useUser,
@@ -96,9 +97,9 @@ export function AppSidebar() {
 
   const allNavItems: NavItem[] = [
     {
-      path: "/batches",
+      path: "/workloads",
       icon: Box,
-      label: "Batches",
+      label: "Workloads",
       demoOnly: false,
       hidden: config !== undefined && !config.batches?.enabled,
     },
@@ -156,6 +157,74 @@ export function AppSidebar() {
           <SidebarGroupContent>
             <SidebarMenu>
               {navItems.map((item) => {
+                // Workloads gets a collapsible section with Async and Batch sub-items
+                if (item.path === "/workloads") {
+                  const isAsyncActive =
+                    location.pathname.startsWith("/workloads/async");
+                  const isBatchActive =
+                    location.pathname.startsWith("/workloads/batch");
+                  return (
+                    <Collapsible
+                      key="workloads"
+                      defaultOpen
+                      className="group/collapsible"
+                    >
+                      <SidebarMenuItem>
+                        <CollapsibleTrigger asChild>
+                          <SidebarMenuButton
+                            isActive={isAsyncActive || isBatchActive}
+                            className={
+                              isAsyncActive || isBatchActive
+                                ? "bg-sidebar-accent! text-sidebar-accent-foreground! hover:bg-sidebar-accent!"
+                                : "hover:bg-sidebar-border/50"
+                            }
+                          >
+                            <Box className="h-4 w-4" />
+                            <span>Workloads</span>
+                            <ChevronRight className="ml-auto h-4 w-4 transition-transform group-data-[state=open]/collapsible:rotate-90" />
+                          </SidebarMenuButton>
+                        </CollapsibleTrigger>
+                        <CollapsibleContent>
+                          <SidebarMenuSub>
+                            <SidebarMenuSubItem>
+                              <SidebarMenuSubButton
+                                asChild
+                                isActive={isAsyncActive}
+                                className={
+                                  isAsyncActive
+                                    ? "bg-sidebar-accent! text-sidebar-accent-foreground!"
+                                    : "hover:bg-sidebar-border/50 hover:text-sidebar-foreground"
+                                }
+                              >
+                                <NavLink to="/workloads/async">
+                                  <Zap className="h-3.5 w-3.5" />
+                                  Async
+                                </NavLink>
+                              </SidebarMenuSubButton>
+                            </SidebarMenuSubItem>
+                            <SidebarMenuSubItem>
+                              <SidebarMenuSubButton
+                                asChild
+                                isActive={isBatchActive}
+                                className={
+                                  isBatchActive
+                                    ? "bg-sidebar-accent! text-sidebar-accent-foreground!"
+                                    : "hover:bg-sidebar-border/50 hover:text-sidebar-foreground"
+                                }
+                              >
+                                <NavLink to="/workloads/batch">
+                                  <Box className="h-3.5 w-3.5" />
+                                  Batch
+                                </NavLink>
+                              </SidebarMenuSubButton>
+                            </SidebarMenuSubItem>
+                          </SidebarMenuSub>
+                        </CollapsibleContent>
+                      </SidebarMenuItem>
+                    </Collapsible>
+                  );
+                }
+
                 // Platform managers get collapsible Models section with sub-items
                 if (item.path === "/models" && canManageModels) {
                   const isManageModelsActive =

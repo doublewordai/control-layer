@@ -87,6 +87,7 @@ export const ROUTE_PERMISSIONS: Record<string, PagePermission> = {
   "/system": "settings",
   "/profile": "profile",
   "/batches": "batches",
+  "/workloads": "batches",
   "/usage": "usage",
   "/connections": "connections",
 };
@@ -116,9 +117,9 @@ export function canAccessRoute(userRoles: Role[], path: string): boolean {
  * Get the first accessible route for a user (fallback when current route is restricted)
  */
 export function getFirstAccessibleRoute(userRoles: Role[]): string {
-  // Priority order for fallback routes - batches first if user has access
+  // Priority order for fallback routes - workloads first if user has access
   const fallbackOrder: string[] = [
-    "/batches",
+    "/workloads",
     "/models",
     "/playground",
     "/api-keys",

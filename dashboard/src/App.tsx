@@ -1,4 +1,4 @@
-import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
+import { BrowserRouter, Routes, Route, Navigate, useParams } from "react-router-dom";
 import { Component, useEffect, lazy, Suspense, type ReactNode } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ReactQueryDevtools } from "@tanstack/react-query-devtools";
@@ -162,6 +162,16 @@ const AcceptInvite = lazy(() =>
     default: m.AcceptInvite,
   })),
 );
+const AsyncRequests = lazy(() =>
+  import("./components/features/async-requests").then((m) => ({
+    default: m.AsyncRequests,
+  })),
+);
+const AsyncRequestDetail = lazy(() =>
+  import("./components/features/async-requests").then((m) => ({
+    default: m.AsyncRequestDetail,
+  })),
+);
 const Connections = lazy(() =>
   import("./components/features/connections").then((m) => ({
     default: m.Connections,
@@ -257,6 +267,16 @@ function RootRedirect() {
 
   // If authenticated, redirect to first accessible route
   return <Navigate to={getFirstAccessibleRoute()} replace />;
+}
+
+function BatchIdRedirect() {
+  const { batchId } = useParams();
+  return <Navigate to={`/workloads/batch/${batchId}`} replace />;
+}
+
+function BatchFileRedirect() {
+  const { fileId } = useParams();
+  return <Navigate to={`/workloads/batch/files/${fileId}/content`} replace />;
 }
 
 function AppRoutes() {
@@ -372,8 +392,33 @@ function AppRoutes() {
             </AppLayout>
           }
         />
+        {/* Workloads routes */}
         <Route
-          path="/batches"
+          path="/workloads/async"
+          element={
+            <AppLayout>
+              <ProtectedRoute path="/batches">
+                <Suspense fallback={<RouteLoader />}>
+                  <AsyncRequests />
+                </Suspense>
+              </ProtectedRoute>
+            </AppLayout>
+          }
+        />
+        <Route
+          path="/workloads/async/:requestId"
+          element={
+            <AppLayout>
+              <ProtectedRoute path="/batches">
+                <Suspense fallback={<RouteLoader />}>
+                  <AsyncRequestDetail />
+                </Suspense>
+              </ProtectedRoute>
+            </AppLayout>
+          }
+        />
+        <Route
+          path="/workloads/batch"
           element={
             <AppLayout>
               <ProtectedRoute path="/batches">
@@ -385,10 +430,10 @@ function AppRoutes() {
           }
         />
         <Route
-          path="/batches/:batchId"
+          path="/workloads/batch/:batchId"
           element={
             <AppLayout>
-              <ProtectedRoute path="/batches/:batchId">
+              <ProtectedRoute path="/batches">
                 <Suspense fallback={<RouteLoader />}>
                   <BatchInfo />
                 </Suspense>
@@ -397,16 +442,29 @@ function AppRoutes() {
           }
         />
         <Route
-          path="/batches/files/:fileId/content"
+          path="/workloads/batch/files/:fileId/content"
           element={
             <AppLayout>
-              <ProtectedRoute path="/batches/files/:fileId/content">
+              <ProtectedRoute path="/batches">
                 <Suspense fallback={<RouteLoader />}>
                   <FileRequests />
                 </Suspense>
               </ProtectedRoute>
             </AppLayout>
           }
+        />
+        {/* Redirects from old /batches paths */}
+        <Route
+          path="/batches"
+          element={<Navigate to="/workloads/batch" replace />}
+        />
+        <Route
+          path="/batches/files/:fileId/content"
+          element={<BatchFileRedirect />}
+        />
+        <Route
+          path="/batches/:batchId"
+          element={<BatchIdRedirect />}
         />
         <Route
           path="/endpoints"

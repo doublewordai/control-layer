@@ -128,7 +128,7 @@ const BatchInfo: React.FC = () => {
           </p>
           <Button
             variant="outline"
-            onClick={() => navigate(fromUrl || "/batches")}
+            onClick={() => navigate(fromUrl || "/workloads/batch")}
             className="mt-4"
           >
             <ArrowLeft className="mr-2 h-4 w-4" />
@@ -146,7 +146,7 @@ const BatchInfo: React.FC = () => {
           <p className="text-gray-600 font-semibold">Batch not found</p>
           <Button
             variant="outline"
-            onClick={() => navigate(fromUrl || "/batches")}
+            onClick={() => navigate(fromUrl || "/workloads/batch")}
             className="mt-4"
           >
             <ArrowLeft className="mr-2 h-4 w-4" />
@@ -285,7 +285,7 @@ const BatchInfo: React.FC = () => {
                   // Go back to details tab
                   handleTabChange("details");
                 } else {
-                  navigate(fromUrl || "/batches");
+                  navigate(fromUrl || "/workloads/batch");
                 }
               }}
               className="p-2 text-gray-500 hover:bg-gray-100 rounded-lg transition-colors"
