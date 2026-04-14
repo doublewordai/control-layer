@@ -383,10 +383,10 @@ export function Batches({
     // Preserve current URL params when navigating to file content
     const currentParams = searchParams.toString();
     const fromUrl = currentParams
-      ? `/workloads/batch?${currentParams}`
-      : `/workloads/batch?tab=${activeTab}`;
+      ? `/batches?${currentParams}`
+      : `/batches?tab=${activeTab}`;
     navigate(
-      `/workloads/batch/files/${file.id}/content?from=${encodeURIComponent(fromUrl)}`,
+      `/batches/files/${file.id}/content?from=${encodeURIComponent(fromUrl)}`,
     );
   };
 
@@ -514,8 +514,8 @@ export function Batches({
     if ((batch as any)._isEmpty) return;
     // Preserve current URL params (pagination, search, filters) when navigating to batch detail
     const currentParams = searchParams.toString();
-    const fromUrl = currentParams ? `/workloads/batch?${currentParams}` : "/workloads/batch";
-    navigate(`/workloads/batch/${batch.id}?from=${encodeURIComponent(fromUrl)}`);
+    const fromUrl = currentParams ? `/batches?${currentParams}` : "/batches";
+    navigate(`/batches/${batch.id}?from=${encodeURIComponent(fromUrl)}`);
   };
 
   const batchColumns = createBatchColumns({

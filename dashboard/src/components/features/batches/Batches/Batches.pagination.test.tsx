@@ -43,7 +43,7 @@ vi.mock("../../../../utils/authorization", () => ({
     isLoading: false,
     hasPermission: () => true,
     canAccessRoute: () => true,
-    getFirstAccessibleRoute: () => "/workloads",
+    getFirstAccessibleRoute: () => "/batches",
   })),
 }));
 

@@ -65,7 +65,7 @@ export const createRequestColumns = (): ColumnDef<RequestsEntry>[] => [
       const shortId = batchId.slice(0, 8);
       return (
         <Link
-          to={`/workloads/batch/${batchId}`}
+          to={`/batches/${batchId}`}
           className="inline-flex items-center gap-1 text-sm text-blue-600 hover:text-blue-800 hover:underline"
         >
           <span className="font-mono">{shortId}</span>

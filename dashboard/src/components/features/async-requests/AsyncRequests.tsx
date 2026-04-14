@@ -160,7 +160,7 @@ export function AsyncRequests() {
         columns={columns}
         data={requests}
         isLoading={isLoading}
-        onRowClick={(row) => navigate(`/workloads/async/${row.id}`)}
+        onRowClick={(row) => navigate(`/async/${row.id}`)}
       />
 
       <CreateAsyncModal

@@ -17,7 +17,7 @@ vi.mock("../../../../utils/authorization", () => ({
     isLoading: false,
     hasPermission: () => true,
     canAccessRoute: () => true,
-    getFirstAccessibleRoute: () => "/workloads",
+    getFirstAccessibleRoute: () => "/batches",
   })),
 }));
 
@@ -67,9 +67,9 @@ function renderBatchInfo() {
 
   return render(
     <QueryClientProvider client={queryClient}>
-      <MemoryRouter initialEntries={["/workloads/batch/batch-1"]}>
+      <MemoryRouter initialEntries={["/batches/batch-1"]}>
         <Routes>
-          <Route path="/workloads/batch/:batchId" element={<BatchInfo />} />
+          <Route path="/batches/:batchId" element={<BatchInfo />} />
         </Routes>
       </MemoryRouter>
     </QueryClientProvider>,

@@ -162,7 +162,7 @@ function SyncEntryList({
               <EntryStatusBadge status={entry.status} />
               {entry.batch_id ? (
                 <a
-                  href={`/workloads/batch?search=${entry.batch_id}`}
+                  href={`/batches?search=${entry.batch_id}`}
                   className="text-xs text-blue-600 hover:underline inline-block w-10"
                 >
                   batch

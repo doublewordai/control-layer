@@ -97,16 +97,16 @@ export function AppSidebar() {
 
   const allNavItems: NavItem[] = [
     {
-      path: "/workloads/async",
-      icon: Zap,
-      label: "Async",
+      path: "/batches",
+      icon: Box,
+      label: "Batches",
       demoOnly: false,
       hidden: config !== undefined && !config.batches?.enabled,
     },
     {
-      path: "/workloads/batch",
-      icon: Box,
-      label: "Batches",
+      path: "/async",
+      icon: Zap,
+      label: "Async",
       demoOnly: false,
       hidden: config !== undefined && !config.batches?.enabled,
     },

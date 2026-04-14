@@ -97,7 +97,7 @@ export function AsyncRequestDetail() {
       {/* Header */}
       <div className="flex items-center gap-3 border-b px-6 py-4">
         <button
-          onClick={() => navigate("/workloads/async")}
+          onClick={() => navigate("/async")}
           className="text-sm text-muted-foreground hover:text-foreground"
         >
           ← Back
@@ -222,7 +222,7 @@ export function AsyncRequestDetail() {
           <div className="space-y-4">
             <MetadataField label="Batch ID">
               <Link
-                to={`/workloads/batch/${request.batch_id}`}
+                to={`/batches/${request.batch_id}`}
                 className="text-xs font-mono text-indigo-400 hover:underline"
               >
                 {request.batch_id.slice(0, 12)}...

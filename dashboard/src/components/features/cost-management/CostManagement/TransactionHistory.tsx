@@ -497,7 +497,7 @@ export function TransactionHistory({
                       ? `/cost-management?${currentParams}`
                       : "/cost-management";
                     navigate(
-                      `/workloads/batch/${transaction.batch_id}?from=${encodeURIComponent(fromUrl)}`,
+                      `/batches/${transaction.batch_id}?from=${encodeURIComponent(fromUrl)}`,
                     );
                   }
                 };

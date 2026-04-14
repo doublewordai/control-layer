@@ -122,7 +122,7 @@ export function FileRequests() {
       {/* Compact Header with Back Button */}
       <div className="mb-6 flex items-center gap-4">
         <button
-          onClick={() => navigate(fromUrl || `/workloads/batch?tab=${returnTab}`)}
+          onClick={() => navigate(fromUrl || `/batches?tab=${returnTab}`)}
           className="p-2 text-gray-500 hover:bg-gray-100 rounded-lg transition-colors shrink-0"
           aria-label={fromUrl ? "Go Back" : "Back to Batches"}
           title="Back to Batches"

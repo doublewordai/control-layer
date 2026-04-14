@@ -83,7 +83,7 @@ const BatchInfo: React.FC = () => {
     setActiveTab(value);
     const newParams = new URLSearchParams(searchParams);
     newParams.set("tab", value);
-    navigate(`/workloads/batch/${batchId}?${newParams.toString()}`, { replace: true });
+    navigate(`/batches/${batchId}?${newParams.toString()}`, { replace: true });
   };
 
   const handleRetry = () => {
@@ -128,7 +128,7 @@ const BatchInfo: React.FC = () => {
           </p>
           <Button
             variant="outline"
-            onClick={() => navigate(fromUrl || "/workloads/batch")}
+            onClick={() => navigate(fromUrl || "/batches")}
             className="mt-4"
           >
             <ArrowLeft className="mr-2 h-4 w-4" />
@@ -146,7 +146,7 @@ const BatchInfo: React.FC = () => {
           <p className="text-gray-600 font-semibold">Batch not found</p>
           <Button
             variant="outline"
-            onClick={() => navigate(fromUrl || "/workloads/batch")}
+            onClick={() => navigate(fromUrl || "/batches")}
             className="mt-4"
           >
             <ArrowLeft className="mr-2 h-4 w-4" />
@@ -285,7 +285,7 @@ const BatchInfo: React.FC = () => {
                   // Go back to details tab
                   handleTabChange("details");
                 } else {
-                  navigate(fromUrl || "/workloads/batch");
+                  navigate(fromUrl || "/batches");
                 }
               }}
               className="p-2 text-gray-500 hover:bg-gray-100 rounded-lg transition-colors"
@@ -464,7 +464,7 @@ const BatchInfo: React.FC = () => {
                             className="text-center p-3 rounded-lg hover:bg-gray-50 transition-colors cursor-pointer disabled:cursor-default disabled:hover:bg-transparent"
                             onClick={() => {
                               if (batch.request_counts.total > 0) {
-                                navigate(`/workloads/batch/${batchId}?tab=results`);
+                                navigate(`/batches/${batchId}?tab=results`);
                               }
                             }}
                             disabled={batch.request_counts.total === 0}
@@ -486,7 +486,7 @@ const BatchInfo: React.FC = () => {
                             onClick={() => {
                               if (batch.request_counts.completed > 0) {
                                 navigate(
-                                  `/workloads/batch/${batchId}?tab=results&status=completed`,
+                                  `/batches/${batchId}?tab=results&status=completed`,
                                 );
                               }
                             }}
@@ -509,7 +509,7 @@ const BatchInfo: React.FC = () => {
                             onClick={() => {
                               if (batch.request_counts.failed > 0) {
                                 navigate(
-                                  `/workloads/batch/${batchId}?tab=results&status=failed`,
+                                  `/batches/${batchId}?tab=results&status=failed`,
                                 );
                               }
                             }}
@@ -747,7 +747,7 @@ const BatchInfo: React.FC = () => {
                               size="sm"
                               onClick={() =>
                                 navigate(
-                                  `/workloads/batch/files/${batch.input_file_id}/content?from=/batches/${batchId}`,
+                                  `/batches/files/${batch.input_file_id}/content?from=/batches/${batchId}`,
                                 )
                               }
                               className="shrink-0"
@@ -786,7 +786,7 @@ const BatchInfo: React.FC = () => {
                                 size="sm"
                                 onClick={() =>
                                   navigate(
-                                    `/workloads/batch/files/${batch.output_file_id}/content?from=/batches/${batchId}`,
+                                    `/batches/files/${batch.output_file_id}/content?from=/batches/${batchId}`,
                                   )
                                 }
                                 className="shrink-0"
@@ -813,7 +813,7 @@ const BatchInfo: React.FC = () => {
                                 size="sm"
                                 onClick={() =>
                                   navigate(
-                                    `/workloads/batch/files/${batch.error_file_id}/content?from=/batches/${batchId}`,
+                                    `/batches/files/${batch.error_file_id}/content?from=/batches/${batchId}`,
                                   )
                                 }
                                 className="shrink-0"
