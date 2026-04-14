@@ -383,10 +383,10 @@ export function Batches({
     // Preserve current URL params when navigating to file content
     const currentParams = searchParams.toString();
     const fromUrl = currentParams
-      ? `/batches?${currentParams}`
-      : `/batches?tab=${activeTab}`;
+      ? `/workloads/batch?${currentParams}`
+      : `/workloads/batch?tab=${activeTab}`;
     navigate(
-      `/batches/files/${file.id}/content?from=${encodeURIComponent(fromUrl)}`,
+      `/workloads/batch/files/${file.id}/content?from=${encodeURIComponent(fromUrl)}`,
     );
   };
 

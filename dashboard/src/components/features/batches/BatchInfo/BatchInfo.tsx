@@ -83,7 +83,7 @@ const BatchInfo: React.FC = () => {
     setActiveTab(value);
     const newParams = new URLSearchParams(searchParams);
     newParams.set("tab", value);
-    navigate(`/batches/${batchId}?${newParams.toString()}`, { replace: true });
+    navigate(`/workloads/batch/${batchId}?${newParams.toString()}`, { replace: true });
   };
 
   const handleRetry = () => {
@@ -464,7 +464,7 @@ const BatchInfo: React.FC = () => {
                             className="text-center p-3 rounded-lg hover:bg-gray-50 transition-colors cursor-pointer disabled:cursor-default disabled:hover:bg-transparent"
                             onClick={() => {
                               if (batch.request_counts.total > 0) {
-                                navigate(`/batches/${batchId}?tab=results`);
+                                navigate(`/workloads/batch/${batchId}?tab=results`);
                               }
                             }}
                             disabled={batch.request_counts.total === 0}
@@ -486,7 +486,7 @@ const BatchInfo: React.FC = () => {
                             onClick={() => {
                               if (batch.request_counts.completed > 0) {
                                 navigate(
-                                  `/batches/${batchId}?tab=results&status=completed`,
+                                  `/workloads/batch/${batchId}?tab=results&status=completed`,
                                 );
                               }
                             }}
@@ -509,7 +509,7 @@ const BatchInfo: React.FC = () => {
                             onClick={() => {
                               if (batch.request_counts.failed > 0) {
                                 navigate(
-                                  `/batches/${batchId}?tab=results&status=failed`,
+                                  `/workloads/batch/${batchId}?tab=results&status=failed`,
                                 );
                               }
                             }}
@@ -747,7 +747,7 @@ const BatchInfo: React.FC = () => {
                               size="sm"
                               onClick={() =>
                                 navigate(
-                                  `/batches/files/${batch.input_file_id}/content?from=/batches/${batchId}`,
+                                  `/workloads/batch/files/${batch.input_file_id}/content?from=/batches/${batchId}`,
                                 )
                               }
                               className="shrink-0"
@@ -786,7 +786,7 @@ const BatchInfo: React.FC = () => {
                                 size="sm"
                                 onClick={() =>
                                   navigate(
-                                    `/batches/files/${batch.output_file_id}/content?from=/batches/${batchId}`,
+                                    `/workloads/batch/files/${batch.output_file_id}/content?from=/batches/${batchId}`,
                                   )
                                 }
                                 className="shrink-0"
@@ -813,7 +813,7 @@ const BatchInfo: React.FC = () => {
                                 size="sm"
                                 onClick={() =>
                                   navigate(
-                                    `/batches/files/${batch.error_file_id}/content?from=/batches/${batchId}`,
+                                    `/workloads/batch/files/${batch.error_file_id}/content?from=/batches/${batchId}`,
                                   )
                                 }
                                 className="shrink-0"

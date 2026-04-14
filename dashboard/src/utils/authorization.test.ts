@@ -58,12 +58,12 @@ describe("canAccessRoute", () => {
 });
 
 describe("getFirstAccessibleRoute", () => {
-  it("returns /workloads as first choice for PlatformManager", () => {
-    expect(getFirstAccessibleRoute(["PlatformManager"])).toBe("/workloads");
+  it("returns /workloads/batch as first choice for PlatformManager", () => {
+    expect(getFirstAccessibleRoute(["PlatformManager"])).toBe("/workloads/batch");
   });
 
-  it("returns /workloads as first choice for BatchAPIUser", () => {
-    expect(getFirstAccessibleRoute(["BatchAPIUser"])).toBe("/workloads");
+  it("returns /workloads/batch as first choice for BatchAPIUser", () => {
+    expect(getFirstAccessibleRoute(["BatchAPIUser"])).toBe("/workloads/batch");
   });
 
   it("returns /models as first choice for StandardUser (no batches access)", () => {

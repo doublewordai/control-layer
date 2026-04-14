@@ -1,4 +1,4 @@
-import { BrowserRouter, Routes, Route, Navigate, useParams } from "react-router-dom";
+import { BrowserRouter, Routes, Route, Navigate, useParams, useLocation } from "react-router-dom";
 import { Component, useEffect, lazy, Suspense, type ReactNode } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ReactQueryDevtools } from "@tanstack/react-query-devtools";
@@ -269,14 +269,21 @@ function RootRedirect() {
   return <Navigate to={getFirstAccessibleRoute()} replace />;
 }
 
+function BatchListRedirect() {
+  const location = useLocation();
+  return <Navigate to={`/workloads/batch${location.search}`} replace />;
+}
+
 function BatchIdRedirect() {
   const { batchId } = useParams();
-  return <Navigate to={`/workloads/batch/${batchId}`} replace />;
+  const location = useLocation();
+  return <Navigate to={`/workloads/batch/${batchId}${location.search}`} replace />;
 }
 
 function BatchFileRedirect() {
   const { fileId } = useParams();
-  return <Navigate to={`/workloads/batch/files/${fileId}/content`} replace />;
+  const location = useLocation();
+  return <Navigate to={`/workloads/batch/files/${fileId}/content${location.search}`} replace />;
 }
 
 function AppRoutes() {
@@ -456,7 +463,7 @@ function AppRoutes() {
         {/* Redirects from old /batches paths */}
         <Route
           path="/batches"
-          element={<Navigate to="/workloads/batch" replace />}
+          element={<BatchListRedirect />}
         />
         <Route
           path="/batches/files/:fileId/content"
