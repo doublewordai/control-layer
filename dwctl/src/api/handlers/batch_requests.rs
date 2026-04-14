@@ -80,26 +80,66 @@ pub async fn list_batch_requests<P: PoolProvider>(
     let pool = state.db.read();
 
     // Count query
-    let total_count: i64 = sqlx::query_scalar(&build_count_query(
-        created_by_filter.as_deref(),
-        query.completion_window.as_deref(),
-        query.status.as_deref(),
-        query.model.as_deref(),
-    ))
+    let total_count: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)::bigint
+        FROM fusillade.requests r
+        JOIN fusillade.batches b ON r.batch_id = b.id
+        WHERE b.deleted_at IS NULL
+          AND ($1::text IS NULL OR b.created_by = $1)
+          AND ($2::text IS NULL OR b.completion_window = $2)
+          AND ($3::text IS NULL OR r.state = $3)
+          AND ($4::text IS NULL OR r.model = $4)
+        "#,
+    )
+    .bind(created_by_filter.as_deref())
+    .bind(query.completion_window.as_deref())
+    .bind(query.status.as_deref())
+    .bind(query.model.as_deref())
     .fetch_one(pool)
     .await
     .map_err(|e| Error::Database(e.into()))?;
 
-    // Data query
-    let requests: Vec<BatchRequestSummary> = sqlx::query_as(&build_list_query(
-        created_by_filter.as_deref(),
-        query.completion_window.as_deref(),
-        query.status.as_deref(),
-        query.model.as_deref(),
-        active_first,
-        skip,
-        limit,
+    // Data query — use active_first to pick ordering
+    let order_clause = if active_first {
+        "CASE r.state WHEN 'processing' THEN 0 WHEN 'claimed' THEN 1 WHEN 'pending' THEN 2 ELSE 3 END ASC, r.created_at DESC"
+    } else {
+        "r.created_at DESC"
+    };
+
+    let requests: Vec<BatchRequestSummary> = sqlx::query_as(&format!(
+        r#"
+            SELECT
+                r.id,
+                r.batch_id,
+                r.model,
+                r.state,
+                r.created_at,
+                r.completed_at,
+                r.failed_at,
+                (CASE
+                    WHEN r.completed_at IS NOT NULL AND r.started_at IS NOT NULL
+                    THEN EXTRACT(EPOCH FROM (r.completed_at - r.started_at)) * 1000
+                    ELSE NULL
+                END)::float8 as duration_ms,
+                r.response_status
+            FROM fusillade.requests r
+            JOIN fusillade.batches b ON r.batch_id = b.id
+            WHERE b.deleted_at IS NULL
+              AND ($1::text IS NULL OR b.created_by = $1)
+              AND ($2::text IS NULL OR b.completion_window = $2)
+              AND ($3::text IS NULL OR r.state = $3)
+              AND ($4::text IS NULL OR r.model = $4)
+            ORDER BY {order_clause}
+            LIMIT $5 OFFSET $6
+            "#
     ))
+    .bind(created_by_filter.as_deref())
+    .bind(query.completion_window.as_deref())
+    .bind(query.status.as_deref())
+    .bind(query.model.as_deref())
+    .bind(limit)
+    .bind(skip)
     .fetch_all(pool)
     .await
     .map_err(|e| Error::Database(e.into()))?;
@@ -143,19 +183,20 @@ pub async fn get_batch_request<P: PoolProvider>(
             r.created_at,
             r.completed_at,
             r.failed_at,
-            CASE
+            (CASE
                 WHEN r.completed_at IS NOT NULL AND r.started_at IS NOT NULL
                 THEN EXTRACT(EPOCH FROM (r.completed_at - r.started_at)) * 1000
                 ELSE NULL
-            END as duration_ms,
+            END)::float8 as duration_ms,
             r.response_status,
-            r.body,
+            COALESCE(t.body, '') as body,
             r.response_body,
             r.error,
             b.completion_window,
             b.created_by as batch_created_by
         FROM fusillade.requests r
         JOIN fusillade.batches b ON r.batch_id = b.id
+        LEFT JOIN fusillade.request_templates t ON r.template_id = t.id
         WHERE r.id = $1 AND b.deleted_at IS NULL
         "#,
     )
@@ -178,91 +219,6 @@ pub async fn get_batch_request<P: PoolProvider>(
     }
 
     Ok(Json(request))
-}
-
-// ---------------------------------------------------------------------------
-// SQL query builders
-// ---------------------------------------------------------------------------
-
-fn build_where_clause(created_by: Option<&str>, completion_window: Option<&str>, status: Option<&str>, model: Option<&str>) -> String {
-    let mut conditions = vec!["b.deleted_at IS NULL".to_string()];
-
-    if let Some(cb) = created_by {
-        conditions.push(format!("b.created_by = '{}'", cb.replace('\'', "''")));
-    }
-    if let Some(cw) = completion_window {
-        conditions.push(format!("b.completion_window = '{}'", cw.replace('\'', "''")));
-    }
-    if let Some(s) = status {
-        conditions.push(format!("r.state = '{}'", s.replace('\'', "''")));
-    }
-    if let Some(m) = model {
-        conditions.push(format!("r.model = '{}'", m.replace('\'', "''")));
-    }
-
-    conditions.join(" AND ")
-}
-
-fn build_count_query(created_by: Option<&str>, completion_window: Option<&str>, status: Option<&str>, model: Option<&str>) -> String {
-    let where_clause = build_where_clause(created_by, completion_window, status, model);
-    format!(
-        r#"
-        SELECT COUNT(*)::bigint
-        FROM fusillade.requests r
-        JOIN fusillade.batches b ON r.batch_id = b.id
-        WHERE {where_clause}
-        "#
-    )
-}
-
-fn build_list_query(
-    created_by: Option<&str>,
-    completion_window: Option<&str>,
-    status: Option<&str>,
-    model: Option<&str>,
-    active_first: bool,
-    skip: i64,
-    limit: i64,
-) -> String {
-    let where_clause = build_where_clause(created_by, completion_window, status, model);
-
-    let order_by = if active_first {
-        r#"
-        CASE r.state
-            WHEN 'processing' THEN 0
-            WHEN 'claimed' THEN 1
-            WHEN 'pending' THEN 2
-            ELSE 3
-        END ASC,
-        r.created_at DESC
-        "#
-    } else {
-        "r.created_at DESC"
-    };
-
-    format!(
-        r#"
-        SELECT
-            r.id,
-            r.batch_id,
-            r.model,
-            r.state,
-            r.created_at,
-            r.completed_at,
-            r.failed_at,
-            CASE
-                WHEN r.completed_at IS NOT NULL AND r.started_at IS NOT NULL
-                THEN EXTRACT(EPOCH FROM (r.completed_at - r.started_at)) * 1000
-                ELSE NULL
-            END as duration_ms,
-            r.response_status
-        FROM fusillade.requests r
-        JOIN fusillade.batches b ON r.batch_id = b.id
-        WHERE {where_clause}
-        ORDER BY {order_by}
-        LIMIT {limit} OFFSET {skip}
-        "#
-    )
 }
 
 #[cfg(test)]
