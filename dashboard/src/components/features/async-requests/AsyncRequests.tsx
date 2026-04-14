@@ -260,6 +260,23 @@ export function AsyncRequests() {
                 pagination.handleReset();
               }}
             />
+            <span className="text-sm text-gray-600">Rows:</span>
+            <Select
+              value={pagination.pageSize.toString()}
+              onValueChange={(value) =>
+                pagination.handlePageSizeChange(Number(value))
+              }
+            >
+              <SelectTrigger className="w-20 h-9">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="10">10</SelectItem>
+                <SelectItem value="20">20</SelectItem>
+                <SelectItem value="50">50</SelectItem>
+                <SelectItem value="100">100</SelectItem>
+              </SelectContent>
+            </Select>
           </div>
         }
       />
