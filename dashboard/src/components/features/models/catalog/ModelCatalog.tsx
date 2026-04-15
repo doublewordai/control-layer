@@ -591,8 +591,8 @@ function SectionTable({
 
   return (
     <div className="border rounded-lg overflow-hidden">
-      <div>
-        <Table className="w-full">
+      <div className="max-w-full overflow-hidden md:overflow-visible">
+        <Table className="w-full table-fixed">
           <TableHeader>
             <TableRow>
               <TableHead className="px-1 md:px-2 w-6 md:w-8" />
