@@ -574,82 +574,84 @@ console.log(response.choices[0].message.content);`;
 
         {model && (
           <div className="w-full overflow-hidden">
-            {/* Example Type Selection — Three tabs */}
+            {/* Example Type Selection — Three tabs + async method selector */}
             <div className="mb-6">
-              <ToggleGroup
-                type="single"
-                value={exampleType}
-                onValueChange={(value) =>
-                  value && setExampleType(value as ExampleType)
-                }
-                className="inline-flex"
-                variant="outline"
-                size="sm"
-              >
-                {!isBatchDenied(model) && (
-                  <ToggleGroupItem
-                    value="batch"
-                    aria-label="Batch API (24h)"
-                    className="px-5 py-1.5"
-                  >
-                    Batch
-                  </ToggleGroupItem>
-                )}
-                {!isBatchDenied(model) && config?.batches?.async_requests?.enabled && (
-                  <ToggleGroupItem
-                    value="async"
-                    aria-label={`Async API (${asyncWindow})`}
-                    className="px-5 py-1.5"
-                  >
-                    Async
-                  </ToggleGroupItem>
-                )}
-                {!isRealtimeDenied(model) && (
-                  <ToggleGroupItem
-                    value="realtime"
-                    aria-label="Realtime API"
-                    className="px-5 py-1.5"
-                  >
-                    Realtime
-                  </ToggleGroupItem>
-                )}
-              </ToggleGroup>
-
-              {/* Async method sub-tabs */}
-              {exampleType === "async" && (
-                <div className="mt-4">
-                  <ToggleGroup
-                    type="single"
-                    value={asyncMethod}
-                    onValueChange={(value) =>
-                      value && setAsyncMethod(value as "autobatcher" | "jsonl")
-                    }
-                    className="inline-flex"
-                    variant="outline"
-                    size="sm"
-                  >
+              <div className="flex items-center justify-between">
+                <ToggleGroup
+                  type="single"
+                  value={exampleType}
+                  onValueChange={(value) =>
+                    value && setExampleType(value as ExampleType)
+                  }
+                  className="inline-flex"
+                  variant="outline"
+                  size="sm"
+                >
+                  {!isBatchDenied(model) && (
                     <ToggleGroupItem
-                      value="autobatcher"
-                      aria-label="Autobatcher"
-                      className="px-4 py-1"
+                      value="batch"
+                      aria-label="Batch API (24h)"
+                      className="px-5 py-1.5"
                     >
-                      Autobatcher
+                      Batch
                     </ToggleGroupItem>
-                    <ToggleGroupItem
-                      value="jsonl"
-                      aria-label="JSONL"
-                      className="px-4 py-1"
-                    >
-                      JSONL
-                    </ToggleGroupItem>
-                  </ToggleGroup>
-                  {asyncMethod === "autobatcher" && (
-                    <p className="text-xs text-gray-500 mt-2">
-                      Install: <code className="bg-gray-100 px-1.5 py-0.5 rounded text-xs font-mono">pip install autobatcher</code>
-                    </p>
                   )}
-                </div>
-              )}
+                  {!isBatchDenied(model) && config?.batches?.async_requests?.enabled && (
+                    <ToggleGroupItem
+                      value="async"
+                      aria-label={`Async API (${asyncWindow})`}
+                      className="px-5 py-1.5"
+                    >
+                      Async
+                    </ToggleGroupItem>
+                  )}
+                  {!isRealtimeDenied(model) && (
+                    <ToggleGroupItem
+                      value="realtime"
+                      aria-label="Realtime API"
+                      className="px-5 py-1.5"
+                    >
+                      Realtime
+                    </ToggleGroupItem>
+                  )}
+                </ToggleGroup>
+
+                {/* Async method selector — inline on the right */}
+                {exampleType === "async" && (
+                  <div className="flex items-center gap-2">
+                    {asyncMethod === "autobatcher" && (
+                      <span className="text-xs text-gray-500">
+                        <code className="bg-gray-100 px-1.5 py-0.5 rounded font-mono">pip install autobatcher</code>
+                      </span>
+                    )}
+                    <ToggleGroup
+                      type="single"
+                      value={asyncMethod}
+                      onValueChange={(value) =>
+                        value && setAsyncMethod(value as "autobatcher" | "jsonl")
+                      }
+                      className="inline-flex"
+                      variant="outline"
+                      size="sm"
+                    >
+                      <ToggleGroupItem
+                        value="autobatcher"
+                        aria-label="Autobatcher"
+                        className="px-4 py-1.5"
+                      >
+                        Autobatcher
+                      </ToggleGroupItem>
+                      <ToggleGroupItem
+                        value="jsonl"
+                        aria-label="JSONL"
+                        className="px-4 py-1.5"
+                      >
+                        JSONL
+                      </ToggleGroupItem>
+                    </ToggleGroup>
+                  </div>
+                )}
+              </div>
 
               {/* JSONL example for batch tab or async+jsonl method */}
               {(exampleType === "batch" || (exampleType === "async" && asyncMethod === "jsonl")) && (
