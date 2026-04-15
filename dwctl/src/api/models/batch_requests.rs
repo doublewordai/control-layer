@@ -1,6 +1,5 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::FromRow;
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
@@ -35,13 +34,13 @@ pub struct ListBatchRequestsQuery {
     pub active_first: Option<bool>,
 }
 
-/// Individual batch request summary for list endpoint
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, FromRow)]
+/// Individual batch request summary for list endpoint.
+/// Combines fusillade request data with http_analytics enrichment.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct BatchRequestSummary {
     pub id: Uuid,
     pub batch_id: Uuid,
     pub model: String,
-    #[sqlx(rename = "state")]
     pub status: String,
     pub created_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,
@@ -56,13 +55,13 @@ pub struct BatchRequestSummary {
     pub created_by_email: Option<String>,
 }
 
-/// Full batch request detail including input/output
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, FromRow)]
+/// Full batch request detail including input/output.
+/// Combines fusillade request detail with http_analytics enrichment.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct BatchRequestDetail {
     pub id: Uuid,
     pub batch_id: Uuid,
     pub model: String,
-    #[sqlx(rename = "state")]
     pub status: String,
     pub created_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,

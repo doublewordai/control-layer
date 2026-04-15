@@ -1,12 +1,14 @@
 //! Batch request handlers
 //!
 //! Endpoints for listing individual requests across fusillade batches.
-//! Queries the fusillade schema directly for cross-batch request listing.
+//! Uses fusillade's Storage trait for request queries, enriches with
+//! http_analytics data (tokens, cost) from the dwctl database.
 
 use axum::{
     extract::{Path, Query, State},
     response::Json,
 };
+use fusillade::Storage;
 use sqlx_pool_router::PoolProvider;
 use uuid::Uuid;
 
@@ -38,9 +40,8 @@ fn is_batch_owner(current_user: &CurrentUser, created_by: &str) -> bool {
 
 /// List individual batch requests across all batches
 ///
-/// Returns a paginated list of individual requests from the fusillade requests table,
-/// with optional filtering by completion window, status, and model. Supports
-/// active-first sorting to show in-progress requests at the top.
+/// Uses fusillade for core request listing, then enriches with token/cost
+/// metrics from http_analytics and user emails from the users table.
 #[utoipa::path(
     get,
     path = "/admin/api/v1/batches/requests",
@@ -62,9 +63,8 @@ pub async fn list_batch_requests<P: PoolProvider>(
     let skip = query.pagination.skip();
     let limit = query.pagination.limit();
     let can_read_all = can_read_all_resources(&current_user, Resource::Batches);
-    let active_first = query.active_first.unwrap_or(true);
 
-    // Build ownership filter — member_id overrides for PMs, otherwise own batches
+    // Build ownership filter
     let created_by_filter: Option<String> = if let Some(member_id) = query.member_id {
         Some(member_id.to_string())
     } else if can_read_all {
@@ -78,108 +78,124 @@ pub async fn list_batch_requests<P: PoolProvider>(
         )
     };
 
-    // Parse comma-separated model filter into array for ANY() matching
-    let model_filter: Option<Vec<String>> = query
-        .model
-        .as_ref()
-        .map(|m| m.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect());
+    // Parse comma-separated model filter
+    let models: Option<Vec<String>> = query.model.as_ref().map(|m| {
+        m.split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    });
 
-    let pool = state.db.read();
+    // Query fusillade for core request data
+    let result = state
+        .request_manager
+        .list_requests(fusillade::ListRequestsFilter {
+            created_by: created_by_filter,
+            completion_window: query.completion_window.clone(),
+            status: query.status.clone(),
+            models,
+            created_after: query.created_after,
+            created_before: query.created_before,
+            active_first: query.active_first.unwrap_or(true),
+            skip,
+            limit,
+        })
+        .await
+        .map_err(|e| Error::Internal {
+            operation: format!("list batch requests: {}", e),
+        })?;
 
-    // Count query
-    let total_count: i64 = sqlx::query_scalar(
-        r#"
-        SELECT COUNT(*)::bigint
-        FROM fusillade.requests r
-        JOIN fusillade.batches b ON r.batch_id = b.id
-        WHERE b.deleted_at IS NULL
-          AND ($1::text IS NULL OR b.created_by = $1)
-          AND ($2::text IS NULL OR b.completion_window = $2)
-          AND ($3::text IS NULL OR r.state = $3)
-          AND ($4::text[] IS NULL OR r.model = ANY($4))
-          AND ($5::timestamptz IS NULL OR r.created_at >= $5)
-          AND ($6::timestamptz IS NULL OR r.created_at <= $6)
-        "#,
-    )
-    .bind(created_by_filter.as_deref())
-    .bind(query.completion_window.as_deref())
-    .bind(query.status.as_deref())
-    .bind(model_filter.as_deref())
-    .bind(query.created_after)
-    .bind(query.created_before)
-    .fetch_one(pool)
-    .await
-    .map_err(|e| Error::Database(e.into()))?;
+    // Enrich with http_analytics data (tokens, cost) and user emails
+    let request_ids: Vec<Uuid> = result.data.iter().map(|r| r.id).collect();
 
-    // Data query — use active_first to pick ordering
-    let order_clause = if active_first {
-        "CASE r.state WHEN 'processing' THEN 0 WHEN 'claimed' THEN 1 WHEN 'pending' THEN 2 ELSE 3 END ASC, r.created_at DESC"
+    let analytics = if !request_ids.is_empty() {
+        sqlx::query_as::<_, AnalyticsRow>(
+            r#"
+            SELECT DISTINCT ON (fusillade_request_id)
+                fusillade_request_id as request_id,
+                prompt_tokens,
+                completion_tokens,
+                reasoning_tokens,
+                total_tokens,
+                total_cost::float8 as total_cost
+            FROM http_analytics
+            WHERE fusillade_request_id = ANY($1)
+            ORDER BY fusillade_request_id, timestamp DESC
+            "#,
+        )
+        .bind(&request_ids)
+        .fetch_all(state.db.read())
+        .await
+        .map_err(|e| Error::Database(e.into()))?
     } else {
-        "r.created_at DESC"
+        vec![]
     };
 
-    let requests: Vec<BatchRequestSummary> = sqlx::query_as(&format!(
-        r#"
-            SELECT
-                r.id,
-                r.batch_id,
-                r.model,
-                r.state,
-                r.created_at,
-                r.completed_at,
-                r.failed_at,
-                (CASE
-                    WHEN r.completed_at IS NOT NULL AND r.started_at IS NOT NULL
-                    THEN EXTRACT(EPOCH FROM (r.completed_at - r.started_at)) * 1000
-                    ELSE NULL
-                END)::float8 as duration_ms,
-                r.response_status,
-                ha.prompt_tokens,
-                ha.completion_tokens,
-                ha.reasoning_tokens,
-                ha.total_tokens,
-                ha.total_cost::float8 as total_cost,
-                u.email as created_by_email
-            FROM fusillade.requests r
-            JOIN fusillade.batches b ON r.batch_id = b.id
-            LEFT JOIN LATERAL (
-                SELECT ha2.prompt_tokens, ha2.completion_tokens, ha2.reasoning_tokens,
-                       ha2.total_tokens, ha2.total_cost
-                FROM http_analytics ha2
-                WHERE ha2.fusillade_request_id = r.id
-                ORDER BY ha2.timestamp DESC
-                LIMIT 1
-            ) ha ON true
-            LEFT JOIN users u ON u.id::text = b.created_by
-            WHERE b.deleted_at IS NULL
-              AND ($1::text IS NULL OR b.created_by = $1)
-              AND ($2::text IS NULL OR b.completion_window = $2)
-              AND ($3::text IS NULL OR r.state = $3)
-              AND ($4::text[] IS NULL OR r.model = ANY($4))
-              AND ($5::timestamptz IS NULL OR r.created_at >= $5)
-              AND ($6::timestamptz IS NULL OR r.created_at <= $6)
-            ORDER BY {order_clause}
-            LIMIT $7 OFFSET $8
-            "#
-    ))
-    .bind(created_by_filter.as_deref())
-    .bind(query.completion_window.as_deref())
-    .bind(query.status.as_deref())
-    .bind(model_filter.as_deref())
-    .bind(query.created_after)
-    .bind(query.created_before)
-    .bind(limit)
-    .bind(skip)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| Error::Database(e.into()))?;
+    let analytics_map: std::collections::HashMap<Uuid, AnalyticsRow> =
+        analytics.into_iter().map(|a| (a.request_id, a)).collect();
 
-    Ok(Json(PaginatedResponse::new(requests, total_count, skip, limit)))
+    // Fetch creator emails
+    let unique_creator_ids: Vec<String> = result
+        .data
+        .iter()
+        .map(|r| r.batch_id.to_string())
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+
+    let emails = if !unique_creator_ids.is_empty() {
+        sqlx::query_as::<_, EmailRow>(
+            "SELECT id::text as user_id, email FROM users WHERE id::text = ANY($1)",
+        )
+        .bind(&unique_creator_ids)
+        .fetch_all(state.db.read())
+        .await
+        .unwrap_or_default()
+    } else {
+        vec![]
+    };
+
+    let email_map: std::collections::HashMap<String, String> =
+        emails.into_iter().map(|e| (e.user_id, e.email)).collect();
+
+    // Combine fusillade data with analytics enrichment
+    let data: Vec<BatchRequestSummary> = result
+        .data
+        .into_iter()
+        .map(|r| {
+            let a = analytics_map.get(&r.id);
+            let email = email_map.get(&r.batch_id.to_string()).cloned();
+            BatchRequestSummary {
+                id: r.id,
+                batch_id: r.batch_id,
+                model: r.model,
+                status: r.status,
+                created_at: r.created_at,
+                completed_at: r.completed_at,
+                failed_at: r.failed_at,
+                duration_ms: r.duration_ms,
+                response_status: r.response_status,
+                prompt_tokens: a.and_then(|a| a.prompt_tokens),
+                completion_tokens: a.and_then(|a| a.completion_tokens),
+                reasoning_tokens: a.and_then(|a| a.reasoning_tokens),
+                total_tokens: a.and_then(|a| a.total_tokens),
+                total_cost: a.and_then(|a| a.total_cost),
+                created_by_email: email,
+            }
+        })
+        .collect();
+
+    Ok(Json(PaginatedResponse::new(
+        data,
+        result.total_count,
+        skip,
+        limit,
+    )))
 }
 
 /// Get individual batch request detail
 ///
-/// Returns full request detail including the request body and response.
+/// Uses fusillade for core request detail, enriches with analytics.
 #[utoipa::path(
     get,
     path = "/admin/api/v1/batches/requests/{request_id}",
@@ -201,67 +217,85 @@ pub async fn get_batch_request<P: PoolProvider>(
     current_user: CurrentUser,
     _: RequiresPermission<resource::Batches, operation::ReadOwn>,
 ) -> Result<Json<BatchRequestDetail>> {
-    let pool = state.db.read();
-
-    let request: BatchRequestDetail = sqlx::query_as(
-        r#"
-        SELECT
-            r.id,
-            r.batch_id,
-            r.model,
-            r.state,
-            r.created_at,
-            r.completed_at,
-            r.failed_at,
-            (CASE
-                WHEN r.completed_at IS NOT NULL AND r.started_at IS NOT NULL
-                THEN EXTRACT(EPOCH FROM (r.completed_at - r.started_at)) * 1000
-                ELSE NULL
-            END)::float8 as duration_ms,
-            r.response_status,
-            ha.prompt_tokens,
-            ha.completion_tokens,
-            ha.reasoning_tokens,
-            ha.total_tokens,
-            ha.total_cost::float8 as total_cost,
-            COALESCE(t.body, '') as body,
-            r.response_body,
-            r.error,
-            b.completion_window,
-            b.created_by as batch_created_by
-        FROM fusillade.requests r
-        JOIN fusillade.batches b ON r.batch_id = b.id
-        LEFT JOIN fusillade.request_templates t ON r.template_id = t.id
-        LEFT JOIN LATERAL (
-            SELECT ha2.prompt_tokens, ha2.completion_tokens, ha2.reasoning_tokens,
-                   ha2.total_tokens, ha2.total_cost
-            FROM http_analytics ha2
-            WHERE ha2.fusillade_request_id = r.id
-            ORDER BY ha2.timestamp DESC
-            LIMIT 1
-        ) ha ON true
-        WHERE r.id = $1 AND b.deleted_at IS NULL
-        "#,
-    )
-    .bind(request_id)
-    .fetch_optional(pool)
-    .await
-    .map_err(|e| Error::Database(e.into()))?
-    .ok_or_else(|| Error::NotFound {
-        resource: "BatchRequest".to_string(),
-        id: request_id.to_string(),
-    })?;
+    // Get core request detail from fusillade
+    let detail = state
+        .request_manager
+        .get_request_detail(fusillade::RequestId(request_id))
+        .await
+        .map_err(|_| Error::NotFound {
+            resource: "BatchRequest".to_string(),
+            id: request_id.to_string(),
+        })?;
 
     // Check ownership
     let can_read_all = can_read_all_resources(&current_user, Resource::Batches);
-    if !can_read_all && !is_batch_owner(&current_user, &request.batch_created_by) {
+    if !can_read_all && !is_batch_owner(&current_user, &detail.batch_created_by) {
         return Err(Error::NotFound {
             resource: "BatchRequest".to_string(),
             id: request_id.to_string(),
         });
     }
 
-    Ok(Json(request))
+    // Enrich with analytics from http_analytics (dwctl-owned table)
+    let analytics = sqlx::query_as::<_, AnalyticsRow>(
+        r#"
+        SELECT DISTINCT ON (fusillade_request_id)
+            fusillade_request_id as request_id,
+            prompt_tokens,
+            completion_tokens,
+            reasoning_tokens,
+            total_tokens,
+            total_cost::float8 as total_cost
+        FROM http_analytics
+        WHERE fusillade_request_id = $1
+        ORDER BY fusillade_request_id, timestamp DESC
+        "#,
+    )
+    .bind(request_id)
+    .fetch_optional(state.db.read())
+    .await
+    .map_err(|e| Error::Database(e.into()))?;
+
+    Ok(Json(BatchRequestDetail {
+        id: detail.id,
+        batch_id: detail.batch_id,
+        model: detail.model,
+        status: detail.status,
+        created_at: detail.created_at,
+        completed_at: detail.completed_at,
+        failed_at: detail.failed_at,
+        duration_ms: detail.duration_ms,
+        response_status: detail.response_status,
+        prompt_tokens: analytics.as_ref().and_then(|a| a.prompt_tokens),
+        completion_tokens: analytics.as_ref().and_then(|a| a.completion_tokens),
+        reasoning_tokens: analytics.as_ref().and_then(|a| a.reasoning_tokens),
+        total_tokens: analytics.as_ref().and_then(|a| a.total_tokens),
+        total_cost: analytics.as_ref().and_then(|a| a.total_cost),
+        body: detail.body,
+        response_body: detail.response_body,
+        error: detail.error,
+        completion_window: detail.completion_window,
+        batch_created_by: detail.batch_created_by,
+    }))
+}
+
+/// Analytics data from http_analytics (dwctl-owned, not fusillade schema)
+#[derive(sqlx::FromRow)]
+struct AnalyticsRow {
+    #[allow(dead_code)]
+    request_id: Uuid,
+    prompt_tokens: Option<i64>,
+    completion_tokens: Option<i64>,
+    reasoning_tokens: Option<i64>,
+    total_tokens: Option<i64>,
+    total_cost: Option<f64>,
+}
+
+/// User email lookup from users table (dwctl-owned)
+#[derive(sqlx::FromRow)]
+struct EmailRow {
+    user_id: String,
+    email: String,
 }
 
 #[cfg(test)]
@@ -282,12 +316,19 @@ mod tests {
     #[test_log::test]
     async fn test_list_batch_requests_empty(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
-        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let user =
+            create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
 
         let response = app
             .get("/admin/api/v1/batches/requests")
-            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
-            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .add_header(
+                &add_auth_headers(&user)[0].0,
+                &add_auth_headers(&user)[0].1,
+            )
+            .add_header(
+                &add_auth_headers(&user)[1].0,
+                &add_auth_headers(&user)[1].1,
+            )
             .await;
 
         response.assert_status_ok();
