@@ -1,0 +1,67 @@
+<h2>Design Section 4 (Revised): Async Submission Modal</h2>
+<p class="subtitle">Single unified view — compose a request or drag-and-drop a JSONL</p>
+
+<div class="mockup">
+  <div class="mockup-header">Create Async Requests</div>
+  <div class="mockup-body" style="padding: 0;">
+    <div style="font-family: system-ui, sans-serif; font-size: 13px; background: #111; color: #ccc; padding: 28px; max-width: 480px; margin: 0 auto; min-height: 520px;">
+      <h3 style="margin: 0 0 4px; color: #fff; font-size: 15px;">Create Async Requests</h3>
+      <p style="margin: 0 0 24px; font-size: 12px; color: #666;">Submit requests for async processing (1h completion window)</p>
+
+      <!-- Model selector -->
+      <div style="margin-bottom: 16px;">
+        <label style="display: block; font-size: 11px; color: #666; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 4px;">Model</label>
+        <div style="background: #1a1a1a; border: 1px solid rgba(255,255,255,0.1); border-radius: 6px; padding: 8px 12px; font-size: 12px; color: #ddd; display: flex; justify-content: space-between; align-items: center;">
+          claude-sonnet-4 <span style="color: #555; font-size: 10px;">▼</span>
+        </div>
+      </div>
+
+      <!-- System prompt -->
+      <div style="margin-bottom: 16px;">
+        <label style="display: block; font-size: 11px; color: #666; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 4px;">System <span style="text-transform: none; color: #444;">(optional)</span></label>
+        <div style="background: #1a1a1a; border: 1px solid rgba(255,255,255,0.1); border-radius: 6px; padding: 8px 12px; font-size: 12px; color: #555; min-height: 36px;">
+          You are a helpful assistant...
+        </div>
+      </div>
+
+      <!-- User prompt -->
+      <div style="margin-bottom: 16px;">
+        <label style="display: block; font-size: 11px; color: #666; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 4px;">Prompt</label>
+        <div style="background: #1a1a1a; border: 1px solid rgba(255,255,255,0.1); border-radius: 6px; padding: 8px 12px; font-size: 12px; color: #ddd; min-height: 60px;">
+          Summarize the key points of...
+        </div>
+      </div>
+
+      <!-- Parameters row -->
+      <div style="display: flex; gap: 12px; margin-bottom: 20px;">
+        <div style="flex: 1;">
+          <label style="display: block; font-size: 11px; color: #666; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 4px;">Temperature</label>
+          <div style="background: #1a1a1a; border: 1px solid rgba(255,255,255,0.1); border-radius: 6px; padding: 8px 12px; font-size: 12px; color: #888;">0.7</div>
+        </div>
+        <div style="flex: 1;">
+          <label style="display: block; font-size: 11px; color: #666; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 4px;">Max Tokens</label>
+          <div style="background: #1a1a1a; border: 1px solid rgba(255,255,255,0.1); border-radius: 6px; padding: 8px 12px; font-size: 12px; color: #888;">4096</div>
+        </div>
+      </div>
+
+      <!-- OR divider -->
+      <div style="display: flex; align-items: center; gap: 12px; margin-bottom: 20px;">
+        <div style="flex: 1; height: 1px; background: rgba(255,255,255,0.08);"></div>
+        <span style="font-size: 11px; color: #444; text-transform: uppercase; letter-spacing: 0.1em;">or</span>
+        <div style="flex: 1; height: 1px; background: rgba(255,255,255,0.08);"></div>
+      </div>
+
+      <!-- Drop zone -->
+      <div style="border: 1px dashed rgba(255,255,255,0.12); border-radius: 8px; padding: 20px; text-align: center; margin-bottom: 20px; cursor: pointer;">
+        <p style="margin: 0 0 2px; font-size: 12px; color: #777;">Drop a .jsonl file here</p>
+        <p style="margin: 0; font-size: 11px; color: #444;">or click to browse</p>
+      </div>
+
+      <!-- Footer -->
+      <div style="display: flex; justify-content: flex-end; gap: 8px; padding-top: 16px; border-top: 1px solid rgba(255,255,255,0.06);">
+        <button style="background: transparent; color: #999; border: 1px solid rgba(255,255,255,0.1); padding: 8px 16px; border-radius: 6px; font-size: 12px; cursor: pointer;">Cancel</button>
+        <button style="background: #fff; color: #000; border: none; padding: 8px 16px; border-radius: 6px; font-size: 12px; font-weight: 600; cursor: pointer;">Create</button>
+      </div>
+    </div>
+  </div>
+</div>

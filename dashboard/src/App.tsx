@@ -1,5 +1,5 @@
 import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
-import { Component, useEffect, lazy, Suspense, type ReactNode } from "react";
+import { Component, useEffect, Suspense, type ReactNode } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ReactQueryDevtools } from "@tanstack/react-query-devtools";
 import { Toaster } from "./components/ui/sonner";
@@ -14,8 +14,10 @@ import {
 } from "./components/auth";
 import { SettingsProvider, useSettings, OrganizationProvider } from "./contexts";
 import { AuthProvider, useAuth } from "./contexts/auth";
-import { useAuthorization } from "./utils";
+import { useAuthorization, lazyWithRetry } from "./utils";
 import { useRegistrationInfo } from "./api/control-layer/hooks";
+import { captureException } from "./lib/telemetry";
+import { TelemetryIdentity } from "./lib/TelemetryIdentity";
 
 // Error boundary to catch and display React render errors
 class ErrorBoundary extends Component<
@@ -28,6 +30,10 @@ class ErrorBoundary extends Component<
   }
   componentDidCatch(error: Error, info: React.ErrorInfo) {
     console.error("React ErrorBoundary caught:", error, info.componentStack);
+    captureException(error, {
+      source: "react-error-boundary",
+      componentStack: info.componentStack ?? undefined,
+    });
   }
   render() {
     if (this.state.error) {
@@ -64,115 +70,115 @@ class ErrorBoundary extends Component<
 }
 
 // Lazy load route components
-const ApiKeys = lazy(() =>
+const ApiKeys = lazyWithRetry(() =>
   import("./components/features/api-keys").then((m) => ({
     default: m.ApiKeys,
   })),
 );
-const CostManagement = lazy(() =>
+const CostManagement = lazyWithRetry(() =>
   import("./components/features/cost-management").then((m) => ({
     default: m.CostManagement,
   })),
 );
-const Endpoints = lazy(() =>
+const Endpoints = lazyWithRetry(() =>
   import("./components/features/endpoints").then((m) => ({
     default: m.Endpoints,
   })),
 );
-const ModelCatalog = lazy(() =>
+const ModelCatalog = lazyWithRetry(() =>
   import("./components/features/models").then((m) => ({
     default: m.ModelCatalog,
   })),
 );
-const ModelDetail = lazy(() =>
+const ModelDetail = lazyWithRetry(() =>
   import("./components/features/models").then((m) => ({
     default: m.ModelDetail,
   })),
 );
-const Models = lazy(() =>
+const Models = lazyWithRetry(() =>
   import("./components/features/models").then((m) => ({ default: m.Models })),
 );
-const ModelInfo = lazy(() =>
+const ModelInfo = lazyWithRetry(() =>
   import("./components/features/models").then((m) => ({
     default: m.ModelInfo,
   })),
 );
-const ProviderDisplayConfigs = lazy(() =>
+const ProviderDisplayConfigs = lazyWithRetry(() =>
   import("./components/features/models").then((m) => ({
     default: m.ProviderDisplayConfigs,
   })),
 );
-const Playground = lazy(() =>
+const Playground = lazyWithRetry(() =>
   import("./components/features/playground").then((m) => ({
     default: m.Playground,
   })),
 );
-const Profile = lazy(() =>
+const Profile = lazyWithRetry(() =>
   import("./components/features/profile").then((m) => ({
     default: m.Profile,
   })),
 );
-const Requests = lazy(() =>
+const Requests = lazyWithRetry(() =>
   import("./components/features/requests").then((m) => ({
     default: m.Requests,
   })),
 );
-const UsersGroups = lazy(() =>
+const UsersGroups = lazyWithRetry(() =>
   import("./components/features/users-groups").then((m) => ({
     default: m.UsersGroups,
   })),
 );
-const Batches = lazy(() =>
+const Batches = lazyWithRetry(() =>
   import("./components/features/batches").then((m) => ({
     default: m.Batches,
   })),
 );
-const BatchInfo = lazy(() =>
+const BatchInfo = lazyWithRetry(() =>
   import("./components/features/batches").then((m) => ({
     default: m.BatchInfo,
   })),
 );
-const FileRequests = lazy(() =>
+const FileRequests = lazyWithRetry(() =>
   import("./components/features/batches/FileRequests").then((m) => ({
     default: m.FileRequests,
   })),
 );
-const System = lazy(() =>
+const System = lazyWithRetry(() =>
   import("./components/features/system").then((m) => ({
     default: m.System,
   })),
 );
-const Usage = lazy(() =>
+const Usage = lazyWithRetry(() =>
   import("./components/features/usage").then((m) => ({
     default: m.Usage,
   })),
 );
-const OrganizationDetail = lazy(() =>
+const OrganizationDetail = lazyWithRetry(() =>
   import("./components/features/organizations").then((m) => ({
     default: m.OrganizationDetail,
   })),
 );
-const MyOrganization = lazy(() =>
+const MyOrganization = lazyWithRetry(() =>
   import("./components/features/organizations").then((m) => ({
     default: m.MyOrganization,
   })),
 );
-const AcceptInvite = lazy(() =>
+const AcceptInvite = lazyWithRetry(() =>
   import("./components/features/organizations").then((m) => ({
     default: m.AcceptInvite,
   })),
 );
-const AsyncRequests = lazy(() =>
+const AsyncRequests = lazyWithRetry(() =>
   import("./components/features/async-requests").then((m) => ({
     default: m.AsyncRequests,
   })),
 );
-const AsyncRequestDetail = lazy(() =>
+const AsyncRequestDetail = lazyWithRetry(() =>
   import("./components/features/async-requests").then((m) => ({
     default: m.AsyncRequestDetail,
   })),
 );
-const Connections = lazy(() =>
+const Connections = lazyWithRetry(() =>
   import("./components/features/connections").then((m) => ({
     default: m.Connections,
   })),
@@ -652,6 +658,7 @@ function App() {
       <QueryClientProvider client={queryClient}>
         <SettingsProvider>
           <AuthProvider>
+            <TelemetryIdentity />
             <OrganizationProvider>
               <AppRoutes />
             </OrganizationProvider>

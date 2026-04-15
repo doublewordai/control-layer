@@ -1179,12 +1179,12 @@ pub struct DaemonConfig {
     #[serde(default = "default_urgency_weight", deserialize_with = "deserialize_urgency_weight")]
     pub urgency_weight: f64,
 
-    /// When true, the daemon injects a `priority` field into each outbound
-    /// request body equal to the Unix timestamp (seconds) of the batch SLA
-    /// deadline. Smaller values = more urgent. Requires inference backends
-    /// configured with lower-priority-first scheduling (vLLM's default
-    /// priority queue; SGLang launched with
-    /// `--schedule-low-priority-values-first`). Default: false.
+    /// When true, the daemon injects a deadline-derived priority hint into
+    /// each outbound request body at `nvext.agent_hints.priority` (NVIDIA
+    /// Dynamo's unified priority extension; `i32`, where higher values mean
+    /// "more important" at the API layer and Dynamo normalizes per backend).
+    /// The injected value is the negated Unix timestamp of the batch SLA
+    /// deadline so earlier deadlines produce larger numbers. Default: false.
     #[serde(default)]
     pub inject_deadline_priority: bool,
 }

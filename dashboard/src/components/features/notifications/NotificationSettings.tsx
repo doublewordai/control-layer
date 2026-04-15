@@ -46,6 +46,7 @@ import {
 } from "../../ui/dialog";
 import { Tabs, TabsList, TabsTrigger } from "../../ui/tabs";
 import type { Webhook, WebhookScope } from "../../../api/control-layer/types";
+import { copyToClipboard } from "../../../utils/clipboard";
 
 const OWN_EVENT_TYPE_OPTIONS = [
   {
@@ -344,9 +345,10 @@ export const NotificationSettings: React.FC<NotificationSettingsProps> = ({
   };
 
   const handleCopySecret = async (secret: string) => {
-    await navigator.clipboard.writeText(secret);
-    setCopiedSecret(true);
-    setTimeout(() => setCopiedSecret(false), 2000);
+    if (await copyToClipboard(secret)) {
+      setCopiedSecret(true);
+      setTimeout(() => setCopiedSecret(false), 2000);
+    }
   };
 
   return (

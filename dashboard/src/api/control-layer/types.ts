@@ -64,7 +64,8 @@ export type Role =
   | "RequestViewer"
   | "StandardUser"
   | "BillingManager"
-  | "BatchAPIUser";
+  | "BatchAPIUser"
+  | "ConnectionsUser";
 export type ApiKeyPurpose = "platform" | "realtime" | "batch" | "playground";
 export type TariffApiKeyPurpose = "realtime" | "batch" | "playground";
 

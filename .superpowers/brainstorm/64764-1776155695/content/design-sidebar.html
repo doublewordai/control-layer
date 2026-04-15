@@ -1,0 +1,86 @@
+<h2>Design Section 1: Sidebar Navigation</h2>
+<p class="subtitle">The "Workloads" section replaces the current "Batches" nav item</p>
+
+<div class="split">
+  <div class="mockup">
+    <div class="mockup-header">Current Sidebar</div>
+    <div class="mockup-body" style="padding: 0;">
+      <div style="font-family: system-ui, sans-serif; font-size: 13px; background: #111; color: #999; padding: 8px 0; min-height: 360px;">
+        <div style="padding: 8px 16px; color: #fff; font-weight: 600; display: flex; align-items: center; gap: 8px; background: rgba(255,255,255,0.05); margin-bottom: 4px;">
+          <span style="opacity: 0.5;">📦</span> Batches
+        </div>
+        <div style="padding: 8px 16px; display: flex; align-items: center; gap: 8px;">
+          <span style="opacity: 0.5;">📊</span> Models
+        </div>
+        <div style="padding: 8px 16px; display: flex; align-items: center; gap: 8px;">
+          <span style="opacity: 0.5;">▶️</span> Playground
+        </div>
+        <div style="padding: 8px 16px; display: flex; align-items: center; gap: 8px;">
+          <span style="opacity: 0.5;">📈</span> Analytics
+        </div>
+        <div style="padding: 8px 16px; display: flex; align-items: center; gap: 8px;">
+          <span style="opacity: 0.5;">👥</span> User Access
+        </div>
+        <div style="padding: 8px 16px; display: flex; align-items: center; gap: 8px;">
+          <span style="opacity: 0.5;">🔑</span> API Keys
+        </div>
+        <div style="padding: 8px 16px; display: flex; align-items: center; gap: 8px;">
+          <span style="opacity: 0.5;">📊</span> Usage
+        </div>
+        <div style="padding: 8px 16px; display: flex; align-items: center; gap: 8px;">
+          <span style="opacity: 0.5;">⚙️</span> System
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="mockup">
+    <div class="mockup-header">Proposed Sidebar</div>
+    <div class="mockup-body" style="padding: 0;">
+      <div style="font-family: system-ui, sans-serif; font-size: 13px; background: #111; color: #999; padding: 8px 0; min-height: 360px;">
+        <div style="padding: 6px 16px 2px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: #555; display: flex; align-items: center; justify-content: space-between; cursor: pointer;">
+          Workloads <span style="font-size: 10px;">▾</span>
+        </div>
+        <div style="padding: 8px 16px 8px 28px; color: #fff; font-weight: 600; display: flex; align-items: center; gap: 8px; background: rgba(255,255,255,0.05);">
+          <span style="opacity: 0.5;">⚡</span> Async
+        </div>
+        <div style="padding: 8px 16px 8px 28px; display: flex; align-items: center; gap: 8px;">
+          <span style="opacity: 0.5;">📦</span> Batch
+        </div>
+        <div style="height: 1px; background: rgba(255,255,255,0.06); margin: 4px 16px;"></div>
+        <div style="padding: 8px 16px; display: flex; align-items: center; gap: 8px;">
+          <span style="opacity: 0.5;">📊</span> Models
+        </div>
+        <div style="padding: 8px 16px; display: flex; align-items: center; gap: 8px;">
+          <span style="opacity: 0.5;">▶️</span> Playground
+        </div>
+        <div style="padding: 8px 16px; display: flex; align-items: center; gap: 8px;">
+          <span style="opacity: 0.5;">📈</span> Analytics
+        </div>
+        <div style="padding: 8px 16px; display: flex; align-items: center; gap: 8px;">
+          <span style="opacity: 0.5;">👥</span> User Access
+        </div>
+        <div style="padding: 8px 16px; display: flex; align-items: center; gap: 8px;">
+          <span style="opacity: 0.5;">🔑</span> API Keys
+        </div>
+        <div style="padding: 8px 16px; display: flex; align-items: center; gap: 8px;">
+          <span style="opacity: 0.5;">📊</span> Usage
+        </div>
+        <div style="padding: 8px 16px; display: flex; align-items: center; gap: 8px;">
+          <span style="opacity: 0.5;">⚙️</span> System
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="section" style="margin-top: 1.5rem; padding: 1rem 1.5rem; background: rgba(255,255,255,0.03); border-radius: 8px;">
+  <h3 style="margin-top: 0;">Details</h3>
+  <ul style="margin-bottom: 0;">
+    <li><strong>"Workloads"</strong> is a section header (small, uppercase, muted) — not a clickable page</li>
+    <li>Collapsible via the chevron, but <strong>expanded by default</strong></li>
+    <li><strong>Async</strong> listed first (primary workflow), <strong>Batch</strong> second</li>
+    <li>Routes: <code>/workloads/async</code> and <code>/workloads/batch</code></li>
+    <li>Old <code>/batches</code> route redirects to <code>/workloads/batch</code></li>
+  </ul>
+</div>

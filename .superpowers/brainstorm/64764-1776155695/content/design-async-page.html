@@ -1,0 +1,121 @@
+<h2>Design Section 3: Async Page — Request List</h2>
+<p class="subtitle">Flat chronological list of individual requests, active-first sorting, auto-refresh</p>
+
+<div class="mockup">
+  <div class="mockup-header">Async Page — Request List View</div>
+  <div class="mockup-body" style="padding: 0; overflow-x: auto;">
+    <div style="font-family: system-ui, sans-serif; font-size: 13px; background: #0a0a0a; color: #ccc; min-height: 400px;">
+      <!-- Header bar -->
+      <div style="display: flex; align-items: center; justify-content: space-between; padding: 16px 20px; border-bottom: 1px solid rgba(255,255,255,0.06);">
+        <div style="display: flex; align-items: center; gap: 16px;">
+          <h3 style="margin: 0; color: #fff; font-size: 16px;">Async Requests</h3>
+          <div style="display: flex; align-items: center; gap: 4px;">
+            <span style="width: 6px; height: 6px; background: #4ade80; border-radius: 50; display: inline-block; animation: pulse 2s infinite;"></span>
+            <span style="font-size: 11px; color: #666;">Auto-refreshing</span>
+          </div>
+        </div>
+        <div style="display: flex; gap: 8px;">
+          <button style="background: transparent; color: #999; border: 1px solid rgba(255,255,255,0.1); padding: 6px 12px; border-radius: 6px; font-size: 12px; cursor: pointer;">API Guide</button>
+          <button style="background: #fff; color: #000; border: none; padding: 6px 14px; border-radius: 6px; font-size: 12px; font-weight: 600; cursor: pointer;">+ New Request</button>
+        </div>
+      </div>
+
+      <!-- Table -->
+      <table style="width: 100%; border-collapse: collapse;">
+        <thead>
+          <tr style="border-bottom: 1px solid rgba(255,255,255,0.08); font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: #555;">
+            <th style="text-align: left; padding: 10px 20px; font-weight: 500;">Created</th>
+            <th style="text-align: left; padding: 10px 12px; font-weight: 500;">Model</th>
+            <th style="text-align: left; padding: 10px 12px; font-weight: 500;">Status</th>
+            <th style="text-align: left; padding: 10px 12px; font-weight: 500;">Tokens</th>
+            <th style="text-align: left; padding: 10px 12px; font-weight: 500;">Cost</th>
+            <th style="text-align: left; padding: 10px 12px; font-weight: 500;">Duration</th>
+            <th style="text-align: right; padding: 10px 20px; font-weight: 500;"></th>
+          </tr>
+        </thead>
+        <tbody>
+          <!-- Active request - highlighted -->
+          <tr style="border-bottom: 1px solid rgba(255,255,255,0.04); background: rgba(59,130,246,0.04);">
+            <td style="padding: 12px 20px; font-size: 12px; color: #888;">Apr 14, 3:02 PM</td>
+            <td style="padding: 12px; font-size: 12px; color: #ddd;">claude-sonnet-4</td>
+            <td style="padding: 12px;">
+              <span style="display: inline-flex; align-items: center; gap: 5px; background: rgba(59,130,246,0.15); color: #60a5fa; padding: 2px 8px; border-radius: 4px; font-size: 11px;">
+                <span style="width: 4px; height: 4px; background: #60a5fa; border-radius: 50%; display: inline-block;"></span>
+                running
+              </span>
+            </td>
+            <td style="padding: 12px; font-size: 12px; color: #555;">—</td>
+            <td style="padding: 12px; font-size: 12px; color: #555;">—</td>
+            <td style="padding: 12px; font-size: 12px; color: #555;">—</td>
+            <td style="padding: 12px 20px; text-align: right;"><span style="color: #555; cursor: pointer; font-size: 12px;">View →</span></td>
+          </tr>
+          <tr style="border-bottom: 1px solid rgba(255,255,255,0.04); background: rgba(59,130,246,0.04);">
+            <td style="padding: 12px 20px; font-size: 12px; color: #888;">Apr 14, 3:01 PM</td>
+            <td style="padding: 12px; font-size: 12px; color: #ddd;">gpt-4o</td>
+            <td style="padding: 12px;">
+              <span style="display: inline-flex; align-items: center; gap: 5px; background: rgba(234,179,8,0.12); color: #facc15; padding: 2px 8px; border-radius: 4px; font-size: 11px;">
+                <span style="width: 4px; height: 4px; background: #facc15; border-radius: 50%; display: inline-block;"></span>
+                queued
+              </span>
+            </td>
+            <td style="padding: 12px; font-size: 12px; color: #555;">—</td>
+            <td style="padding: 12px; font-size: 12px; color: #555;">—</td>
+            <td style="padding: 12px; font-size: 12px; color: #555;">—</td>
+            <td style="padding: 12px 20px; text-align: right;"><span style="color: #555; cursor: pointer; font-size: 12px;">View →</span></td>
+          </tr>
+          <!-- Completed requests -->
+          <tr style="border-bottom: 1px solid rgba(255,255,255,0.04);">
+            <td style="padding: 12px 20px; font-size: 12px; color: #888;">Apr 14, 2:45 PM</td>
+            <td style="padding: 12px; font-size: 12px; color: #ddd;">claude-sonnet-4</td>
+            <td style="padding: 12px;"><span style="background: rgba(34,197,94,0.15); color: #4ade80; padding: 2px 8px; border-radius: 4px; font-size: 11px;">completed</span></td>
+            <td style="padding: 12px; font-size: 12px; color: #888;">1,247 / 832</td>
+            <td style="padding: 12px; font-size: 12px; color: #888;">$0.012</td>
+            <td style="padding: 12px; font-size: 12px; color: #888;">12s</td>
+            <td style="padding: 12px 20px; text-align: right;"><span style="color: #555; cursor: pointer; font-size: 12px;">View →</span></td>
+          </tr>
+          <tr style="border-bottom: 1px solid rgba(255,255,255,0.04);">
+            <td style="padding: 12px 20px; font-size: 12px; color: #888;">Apr 14, 2:44 PM</td>
+            <td style="padding: 12px; font-size: 12px; color: #ddd;">claude-sonnet-4</td>
+            <td style="padding: 12px;"><span style="background: rgba(34,197,94,0.15); color: #4ade80; padding: 2px 8px; border-radius: 4px; font-size: 11px;">completed</span></td>
+            <td style="padding: 12px; font-size: 12px; color: #888;">2,103 / 1,456</td>
+            <td style="padding: 12px; font-size: 12px; color: #888;">$0.021</td>
+            <td style="padding: 12px; font-size: 12px; color: #888;">18s</td>
+            <td style="padding: 12px 20px; text-align: right;"><span style="color: #555; cursor: pointer; font-size: 12px;">View →</span></td>
+          </tr>
+          <tr style="border-bottom: 1px solid rgba(255,255,255,0.04);">
+            <td style="padding: 12px 20px; font-size: 12px; color: #888;">Apr 14, 2:30 PM</td>
+            <td style="padding: 12px; font-size: 12px; color: #ddd;">gpt-4o</td>
+            <td style="padding: 12px;"><span style="background: rgba(239,68,68,0.15); color: #f87171; padding: 2px 8px; border-radius: 4px; font-size: 11px;">failed</span></td>
+            <td style="padding: 12px; font-size: 12px; color: #555;">—</td>
+            <td style="padding: 12px; font-size: 12px; color: #555;">—</td>
+            <td style="padding: 12px; font-size: 12px; color: #555;">—</td>
+            <td style="padding: 12px 20px; text-align: right;"><span style="color: #555; cursor: pointer; font-size: 12px;">View →</span></td>
+          </tr>
+          <tr style="border-bottom: 1px solid rgba(255,255,255,0.04);">
+            <td style="padding: 12px 20px; font-size: 12px; color: #888;">Apr 14, 2:20 PM</td>
+            <td style="padding: 12px; font-size: 12px; color: #ddd;">claude-opus-4</td>
+            <td style="padding: 12px;"><span style="background: rgba(34,197,94,0.15); color: #4ade80; padding: 2px 8px; border-radius: 4px; font-size: 11px;">completed</span></td>
+            <td style="padding: 12px; font-size: 12px; color: #888;">856 / 2,341</td>
+            <td style="padding: 12px; font-size: 12px; color: #888;">$0.087</td>
+            <td style="padding: 12px; font-size: 12px; color: #888;">45s</td>
+            <td style="padding: 12px 20px; text-align: right;"><span style="color: #555; cursor: pointer; font-size: 12px;">View →</span></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<div class="section" style="margin-top: 1.5rem; padding: 1rem 1.5rem; background: rgba(255,255,255,0.03); border-radius: 8px;">
+  <h3 style="margin-top: 0;">Details</h3>
+  <ul style="margin-bottom: 0;">
+    <li><strong>Data source:</strong> <code>GET /admin/api/v1/requests</code> — queries fusillade for individual requests from 1h batches</li>
+    <li><strong>Columns:</strong> Created, Model, Status, Tokens (prompt / completion), Cost, Duration</li>
+    <li><strong>Active-first sorting:</strong> running/queued requests float to top with subtle blue background</li>
+    <li><strong>Auto-refresh:</strong> polls every 2s when active requests exist (same pattern as batch page)</li>
+    <li><strong>Tokens format:</strong> <code>prompt / completion</code> — dashes for incomplete requests</li>
+    <li><strong>"View →"</strong> navigates to request detail page showing full input/output</li>
+    <li><strong>"+ New Request"</strong> opens submission modal (next section)</li>
+    <li><strong>"API Guide"</strong> opens API usage documentation</li>
+  </ul>
+</div>

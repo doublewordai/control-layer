@@ -70,6 +70,10 @@ const ROLE_PERMISSIONS: Record<Role, PagePermission[]> = {
     "my-organization",
     "usage",
   ],
+  ConnectionsUser: [
+    "connections",
+    "batches",
+  ],
 };
 
 // Map route paths to permissions

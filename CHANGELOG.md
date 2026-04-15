@@ -1,5 +1,19 @@
 # Changelog
 
+## [8.38.0](https://github.com/doublewordai/control-layer/compare/v8.37.1...v8.38.0) (2026-04-14)
+
+
+### Features
+
+* connections role for gating feature ([#981](https://github.com/doublewordai/control-layer/issues/981)) ([5ce28e2](https://github.com/doublewordai/control-layer/commit/5ce28e212fa7a52299e4328451210079a4f30757))
+
+## [8.37.1](https://github.com/doublewordai/control-layer/compare/v8.37.0...v8.37.1) (2026-04-13)
+
+
+### Bug Fixes
+
+* document dynamo nvext.agent_hints.priority injection path ([#984](https://github.com/doublewordai/control-layer/issues/984)) ([cf613b0](https://github.com/doublewordai/control-layer/commit/cf613b0d90cf1a224bbaa817e22640bb0452c28c))
+
 ## [8.37.0](https://github.com/doublewordai/control-layer/compare/v8.36.0...v8.37.0) (2026-04-13)
 
 

@@ -1,0 +1,115 @@
+<h2>Design Section 4 (Revised): Async Submission Modal</h2>
+<p class="subtitle">Two tabs — Compose (default) with newline-separated prompts, and Upload JSONL</p>
+
+<div class="split">
+  <div class="mockup">
+    <div class="mockup-header">Tab 1: Compose (default)</div>
+    <div class="mockup-body" style="padding: 0;">
+      <div style="font-family: system-ui, sans-serif; font-size: 13px; background: #111; color: #ccc; padding: 28px; min-height: 460px;">
+        <h3 style="margin: 0 0 4px; color: #fff; font-size: 15px;">Create Async Requests</h3>
+        <p style="margin: 0 0 20px; font-size: 12px; color: #666;">Submit requests for async processing (1h completion window)</p>
+
+        <!-- Tabs -->
+        <div style="display: flex; gap: 0; margin-bottom: 20px; border-bottom: 1px solid rgba(255,255,255,0.08);">
+          <button style="background: none; border: none; color: #fff; padding: 8px 16px; font-size: 12px; border-bottom: 2px solid #fff; cursor: pointer; font-weight: 600;">Compose</button>
+          <button style="background: none; border: none; color: #555; padding: 8px 16px; font-size: 12px; border-bottom: 2px solid transparent; cursor: pointer;">Upload JSONL</button>
+        </div>
+
+        <!-- Model selector -->
+        <div style="margin-bottom: 16px;">
+          <label style="display: block; font-size: 11px; color: #666; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 4px;">Model</label>
+          <div style="background: #1a1a1a; border: 1px solid rgba(255,255,255,0.1); border-radius: 6px; padding: 8px 12px; font-size: 12px; color: #ddd; display: flex; justify-content: space-between; align-items: center;">
+            claude-sonnet-4 <span style="color: #555; font-size: 10px;">▼</span>
+          </div>
+        </div>
+
+        <!-- System prompt -->
+        <div style="margin-bottom: 16px;">
+          <label style="display: block; font-size: 11px; color: #666; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 4px;">System <span style="text-transform: none; color: #444;">(optional)</span></label>
+          <div style="background: #1a1a1a; border: 1px solid rgba(255,255,255,0.1); border-radius: 6px; padding: 8px 12px; font-size: 12px; color: #555; min-height: 36px;">
+            You are a helpful assistant...
+          </div>
+        </div>
+
+        <!-- Prompts textarea -->
+        <div style="margin-bottom: 16px;">
+          <label style="display: flex; justify-content: space-between; align-items: baseline; font-size: 11px; color: #666; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 4px;">
+            <span>Prompts</span>
+            <span style="text-transform: none; letter-spacing: 0; color: #444;">Each line is a separate request</span>
+          </label>
+          <div style="background: #1a1a1a; border: 1px solid rgba(255,255,255,0.1); border-radius: 6px; padding: 10px 12px; font-size: 12px; color: #ddd; min-height: 110px; line-height: 1.7;">
+            <span style="color: #ddd;">Summarize the key points of the Q1 earnings report</span><br>
+            <span style="color: #ddd;">Compare our Q1 performance against competitors</span><br>
+            <span style="color: #ddd;">Draft a summary email for the leadership team</span><br>
+            <span style="color: #333;">|</span>
+          </div>
+        </div>
+
+        <!-- Parameters row -->
+        <div style="display: flex; gap: 12px; margin-bottom: 16px;">
+          <div style="flex: 1;">
+            <label style="display: block; font-size: 11px; color: #666; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 4px;">Temperature</label>
+            <div style="background: #1a1a1a; border: 1px solid rgba(255,255,255,0.1); border-radius: 6px; padding: 8px 12px; font-size: 12px; color: #888;">0.7</div>
+          </div>
+          <div style="flex: 1;">
+            <label style="display: block; font-size: 11px; color: #666; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 4px;">Max Tokens</label>
+            <div style="background: #1a1a1a; border: 1px solid rgba(255,255,255,0.1); border-radius: 6px; padding: 8px 12px; font-size: 12px; color: #888;">4096</div>
+          </div>
+        </div>
+
+        <!-- Footer -->
+        <div style="display: flex; justify-content: space-between; align-items: center; padding-top: 16px; border-top: 1px solid rgba(255,255,255,0.06);">
+          <span style="font-size: 11px; color: #555;">3 requests</span>
+          <div style="display: flex; gap: 8px;">
+            <button style="background: transparent; color: #999; border: 1px solid rgba(255,255,255,0.1); padding: 8px 16px; border-radius: 6px; font-size: 12px; cursor: pointer;">Cancel</button>
+            <button style="background: #fff; color: #000; border: none; padding: 8px 16px; border-radius: 6px; font-size: 12px; font-weight: 600; cursor: pointer;">Create</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="mockup">
+    <div class="mockup-header">Tab 2: Upload JSONL</div>
+    <div class="mockup-body" style="padding: 0;">
+      <div style="font-family: system-ui, sans-serif; font-size: 13px; background: #111; color: #ccc; padding: 28px; min-height: 460px;">
+        <h3 style="margin: 0 0 4px; color: #fff; font-size: 15px;">Create Async Requests</h3>
+        <p style="margin: 0 0 20px; font-size: 12px; color: #666;">Submit requests for async processing (1h completion window)</p>
+
+        <!-- Tabs -->
+        <div style="display: flex; gap: 0; margin-bottom: 20px; border-bottom: 1px solid rgba(255,255,255,0.08);">
+          <button style="background: none; border: none; color: #555; padding: 8px 16px; font-size: 12px; border-bottom: 2px solid transparent; cursor: pointer;">Compose</button>
+          <button style="background: none; border: none; color: #fff; padding: 8px 16px; font-size: 12px; border-bottom: 2px solid #fff; cursor: pointer; font-weight: 600;">Upload JSONL</button>
+        </div>
+
+        <!-- Drop zone -->
+        <div style="border: 1px dashed rgba(255,255,255,0.12); border-radius: 8px; padding: 48px 24px; text-align: center; margin-bottom: 16px; cursor: pointer;">
+          <div style="font-size: 28px; margin-bottom: 10px; opacity: 0.2;">📄</div>
+          <p style="margin: 0 0 4px; font-size: 12px; color: #777;">Drop a .jsonl file here</p>
+          <p style="margin: 0; font-size: 11px; color: #444;">or click to browse</p>
+        </div>
+
+        <p style="font-size: 11px; color: #444; margin: 0 0 16px;">Each line should be a chat completions request object</p>
+
+        <!-- Spacer to align footer -->
+        <div style="flex: 1;"></div>
+
+        <!-- Footer -->
+        <div style="display: flex; justify-content: flex-end; gap: 8px; padding-top: 16px; border-top: 1px solid rgba(255,255,255,0.06); margin-top: 140px;">
+          <button style="background: transparent; color: #999; border: 1px solid rgba(255,255,255,0.1); padding: 8px 16px; border-radius: 6px; font-size: 12px; cursor: pointer;">Cancel</button>
+          <button style="background: #333; color: #555; border: none; padding: 8px 16px; border-radius: 6px; font-size: 12px; cursor: not-allowed;">Create</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="section" style="margin-top: 1.5rem; padding: 1rem 1.5rem; background: rgba(255,255,255,0.03); border-radius: 8px;">
+  <h3 style="margin-top: 0;">How it works</h3>
+  <ul style="margin-bottom: 0;">
+    <li><strong>Compose tab (default):</strong> Model, system prompt, prompts textarea, temperature, max tokens</li>
+    <li><strong>Prompts field:</strong> Single textarea — each newline is a separate request. Counter in footer updates live</li>
+    <li><strong>Upload JSONL tab:</strong> Drag-and-drop or browse for a .jsonl file</li>
+    <li><strong>Both paths:</strong> Create a batch via <code>POST /ai/v1/batches</code> with <code>completion_window=1h</code></li>
+  </ul>
+</div>

@@ -26,7 +26,7 @@ import {
 } from "../../../ui";
 import { Input } from "../../../ui/input";
 import { Button } from "../../../ui/button";
-import { AVAILABLE_ROLES, getRoleDisplayName } from "../../../../utils/roles";
+import { AVAILABLE_ROLES, SUBSET_ROLES, getRoleDisplayName } from "../../../../utils/roles";
 import type { Role } from "../../../../api/control-layer/types";
 import { dwctlApi } from "../../../../api/control-layer/client";
 import { ApiError } from "../../../../api/control-layer/errors";
@@ -77,6 +77,8 @@ export const Profile: React.FC = () => {
         "Billing Managers can view and manage cost information and user credit balances.",
       BatchAPIUser:
         "Batch API Users can upload, view, and delete their own files for use with the Batch API.",
+      ConnectionsUser:
+        "Connections Users can create and manage external data source connections, sync files, and view resulting batches.",
     };
     return descriptions[role];
   };
@@ -549,8 +551,7 @@ export const Profile: React.FC = () => {
                       {AVAILABLE_ROLES.map((role) => {
                         const isPlatformManagerSelected =
                           roles.includes("PlatformManager");
-                        const isSubsetRole =
-                          role === "BatchAPIUser" || role === "BillingManager";
+                        const isSubsetRole = SUBSET_ROLES.includes(role);
                         const isDisabled =
                           role === "StandardUser" ||
                           (isPlatformManagerSelected && isSubsetRole);
