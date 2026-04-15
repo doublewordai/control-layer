@@ -590,8 +590,8 @@ function SectionTable({
 
   return (
     <div className="border rounded-lg overflow-hidden">
-      <div className="overflow-x-auto">
-        <Table className="table-fixed w-full min-w-[900px]">
+      <div>
+        <Table className="w-full">
           <colgroup>
             <col style={{ width: "3%" }} />
             <col />
