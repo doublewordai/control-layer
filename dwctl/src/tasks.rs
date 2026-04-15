@@ -36,6 +36,8 @@ pub struct TaskState<P: PoolProvider + Clone = sqlx_pool_router::DbPools> {
     pub request_manager: Arc<PostgresRequestManager<P, fusillade::ReqwestHttpClient>>,
     /// dwctl database pool — for querying connections, sync_operations, sync_entries.
     pub dwctl_pool: PgPool,
+    /// Shared config for capacity checks and other runtime configuration.
+    pub config: crate::SharedConfig,
     /// Encryption key for decrypting connection credentials inside jobs.
     pub encryption_key: Option<Vec<u8>>,
     /// Weak reference to the IngestFileJob so SyncConnectionJob can enqueue it.

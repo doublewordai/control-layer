@@ -148,6 +148,16 @@ pub async fn build_activate_batch_job<P: PoolProvider + Clone + Send + Sync + 's
     use underway::job::To;
     use underway::task::Error as TaskError;
 
+    // Generous retry policy: capacity-gated activations may wait hours for queue
+    // space during large ingestions. Actual errors (Fatal) skip retries entirely,
+    // so the high max_attempts only affects retryable failures (capacity + transient).
+    let retry_policy = underway::task::RetryPolicy::builder()
+        .max_attempts(10_000) // effectively unlimited for capacity backpressure
+        .initial_interval_ms(5_000) // start at 5 seconds
+        .max_interval_ms(300_000) // cap at 5 minutes between retries
+        .backoff_coefficient(2.0) // exponential: 5s → 10s → 20s → ... → 5min
+        .build();
+
     Job::<ActivateBatchInput, _>::builder()
         .state(state)
         .step(|cx, input: ActivateBatchInput| async move {
@@ -196,6 +206,7 @@ pub async fn build_activate_batch_job<P: PoolProvider + Clone + Send + Sync + 's
                 }
             }
         })
+        .retry_policy(retry_policy)
         .name("activate-batch")
         .pool(pool)
         .build()
@@ -896,16 +907,125 @@ pub(crate) async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + '
         .unwrap_or("24h")
         .to_string();
 
-    // 3. TODO: capacity check (if respect_capacity_reservations is enabled)
-    //    For now, we proceed directly. When capacity checking is added,
-    //    return Err with "insufficient capacity" message to trigger retryable error.
+    // 3. Load sync entry early — needed for retry detection (batch_id already set)
+    //    and for provenance metadata / validation errors later.
+    let sync_entry = {
+        let mut conn = dwctl.acquire().await?;
+        SyncEntries::new(&mut conn)
+            .get_by_id(input.sync_entry_id)
+            .await?
+            .ok_or_else(|| ActivateError::Fatal(format!("sync entry not found: {}", input.sync_entry_id)))?
+    };
+    let external_key = sync_entry.external_key.clone();
 
-    // 4. Resolve the connection owner's hidden batch API key.
-    //    connection.user_id = the owner (org ID in org context, personal ID otherwise).
-    //    sync_op.triggered_by = the individual who triggered the sync.
-    //    Same pattern as create_batch handler:
-    //      - key owned by target_user_id (org/user) for billing scope
-    //      - created_by on key = individual for per-member attribution
+    // 4. Capacity check — reserve capacity before creating the batch.
+    //    On retries where a previous attempt already created AND populated a batch,
+    //    skip reservation since those requests are already counted in pending.
+    //    If the batch exists but isn't populated yet (failure between create and populate),
+    //    we still need to reserve capacity.
+    let batch_already_populated = if let Some(existing_batch_id) = sync_entry.batch_id {
+        let batch = state.request_manager.get_batch(fusillade::BatchId(existing_batch_id)).await;
+        match batch {
+            Ok(b) => b.pending_requests + b.in_progress_requests + b.completed_requests + b.failed_requests > 0,
+            Err(_) => false, // Batch record missing or error — treat as not populated
+        }
+    } else {
+        false
+    };
+
+    let reservation_ids = if batch_already_populated {
+        Vec::new()
+    } else {
+        use crate::api::handlers::sla_capacity::{CapacityError, CapacityReservationInput, reserve_capacity};
+        use crate::db::handlers::deployments::Deployments;
+
+        let file_stats = state
+            .request_manager
+            .get_file_template_stats(fusillade::FileId(input.file_id))
+            .await
+            .map_err(|e| anyhow::anyhow!("get file template stats: {e}"))?;
+
+        // Filter out empty model aliases — those are tier-2 invalid lines that will
+        // be failed after populate. They don't need capacity reservations.
+        let file_model_counts: std::collections::HashMap<String, i64> = file_stats
+            .iter()
+            .filter(|s| !s.model.is_empty())
+            .map(|s| (s.model.clone(), s.request_count))
+            .collect();
+
+        if file_model_counts.is_empty() {
+            Vec::new()
+        } else {
+            let model_aliases: Vec<String> = file_model_counts.keys().cloned().collect();
+
+            let batch_model_info = {
+                let mut conn = dwctl.acquire().await?;
+                Deployments::new(&mut conn).get_batch_model_info(&model_aliases).await?
+            };
+
+            let model_ids_by_alias = {
+                let mut conn = dwctl.acquire().await?;
+                Deployments::new(&mut conn).get_model_ids_by_aliases(&model_aliases).await?
+            };
+
+            // Validate all models exist (deleted/missing models would bypass capacity checks)
+            let missing: Vec<&str> = model_aliases
+                .iter()
+                .filter(|a| !model_ids_by_alias.contains_key(*a))
+                .map(|a| a.as_str())
+                .collect();
+            if !missing.is_empty() {
+                return Err(ActivateError::Fatal(format!("model(s) no longer available: {}", missing.join(", "))).into());
+            }
+
+            let config = state.config.snapshot();
+            let cap_input = CapacityReservationInput {
+                completion_window: &completion_window,
+                file_model_counts: &file_model_counts,
+                model_throughputs: &batch_model_info.throughputs,
+                model_ids_by_alias: &model_ids_by_alias,
+                default_throughput: config.batches.default_throughput,
+                relaxation_factor: config.batches.relaxation_factor(&completion_window),
+                reservation_ttl_secs: config.batches.reservation_ttl_secs,
+            };
+
+            match reserve_capacity(dwctl, &*state.request_manager, &cap_input).await {
+                Ok(ids) => ids,
+                Err(CapacityError::InsufficientCapacity { completion_window, models }) => {
+                    return Err(ActivateError::Retryable(format!(
+                        "insufficient capacity for {completion_window} window (models: {models})"
+                    ))
+                    .into());
+                }
+                Err(CapacityError::Internal(msg)) => {
+                    return Err(anyhow::anyhow!("capacity reservation: {msg}"));
+                }
+            }
+        }
+    };
+
+    // RAII guard: release reservations on early return / error (TTL is the safety net).
+    // Defused after successful populate_batch, since requests are then in fusillade's
+    // pending queue and counted by the capacity system directly.
+    let release_guard = {
+        let pool = state.dwctl_pool.clone();
+        let ids = reservation_ids.clone();
+        scopeguard::guard((), move |()| {
+            if !ids.is_empty() {
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    handle.spawn(async move {
+                        if let Err(e) = crate::api::handlers::sla_capacity::release_reservations(&pool, &ids).await {
+                            tracing::warn!(error = %e, "Failed to release capacity reservations — will expire via TTL");
+                        }
+                    });
+                } else {
+                    tracing::debug!("No Tokio runtime available for reservation release — TTL will handle cleanup");
+                }
+            }
+        })
+    };
+
+    // 5. Resolve the connection owner's hidden batch API key.
     let (batch_owner, batch_api_key, api_key_id, connection_name) = {
         use crate::db::handlers::api_keys::ApiKeys;
         use crate::db::models::api_keys::ApiKeyPurpose;
@@ -927,17 +1047,6 @@ pub(crate) async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + '
 
         (owner_id, secret, key_id, conn_name)
     };
-
-    // 5. Look up sync entry for external key (used in batch provenance metadata below)
-    //    and validation errors (for tier-2 failure marking after populate).
-    let sync_entry = {
-        let mut conn = dwctl.acquire().await?;
-        SyncEntries::new(&mut conn)
-            .get_by_id(input.sync_entry_id)
-            .await?
-            .ok_or_else(|| ActivateError::Fatal(format!("sync entry not found: {}", input.sync_entry_id)))?
-    };
-    let external_key = sync_entry.external_key.clone();
 
     // 6. Create or reuse batch record.
     //    On retries (transient failure after create_batch_record), reuse the batch_id
@@ -1055,6 +1164,19 @@ pub(crate) async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + '
         });
     }
 
+    // Populate succeeded — requests are now in fusillade's pending queue and counted
+    // by the capacity system. Release reservations immediately to avoid double-counting,
+    // then defuse the guard so it doesn't release again on drop.
+    match crate::api::handlers::sla_capacity::release_reservations(&state.dwctl_pool, &reservation_ids).await {
+        Ok(()) => {
+            scopeguard::ScopeGuard::into_inner(release_guard);
+        }
+        Err(e) => {
+            // Keep the guard active so it retries release on function return
+            tracing::warn!(error = %e, "Failed to release capacity reservations after populate — guard will retry on drop");
+        }
+    }
+
     // 8. Fail requests whose templates came from invalid lines (tier 2 errors).
     //    Read template_index values from the stored validation_errors JSON (capped
     //    at 1000 during ingest) so nothing large passes through the job payload.
@@ -1124,6 +1246,13 @@ mod tests {
 
     /// Helper: create a TaskState backed by a real fusillade schema (for create_file_stream, etc.)
     async fn setup_task_state(pool: PgPool) -> crate::tasks::TaskState<sqlx_pool_router::TestDbPools> {
+        setup_task_state_with_config(pool, create_test_config()).await
+    }
+
+    async fn setup_task_state_with_config(
+        pool: PgPool,
+        config: crate::config::Config,
+    ) -> crate::tasks::TaskState<sqlx_pool_router::TestDbPools> {
         use sqlx::Executor;
         use sqlx::postgres::PgConnectOptions;
 
@@ -1149,6 +1278,7 @@ mod tests {
         crate::tasks::TaskState {
             request_manager,
             dwctl_pool: pool,
+            config: crate::SharedConfig::new(config),
             encryption_key: None,
             ingest_file_job: std::sync::Arc::new(std::sync::OnceLock::new()),
             activate_batch_job: std::sync::Arc::new(std::sync::OnceLock::new()),
@@ -1269,6 +1399,8 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_three_tier_ingestion_and_activation(pool: PgPool) {
+        use crate::test::utils::{create_test_endpoint, create_test_model};
+
         // -- Setup --
         let state = setup_task_state(pool.clone()).await;
         let config = create_test_config();
@@ -1276,6 +1408,10 @@ mod tests {
 
         let user = create_test_user(&pool, crate::api::models::users::Role::PlatformManager).await;
         let user_id = user.id;
+
+        // Create a deployed model so the capacity check can resolve it
+        let endpoint_id = create_test_endpoint(&pool, "test-ep", user_id).await;
+        create_test_model(&pool, "gpt-4-internal", "gpt-4", endpoint_id, user_id).await;
 
         let connection_id = insert_test_connection(&pool, user_id).await;
         let sync_id = insert_test_sync_op(&pool, connection_id, user_id).await;
@@ -1353,6 +1489,18 @@ mod tests {
 
         assert_eq!(pending_count, 2, "2 valid requests should be pending");
         assert_eq!(failed_count, 2, "2 invalid requests should be failed");
+
+        // Verify capacity reservations were released after successful populate
+        let active_reservations: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(reserved_requests), 0)::BIGINT FROM batch_capacity_reservations WHERE released_at IS NULL AND expires_at > now()",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("query active reservations");
+        assert_eq!(
+            active_reservations, 0,
+            "all capacity reservations should be released after successful activation"
+        );
     }
 
     /// Verify that skipped_lines and validation_errors are stored correctly in
@@ -1414,5 +1562,79 @@ mod tests {
         assert_eq!(errors[0]["template_index"], 1);
         assert_eq!(errors[0]["line"], 4);
         assert_eq!(errors[0]["error"], "missing model field in body");
+    }
+
+    /// Verify that run_activate_batch returns a retryable error when the model
+    /// queue is at capacity, and does NOT mark the sync entry as failed.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_activate_batch_rejects_on_insufficient_capacity(pool: PgPool) {
+        use crate::api::models::users::Role;
+        use crate::test::utils::{create_test_endpoint, create_test_model};
+
+        // Config with very low throughput: 0.001 req/s = 86.4 req/24h
+        let mut config = create_test_config();
+        config.batches.default_throughput = 0.001;
+
+        let state = setup_task_state_with_config(pool.clone(), config).await;
+
+        let user = create_test_user(&pool, Role::PlatformManager).await;
+        let user_id = user.id;
+
+        // Create a deployed model so capacity check can resolve it
+        let endpoint_id = create_test_endpoint(&pool, "test-endpoint", user_id).await;
+        let model_alias = "test-model";
+        create_test_model(&pool, "test-model-internal", model_alias, endpoint_id, user_id).await;
+
+        let connection_id = insert_test_connection(&pool, user_id).await;
+        let sync_id = insert_test_sync_op(&pool, connection_id, user_id).await;
+        let entry_id = insert_test_sync_entry(&pool, sync_id, connection_id, "data/big.jsonl").await;
+
+        // Create a file with 200 requests (exceeds 86.4 capacity at 0.001 req/s × 24h)
+        let templates: Vec<_> = (0..200).map(|_| valid_template(model_alias)).collect();
+        let file_id = create_test_file(&state, user_id, templates).await;
+
+        // Update sync entry with file_id
+        sqlx::query!(
+            "UPDATE sync_entries SET file_id = $2, template_count = 200 WHERE id = $1",
+            entry_id,
+            file_id,
+        )
+        .execute(&pool)
+        .await
+        .expect("update sync_entry");
+
+        // Run activate — should fail with retryable error
+        let input = ActivateBatchInput {
+            sync_id,
+            sync_entry_id: entry_id,
+            connection_id,
+            file_id,
+            template_count: 200,
+        };
+
+        let err = run_activate_batch(&state, &input).await.unwrap_err();
+
+        // Should be retryable (not fatal)
+        let is_retryable = err
+            .downcast_ref::<ActivateError>()
+            .is_some_and(|ae| matches!(ae, ActivateError::Retryable(_)));
+        assert!(is_retryable, "capacity rejection should be retryable, got: {err}");
+
+        // Sync entry should still be in 'activating' (not 'failed')
+        let status: String = sqlx::query_scalar("SELECT status FROM sync_entries WHERE id = $1")
+            .bind(entry_id)
+            .fetch_one(&pool)
+            .await
+            .expect("fetch status");
+        assert_eq!(status, "activating", "sync entry should not be marked failed on capacity rejection");
+
+        // No batch should have been created
+        let batch_id: Option<Uuid> = sqlx::query_scalar("SELECT batch_id FROM sync_entries WHERE id = $1")
+            .bind(entry_id)
+            .fetch_one(&pool)
+            .await
+            .expect("fetch batch_id");
+        assert!(batch_id.is_none(), "no batch should be created when capacity is insufficient");
     }
 }

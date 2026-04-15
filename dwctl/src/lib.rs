@@ -1799,6 +1799,7 @@ async fn setup_background_services(
     fusillade_pools: DbPools,
     outlet_pool: Option<PgPool>,
     config: Config,
+    shared_config: SharedConfig,
     shutdown_token: tokio_util::sync::CancellationToken,
     metrics_recorder: Option<GenAiMetrics>,
 ) -> anyhow::Result<BackgroundServices> {
@@ -2224,6 +2225,7 @@ async fn setup_background_services(
     let task_state = tasks::TaskState {
         request_manager: request_manager.clone(),
         dwctl_pool: pool.clone(),
+        config: shared_config.clone(),
         encryption_key: encryption_key.clone(),
         ingest_file_job: Arc::new(std::sync::OnceLock::new()),
         activate_batch_job: Arc::new(std::sync::OnceLock::new()),
@@ -2340,11 +2342,13 @@ impl Application {
         // Setup background services (onwards integration, probe scheduler, batch daemon, leader election)
         // Note: Must use primary pool (via Deref) because onwards sync uses LISTEN/NOTIFY
         // which requires direct database connection to primary (not through PgBouncer transaction pooling)
+        let shared_config = SharedConfig::new(config.clone());
         let mut bg_services = setup_background_services(
             (*db_pools).clone(),
             fusillade_pools.clone(),
             outlet_pools.as_ref().map(|p| (**p).clone()),
             config.clone(),
+            shared_config.clone(),
             shutdown_token.clone(),
             metrics_recorder.clone(),
         )
@@ -2382,7 +2386,6 @@ impl Application {
 
         // Build resource limiters
         let limiters = limits::Limiters::new(&config.limits);
-        let shared_config = SharedConfig::new(config.clone());
 
         // Build app state and router
         let mut app_state = AppState::builder()
