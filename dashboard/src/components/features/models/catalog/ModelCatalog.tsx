@@ -291,10 +291,10 @@ function ModelRow({
   return (
     <Fragment>
       <TableRow
-        className="cursor-pointer hover:bg-muted/50 transition-colors [&>td]:py-1.5"
+        className="group cursor-pointer hover:bg-muted/50 transition-colors [&>td]:py-1.5 max-[699px]:[&>td]:py-1"
         onClick={onClick}
       >
-        <TableCell className="px-2">
+        <TableCell className="px-2 max-[699px]:w-8 max-[699px]:px-1.5">
           <button
             onClick={(e) => {
               e.stopPropagation();
@@ -310,73 +310,101 @@ function ModelRow({
             )}
           </button>
         </TableCell>
-        <TableCell className="overflow-hidden">
-          <div className="flex items-center gap-2 min-w-0">
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <span className="font-medium truncate">{model.display_name || model.alias}</span>
-              </TooltipTrigger>
-              <TooltipContent>
-                <span className="font-mono text-xs">{model.alias}</span>
-              </TooltipContent>
-            </Tooltip>
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <button
-                  type="button"
-                  className="shrink-0 p-0.5 text-gray-400 hover:text-gray-600 transition-colors"
-                  aria-label="Copy model alias"
-                  onClick={async (e) => {
-                    e.stopPropagation();
-                    if (await copyToClipboard(model.alias)) {
-                      setCopied(true);
-                      setTimeout(() => setCopied(false), 1500);
-                    }
-                  }}
-                >
-                  {copied ? (
-                    <Check className="h-3.5 w-3.5 text-green-600" />
-                  ) : (
-                    <Copy className="h-3.5 w-3.5" />
-                  )}
-                </button>
-              </TooltipTrigger>
-              <TooltipContent>
-                <span className="font-mono text-xs">{model.alias}</span>
-              </TooltipContent>
-            </Tooltip>
-            {isLatest && (
-              <span className="inline-flex items-center shrink-0 rounded-full bg-blue-100 text-blue-800 px-2 py-0.5 text-[10px] font-semibold tracking-wide uppercase">
-                New
-              </span>
-            )}
-            {model.metadata?.quantization && (
-              <span className="inline-flex items-center shrink-0 rounded-full bg-gray-100 text-gray-600 px-2 py-0.5 text-[10px] font-semibold tracking-wide uppercase">
-                {model.metadata.quantization}
-              </span>
-            )}
-            {model.metadata?.extra?.deployment_providers?.map((dp) => {
-              const config = providerConfigMap.get(dp);
-              if (!config) return null;
-              return (
-                <Tooltip key={dp}>
+        <TableCell className="overflow-hidden max-[699px]:w-full max-[699px]:whitespace-normal max-[699px]:px-1">
+          <div className="flex min-w-0 items-center gap-2 max-[699px]:items-start max-[699px]:gap-1.5">
+            <div className="min-w-0 flex-1">
+              <div className="flex min-w-0 items-center gap-2 max-[699px]:flex-wrap max-[699px]:gap-1.5">
+                <Tooltip>
                   <TooltipTrigger asChild>
-                    <span className="shrink-0">
-                      <CatalogIcon
-                        icon={config.icon || undefined}
-                        label={config.display_name}
-                        size="sm"
-                        fallback="none"
-                      />
-                    </span>
+                    <span className="font-medium truncate">{model.display_name || model.alias}</span>
                   </TooltipTrigger>
-                  <TooltipContent>{config.display_name}</TooltipContent>
+                  <TooltipContent>
+                    <span className="font-mono text-xs">{model.alias}</span>
+                  </TooltipContent>
                 </Tooltip>
-              );
-            })}
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <button
+                      type="button"
+                      className="shrink-0 p-0.5 text-gray-400 hover:text-gray-600 transition-colors"
+                      aria-label="Copy model alias"
+                      onClick={async (e) => {
+                        e.stopPropagation();
+                        if (await copyToClipboard(model.alias)) {
+                          setCopied(true);
+                          setTimeout(() => setCopied(false), 1500);
+                        }
+                      }}
+                    >
+                      {copied ? (
+                        <Check className="h-3.5 w-3.5 text-green-600" />
+                      ) : (
+                        <Copy className="h-3.5 w-3.5" />
+                      )}
+                    </button>
+                  </TooltipTrigger>
+                  <TooltipContent>
+                    <span className="font-mono text-xs">{model.alias}</span>
+                  </TooltipContent>
+                </Tooltip>
+                {isLatest && (
+                  <span className="inline-flex items-center shrink-0 rounded-full bg-blue-100 text-blue-800 px-2 py-0.5 text-[10px] font-semibold tracking-wide uppercase">
+                    New
+                  </span>
+                )}
+                {model.metadata?.quantization && (
+                  <span className="inline-flex items-center shrink-0 rounded-full bg-gray-100 text-gray-600 px-2 py-0.5 text-[10px] font-semibold tracking-wide uppercase">
+                    {model.metadata.quantization}
+                  </span>
+                )}
+                {model.metadata?.extra?.deployment_providers?.map((dp) => {
+                  const config = providerConfigMap.get(dp);
+                  if (!config) return null;
+                  return (
+                    <Tooltip key={dp}>
+                      <TooltipTrigger asChild>
+                        <span className="hidden shrink-0 min-[700px]:inline-flex">
+                          <CatalogIcon
+                            icon={config.icon || undefined}
+                            label={config.display_name}
+                            size="sm"
+                            fallback="none"
+                          />
+                        </span>
+                      </TooltipTrigger>
+                      <TooltipContent>{config.display_name}</TooltipContent>
+                    </Tooltip>
+                  );
+                })}
+              </div>
+
+              <div className="mt-1 hidden min-w-0 flex-wrap items-center gap-1.5 text-xs text-muted-foreground max-[699px]:flex">
+                <CatalogIcon
+                  icon={providerIcon || undefined}
+                  label={providerLabel}
+                  size="sm"
+                  fallback="none"
+                />
+                <span className="truncate">{providerLabel}</span>
+                {model.metadata?.extra?.deployment_providers?.map((dp) => {
+                  const config = providerConfigMap.get(dp);
+                  if (!config) return null;
+
+                  return (
+                    <CatalogIcon
+                      key={dp}
+                      icon={config.icon || undefined}
+                      label={config.display_name}
+                      size="sm"
+                      fallback="none"
+                    />
+                  );
+                })}
+              </div>
+            </div>
           </div>
         </TableCell>
-        <TableCell className="overflow-hidden">
+        <TableCell className="overflow-hidden max-[699px]:hidden">
           <div className="flex items-center gap-2 min-w-0">
             <CatalogIcon
               icon={providerIcon || undefined}
@@ -442,8 +470,8 @@ function ModelRow({
             ? formatReleaseDate(model.metadata.released_at)
             : "\u2014"}
         </TableCell>
-        <TableCell className="text-right pr-3 lg:pr-6">
-          <div className="flex items-center justify-end gap-1.5">
+        <TableCell className="w-px whitespace-nowrap text-right pr-3 lg:pr-6 max-[699px]:sticky max-[699px]:right-0 max-[699px]:z-10 max-[699px]:px-1.5 max-[699px]:bg-background">
+          <div className="flex items-center justify-end gap-1.5 max-[699px]:gap-1">
             {playgroundAvailable && (
               <Button
                 variant="outline"
@@ -454,9 +482,10 @@ function ModelRow({
                     `/playground?model=${encodeURIComponent(model.id)}`,
                   );
                 }}
-                className="text-xs h-7 px-2.5 border-blue-200 text-blue-700 hover:bg-blue-50 hover:text-blue-800"
+                className="text-xs h-7 px-2.5 border-blue-200 text-blue-700 hover:bg-blue-50 hover:text-blue-800 max-[699px]:px-2"
               >
-                Try it &rarr;
+                <span className="max-[699px]:hidden">Try it &rarr;</span>
+                <span className="hidden max-[699px]:inline">Try</span>
               </Button>
             )}
             <Button
@@ -466,10 +495,10 @@ function ModelRow({
                 e.stopPropagation();
                 onApiClick();
               }}
-              className="text-xs h-7 px-2 text-gray-500 hover:text-gray-700 hover:bg-gray-100"
+              className="text-xs h-7 px-2 text-gray-500 hover:text-gray-700 hover:bg-gray-100 max-[699px]:px-1.5"
             >
               <Code className="h-3.5 w-3.5" />
-              <span className="hidden lg:inline ml-1">API</span>
+              <span className="hidden ml-1 max-[699px]:inline lg:inline">API</span>
             </Button>
           </div>
         </TableCell>
@@ -588,14 +617,27 @@ function SectionTable({
     });
   }, [models, sortDirection, sortField]);
 
+  const getProviderData = (model: Model) => {
+    const providerKey = (model.metadata?.provider?.trim() || "Other").toLowerCase();
+    const providerConfig = providerConfigMap.get(providerKey);
+
+    return {
+      providerLabel:
+        providerConfig?.display_name ||
+        model.metadata?.provider?.trim() ||
+        "Other",
+      providerIcon: providerConfig?.icon,
+    };
+  };
+
   return (
     <div className="border rounded-lg overflow-hidden">
       <div className="overflow-x-auto">
-        <Table className="w-full">
+        <Table className="w-full max-[699px]:table-fixed">
           <TableHeader>
             <TableRow>
-              <TableHead className="px-2" />
-              <TableHead>
+              <TableHead className="px-2 max-[699px]:w-8 max-[699px]:px-1.5" />
+              <TableHead className="max-[699px]:w-full">
                 <SortButton
                   field="alias"
                   label="Name"
@@ -604,7 +646,7 @@ function SectionTable({
                   onSort={(field) => onSort(tableKey, field)}
                 />
               </TableHead>
-              <TableHead>
+              <TableHead className="max-[699px]:hidden">
                 Provider
               </TableHead>
               <TableHead className="hidden md:table-cell">
@@ -646,19 +688,18 @@ function SectionTable({
                   onSort={(field) => onSort(tableKey, field)}
                 />
               </TableHead>
-              <TableHead />
+              <TableHead className="max-[699px]:sticky max-[699px]:right-0 max-[699px]:z-10 max-[699px]:w-px max-[699px]:px-1.5 max-[699px]:bg-background" />
             </TableRow>
           </TableHeader>
           <TableBody>
             {sortedModels.map((model) => {
-              const providerKey = (model.metadata?.provider?.trim() || "Other").toLowerCase();
-              const providerConfig = providerConfigMap.get(providerKey);
+              const { providerLabel, providerIcon } = getProviderData(model);
               return (
                 <ModelRow
                   key={model.id}
                   model={model}
-                  providerLabel={providerConfig?.display_name || model.metadata?.provider?.trim() || "Other"}
-                  providerIcon={providerConfig?.icon}
+                  providerLabel={providerLabel}
+                  providerIcon={providerIcon}
                   providerConfigMap={providerConfigMap}
                   isLatest={newModelIds.has(model.id)}
                   isExpanded={expandedRows.has(model.id)}
@@ -692,9 +733,9 @@ function LoadingSkeleton() {
         </colgroup>
         <TableHeader>
           <TableRow>
-            <TableHead className="px-2" />
+            <TableHead className="px-2 max-[699px]:w-8 max-[699px]:px-1.5" />
             <TableHead>Name</TableHead>
-            <TableHead>Provider</TableHead>
+            <TableHead className="max-[699px]:hidden">Provider</TableHead>
             <TableHead>Capabilities</TableHead>
             <TableHead>Intelligence</TableHead>
             <TableHead>Cost</TableHead>
@@ -706,13 +747,13 @@ function LoadingSkeleton() {
         <TableBody>
           {Array.from({ length: 8 }).map((_, i) => (
             <TableRow key={i}>
-              <TableCell className="w-8 px-2">
+              <TableCell className="w-8 px-2 max-[699px]:px-1.5">
                 <Skeleton className="h-4 w-4" />
               </TableCell>
               <TableCell>
                 <Skeleton className="h-5 w-48" />
               </TableCell>
-              <TableCell>
+              <TableCell className="max-[699px]:hidden">
                 <div className="flex items-center gap-2">
                   <Skeleton className="h-5 w-5 rounded" />
                   <Skeleton className="h-5 w-20" />
@@ -851,96 +892,96 @@ export const ModelCatalog: React.FC = () => {
           <div className="flex items-center gap-3">
             {canManageGroups && (
               <div className="flex items-center gap-2">
-              <span className="text-sm text-muted-foreground">Group:</span>
-              <Popover>
-                <PopoverTrigger asChild>
-                  <button
-                    className="inline-flex items-center justify-between rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 min-w-[160px]"
-                    aria-label="Filter by group"
-                  >
-                    <span className="flex-1 text-left truncate">
-                      {selectedGroups.length === 0 ? (
-                        <span className="text-muted-foreground">
-                          All groups
-                        </span>
-                      ) : selectedGroups.length === 1 ? (
-                        <span>
-                          {groups.find((g) => g.id === selectedGroups[0])
-                            ?.name || "Everyone"}
-                        </span>
+                <span className="text-sm text-muted-foreground">Group:</span>
+                <Popover>
+                  <PopoverTrigger asChild>
+                    <button
+                      className="inline-flex items-center justify-between rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 min-w-[160px]"
+                      aria-label="Filter by group"
+                    >
+                      <span className="flex-1 text-left truncate">
+                        {selectedGroups.length === 0 ? (
+                          <span className="text-muted-foreground">
+                            All groups
+                          </span>
+                        ) : selectedGroups.length === 1 ? (
+                          <span>
+                            {groups.find((g) => g.id === selectedGroups[0])
+                              ?.name || "Everyone"}
+                          </span>
+                        ) : (
+                          <span className="flex gap-1 flex-wrap">
+                            {selectedGroups.map((groupId) => {
+                              const group = groups.find(
+                                (g) => g.id === groupId,
+                              );
+                              return group ? (
+                                <span
+                                  key={groupId}
+                                  className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-secondary text-secondary-foreground text-xs"
+                                >
+                                  {group.name}
+                                  <X
+                                    className="h-3 w-3 cursor-pointer hover:opacity-70"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      setSelectedGroups(
+                                        selectedGroups.filter(
+                                          (id) => id !== groupId,
+                                        ),
+                                      );
+                                    }}
+                                  />
+                                </span>
+                              ) : null;
+                            })}
+                          </span>
+                        )}
+                      </span>
+                      <ChevronDown className="h-4 w-4 opacity-50 shrink-0 ml-2" />
+                    </button>
+                  </PopoverTrigger>
+                  <PopoverContent align="end" className="w-56 p-0">
+                    <div className="max-h-64 overflow-y-auto">
+                      {groups.length === 0 ? (
+                        <div className="p-3 text-sm text-muted-foreground">
+                          No groups available
+                        </div>
                       ) : (
-                        <span className="flex gap-1 flex-wrap">
-                          {selectedGroups.map((groupId) => {
-                            const group = groups.find(
-                              (g) => g.id === groupId,
-                            );
-                            return group ? (
-                              <span
-                                key={groupId}
-                                className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-secondary text-secondary-foreground text-xs"
-                              >
-                                {group.name}
-                                <X
-                                  className="h-3 w-3 cursor-pointer hover:opacity-70"
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    setSelectedGroups(
-                                      selectedGroups.filter(
-                                        (id) => id !== groupId,
-                                      ),
-                                    );
-                                  }}
-                                />
-                              </span>
-                            ) : null;
-                          })}
-                        </span>
+                        groups.map((group) => {
+                          const isSelected = selectedGroups.includes(group.id);
+                          return (
+                            <button
+                              key={group.id}
+                              onClick={() => {
+                                if (isSelected) {
+                                  setSelectedGroups(
+                                    selectedGroups.filter(
+                                      (id) => id !== group.id,
+                                    ),
+                                  );
+                                } else {
+                                  setSelectedGroups([
+                                    ...selectedGroups,
+                                    group.id,
+                                  ]);
+                                }
+                              }}
+                              className="w-full flex items-center gap-2 rounded-sm py-1.5 pl-2 pr-2 text-sm hover:bg-accent hover:text-accent-foreground transition-colors text-left cursor-default"
+                            >
+                              <div className="w-4 h-4 shrink-0 flex items-center justify-center">
+                                {isSelected && (
+                                  <Check className="h-4 w-4 text-primary" />
+                                )}
+                              </div>
+                              <span>{group.name}</span>
+                            </button>
+                          );
+                        })
                       )}
-                    </span>
-                    <ChevronDown className="h-4 w-4 opacity-50 shrink-0 ml-2" />
-                  </button>
-                </PopoverTrigger>
-                <PopoverContent align="end" className="w-56 p-0">
-                  <div className="max-h-64 overflow-y-auto">
-                    {groups.length === 0 ? (
-                      <div className="p-3 text-sm text-muted-foreground">
-                        No groups available
-                      </div>
-                    ) : (
-                      groups.map((group) => {
-                        const isSelected = selectedGroups.includes(group.id);
-                        return (
-                          <button
-                            key={group.id}
-                            onClick={() => {
-                              if (isSelected) {
-                                setSelectedGroups(
-                                  selectedGroups.filter(
-                                    (id) => id !== group.id,
-                                  ),
-                                );
-                              } else {
-                                setSelectedGroups([
-                                  ...selectedGroups,
-                                  group.id,
-                                ]);
-                              }
-                            }}
-                            className="w-full flex items-center gap-2 rounded-sm py-1.5 pl-2 pr-2 text-sm hover:bg-accent hover:text-accent-foreground transition-colors text-left cursor-default"
-                          >
-                            <div className="w-4 h-4 shrink-0 flex items-center justify-center">
-                              {isSelected && (
-                                <Check className="h-4 w-4 text-primary" />
-                              )}
-                            </div>
-                            <span>{group.name}</span>
-                          </button>
-                        );
-                      })
-                    )}
-                  </div>
-                </PopoverContent>
-              </Popover>
+                    </div>
+                  </PopoverContent>
+                </Popover>
               </div>
             )}
             <div className="relative">
