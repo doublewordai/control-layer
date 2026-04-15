@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.38.1](https://github.com/doublewordai/control-layer/compare/v8.38.0...v8.38.1) (2026-04-15)
+
+
+### Bug Fixes
+
+* bump onwards to 0.24.1 ([#991](https://github.com/doublewordai/control-layer/issues/991)) ([9058b99](https://github.com/doublewordai/control-layer/commit/9058b99cdf8ea64b01032c55503337c76ca88658))
+
 ## [8.38.0](https://github.com/doublewordai/control-layer/compare/v8.37.1...v8.38.0) (2026-04-14)
 
 
