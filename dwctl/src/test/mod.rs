@@ -880,6 +880,7 @@ async fn test_request_logging_disabled(pool: PgPool) {
     let task_state = TaskState {
         request_manager: request_manager.clone(),
         dwctl_pool: pool.clone(),
+        config: crate::SharedConfig::new(config.clone()),
         encryption_key: None,
         ingest_file_job: std::sync::Arc::new(std::sync::OnceLock::new()),
         activate_batch_job: std::sync::Arc::new(std::sync::OnceLock::new()),
@@ -1234,6 +1235,7 @@ async fn test_build_router_with_metrics_disabled(pool: PgPool) {
     let task_state = crate::tasks::TaskState {
         request_manager: request_manager.clone(),
         dwctl_pool: pool.clone(),
+        config: crate::SharedConfig::new(config.clone()),
         encryption_key: None,
         ingest_file_job: std::sync::Arc::new(std::sync::OnceLock::new()),
         activate_batch_job: std::sync::Arc::new(std::sync::OnceLock::new()),
@@ -1280,6 +1282,7 @@ async fn test_build_router_with_metrics_enabled(pool: PgPool) {
     let task_state = TaskState {
         request_manager: request_manager.clone(),
         dwctl_pool: pool.clone(),
+        config: crate::SharedConfig::new(config.clone()),
         encryption_key: None,
         ingest_file_job: std::sync::Arc::new(std::sync::OnceLock::new()),
         activate_batch_job: std::sync::Arc::new(std::sync::OnceLock::new()),

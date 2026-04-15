@@ -6,7 +6,6 @@
 
 use sqlx_pool_router::PoolProvider;
 
-use super::sla_capacity::{check_sla_capacity, parse_window_to_seconds};
 use crate::AppState;
 use crate::api::models::batches::{
     BatchAnalytics, BatchErrors, BatchListResponse, BatchObjectType, BatchResponse, BatchResultsQuery, CreateBatchRequest,
@@ -25,7 +24,6 @@ use axum::{
     http::StatusCode,
 };
 use bytes::Bytes;
-use chrono::{Duration, Utc};
 use fusillade::Storage;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -472,9 +470,6 @@ pub async fn create_batch<P: PoolProvider>(
         }
     }
 
-    let windows = vec![(req.completion_window.clone(), parse_window_to_seconds(&req.completion_window))];
-    let states = vec!["pending".to_string(), "claimed".to_string(), "processing".to_string()];
-
     let model_throughputs = batch_model_info.throughputs;
     let model_ids_by_alias = get_model_ids_by_aliases(&state, &model_aliases).await?;
 
@@ -529,9 +524,6 @@ pub async fn create_batch<P: PoolProvider>(
         &file_model_counts,
         &model_throughputs,
         &model_ids_by_alias,
-        &windows,
-        &states,
-        &model_aliases,
         config.batches.relaxation_factor(&req.completion_window),
     )
     .await?;
@@ -682,146 +674,46 @@ async fn get_model_ids_by_aliases<P: PoolProvider>(state: &AppState<P>, model_al
 ///
 /// In short: the race is an inherent consequence of reading across two independent
 /// connections, but the read order ensures it always errs on the side of caution.
-#[allow(clippy::too_many_arguments)]
+/// Thin wrapper around the shared `reserve_capacity` for the API handler context.
+/// Converts `CapacityError` to the API's `Error` type.
 async fn reserve_capacity_for_batch<P: PoolProvider>(
     state: &AppState<P>,
     completion_window: &str,
     file_model_counts: &HashMap<String, i64>,
     model_throughputs: &HashMap<String, f32>,
     model_ids_by_alias: &HashMap<String, Uuid>,
-    windows: &[(String, i64)],
-    states: &[String],
-    model_filter: &[String],
     relaxation_factor: f32,
 ) -> Result<Vec<Uuid>> {
-    use crate::db::handlers::BatchCapacityReservations;
+    use super::sla_capacity::{CapacityError, CapacityReservationInput, reserve_capacity};
+
     let config = state.current_config();
-
-    let mut tx = state.db.write().begin().await.map_err(|e| Error::Internal {
-        operation: format!("begin reservation transaction: {}", e),
-    })?;
-
-    // Lock per model+window in deterministic order
-    let mut model_pairs: Vec<(String, Uuid)> = model_ids_by_alias.iter().map(|(a, id)| (a.clone(), *id)).collect();
-    model_pairs.sort_by_key(|(_, id)| *id);
-
-    for (alias, model_id) in &model_pairs {
-        sqlx::query!(
-            "SELECT pg_advisory_xact_lock(hashtext($1::text), hashtext($2::text))",
-            model_id.to_string(),
-            completion_window
-        )
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| Error::Internal {
-            operation: format!("lock reservation for {}: {}", alias, e),
-        })?;
-    }
-
-    // Sum active reservations and add to pending_counts
-    let model_ids: Vec<Uuid> = model_pairs.iter().map(|(_, id)| *id).collect();
-    let id_to_alias: HashMap<Uuid, String> = model_pairs.iter().map(|(a, id)| (*id, a.clone())).collect();
-    let mut reservations = BatchCapacityReservations::new(&mut tx);
-
-    let reserved_rows = reservations
-        .sum_active_by_model_window(&model_ids, completion_window)
-        .await
-        .map_err(|e| Error::Internal {
-            operation: format!("sum active reservations: {}", e),
-        })?;
-
-    // Fetch pending counts AFTER locks to avoid stale snapshots
-    let pending_counts = state
-        .request_manager
-        .get_pending_request_counts_by_model_and_completion_window(windows, states, model_filter, true)
-        .await
-        .map_err(|e| Error::Internal {
-            operation: format!("get pending counts: {}", e),
-        })?;
-
-    let mut pending_with_reservations = pending_counts.clone();
-    for (model_id, reserved) in reserved_rows {
-        if let Some(alias) = id_to_alias.get(&model_id) {
-            let windows = pending_with_reservations.entry(alias.clone()).or_default();
-            let entry = windows.entry(completion_window.to_string()).or_insert(0);
-            *entry += reserved;
-        }
-    }
-
-    let capacity_result = check_sla_capacity(
-        file_model_counts,
-        &pending_with_reservations,
-        model_throughputs,
-        config.batches.default_throughput,
+    let input = CapacityReservationInput {
         completion_window,
+        file_model_counts,
+        model_throughputs,
+        model_ids_by_alias,
+        default_throughput: config.batches.default_throughput,
         relaxation_factor,
-    );
+        reservation_ttl_secs: config.batches.reservation_ttl_secs,
+    };
 
-    if !capacity_result.has_capacity {
-        tx.rollback().await.ok();
-
-        let overloaded_details: Vec<String> = capacity_result
-            .overloaded_models
-            .iter()
-            .map(|(model, deficit)| format!("{} (needs {} more capacity)", model, deficit))
-            .collect();
-        tracing::warn!(
-            completion_window = %completion_window,
-            overloaded_models = %overloaded_details.join(", "),
-            "Batch rejected due to insufficient capacity"
-        );
-
-        let model_names: Vec<&str> = capacity_result.overloaded_models.keys().map(|model| model.as_str()).collect();
-
-        return Err(Error::TooManyRequests {
+    // Use the write pool for the reservation transaction
+    let pool = state.db.write();
+    reserve_capacity(pool, &*state.request_manager, &input).await.map_err(|e| match e {
+        CapacityError::InsufficientCapacity { completion_window, models } => Error::TooManyRequests {
             message: format!(
                 "Insufficient capacity for {} completion window. The following models are currently at capacity: {}. Try again later or use a longer completion window.",
-                completion_window,
-                model_names.join(", ")
+                completion_window, models
             ),
-        });
-    }
-
-    let expires_at = Utc::now() + Duration::seconds(config.batches.reservation_ttl_secs);
-
-    let mut rows = Vec::new();
-    for (alias, model_id) in &model_pairs {
-        if let Some(&count) = file_model_counts.get(alias)
-            && count > 0
-        {
-            rows.push((*model_id, completion_window, count, expires_at));
-        }
-    }
-
-    let reservation_ids = reservations.insert_reservations(&rows).await.map_err(|e| Error::Internal {
-        operation: format!("insert reservations: {}", e),
-    })?;
-
-    tx.commit().await.map_err(|e| Error::Internal {
-        operation: format!("commit reservation transaction: {}", e),
-    })?;
-
-    Ok(reservation_ids)
+        },
+        CapacityError::Internal(msg) => Error::Internal { operation: msg },
+    })
 }
 
 async fn release_capacity_reservations<P: PoolProvider>(state: &AppState<P>, reservation_ids: &[Uuid]) -> Result<()> {
-    use crate::db::handlers::BatchCapacityReservations;
-
-    if reservation_ids.is_empty() {
-        return Ok(());
-    }
-
-    let mut conn = state.db.write().acquire().await.map_err(|e| Error::Internal {
-        operation: format!("get db connection: {}", e),
-    })?;
-
-    let mut reservations = BatchCapacityReservations::new(&mut conn);
-    reservations
-        .release_reservations(reservation_ids)
+    super::sla_capacity::release_reservations(state.db.write(), reservation_ids)
         .await
-        .map_err(|e| Error::Internal {
-            operation: format!("release reservations: {}", e),
-        })
+        .map_err(|msg| Error::Internal { operation: msg })
 }
 
 #[utoipa::path(
@@ -2796,23 +2688,10 @@ mod tests {
         let model_throughputs = HashMap::from([(alias.clone(), 1000.0_f32)]);
         let model_ids_by_alias = HashMap::from([(alias.clone(), model_id)]);
 
-        let windows = vec![("24h".to_string(), super::parse_window_to_seconds("24h"))];
-        let states = vec!["pending".to_string(), "claimed".to_string(), "processing".to_string()];
-        let model_filter = vec![alias.clone()];
-
-        let reservation_ids = super::reserve_capacity_for_batch(
-            &state,
-            "24h",
-            &file_model_counts,
-            &model_throughputs,
-            &model_ids_by_alias,
-            &windows,
-            &states,
-            &model_filter,
-            1.0,
-        )
-        .await
-        .unwrap();
+        let reservation_ids =
+            super::reserve_capacity_for_batch(&state, "24h", &file_model_counts, &model_throughputs, &model_ids_by_alias, 1.0)
+                .await
+                .unwrap();
 
         assert_eq!(reservation_ids.len(), 1);
 
@@ -2858,23 +2737,9 @@ mod tests {
         let model_throughputs = HashMap::from([(alias.clone(), 0.0_f32)]);
         let model_ids_by_alias = HashMap::from([(alias.clone(), model_id)]);
 
-        let windows = vec![("1h".to_string(), super::parse_window_to_seconds("1h"))];
-        let states = vec!["pending".to_string(), "claimed".to_string(), "processing".to_string()];
-        let model_filter = vec![alias.clone()];
-
-        let err = super::reserve_capacity_for_batch(
-            &state,
-            "1h",
-            &file_model_counts,
-            &model_throughputs,
-            &model_ids_by_alias,
-            &windows,
-            &states,
-            &model_filter,
-            1.0,
-        )
-        .await
-        .unwrap_err();
+        let err = super::reserve_capacity_for_batch(&state, "1h", &file_model_counts, &model_throughputs, &model_ids_by_alias, 1.0)
+            .await
+            .unwrap_err();
 
         match err {
             Error::TooManyRequests { .. } => {}
@@ -3219,43 +3084,21 @@ mod tests {
         let file_model_counts = HashMap::from([(alias.clone(), 5_i64)]);
         let model_throughputs = HashMap::from([(alias.clone(), 0.001_f32)]);
         let model_ids_by_alias = HashMap::from([(alias.clone(), model_id)]);
-        let windows = vec![("1h".to_string(), super::parse_window_to_seconds("1h"))];
-        let states = vec!["pending".to_string(), "claimed".to_string(), "processing".to_string()];
-        let model_filter = vec![alias.clone()];
 
         // Without relaxation (strict): should be rejected
-        let strict_err = super::reserve_capacity_for_batch(
-            &state,
-            "1h",
-            &file_model_counts,
-            &model_throughputs,
-            &model_ids_by_alias,
-            &windows,
-            &states,
-            &model_filter,
-            1.0,
-        )
-        .await
-        .unwrap_err();
+        let strict_err = super::reserve_capacity_for_batch(&state, "1h", &file_model_counts, &model_throughputs, &model_ids_by_alias, 1.0)
+            .await
+            .unwrap_err();
         assert!(
             matches!(strict_err, Error::TooManyRequests { .. }),
             "Should be rejected at strict capacity"
         );
 
         // With relaxation factor 2.0: should be accepted
-        let reservation_ids = super::reserve_capacity_for_batch(
-            &state,
-            "1h",
-            &file_model_counts,
-            &model_throughputs,
-            &model_ids_by_alias,
-            &windows,
-            &states,
-            &model_filter,
-            2.0,
-        )
-        .await
-        .expect("Should be accepted with 2× relaxation factor");
+        let reservation_ids =
+            super::reserve_capacity_for_batch(&state, "1h", &file_model_counts, &model_throughputs, &model_ids_by_alias, 2.0)
+                .await
+                .expect("Should be accepted with 2× relaxation factor");
         assert_eq!(reservation_ids.len(), 1);
 
         super::release_capacity_reservations(&state, &reservation_ids).await.unwrap();
@@ -3282,41 +3125,18 @@ mod tests {
         let file_model_counts = HashMap::from([(alias.clone(), 5_i64)]);
         let model_throughputs = HashMap::from([(alias.clone(), 0.001_f32)]);
         let model_ids_by_alias = HashMap::from([(alias.clone(), model_id)]);
-        let states = vec!["pending".to_string(), "claimed".to_string(), "processing".to_string()];
-        let model_filter = vec![alias.clone()];
 
         // 1h window — strict (factor defaults to 1.0), 5 > 3.6, rejected
-        let windows_1h = vec![("1h".to_string(), super::parse_window_to_seconds("1h"))];
-        let err = super::reserve_capacity_for_batch(
-            &state,
-            "1h",
-            &file_model_counts,
-            &model_throughputs,
-            &model_ids_by_alias,
-            &windows_1h,
-            &states,
-            &model_filter,
-            1.0,
-        )
-        .await
-        .unwrap_err();
+        let err = super::reserve_capacity_for_batch(&state, "1h", &file_model_counts, &model_throughputs, &model_ids_by_alias, 1.0)
+            .await
+            .unwrap_err();
         assert!(matches!(err, Error::TooManyRequests { .. }), "1h should be rejected — not relaxed");
 
         // 24h window — factor=10.0, effective capacity = 86400 * 0.001 * 10 = 864, accepted
-        let windows_24h = vec![("24h".to_string(), super::parse_window_to_seconds("24h"))];
-        let reservation_ids = super::reserve_capacity_for_batch(
-            &state,
-            "24h",
-            &file_model_counts,
-            &model_throughputs,
-            &model_ids_by_alias,
-            &windows_24h,
-            &states,
-            &model_filter,
-            10.0,
-        )
-        .await
-        .expect("24h should be accepted with 10× relaxation");
+        let reservation_ids =
+            super::reserve_capacity_for_batch(&state, "24h", &file_model_counts, &model_throughputs, &model_ids_by_alias, 10.0)
+                .await
+                .expect("24h should be accepted with 10× relaxation");
         assert_eq!(reservation_ids.len(), 1);
 
         super::release_capacity_reservations(&state, &reservation_ids).await.unwrap();

@@ -2224,6 +2224,7 @@ async fn setup_background_services(
     let task_state = tasks::TaskState {
         request_manager: request_manager.clone(),
         dwctl_pool: pool.clone(),
+        config: SharedConfig::new(config.clone()),
         encryption_key: encryption_key.clone(),
         ingest_file_job: Arc::new(std::sync::OnceLock::new()),
         activate_batch_job: Arc::new(std::sync::OnceLock::new()),

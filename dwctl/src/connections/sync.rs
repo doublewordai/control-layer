@@ -896,9 +896,80 @@ pub(crate) async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + '
         .unwrap_or("24h")
         .to_string();
 
-    // 3. TODO: capacity check (if respect_capacity_reservations is enabled)
-    //    For now, we proceed directly. When capacity checking is added,
-    //    return Err with "insufficient capacity" message to trigger retryable error.
+    // 3. Capacity check — reserve capacity before creating the batch.
+    //    If the model queue is full, return a retryable error so underway backs off
+    //    and retries when capacity becomes available.
+    let reservation_ids = {
+        use crate::api::handlers::sla_capacity::{CapacityError, CapacityReservationInput, reserve_capacity};
+        use crate::db::handlers::deployments::Deployments;
+
+        // Get per-model request counts from the file templates
+        let file_stats = state
+            .request_manager
+            .get_file_template_stats(fusillade::FileId(input.file_id))
+            .await
+            .map_err(|e| anyhow::anyhow!("get file template stats: {e}"))?;
+
+        let file_model_counts: std::collections::HashMap<String, i64> =
+            file_stats.iter().map(|s| (s.model.clone(), s.request_count)).collect();
+
+        if file_model_counts.is_empty() {
+            Vec::new()
+        } else {
+            let model_aliases: Vec<String> = file_model_counts.keys().cloned().collect();
+
+            // Get per-model throughputs
+            let batch_model_info = {
+                let mut conn = dwctl.acquire().await?;
+                Deployments::new(&mut conn).get_batch_model_info(&model_aliases).await?
+            };
+
+            // Get model UUIDs for advisory locks
+            let model_ids_by_alias = {
+                let mut conn = dwctl.acquire().await?;
+                Deployments::new(&mut conn).get_model_ids_by_aliases(&model_aliases).await?
+            };
+
+            let config = state.config.snapshot();
+            let input = CapacityReservationInput {
+                completion_window: &completion_window,
+                file_model_counts: &file_model_counts,
+                model_throughputs: &batch_model_info.throughputs,
+                model_ids_by_alias: &model_ids_by_alias,
+                default_throughput: config.batches.default_throughput,
+                relaxation_factor: config.batches.relaxation_factor(&completion_window),
+                reservation_ttl_secs: config.batches.reservation_ttl_secs,
+            };
+
+            match reserve_capacity(dwctl, &*state.request_manager, &input).await {
+                Ok(ids) => ids,
+                Err(CapacityError::InsufficientCapacity { completion_window, models }) => {
+                    return Err(ActivateError::Retryable(format!(
+                        "insufficient capacity for {completion_window} window (models: {models})"
+                    ))
+                    .into());
+                }
+                Err(CapacityError::Internal(msg)) => {
+                    return Err(anyhow::anyhow!("capacity reservation: {msg}"));
+                }
+            }
+        }
+    };
+
+    // RAII guard: release reservations when scope exits (TTL is the safety net)
+    let _release_guard = {
+        let pool = state.dwctl_pool.clone();
+        let ids = reservation_ids.clone();
+        scopeguard::guard((), move |()| {
+            if !ids.is_empty() {
+                tokio::runtime::Handle::current().spawn(async move {
+                    if let Err(e) = crate::api::handlers::sla_capacity::release_reservations(&pool, &ids).await {
+                        tracing::warn!(error = %e, "Failed to release capacity reservations — will expire via TTL");
+                    }
+                });
+            }
+        })
+    };
 
     // 4. Resolve the connection owner's hidden batch API key.
     //    connection.user_id = the owner (org ID in org context, personal ID otherwise).
@@ -1149,6 +1220,7 @@ mod tests {
         crate::tasks::TaskState {
             request_manager,
             dwctl_pool: pool,
+            config: crate::SharedConfig::new(crate::test::utils::create_test_config()),
             encryption_key: None,
             ingest_file_job: std::sync::Arc::new(std::sync::OnceLock::new()),
             activate_batch_job: std::sync::Arc::new(std::sync::OnceLock::new()),

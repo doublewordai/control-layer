@@ -110,7 +110,7 @@ pub fn check_sla_capacity(
 /// Returns the window duration in seconds. Invalid or negative values
 /// default to 24 hours (86400 seconds). Very large values are clamped
 /// to MAX_WINDOW_SECONDS to prevent overflow in capacity calculations.
-pub(super) fn parse_window_to_seconds(window: &str) -> i64 {
+pub(crate) fn parse_window_to_seconds(window: &str) -> i64 {
     let parsed = if window.ends_with('h') {
         window.trim_end_matches('h').parse::<i64>().ok().map(|h| h * 3600)
     } else if window.ends_with('m') {
@@ -149,6 +149,168 @@ pub(super) fn parse_window_to_seconds(window: &str) -> i64 {
             86400
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Shared capacity reservation — used by both API batch creation and sync activate
+// ---------------------------------------------------------------------------
+
+use chrono::{Duration, Utc};
+use sqlx::PgPool;
+use uuid::Uuid;
+
+/// Inputs for a capacity reservation check, independent of API/sync context.
+pub(crate) struct CapacityReservationInput<'a> {
+    pub completion_window: &'a str,
+    pub file_model_counts: &'a HashMap<String, i64>,
+    pub model_throughputs: &'a HashMap<String, f32>,
+    pub model_ids_by_alias: &'a HashMap<String, Uuid>,
+    pub default_throughput: f32,
+    pub relaxation_factor: f32,
+    pub reservation_ttl_secs: i64,
+}
+
+/// Error type for capacity reservation operations.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum CapacityError {
+    #[error("insufficient capacity for {completion_window} window: {models}")]
+    InsufficientCapacity { completion_window: String, models: String },
+    #[error("{0}")]
+    Internal(String),
+}
+
+/// Reserve capacity for a batch. Returns reservation IDs on success,
+/// or `CapacityError::InsufficientCapacity` if the queue is full.
+///
+/// Used by both `POST /batches` (API) and `run_activate_batch` (sync pipeline).
+pub(crate) async fn reserve_capacity<P: sqlx_pool_router::PoolProvider>(
+    dwctl_pool: &PgPool,
+    request_manager: &fusillade::PostgresRequestManager<P, fusillade::ReqwestHttpClient>,
+    input: &CapacityReservationInput<'_>,
+) -> Result<Vec<Uuid>, CapacityError> {
+    use crate::db::handlers::BatchCapacityReservations;
+    use fusillade::Storage;
+
+    let mut tx = dwctl_pool
+        .begin()
+        .await
+        .map_err(|e| CapacityError::Internal(format!("begin reservation transaction: {e}")))?;
+
+    // Lock per model+window in deterministic order to prevent concurrent races
+    let mut model_pairs: Vec<(String, Uuid)> = input.model_ids_by_alias.iter().map(|(a, id)| (a.clone(), *id)).collect();
+    model_pairs.sort_by_key(|(_, id)| *id);
+
+    for (alias, model_id) in &model_pairs {
+        sqlx::query!(
+            "SELECT pg_advisory_xact_lock(hashtext($1::text), hashtext($2::text))",
+            model_id.to_string(),
+            input.completion_window
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| CapacityError::Internal(format!("lock reservation for {alias}: {e}")))?;
+    }
+
+    // Sum active reservations
+    let model_ids: Vec<Uuid> = model_pairs.iter().map(|(_, id)| *id).collect();
+    let id_to_alias: HashMap<Uuid, String> = model_pairs.iter().map(|(a, id)| (*id, a.clone())).collect();
+    let mut reservations = BatchCapacityReservations::new(&mut tx);
+
+    let reserved_rows = reservations
+        .sum_active_by_model_window(&model_ids, input.completion_window)
+        .await
+        .map_err(|e| CapacityError::Internal(format!("sum active reservations: {e}")))?;
+
+    // Fetch pending counts AFTER locks to avoid stale snapshots
+    let windows = vec![(
+        input.completion_window.to_string(),
+        parse_window_to_seconds(input.completion_window),
+    )];
+    let states = vec!["pending".to_string(), "claimed".to_string(), "processing".to_string()];
+    let model_filter: Vec<String> = input.file_model_counts.keys().cloned().collect();
+
+    let pending_counts: HashMap<String, HashMap<String, i64>> = request_manager
+        .get_pending_request_counts_by_model_and_completion_window(&windows, &states, &model_filter, true)
+        .await
+        .map_err(|e| CapacityError::Internal(format!("get pending counts: {e}")))?;
+
+    // Merge reservations into pending
+    let mut pending_with_reservations = pending_counts.clone();
+    for (model_id, reserved) in reserved_rows {
+        if let Some(alias) = id_to_alias.get(&model_id) {
+            let windows = pending_with_reservations.entry(alias.clone()).or_default();
+            let entry = windows.entry(input.completion_window.to_string()).or_insert(0);
+            *entry += reserved;
+        }
+    }
+
+    let capacity_result = check_sla_capacity(
+        input.file_model_counts,
+        &pending_with_reservations,
+        input.model_throughputs,
+        input.default_throughput,
+        input.completion_window,
+        input.relaxation_factor,
+    );
+
+    if !capacity_result.has_capacity {
+        tx.rollback().await.ok();
+
+        let overloaded_details: Vec<String> = capacity_result
+            .overloaded_models
+            .iter()
+            .map(|(model, deficit)| format!("{model} (needs {deficit} more capacity)"))
+            .collect();
+        tracing::warn!(
+            completion_window = %input.completion_window,
+            overloaded_models = %overloaded_details.join(", "),
+            "Batch rejected due to insufficient capacity"
+        );
+
+        let model_names: Vec<&str> = capacity_result.overloaded_models.keys().map(|s| s.as_str()).collect();
+        return Err(CapacityError::InsufficientCapacity {
+            completion_window: input.completion_window.to_string(),
+            models: model_names.join(", "),
+        });
+    }
+
+    // Insert reservations
+    let expires_at = Utc::now() + Duration::seconds(input.reservation_ttl_secs);
+    let mut rows = Vec::new();
+    for (alias, model_id) in &model_pairs {
+        if let Some(&count) = input.file_model_counts.get(alias)
+            && count > 0
+        {
+            rows.push((*model_id, input.completion_window, count, expires_at));
+        }
+    }
+
+    let reservation_ids = reservations
+        .insert_reservations(&rows)
+        .await
+        .map_err(|e| CapacityError::Internal(format!("insert reservations: {e}")))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| CapacityError::Internal(format!("commit reservation transaction: {e}")))?;
+
+    Ok(reservation_ids)
+}
+
+/// Release capacity reservations (best-effort — TTL is the safety net).
+pub(crate) async fn release_reservations(dwctl_pool: &PgPool, reservation_ids: &[Uuid]) -> Result<(), String> {
+    use crate::db::handlers::BatchCapacityReservations;
+
+    if reservation_ids.is_empty() {
+        return Ok(());
+    }
+
+    let mut conn = dwctl_pool.acquire().await.map_err(|e| format!("acquire connection: {e}"))?;
+
+    BatchCapacityReservations::new(&mut conn)
+        .release_reservations(reservation_ids)
+        .await
+        .map_err(|e| format!("release reservations: {e}"))
 }
 
 #[cfg(test)]
