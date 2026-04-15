@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
 import { Code, Play, X, Filter, Clock, DollarSign, Check, ChevronsUpDown } from "lucide-react";
 import { type ColumnDef } from "@tanstack/react-table";
@@ -231,7 +231,7 @@ export function AsyncRequests() {
   const bootstrapBanner = useBootstrapContent();
   const { hasPermission } = useAuthorization();
   const isPlatformManager = hasPermission("manage-models");
-  const { isOrgContext } = useOrganizationContext();
+  const { isOrgContext, activeOrganizationId } = useOrganizationContext();
   const showUserColumn = isPlatformManager || isOrgContext;
   const { data: config } = useConfig();
   const asyncCompletionWindow =
@@ -254,6 +254,13 @@ export function AsyncRequests() {
     allModels.map((m) => [m.alias, m.display_name || m.alias]),
   );
   const [modelPopoverOpen, setModelPopoverOpen] = useState(false);
+
+  // Reset filters when org context changes
+  useEffect(() => {
+    setStatusFilter("all");
+    setModelFilter([]);
+    setDateRange(undefined);
+  }, [activeOrganizationId]);
 
   // Server-side offset pagination
   const pagination = useServerPagination({ defaultPageSize: 10 });

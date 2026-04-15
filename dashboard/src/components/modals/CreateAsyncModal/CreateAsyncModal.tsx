@@ -263,10 +263,13 @@ export function CreateAsyncModal({
       onClose();
     } catch (err) {
       console.error("Failed to create async requests:", err);
-      setError(
+      const baseMessage =
         err instanceof Error
           ? err.message
-          : "Failed to create async requests. Please try again.",
+          : "Failed to create async requests.";
+      // If file was uploaded but batch creation failed, inform user
+      setError(
+        `${baseMessage} If a file was uploaded, you can find it in the Batches > Files tab.`,
       );
     } finally {
       setIsSubmitting(false);

@@ -148,7 +148,7 @@ pub async fn list_batch_requests<P: PoolProvider>(
     let emails = if !unique_creator_ids.is_empty() {
         sqlx::query_as::<_, EmailRow>("SELECT id::text as user_id, email FROM users WHERE id::text = ANY($1)")
             .bind(&unique_creator_ids)
-            .fetch_all(state.db.read())
+            .fetch_all(state.db.write())
             .await
             .unwrap_or_else(|e| {
                 tracing::warn!(error = %e, "failed to fetch creator emails for batch requests");
@@ -234,7 +234,8 @@ pub async fn get_batch_request<P: PoolProvider>(
             }
         })?;
 
-    // Check ownership
+    // Check ownership — fetch-then-check pattern matches get_batch handler.
+    // The response is discarded on failure (returns 404, no data leakage).
     let can_read_all = can_read_all_resources(&current_user, Resource::Batches);
     if !can_read_all && !is_batch_owner(&current_user, &detail.batch_created_by) {
         return Err(Error::NotFound {

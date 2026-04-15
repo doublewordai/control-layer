@@ -197,7 +197,7 @@ const ApiExamplesModal: React.FC<ApiExamplesModalProps> = ({
     toast.success("JSONL file downloaded");
   };
 
-  const getBaseUrl = () => `https://api.doubleword.ai/v1`;
+  const getBaseUrl = () => config?.ai_api_base_url || `https://api.doubleword.ai/v1`;
 
   const generateAutobatcherCode = (language: Language) => {
     const keyValue = apiKey || "your-api-key-here";
