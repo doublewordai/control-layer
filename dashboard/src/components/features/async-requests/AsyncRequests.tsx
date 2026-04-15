@@ -76,11 +76,16 @@ const userColumn: ColumnDef<AsyncRequest> = {
   header: "User",
   cell: ({ row }) => {
     const email = row.original.created_by_email;
-    if (!email) return <span className="text-sm text-doubleword-neutral-600">-</span>;
+    if (!email) return <span className="text-xs text-doubleword-neutral-600">-</span>;
     return (
-      <span className="text-sm text-gray-700 truncate max-w-[120px] block cursor-default" title={email}>
-        {email}
-      </span>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <span className="text-xs text-doubleword-neutral-700 truncate max-w-[180px] block cursor-default">
+            {email}
+          </span>
+        </TooltipTrigger>
+        <TooltipContent side="top">{email}</TooltipContent>
+      </Tooltip>
     );
   },
 };
@@ -96,7 +101,7 @@ function createColumns(
     cell: ({ row }) => {
       const timestamp = row.getValue("created_at") as string;
       return (
-        <span className="text-sm text-doubleword-neutral-900">
+        <span className="text-xs text-doubleword-neutral-900">
           {formatTimestamp(timestamp)}
         </span>
       );
@@ -106,11 +111,25 @@ function createColumns(
   {
     accessorKey: "model",
     header: "Model",
-    cell: ({ row }) => (
-      <span className="text-sm text-doubleword-neutral-900 truncate max-w-[160px] block">
-        {modelDisplayNames?.get(row.getValue("model") as string) || row.getValue("model")}
-      </span>
-    ),
+    cell: ({ row }) => {
+      const alias = row.getValue("model") as string;
+      const displayName = modelDisplayNames?.get(alias) || alias;
+      const showTooltip = displayName !== alias;
+      const content = (
+        <span className="text-xs text-doubleword-neutral-900 truncate max-w-[220px] block">
+          {displayName}
+        </span>
+      );
+      if (!showTooltip) return content;
+      return (
+        <Tooltip>
+          <TooltipTrigger asChild>{content}</TooltipTrigger>
+          <TooltipContent side="top">
+            <span className="font-mono text-xs">{alias}</span>
+          </TooltipContent>
+        </Tooltip>
+      );
+    },
   },
   {
     accessorKey: "status",
@@ -119,7 +138,7 @@ function createColumns(
       const status = row.getValue("status") as string;
       return (
         <span
-          className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${getStatusColor(status)}`}
+          className={`inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-medium ${getStatusColor(status)}`}
         >
           {statusLabels[status] || status}
         </span>
@@ -136,12 +155,12 @@ function createColumns(
         (prompt_tokens == null && completion_tokens == null) ||
         (prompt_tokens === 0 && completion_tokens === 0)
       ) {
-        return <span className="text-sm text-doubleword-neutral-600">-</span>;
+        return <span className="text-xs text-doubleword-neutral-600">-</span>;
       }
       return (
         <Tooltip>
           <TooltipTrigger asChild>
-            <span className="text-sm text-doubleword-neutral-900 tabular-nums cursor-help">
+            <span className="text-xs text-doubleword-neutral-900 tabular-nums cursor-help">
               {(prompt_tokens ?? 0).toLocaleString()} / {(completion_tokens ?? 0).toLocaleString()}
             </span>
           </TooltipTrigger>
@@ -177,11 +196,11 @@ function createColumns(
     cell: ({ row }) => {
       const cost = row.original.total_cost;
       if (cost == null) {
-        return <span className="text-sm text-doubleword-neutral-600">-</span>;
+        return <span className="text-xs text-doubleword-neutral-600">-</span>;
       }
       return (
-        <span className="text-sm text-green-700 font-medium flex items-center gap-1">
-          <DollarSign className="w-3 h-3" />
+        <span className="text-xs text-green-700 font-medium flex items-center gap-0.5">
+          <DollarSign className="w-2.5 h-2.5" />
           {formatCost(cost).slice(1)}
         </span>
       );
@@ -192,10 +211,10 @@ function createColumns(
     header: "Duration",
     cell: ({ row }) => {
       const ms = row.original.duration_ms;
-      if (!ms) return <span className="text-sm text-doubleword-neutral-600">-</span>;
+      if (!ms) return <span className="text-xs text-doubleword-neutral-600">-</span>;
       return (
-        <div className="flex items-center gap-1 text-sm text-doubleword-neutral-900">
-          <Clock className="w-3 h-3" />
+        <div className="flex items-center gap-1 text-xs text-doubleword-neutral-900">
+          <Clock className="w-2.5 h-2.5" />
           {formatLongDuration(ms)}
         </div>
       );
