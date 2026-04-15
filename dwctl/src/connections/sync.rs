@@ -148,6 +148,16 @@ pub async fn build_activate_batch_job<P: PoolProvider + Clone + Send + Sync + 's
     use underway::job::To;
     use underway::task::Error as TaskError;
 
+    // Generous retry policy: capacity-gated activations may wait hours for queue
+    // space during large ingestions. Actual errors (Fatal) skip retries entirely,
+    // so the high max_attempts only affects retryable failures (capacity + transient).
+    let retry_policy = underway::task::RetryPolicy::builder()
+        .max_attempts(10_000) // effectively unlimited for capacity backpressure
+        .initial_interval_ms(5_000) // start at 5 seconds
+        .max_interval_ms(300_000) // cap at 5 minutes between retries
+        .backoff_coefficient(2.0) // exponential: 5s → 10s → 20s → ... → 5min
+        .build();
+
     Job::<ActivateBatchInput, _>::builder()
         .state(state)
         .step(|cx, input: ActivateBatchInput| async move {
@@ -196,6 +206,7 @@ pub async fn build_activate_batch_job<P: PoolProvider + Clone + Send + Sync + 's
                 }
             }
         })
+        .retry_policy(retry_policy)
         .name("activate-batch")
         .pool(pool)
         .build()
