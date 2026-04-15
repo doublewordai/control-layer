@@ -37,6 +37,7 @@ import type {
 import { CreateAsyncModal } from "../../modals/CreateAsyncModal/CreateAsyncModal";
 import { ApiExamples } from "../../modals";
 import { useBootstrapContent } from "../../../hooks/use-bootstrap-content";
+import { useOrganizationContext } from "../../../contexts/organization/useOrganizationContext";
 import { useServerPagination } from "../../../hooks/useServerPagination";
 import { formatTimestamp, formatLongDuration } from "../../../utils";
 
@@ -230,6 +231,8 @@ export function AsyncRequests() {
   const bootstrapBanner = useBootstrapContent();
   const { hasPermission } = useAuthorization();
   const isPlatformManager = hasPermission("manage-models");
+  const { isOrgContext } = useOrganizationContext();
+  const showUserColumn = isPlatformManager || isOrgContext;
   const { data: config } = useConfig();
   const asyncCompletionWindow =
     config?.batches?.async_requests?.completion_window ?? "1h";
@@ -255,7 +258,7 @@ export function AsyncRequests() {
   // Server-side offset pagination
   const pagination = useServerPagination({ defaultPageSize: 10 });
 
-  const columns = createColumns(isPlatformManager, modelDisplayNames);
+  const columns = createColumns(showUserColumn, modelDisplayNames);
 
   const { data, isLoading } = useAsyncRequests({
     completion_window: asyncCompletionWindow,

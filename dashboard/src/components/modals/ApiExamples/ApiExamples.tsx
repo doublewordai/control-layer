@@ -203,16 +203,22 @@ const ApiExamplesModal: React.FC<ApiExamplesModalProps> = ({
     const keyValue = apiKey || "your-api-key-here";
     const modelAlias = model?.alias || "model-name";
     if (language === "python") {
-      return `from autobatcher import AsyncOpenAI
+      return `import asyncio
+from autobatcher import AsyncOpenAI
 
-client = AsyncOpenAI(api_key="${keyValue}")
 
-response = await client.chat.completions.create(
-    model="${modelAlias}",
-    messages=[{"role": "user", "content": "Explain quantum computing"}],
-)
+async def main():
+    client = AsyncOpenAI(api_key="${keyValue}")
 
-print(response.choices[0].message.content)`;
+    response = await client.chat.completions.create(
+        model="${modelAlias}",
+        messages=[{"role": "user", "content": "Explain quantum computing"}],
+    )
+
+    print(response.choices[0].message.content)
+
+
+asyncio.run(main())`;
     } else if (language === "javascript") {
       return `import OpenAI from 'openai';
 

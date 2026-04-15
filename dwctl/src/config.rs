@@ -1087,6 +1087,19 @@ impl Default for BatchConfig {
 
 /// Batch processing daemon configuration.
 ///
+impl BatchConfig {
+    /// Validate batch config consistency. Logs warnings for misconfigurations.
+    pub fn validate(&self) {
+        if self.async_requests.enabled && !self.allowed_completion_windows.contains(&self.async_requests.completion_window) {
+            tracing::error!(
+                async_window = %self.async_requests.completion_window,
+                allowed = ?self.allowed_completion_windows,
+                "async_requests.completion_window is not in allowed_completion_windows — async requests will fail"
+            );
+        }
+    }
+}
+
 /// The daemon processes batch requests asynchronously in the background.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]

@@ -47,6 +47,9 @@ async fn async_main() -> anyhow::Result<()> {
     // Load configuration
     let config = Config::load(&args)?;
 
+    // Validate config consistency
+    config.batches.validate();
+
     // If --validate flag is set, exit successfully after config validation
     if args.validate {
         println!("Configuration is valid.");

@@ -150,7 +150,10 @@ pub async fn list_batch_requests<P: PoolProvider>(
             .bind(&unique_creator_ids)
             .fetch_all(state.db.read())
             .await
-            .unwrap_or_default()
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "failed to fetch creator emails for batch requests");
+                vec![]
+            })
     } else {
         vec![]
     };
@@ -216,9 +219,19 @@ pub async fn get_batch_request<P: PoolProvider>(
         .request_manager
         .get_request_detail(fusillade::RequestId(request_id))
         .await
-        .map_err(|_| Error::NotFound {
-            resource: "BatchRequest".to_string(),
-            id: request_id.to_string(),
+        .map_err(|e| {
+            let msg = e.to_string();
+            if msg.to_lowercase().contains("not found") {
+                Error::NotFound {
+                    resource: "BatchRequest".to_string(),
+                    id: request_id.to_string(),
+                }
+            } else {
+                tracing::error!(request_id = %request_id, error = %msg, "failed to fetch batch request detail");
+                Error::Internal {
+                    operation: format!("get batch request detail: {}", msg),
+                }
+            }
         })?;
 
     // Check ownership
