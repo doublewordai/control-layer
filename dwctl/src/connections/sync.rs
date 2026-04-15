@@ -1478,6 +1478,18 @@ mod tests {
 
         assert_eq!(pending_count, 2, "2 valid requests should be pending");
         assert_eq!(failed_count, 2, "2 invalid requests should be failed");
+
+        // Verify capacity reservations were released after successful populate
+        let active_reservations: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(reserved_requests), 0)::BIGINT FROM batch_capacity_reservations WHERE released_at IS NULL AND expires_at > now()",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("query active reservations");
+        assert_eq!(
+            active_reservations, 0,
+            "all capacity reservations should be released after successful activation"
+        );
     }
 
     /// Verify that skipped_lines and validation_errors are stored correctly in
