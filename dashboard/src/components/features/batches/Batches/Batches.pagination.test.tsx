@@ -8,6 +8,7 @@ import * as hooks from "../../../../api/control-layer/hooks";
 
 // Mock the hooks
 vi.mock("../../../../api/control-layer/hooks", () => ({
+  useConfig: vi.fn(),
   useFiles: vi.fn(),
   useBatches: vi.fn(),
   useDeleteFile: vi.fn(),
@@ -147,6 +148,15 @@ const createWrapper = (initialEntries = ["/"]) => {
 describe("Batches - Pagination", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.mocked(hooks.useConfig).mockReturnValue({
+      data: {
+        batches: {
+          allowed_completion_windows: ["24h", "1h"],
+          async_requests: { enabled: true, completion_window: "1h" },
+        },
+      },
+      isLoading: false,
+    } as any);
   });
 
   describe("Files Pagination", () => {

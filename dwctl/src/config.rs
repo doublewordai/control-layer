@@ -942,6 +942,10 @@ pub struct BatchConfig {
     /// Allowed OpenAI-compatible URL paths for batch requests.
     /// These paths are validated during file upload and batch creation.
     pub allowed_url_paths: Vec<String>,
+    /// Async request configuration.
+    /// Controls whether the async UI is shown and which completion window is used for async requests.
+    #[serde(default)]
+    pub async_requests: AsyncRequestsConfig,
     /// Files configuration for batch file uploads/downloads
     pub files: FilesConfig,
     /// Default throughput (requests/second) for models without explicit throughput configured.
@@ -958,6 +962,30 @@ pub struct BatchConfig {
         deserialize_with = "deserialize_positive_reservation_ttl"
     )]
     pub reservation_ttl_secs: i64,
+}
+
+/// Configuration for the async requests feature.
+///
+/// Async requests provide a simplified UI for submitting individual requests
+/// that are processed as batches with a fast completion window.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AsyncRequestsConfig {
+    /// Enable async requests UI and API functionality (default: true)
+    pub enabled: bool,
+    /// Completion window used for async requests (e.g., "1h").
+    /// Must be present in the parent `allowed_completion_windows` list.
+    /// Default: "1h"
+    pub completion_window: String,
+}
+
+impl Default for AsyncRequestsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            completion_window: "1h".to_string(),
+        }
+    }
 }
 
 fn default_batch_throughput() -> f32 {
@@ -1049,6 +1077,7 @@ impl Default for BatchConfig {
                 "/v1/embeddings".to_string(),
                 "/v1/responses".to_string(),
             ],
+            async_requests: AsyncRequestsConfig::default(),
             files: FilesConfig::default(),
             default_throughput: default_batch_throughput(),
             reservation_ttl_secs: default_reservation_ttl_secs(),

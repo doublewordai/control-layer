@@ -15,6 +15,17 @@ pub struct BatchConfigResponse {
     pub allowed_completion_windows: Vec<String>,
     /// Allowed endpoint URL paths (e.g., "/v1/chat/completions", "/v1/responses").
     pub allowed_url_paths: Vec<String>,
+    /// Async requests configuration
+    pub async_requests: AsyncRequestsConfigResponse,
+}
+
+/// Async requests configuration
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct AsyncRequestsConfigResponse {
+    /// Whether async requests UI is enabled
+    pub enabled: bool,
+    /// Completion window used for async requests (e.g., "1h")
+    pub completion_window: String,
 }
 
 /// Onwards AI proxy configuration
@@ -76,6 +87,10 @@ pub async fn get_config(State(state): State<AppState>, _user: CurrentUser) -> im
             enabled: config.batches.enabled,
             allowed_completion_windows: config.batches.allowed_completion_windows.clone(),
             allowed_url_paths: config.batches.allowed_url_paths.clone(),
+            async_requests: AsyncRequestsConfigResponse {
+                enabled: config.batches.async_requests.enabled,
+                completion_window: config.batches.async_requests.completion_window.clone(),
+            },
         })
     } else {
         None

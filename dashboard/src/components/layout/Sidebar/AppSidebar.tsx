@@ -109,7 +109,9 @@ export function AppSidebar() {
       icon: Zap,
       label: "Async",
       demoOnly: false,
-      hidden: config !== undefined && !config.batches?.enabled,
+      hidden:
+        config !== undefined &&
+        (!config.batches?.enabled || !config.batches?.async_requests?.enabled),
     },
     { path: "/models", icon: Layers, label: "Models" },
     {

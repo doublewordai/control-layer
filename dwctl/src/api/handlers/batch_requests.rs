@@ -140,7 +140,7 @@ pub async fn list_batch_requests<P: PoolProvider>(
     let unique_creator_ids: Vec<String> = result
         .data
         .iter()
-        .map(|r| r.batch_id.to_string())
+        .map(|r| r.batch_created_by.clone())
         .collect::<std::collections::HashSet<_>>()
         .into_iter()
         .collect();
@@ -163,7 +163,7 @@ pub async fn list_batch_requests<P: PoolProvider>(
         .into_iter()
         .map(|r| {
             let a = analytics_map.get(&r.id);
-            let email = email_map.get(&r.batch_id.to_string()).cloned();
+            let email = email_map.get(&r.batch_created_by).cloned();
             BatchRequestSummary {
                 id: r.id,
                 batch_id: r.batch_id,

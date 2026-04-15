@@ -28,12 +28,14 @@ interface CreateAsyncModalProps {
   isOpen: boolean;
   onClose: () => void;
   onSuccess: () => void;
+  completionWindow?: string;
 }
 
 export function CreateAsyncModal({
   isOpen,
   onClose,
   onSuccess,
+  completionWindow = "1h",
 }: CreateAsyncModalProps) {
   const [activeTab, setActiveTab] = useState<"compose" | "upload">("compose");
 
@@ -197,7 +199,7 @@ export function CreateAsyncModal({
       await createBatchMutation.mutateAsync({
         input_file_id: fileId,
         endpoint,
-        completion_window: "1h",
+        completion_window: completionWindow,
       });
 
       toast.success(
@@ -261,7 +263,7 @@ export function CreateAsyncModal({
         <DialogHeader>
           <DialogTitle>Create Async Requests</DialogTitle>
           <DialogDescription>
-            Submit requests for async processing (1h completion window)
+            Submit requests for async processing ({completionWindow} completion window)
           </DialogDescription>
         </DialogHeader>
 

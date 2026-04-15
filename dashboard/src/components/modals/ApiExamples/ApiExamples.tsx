@@ -119,8 +119,10 @@ const ApiExamplesModal: React.FC<ApiExamplesModalProps> = ({
     [allModels],
   );
 
-  // Completion window is determined by tab
-  const completionWindow = exampleType === "async" ? "1h" : "24h";
+  // Completion window is determined by tab — async uses configured window
+  const asyncWindow =
+    config?.batches?.async_requests?.completion_window ?? "1h";
+  const completionWindow = exampleType === "async" ? asyncWindow : "24h";
 
   const createApiKeyMutation = useCreateApiKey();
 
@@ -544,10 +546,10 @@ console.log(response.choices[0].message.content);`;
                     Batch
                   </ToggleGroupItem>
                 )}
-                {!isBatchDenied(model) && (
+                {!isBatchDenied(model) && config?.batches?.async_requests?.enabled && (
                   <ToggleGroupItem
                     value="async"
-                    aria-label="Async API (1h)"
+                    aria-label={`Async API (${asyncWindow})`}
                     className="px-5 py-1.5"
                   >
                     Async

@@ -255,6 +255,12 @@ batches:
     # - "12h"  # Uncomment to allow 12 hour
     # - "48h"  # Uncomment to allow 48 hour
 
+  # Async requests configuration
+  # Controls the async UI page and which completion window is used for async requests
+  async_requests:
+    enabled: true
+    completion_window: "1h"  # Must be in allowed_completion_windows above
+
   # Per-window relaxation factors for capacity acceptance.
   # A multiplier on the model's computed capacity for that window.
   #   1.0 (default) = strict, only accept what current throughput supports
