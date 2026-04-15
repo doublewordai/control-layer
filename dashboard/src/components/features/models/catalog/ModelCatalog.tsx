@@ -387,10 +387,10 @@ function ModelRow({
             <span className="text-sm text-muted-foreground truncate">{providerLabel}</span>
           </div>
         </TableCell>
-        <TableCell>
+        <TableCell className="hidden md:table-cell">
           <CapabilityIcons capabilities={getDisplayCapabilities(model)} />
         </TableCell>
-        <TableCell>
+        <TableCell className="hidden md:table-cell">
           {isChat ? (
             model.metadata?.intelligence_index != null ? (
               <IntelligenceBars value={model.metadata.intelligence_index} metadata={model.metadata} />
@@ -401,7 +401,7 @@ function ModelRow({
             <EmbeddingScore metadata={model.metadata} />
           )}
         </TableCell>
-        <TableCell className="tabular-nums text-muted-foreground whitespace-nowrap">
+        <TableCell className="hidden lg:table-cell tabular-nums text-muted-foreground whitespace-nowrap">
           {cheapestPrice && visibleTariffs.length > 0 ? (
             <HoverCard openDelay={150} closeDelay={100}>
               <HoverCardTrigger asChild>
@@ -432,12 +432,12 @@ function ModelRow({
             "\u2014"
           )}
         </TableCell>
-        <TableCell className="tabular-nums text-muted-foreground">
+        <TableCell className="hidden lg:table-cell tabular-nums text-muted-foreground">
           {model.metadata?.context_window
             ? formatContextLength(model.metadata.context_window)
             : "\u2014"}
         </TableCell>
-        <TableCell className="text-muted-foreground whitespace-nowrap">
+        <TableCell className="hidden lg:table-cell text-muted-foreground whitespace-nowrap">
           {model.metadata?.released_at
             ? formatReleaseDate(model.metadata.released_at)
             : "\u2014"}
@@ -592,21 +592,10 @@ function SectionTable({
     <div className="border rounded-lg overflow-hidden">
       <div>
         <Table className="w-full">
-          <colgroup>
-            <col style={{ width: "3%" }} />
-            <col />
-            <col style={{ width: "13%" }} />
-            <col style={{ width: "10%" }} />
-            <col style={{ width: "11%" }} />
-            <col style={{ width: "10%" }} />
-            <col style={{ width: "8%" }} />
-            <col style={{ width: "8%" }} />
-            <col style={{ width: "12%" }} />
-          </colgroup>
           <TableHeader>
             <TableRow>
-              <TableHead className="px-2" />
-              <TableHead>
+              <TableHead className="px-2 w-8" />
+              <TableHead className="w-auto">
                 <SortButton
                   field="alias"
                   label="Name"
@@ -618,10 +607,10 @@ function SectionTable({
               <TableHead>
                 Provider
               </TableHead>
-              <TableHead>
+              <TableHead className="hidden md:table-cell">
                 Capabilities
               </TableHead>
-              <TableHead>
+              <TableHead className="hidden md:table-cell">
                 <SortButton
                   field="intelligence_index"
                   label="Intelligence"
@@ -630,7 +619,7 @@ function SectionTable({
                   onSort={(field) => onSort(tableKey, field)}
                 />
               </TableHead>
-              <TableHead>
+              <TableHead className="hidden lg:table-cell">
                 <SortButton
                   field="price_from"
                   label="Cost"
@@ -639,7 +628,7 @@ function SectionTable({
                   onSort={(field) => onSort(tableKey, field)}
                 />
               </TableHead>
-              <TableHead>
+              <TableHead className="hidden lg:table-cell">
                 <SortButton
                   field="context_window"
                   label="Context"
@@ -648,7 +637,7 @@ function SectionTable({
                   onSort={(field) => onSort(tableKey, field)}
                 />
               </TableHead>
-              <TableHead>
+              <TableHead className="hidden lg:table-cell">
                 <SortButton
                   field="released_at"
                   label="Released"
@@ -657,7 +646,7 @@ function SectionTable({
                   onSort={(field) => onSort(tableKey, field)}
                 />
               </TableHead>
-              <TableHead />
+              <TableHead className="w-[1%] whitespace-nowrap" />
             </TableRow>
           </TableHeader>
           <TableBody>
@@ -729,19 +718,19 @@ function LoadingSkeleton() {
                   <Skeleton className="h-5 w-20" />
                 </div>
               </TableCell>
-              <TableCell>
+              <TableCell className="hidden md:table-cell">
                 <Skeleton className="h-5 w-16" />
               </TableCell>
-              <TableCell>
+              <TableCell className="hidden md:table-cell">
                 <Skeleton className="h-5 w-20" />
               </TableCell>
-              <TableCell>
+              <TableCell className="hidden lg:table-cell">
                 <Skeleton className="h-5 w-16" />
               </TableCell>
-              <TableCell>
+              <TableCell className="hidden lg:table-cell">
                 <Skeleton className="h-5 w-12" />
               </TableCell>
-              <TableCell>
+              <TableCell className="hidden lg:table-cell">
                 <Skeleton className="h-5 w-14" />
               </TableCell>
             </TableRow>
