@@ -294,13 +294,13 @@ function ModelRow({
         className="cursor-pointer hover:bg-muted/50 transition-colors [&>td]:py-1.5"
         onClick={onClick}
       >
-        <TableCell className="px-2">
+        <TableCell className="px-1 md:px-2">
           <button
             onClick={(e) => {
               e.stopPropagation();
               onToggleExpand();
             }}
-            className="p-1 text-gray-400 hover:text-gray-600 transition-colors rounded"
+            className="p-0.5 md:p-1 text-gray-400 hover:text-gray-600 transition-colors rounded"
             aria-label={isExpanded ? "Collapse row" : "Expand row"}
           >
             {isExpanded ? (
@@ -310,11 +310,11 @@ function ModelRow({
             )}
           </button>
         </TableCell>
-        <TableCell className="overflow-hidden">
-          <div className="flex items-center gap-2 min-w-0">
+        <TableCell className="overflow-hidden px-2 md:px-4">
+          <div className="flex items-center gap-1 md:gap-2 min-w-0">
             <Tooltip>
               <TooltipTrigger asChild>
-                <span className="font-medium truncate">{model.display_name || model.alias}</span>
+                <span className="font-medium truncate text-sm md:text-base">{model.display_name || model.alias}</span>
               </TooltipTrigger>
               <TooltipContent>
                 <span className="font-mono text-xs">{model.alias}</span>
@@ -376,15 +376,15 @@ function ModelRow({
             })}
           </div>
         </TableCell>
-        <TableCell className="overflow-hidden">
-          <div className="flex items-center gap-2 min-w-0">
+        <TableCell className="overflow-hidden px-2 md:px-4">
+          <div className="flex items-center gap-1 md:gap-2 min-w-0">
             <CatalogIcon
               icon={providerIcon || undefined}
               label={providerLabel}
               size="sm"
               fallback="none"
             />
-            <span className="text-sm text-muted-foreground truncate">{providerLabel}</span>
+            <span className="text-xs md:text-sm text-muted-foreground truncate">{providerLabel}</span>
           </div>
         </TableCell>
         <TableCell className="hidden md:table-cell">
@@ -442,8 +442,8 @@ function ModelRow({
             ? formatReleaseDate(model.metadata.released_at)
             : "\u2014"}
         </TableCell>
-        <TableCell className="text-right pr-3 lg:pr-6">
-          <div className="flex items-center justify-end gap-1.5">
+        <TableCell className="text-right px-1 md:px-3 lg:px-6">
+          <div className="flex items-center justify-end gap-0.5 md:gap-1.5">
             {playgroundAvailable && (
               <Button
                 variant="outline"
@@ -454,9 +454,10 @@ function ModelRow({
                     `/playground?model=${encodeURIComponent(model.id)}`,
                   );
                 }}
-                className="text-xs h-7 px-2.5 border-blue-200 text-blue-700 hover:bg-blue-50 hover:text-blue-800"
+                className="text-xs h-6 md:h-7 px-1.5 md:px-2.5 border-blue-200 text-blue-700 hover:bg-blue-50 hover:text-blue-800"
               >
-                Try it &rarr;
+                <span className="hidden md:inline">Try it &rarr;</span>
+                <span className="md:hidden">&rarr;</span>
               </Button>
             )}
             <Button
@@ -466,7 +467,7 @@ function ModelRow({
                 e.stopPropagation();
                 onApiClick();
               }}
-              className="text-xs h-7 px-2 text-gray-500 hover:text-gray-700 hover:bg-gray-100"
+              className="text-xs h-6 md:h-7 px-1 md:px-2 text-gray-500 hover:text-gray-700 hover:bg-gray-100"
             >
               <Code className="h-3.5 w-3.5" />
               <span className="hidden lg:inline ml-1">API</span>
@@ -594,7 +595,7 @@ function SectionTable({
         <Table className="w-full">
           <TableHeader>
             <TableRow>
-              <TableHead className="px-2 w-8" />
+              <TableHead className="px-1 md:px-2 w-6 md:w-8" />
               <TableHead className="w-auto">
                 <SortButton
                   field="alias"
