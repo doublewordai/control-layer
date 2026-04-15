@@ -71,6 +71,10 @@ vi.mock("../../../modals/DownloadFileModal", () => ({
   DownloadFileModal: () => null,
 }));
 
+vi.mock("../../../modals", () => ({
+  ApiExamples: () => null,
+}));
+
 vi.mock("sonner", () => ({
   toast: {
     success: vi.fn(),

@@ -14,6 +14,7 @@ import {
   ChevronsUpDown,
   Check,
   Filter,
+  Code,
 } from "lucide-react";
 import { Button } from "../../../ui/button";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "../../../ui/tabs";
@@ -59,6 +60,7 @@ import { useDebounce } from "../../../../hooks/useDebounce";
 import { useAuthorization } from "../../../../utils/authorization";
 import { useOrganizationContext } from "../../../../contexts/organization/useOrganizationContext";
 import { useBootstrapContent } from "@/hooks/use-bootstrap-content";
+import { ApiExamples } from "../../../modals";
 import { cn } from "@/lib/utils";
 
 /**
@@ -630,6 +632,7 @@ export function Batches({
   );
 
   const bootstrapBanner = useBootstrapContent();
+  const [showApiExamples, setShowApiExamples] = useState(false);
 
   return (
     <div
@@ -645,9 +648,9 @@ export function Batches({
         className="space-y-4"
       >
         {/* Header with Tabs and Actions */}
-        <div className="mb-6 flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4">
+        <div className="mb-4 flex flex-col sm:flex-row sm:items-end sm:justify-between gap-4">
           {/* Left: Title */}
-          <div className="shrink-0">
+          <div>
             <h1 className="text-3xl font-bold text-doubleword-neutral-900">
               {activeTab === "batches" ? "Batches" : "Batch Files"}
             </h1>
@@ -659,13 +662,12 @@ export function Batches({
           </div>
 
           {/* Right: Buttons + Tabs */}
-          <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-3 lg:shrink-0">
+          <div className="flex items-center gap-2">
             {/* Action Button - changes based on active tab */}
             {activeTab === "batches" ? (
               <Button
                 onClick={() => onOpenCreateBatchModal()}
                 variant="outline"
-                className="flex-1 sm:flex-none"
               >
                 <Play className="w-4 h-4 mr-2" />
                 Create Batch
@@ -674,7 +676,7 @@ export function Batches({
               <Button
                 onClick={() => onOpenUploadModal()}
                 variant="outline"
-                className={`flex-1 sm:flex-none transition-all duration-200 ${
+                className={`transition-all duration-200 ${
                   dragActive ? "border-blue-500 bg-blue-50 text-blue-700" : ""
                 }`}
               >
@@ -683,18 +685,24 @@ export function Batches({
               </Button>
             )}
 
+            {/* API Button */}
+            <Button variant="outline" onClick={() => setShowApiExamples(true)}>
+              <Code className="h-4 w-4" />
+              API
+            </Button>
+
             {/* Tabs Selector */}
-            <TabsList className="w-full sm:w-auto">
+            <TabsList>
               <TabsTrigger
                 value="batches"
-                className="flex items-center gap-2 flex-1 sm:flex-none"
+                className="flex items-center gap-2"
               >
                 <Box className="w-4 h-4" />
                 Batches
               </TabsTrigger>
               <TabsTrigger
                 value="files"
-                className="flex items-center gap-2 flex-1 sm:flex-none"
+                className="flex items-center gap-2"
               >
                 <FileInput className="w-4 h-4" />
                 Files
@@ -1022,6 +1030,12 @@ export function Batches({
           />
         </TabsContent>
       </Tabs>
+
+      <ApiExamples
+        isOpen={showApiExamples}
+        onClose={() => setShowApiExamples(false)}
+        defaultTab="batch"
+      />
     </div>
   );
 }

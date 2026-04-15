@@ -94,6 +94,10 @@ vi.mock("../../../modals/DownloadFileModal", () => ({
     ) : null,
 }));
 
+vi.mock("../../../modals", () => ({
+  ApiExamples: () => null,
+}));
+
 // Mock sonner toast
 vi.mock("sonner", () => ({
   toast: {
