@@ -476,8 +476,8 @@ console.log(response.choices[0].message.content);`;
   };
 
   const getCurrentCode = () => {
-    if (exampleType === "async" && asyncMethod === "autobatcher") {
-      return generateAutobatcherCode(selectedLanguage);
+    if (isAutobatcher) {
+      return generateAutobatcherCode("python");
     }
     if (exampleType === "batch" || exampleType === "async") {
       return generateBatchApiCode(selectedLanguage);
@@ -539,6 +539,7 @@ console.log(response.choices[0].message.content);`;
   };
 
   const isBatchTab = exampleType === "batch" || exampleType === "async";
+  const isAutobatcher = exampleType === "async" && asyncMethod === "autobatcher";
 
   return (
     <Dialog open={isOpen} onOpenChange={onClose}>
@@ -619,11 +620,6 @@ console.log(response.choices[0].message.content);`;
                 {/* Async method selector — inline on the right */}
                 {exampleType === "async" && (
                   <div className="flex items-center gap-2">
-                    {asyncMethod === "autobatcher" && (
-                      <span className="text-xs text-gray-500">
-                        <code className="bg-gray-100 px-1.5 py-0.5 rounded font-mono">pip install autobatcher</code>
-                      </span>
-                    )}
                     <ToggleGroup
                       type="single"
                       value={asyncMethod}
@@ -704,62 +700,96 @@ console.log(response.choices[0].message.content);`;
               )}
             </div>
 
+            {/* Install snippet for autobatcher */}
+            {isAutobatcher && (
+              <div className="bg-white border border-gray-200 rounded-lg overflow-hidden max-w-full mb-3">
+                <div className="bg-gray-50 px-4 py-2 border-b border-gray-200 flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <Code className="w-4 h-4 text-gray-600" />
+                    <span className="text-sm font-medium text-gray-700">
+                      Shell
+                    </span>
+                  </div>
+                  <button
+                    onClick={() =>
+                      copyToClipboard("pip install autobatcher", "install")
+                    }
+                    className="flex items-center gap-1 px-2 py-1 text-xs text-gray-500 hover:text-gray-700 hover:bg-gray-100 rounded transition-colors"
+                  >
+                    <Copy className="w-3 h-3" />
+                    {copiedCode === "install" ? "Copied!" : "Copy"}
+                  </button>
+                </div>
+                <div className="overflow-x-auto max-w-full">
+                  <CodeBlock language="bash">pip install autobatcher</CodeBlock>
+                </div>
+              </div>
+            )}
+
             {/* Code Example */}
             <div className="bg-white border border-gray-200 rounded-lg overflow-hidden max-w-full">
               <div className="bg-gray-50 px-4 py-3 border-b border-gray-200 flex items-center justify-between">
                 <div className="flex items-center gap-2">
                   <Code className="w-4 h-4 text-gray-600" />
-                  <Select
-                    value={selectedLanguage}
-                    onValueChange={(value) =>
-                      setSelectedLanguage(value as Language)
-                    }
-                  >
-                    <SelectTrigger
-                      size="sm"
-                      className="h-7 border-0 bg-transparent shadow-none hover:bg-gray-100 focus-visible:ring-0"
-                    >
-                      <SelectValue>
-                        <span className="text-sm font-medium text-gray-700">
-                          {selectedLanguage.charAt(0).toUpperCase() +
-                            selectedLanguage.slice(1)}
-                        </span>
-                      </SelectValue>
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="python">Python</SelectItem>
-                      <SelectItem value="javascript">JavaScript</SelectItem>
-                      <SelectItem value="curl">cURL</SelectItem>
-                    </SelectContent>
-                  </Select>
-                  <div className="relative">
-                    <button
-                      onMouseEnter={() => setShowInfoTooltip(true)}
-                      onMouseLeave={() => setShowInfoTooltip(false)}
-                      className="p-1 text-gray-400 hover:text-gray-600 transition-colors"
-                    >
-                      <Info className="w-4 h-4" />
-                    </button>
+                  {isAutobatcher ? (
+                    <span className="text-sm font-medium text-gray-700">
+                      Python
+                    </span>
+                  ) : (
+                    <>
+                      <Select
+                        value={selectedLanguage}
+                        onValueChange={(value) =>
+                          setSelectedLanguage(value as Language)
+                        }
+                      >
+                        <SelectTrigger
+                          size="sm"
+                          className="h-7 border-0 bg-transparent shadow-none hover:bg-gray-100 focus-visible:ring-0"
+                        >
+                          <SelectValue>
+                            <span className="text-sm font-medium text-gray-700">
+                              {selectedLanguage.charAt(0).toUpperCase() +
+                                selectedLanguage.slice(1)}
+                            </span>
+                          </SelectValue>
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="python">Python</SelectItem>
+                          <SelectItem value="javascript">JavaScript</SelectItem>
+                          <SelectItem value="curl">cURL</SelectItem>
+                        </SelectContent>
+                      </Select>
+                      <div className="relative">
+                        <button
+                          onMouseEnter={() => setShowInfoTooltip(true)}
+                          onMouseLeave={() => setShowInfoTooltip(false)}
+                          className="p-1 text-gray-400 hover:text-gray-600 transition-colors"
+                        >
+                          <Info className="w-4 h-4" />
+                        </button>
 
-                    {showInfoTooltip && (
-                      <div className="absolute left-0 top-full mt-2 w-64 bg-gray-900 text-white text-xs rounded-lg p-3 shadow-lg z-10">
-                        <div className="space-y-2">
-                          <div className="font-medium">
-                            {getInstallationInfo(selectedLanguage)?.title}
-                          </div>
-                          <div className="text-gray-300">
-                            {getInstallationInfo(selectedLanguage)?.description}
-                          </div>
-                          {getInstallationInfo(selectedLanguage)?.command && (
-                            <div className="bg-gray-800 rounded px-2 py-1 font-mono">
-                              {getInstallationInfo(selectedLanguage)?.command}
+                        {showInfoTooltip && (
+                          <div className="absolute left-0 top-full mt-2 w-64 bg-gray-900 text-white text-xs rounded-lg p-3 shadow-lg z-10">
+                            <div className="space-y-2">
+                              <div className="font-medium">
+                                {getInstallationInfo(selectedLanguage)?.title}
+                              </div>
+                              <div className="text-gray-300">
+                                {getInstallationInfo(selectedLanguage)?.description}
+                              </div>
+                              {getInstallationInfo(selectedLanguage)?.command && (
+                                <div className="bg-gray-800 rounded px-2 py-1 font-mono">
+                                  {getInstallationInfo(selectedLanguage)?.command}
+                                </div>
+                              )}
                             </div>
-                          )}
-                        </div>
-                        <div className="absolute -top-1 left-4 w-2 h-2 bg-gray-900 rotate-45"></div>
+                            <div className="absolute -top-1 left-4 w-2 h-2 bg-gray-900 rotate-45"></div>
+                          </div>
+                        )}
                       </div>
-                    )}
-                  </div>
+                    </>
+                  )}
                 </div>
                 <div className="flex items-center gap-2">
                   {!apiKey && (
@@ -862,7 +892,9 @@ console.log(response.choices[0].message.content);`;
               <div className="overflow-x-auto max-w-full">
                 <CodeBlock
                   language={
-                    getLanguageForHighlighting(selectedLanguage) as
+                    (isAutobatcher
+                      ? "python"
+                      : getLanguageForHighlighting(selectedLanguage)) as
                       | "python"
                       | "javascript"
                       | "bash"
