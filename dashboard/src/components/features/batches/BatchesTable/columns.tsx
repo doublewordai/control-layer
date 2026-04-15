@@ -5,15 +5,12 @@ import {
   ArrowUpDown,
   XCircle,
   Clock,
-  CheckCircle2,
   AlertCircle,
-  Loader2,
   FileCheck,
-  FileText,
-  DollarSign,
   Eye,
   Trash2,
-  Cable,
+  Box,
+  Zap,
 } from "lucide-react";
 import { Button } from "../../../ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "../../../ui/tooltip";
@@ -22,7 +19,7 @@ import {
   formatLongDuration,
   formatNumber,
 } from "../../../../utils";
-import type { Batch, BatchStatus, BatchAnalytics } from "../types";
+import type { Batch, BatchStatus } from "../types";
 
 interface ColumnActions {
   onCancel: (batch: Batch) => void;
@@ -31,33 +28,13 @@ interface ColumnActions {
   onViewFile: (file: any) => void;
   getInputFile: (batch: Batch) => any | undefined;
   onRowClick?: (batch: Batch) => void;
-  batchAnalytics?: Map<string, BatchAnalytics>;
   /** Show the User column (PlatformManagers or org context) */
   showUserColumn?: boolean;
-  /** Show the Context column (personal vs org name) */
-  showContextColumn?: boolean;
-  /** Show the Source column (S3/API/UI) — gated behind PlatformManager */
-  showSourceColumn?: boolean;
+  /** Show the Type column (hidden when "Batch only" filter is on) */
+  showTypeColumn?: boolean;
+  /** Completion window that identifies async batches (default: "1h") */
+  asyncCompletionWindow?: string;
 }
-
-const getStatusIcon = (status: BatchStatus) => {
-  switch (status) {
-    case "completed":
-      return <CheckCircle2 className="w-4 h-4 text-green-600" />;
-    case "failed":
-      return <AlertCircle className="w-4 h-4 text-red-600" />;
-    case "cancelled":
-      return <XCircle className="w-4 h-4 text-gray-600" />;
-    case "in_progress":
-    case "finalizing":
-      return <Loader2 className="w-4 h-4 text-blue-600 animate-spin" />;
-    case "validating":
-    case "cancelling":
-      return <Clock className="w-4 h-4 text-yellow-600" />;
-    default:
-      return <Clock className="w-4 h-4 text-gray-600" />;
-  }
-};
 
 const getStatusColor = (status: BatchStatus) => {
   switch (status) {
@@ -102,61 +79,6 @@ const userColumn: ColumnDef<Batch> = {
   },
 };
 
-const sourceColumn: ColumnDef<Batch> = {
-  id: "source",
-  header: "Source",
-  cell: ({ row }) => {
-    const batch = row.original as Batch;
-    const source = batch.dwext?.source;
-
-    if (source === "sync") {
-      return (
-        <Tooltip delayDuration={300}>
-          <TooltipTrigger asChild>
-            <span className="inline-flex items-center gap-1 text-xs text-blue-600 cursor-default">
-              <Cable className="w-3 h-3" />
-              S3
-            </span>
-          </TooltipTrigger>
-          <TooltipContent>{batch.dwext?.source_name || "External sync"}</TooltipContent>
-        </Tooltip>
-      );
-    }
-    if (source === "api") {
-      return <span className="text-xs text-gray-500">API</span>;
-    }
-    if (source === "frontend") {
-      return <span className="text-xs text-gray-500">UI</span>;
-    }
-    return <span className="text-gray-400 text-xs">-</span>;
-  },
-};
-
-const contextColumn: ColumnDef<Batch> = {
-  id: "context",
-  header: "Context",
-  cell: ({ row }) => {
-    const batch = row.original as Batch;
-    const contextName = batch.metadata?.context_name;
-    const contextType = batch.metadata?.context_type;
-    if (!contextName) {
-      return <span className="text-gray-400">-</span>;
-    }
-    const isOrg = contextType === "organization";
-    return (
-      <span
-        className={`text-sm truncate max-w-[120px] block ${
-          isOrg
-            ? "text-blue-700 font-medium"
-            : "text-gray-500"
-        }`}
-      >
-        {contextName}
-      </span>
-    );
-  },
-};
-
 export const createBatchColumns = (
   actions: ColumnActions,
 ): ColumnDef<Batch>[] => [
@@ -183,47 +105,40 @@ export const createBatchColumns = (
     },
   },
   ...(actions.showUserColumn ? [userColumn] : []),
-  ...(actions.showContextColumn ? [contextColumn] : []),
-  {
-    id: "input_file",
-    header: "Input File ID",
-    cell: ({ row }) => {
-      const batch = row.original as Batch;
-      const inputFile = actions.getInputFile(batch);
-
-      if (!inputFile || !inputFile.id) {
-        return <span className="text-gray-400">-</span>;
-      }
-
-      // Truncate file ID to show first 8 characters
-      const truncatedId = inputFile.id.slice(0, 8) + "...";
-
-      return (
-        <Tooltip delayDuration={300}>
-          <TooltipTrigger asChild>
-            <div
-              className="flex items-center gap-2 cursor-pointer hover:text-blue-600 transition-colors"
-              onClick={(e) => {
-                e.stopPropagation();
-                actions.onViewFile(inputFile);
-              }}
-            >
-              <FileText className="w-4 h-4 text-gray-500" />
-              <span className="font-mono text-sm">{truncatedId}</span>
-            </div>
-          </TooltipTrigger>
-          <TooltipContent>{inputFile.id}</TooltipContent>
-        </Tooltip>
-      );
-    },
-  },
-  ...(actions.showSourceColumn ? [sourceColumn] : []),
+  ...(actions.showTypeColumn !== false
+    ? [
+        {
+          id: "type",
+          header: "Type",
+          cell: ({ row }: { row: { original: Batch } }) => {
+            const batch = row.original;
+            const isAsync = batch.completion_window === (actions.asyncCompletionWindow ?? "1h");
+            return (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <span className="inline-flex text-doubleword-neutral-600">
+                    {isAsync ? (
+                      <Zap className="h-4 w-4" />
+                    ) : (
+                      <Box className="h-4 w-4" />
+                    )}
+                  </span>
+                </TooltipTrigger>
+                <TooltipContent side="top">
+                  {isAsync ? "Async" : "Batch"}
+                </TooltipContent>
+              </Tooltip>
+            );
+          },
+        } as ColumnDef<Batch>,
+      ]
+    : []),
   {
     accessorKey: "completion_window",
-    header: "Priority",
+    header: "Completion Window",
     cell: ({ row }) => {
-      const priority = row.getValue("completion_window") as string;
-      return <span className="text-sm text-gray-700">{priority}</span>;
+      const window = row.getValue("completion_window") as string;
+      return <span className="text-sm text-doubleword-neutral-900">{window}</span>;
     },
   },
   {
@@ -240,24 +155,18 @@ export const createBatchColumns = (
 
       if (isQueued) {
         return (
-          <div className="flex items-center gap-2">
-            <Clock className="w-4 h-4 text-gray-500" />
-            <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-gray-100 text-gray-700">
-              queued
-            </span>
-          </div>
+          <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-gray-100 text-gray-700">
+            queued
+          </span>
         );
       }
 
       return (
-        <div className="flex items-center gap-2">
-          {getStatusIcon(status)}
-          <span
-            className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${getStatusColor(status)}`}
-          >
-            {status.replace("_", " ")}
-          </span>
-        </div>
+        <span
+          className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${getStatusColor(status)}`}
+        >
+          {status.replace("_", " ")}
+        </span>
       );
     },
   },
@@ -321,24 +230,6 @@ export const createBatchColumns = (
     },
   },
   {
-    accessorKey: "id",
-    header: ({ column }) => {
-      return (
-        <button
-          onClick={() => column.toggleSorting(column.getIsSorted() === "asc")}
-          className="flex items-center text-left font-medium group"
-        >
-          Batch ID
-          <ArrowUpDown className="ml-2 h-4 w-4 text-gray-400 group-hover:text-gray-700 transition-colors" />
-        </button>
-      );
-    },
-    cell: ({ row }) => {
-      const batch = row.original as Batch;
-      return <div className="font-mono text-xs text-gray-600">{batch.id}</div>;
-    },
-  },
-  {
     id: "duration",
     header: "Duration",
     cell: ({ row }) => {
@@ -372,33 +263,50 @@ export const createBatchColumns = (
     header: "Cost",
     cell: ({ row }) => {
       const batch = row.original as Batch;
-      const analytics = actions.batchAnalytics?.get(batch.id);
-      if (!analytics) {
-        return (
-          <div className="flex items-center gap-1 text-sm text-gray-400">
-            <Loader2 className="w-3 h-3 animate-spin" />
-            <span>...</span>
-          </div>
-        );
+      const cost = batch.analytics?.total_cost;
+      if (!cost || parseFloat(cost) === 0) {
+        return <span className="text-gray-400">-</span>;
       }
-
-      if (!analytics.total_cost || parseFloat(analytics.total_cost) === 0) {
-        return <span className="text-gray-400 text-sm">-</span>;
-      }
-
-      const cost = parseFloat(analytics.total_cost);
-
+      const value = parseFloat(cost);
+      const formatted =
+        value < 0.0001
+          ? `$${value.toFixed(6)}`
+          : value < 0.01
+            ? `$${value.toFixed(4)}`
+            : `$${value.toFixed(2)}`;
       return (
-        <div className="flex items-center gap-1 text-sm text-gray-700">
-          <DollarSign className="w-3 h-3 text-green-600" />
-          <span className="font-medium">{cost.toFixed(4)}</span>
-        </div>
+        <span className="text-sm text-green-700 font-medium">{formatted}</span>
       );
     },
   },
   {
-    id: "files",
-    header: "Results",
+    id: "batch_id",
+    header: "Batch ID",
+    cell: ({ row }) => {
+      const batch = row.original as Batch;
+      return (
+        <span className="font-mono text-xs text-doubleword-neutral-700 truncate max-w-[100px] block cursor-default" title={batch.id}>
+          {batch.id.slice(0, 8)}...
+        </span>
+      );
+    },
+  },
+  {
+    id: "input_file_id",
+    header: "Input File",
+    cell: ({ row }) => {
+      const batch = row.original as Batch;
+      if (!batch.input_file_id) return <span className="text-gray-400">-</span>;
+      return (
+        <span className="font-mono text-xs text-doubleword-neutral-700 truncate max-w-[100px] block cursor-default" title={batch.input_file_id}>
+          {batch.input_file_id.slice(0, 8)}...
+        </span>
+      );
+    },
+  },
+  {
+    id: "actions",
+    header: "Actions",
     cell: ({ row }) => {
       const batch = row.original as Batch;
       const files = actions.getBatchFiles(batch);

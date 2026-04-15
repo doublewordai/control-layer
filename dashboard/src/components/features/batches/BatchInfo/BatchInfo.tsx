@@ -1,18 +1,15 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useCallback } from "react";
 import { useParams, useNavigate, useSearchParams } from "react-router-dom";
 import {
   ArrowLeft,
   FileInput,
   FileCheck,
   AlertCircle,
-  Clock,
-  CheckCircle,
-  XCircle,
-  Ban,
   Loader2,
   RotateCcw,
-  Timer,
   ExternalLink,
+  Copy,
+  Check,
   Info,
   List,
   Download,
@@ -24,7 +21,6 @@ import {
   useRetryBatch,
 } from "../../../../api/control-layer/hooks";
 import { Card, CardContent, CardHeader, CardTitle } from "../../../ui/card";
-import { Badge } from "../../../ui/badge";
 import { Button } from "../../../ui/button";
 import { Skeleton } from "../../../ui/skeleton";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "../../../ui/tabs";
@@ -35,7 +31,7 @@ import {
   DropdownMenuTrigger,
 } from "../../../ui/dropdown-menu";
 import type { BatchStatus } from "../../../../api/control-layer/types";
-import { useAuthorization } from "../../../../utils/authorization";
+import { useAuthorization, copyToClipboard } from "../../../../utils";
 import {
   getBatchDownloadFilename,
   downloadFile,
@@ -164,72 +160,32 @@ const BatchInfo: React.FC = () => {
     batch.request_counts.failed === 0;
 
   const getStatusBadge = (status: BatchStatus) => {
-    // Handle queued state
-    if (isQueued) {
-      return (
-        <Badge variant="secondary" className="flex items-center gap-1 w-fit">
-          <Clock className="w-3 h-3 text-gray-500" />
-          Queued
-        </Badge>
-      );
-    }
-
-    const statusConfig: Record<
-      BatchStatus,
-      {
-        label: string;
-        variant: "default" | "destructive" | "outline" | "secondary";
-        icon: React.ReactNode;
-      }
-    > = {
-      validating: {
-        label: "Validating",
-        variant: "secondary",
-        icon: <Loader2 className="w-3 h-3 animate-spin" />,
-      },
-      in_progress: {
-        label: "In Progress",
-        variant: "default",
-        icon: <Timer className="w-3 h-3" />,
-      },
-      finalizing: {
-        label: "Finalizing",
-        variant: "secondary",
-        icon: <Loader2 className="w-3 h-3 animate-spin" />,
-      },
-      completed: {
-        label: "Completed",
-        variant: "outline",
-        icon: <CheckCircle className="w-3 h-3 text-green-600" />,
-      },
-      failed: {
-        label: "Failed",
-        variant: "destructive",
-        icon: <XCircle className="w-3 h-3" />,
-      },
-      expired: {
-        label: "Expired",
-        variant: "outline",
-        icon: <Clock className="w-3 h-3 text-gray-500" />,
-      },
-      cancelling: {
-        label: "Cancelling",
-        variant: "secondary",
-        icon: <Loader2 className="w-3 h-3 animate-spin" />,
-      },
-      cancelled: {
-        label: "Cancelled",
-        variant: "outline",
-        icon: <Ban className="w-3 h-3 text-gray-500" />,
-      },
+    const statusColors: Record<string, string> = {
+      validating: "bg-yellow-100 text-yellow-800",
+      in_progress: "bg-blue-100 text-blue-800",
+      finalizing: "bg-blue-100 text-blue-800",
+      completed: "bg-green-100 text-green-800",
+      failed: "bg-red-100 text-red-800",
+      expired: "bg-orange-100 text-orange-800",
+      cancelling: "bg-gray-100 text-gray-800",
+      cancelled: "bg-gray-100 text-gray-800",
     };
 
-    const config = statusConfig[status];
+    const statusLabels: Record<string, string> = {
+      in_progress: "in progress",
+    };
+
+    const displayStatus = isQueued ? "queued" : (statusLabels[status] || status);
+    const colorClass = isQueued
+      ? "bg-gray-100 text-gray-700"
+      : (statusColors[status] || "bg-gray-100 text-gray-800");
+
     return (
-      <Badge variant={config.variant} className="flex items-center gap-1 w-fit">
-        {config.icon}
-        {config.label}
-      </Badge>
+      <span
+        className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${colorClass}`}
+      >
+        {displayStatus}
+      </span>
     );
   };
 
@@ -315,9 +271,10 @@ const BatchInfo: React.FC = () => {
                       : "Batch Details"}
                   </h1>
                   <div className="flex items-center gap-2 mt-1">
-                    <p className="text-doubleword-neutral-600 font-mono text-sm">
+                    <span className="flex items-center gap-1 text-doubleword-neutral-600 font-mono text-sm">
                       {batch.id}
-                    </p>
+                      <CopyIconButton value={batch.id} />
+                    </span>
                     {getStatusBadge(batch.status)}
                   </div>
                   {description && (
@@ -531,6 +488,55 @@ const BatchInfo: React.FC = () => {
                   </Card>
                 )}
 
+              {/* Associated Files Card */}
+              <Card className="p-0 gap-0 rounded-lg">
+                <CardHeader className="px-6 pt-5 pb-4">
+                  <CardTitle>Associated Files</CardTitle>
+                </CardHeader>
+                <CardContent className="px-6 pb-6 pt-0">
+                  <div className="space-y-2">
+                    {batch.input_file_id ? (
+                      <div className="flex items-center gap-2 p-2 bg-gray-50 rounded">
+                        <FileInput className="w-4 h-4 text-gray-600" />
+                        <div className="flex-1 min-w-0">
+                          <p className="text-sm font-medium text-gray-700">Input File</p>
+                          <p className="text-xs text-gray-500 font-mono truncate">{batch.input_file_id}</p>
+                        </div>
+                        <Button variant="ghost" size="sm" onClick={() => navigate(`/batches/files/${batch.input_file_id}/content?from=/batches/${batchId}`)} className="shrink-0">View</Button>
+                      </div>
+                    ) : (
+                      <div className="flex items-center gap-2 p-2 bg-gray-100 rounded">
+                        <FileInput className="w-4 h-4 text-gray-400" />
+                        <div className="flex-1 min-w-0">
+                          <p className="text-sm font-medium text-gray-500">Input File</p>
+                          <p className="text-xs text-gray-400">Source file has been deleted</p>
+                        </div>
+                      </div>
+                    )}
+                    {batch.output_file_id && batch.request_counts.completed > 0 && (
+                      <div className="flex items-center gap-2 p-2 bg-green-50 rounded">
+                        <FileCheck className="w-4 h-4 text-green-600" />
+                        <div className="flex-1 min-w-0">
+                          <p className="text-sm font-medium text-gray-700">Output File</p>
+                          <p className="text-xs text-gray-500 font-mono truncate">{batch.output_file_id}</p>
+                        </div>
+                        <Button variant="ghost" size="sm" onClick={() => navigate(`/batches/files/${batch.output_file_id}/content?from=/batches/${batchId}`)} className="shrink-0">View</Button>
+                      </div>
+                    )}
+                    {batch.error_file_id && batch.request_counts.failed > 0 && (
+                      <div className="flex items-center gap-2 p-2 bg-red-50 rounded">
+                        <AlertCircle className="w-4 h-4 text-red-600" />
+                        <div className="flex-1 min-w-0">
+                          <p className="text-sm font-medium text-gray-700">Error File</p>
+                          <p className="text-xs text-gray-500 font-mono truncate">{batch.error_file_id}</p>
+                        </div>
+                        <Button variant="ghost" size="sm" onClick={() => navigate(`/batches/files/${batch.error_file_id}/content?from=/batches/${batchId}`)} className="shrink-0">View</Button>
+                      </div>
+                    )}
+                  </div>
+                </CardContent>
+              </Card>
+
               {/* Retry Failed Requests */}
               {batch &&
                 batch.request_counts.failed > 0 &&
@@ -587,113 +593,6 @@ const BatchInfo: React.FC = () => {
                   </Card>
                 )}
 
-              {/* Analytics Card - hide when no requests have been processed */}
-              {analytics &&
-                (batch.request_counts.completed > 0 ||
-                  batch.request_counts.failed > 0) && (
-                  <Card className="p-0 gap-0 rounded-lg">
-                    <CardHeader className="flex w-full justify-between px-6 pt-5 pb-4">
-                      <CardTitle>Metrics</CardTitle>
-                      {hasRequestsPermission && (
-                        <Button
-                          variant="outline"
-                          onClick={() =>
-                            navigate(
-                              `/analytics?tab=requests&fusillade_batch_id=${batchId}&from=/batches/${batchId}`,
-                            )
-                          }
-                        >
-                          View Request Analytics
-                          <ExternalLink className="ml-2 h-4 w-4" />
-                        </Button>
-                      )}
-                    </CardHeader>
-                    <CardContent className="px-6 pb-6 pt-0">
-                      {analyticsLoading ? (
-                        <div className="space-y-4">
-                          <Skeleton className="h-20 w-full" />
-                          <Skeleton className="h-20 w-full" />
-                        </div>
-                      ) : analytics.total_requests > 0 ? (
-                        <div className="space-y-6">
-                          {/* Token Usage */}
-                          <div>
-                            <h4 className="text-sm font-medium text-gray-900 mb-3">
-                              Token Usage
-                            </h4>
-                            <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-                              <div className="text-center p-3 rounded-lg">
-                                <p className="text-2xl font-bold">
-                                  {analytics.total_prompt_tokens.toLocaleString()}
-                                </p>
-                                <p className="text-xs text-gray-600 mt-1">
-                                  Prompt Tokens
-                                </p>
-                              </div>
-                              <div className="text-center p-3 rounded-lg">
-                                <p className="text-2xl font-bold">
-                                  {analytics.total_completion_tokens.toLocaleString()}
-                                </p>
-                                <p className="text-xs text-gray-600 mt-1">
-                                  Completion Tokens
-                                </p>
-                              </div>
-                              {reasoningTokens > 0 && (
-                                <div className="text-center p-3 rounded-lg">
-                                  <p className="text-2xl font-bold">
-                                    {reasoningTokens.toLocaleString()}
-                                  </p>
-                                  <p className="text-xs text-gray-600 mt-1">
-                                    Reasoning Tokens
-                                  </p>
-                                </div>
-                              )}
-                              <div className="text-center p-3 rounded-lg">
-                                <p className="text-2xl font-bold text-gray-900">
-                                  {analytics.total_tokens.toLocaleString()}
-                                </p>
-                                <p className="text-xs text-gray-600 mt-1">
-                                  Total Tokens
-                                </p>
-                              </div>
-                            </div>
-                          </div>
-
-                          {/* Cost */}
-                          {analytics.total_cost &&
-                            parseFloat(analytics.total_cost) > 0 && (
-                              <div className="border-t pt-6">
-                                <h4 className="text-sm font-medium text-gray-900 mb-3">
-                                  Cost
-                                </h4>
-                                <div className="p-4 rounded-lg text-center">
-                                  <p className="text-3xl font-bold text-green-700">
-                                    $
-                                    {parseFloat(analytics.total_cost).toFixed(
-                                      4,
-                                    )}
-                                  </p>
-                                  <p className="text-xs text-gray-600 mt-1">
-                                    Total Cost
-                                  </p>
-                                </div>
-                              </div>
-                            )}
-                        </div>
-                      ) : (
-                        <div className="text-center py-8 text-gray-500">
-                          <p className="text-sm">
-                            No analytics data available yet.
-                          </p>
-                          <p className="text-xs mt-1">
-                            Analytics will appear as requests complete.
-                          </p>
-                        </div>
-                      )}
-                    </CardContent>
-                  </Card>
-                )}
-
               {/* Batch Details */}
               <Card className="p-0 gap-0 rounded-lg">
                 <CardHeader className="px-6 pt-5 pb-4">
@@ -724,106 +623,6 @@ const BatchInfo: React.FC = () => {
                         <p className="text-gray-700">{description}</p>
                       </div>
                     )}
-
-                    {/* Files */}
-                    <div className="border-t pt-6">
-                      <h4 className="text-sm font-medium text-gray-900 mb-3">
-                        Associated Files
-                      </h4>
-                      <div className="space-y-2">
-                        {batch.input_file_id ? (
-                          <div className="flex items-center gap-2 p-2 bg-gray-50 rounded">
-                            <FileInput className="w-4 h-4 text-gray-600" />
-                            <div className="flex-1 min-w-0">
-                              <p className="text-sm font-medium text-gray-700">
-                                Input File
-                              </p>
-                              <p className="text-xs text-gray-500 font-mono truncate">
-                                {batch.input_file_id}
-                              </p>
-                            </div>
-                            <Button
-                              variant="ghost"
-                              size="sm"
-                              onClick={() =>
-                                navigate(
-                                  `/batches/files/${batch.input_file_id}/content?from=/batches/${batchId}`,
-                                )
-                              }
-                              className="shrink-0"
-                            >
-                              View
-                            </Button>
-                          </div>
-                        ) : (
-                          <div className="flex items-center gap-2 p-2 bg-gray-100 rounded">
-                            <FileInput className="w-4 h-4 text-gray-400" />
-                            <div className="flex-1 min-w-0">
-                              <p className="text-sm font-medium text-gray-500">
-                                Input File
-                              </p>
-                              <p className="text-xs text-gray-400">
-                                Source file has been deleted
-                              </p>
-                            </div>
-                          </div>
-                        )}
-
-                        {batch.output_file_id &&
-                          batch.request_counts.completed > 0 && (
-                            <div className="flex items-center gap-2 p-2 bg-green-50 rounded">
-                              <FileCheck className="w-4 h-4 text-green-600" />
-                              <div className="flex-1 min-w-0">
-                                <p className="text-sm font-medium text-gray-700">
-                                  Output File
-                                </p>
-                                <p className="text-xs text-gray-500 font-mono truncate">
-                                  {batch.output_file_id}
-                                </p>
-                              </div>
-                              <Button
-                                variant="ghost"
-                                size="sm"
-                                onClick={() =>
-                                  navigate(
-                                    `/batches/files/${batch.output_file_id}/content?from=/batches/${batchId}`,
-                                  )
-                                }
-                                className="shrink-0"
-                              >
-                                View
-                              </Button>
-                            </div>
-                          )}
-
-                        {batch.error_file_id &&
-                          batch.request_counts.failed > 0 && (
-                            <div className="flex items-center gap-2 p-2 bg-red-50 rounded">
-                              <AlertCircle className="w-4 h-4 text-red-600" />
-                              <div className="flex-1 min-w-0">
-                                <p className="text-sm font-medium text-gray-700">
-                                  Error File
-                                </p>
-                                <p className="text-xs text-gray-500 font-mono truncate">
-                                  {batch.error_file_id}
-                                </p>
-                              </div>
-                              <Button
-                                variant="ghost"
-                                size="sm"
-                                onClick={() =>
-                                  navigate(
-                                    `/batches/files/${batch.error_file_id}/content?from=/batches/${batchId}`,
-                                  )
-                                }
-                                className="shrink-0"
-                              >
-                                View
-                              </Button>
-                            </div>
-                          )}
-                      </div>
-                    </div>
 
                     {/* Errors */}
                     {batch.errors && batch.errors.data.length > 0 && (
@@ -871,31 +670,13 @@ const BatchInfo: React.FC = () => {
                   <CardTitle>Timeline</CardTitle>
                 </CardHeader>
                 <CardContent className="px-6 pb-6 pt-0">
-                  <div className="space-y-4">
+                  <div className="space-y-3">
                     <div>
                       <p className="text-sm text-gray-600 mb-1">Created</p>
                       <p className="text-sm font-medium">
                         {formatTimestamp(batch.created_at)}
                       </p>
                     </div>
-
-                    {batch.in_progress_at && (
-                      <div>
-                        <p className="text-sm text-gray-600 mb-1">Started</p>
-                        <p className="text-sm font-medium">
-                          {formatTimestamp(batch.in_progress_at)}
-                        </p>
-                      </div>
-                    )}
-
-                    {batch.finalizing_at && (
-                      <div>
-                        <p className="text-sm text-gray-600 mb-1">Finalizing</p>
-                        <p className="text-sm font-medium">
-                          {formatTimestamp(batch.finalizing_at)}
-                        </p>
-                      </div>
-                    )}
 
                     {batch.completed_at && (
                       <div>
@@ -915,37 +696,8 @@ const BatchInfo: React.FC = () => {
                       </div>
                     )}
 
-                    {batch.cancelled_at && (
-                      <div>
-                        <p className="text-sm text-gray-600 mb-1">Cancelled</p>
-                        <p className="text-sm font-medium">
-                          {formatTimestamp(batch.cancelled_at)}
-                        </p>
-                      </div>
-                    )}
-
-                    {/* TODO: Enable when backend expiration enforcement is implemented */}
-                    {/* {batch.expired_at && (
-                      <div>
-                        <p className="text-sm text-gray-600 mb-1">Expired</p>
-                        <p className="text-sm font-medium">
-                          {formatTimestamp(batch.expired_at)}
-                        </p>
-                      </div>
-                    )}
-
-                    {batch.expires_at && !batch.expired_at && (
-                      <div>
-                        <p className="text-sm text-gray-600 mb-1">Expires</p>
-                        <p className="text-sm font-medium">
-                          {formatTimestamp(batch.expires_at)}
-                        </p>
-                      </div>
-                    )} */}
-
-                    {/* Duration */}
                     {batch.in_progress_at && batch.completed_at && (
-                      <div className="border-t pt-4">
+                      <div className="border-t border-doubleword-border-light pt-3">
                         <p className="text-sm text-gray-600 mb-1">Duration</p>
                         <p className="text-sm font-medium">
                           {formatDuration(
@@ -955,28 +707,85 @@ const BatchInfo: React.FC = () => {
                         </p>
                       </div>
                     )}
-                    {/*
-                    {analytics && analytics.avg_ttfb_ms && (
-                      <div>
-                        <p className="text-sm text-gray-600 mb-1">Avg TTFB</p>
-                        <p className="text-sm font-medium">
-                          {analytics.avg_ttfb_ms.toFixed(0)}ms
-                        </p>
-                      </div>
-                    )}
-
-                    {analytics && analytics.avg_duration_ms && (
-                      <div>
-                        <p className="text-sm text-gray-600 mb-1">Avg Duration</p>
-                        <p className="text-sm font-medium">
-                          {analytics.avg_duration_ms.toFixed(0)}ms
-                        </p>
-                      </div>
-                    )}
-                    */}
                   </div>
                 </CardContent>
               </Card>
+
+              {/* Metrics Card — compact inline format */}
+              {analytics &&
+                (batch.request_counts.completed > 0 ||
+                  batch.request_counts.failed > 0) && (
+                  <Card className="p-0 gap-0 rounded-lg">
+                    <CardHeader className="flex w-full justify-between px-6 pt-5 pb-4">
+                      <CardTitle>Metrics</CardTitle>
+                      {hasRequestsPermission && (
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          onClick={() =>
+                            navigate(
+                              `/analytics?tab=requests&fusillade_batch_id=${batchId}&from=/batches/${batchId}`,
+                            )
+                          }
+                        >
+                          Analytics
+                          <ExternalLink className="ml-1 h-3 w-3" />
+                        </Button>
+                      )}
+                    </CardHeader>
+                    <CardContent className="px-6 pb-6 pt-0">
+                      {analyticsLoading ? (
+                        <div className="space-y-2">
+                          <Skeleton className="h-5 w-full" />
+                          <Skeleton className="h-5 w-full" />
+                          <Skeleton className="h-5 w-full" />
+                        </div>
+                      ) : analytics.total_requests > 0 ? (
+                        <div className="space-y-2">
+                          <div className="flex justify-between text-sm">
+                            <span className="text-gray-600">Prompt</span>
+                            <span className="font-medium tabular-nums">
+                              {analytics.total_prompt_tokens.toLocaleString()}
+                            </span>
+                          </div>
+                          <div className="flex justify-between text-sm">
+                            <span className="text-gray-600">Completion</span>
+                            <span className="font-medium tabular-nums">
+                              {analytics.total_completion_tokens.toLocaleString()}
+                            </span>
+                          </div>
+                          {reasoningTokens > 0 && (
+                            <div className="flex justify-between text-sm">
+                              <span className="text-gray-600">Reasoning</span>
+                              <span className="font-medium tabular-nums">
+                                {reasoningTokens.toLocaleString()}
+                              </span>
+                            </div>
+                          )}
+                          <div className="flex justify-between text-sm font-medium border-t border-doubleword-border-light pt-2 mt-2">
+                            <span>Total tokens</span>
+                            <span className="tabular-nums">
+                              {analytics.total_tokens.toLocaleString()}
+                            </span>
+                          </div>
+                          {analytics.total_cost &&
+                            parseFloat(analytics.total_cost) > 0 && (
+                              <div className="flex justify-between text-sm border-t border-doubleword-border-light pt-2 mt-2">
+                                <span className="text-gray-600">Cost</span>
+                                <span className="font-medium text-green-700">
+                                  ${parseFloat(analytics.total_cost).toFixed(4)}
+                                </span>
+                              </div>
+                            )}
+                        </div>
+                      ) : (
+                        <p className="text-sm text-gray-500">
+                          Analytics will appear as requests complete.
+                        </p>
+                      )}
+                    </CardContent>
+                  </Card>
+                )}
 
               {/* Source Card — shown when batch was created from a sync */}
               {hasConnectionsPermission && batch.dwext?.source === "sync" && (
@@ -1043,5 +852,29 @@ const BatchInfo: React.FC = () => {
     </div>
   );
 };
+
+function CopyIconButton({ value }: { value: string }) {
+  const [copied, setCopied] = useState(false);
+  const handleCopy = useCallback(async () => {
+    const ok = await copyToClipboard(value);
+    if (ok) {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    }
+  }, [value]);
+  return (
+    <button
+      onClick={handleCopy}
+      className="shrink-0 p-1 text-gray-400 hover:text-gray-600 transition-colors"
+      aria-label="Copy to clipboard"
+    >
+      {copied ? (
+        <Check className="h-4 w-4 text-green-600" />
+      ) : (
+        <Copy className="h-4 w-4" />
+      )}
+    </button>
+  );
+}
 
 export default BatchInfo;

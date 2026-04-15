@@ -14,6 +14,7 @@ import {
   ChevronsUpDown,
   Check,
   Filter,
+  Code,
 } from "lucide-react";
 import { Button } from "../../../ui/button";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "../../../ui/tabs";
@@ -47,11 +48,11 @@ import {
   useBatches,
   useOrganizationMembers,
   useUsers,
+  useConfig,
 } from "../../../../api/control-layer/hooks";
 import { dwctlApi } from "../../../../api/control-layer/client";
 import type { FileObject, Batch } from "../types";
 import type {
-  BatchAnalytics,
   BatchStatus,
 } from "../../../../api/control-layer/types";
 import { useServerCursorPagination } from "../../../../hooks/useServerCursorPagination";
@@ -59,6 +60,7 @@ import { useDebounce } from "../../../../hooks/useDebounce";
 import { useAuthorization } from "../../../../utils/authorization";
 import { useOrganizationContext } from "../../../../contexts/organization/useOrganizationContext";
 import { useBootstrapContent } from "@/hooks/use-bootstrap-content";
+import { ApiExamples } from "../../../modals";
 import { cn } from "@/lib/utils";
 
 /**
@@ -96,9 +98,14 @@ export function Batches({
   const { userRoles, hasPermission } = useAuthorization();
   const { isOrgContext, activeOrganizationId } = useOrganizationContext();
 
+  const { data: appConfig } = useConfig();
+  const asyncCompletionWindow =
+    appConfig?.batches?.async_requests?.completion_window ?? "1h";
+
   // Show User column for PlatformManagers (see all batches) or in org context (see org members)
   const isPlatformManager = userRoles.includes("PlatformManager");
   const showUserColumn = isPlatformManager || isOrgContext;
+  // Context and Source columns are used by the file table only
   const showContextColumn = isPlatformManager;
   const showSourceColumn = hasPermission("connections");
 
@@ -156,6 +163,7 @@ export function Batches({
 
   // Batch-specific filters
   const [statusFilter, setStatusFilter] = useState<BatchStatus | "all">("all");
+  const [hideAsync, setHideAsync] = useState(false);
   const [sortActiveFirst, setSortActiveFirst] = useState(true);
   const [dateRange, setDateRange] = useState<
     { from: Date; to: Date } | undefined
@@ -266,6 +274,7 @@ export function Batches({
     created_after: dateRange?.from.toISOString(),
     created_before: dateRange?.to.toISOString(),
     active_first: sortActiveFirst || undefined,
+    exclude_completion_window: hideAsync ? asyncCompletionWindow : undefined,
     ...batchesPagination.queryParams,
   });
 
@@ -297,17 +306,6 @@ export function Batches({
 
     return result;
   }, [batches, batchFileFilter]);
-
-  // Create a map of batch ID to analytics for easy lookup (analytics are now embedded in batch response)
-  const batchAnalyticsMap = React.useMemo(() => {
-    const map = new Map<string, BatchAnalytics>();
-    batches.forEach((batch) => {
-      if (batch.analytics) {
-        map.set(batch.id, batch.analytics);
-      }
-    });
-    return map;
-  }, [batches]);
 
   // Prefetch next page for files - only if user has already started paginating
   useEffect(() => {
@@ -536,10 +534,9 @@ export function Batches({
     onViewFile: handleViewFileRequests,
     getInputFile,
     onRowClick: handleBatchClick,
-    batchAnalytics: batchAnalyticsMap,
     showUserColumn,
-    showContextColumn,
-    showSourceColumn,
+    showTypeColumn: !hideAsync,
+    asyncCompletionWindow,
   });
 
   // Searchable member filter combobox - shared between batches and files tabs
@@ -632,6 +629,7 @@ export function Batches({
   );
 
   const bootstrapBanner = useBootstrapContent();
+  const [showApiExamples, setShowApiExamples] = useState(false);
 
   return (
     <div
@@ -647,11 +645,11 @@ export function Batches({
         className="space-y-4"
       >
         {/* Header with Tabs and Actions */}
-        <div className="mb-6 flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4">
+        <div className="mb-4 flex flex-col sm:flex-row sm:items-end sm:justify-between gap-4">
           {/* Left: Title */}
-          <div className="shrink-0">
+          <div>
             <h1 className="text-3xl font-bold text-doubleword-neutral-900">
-              {activeTab === "batches" ? "Batch Requests" : "Batch Files"}
+              {activeTab === "batches" ? "Batches" : "Batch Files"}
             </h1>
             <p className="text-doubleword-neutral-600 mt-1">
               {activeTab === "batches"
@@ -661,13 +659,12 @@ export function Batches({
           </div>
 
           {/* Right: Buttons + Tabs */}
-          <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-3 lg:shrink-0">
+          <div className="flex items-center gap-2">
             {/* Action Button - changes based on active tab */}
             {activeTab === "batches" ? (
               <Button
                 onClick={() => onOpenCreateBatchModal()}
                 variant="outline"
-                className="flex-1 sm:flex-none"
               >
                 <Play className="w-4 h-4 mr-2" />
                 Create Batch
@@ -676,7 +673,7 @@ export function Batches({
               <Button
                 onClick={() => onOpenUploadModal()}
                 variant="outline"
-                className={`flex-1 sm:flex-none transition-all duration-200 ${
+                className={`transition-all duration-200 ${
                   dragActive ? "border-blue-500 bg-blue-50 text-blue-700" : ""
                 }`}
               >
@@ -685,18 +682,24 @@ export function Batches({
               </Button>
             )}
 
+            {/* API Button */}
+            <Button variant="outline" onClick={() => setShowApiExamples(true)}>
+              <Code className="h-4 w-4" />
+              API
+            </Button>
+
             {/* Tabs Selector */}
-            <TabsList className="w-full sm:w-auto">
+            <TabsList>
               <TabsTrigger
                 value="batches"
-                className="flex items-center gap-2 flex-1 sm:flex-none"
+                className="flex items-center gap-2"
               >
                 <Box className="w-4 h-4" />
                 Batches
               </TabsTrigger>
               <TabsTrigger
                 value="files"
-                className="flex items-center gap-2 flex-1 sm:flex-none"
+                className="flex items-center gap-2"
               >
                 <FileInput className="w-4 h-4" />
                 Files
@@ -759,7 +762,7 @@ export function Batches({
             pageSize={batchesPagination.pageSize}
             minRows={batchesPagination.pageSize}
             rowHeight="40px"
-            initialColumnVisibility={{ id: false }}
+            initialColumnVisibility={{ batch_id: false, input_file_id: false }}
             onRowClick={handleBatchClick}
             isLoading={batchesLoading}
             emptyState={
@@ -806,6 +809,22 @@ export function Batches({
                     className="text-sm text-gray-600 cursor-pointer select-none"
                   >
                     Active first
+                  </label>
+                </div>
+                <div className="flex items-center gap-1.5">
+                  <Switch
+                    id="hide-async"
+                    checked={hideAsync}
+                    onCheckedChange={(checked) => {
+                      setHideAsync(checked);
+                      batchesPagination.handleFirstPage();
+                    }}
+                  />
+                  <label
+                    htmlFor="hide-async"
+                    className="text-sm text-gray-600 cursor-pointer select-none"
+                  >
+                    Batch only
                   </label>
                 </div>
                 {memberFilterCombobox}
@@ -1008,6 +1027,12 @@ export function Batches({
           />
         </TabsContent>
       </Tabs>
+
+      <ApiExamples
+        isOpen={showApiExamples}
+        onClose={() => setShowApiExamples(false)}
+        defaultTab="batch"
+      />
     </div>
   );
 }

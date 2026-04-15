@@ -224,13 +224,14 @@ pub(crate) async fn reserve_capacity<P: sqlx_pool_router::PoolProvider>(
     // Fetch pending counts AFTER locks to avoid stale snapshots
     let windows = vec![(
         input.completion_window.to_string(),
+        None,
         parse_window_to_seconds(input.completion_window),
     )];
     let states = vec!["pending".to_string(), "claimed".to_string(), "processing".to_string()];
     let model_filter: Vec<String> = input.file_model_counts.keys().cloned().collect();
 
     let pending_counts: HashMap<String, HashMap<String, i64>> = request_manager
-        .get_pending_request_counts_by_model_and_completion_window(&windows, &states, &model_filter, true)
+        .get_pending_request_counts_by_model_and_window(&windows, &states, &model_filter, true)
         .await
         .map_err(|e| CapacityError::Internal(format!("get pending counts: {e}")))?;
 

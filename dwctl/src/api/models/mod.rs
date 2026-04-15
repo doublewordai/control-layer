@@ -4,6 +4,7 @@
 //! and response serialization. These models define the public API contract.
 pub mod api_keys;
 pub mod auth;
+pub mod batch_requests;
 pub mod batches;
 pub mod connections;
 pub mod daemons;

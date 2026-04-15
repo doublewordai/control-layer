@@ -168,6 +168,16 @@ const AcceptInvite = lazyWithRetry(() =>
     default: m.AcceptInvite,
   })),
 );
+const AsyncRequests = lazyWithRetry(() =>
+  import("./components/features/async-requests").then((m) => ({
+    default: m.AsyncRequests,
+  })),
+);
+const AsyncRequestDetail = lazyWithRetry(() =>
+  import("./components/features/async-requests").then((m) => ({
+    default: m.AsyncRequestDetail,
+  })),
+);
 const Connections = lazyWithRetry(() =>
   import("./components/features/connections").then((m) => ({
     default: m.Connections,
@@ -264,6 +274,7 @@ function RootRedirect() {
   // If authenticated, redirect to first accessible route
   return <Navigate to={getFirstAccessibleRoute()} replace />;
 }
+
 
 function AppRoutes() {
   const { isFeatureEnabled, isMswReady, setMswReady } = useSettings();
@@ -378,6 +389,31 @@ function AppRoutes() {
             </AppLayout>
           }
         />
+        {/* Async routes */}
+        <Route
+          path="/async"
+          element={
+            <AppLayout>
+              <ProtectedRoute path="/async">
+                <Suspense fallback={<RouteLoader />}>
+                  <AsyncRequests />
+                </Suspense>
+              </ProtectedRoute>
+            </AppLayout>
+          }
+        />
+        <Route
+          path="/async/:requestId"
+          element={
+            <AppLayout>
+              <ProtectedRoute path="/async">
+                <Suspense fallback={<RouteLoader />}>
+                  <AsyncRequestDetail />
+                </Suspense>
+              </ProtectedRoute>
+            </AppLayout>
+          }
+        />
         <Route
           path="/batches"
           element={
@@ -394,7 +430,7 @@ function AppRoutes() {
           path="/batches/:batchId"
           element={
             <AppLayout>
-              <ProtectedRoute path="/batches/:batchId">
+              <ProtectedRoute path="/batches">
                 <Suspense fallback={<RouteLoader />}>
                   <BatchInfo />
                 </Suspense>
@@ -406,7 +442,7 @@ function AppRoutes() {
           path="/batches/files/:fileId/content"
           element={
             <AppLayout>
-              <ProtectedRoute path="/batches/files/:fileId/content">
+              <ProtectedRoute path="/batches">
                 <Suspense fallback={<RouteLoader />}>
                   <FileRequests />
                 </Suspense>

@@ -1559,6 +1559,8 @@ const batchesApi = {
     if (options?.created_after) params.set("created_after", options.created_after);
     if (options?.created_before) params.set("created_before", options.created_before);
     if (options?.active_first) params.set("active_first", "true");
+    if (options?.exclude_completion_window)
+      params.set("exclude_completion_window", options.exclude_completion_window);
 
     const response = await fetchAiApi(
       `/ai/v1/batches${params.toString() ? "?" + params.toString() : ""}`,
@@ -2108,6 +2110,47 @@ const connectionsApi = {
   },
 };
 
+const asyncRequestsApi = {
+  async list(
+    options?: import("./types").AsyncRequestsListQuery,
+  ): Promise<import("./types").PaginatedResponse<import("./types").AsyncRequest>> {
+    const params = new URLSearchParams();
+    if (options?.skip) params.set("skip", options.skip.toString());
+    if (options?.limit) params.set("limit", options.limit.toString());
+    if (options?.completion_window)
+      params.set("completion_window", options.completion_window);
+    if (options?.status) params.set("status", options.status);
+    if (options?.model) params.set("model", options.model);
+    if (options?.member_id) params.set("member_id", options.member_id);
+    if (options?.created_after)
+      params.set("created_after", options.created_after);
+    if (options?.created_before)
+      params.set("created_before", options.created_before);
+    if (options?.active_first !== undefined)
+      params.set("active_first", options.active_first.toString());
+
+    const response = await fetch(
+      `/admin/api/v1/batches/requests${params.toString() ? "?" + params.toString() : ""}`,
+    );
+    if (!response.ok) {
+      throw new Error(`Failed to fetch batch requests: ${response.status}`);
+    }
+    return response.json();
+  },
+
+  async get(
+    id: string,
+  ): Promise<import("./types").AsyncRequestDetail> {
+    const response = await fetch(
+      `/admin/api/v1/batches/requests/${id}`,
+    );
+    if (!response.ok) {
+      throw new Error(`Failed to fetch batch request: ${response.status}`);
+    }
+    return response.json();
+  },
+};
+
 // Main nested API object
 export const dwctlApi = {
   users: userApi,
@@ -2129,4 +2172,5 @@ export const dwctlApi = {
   organizations: organizationsApi,
   support: supportApi,
   connections: connectionsApi,
+  asyncRequests: asyncRequestsApi,
 };

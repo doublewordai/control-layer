@@ -85,12 +85,19 @@ export default function BatchResults({
   // Fetch batch results with pagination and search
   const { data, isLoading } = useBatchResults(batchId, queryParams);
 
-  // Parse JSONL into results
+  // Parse JSONL into results, skipping malformed lines
   const results: BatchResultItem[] = data?.content
     ? data.content
         .split("\n")
         .filter((line) => line.trim())
-        .map((line) => JSON.parse(line))
+        .map((line) => {
+          try {
+            return JSON.parse(line);
+          } catch {
+            return null;
+          }
+        })
+        .filter((item): item is BatchResultItem => item !== null)
     : [];
 
   const hasMore = data?.incomplete ?? false;

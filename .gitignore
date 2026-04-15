@@ -57,3 +57,5 @@ emails
 .scratch
 LOCAL_OVERRIDES.md
 docker-compose.local.yml
+
+.superpowers

@@ -8,6 +8,7 @@ import * as hooks from "../../../../api/control-layer/hooks";
 
 // Mock the hooks
 vi.mock("../../../../api/control-layer/hooks", () => ({
+  useConfig: vi.fn(),
   useFiles: vi.fn(),
   useBatches: vi.fn(),
   useDeleteFile: vi.fn(),
@@ -91,6 +92,10 @@ vi.mock("../../../modals/DownloadFileModal", () => ({
     isOpen ? (
       <div data-testid="download-file-modal">Download File Modal</div>
     ) : null,
+}));
+
+vi.mock("../../../modals", () => ({
+  ApiExamples: () => null,
 }));
 
 // Mock sonner toast
@@ -207,6 +212,16 @@ describe("Batches", () => {
     vi.clearAllMocks();
 
     // Default mock implementations
+    vi.mocked(hooks.useConfig).mockReturnValue({
+      data: {
+        batches: {
+          allowed_completion_windows: ["24h", "1h"],
+          async_requests: { enabled: true, completion_window: "1h" },
+        },
+      },
+      isLoading: false,
+    } as any);
+
     // Mock useFiles to handle multiple calls with different parameters
     vi.mocked(hooks.useFiles).mockImplementation((params?: any) => {
       // All files query (no limit, for batch file lookups)
@@ -260,8 +275,10 @@ describe("Batches", () => {
         wrapper: createWrapper(),
       });
 
-      // On batches tab by default, title should be "Batch Requests"
-      expect(within(container).getByText("Batch Requests")).toBeInTheDocument();
+      // On batches tab by default, title should be "Batches"
+      expect(
+        within(container).getByRole("heading", { level: 1, name: "Batches" }),
+      ).toBeInTheDocument();
       expect(
         within(container).getByText("Create and manage batch requests"),
       ).toBeInTheDocument();

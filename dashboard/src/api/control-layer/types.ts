@@ -91,8 +91,12 @@ export interface ConfigResponse {
   docs_url: string;
   batches?: {
     enabled: boolean;
-    allowed_completion_windows: string[]; // Raw completion windows like ["24h", "1h"]
-    allowed_url_paths: string[]; // Allowed endpoint paths like ["/v1/chat/completions", "/v1/responses"]
+    allowed_completion_windows: string[];
+    allowed_url_paths: string[];
+    async_requests: {
+      enabled: boolean;
+      completion_window: string; // e.g., "1h"
+    };
   };
   /** Base URL for AI API endpoints (files, batches, daemons). If not set, use relative paths. */
   ai_api_base_url?: string;
@@ -1228,6 +1232,8 @@ export interface BatchesListQuery {
   created_before?: string;
   /** When true, sort active (non-terminal) batches before terminal ones */
   active_first?: boolean;
+  /** Exclude batches with this completion window (e.g., "1h" to hide async) */
+  exclude_completion_window?: string;
 }
 
 // ===== BATCH REQUESTS (Custom endpoints beyond OpenAI spec) =====
@@ -1591,4 +1597,52 @@ export interface SetActiveOrganizationRequest {
 
 export interface SetActiveOrganizationResponse {
   active_organization_id: string | null;
+}
+
+// === Async Requests (individual requests within batches, for async page) ===
+
+export type AsyncRequestStatus =
+  | "pending"
+  | "claimed"
+  | "processing"
+  | "completed"
+  | "failed"
+  | "canceled";
+
+export interface AsyncRequest {
+  id: string;
+  batch_id: string;
+  model: string;
+  status: AsyncRequestStatus;
+  created_at: string;
+  completed_at: string | null;
+  failed_at: string | null;
+  duration_ms: number | null;
+  response_status: number | null;
+  prompt_tokens: number | null;
+  completion_tokens: number | null;
+  reasoning_tokens: number | null;
+  total_tokens: number | null;
+  total_cost: number | null;
+  created_by_email: string | null;
+}
+
+export interface AsyncRequestDetail extends AsyncRequest {
+  body: string;
+  response_body: string | null;
+  error: string | null;
+  completion_window: string;
+  batch_created_by: string;
+}
+
+export interface AsyncRequestsListQuery {
+  skip?: number;
+  limit?: number;
+  completion_window?: string;
+  status?: string;
+  model?: string;
+  member_id?: string;
+  created_after?: string;
+  created_before?: string;
+  active_first?: boolean;
 }

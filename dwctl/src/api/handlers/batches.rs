@@ -1517,6 +1517,7 @@ pub async fn list_batches<P: PoolProvider>(
             created_after: query.created_after,
             created_before: query.created_before,
             active_first: query.active_first,
+            exclude_completion_window: query.exclude_completion_window.clone(),
         })
         .await
         .map_err(|e| Error::Internal {

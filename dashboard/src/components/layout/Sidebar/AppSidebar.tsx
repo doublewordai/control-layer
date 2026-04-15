@@ -21,6 +21,7 @@ import {
   Check,
   Cable,
   Plus,
+  Zap,
 } from "lucide-react";
 import {
   useUser,
@@ -102,6 +103,15 @@ export function AppSidebar() {
       label: "Batches",
       demoOnly: false,
       hidden: config !== undefined && !config.batches?.enabled,
+    },
+    {
+      path: "/async",
+      icon: Zap,
+      label: "Async",
+      demoOnly: false,
+      hidden:
+        config !== undefined &&
+        (!config.batches?.enabled || !config.batches?.async_requests?.enabled),
     },
     { path: "/models", icon: Layers, label: "Models" },
     {

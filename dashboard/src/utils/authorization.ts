@@ -91,6 +91,7 @@ export const ROUTE_PERMISSIONS: Record<string, PagePermission> = {
   "/system": "settings",
   "/profile": "profile",
   "/batches": "batches",
+  "/async": "batches",
   "/usage": "usage",
   "/connections": "connections",
 };
