@@ -1085,10 +1085,8 @@ impl Default for BatchConfig {
     }
 }
 
-/// Batch processing daemon configuration.
-///
 impl BatchConfig {
-    /// Validate batch config consistency. Logs warnings for misconfigurations.
+    /// Validate batch config consistency at startup.
     pub fn validate(&self) {
         if self.async_requests.enabled && !self.allowed_completion_windows.contains(&self.async_requests.completion_window) {
             tracing::error!(
