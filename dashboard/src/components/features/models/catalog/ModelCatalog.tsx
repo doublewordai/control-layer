@@ -387,10 +387,10 @@ function ModelRow({
             <span className="text-sm text-muted-foreground truncate">{providerLabel}</span>
           </div>
         </TableCell>
-        <TableCell>
+        <TableCell className="hidden md:table-cell">
           <CapabilityIcons capabilities={getDisplayCapabilities(model)} />
         </TableCell>
-        <TableCell>
+        <TableCell className="hidden md:table-cell">
           {isChat ? (
             model.metadata?.intelligence_index != null ? (
               <IntelligenceBars value={model.metadata.intelligence_index} metadata={model.metadata} />
@@ -401,7 +401,7 @@ function ModelRow({
             <EmbeddingScore metadata={model.metadata} />
           )}
         </TableCell>
-        <TableCell className="tabular-nums text-muted-foreground text-xs">
+        <TableCell className="hidden md:table-cell tabular-nums text-muted-foreground text-xs">
           {cheapestPrice && visibleTariffs.length > 0 ? (
             <HoverCard openDelay={150} closeDelay={100}>
               <HoverCardTrigger asChild>
@@ -432,12 +432,12 @@ function ModelRow({
             "\u2014"
           )}
         </TableCell>
-        <TableCell className="tabular-nums text-muted-foreground text-xs">
+        <TableCell className="hidden md:table-cell tabular-nums text-muted-foreground text-xs">
           {model.metadata?.context_window
             ? formatContextLength(model.metadata.context_window)
             : "\u2014"}
         </TableCell>
-        <TableCell className="text-muted-foreground text-xs">
+        <TableCell className="hidden md:table-cell text-muted-foreground text-xs">
           {model.metadata?.released_at
             ? formatReleaseDate(model.metadata.released_at)
             : "\u2014"}
@@ -607,10 +607,10 @@ function SectionTable({
               <TableHead>
                 Provider
               </TableHead>
-              <TableHead>
+              <TableHead className="hidden md:table-cell">
                 Capabilities
               </TableHead>
-              <TableHead>
+              <TableHead className="hidden md:table-cell">
                 <SortButton
                   field="intelligence_index"
                   label="Intelligence"
@@ -619,7 +619,7 @@ function SectionTable({
                   onSort={(field) => onSort(tableKey, field)}
                 />
               </TableHead>
-              <TableHead>
+              <TableHead className="hidden md:table-cell">
                 <SortButton
                   field="price_from"
                   label="Cost"
@@ -628,7 +628,7 @@ function SectionTable({
                   onSort={(field) => onSort(tableKey, field)}
                 />
               </TableHead>
-              <TableHead>
+              <TableHead className="hidden md:table-cell">
                 <SortButton
                   field="context_window"
                   label="Context"
@@ -637,7 +637,7 @@ function SectionTable({
                   onSort={(field) => onSort(tableKey, field)}
                 />
               </TableHead>
-              <TableHead>
+              <TableHead className="hidden md:table-cell">
                 <SortButton
                   field="released_at"
                   label="Released"
@@ -718,19 +718,19 @@ function LoadingSkeleton() {
                   <Skeleton className="h-5 w-20" />
                 </div>
               </TableCell>
-              <TableCell>
+              <TableCell className="hidden md:table-cell">
                 <Skeleton className="h-5 w-16" />
               </TableCell>
-              <TableCell>
+              <TableCell className="hidden md:table-cell">
                 <Skeleton className="h-5 w-20" />
               </TableCell>
-              <TableCell>
+              <TableCell className="hidden md:table-cell">
                 <Skeleton className="h-5 w-16" />
               </TableCell>
-              <TableCell>
+              <TableCell className="hidden md:table-cell">
                 <Skeleton className="h-5 w-12" />
               </TableCell>
-              <TableCell>
+              <TableCell className="hidden md:table-cell">
                 <Skeleton className="h-5 w-14" />
               </TableCell>
             </TableRow>
