@@ -1232,11 +1232,12 @@ async fn test_build_router_with_metrics_disabled(pool: PgPool) {
         Default::default(),
     ));
     let limiters = crate::limits::Limiters::new(&config.limits);
+    let shared_config = crate::SharedConfig::new(config);
     underway::run_migrations(&pool).await.expect("Failed to run underway migrations");
     let task_state = crate::tasks::TaskState {
         request_manager: request_manager.clone(),
         dwctl_pool: pool.clone(),
-        config: crate::SharedConfig::new(config.clone()),
+        config: shared_config.clone(),
         encryption_key: None,
         ingest_file_job: std::sync::Arc::new(std::sync::OnceLock::new()),
         activate_batch_job: std::sync::Arc::new(std::sync::OnceLock::new()),
@@ -1249,7 +1250,7 @@ async fn test_build_router_with_metrics_disabled(pool: PgPool) {
     );
     let mut app_state = AppState::builder()
         .db(DbPools::new(pool))
-        .config(crate::SharedConfig::new(config))
+        .config(shared_config)
         .request_manager(request_manager)
         .task_runner(task_runner)
         .limiters(limiters)
@@ -1279,11 +1280,12 @@ async fn test_build_router_with_metrics_enabled(pool: PgPool) {
         Default::default(),
     ));
     let limiters = crate::limits::Limiters::new(&config.limits);
+    let shared_config = crate::SharedConfig::new(config);
     underway::run_migrations(&pool).await.expect("Failed to run underway migrations");
     let task_state = TaskState {
         request_manager: request_manager.clone(),
         dwctl_pool: pool.clone(),
-        config: crate::SharedConfig::new(config.clone()),
+        config: shared_config.clone(),
         encryption_key: None,
         ingest_file_job: std::sync::Arc::new(std::sync::OnceLock::new()),
         activate_batch_job: std::sync::Arc::new(std::sync::OnceLock::new()),
@@ -1296,7 +1298,7 @@ async fn test_build_router_with_metrics_enabled(pool: PgPool) {
     );
     let mut app_state = AppState::builder()
         .db(DbPools::new(pool))
-        .config(crate::SharedConfig::new(config))
+        .config(shared_config)
         .request_manager(request_manager)
         .task_runner(task_runner)
         .limiters(limiters)
