@@ -993,8 +993,10 @@ pub(crate) async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + '
         }
     };
 
-    // RAII guard: release reservations when scope exits (TTL is the safety net)
-    let _release_guard = {
+    // RAII guard: release reservations on early return / error (TTL is the safety net).
+    // Defused after successful populate_batch, since requests are then in fusillade's
+    // pending queue and counted by the capacity system directly.
+    let release_guard = {
         let pool = state.dwctl_pool.clone();
         let ids = reservation_ids.clone();
         scopeguard::guard((), move |()| {
@@ -1150,6 +1152,14 @@ pub(crate) async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + '
             }
         });
     }
+
+    // Populate succeeded — requests are now in fusillade's pending queue and counted
+    // by the capacity system. Release reservations immediately to avoid double-counting,
+    // then defuse the guard so it doesn't release again on drop.
+    if let Err(e) = crate::api::handlers::sla_capacity::release_reservations(&state.dwctl_pool, &reservation_ids).await {
+        tracing::warn!(error = %e, "Failed to release capacity reservations after populate — will expire via TTL");
+    }
+    scopeguard::ScopeGuard::into_inner(release_guard);
 
     // 8. Fail requests whose templates came from invalid lines (tier 2 errors).
     //    Read template_index values from the stored validation_errors JSON (capped
