@@ -79,7 +79,7 @@ const ApiExamplesModal: React.FC<ApiExamplesModalProps> = ({
     limit: 100,
   });
 
-  const allModels = modelsData?.data ?? [];
+  const allModels = useMemo(() => modelsData?.data ?? [], [modelsData?.data]);
 
   // Resolve the active model from user selection (initialModel only sets the default)
   const model: Model | null = useMemo(() => {
@@ -538,7 +538,6 @@ console.log(response.choices[0].message.content);`;
     }
   };
 
-  const isBatchTab = exampleType === "batch" || exampleType === "async";
   const isAutobatcher = exampleType === "async" && asyncMethod === "autobatcher";
 
   return (
