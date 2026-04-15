@@ -237,7 +237,7 @@ export function AsyncRequests() {
 
   const { data, isLoading } = useAsyncRequests({
     completion_window: "1h",
-    active_first: sortActiveFirst || undefined,
+    active_first: sortActiveFirst,
     status: statusFilter !== "all" ? statusFilter : undefined,
     model: modelFilter.length > 0 ? modelFilter.join(",") : undefined,
     created_after: dateRange?.from.toISOString(),

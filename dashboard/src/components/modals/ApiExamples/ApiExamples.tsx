@@ -107,7 +107,7 @@ const ApiExamplesModal: React.FC<ApiExamplesModalProps> = ({
         if (chatModel) setSelectedModelId(chatModel.id);
       }
     }
-  }, [isOpen, defaultTab, initialModel]);
+  }, [isOpen, defaultTab, initialModel, selectedModelId, allModels]);
 
   const modelOptions = useMemo(
     () =>

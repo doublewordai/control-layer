@@ -64,8 +64,13 @@ pub async fn list_batch_requests<P: PoolProvider>(
     let limit = query.pagination.limit();
     let can_read_all = can_read_all_resources(&current_user, Resource::Batches);
 
-    // Build ownership filter
+    // Build ownership filter — member_id only allowed for users with ReadAll permission
     let created_by_filter: Option<String> = if let Some(member_id) = query.member_id {
+        if !can_read_all {
+            return Err(Error::BadRequest {
+                message: "member_id filter requires platform manager permissions".to_string(),
+            });
+        }
         Some(member_id.to_string())
     } else if can_read_all {
         None
@@ -79,12 +84,10 @@ pub async fn list_batch_requests<P: PoolProvider>(
     };
 
     // Parse comma-separated model filter
-    let models: Option<Vec<String>> = query.model.as_ref().map(|m| {
-        m.split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect()
-    });
+    let models: Option<Vec<String>> = query
+        .model
+        .as_ref()
+        .map(|m| m.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect());
 
     // Query fusillade for core request data
     let result = state
@@ -131,8 +134,7 @@ pub async fn list_batch_requests<P: PoolProvider>(
         vec![]
     };
 
-    let analytics_map: std::collections::HashMap<Uuid, AnalyticsRow> =
-        analytics.into_iter().map(|a| (a.request_id, a)).collect();
+    let analytics_map: std::collections::HashMap<Uuid, AnalyticsRow> = analytics.into_iter().map(|a| (a.request_id, a)).collect();
 
     // Fetch creator emails
     let unique_creator_ids: Vec<String> = result
@@ -144,19 +146,16 @@ pub async fn list_batch_requests<P: PoolProvider>(
         .collect();
 
     let emails = if !unique_creator_ids.is_empty() {
-        sqlx::query_as::<_, EmailRow>(
-            "SELECT id::text as user_id, email FROM users WHERE id::text = ANY($1)",
-        )
-        .bind(&unique_creator_ids)
-        .fetch_all(state.db.read())
-        .await
-        .unwrap_or_default()
+        sqlx::query_as::<_, EmailRow>("SELECT id::text as user_id, email FROM users WHERE id::text = ANY($1)")
+            .bind(&unique_creator_ids)
+            .fetch_all(state.db.read())
+            .await
+            .unwrap_or_default()
     } else {
         vec![]
     };
 
-    let email_map: std::collections::HashMap<String, String> =
-        emails.into_iter().map(|e| (e.user_id, e.email)).collect();
+    let email_map: std::collections::HashMap<String, String> = emails.into_iter().map(|e| (e.user_id, e.email)).collect();
 
     // Combine fusillade data with analytics enrichment
     let data: Vec<BatchRequestSummary> = result
@@ -185,12 +184,7 @@ pub async fn list_batch_requests<P: PoolProvider>(
         })
         .collect();
 
-    Ok(Json(PaginatedResponse::new(
-        data,
-        result.total_count,
-        skip,
-        limit,
-    )))
+    Ok(Json(PaginatedResponse::new(data, result.total_count, skip, limit)))
 }
 
 /// Get individual batch request detail
@@ -316,19 +310,12 @@ mod tests {
     #[test_log::test]
     async fn test_list_batch_requests_empty(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
-        let user =
-            create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
 
         let response = app
             .get("/admin/api/v1/batches/requests")
-            .add_header(
-                &add_auth_headers(&user)[0].0,
-                &add_auth_headers(&user)[0].1,
-            )
-            .add_header(
-                &add_auth_headers(&user)[1].0,
-                &add_auth_headers(&user)[1].1,
-            )
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .await;
 
         response.assert_status_ok();
