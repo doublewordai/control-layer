@@ -31,7 +31,7 @@ import {
   DropdownMenuTrigger,
 } from "../../../ui/dropdown-menu";
 import type { BatchStatus } from "../../../../api/control-layer/types";
-import { useAuthorization } from "../../../../utils/authorization";
+import { useAuthorization, copyToClipboard } from "../../../../utils";
 import {
   getBatchDownloadFilename,
   downloadFile,
@@ -856,9 +856,11 @@ const BatchInfo: React.FC = () => {
 function CopyIconButton({ value }: { value: string }) {
   const [copied, setCopied] = useState(false);
   const handleCopy = useCallback(async () => {
-    await navigator.clipboard.writeText(value);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 1500);
+    const ok = await copyToClipboard(value);
+    if (ok) {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    }
   }, [value]);
   return (
     <button
