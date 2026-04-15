@@ -48,14 +48,14 @@ pub async fn get_pending_request_counts<P: PoolProvider>(
         .batches
         .allowed_completion_windows
         .iter()
-        .map(|window| (window.clone(), parse_window_to_seconds(window)))
+        .map(|window| (window.clone(), None, parse_window_to_seconds(window)))
         .collect::<Vec<_>>();
     let states = vec!["pending".to_string(), "claimed".to_string(), "processing".to_string()]; // Include claimed and processing to get a more complete picture of queue depth
     let model_filter: Vec<String> = Vec::new();
 
     let counts = state
         .request_manager
-        .get_pending_request_counts_by_model_and_completion_window(&windows, &states, &model_filter, false)
+        .get_pending_request_counts_by_model_and_window(&windows, &states, &model_filter, false)
         .await
         .map_err(|e| Error::Internal {
             operation: format!("get pending request counts: {}", e),
