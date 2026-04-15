@@ -57,6 +57,9 @@ const ApiExamplesModal: React.FC<ApiExamplesModalProps> = ({
 }) => {
   const [selectedLanguage, setSelectedLanguage] = useState<Language>("python");
   const [exampleType, setExampleType] = useState<ExampleType>(defaultTab);
+  const [asyncMethod, setAsyncMethod] = useState<"autobatcher" | "jsonl">(
+    "autobatcher",
+  );
   const [selectedModelId, setSelectedModelId] = useState<string>(
     initialModel?.id || "",
   );
@@ -195,6 +198,49 @@ const ApiExamplesModal: React.FC<ApiExamplesModalProps> = ({
   };
 
   const getBaseUrl = () => `https://api.doubleword.ai/v1`;
+
+  const generateAutobatcherCode = (language: Language) => {
+    const keyValue = apiKey || "your-api-key-here";
+    const modelAlias = model?.alias || "model-name";
+    if (language === "python") {
+      return `from autobatcher import AsyncOpenAI
+
+client = AsyncOpenAI(api_key="${keyValue}")
+
+response = await client.chat.completions.create(
+    model="${modelAlias}",
+    messages=[{"role": "user", "content": "Explain quantum computing"}],
+)
+
+print(response.choices[0].message.content)`;
+    } else if (language === "javascript") {
+      return `import OpenAI from 'openai';
+
+const client = new OpenAI({
+    baseURL: '${getBaseUrl()}',
+    apiKey: '${keyValue}'
+});
+
+const response = await client.chat.completions.create({
+    model: '${modelAlias}',
+    messages: [
+        { role: 'user', content: 'Explain quantum computing' }
+    ]
+});
+
+console.log(response.choices[0].message.content);`;
+    } else {
+      return `curl ${getBaseUrl()}/chat/completions \\
+  -H "Content-Type: application/json" \\
+  -H "Authorization: Bearer ${keyValue}" \\
+  -d '{
+    "model": "${modelAlias}",
+    "messages": [
+      {"role": "user", "content": "Explain quantum computing"}
+    ]
+  }'`;
+    }
+  };
 
   const generateBatchApiCode = (language: Language) => {
     const keyValue = apiKey || "your-api-key-here";
@@ -430,6 +476,9 @@ console.log(response.choices[0].message.content);`;
   };
 
   const getCurrentCode = () => {
+    if (exampleType === "async" && asyncMethod === "autobatcher") {
+      return generateAutobatcherCode(selectedLanguage);
+    }
     if (exampleType === "batch" || exampleType === "async") {
       return generateBatchApiCode(selectedLanguage);
     }
@@ -566,8 +615,44 @@ console.log(response.choices[0].message.content);`;
                 )}
               </ToggleGroup>
 
-              {/* JSONL example for batch/async tabs */}
-              {isBatchTab && (
+              {/* Async method sub-tabs */}
+              {exampleType === "async" && (
+                <div className="mt-4">
+                  <ToggleGroup
+                    type="single"
+                    value={asyncMethod}
+                    onValueChange={(value) =>
+                      value && setAsyncMethod(value as "autobatcher" | "jsonl")
+                    }
+                    className="inline-flex"
+                    variant="outline"
+                    size="sm"
+                  >
+                    <ToggleGroupItem
+                      value="autobatcher"
+                      aria-label="Autobatcher"
+                      className="px-4 py-1"
+                    >
+                      Autobatcher
+                    </ToggleGroupItem>
+                    <ToggleGroupItem
+                      value="jsonl"
+                      aria-label="JSONL"
+                      className="px-4 py-1"
+                    >
+                      JSONL
+                    </ToggleGroupItem>
+                  </ToggleGroup>
+                  {asyncMethod === "autobatcher" && (
+                    <p className="text-xs text-gray-500 mt-2">
+                      Install: <code className="bg-gray-100 px-1.5 py-0.5 rounded text-xs font-mono">pip install autobatcher</code>
+                    </p>
+                  )}
+                </div>
+              )}
+
+              {/* JSONL example for batch tab or async+jsonl method */}
+              {(exampleType === "batch" || (exampleType === "async" && asyncMethod === "jsonl")) && (
                 <div className="mt-4 space-y-3">
                   <div className="bg-white border border-gray-200 rounded-lg overflow-hidden max-w-full">
                     <div className="bg-gray-50 px-4 py-2 border-b border-gray-200 flex items-center justify-between">
