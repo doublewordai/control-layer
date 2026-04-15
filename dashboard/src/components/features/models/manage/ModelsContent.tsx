@@ -360,10 +360,9 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
         </div>
       ) : (
         <>
-          <div className="overflow-x-auto">
           <div
             role="list"
-            className="grid grid-cols-1 lg:grid-cols-2 2xl:grid-cols-3 gap-6 min-w-[640px]"
+            className="grid grid-cols-1 lg:grid-cols-2 2xl:grid-cols-3 gap-6"
           >
             {filteredModels.map((model) => {
               return (
@@ -932,7 +931,6 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                 </Card>
               );
             })}
-          </div>
           </div>
 
           <TablePagination

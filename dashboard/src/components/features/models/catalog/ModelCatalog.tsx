@@ -294,13 +294,13 @@ function ModelRow({
         className="cursor-pointer hover:bg-muted/50 transition-colors [&>td]:py-1.5"
         onClick={onClick}
       >
-        <TableCell className="hidden sm:table-cell px-1 md:px-2">
+        <TableCell className="px-2">
           <button
             onClick={(e) => {
               e.stopPropagation();
               onToggleExpand();
             }}
-            className="p-0.5 md:p-1 text-gray-400 hover:text-gray-600 transition-colors rounded"
+            className="p-1 text-gray-400 hover:text-gray-600 transition-colors rounded"
             aria-label={isExpanded ? "Collapse row" : "Expand row"}
           >
             {isExpanded ? (
@@ -310,11 +310,11 @@ function ModelRow({
             )}
           </button>
         </TableCell>
-        <TableCell className="overflow-hidden px-2 md:px-4">
-          <div className="flex items-center gap-1 md:gap-2 min-w-0">
+        <TableCell className="overflow-hidden">
+          <div className="flex items-center gap-2 min-w-0">
             <Tooltip>
               <TooltipTrigger asChild>
-                <span className="font-medium truncate text-sm md:text-base">{model.display_name || model.alias}</span>
+                <span className="font-medium truncate">{model.display_name || model.alias}</span>
               </TooltipTrigger>
               <TooltipContent>
                 <span className="font-mono text-xs">{model.alias}</span>
@@ -376,21 +376,21 @@ function ModelRow({
             })}
           </div>
         </TableCell>
-        <TableCell className="hidden sm:table-cell overflow-hidden px-2 md:px-4">
-          <div className="flex items-center gap-1 md:gap-2 min-w-0">
+        <TableCell className="overflow-hidden">
+          <div className="flex items-center gap-2 min-w-0">
             <CatalogIcon
               icon={providerIcon || undefined}
               label={providerLabel}
               size="sm"
               fallback="none"
             />
-            <span className="text-xs md:text-sm text-muted-foreground truncate">{providerLabel}</span>
+            <span className="text-sm text-muted-foreground truncate">{providerLabel}</span>
           </div>
         </TableCell>
-        <TableCell className="hidden md:table-cell">
+        <TableCell>
           <CapabilityIcons capabilities={getDisplayCapabilities(model)} />
         </TableCell>
-        <TableCell className="hidden md:table-cell">
+        <TableCell>
           {isChat ? (
             model.metadata?.intelligence_index != null ? (
               <IntelligenceBars value={model.metadata.intelligence_index} metadata={model.metadata} />
@@ -401,7 +401,7 @@ function ModelRow({
             <EmbeddingScore metadata={model.metadata} />
           )}
         </TableCell>
-        <TableCell className="hidden lg:table-cell tabular-nums text-muted-foreground whitespace-nowrap">
+        <TableCell className="tabular-nums text-muted-foreground text-xs">
           {cheapestPrice && visibleTariffs.length > 0 ? (
             <HoverCard openDelay={150} closeDelay={100}>
               <HoverCardTrigger asChild>
@@ -432,18 +432,18 @@ function ModelRow({
             "\u2014"
           )}
         </TableCell>
-        <TableCell className="hidden lg:table-cell tabular-nums text-muted-foreground">
+        <TableCell className="tabular-nums text-muted-foreground text-xs">
           {model.metadata?.context_window
             ? formatContextLength(model.metadata.context_window)
             : "\u2014"}
         </TableCell>
-        <TableCell className="hidden lg:table-cell text-muted-foreground whitespace-nowrap">
+        <TableCell className="text-muted-foreground text-xs">
           {model.metadata?.released_at
             ? formatReleaseDate(model.metadata.released_at)
             : "\u2014"}
         </TableCell>
-        <TableCell className="text-right px-1 md:px-3 lg:px-6">
-          <div className="flex items-center justify-end gap-0.5 md:gap-1.5">
+        <TableCell className="text-right pr-3 lg:pr-6">
+          <div className="flex items-center justify-end gap-1.5">
             {playgroundAvailable && (
               <Button
                 variant="outline"
@@ -454,10 +454,9 @@ function ModelRow({
                     `/playground?model=${encodeURIComponent(model.id)}`,
                   );
                 }}
-                className="text-xs h-6 md:h-7 px-1.5 md:px-2.5 border-blue-200 text-blue-700 hover:bg-blue-50 hover:text-blue-800"
+                className="text-xs h-7 px-2.5 border-blue-200 text-blue-700 hover:bg-blue-50 hover:text-blue-800"
               >
-                <span className="hidden md:inline">Try it &rarr;</span>
-                <span className="md:hidden">&rarr;</span>
+                Try it &rarr;
               </Button>
             )}
             <Button
@@ -467,7 +466,7 @@ function ModelRow({
                 e.stopPropagation();
                 onApiClick();
               }}
-              className="text-xs h-6 md:h-7 px-1 md:px-2 text-gray-500 hover:text-gray-700 hover:bg-gray-100"
+              className="text-xs h-7 px-2 text-gray-500 hover:text-gray-700 hover:bg-gray-100"
             >
               <Code className="h-3.5 w-3.5" />
               <span className="hidden lg:inline ml-1">API</span>
@@ -591,11 +590,11 @@ function SectionTable({
 
   return (
     <div className="border rounded-lg overflow-hidden">
-      <div className="max-w-full overflow-hidden md:overflow-visible">
+      <div className="overflow-x-auto">
         <Table className="w-full">
           <TableHeader>
             <TableRow>
-              <TableHead className="hidden sm:table-cell px-1 md:px-2 w-6 md:w-8" />
+              <TableHead className="px-2" />
               <TableHead>
                 <SortButton
                   field="alias"
@@ -605,13 +604,13 @@ function SectionTable({
                   onSort={(field) => onSort(tableKey, field)}
                 />
               </TableHead>
-              <TableHead className="hidden sm:table-cell">
+              <TableHead>
                 Provider
               </TableHead>
-              <TableHead className="hidden md:table-cell">
+              <TableHead>
                 Capabilities
               </TableHead>
-              <TableHead className="hidden md:table-cell">
+              <TableHead>
                 <SortButton
                   field="intelligence_index"
                   label="Intelligence"
@@ -620,7 +619,7 @@ function SectionTable({
                   onSort={(field) => onSort(tableKey, field)}
                 />
               </TableHead>
-              <TableHead className="hidden lg:table-cell">
+              <TableHead>
                 <SortButton
                   field="price_from"
                   label="Cost"
@@ -629,7 +628,7 @@ function SectionTable({
                   onSort={(field) => onSort(tableKey, field)}
                 />
               </TableHead>
-              <TableHead className="hidden lg:table-cell">
+              <TableHead>
                 <SortButton
                   field="context_window"
                   label="Context"
@@ -638,7 +637,7 @@ function SectionTable({
                   onSort={(field) => onSort(tableKey, field)}
                 />
               </TableHead>
-              <TableHead className="hidden lg:table-cell">
+              <TableHead>
                 <SortButton
                   field="released_at"
                   label="Released"
@@ -647,7 +646,7 @@ function SectionTable({
                   onSort={(field) => onSort(tableKey, field)}
                 />
               </TableHead>
-              <TableHead className="w-0" />
+              <TableHead />
             </TableRow>
           </TableHeader>
           <TableBody>
@@ -707,31 +706,31 @@ function LoadingSkeleton() {
         <TableBody>
           {Array.from({ length: 8 }).map((_, i) => (
             <TableRow key={i}>
-              <TableCell className="hidden sm:table-cell w-8 px-2">
+              <TableCell className="w-8 px-2">
                 <Skeleton className="h-4 w-4" />
               </TableCell>
               <TableCell>
                 <Skeleton className="h-5 w-48" />
               </TableCell>
-              <TableCell className="hidden sm:table-cell">
+              <TableCell>
                 <div className="flex items-center gap-2">
                   <Skeleton className="h-5 w-5 rounded" />
                   <Skeleton className="h-5 w-20" />
                 </div>
               </TableCell>
-              <TableCell className="hidden md:table-cell">
+              <TableCell>
                 <Skeleton className="h-5 w-16" />
               </TableCell>
-              <TableCell className="hidden md:table-cell">
+              <TableCell>
                 <Skeleton className="h-5 w-20" />
               </TableCell>
-              <TableCell className="hidden lg:table-cell">
+              <TableCell>
                 <Skeleton className="h-5 w-16" />
               </TableCell>
-              <TableCell className="hidden lg:table-cell">
+              <TableCell>
                 <Skeleton className="h-5 w-12" />
               </TableCell>
-              <TableCell className="hidden lg:table-cell">
+              <TableCell>
                 <Skeleton className="h-5 w-14" />
               </TableCell>
             </TableRow>
