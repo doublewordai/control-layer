@@ -757,6 +757,7 @@ export function Batches({
             pageSize={batchesPagination.pageSize}
             minRows={batchesPagination.pageSize}
             rowHeight="40px"
+            initialColumnVisibility={{ batch_id: false, input_file_id: false }}
             onRowClick={handleBatchClick}
             isLoading={batchesLoading}
             emptyState={

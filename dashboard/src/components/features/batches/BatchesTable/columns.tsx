@@ -286,6 +286,52 @@ export const createBatchColumns = (
     },
   },
   {
+    id: "cost",
+    header: "Cost",
+    cell: ({ row }) => {
+      const batch = row.original as Batch;
+      const cost = batch.analytics?.total_cost;
+      if (!cost || parseFloat(cost) === 0) {
+        return <span className="text-gray-400">-</span>;
+      }
+      const value = parseFloat(cost);
+      const formatted =
+        value < 0.0001
+          ? `$${value.toFixed(6)}`
+          : value < 0.01
+            ? `$${value.toFixed(4)}`
+            : `$${value.toFixed(2)}`;
+      return (
+        <span className="text-sm text-green-700 font-medium">{formatted}</span>
+      );
+    },
+  },
+  {
+    id: "batch_id",
+    header: "Batch ID",
+    cell: ({ row }) => {
+      const batch = row.original as Batch;
+      return (
+        <span className="font-mono text-xs text-doubleword-neutral-700 truncate max-w-[100px] block cursor-default" title={batch.id}>
+          {batch.id.slice(0, 8)}...
+        </span>
+      );
+    },
+  },
+  {
+    id: "input_file_id",
+    header: "Input File",
+    cell: ({ row }) => {
+      const batch = row.original as Batch;
+      if (!batch.input_file_id) return <span className="text-gray-400">-</span>;
+      return (
+        <span className="font-mono text-xs text-doubleword-neutral-700 truncate max-w-[100px] block cursor-default" title={batch.input_file_id}>
+          {batch.input_file_id.slice(0, 8)}...
+        </span>
+      );
+    },
+  },
+  {
     id: "actions",
     header: "Actions",
     cell: ({ row }) => {
