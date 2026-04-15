@@ -265,7 +265,7 @@ pub async fn get_batch_request<P: PoolProvider>(
         reasoning_tokens: analytics.as_ref().and_then(|a| a.reasoning_tokens),
         total_tokens: analytics.as_ref().and_then(|a| a.total_tokens),
         total_cost: analytics.as_ref().and_then(|a| a.total_cost),
-        body: detail.body,
+        body: detail.body.unwrap_or_default(),
         response_body: detail.response_body,
         error: detail.error,
         completion_window: detail.completion_window,
