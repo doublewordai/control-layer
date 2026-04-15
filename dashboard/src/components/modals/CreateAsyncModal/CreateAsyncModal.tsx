@@ -21,6 +21,7 @@ import {
   useFiles,
 } from "../../../api/control-layer/hooks";
 import { useDebounce } from "../../../hooks/useDebounce";
+import { dwctlApi } from "../../../api/control-layer/client";
 import { toast } from "sonner";
 import { useQueryClient } from "@tanstack/react-query";
 
@@ -53,6 +54,9 @@ export function CreateAsyncModal({
   const debouncedFileSearch = useDebounce(fileSearchQuery, 300);
   const [hasLoadedFiles, setHasLoadedFiles] = useState(false);
 
+  // Detected endpoint for upload tab (from file contents)
+  const [detectedEndpoint, setDetectedEndpoint] = useState<string>("/v1/chat/completions");
+
   // Shared state
   const [error, setError] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -80,6 +84,47 @@ export function CreateAsyncModal({
     value: file.id,
     label: file.filename,
   }));
+
+  // Detect endpoint from JSONL content (reads first request's url field)
+  const detectEndpointFromJsonl = useCallback((text: string): string => {
+    for (const line of text.split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      try {
+        const parsed = JSON.parse(trimmed) as { url?: string };
+        if (parsed.url) return parsed.url;
+      } catch {
+        // skip malformed lines
+      }
+    }
+    return "/v1/chat/completions";
+  }, []);
+
+  // Detect endpoint when a local file is selected for upload
+  useEffect(() => {
+    if (!fileToUpload) return;
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const text = e.target?.result;
+      if (typeof text === "string") {
+        setDetectedEndpoint(detectEndpointFromJsonl(text));
+      }
+    };
+    reader.readAsText(fileToUpload);
+  }, [fileToUpload, detectEndpointFromJsonl]);
+
+  // Detect endpoint when an existing file is selected
+  useEffect(() => {
+    if (!selectedFileId) return;
+    let cancelled = false;
+    dwctlApi.files
+      .getFileContent(selectedFileId, { limit: 1 })
+      .then(({ content }) => {
+        if (!cancelled) setDetectedEndpoint(detectEndpointFromJsonl(content));
+      })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [selectedFileId, detectEndpointFromJsonl]);
 
   const { data: modelsData } = useModels({
     accessible: true,
@@ -192,9 +237,14 @@ export function CreateAsyncModal({
         }
       }
 
-      const endpoint = isEmbeddingsModel
-        ? "/v1/embeddings"
-        : "/v1/chat/completions";
+      // Compose tab: derive endpoint from selected model type
+      // Upload tab: use endpoint detected from the file contents
+      const endpoint =
+        activeTab === "compose"
+          ? isEmbeddingsModel
+            ? "/v1/embeddings"
+            : "/v1/chat/completions"
+          : detectedEndpoint;
 
       await createBatchMutation.mutateAsync({
         input_file_id: fileId,
@@ -232,6 +282,7 @@ export function CreateAsyncModal({
     setSelectedFileId(null);
     setFileSearchQuery("");
     setHasLoadedFiles(false);
+    setDetectedEndpoint("/v1/chat/completions");
     setError(null);
     setActiveTab("compose");
   };
