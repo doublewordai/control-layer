@@ -294,7 +294,7 @@ function ModelRow({
         className="cursor-pointer hover:bg-muted/50 transition-colors [&>td]:py-1.5"
         onClick={onClick}
       >
-        <TableCell className="px-1 md:px-2">
+        <TableCell className="hidden sm:table-cell px-1 md:px-2">
           <button
             onClick={(e) => {
               e.stopPropagation();
@@ -376,7 +376,7 @@ function ModelRow({
             })}
           </div>
         </TableCell>
-        <TableCell className="overflow-hidden px-2 md:px-4">
+        <TableCell className="hidden sm:table-cell overflow-hidden px-2 md:px-4">
           <div className="flex items-center gap-1 md:gap-2 min-w-0">
             <CatalogIcon
               icon={providerIcon || undefined}
@@ -592,11 +592,11 @@ function SectionTable({
   return (
     <div className="border rounded-lg overflow-hidden">
       <div className="max-w-full overflow-hidden md:overflow-visible">
-        <Table className="w-full table-fixed">
+        <Table className="w-full">
           <TableHeader>
             <TableRow>
-              <TableHead className="px-1 md:px-2 w-6 md:w-8" />
-              <TableHead className="w-auto">
+              <TableHead className="hidden sm:table-cell px-1 md:px-2 w-6 md:w-8" />
+              <TableHead>
                 <SortButton
                   field="alias"
                   label="Name"
@@ -605,7 +605,7 @@ function SectionTable({
                   onSort={(field) => onSort(tableKey, field)}
                 />
               </TableHead>
-              <TableHead>
+              <TableHead className="hidden sm:table-cell">
                 Provider
               </TableHead>
               <TableHead className="hidden md:table-cell">
@@ -647,7 +647,7 @@ function SectionTable({
                   onSort={(field) => onSort(tableKey, field)}
                 />
               </TableHead>
-              <TableHead className="w-[1%] whitespace-nowrap" />
+              <TableHead className="w-0" />
             </TableRow>
           </TableHeader>
           <TableBody>
@@ -707,13 +707,13 @@ function LoadingSkeleton() {
         <TableBody>
           {Array.from({ length: 8 }).map((_, i) => (
             <TableRow key={i}>
-              <TableCell className="w-8 px-2">
+              <TableCell className="hidden sm:table-cell w-8 px-2">
                 <Skeleton className="h-4 w-4" />
               </TableCell>
               <TableCell>
                 <Skeleton className="h-5 w-48" />
               </TableCell>
-              <TableCell>
+              <TableCell className="hidden sm:table-cell">
                 <div className="flex items-center gap-2">
                   <Skeleton className="h-5 w-5 rounded" />
                   <Skeleton className="h-5 w-20" />
