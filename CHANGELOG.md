@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.38.2](https://github.com/doublewordai/control-layer/compare/v8.38.1...v8.38.2) (2026-04-15)
+
+
+### Bug Fixes
+
+* batch creation from sync respects queue capacity, jobs backoff and retry ([#990](https://github.com/doublewordai/control-layer/issues/990)) ([dafed4a](https://github.com/doublewordai/control-layer/commit/dafed4a072eae6e638fcf26ff25503af84603abc))
+
 ## [8.38.1](https://github.com/doublewordai/control-layer/compare/v8.38.0...v8.38.1) (2026-04-15)
 
 
