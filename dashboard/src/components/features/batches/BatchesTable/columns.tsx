@@ -5,9 +5,7 @@ import {
   ArrowUpDown,
   XCircle,
   Clock,
-  CheckCircle2,
   AlertCircle,
-  Loader2,
   FileCheck,
   Eye,
   Trash2,
@@ -37,25 +35,6 @@ interface ColumnActions {
   /** Completion window that identifies async batches (default: "1h") */
   asyncCompletionWindow?: string;
 }
-
-const getStatusIcon = (status: BatchStatus) => {
-  switch (status) {
-    case "completed":
-      return <CheckCircle2 className="w-4 h-4 text-green-600" />;
-    case "failed":
-      return <AlertCircle className="w-4 h-4 text-red-600" />;
-    case "cancelled":
-      return <XCircle className="w-4 h-4 text-gray-600" />;
-    case "in_progress":
-    case "finalizing":
-      return <Loader2 className="w-4 h-4 text-blue-600 animate-spin" />;
-    case "validating":
-    case "cancelling":
-      return <Clock className="w-4 h-4 text-yellow-600" />;
-    default:
-      return <Clock className="w-4 h-4 text-gray-600" />;
-  }
-};
 
 const getStatusColor = (status: BatchStatus) => {
   switch (status) {
@@ -176,24 +155,18 @@ export const createBatchColumns = (
 
       if (isQueued) {
         return (
-          <div className="flex items-center gap-2">
-            <Clock className="w-4 h-4 text-gray-500" />
-            <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-gray-100 text-gray-700">
-              queued
-            </span>
-          </div>
+          <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-gray-100 text-gray-700">
+            queued
+          </span>
         );
       }
 
       return (
-        <div className="flex items-center gap-2">
-          {getStatusIcon(status)}
-          <span
-            className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${getStatusColor(status)}`}
-          >
-            {status.replace("_", " ")}
-          </span>
-        </div>
+        <span
+          className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${getStatusColor(status)}`}
+        >
+          {status.replace("_", " ")}
+        </span>
       );
     },
   },
