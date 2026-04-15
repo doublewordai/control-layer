@@ -1232,6 +1232,8 @@ export interface BatchesListQuery {
   created_before?: string;
   /** When true, sort active (non-terminal) batches before terminal ones */
   active_first?: boolean;
+  /** Exclude batches with this completion window (e.g., "1h" to hide async) */
+  exclude_completion_window?: string;
 }
 
 // ===== BATCH REQUESTS (Custom endpoints beyond OpenAI spec) =====

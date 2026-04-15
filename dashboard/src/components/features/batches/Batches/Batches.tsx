@@ -274,19 +274,16 @@ export function Batches({
     created_after: dateRange?.from.toISOString(),
     created_before: dateRange?.to.toISOString(),
     active_first: sortActiveFirst || undefined,
+    exclude_completion_window: hideAsync ? asyncCompletionWindow : undefined,
     ...batchesPagination.queryParams,
   });
 
   // Process batches response - remove extra item used for hasMore detection
-  const batchesRaw = batchesResponse?.data || [];
-  // Filter out async (1h) batches when toggle is on
-  const batchesFiltered = hideAsync
-    ? batchesRaw.filter((b) => b.completion_window !== asyncCompletionWindow)
-    : batchesRaw;
-  const batchesHasMore = batchesFiltered.length > batchesPagination.pageSize;
+  const batchesData = batchesResponse?.data || [];
+  const batchesHasMore = batchesData.length > batchesPagination.pageSize;
   const batches = batchesHasMore
-    ? batchesFiltered.slice(0, batchesPagination.pageSize)
-    : batchesFiltered;
+    ? batchesData.slice(0, batchesPagination.pageSize)
+    : batchesData;
 
   // Process files response - remove extra item used for hasMore detection
   const filesData = filesResponse?.data || [];

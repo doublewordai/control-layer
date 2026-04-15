@@ -327,6 +327,10 @@ pub struct ListBatchesQuery {
     /// Each group is sorted by creation time (newest first). Default: false.
     #[serde(default)]
     pub active_first: bool,
+
+    /// Exclude batches with this completion window (e.g., "1h" to hide async batches).
+    /// Applied server-side for accurate pagination.
+    pub exclude_completion_window: Option<String>,
 }
 
 /// Query parameters for batch results

@@ -1559,6 +1559,8 @@ const batchesApi = {
     if (options?.created_after) params.set("created_after", options.created_after);
     if (options?.created_before) params.set("created_before", options.created_before);
     if (options?.active_first) params.set("active_first", "true");
+    if (options?.exclude_completion_window)
+      params.set("exclude_completion_window", options.exclude_completion_window);
 
     const response = await fetchAiApi(
       `/ai/v1/batches${params.toString() ? "?" + params.toString() : ""}`,
