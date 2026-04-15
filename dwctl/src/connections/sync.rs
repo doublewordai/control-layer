@@ -896,42 +896,67 @@ pub(crate) async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + '
         .unwrap_or("24h")
         .to_string();
 
-    // 3. Capacity check — reserve capacity before creating the batch.
-    //    If the model queue is full, return a retryable error so underway backs off
-    //    and retries when capacity becomes available.
-    let reservation_ids = {
+    // 3. Load sync entry early — needed for retry detection (batch_id already set)
+    //    and for provenance metadata / validation errors later.
+    let sync_entry = {
+        let mut conn = dwctl.acquire().await?;
+        SyncEntries::new(&mut conn)
+            .get_by_id(input.sync_entry_id)
+            .await?
+            .ok_or_else(|| ActivateError::Fatal(format!("sync entry not found: {}", input.sync_entry_id)))?
+    };
+    let external_key = sync_entry.external_key.clone();
+
+    // 4. Capacity check — reserve capacity before creating the batch.
+    //    Skip on retries where a batch was already created (batch_id is set),
+    //    since that batch's requests are already counted in pending.
+    let reservation_ids = if sync_entry.batch_id.is_some() {
+        Vec::new() // Retry path — batch already exists, no new reservation needed
+    } else {
         use crate::api::handlers::sla_capacity::{CapacityError, CapacityReservationInput, reserve_capacity};
         use crate::db::handlers::deployments::Deployments;
 
-        // Get per-model request counts from the file templates
         let file_stats = state
             .request_manager
             .get_file_template_stats(fusillade::FileId(input.file_id))
             .await
             .map_err(|e| anyhow::anyhow!("get file template stats: {e}"))?;
 
-        let file_model_counts: std::collections::HashMap<String, i64> =
-            file_stats.iter().map(|s| (s.model.clone(), s.request_count)).collect();
+        // Filter out empty model aliases — those are tier-2 invalid lines that will
+        // be failed after populate. They don't need capacity reservations.
+        let file_model_counts: std::collections::HashMap<String, i64> = file_stats
+            .iter()
+            .filter(|s| !s.model.is_empty())
+            .map(|s| (s.model.clone(), s.request_count))
+            .collect();
 
         if file_model_counts.is_empty() {
             Vec::new()
         } else {
             let model_aliases: Vec<String> = file_model_counts.keys().cloned().collect();
 
-            // Get per-model throughputs
             let batch_model_info = {
                 let mut conn = dwctl.acquire().await?;
                 Deployments::new(&mut conn).get_batch_model_info(&model_aliases).await?
             };
 
-            // Get model UUIDs for advisory locks
             let model_ids_by_alias = {
                 let mut conn = dwctl.acquire().await?;
                 Deployments::new(&mut conn).get_model_ids_by_aliases(&model_aliases).await?
             };
 
+            // Validate all models exist (deleted/missing models would bypass capacity checks)
+            let missing: Vec<&str> = model_aliases
+                .iter()
+                .filter(|a| !model_ids_by_alias.contains_key(*a))
+                .map(|a| a.as_str())
+                .collect();
+            if !missing.is_empty() {
+                return Err(ActivateError::Fatal(format!("model(s) no longer available: {}", missing.join(", "))).into());
+            }
+
             let config = state.config.snapshot();
-            let input = CapacityReservationInput {
+            let cap_input = CapacityReservationInput {
                 completion_window: &completion_window,
                 file_model_counts: &file_model_counts,
                 model_throughputs: &batch_model_info.throughputs,
@@ -941,7 +966,7 @@ pub(crate) async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + '
                 reservation_ttl_secs: config.batches.reservation_ttl_secs,
             };
 
-            match reserve_capacity(dwctl, &*state.request_manager, &input).await {
+            match reserve_capacity(dwctl, &*state.request_manager, &cap_input).await {
                 Ok(ids) => ids,
                 Err(CapacityError::InsufficientCapacity { completion_window, models }) => {
                     return Err(ActivateError::Retryable(format!(
@@ -975,12 +1000,7 @@ pub(crate) async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + '
         })
     };
 
-    // 4. Resolve the connection owner's hidden batch API key.
-    //    connection.user_id = the owner (org ID in org context, personal ID otherwise).
-    //    sync_op.triggered_by = the individual who triggered the sync.
-    //    Same pattern as create_batch handler:
-    //      - key owned by target_user_id (org/user) for billing scope
-    //      - created_by on key = individual for per-member attribution
+    // 5. Resolve the connection owner's hidden batch API key.
     let (batch_owner, batch_api_key, api_key_id, connection_name) = {
         use crate::db::handlers::api_keys::ApiKeys;
         use crate::db::models::api_keys::ApiKeyPurpose;
@@ -1002,17 +1022,6 @@ pub(crate) async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + '
 
         (owner_id, secret, key_id, conn_name)
     };
-
-    // 5. Look up sync entry for external key (used in batch provenance metadata below)
-    //    and validation errors (for tier-2 failure marking after populate).
-    let sync_entry = {
-        let mut conn = dwctl.acquire().await?;
-        SyncEntries::new(&mut conn)
-            .get_by_id(input.sync_entry_id)
-            .await?
-            .ok_or_else(|| ActivateError::Fatal(format!("sync entry not found: {}", input.sync_entry_id)))?
-    };
-    let external_key = sync_entry.external_key.clone();
 
     // 6. Create or reuse batch record.
     //    On retries (transient failure after create_batch_record), reuse the batch_id
@@ -1352,6 +1361,8 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_three_tier_ingestion_and_activation(pool: PgPool) {
+        use crate::test::utils::{create_test_endpoint, create_test_model};
+
         // -- Setup --
         let state = setup_task_state(pool.clone()).await;
         let config = create_test_config();
@@ -1359,6 +1370,10 @@ mod tests {
 
         let user = create_test_user(&pool, crate::api::models::users::Role::PlatformManager).await;
         let user_id = user.id;
+
+        // Create a deployed model so the capacity check can resolve it
+        let endpoint_id = create_test_endpoint(&pool, "test-ep", user_id).await;
+        create_test_model(&pool, "gpt-4-internal", "gpt-4", endpoint_id, user_id).await;
 
         let connection_id = insert_test_connection(&pool, user_id).await;
         let sync_id = insert_test_sync_op(&pool, connection_id, user_id).await;
