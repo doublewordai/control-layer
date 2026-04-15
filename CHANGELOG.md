@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.39.0](https://github.com/doublewordai/control-layer/compare/v8.38.2...v8.39.0) (2026-04-15)
+
+
+### Features
+
+* async requests UI and streamlined batch experience ([#989](https://github.com/doublewordai/control-layer/issues/989)) ([76cd01b](https://github.com/doublewordai/control-layer/commit/76cd01baff9fe6b36d22d5549f92a03524aeb3c8))
+
 ## [8.38.2](https://github.com/doublewordai/control-layer/compare/v8.38.1...v8.38.2) (2026-04-15)
 
 
