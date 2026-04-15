@@ -394,7 +394,7 @@ function AppRoutes() {
           path="/async"
           element={
             <AppLayout>
-              <ProtectedRoute path="/batches">
+              <ProtectedRoute path="/async">
                 <Suspense fallback={<RouteLoader />}>
                   <AsyncRequests />
                 </Suspense>
@@ -406,7 +406,7 @@ function AppRoutes() {
           path="/async/:requestId"
           element={
             <AppLayout>
-              <ProtectedRoute path="/batches">
+              <ProtectedRoute path="/async">
                 <Suspense fallback={<RouteLoader />}>
                   <AsyncRequestDetail />
                 </Suspense>

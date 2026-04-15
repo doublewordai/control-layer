@@ -337,4 +337,19 @@ mod tests {
         assert_eq!(body["total_count"], 0);
         assert!(body["data"].as_array().unwrap().is_empty());
     }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_member_id_filter_rejected_for_non_pm(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+
+        let response = app
+            .get(&format!("/admin/api/v1/batches/requests?member_id={}", uuid::Uuid::new_v4()))
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+
+        response.assert_status(axum::http::StatusCode::BAD_REQUEST);
+    }
 }
