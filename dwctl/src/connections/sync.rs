@@ -908,10 +908,22 @@ pub(crate) async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + '
     let external_key = sync_entry.external_key.clone();
 
     // 4. Capacity check — reserve capacity before creating the batch.
-    //    Skip on retries where a batch was already created (batch_id is set),
-    //    since that batch's requests are already counted in pending.
-    let reservation_ids = if sync_entry.batch_id.is_some() {
-        Vec::new() // Retry path — batch already exists, no new reservation needed
+    //    On retries where a previous attempt already created AND populated a batch,
+    //    skip reservation since those requests are already counted in pending.
+    //    If the batch exists but isn't populated yet (failure between create and populate),
+    //    we still need to reserve capacity.
+    let batch_already_populated = if let Some(existing_batch_id) = sync_entry.batch_id {
+        let batch = state.request_manager.get_batch(fusillade::BatchId(existing_batch_id)).await;
+        match batch {
+            Ok(b) => b.pending_requests + b.in_progress_requests + b.completed_requests + b.failed_requests > 0,
+            Err(_) => false, // Batch record missing or error — treat as not populated
+        }
+    } else {
+        false
+    };
+
+    let reservation_ids = if batch_already_populated {
+        Vec::new()
     } else {
         use crate::api::handlers::sla_capacity::{CapacityError, CapacityReservationInput, reserve_capacity};
         use crate::db::handlers::deployments::Deployments;
