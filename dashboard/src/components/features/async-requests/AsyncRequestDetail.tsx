@@ -310,12 +310,6 @@ export function AsyncRequestDetail() {
                   <p className="text-sm text-gray-600 mb-1">Model</p>
                   <p className="font-medium text-sm">{request.model}</p>
                 </div>
-                <div>
-                  <p className="text-sm text-gray-600 mb-1">
-                    Completion Window
-                  </p>
-                  <p className="font-medium">{request.completion_window}</p>
-                </div>
                 {request.created_by_email && (
                   <div>
                     <p className="text-sm text-gray-600 mb-1">Created by</p>
