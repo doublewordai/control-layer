@@ -92,7 +92,7 @@ const userColumn: ColumnDef<AsyncRequest> = {
         <TooltipTrigger asChild>
           <span
             onClick={(e) => handleCopyCellValue(e, email, "user")}
-            className="text-sm text-doubleword-neutral-700 truncate max-w-[180px] inline-block align-middle cursor-copy hover:text-doubleword-neutral-900 transition-colors"
+            className="text-sm text-doubleword-neutral-700 truncate max-w-[180px] inline-block align-middle cursor-pointer hover:text-doubleword-neutral-900 transition-colors"
           >
             {email}
           </span>
@@ -131,7 +131,7 @@ function createColumns(
       const content = (
         <span
           onClick={(e) => handleCopyCellValue(e, alias, "model alias")}
-          className="text-sm text-doubleword-neutral-900 truncate max-w-[220px] inline-block align-middle cursor-copy hover:text-doubleword-neutral-700 transition-colors"
+          className="text-sm text-doubleword-neutral-900 truncate max-w-[220px] inline-block align-middle cursor-pointer hover:text-doubleword-neutral-700 transition-colors"
         >
           {displayName}
         </span>
