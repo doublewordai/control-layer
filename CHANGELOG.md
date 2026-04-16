@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.40.1](https://github.com/doublewordai/control-layer/compare/v8.40.0...v8.40.1) (2026-04-16)
+
+
+### Bug Fixes
+
+* center tooltips and make model/user cells click-to-copy ([#998](https://github.com/doublewordai/control-layer/issues/998)) ([e2fb2f5](https://github.com/doublewordai/control-layer/commit/e2fb2f5fab090e4265e1236ff94f7dc553b466e6))
+
 ## [8.40.0](https://github.com/doublewordai/control-layer/compare/v8.39.0...v8.40.0) (2026-04-16)
 
 
