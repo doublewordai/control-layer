@@ -612,7 +612,7 @@ where
 
     // --- 4. Create new deployments, error if conflicts found ---
     let system_user_id = uuid::Uuid::nil();
-    for (model_name, alias) in create_model_names.into_iter().zip(create_aliases.into_iter()) {
+    for (model_name, alias) in create_model_names.into_iter().zip(create_aliases) {
         if conflict_create_aliases.contains(&alias) {
             return Err(SyncError::AliasConflicts {
                 conflicts: vec![AliasConflict {
