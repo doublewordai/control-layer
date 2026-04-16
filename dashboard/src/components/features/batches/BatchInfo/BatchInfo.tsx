@@ -613,6 +613,14 @@ const BatchInfo: React.FC = () => {
                           {batch.completion_window}
                         </p>
                       </div>
+                      {batch.metadata?.created_by_email && (
+                        <div>
+                          <p className="text-sm text-gray-600 mb-1">Created by</p>
+                          <p className="font-medium text-sm wrap-break-words">
+                            {batch.metadata.created_by_email}
+                          </p>
+                        </div>
+                      )}
                     </div>
 
                     {description && (
