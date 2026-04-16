@@ -219,17 +219,15 @@ pub async fn get_batch_request<P: PoolProvider>(
         .request_manager
         .get_request_detail(fusillade::RequestId(request_id))
         .await
-        .map_err(|e| {
-            let msg = e.to_string();
-            if msg.to_lowercase().contains("not found") {
-                Error::NotFound {
-                    resource: "BatchRequest".to_string(),
-                    id: request_id.to_string(),
-                }
-            } else {
-                tracing::error!(request_id = %request_id, error = %msg, "failed to fetch batch request detail");
+        .map_err(|e| match e {
+            fusillade::FusilladeError::RequestNotFound(_) => Error::NotFound {
+                resource: "BatchRequest".to_string(),
+                id: request_id.to_string(),
+            },
+            other => {
+                tracing::error!(request_id = %request_id, error = %other, "failed to fetch batch request detail");
                 Error::Internal {
-                    operation: format!("get batch request detail: {}", msg),
+                    operation: format!("get batch request detail: {}", other),
                 }
             }
         })?;
@@ -264,6 +262,23 @@ pub async fn get_batch_request<P: PoolProvider>(
     .await
     .map_err(|e| Error::Database(e.into()))?;
 
+    // Look up the creator's email via UUID primary-key lookup (org IDs and unparseable
+    // values return None without a query). Uses the primary pool to avoid replica lag
+    // right after batch creation.
+    let created_by_email = if let Ok(created_by_uuid) = Uuid::parse_str(&detail.batch_created_by) {
+        sqlx::query_as::<_, EmailRow>("SELECT id::text as user_id, email FROM users WHERE id = $1")
+            .bind(created_by_uuid)
+            .fetch_optional(state.db.write())
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "failed to fetch creator email for batch request detail");
+                None
+            })
+            .map(|row| row.email)
+    } else {
+        None
+    };
+
     Ok(Json(BatchRequestDetail {
         id: detail.id,
         batch_id: detail.batch_id,
@@ -284,6 +299,7 @@ pub async fn get_batch_request<P: PoolProvider>(
         error: detail.error,
         completion_window: detail.completion_window,
         batch_created_by: detail.batch_created_by,
+        created_by_email,
     }))
 }
 
@@ -351,5 +367,86 @@ mod tests {
             .await;
 
         response.assert_status(axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_get_batch_request_returns_404_for_missing(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let auth = add_auth_headers(&user);
+
+        let response = app
+            .get(&format!("/admin/api/v1/batches/requests/{}", uuid::Uuid::new_v4()))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+
+        response.assert_status_not_found();
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_get_batch_request_populates_created_by_email(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let auth = add_auth_headers(&user);
+
+        // Insert a fusillade batch + request owned by the test user directly, mirroring
+        // the approach used in batches.rs tests.
+        let file_id = uuid::Uuid::new_v4();
+        let batch_id = uuid::Uuid::new_v4();
+        let template_id = uuid::Uuid::new_v4();
+        let request_id = uuid::Uuid::new_v4();
+        let body = serde_json::json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}]});
+
+        sqlx::query(
+            "INSERT INTO fusillade.files (id, name, status, created_at, updated_at) VALUES ($1, 'test.jsonl', 'processed', NOW(), NOW())",
+        )
+        .bind(file_id)
+        .execute(&pool)
+        .await
+        .expect("insert file");
+
+        sqlx::query(
+            "INSERT INTO fusillade.batches (id, created_by, file_id, endpoint, completion_window, expires_at, created_at, total_requests) VALUES ($1, $2, $3, '/v1/chat/completions', '24h', NOW() + interval '24 hours', NOW(), 1)",
+        )
+        .bind(batch_id)
+        .bind(user.id.to_string())
+        .bind(file_id)
+        .execute(&pool)
+        .await
+        .expect("insert batch");
+
+        sqlx::query(
+            "INSERT INTO fusillade.request_templates (id, file_id, model, api_key, endpoint, path, body, custom_id, method) VALUES ($1, $2, 'test-model', 'test-key', 'http://test', '/v1/chat/completions', $3, 'req-0', 'POST')",
+        )
+        .bind(template_id)
+        .bind(file_id)
+        .bind(serde_json::to_string(&body).unwrap())
+        .execute(&pool)
+        .await
+        .expect("insert template");
+
+        sqlx::query(
+            "INSERT INTO fusillade.requests (id, batch_id, template_id, model, state, created_at) VALUES ($1, $2, $3, 'test-model', 'pending', NOW())",
+        )
+        .bind(request_id)
+        .bind(batch_id)
+        .bind(template_id)
+        .execute(&pool)
+        .await
+        .expect("insert request");
+
+        let response = app
+            .get(&format!("/admin/api/v1/batches/requests/{}", request_id))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+
+        response.assert_status_ok();
+        let body: serde_json::Value = response.json();
+        assert_eq!(body["id"], request_id.to_string());
+        assert_eq!(body["created_by_email"], user.email);
     }
 }
