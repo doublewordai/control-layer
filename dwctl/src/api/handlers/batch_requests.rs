@@ -262,6 +262,18 @@ pub async fn get_batch_request<P: PoolProvider>(
     .await
     .map_err(|e| Error::Database(e.into()))?;
 
+    // Look up the creator's email. Matches the list endpoint's pattern and uses the
+    // primary pool to avoid replica lag right after batch creation.
+    let created_by_email = sqlx::query_as::<_, EmailRow>("SELECT id::text as user_id, email FROM users WHERE id::text = $1")
+        .bind(&detail.batch_created_by)
+        .fetch_optional(state.db.write())
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "failed to fetch creator email for batch request detail");
+            None
+        })
+        .map(|row| row.email);
+
     Ok(Json(BatchRequestDetail {
         id: detail.id,
         batch_id: detail.batch_id,
@@ -282,6 +294,7 @@ pub async fn get_batch_request<P: PoolProvider>(
         error: detail.error,
         completion_window: detail.completion_window,
         batch_created_by: detail.batch_created_by,
+        created_by_email,
     }))
 }
 

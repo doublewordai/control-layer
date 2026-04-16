@@ -78,4 +78,5 @@ pub struct BatchRequestDetail {
     pub error: Option<String>,
     pub completion_window: String,
     pub batch_created_by: String,
+    pub created_by_email: Option<String>,
 }
