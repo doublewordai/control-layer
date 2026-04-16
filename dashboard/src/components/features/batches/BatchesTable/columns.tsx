@@ -18,6 +18,7 @@ import {
   formatTimestamp,
   formatLongDuration,
   formatNumber,
+  copyToClipboard,
 } from "../../../../utils";
 import type { Batch, BatchStatus } from "../types";
 
@@ -69,7 +70,13 @@ const userColumn: ColumnDef<Batch> = {
     return (
       <Tooltip delayDuration={300}>
         <TooltipTrigger asChild>
-          <span className="text-sm text-gray-700 truncate max-w-[120px] block cursor-default">
+          <span
+            onClick={(e) => {
+              e.stopPropagation();
+              void copyToClipboard(email, { successMessage: "Copied user" });
+            }}
+            className="text-sm text-gray-700 truncate max-w-[120px] inline-block align-middle cursor-pointer hover:text-gray-900 transition-colors"
+          >
             {email}
           </span>
         </TooltipTrigger>

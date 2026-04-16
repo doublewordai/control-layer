@@ -39,7 +39,7 @@ import { ApiExamples } from "../../modals";
 import { useBootstrapContent } from "../../../hooks/use-bootstrap-content";
 import { useOrganizationContext } from "../../../contexts/organization/useOrganizationContext";
 import { useServerPagination } from "../../../hooks/useServerPagination";
-import { formatTimestamp, formatLongDuration } from "../../../utils";
+import { formatTimestamp, formatLongDuration, copyToClipboard } from "../../../utils";
 
 const getStatusColor = (status: string): string => {
   switch (status) {
@@ -72,6 +72,15 @@ function formatCost(cost: number): string {
   return `$${cost.toFixed(2)}`;
 }
 
+const handleCopyCellValue = (
+  e: React.MouseEvent,
+  value: string,
+  label: string,
+) => {
+  e.stopPropagation();
+  void copyToClipboard(value, { successMessage: `Copied ${label}` });
+};
+
 const userColumn: ColumnDef<AsyncRequest> = {
   id: "user",
   header: "User",
@@ -81,7 +90,10 @@ const userColumn: ColumnDef<AsyncRequest> = {
     return (
       <Tooltip>
         <TooltipTrigger asChild>
-          <span className="text-sm text-doubleword-neutral-700 truncate max-w-[180px] block cursor-default">
+          <span
+            onClick={(e) => handleCopyCellValue(e, email, "user")}
+            className="text-sm text-doubleword-neutral-700 truncate max-w-[180px] inline-block align-middle cursor-pointer hover:text-doubleword-neutral-900 transition-colors"
+          >
             {email}
           </span>
         </TooltipTrigger>
@@ -117,7 +129,10 @@ function createColumns(
       const displayName = modelDisplayNames?.get(alias) || alias;
       const showTooltip = displayName !== alias;
       const content = (
-        <span className="text-sm text-doubleword-neutral-900 truncate max-w-[220px] block">
+        <span
+          onClick={(e) => handleCopyCellValue(e, alias, "model alias")}
+          className="text-sm text-doubleword-neutral-900 truncate max-w-[220px] inline-block align-middle cursor-pointer hover:text-doubleword-neutral-700 transition-colors"
+        >
           {displayName}
         </span>
       );
