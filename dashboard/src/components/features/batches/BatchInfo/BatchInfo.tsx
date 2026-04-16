@@ -616,7 +616,7 @@ const BatchInfo: React.FC = () => {
                       {batch.metadata?.created_by_email && (
                         <div>
                           <p className="text-sm text-gray-600 mb-1">Created by</p>
-                          <p className="font-medium text-sm wrap-break-words">
+                          <p className="font-medium text-sm wrap-break-word">
                             {batch.metadata.created_by_email}
                           </p>
                         </div>
@@ -835,7 +835,7 @@ const BatchInfo: React.FC = () => {
                         {userMetadata.map(([key, value]) => (
                           <div key={key}>
                             <p className="text-sm text-gray-600 mb-1">{key}</p>
-                            <p className="text-sm font-medium wrap-break-words">
+                            <p className="text-sm font-medium wrap-break-word">
                               {value}
                             </p>
                           </div>

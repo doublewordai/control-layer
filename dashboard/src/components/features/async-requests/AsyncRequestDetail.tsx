@@ -319,7 +319,7 @@ export function AsyncRequestDetail() {
                 {request.created_by_email && (
                   <div>
                     <p className="text-sm text-gray-600 mb-1">Created by</p>
-                    <p className="font-medium text-sm wrap-break-words">
+                    <p className="font-medium text-sm wrap-break-word">
                       {request.created_by_email}
                     </p>
                   </div>
