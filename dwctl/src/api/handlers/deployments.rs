@@ -841,24 +841,21 @@ pub async fn get_deployed_model<P: PoolProvider>(
 
     for &include in &all_includes {
         match include {
-            "groups" => {
+            "groups"
                 // Only users with Groups::ReadAll can include groups
-                if can_read_groups {
+                if can_read_groups => {
                     include_groups = true;
                 }
-            }
-            "metrics" => {
+            "metrics"
                 // Only users with Analytics::ReadAll can include metrics
-                if can_read_metrics {
+                if can_read_metrics => {
                     include_metrics = true;
                 }
-            }
-            "endpoints" => {
+            "endpoints"
                 // Model endpoints is priviliged information for admins
-                if can_read_all_models {
+                if can_read_all_models => {
                     include_endpoints = true;
                 }
-            }
             "status" => {
                 // Status is allowed for all users
                 include_status = true;
