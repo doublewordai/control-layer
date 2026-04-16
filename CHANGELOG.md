@@ -1,5 +1,17 @@
 # Changelog
 
+## [8.40.0](https://github.com/doublewordai/control-layer/compare/v8.39.0...v8.40.0) (2026-04-16)
+
+
+### Features
+
+* async-ui followups - onwards 0.24.2, user in metadata, cleaner batch view ([#995](https://github.com/doublewordai/control-layer/issues/995)) ([7284c07](https://github.com/doublewordai/control-layer/commit/7284c0762194fd4b446d5141dc372d8af5832c48))
+
+
+### Bug Fixes
+
+* bump fusillade to 16.1.2 ([#997](https://github.com/doublewordai/control-layer/issues/997)) ([24117da](https://github.com/doublewordai/control-layer/commit/24117da746058abbd4cd6bb3f52d02e521926851))
+
 ## [8.39.0](https://github.com/doublewordai/control-layer/compare/v8.38.2...v8.39.0) (2026-04-15)
 
 
