@@ -210,12 +210,14 @@ fn is_batch_owner(current_user: &CurrentUser, created_by: &str) -> bool {
 /// the given target state. Best-effort: logs a warning on failure so the
 /// caller (cancel/delete handler) can still return a success response.
 async fn enqueue_cascade_batch_state<P: PoolProvider>(state: &AppState<P>, batch_id: Uuid, target_state: CascadeTarget) {
-    if let Err(e) = state
-        .task_runner
-        .cascade_batch_state_job
-        .enqueue(&CascadeBatchStateInput { batch_id, target_state })
-        .await
-    {
+    let Some(ref job) = state.task_runner.cascade_batch_state_job else {
+        tracing::debug!(
+            batch_id = %batch_id,
+            "cascade-batch-state job not configured, skipping enqueue"
+        );
+        return;
+    };
+    if let Err(e) = job.enqueue(&CascadeBatchStateInput { batch_id, target_state }).await {
         tracing::warn!(
             batch_id = %batch_id,
             target_state = target_state.as_str(),

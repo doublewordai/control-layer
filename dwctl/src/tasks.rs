@@ -94,7 +94,9 @@ impl<P: PoolProvider + Clone> TaskState<P> {
 /// holds `Weak` references back, so dropping TaskRunner cleans up properly.
 pub struct TaskRunner<P: PoolProvider + Clone + 'static = sqlx_pool_router::DbPools> {
     pub create_batch_job: Arc<Job<CreateBatchInput, TaskState<P>>>,
-    pub cascade_batch_state_job: Arc<Job<CascadeBatchStateInput, TaskState<P>>>,
+    /// `None` when `cascade_batch_state_workers` is 0 (avoids opening
+    /// PgListener connections during Job construction in test environments).
+    pub cascade_batch_state_job: Option<Arc<Job<CascadeBatchStateInput, TaskState<P>>>>,
     pub sync_connection_job: Arc<Job<SyncConnectionInput, TaskState<P>>>,
     pub ingest_file_job: Arc<Job<IngestFileInput, TaskState<P>>>,
     pub activate_batch_job: Arc<Job<ActivateBatchInput, TaskState<P>>>,
@@ -105,9 +107,18 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> TaskRunner<P> {
     ///
     /// All jobs share a single TaskState with `Weak` cross-references that are
     /// set after construction, breaking the reference cycle.
-    pub async fn new(pool: PgPool, state: TaskState<P>) -> Result<Self> {
+    pub async fn new(pool: PgPool, state: TaskState<P>, task_config: &crate::config::TaskWorkersConfig) -> Result<Self> {
         let create_batch_job = Arc::new(build_create_batch_job(pool.clone(), state.clone()).await?);
-        let cascade_batch_state_job = Arc::new(build_cascade_batch_state_job(pool.clone(), state.clone()).await?);
+        let cascade_batch_state_job = if task_config.cascade_batch_state_workers > 0 {
+            let job = Arc::new(build_cascade_batch_state_job(pool.clone(), state.clone()).await?);
+            state
+                .cascade_batch_state_job
+                .set(Arc::downgrade(&job))
+                .map_err(|_| anyhow::anyhow!("cascade_batch_state_job OnceLock already set"))?;
+            Some(job)
+        } else {
+            None
+        };
         let ingest_file_job = Arc::new(build_ingest_file_job(pool.clone(), state.clone()).await?);
         let activate_batch_job = Arc::new(build_activate_batch_job(pool.clone(), state.clone()).await?);
         let sync_connection_job = Arc::new(build_sync_connection_job(pool, state.clone()).await?);
@@ -126,10 +137,6 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> TaskRunner<P> {
             .create_batch_job
             .set(Arc::downgrade(&create_batch_job))
             .map_err(|_| anyhow::anyhow!("create_batch_job OnceLock already set — double initialization"))?;
-        state
-            .cascade_batch_state_job
-            .set(Arc::downgrade(&cascade_batch_state_job))
-            .map_err(|_| anyhow::anyhow!("cascade_batch_state_job OnceLock already set — double initialization"))?;
 
         Ok(Self {
             create_batch_job,
@@ -172,17 +179,19 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> TaskRunner<P> {
 
         // Cascade-batch-state workers — updates child request states after
         // a batch is cancelled/deleted.
-        for i in 0..task_config.cascade_batch_state_workers {
-            let mut worker = self.cascade_batch_state_job.worker();
-            worker.set_shutdown_token(shutdown_token.clone());
-            handles.push((
-                "cascade-batch-state-worker",
-                tokio::spawn(async move {
-                    if let Err(e) = worker.run().await {
-                        tracing::error!(error = %e, worker = i, "Cascade-batch-state worker error");
-                    }
-                }),
-            ));
+        if let Some(ref job) = self.cascade_batch_state_job {
+            for i in 0..task_config.cascade_batch_state_workers {
+                let mut worker = job.worker();
+                worker.set_shutdown_token(shutdown_token.clone());
+                handles.push((
+                    "cascade-batch-state-worker",
+                    tokio::spawn(async move {
+                        if let Err(e) = worker.run().await {
+                            tracing::error!(error = %e, worker = i, "Cascade-batch-state worker error");
+                        }
+                    }),
+                ));
+            }
         }
 
         if !sync_config.enabled {

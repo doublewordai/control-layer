@@ -2237,7 +2237,7 @@ async fn setup_background_services(
         create_batch_job: Arc::new(std::sync::OnceLock::new()),
         cascade_batch_state_job: Arc::new(std::sync::OnceLock::new()),
     };
-    let task_runner = Arc::new(tasks::TaskRunner::new(underway_pool, task_state).await?);
+    let task_runner = Arc::new(tasks::TaskRunner::new(underway_pool, task_state, &config.background_services.task_workers).await?);
     for (name, handle) in task_runner.start(
         shutdown_token.clone(),
         &config.background_services.task_workers,
