@@ -102,21 +102,42 @@ pub async fn build_create_batch_job<P: sqlx_pool_router::PoolProvider + Clone + 
 // Background task: cascade batch state to child requests
 // ---------------------------------------------------------------------------
 
+/// Target state for cascading to child requests. Local mirror of
+/// `fusillade::CascadeTargetState` with serde support for underway
+/// JSON serialization.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CascadeTarget {
+    Canceled,
+    Failed,
+}
+
+impl CascadeTarget {
+    fn to_fusillade(self) -> fusillade::CascadeTargetState {
+        match self {
+            CascadeTarget::Canceled => fusillade::CascadeTargetState::Canceled,
+            CascadeTarget::Failed => fusillade::CascadeTargetState::Failed,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            CascadeTarget::Canceled => "canceled",
+            CascadeTarget::Failed => "failed",
+        }
+    }
+}
+
 /// Input for the cascade-batch-state background job.
 ///
 /// After a batch is cancelled (or otherwise terminates), this job updates
 /// child requests that are still in-flight (pending/claimed/processing) to
 /// the target state. This is done asynchronously so the cancel API stays
 /// O(1) while the child rows are cleaned up in the background.
-///
-/// `target_state` is stored as a string for serde compatibility (underway
-/// serializes job inputs to JSON). Converted to `CascadeTargetState` enum
-/// inside the job step.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CascadeBatchStateInput {
     pub batch_id: Uuid,
-    /// The state to transition in-flight child requests to ("canceled" or "failed").
-    pub target_state: String,
+    pub target_state: CascadeTarget,
 }
 
 /// Build the underway job for cascading batch state to child requests.
@@ -132,25 +153,18 @@ pub async fn build_cascade_batch_state_job<P: sqlx_pool_router::PoolProvider + C
         .state(state)
         .step(|cx, input: CascadeBatchStateInput| async move {
             let batch_id = fusillade::BatchId(input.batch_id);
-            let target_state = match input.target_state.as_str() {
-                "canceled" => fusillade::CascadeTargetState::Canceled,
-                "failed" => fusillade::CascadeTargetState::Failed,
-                other => {
-                    return Err(TaskError::Fatal(format!("Unknown cascade target state: {other}")));
-                }
-            };
 
             match cx
                 .state
                 .request_manager
-                .cascade_batch_state_to_requests(batch_id, target_state)
+                .cascade_batch_state_to_requests(batch_id, input.target_state.to_fusillade())
                 .await
             {
                 Ok(updated) => {
                     if updated > 0 {
                         tracing::info!(
                             batch_id = %input.batch_id,
-                            target_state = %input.target_state,
+                            target_state = input.target_state.as_str(),
                             updated,
                             "Cascaded batch state to child requests"
                         );
@@ -160,7 +174,7 @@ pub async fn build_cascade_batch_state_job<P: sqlx_pool_router::PoolProvider + C
                 Err(e) => {
                     tracing::error!(
                         batch_id = %input.batch_id,
-                        target_state = %input.target_state,
+                        target_state = input.target_state.as_str(),
                         error = %e,
                         "Failed to cascade batch state to child requests"
                     );
@@ -195,19 +209,16 @@ fn is_batch_owner(current_user: &CurrentUser, created_by: &str) -> bool {
 /// Enqueue a background job to transition in-flight child requests to
 /// the given target state. Best-effort: logs a warning on failure so the
 /// caller (cancel/delete handler) can still return a success response.
-async fn enqueue_cascade_batch_state<P: PoolProvider>(state: &AppState<P>, batch_id: Uuid, target_state: &str) {
+async fn enqueue_cascade_batch_state<P: PoolProvider>(state: &AppState<P>, batch_id: Uuid, target_state: CascadeTarget) {
     if let Err(e) = state
         .task_runner
         .cascade_batch_state_job
-        .enqueue(&CascadeBatchStateInput {
-            batch_id,
-            target_state: target_state.to_string(),
-        })
+        .enqueue(&CascadeBatchStateInput { batch_id, target_state })
         .await
     {
         tracing::warn!(
             batch_id = %batch_id,
-            target_state,
+            target_state = target_state.as_str(),
             error = %e,
             "Failed to enqueue cascade-batch-state job (child requests will remain in old state)"
         );
@@ -1242,7 +1253,7 @@ pub async fn cancel_batch<P: PoolProvider>(
         })?;
 
     // Enqueue background cleanup of child request states
-    enqueue_cascade_batch_state(&state, batch_id, "canceled").await;
+    enqueue_cascade_batch_state(&state, batch_id, CascadeTarget::Canceled).await;
 
     // Fetch updated batch to get latest status
     let batch = state
@@ -1318,7 +1329,7 @@ pub async fn delete_batch<P: PoolProvider>(
         })?;
 
     // Enqueue background cleanup of child request states
-    enqueue_cascade_batch_state(&state, batch_id, "canceled").await;
+    enqueue_cascade_batch_state(&state, batch_id, CascadeTarget::Canceled).await;
 
     tracing::debug!("Batch {} deleted", batch_id);
 

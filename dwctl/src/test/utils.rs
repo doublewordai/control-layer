@@ -252,6 +252,10 @@ pub fn create_test_config() -> crate::config::Config {
                 enabled: false,
                 ..Default::default()
             },
+            task_workers: crate::config::TaskWorkersConfig {
+                create_batch_workers: 0,
+                cascade_batch_state_workers: 0,
+            },
             ..Default::default()
         },
         email: crate::config::EmailConfig {

@@ -153,8 +153,10 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> TaskRunner<P> {
         let mut handles: Vec<(&'static str, tokio::task::JoinHandle<()>)> = Vec::new();
 
         // Batch creation workers — handles both API-triggered and
-        // sync-triggered batch population.
-        for i in 0..task_config.create_batch_workers {
+        // sync-triggered batch population. Clamped to at least 1: without a
+        // worker, newly created batches would never be populated.
+        let create_batch_workers = task_config.create_batch_workers.max(1);
+        for i in 0..create_batch_workers {
             let mut worker = self.create_batch_job.worker();
             worker.set_shutdown_token(shutdown_token.clone());
             handles.push((
