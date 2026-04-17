@@ -604,11 +604,6 @@ export function CreateBatchModal({
               </p>
             </div>
 
-            {/* Completion Window Note */}
-            <p className="text-xs text-muted-foreground">
-              Batches are submitted with a 24h completion window
-            </p>
-
             {/* Cost Estimate */}
             {(selectedFileId || fileToUpload) && (
               <div className="bg-gray-50 border border-gray-200 rounded-lg p-3">
@@ -622,9 +617,8 @@ export function CreateBatchModal({
                         <Info className="w-3.5 h-3.5 text-gray-400 cursor-help" />
                       </TooltipTrigger>
                       <TooltipContent side="top" className="max-w-[250px]">
-                        Based on {completionWindow} priority pricing and average
-                        output tokens for the requested model(s). Actual cost
-                        may vary.
+                        Based on priority pricing and average output tokens for
+                        the requested model(s). Actual cost may vary.
                       </TooltipContent>
                     </Tooltip>
                   </div>

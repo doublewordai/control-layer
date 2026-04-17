@@ -1428,6 +1428,8 @@ pub struct BackgroundServicesConfig {
     pub notifications: NotificationsConfig,
     /// Configuration for connection sync workers (file ingestion, batch activation)
     pub sync_workers: SyncWorkersConfig,
+    /// Worker counts for core batch task processing (always run, not gated by sync)
+    pub task_workers: TaskWorkersConfig,
 }
 
 /// Database pool metrics sampling configuration.
@@ -1697,6 +1699,30 @@ impl Default for SyncWorkersConfig {
             ingest_workers: 4,
             activate_workers: 1,
             discovery_workers: 1,
+        }
+    }
+}
+
+/// Worker counts for core batch task processing.
+///
+/// These workers always run regardless of the sync `enabled` flag — they
+/// handle API-triggered work (batch population, state cascade on cancel).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TaskWorkersConfig {
+    /// Number of batch population workers (default: 1).
+    /// Populates requests from templates after a batch is created.
+    pub create_batch_workers: usize,
+    /// Number of cascade-batch-state workers (default: 1).
+    /// Updates child request states after a batch is cancelled or deleted.
+    pub cascade_batch_state_workers: usize,
+}
+
+impl Default for TaskWorkersConfig {
+    fn default() -> Self {
+        Self {
+            create_batch_workers: 1,
+            cascade_batch_state_workers: 1,
         }
     }
 }

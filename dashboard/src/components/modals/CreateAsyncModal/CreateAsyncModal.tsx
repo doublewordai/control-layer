@@ -317,7 +317,7 @@ export function CreateAsyncModal({
         <DialogHeader>
           <DialogTitle>Create Async Requests</DialogTitle>
           <DialogDescription>
-            Submit requests for async processing ({completionWindow} completion window)
+            Submit requests for async processing
           </DialogDescription>
         </DialogHeader>
 
