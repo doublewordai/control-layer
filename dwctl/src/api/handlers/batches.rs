@@ -4013,4 +4013,143 @@ mod tests {
             "Reasoning tokens should match in list analytics"
         );
     }
+
+    fn test_config_with_cascade_worker() -> crate::config::Config {
+        let mut config = create_test_config();
+        config.background_services.task_workers.cascade_batch_state_workers = 1;
+        config
+    }
+
+    /// Helper: insert a batch with `n` pending requests directly into fusillade tables.
+    /// Returns (batch_id, request_ids).
+    async fn insert_batch_with_pending_requests(pool: &PgPool, user_id: Uuid, n: usize) -> (Uuid, Vec<Uuid>) {
+        let file_id = Uuid::new_v4();
+        let batch_id = Uuid::new_v4();
+
+        sqlx::query(
+            "INSERT INTO fusillade.files (id, name, status, created_at, updated_at) VALUES ($1, 'test.jsonl', 'processed', NOW(), NOW())",
+        )
+        .bind(file_id)
+        .execute(pool)
+        .await
+        .expect("insert file");
+
+        sqlx::query(
+            "INSERT INTO fusillade.batches (id, created_by, file_id, endpoint, completion_window, expires_at, created_at, total_requests) VALUES ($1, $2, $3, '/v1/chat/completions', '24h', NOW() + interval '24 hours', NOW(), $4)",
+        )
+        .bind(batch_id)
+        .bind(user_id.to_string())
+        .bind(file_id)
+        .bind(n as i32)
+        .execute(pool)
+        .await
+        .expect("insert batch");
+
+        let mut request_ids = Vec::new();
+        for i in 0..n {
+            let template_id = Uuid::new_v4();
+            let request_id = Uuid::new_v4();
+            let body = serde_json::json!({"model": "test-model", "messages": [{"role": "user", "content": format!("Test {}", i)}]});
+
+            sqlx::query(
+                "INSERT INTO fusillade.request_templates (id, file_id, model, api_key, endpoint, path, body, custom_id, method) VALUES ($1, $2, 'test-model', 'test-key', 'http://test', '/v1/chat/completions', $3, $4, 'POST')",
+            )
+            .bind(template_id)
+            .bind(file_id)
+            .bind(serde_json::to_string(&body).unwrap())
+            .bind(format!("req-{i}"))
+            .execute(pool)
+            .await
+            .expect("insert template");
+
+            sqlx::query(
+                "INSERT INTO fusillade.requests (id, batch_id, template_id, model, state, created_at) VALUES ($1, $2, $3, 'test-model', 'pending', NOW())",
+            )
+            .bind(request_id)
+            .bind(batch_id)
+            .bind(template_id)
+            .execute(pool)
+            .await
+            .expect("insert request");
+
+            request_ids.push(request_id);
+        }
+
+        (batch_id, request_ids)
+    }
+
+    /// Poll fusillade requests until all match the expected state, or timeout.
+    async fn poll_request_states(pool: &PgPool, request_ids: &[Uuid], expected_state: &str) {
+        let start = std::time::Instant::now();
+        loop {
+            let count: i64 = sqlx::query_scalar("SELECT COUNT(*)::bigint FROM fusillade.requests WHERE id = ANY($1) AND state = $2")
+                .bind(request_ids)
+                .bind(expected_state)
+                .fetch_one(pool)
+                .await
+                .expect("poll query");
+
+            if count == request_ids.len() as i64 {
+                return;
+            }
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(15),
+                "Timed out waiting for {} requests to reach state '{expected_state}' (got {count}/{})",
+                request_ids.len(),
+                request_ids.len(),
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_cancel_batch_cascades_state_to_child_requests(pool: PgPool) {
+        let (app, _bg_services) = create_test_app_with_config(pool.clone(), test_config_with_cascade_worker(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let auth = add_auth_headers(&user);
+
+        let (batch_id, request_ids) = insert_batch_with_pending_requests(&pool, user.id, 5).await;
+
+        // Verify all start as pending
+        let pending_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*)::bigint FROM fusillade.requests WHERE id = ANY($1) AND state = 'pending'")
+                .bind(&request_ids)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(pending_count, 5, "all requests should start as pending");
+
+        // Cancel the batch via the API
+        let resp = app
+            .post(&format!("/ai/v1/batches/{batch_id}/cancel"))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+        resp.assert_status_ok();
+
+        // Poll until the cascade job transitions all requests to canceled
+        poll_request_states(&pool, &request_ids, "canceled").await;
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_delete_batch_cascades_state_to_child_requests(pool: PgPool) {
+        let (app, _bg_services) = create_test_app_with_config(pool.clone(), test_config_with_cascade_worker(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser, Role::PlatformManager]).await;
+        let auth = add_auth_headers(&user);
+
+        let (batch_id, request_ids) = insert_batch_with_pending_requests(&pool, user.id, 5).await;
+
+        // Delete the batch via the API
+        let resp = app
+            .delete(&format!("/ai/v1/batches/{batch_id}"))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+        resp.assert_status(StatusCode::NO_CONTENT);
+
+        // Poll until the cascade job transitions all requests to canceled
+        poll_request_states(&pool, &request_ids, "canceled").await;
+    }
 }
