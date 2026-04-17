@@ -99,6 +99,72 @@ pub async fn build_create_batch_job<P: sqlx_pool_router::PoolProvider + Clone + 
 }
 
 // ---------------------------------------------------------------------------
+// Background task: cascade batch state to child requests
+// ---------------------------------------------------------------------------
+
+/// Input for the cascade-batch-state background job.
+///
+/// After a batch is cancelled (or otherwise terminates), this job updates
+/// child requests that are still in-flight (pending/claimed/processing) to
+/// the target state. This is done asynchronously so the cancel API stays
+/// O(1) while the child rows are cleaned up in the background.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CascadeBatchStateInput {
+    pub batch_id: Uuid,
+    /// The state to transition in-flight child requests to (e.g. "canceled").
+    pub target_state: String,
+}
+
+/// Build the underway job for cascading batch state to child requests.
+pub async fn build_cascade_batch_state_job<P: sqlx_pool_router::PoolProvider + Clone + Send + Sync + 'static>(
+    pool: sqlx::PgPool,
+    state: crate::tasks::TaskState<P>,
+) -> anyhow::Result<underway::Job<CascadeBatchStateInput, crate::tasks::TaskState<P>>> {
+    use underway::Job;
+    use underway::job::To;
+    use underway::task::Error as TaskError;
+
+    Job::<CascadeBatchStateInput, _>::builder()
+        .state(state)
+        .step(|cx, input: CascadeBatchStateInput| async move {
+            let batch_id = fusillade::BatchId(input.batch_id);
+
+            match cx
+                .state
+                .request_manager
+                .cascade_batch_state_to_requests(batch_id, &input.target_state)
+                .await
+            {
+                Ok(updated) => {
+                    if updated > 0 {
+                        tracing::info!(
+                            batch_id = %input.batch_id,
+                            target_state = %input.target_state,
+                            updated,
+                            "Cascaded batch state to child requests"
+                        );
+                    }
+                    To::done()
+                }
+                Err(e) => {
+                    tracing::error!(
+                        batch_id = %input.batch_id,
+                        target_state = %input.target_state,
+                        error = %e,
+                        "Failed to cascade batch state to child requests"
+                    );
+                    Err(TaskError::Retryable(e.to_string()))
+                }
+            }
+        })
+        .name("cascade-batch-state")
+        .pool(pool)
+        .build()
+        .await
+        .map_err(Into::into)
+}
+
+// ---------------------------------------------------------------------------
 
 /// Check if the current user "owns" a batch, considering org context.
 /// Returns true if the batch creator matches the user's ID or their active organization.
@@ -113,6 +179,32 @@ fn is_batch_owner(current_user: &CurrentUser, created_by: &str) -> bool {
         return true;
     }
     false
+}
+
+/// Enqueue a background job to transition in-flight child requests to
+/// the given target state. Best-effort: logs a warning on failure so the
+/// caller (cancel/delete handler) can still return a success response.
+async fn enqueue_cascade_batch_state<P: PoolProvider>(
+    state: &AppState<P>,
+    batch_id: Uuid,
+    target_state: &str,
+) {
+    if let Err(e) = state
+        .task_runner
+        .cascade_batch_state_job
+        .enqueue(&CascadeBatchStateInput {
+            batch_id,
+            target_state: target_state.to_string(),
+        })
+        .await
+    {
+        tracing::warn!(
+            batch_id = %batch_id,
+            target_state,
+            error = %e,
+            "Failed to enqueue cascade-batch-state job (child requests will remain in old state)"
+        );
+    }
 }
 
 /// Helper function to convert fusillade Batch to OpenAI BatchResponse
@@ -1142,6 +1234,9 @@ pub async fn cancel_batch<P: PoolProvider>(
             operation: format!("cancel batch: {}", e),
         })?;
 
+    // Enqueue background cleanup of child request states
+    enqueue_cascade_batch_state(&state, batch_id, "canceled").await;
+
     // Fetch updated batch to get latest status
     let batch = state
         .request_manager
@@ -1206,7 +1301,7 @@ pub async fn delete_batch<P: PoolProvider>(
         });
     }
 
-    // Delete the batch
+    // Delete the batch (also sets cancelling_at/cancelled_at if not already terminal)
     state
         .request_manager
         .delete_batch(fusillade::BatchId(batch_id))
@@ -1214,6 +1309,9 @@ pub async fn delete_batch<P: PoolProvider>(
         .map_err(|e| Error::Internal {
             operation: format!("delete batch: {}", e),
         })?;
+
+    // Enqueue background cleanup of child request states
+    enqueue_cascade_batch_state(&state, batch_id, "canceled").await;
 
     tracing::debug!("Batch {} deleted", batch_id);
 

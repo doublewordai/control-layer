@@ -1283,6 +1283,7 @@ mod tests {
             ingest_file_job: std::sync::Arc::new(std::sync::OnceLock::new()),
             activate_batch_job: std::sync::Arc::new(std::sync::OnceLock::new()),
             create_batch_job: std::sync::Arc::new(std::sync::OnceLock::new()),
+            cascade_batch_state_job: std::sync::Arc::new(std::sync::OnceLock::new()),
         }
     }
 
