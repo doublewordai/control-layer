@@ -13,9 +13,7 @@ use sqlx_pool_router::PoolProvider;
 use tokio_util::sync::CancellationToken;
 use underway::Job;
 
-use crate::api::handlers::batches::{
-    CascadeBatchStateInput, CreateBatchInput, build_cascade_batch_state_job, build_create_batch_job,
-};
+use crate::api::handlers::batches::{CascadeBatchStateInput, CreateBatchInput, build_cascade_batch_state_job, build_create_batch_job};
 use crate::connections::sync::{
     ActivateBatchInput, IngestFileInput, SyncConnectionInput, build_activate_batch_job, build_ingest_file_job, build_sync_connection_job,
 };

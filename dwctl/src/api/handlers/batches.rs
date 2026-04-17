@@ -108,10 +108,14 @@ pub async fn build_create_batch_job<P: sqlx_pool_router::PoolProvider + Clone + 
 /// child requests that are still in-flight (pending/claimed/processing) to
 /// the target state. This is done asynchronously so the cancel API stays
 /// O(1) while the child rows are cleaned up in the background.
+///
+/// `target_state` is stored as a string for serde compatibility (underway
+/// serializes job inputs to JSON). Converted to `CascadeTargetState` enum
+/// inside the job step.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CascadeBatchStateInput {
     pub batch_id: Uuid,
-    /// The state to transition in-flight child requests to (e.g. "canceled").
+    /// The state to transition in-flight child requests to ("canceled" or "failed").
     pub target_state: String,
 }
 
@@ -128,11 +132,18 @@ pub async fn build_cascade_batch_state_job<P: sqlx_pool_router::PoolProvider + C
         .state(state)
         .step(|cx, input: CascadeBatchStateInput| async move {
             let batch_id = fusillade::BatchId(input.batch_id);
+            let target_state = match input.target_state.as_str() {
+                "canceled" => fusillade::CascadeTargetState::Canceled,
+                "failed" => fusillade::CascadeTargetState::Failed,
+                other => {
+                    return Err(TaskError::Fatal(format!("Unknown cascade target state: {other}")));
+                }
+            };
 
             match cx
                 .state
                 .request_manager
-                .cascade_batch_state_to_requests(batch_id, &input.target_state)
+                .cascade_batch_state_to_requests(batch_id, target_state)
                 .await
             {
                 Ok(updated) => {
@@ -184,11 +195,7 @@ fn is_batch_owner(current_user: &CurrentUser, created_by: &str) -> bool {
 /// Enqueue a background job to transition in-flight child requests to
 /// the given target state. Best-effort: logs a warning on failure so the
 /// caller (cancel/delete handler) can still return a success response.
-async fn enqueue_cascade_batch_state<P: PoolProvider>(
-    state: &AppState<P>,
-    batch_id: Uuid,
-    target_state: &str,
-) {
+async fn enqueue_cascade_batch_state<P: PoolProvider>(state: &AppState<P>, batch_id: Uuid, target_state: &str) {
     if let Err(e) = state
         .task_runner
         .cascade_batch_state_job
