@@ -210,14 +210,17 @@ function createColumns(
     id: "cost",
     header: "Cost",
     cell: ({ row }) => {
-      const cost = row.original.total_cost;
-      if (cost == null) {
+      const { prompt_tokens, completion_tokens, total_cost } = row.original;
+      const noTokens =
+        (prompt_tokens == null && completion_tokens == null) ||
+        (prompt_tokens === 0 && completion_tokens === 0);
+      if (total_cost == null || noTokens) {
         return <span className="text-sm text-doubleword-neutral-600">-</span>;
       }
       return (
         <span className="text-sm text-green-700 font-medium flex items-center gap-1">
           <DollarSign className="w-3 h-3" />
-          {formatCost(cost).slice(1)}
+          {formatCost(total_cost).slice(1)}
         </span>
       );
     },

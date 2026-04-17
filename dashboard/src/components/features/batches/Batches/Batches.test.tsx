@@ -585,6 +585,24 @@ describe("Batches", () => {
       // Check for in_progress status
       expect(within(container).getByText(/in progress/i)).toBeInTheDocument();
     });
+
+    it("should hide the Completion Window column by default", async () => {
+      const user = userEvent.setup();
+      const { container } = render(<Batches {...defaultProps} />, {
+        wrapper: createWrapper(),
+      });
+
+      await user.click(
+        within(container).getByRole("tab", { name: /batches/i }),
+      );
+
+      // No column header with that label should be rendered
+      expect(
+        within(container).queryByRole("columnheader", {
+          name: /completion window/i,
+        }),
+      ).not.toBeInTheDocument();
+    });
   });
 
   describe("Tab Switching", () => {
