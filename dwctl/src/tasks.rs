@@ -144,19 +144,19 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> TaskRunner<P> {
 
     /// Start the underway workers with the given shutdown token and config.
     ///
-    /// Batch workers (create-batch, cascade-batch-state) always run.
+    /// Task workers (create-batch, cascade-batch-state) always run.
     /// Sync workers (discovery, ingest, activate) are gated by `sync_config.enabled`.
-    /// All worker counts are configurable via `sync_config`.
     pub fn start(
         &self,
         shutdown_token: CancellationToken,
+        task_config: &crate::config::TaskWorkersConfig,
         sync_config: &crate::config::SyncWorkersConfig,
     ) -> Vec<(&'static str, tokio::task::JoinHandle<()>)> {
         let mut handles: Vec<(&'static str, tokio::task::JoinHandle<()>)> = Vec::new();
 
         // Batch creation workers — handles both API-triggered and
         // sync-triggered batch population.
-        for i in 0..sync_config.create_batch_workers {
+        for i in 0..task_config.create_batch_workers {
             let mut worker = self.create_batch_job.worker();
             worker.set_shutdown_token(shutdown_token.clone());
             handles.push((
@@ -171,7 +171,7 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> TaskRunner<P> {
 
         // Cascade-batch-state workers — updates child request states after
         // a batch is cancelled/deleted.
-        for i in 0..sync_config.cascade_batch_state_workers {
+        for i in 0..task_config.cascade_batch_state_workers {
             let mut worker = self.cascade_batch_state_job.worker();
             worker.set_shutdown_token(shutdown_token.clone());
             handles.push((
