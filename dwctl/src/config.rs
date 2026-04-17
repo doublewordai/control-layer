@@ -1677,6 +1677,18 @@ pub struct SyncWorkersConfig {
     /// Set to false for API-only replicas that should not process sync jobs.
     /// Jobs are still enqueued to Postgres and picked up by other replicas.
     pub enabled: bool,
+
+    // -- Batch workers (always run, not gated by `enabled`) --
+
+    /// Number of batch population workers (default: 1).
+    /// Populates requests from templates after a batch is created.
+    pub create_batch_workers: usize,
+    /// Number of cascade-batch-state workers (default: 1).
+    /// Updates child request states after a batch is cancelled or deleted.
+    pub cascade_batch_state_workers: usize,
+
+    // -- Sync workers (gated by `enabled`) --
+
     /// Number of concurrent file ingestion workers (default: 4).
     /// Controls how many files are streamed from S3 and written to fusillade
     /// simultaneously. Higher values increase throughput but use more memory.
@@ -1694,6 +1706,8 @@ impl Default for SyncWorkersConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            create_batch_workers: 1,
+            cascade_batch_state_workers: 1,
             ingest_workers: 4,
             activate_workers: 1,
             discovery_workers: 1,

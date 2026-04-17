@@ -144,10 +144,9 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> TaskRunner<P> {
 
     /// Start the underway workers with the given shutdown token and config.
     ///
-    /// The batch creation worker always runs (1 worker). Sync/ingest/activate
-    /// workers are controlled by `sync_config`:
-    /// - `enabled: false` → no sync workers (API-only replica)
-    /// - Worker counts control concurrency per pipeline stage
+    /// Batch workers (create-batch, cascade-batch-state) always run.
+    /// Sync workers (discovery, ingest, activate) are gated by `sync_config.enabled`.
+    /// All worker counts are configurable via `sync_config`.
     pub fn start(
         &self,
         shutdown_token: CancellationToken,
@@ -155,31 +154,35 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> TaskRunner<P> {
     ) -> Vec<(&'static str, tokio::task::JoinHandle<()>)> {
         let mut handles: Vec<(&'static str, tokio::task::JoinHandle<()>)> = Vec::new();
 
-        // Batch creation worker always runs (1 worker) — handles both
-        // API-triggered and sync-triggered batch population.
-        let mut create_batch_worker = self.create_batch_job.worker();
-        create_batch_worker.set_shutdown_token(shutdown_token.clone());
-        handles.push((
-            "create-batch-worker",
-            tokio::spawn(async move {
-                if let Err(e) = create_batch_worker.run().await {
-                    tracing::error!(error = %e, "Create-batch worker error");
-                }
-            }),
-        ));
+        // Batch creation workers — handles both API-triggered and
+        // sync-triggered batch population.
+        for i in 0..sync_config.create_batch_workers {
+            let mut worker = self.create_batch_job.worker();
+            worker.set_shutdown_token(shutdown_token.clone());
+            handles.push((
+                "create-batch-worker",
+                tokio::spawn(async move {
+                    if let Err(e) = worker.run().await {
+                        tracing::error!(error = %e, worker = i, "Create-batch worker error");
+                    }
+                }),
+            ));
+        }
 
-        // Cascade-batch-state worker (1 worker) — updates child requests after
-        // a batch is cancelled/deleted. Enqueued by cancel_batch/delete_batch handlers.
-        let mut cascade_worker = self.cascade_batch_state_job.worker();
-        cascade_worker.set_shutdown_token(shutdown_token.clone());
-        handles.push((
-            "cascade-batch-state-worker",
-            tokio::spawn(async move {
-                if let Err(e) = cascade_worker.run().await {
-                    tracing::error!(error = %e, "Cascade-batch-state worker error");
-                }
-            }),
-        ));
+        // Cascade-batch-state workers — updates child request states after
+        // a batch is cancelled/deleted.
+        for i in 0..sync_config.cascade_batch_state_workers {
+            let mut worker = self.cascade_batch_state_job.worker();
+            worker.set_shutdown_token(shutdown_token.clone());
+            handles.push((
+                "cascade-batch-state-worker",
+                tokio::spawn(async move {
+                    if let Err(e) = worker.run().await {
+                        tracing::error!(error = %e, worker = i, "Cascade-batch-state worker error");
+                    }
+                }),
+            ));
+        }
 
         if !sync_config.enabled {
             tracing::info!("Sync workers disabled on this instance");
