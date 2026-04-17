@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.41.0](https://github.com/doublewordai/control-layer/compare/v8.40.1...v8.41.0) (2026-04-17)
+
+
+### Features
+
+* cascade batch state to child requests via background job ([#1001](https://github.com/doublewordai/control-layer/issues/1001)) ([0071c85](https://github.com/doublewordai/control-layer/commit/0071c85cdb0a8139e568be31bf6e61c06ba3854f))
+
 ## [8.40.1](https://github.com/doublewordai/control-layer/compare/v8.40.0...v8.40.1) (2026-04-16)
 
 
