@@ -381,3 +381,125 @@ Based on the schema and code inspection alone, before live measurement:
 - Do not spend time on BRIN for `webhook_deliveries`, `sync_operations`,
   `sync_entries`, or `batch_capacity_reservations` unless workload evidence
   changes.
+
+## Findings
+
+This section summarizes the outcome of running the investigation against a
+large real dataset. It intentionally avoids environment-specific details and
+records only conclusions that are safe to keep in open source documentation.
+
+### Summary
+
+- `http_analytics(timestamp)` is the best BRIN candidate in this schema.
+- `credits_transactions(created_at)` is a possible supplemental BRIN candidate
+  for broad reporting workloads, but it is not the first change to make.
+- `probe_results(executed_at)` is not currently a worthwhile BRIN target.
+- Existing B-tree indexes should remain in place for the dominant selective and
+  ordered read paths.
+
+### `http_analytics`
+
+Observed characteristics:
+
+- The table behaves like a classic append-heavy event log.
+- `timestamp` and `created_at` remain strongly correlated with heap order.
+- Broad time-window analytics reads become expensive as the table grows.
+- Ordered request listing by `timestamp DESC LIMIT ...` is still a strong
+  B-tree workload.
+
+Recommendation:
+
+- Adding a BRIN index on `timestamp` is appropriate as a supplemental index for
+  large deployments where broad time-window aggregations are important.
+- Keep `idx_analytics_timestamp` even if a BRIN is added. The existing B-tree
+  continues to serve ordered pagination and recent-request lookups well.
+- Do not drop selective B-tree indexes such as `(model, timestamp)` or
+  `(status_code, timestamp)` based on BRIN alone.
+
+Recommended DDL when needed:
+
+```sql
+CREATE INDEX CONCURRENTLY idx_http_analytics_timestamp_brin
+ON http_analytics
+USING BRIN (timestamp);
+```
+
+Optional follow-up:
+
+- If operational queries ever pivot to `created_at` rather than `timestamp`,
+  evaluate a BRIN on `created_at` separately. It is not the first index to add.
+
+### `credits_transactions`
+
+Observed characteristics:
+
+- `created_at` is strongly correlated with physical row order, so the table is
+  technically BRIN-friendly.
+- Broad history/reporting scans over time ranges become expensive as the table
+  grows.
+- The most important application paths are still not broad time-range scans:
+  they are per-user history, recent transaction listing, and checkpoint-based
+  balance calculations.
+- Those dominant paths are still fundamentally B-tree-shaped, especially where
+  reads are scoped by `user_id` or ordered by `seq`.
+
+Recommendation:
+
+- Do not treat BRIN on `created_at` as a default change for this table.
+- A BRIN on `created_at` is reasonable only as a supplemental index if admin or
+  reporting workloads spend meaningful time scanning broad historical windows.
+- Keep the existing B-tree indexes that support per-user and seq-based access.
+- If there is balance-path latency, investigate the seq-based query path first;
+  BRIN on `created_at` will not help that access pattern.
+
+Optional DDL for reporting-heavy deployments:
+
+```sql
+CREATE INDEX CONCURRENTLY idx_credits_transactions_created_at_brin
+ON credits_transactions
+USING BRIN (created_at);
+```
+
+### `probe_results`
+
+Observed characteristics:
+
+- The table shape is append-oriented, but the important query pattern is
+  per-probe history ordered by `executed_at DESC`.
+- That pattern remains a better fit for composite B-tree coverage than BRIN.
+
+Recommendation:
+
+- Do not add a BRIN index to `probe_results` at this stage.
+- If probe history queries need improvement, prefer a composite B-tree such as
+  `(probe_id, executed_at DESC)` over BRIN.
+
+### Tables that should stay off the BRIN list
+
+The investigation did not change the earlier conclusion for these tables:
+
+- `webhook_deliveries`
+- `sync_operations`
+- `sync_entries`
+- `batch_capacity_reservations`
+
+These are queue, workflow, or targeted lookup tables. Their hot paths are
+selective and ordering-sensitive, which is exactly where B-tree remains the
+right default.
+
+## Recommended Action
+
+If we want one concrete BRIN change from this investigation, it should be:
+
+```sql
+CREATE INDEX CONCURRENTLY idx_http_analytics_timestamp_brin
+ON http_analytics
+USING BRIN (timestamp);
+```
+
+Everything else is either optional or premature:
+
+- `credits_transactions(created_at)` is optional and only justified by
+  reporting-heavy scans across large time windows.
+- `probe_results(executed_at)` is not recommended.
+- No existing B-tree index should be dropped solely because a BRIN is added.
