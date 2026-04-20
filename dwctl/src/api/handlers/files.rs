@@ -435,6 +435,7 @@ fn create_file_stream(
     uploaded_by: Option<String>,
     req_ctx: FileRequestContext,
     api_key_id: Option<uuid::Uuid>,
+    default_expires_after_seconds: Option<i64>,
 ) -> FileStreamResult {
     let FileRequestContext {
         endpoint,
@@ -514,6 +515,9 @@ fn create_file_stream(
                 "file" => {
                     // Extract filename from the field
                     metadata.filename = field.file_name().map(|s| s.to_string());
+                    if metadata.expires_after_seconds.is_none() {
+                        metadata.expires_after_seconds = default_expires_after_seconds;
+                    }
 
                     // Send metadata before processing file content
                     if tx.send(fusillade::FileStreamItem::Metadata(metadata.clone())).await.is_err() {
@@ -899,6 +903,7 @@ pub async fn upload_file<P: PoolProvider>(
             allowed_url_paths: config.batches.allowed_url_paths.clone(),
         },
         Some(api_key_id),
+        crate::retention::default_batch_artifact_ttl_seconds(&config),
     );
 
     // Create file via request manager with streaming

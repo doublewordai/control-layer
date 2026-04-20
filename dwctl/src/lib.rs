@@ -159,6 +159,7 @@ mod openapi;
 mod payment_providers;
 mod probes;
 mod request_logging;
+mod retention;
 pub mod sample_files;
 mod static_assets;
 mod sync;
@@ -1816,6 +1817,7 @@ async fn setup_background_services(
     // Create shared model capacity limits map for daemon coordination
     // This is populated by onwards config sync and read by fusillade daemon
     let model_capacity_limits = Arc::new(dashmap::DashMap::new());
+    let fusillade_retention_pool = fusillade_pools.write().clone();
 
     // Start onwards integration for proxying AI requests (if enabled)
     #[cfg_attr(not(test), allow(unused_variables))]
@@ -1978,6 +1980,22 @@ async fn setup_background_services(
                 Ok(())
             });
         }
+
+        {
+            let retention_pool = fusillade_retention_pool.clone();
+            let retention_request_manager = request_manager.clone();
+            let retention_shared_config = shared_config.clone();
+            let retention_shutdown = shutdown_token.clone();
+            background_tasks.spawn("retention-sweeper", async move {
+                retention::run_retention_loop(
+                    retention_pool,
+                    retention_request_manager,
+                    retention_shared_config,
+                    retention_shutdown,
+                )
+                .await
+            });
+        }
     } else {
         // Normal leader election
         is_leader = false;
@@ -2017,6 +2035,8 @@ async fn setup_background_services(
         let leader_election_request_manager_gain = request_manager.clone();
         let leader_election_config = config.clone();
         let leader_election_flag = is_leader_flag.clone();
+        let leader_election_retention_pool = fusillade_retention_pool.clone();
+        let leader_election_shared_config = shared_config.clone();
 
         // Store daemon handle for cleanup on leadership loss
         let daemon_handle: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<fusillade::Result<()>>>>> =
@@ -2044,6 +2064,8 @@ async fn setup_background_services(
                     let request_manager = leader_election_request_manager_gain.clone();
                     let daemon_handle = daemon_handle_gain.clone();
                     let leadership_shutdown = leadership_shutdown_gain.clone();
+                    let retention_pool = leader_election_retention_pool.clone();
+                    let retention_shared_config = leader_election_shared_config.clone();
                     async move {
                         // Wait for the server to be fully up before starting probes
                         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -2078,6 +2100,7 @@ async fn setup_background_services(
                         match config.background_services.batch_daemon.enabled {
                             DaemonEnabled::Leader => {
                                 let handle = request_manager
+                                    .clone()
                                     .run(session_token.clone())
                                     .map_err(|e| anyhow::anyhow!("Failed to start fusillade daemon: {}", e))?;
 
@@ -2109,6 +2132,24 @@ async fn setup_background_services(
                                 .await;
                             });
                             tracing::info!("Batch completion poller started on elected leader");
+                        }
+
+                        {
+                            let retention_request_manager = request_manager.clone();
+                            let retention_session_token = session_token.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = retention::run_retention_loop(
+                                    retention_pool,
+                                    retention_request_manager,
+                                    retention_shared_config,
+                                    retention_session_token,
+                                )
+                                .await
+                                {
+                                    tracing::error!(error = %e, "Retention sweeper failed");
+                                }
+                            });
+                            tracing::info!("Retention sweeper started on elected leader");
                         }
 
                         Ok(())

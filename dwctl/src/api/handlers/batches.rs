@@ -153,7 +153,14 @@ fn to_batch_response_enriched(batch: fusillade::Batch, creator_email: Option<&st
 
     // Build user-facing metadata: filter out internal dw_* keys.
     // Keep request_source, created_by_email, context_name, context_type for backwards compat.
-    let internal_keys = ["dw_source_id", "dw_source_name", "dw_sync_id", "dw_external_key", "created_by"];
+    let internal_keys = [
+        "dw_source_id",
+        "dw_source_name",
+        "dw_sync_id",
+        "dw_external_key",
+        "created_by",
+        crate::retention::RETENTION_TTL_METADATA_KEY,
+    ];
     let mut metadata: HashMap<String, String> = raw_metadata
         .into_iter()
         .filter(|(k, _)| !internal_keys.contains(&k.as_str()))
@@ -498,11 +505,21 @@ pub async fn create_batch<P: PoolProvider>(
     // Strip reserved keys that are injected server-side during response enrichment
     // to prevent user-supplied values from colliding with system fields.
     let mut metadata_map = req.metadata.unwrap_or_default();
-    for key in &["created_by_email", "context_name", "context_type", "request_source", "created_by"] {
+    for key in &[
+        "created_by_email",
+        "context_name",
+        "context_type",
+        "request_source",
+        "created_by",
+        crate::retention::RETENTION_TTL_METADATA_KEY,
+    ] {
         metadata_map.remove(*key);
     }
     metadata_map.insert("request_source".to_string(), request_source.to_string());
     metadata_map.insert("created_by".to_string(), current_user.id.to_string());
+    if let Some(ttl_seconds) = crate::retention::default_batch_artifact_ttl_seconds(&config) {
+        metadata_map.insert(crate::retention::RETENTION_TTL_METADATA_KEY.to_string(), ttl_seconds.to_string());
+    }
     let metadata = serde_json::to_value(metadata_map).ok();
 
     // Create batch input — created_by uses org ID when in org context for ownership scoping

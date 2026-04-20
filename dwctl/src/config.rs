@@ -1428,6 +1428,47 @@ pub struct BackgroundServicesConfig {
     pub notifications: NotificationsConfig,
     /// Configuration for connection sync workers (file ingestion, batch activation)
     pub sync_workers: SyncWorkersConfig,
+    /// Configuration for artifact retention and delete sweeps
+    pub retention: RetentionConfig,
+}
+
+/// Artifact retention sweep configuration.
+///
+/// Controls how batch artifacts are assigned default TTLs and how often the
+/// system scans for due deletions.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RetentionConfig {
+    /// Enable retention sweeps (default: true).
+    /// When disabled, no automatic deletion occurs even if artifact TTLs are set.
+    pub enabled: bool,
+    /// How often to scan for expired artifacts (default: 10m).
+    #[serde(with = "humantime_serde")]
+    pub sweep_interval: Duration,
+    /// Maximum number of batches/files to process per sweep pass (default: 100).
+    pub batch_size: i64,
+    /// Default TTL applied to batch artifacts when no explicit file expiry is
+    /// provided. `null` means "no control-layer default".
+    #[serde(default, with = "humantime_serde::option")]
+    pub batch_artifacts_default_ttl: Option<Duration>,
+}
+
+impl Default for RetentionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            sweep_interval: Duration::from_secs(600),
+            batch_size: 100,
+            batch_artifacts_default_ttl: None,
+        }
+    }
+}
+
+impl RetentionConfig {
+    /// Default batch artifact TTL in whole seconds, if configured.
+    pub fn batch_artifacts_default_ttl_seconds(&self) -> Option<i64> {
+        self.batch_artifacts_default_ttl.and_then(|ttl| i64::try_from(ttl.as_secs()).ok())
+    }
 }
 
 /// Database pool metrics sampling configuration.
@@ -3051,6 +3092,59 @@ background_services:
 
             let config = Config::load(&args)?;
             assert_eq!(config.background_services.batch_daemon.urgency_weight, 0.5);
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_retention_default_ttl_yaml_override() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+background_services:
+  retention:
+    batch_artifacts_default_ttl: 7d
+"#,
+            )?;
+
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+
+            let config = Config::load(&args)?;
+            assert_eq!(
+                config.background_services.retention.batch_artifacts_default_ttl,
+                Some(Duration::from_secs(7 * 24 * 60 * 60))
+            );
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_retention_default_ttl_null() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+background_services:
+  retention:
+    batch_artifacts_default_ttl: null
+"#,
+            )?;
+
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+
+            let config = Config::load(&args)?;
+            assert_eq!(config.background_services.retention.batch_artifacts_default_ttl, None);
 
             Ok(())
         });

@@ -424,6 +424,16 @@ background_services:
   #     max_concurrent_sends: 20        # Max parallel outbound HTTP requests
   #     channel_capacity: 200           # Internal send/result channel buffer size
 
+  # Artifact retention policy for user-facing batch artefacts.
+  # Files API uploads can still set their own expires_after values explicitly.
+  retention:
+    enabled: true
+    sweep_interval: 10m
+    batch_size: 100
+    # Optional default TTL applied to batch-related artefacts when no explicit
+    # file expiry is provided. Example values: 7d, 30d. Set to null to disable.
+    batch_artifacts_default_ttl: null
+
   # Leader election - coordinates which instance runs leader-only services
   # When disabled, all instances run as leader (useful for single-instance deployments)
   leader_election:

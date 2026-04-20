@@ -468,6 +468,7 @@ pub(crate) async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'sta
     // Spawn producer task: reads from S3, parses JSONL, sends templates
     let external_key = input.external_key.clone();
     let connection_id = input.connection_id;
+    let config = state.config.snapshot();
     let producer = tokio::spawn(async move {
         use futures::StreamExt;
 
@@ -484,6 +485,8 @@ pub(crate) async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'sta
             source_external_key: Some(external_key.clone()),
             ..Default::default()
         };
+        let mut metadata = metadata;
+        crate::retention::apply_default_file_ttl(&mut metadata, &config);
 
         if tx.send(FileStreamItem::Metadata(metadata)).await.is_err() {
             return (0i32, 0i32, Vec::new());
@@ -1055,13 +1058,21 @@ pub(crate) async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + '
         tracing::info!(batch_id = %existing, "Reusing batch from previous attempt");
         existing
     } else {
-        let metadata = serde_json::json!({
+        let mut metadata = serde_json::json!({
             "request_source": "sync",
             "dw_source_id": input.connection_id.to_string(),
             "dw_source_name": connection_name,
             "dw_sync_id": input.sync_id.to_string(),
             "dw_external_key": external_key,
         });
+        if let Some(ttl_seconds) = crate::retention::default_batch_artifact_ttl_seconds(&state.config.snapshot())
+            && let Some(obj) = metadata.as_object_mut()
+        {
+            obj.insert(
+                crate::retention::RETENTION_TTL_METADATA_KEY.to_string(),
+                serde_json::Value::String(ttl_seconds.to_string()),
+            );
+        }
 
         let batch_input = fusillade::BatchInput {
             file_id: fusillade::FileId(input.file_id),
