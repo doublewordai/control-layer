@@ -97,13 +97,7 @@ export function AppSidebar() {
   const canManageModels = hasPermission("manage-models");
 
   const allNavItems: NavItem[] = [
-    {
-      path: "/batches",
-      icon: Box,
-      label: "Batches",
-      demoOnly: false,
-      hidden: config !== undefined && !config.batches?.enabled,
-    },
+    { path: "/models", icon: Layers, label: "Models" },
     {
       path: "/async",
       icon: Zap,
@@ -113,7 +107,13 @@ export function AppSidebar() {
         config !== undefined &&
         (!config.batches?.enabled || !config.batches?.async_requests?.enabled),
     },
-    { path: "/models", icon: Layers, label: "Models" },
+    {
+      path: "/batches",
+      icon: Box,
+      label: "Batches",
+      demoOnly: false,
+      hidden: config !== undefined && !config.batches?.enabled,
+    },
     {
       path: "/endpoints",
       icon: Server,
