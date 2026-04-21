@@ -336,17 +336,17 @@ async fn test_fusillade_header_skips_row_creation(pool: PgPool) {
     );
 }
 
-/// Test that a default service_tier (async) request with background=true returns 202
+/// Test that a flex service_tier request with background=true returns 202
 /// and creates a batch of 1 in fusillade.
 #[sqlx::test]
 #[test_log::test]
-async fn test_async_background_returns_202_with_queued_status(pool: PgPool) {
+async fn test_flex_background_returns_202_with_queued_status(pool: PgPool) {
     let mock_server = wiremock::MockServer::start().await;
     mount_chat_completions_mock(&mock_server).await;
 
     let (server, api_key, _bg) = setup_ai_test(pool.clone(), &mock_server, true).await;
 
-    // Make a responses API request with default tier + background=true
+    // Make a responses API request with flex tier + background=true
     let response = server
         .post("/ai/v1/responses")
         .add_header("Authorization", &format!("Bearer {}", api_key))
@@ -354,6 +354,7 @@ async fn test_async_background_returns_202_with_queued_status(pool: PgPool) {
         .json(&serde_json::json!({
             "model": "gpt-4o",
             "input": "Process this asynchronously",
+            "service_tier": "flex",
             "background": true
         }))
         .await;
@@ -388,54 +389,6 @@ async fn test_async_background_returns_202_with_queued_status(pool: PgPool) {
 
     assert_eq!(state, "pending", "Async request should be in pending state");
     assert!(batch_id.is_some(), "Async request should have a batch_id");
-}
-
-/// Test that a flex service_tier request with background=true returns 202
-/// and creates a batch with 24h window.
-#[sqlx::test]
-#[test_log::test]
-async fn test_flex_background_returns_202(pool: PgPool) {
-    let mock_server = wiremock::MockServer::start().await;
-    mount_chat_completions_mock(&mock_server).await;
-
-    let (server, api_key, _bg) = setup_ai_test(pool.clone(), &mock_server, true).await;
-
-    let response = server
-        .post("/ai/v1/responses")
-        .add_header("Authorization", &format!("Bearer {}", api_key))
-        .add_header("Content-Type", "application/json")
-        .json(&serde_json::json!({
-            "model": "gpt-4o",
-            "input": "Process this at batch pricing",
-            "service_tier": "flex",
-            "background": true
-        }))
-        .await;
-
-    assert_eq!(response.status_code(), 202);
-
-    let body: serde_json::Value = response.json();
-    assert_eq!(body["status"].as_str(), Some("queued"));
-    assert_eq!(body["service_tier"].as_str(), Some("flex"));
-
-    // Verify the batch has 24h completion window
-    let resp_id = body["id"].as_str().unwrap();
-    let uuid_str = resp_id.strip_prefix("resp_").unwrap();
-    let request_id: uuid::Uuid = uuid_str.parse().unwrap();
-
-    let row = sqlx::query(
-        "SELECT b.completion_window FROM fusillade.requests r
-         JOIN fusillade.batches b ON r.batch_id = b.id
-         WHERE r.id = $1",
-    )
-    .bind(request_id)
-    .fetch_optional(&pool)
-    .await
-    .unwrap();
-
-    let row = row.expect("Batch row should exist");
-    let completion_window: String = sqlx::Row::get(&row, "completion_window");
-    assert_eq!(completion_window, "24h");
 }
 
 /// Test that priority + background=true returns 202 with in_progress status.

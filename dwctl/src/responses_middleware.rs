@@ -74,8 +74,17 @@ pub async fn responses_middleware(
 
     let model = request_value["model"].as_str().unwrap_or("unknown");
     let endpoint = parts.uri.path().to_string();
-    let service_tier = resolve_service_tier(request_value["service_tier"].as_str());
-    let background = request_value["background"].as_bool().unwrap_or(false);
+    let is_responses_api = endpoint.ends_with("/responses");
+
+    // Only the Responses API supports service_tier and background.
+    // Chat completions and embeddings always use realtime tier.
+    let (service_tier, background) = if is_responses_api {
+        let tier = resolve_service_tier(request_value["service_tier"].as_str());
+        let bg = request_value["background"].as_bool().unwrap_or(false);
+        (tier, bg)
+    } else {
+        (ServiceTier::Realtime, false)
+    };
 
     tracing::debug!(
         model = %model,
@@ -86,51 +95,47 @@ pub async fn responses_middleware(
     );
 
     match service_tier {
-        ServiceTier::Priority => {
-            handle_priority(&state, &request_value, model, &endpoint, background, parts, body_bytes, next).await
+        ServiceTier::Realtime => {
+            handle_realtime(&state, &request_value, model, &endpoint, background, parts, body_bytes, next).await
         }
-        ServiceTier::Async { completion_window } => {
-            handle_async(&state, &request_value, model, &endpoint, background, &completion_window).await
+        ServiceTier::Flex => {
+            handle_flex(&state, &request_value, model, &endpoint, background).await
         }
     }
 }
 
-/// Resolved service tier with its completion window.
+/// Resolved service tier.
 enum ServiceTier {
     /// Realtime: direct proxy via onwards.
-    Priority,
-    /// Async: batch of 1 processed by fusillade daemon.
-    Async { completion_window: String },
+    Realtime,
+    /// Flex: batch of 1 with 1h completion window, processed by fusillade daemon.
+    Flex,
 }
 
 impl std::fmt::Display for ServiceTier {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ServiceTier::Priority => write!(f, "priority"),
-            ServiceTier::Async { completion_window } => write!(f, "async({completion_window})"),
+            ServiceTier::Realtime => write!(f, "realtime"),
+            ServiceTier::Flex => write!(f, "flex"),
         }
     }
 }
 
 /// Map the service_tier string to a resolved tier.
+/// Only "flex" gets async processing. Everything else is realtime.
 fn resolve_service_tier(tier: Option<&str>) -> ServiceTier {
     match tier {
-        Some("priority") => ServiceTier::Priority,
-        Some("flex") => ServiceTier::Async {
-            completion_window: "24h".to_string(),
-        },
-        // "default", "auto", None, or unrecognized → async with 1h window
-        _ => ServiceTier::Async {
-            completion_window: "1h".to_string(),
-        },
+        Some("flex") => ServiceTier::Flex,
+        // "priority", "default", "auto", None → realtime
+        _ => ServiceTier::Realtime,
     }
 }
 
-/// Handle a priority (realtime) request.
+/// Handle a realtime request (priority/default/auto).
 ///
 /// Creates a `processing` row and proxies via onwards.
 /// With `background=true`, returns 202 immediately and spawns the proxy as a background task.
-async fn handle_priority(
+async fn handle_realtime(
     state: &ResponsesMiddlewareState,
     request_value: &serde_json::Value,
     model: &str,
@@ -192,33 +197,31 @@ async fn handle_priority(
     }
 }
 
-/// Handle an async/flex request by creating a batch of 1 in fusillade.
+/// Handle a flex request by creating a batch of 1 in fusillade (1h completion window).
 ///
-/// The fusillade daemon will pick it up and process it.
-/// With `background=false`, this would hold the connection and poll (Phase 3 — not yet implemented).
+/// The fusillade daemon will pick it up and process it at async pricing.
+/// With `background=false`, holds the connection and polls until complete (Phase 3).
 /// With `background=true`, returns 202 immediately.
-async fn handle_async(
+async fn handle_flex(
     state: &ResponsesMiddlewareState,
     request_value: &serde_json::Value,
     model: &str,
     endpoint: &str,
     background: bool,
-    completion_window: &str,
 ) -> Response {
-    // Create a batch of 1 in fusillade. The daemon will process it.
     let result = response_store::create_batch_of_1(
         &state.pool,
         request_value,
         model,
         endpoint,
-        completion_window,
+        "1h",
     )
     .await;
 
-    let (response_id, request_id) = match result {
+    let (response_id, _request_id) = match result {
         Ok(ids) => ids,
         Err(e) => {
-            tracing::error!(error = %e, "Failed to create async batch in fusillade");
+            tracing::error!(error = %e, "Failed to create flex batch in fusillade");
             return Response::builder()
                 .status(StatusCode::INTERNAL_SERVER_ERROR)
                 .body(Body::from(
@@ -235,29 +238,24 @@ async fn handle_async(
     };
 
     if background {
-        // Return 202 with queued status
         let response_body = serde_json::json!({
             "id": response_id,
             "object": "response",
             "status": "queued",
             "model": model,
             "background": true,
-            "service_tier": completion_window_to_tier(completion_window),
+            "service_tier": "flex",
             "output": [],
         });
-        tracing::debug!(
-            response_id = %response_id,
-            completion_window = %completion_window,
-            "Enqueued async request"
-        );
+        tracing::debug!(response_id = %response_id, "Enqueued flex request");
         (StatusCode::ACCEPTED, Json(response_body)).into_response()
     } else {
         // Phase 3: hold connection and poll until daemon completes.
-        // For now, return 202 with a note that blocking async is not yet supported.
-        // TODO: implement polling/LISTEN-NOTIFY for blocking async
+        // For now, return 202.
+        // TODO: implement polling/LISTEN-NOTIFY for blocking flex
         tracing::warn!(
             response_id = %response_id,
-            "Blocking async (background=false + non-priority tier) not yet implemented, returning 202"
+            "Blocking flex (background=false) not yet implemented, returning 202"
         );
         let response_body = serde_json::json!({
             "id": response_id,
@@ -265,17 +263,10 @@ async fn handle_async(
             "status": "queued",
             "model": model,
             "background": false,
-            "service_tier": completion_window_to_tier(completion_window),
+            "service_tier": "flex",
             "output": [],
         });
         (StatusCode::ACCEPTED, Json(response_body)).into_response()
-    }
-}
-
-fn completion_window_to_tier(window: &str) -> &str {
-    match window {
-        "24h" => "flex",
-        _ => "default",
     }
 }
 
@@ -335,42 +326,27 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_service_tier_priority() {
-        assert!(matches!(
-            resolve_service_tier(Some("priority")),
-            ServiceTier::Priority
-        ));
+    fn test_resolve_service_tier_priority_is_realtime() {
+        assert!(matches!(resolve_service_tier(Some("priority")), ServiceTier::Realtime));
     }
 
     #[test]
-    fn test_resolve_service_tier_default() {
-        match resolve_service_tier(Some("default")) {
-            ServiceTier::Async { completion_window } => assert_eq!(completion_window, "1h"),
-            _ => panic!("Expected Async"),
-        }
+    fn test_resolve_service_tier_default_is_realtime() {
+        assert!(matches!(resolve_service_tier(Some("default")), ServiceTier::Realtime));
     }
 
     #[test]
-    fn test_resolve_service_tier_auto() {
-        match resolve_service_tier(Some("auto")) {
-            ServiceTier::Async { completion_window } => assert_eq!(completion_window, "1h"),
-            _ => panic!("Expected Async"),
-        }
+    fn test_resolve_service_tier_auto_is_realtime() {
+        assert!(matches!(resolve_service_tier(Some("auto")), ServiceTier::Realtime));
+    }
+
+    #[test]
+    fn test_resolve_service_tier_none_is_realtime() {
+        assert!(matches!(resolve_service_tier(None), ServiceTier::Realtime));
     }
 
     #[test]
     fn test_resolve_service_tier_flex() {
-        match resolve_service_tier(Some("flex")) {
-            ServiceTier::Async { completion_window } => assert_eq!(completion_window, "24h"),
-            _ => panic!("Expected Async"),
-        }
-    }
-
-    #[test]
-    fn test_resolve_service_tier_none() {
-        match resolve_service_tier(None) {
-            ServiceTier::Async { completion_window } => assert_eq!(completion_window, "1h"),
-            _ => panic!("Expected Async for None"),
-        }
+        assert!(matches!(resolve_service_tier(Some("flex")), ServiceTier::Flex));
     }
 }
