@@ -177,24 +177,31 @@ async fn test_chat_completion_creates_retrievable_response(pool: PgPool) {
         "Chat completion should succeed"
     );
 
-    // Check that the X-Onwards-Response-Id header was set (visible in the request
-    // that went to onwards, but not in the client response). Instead, verify a row
-    // exists in fusillade by querying directly.
-    let row = sqlx::query(
-        "SELECT id, state, model FROM fusillade.requests WHERE batch_id IS NULL ORDER BY created_at DESC LIMIT 1"
-    )
-    .fetch_optional(&pool)
-    .await
-    .unwrap();
+    // The outlet handler runs asynchronously in a background task, so poll
+    // until the row transitions from 'processing' to 'completed'.
+    let start = std::time::Instant::now();
+    let mut id = uuid::Uuid::nil();
+    let mut final_state = String::new();
+    while start.elapsed() < std::time::Duration::from_secs(5) {
+        let row = sqlx::query(
+            "SELECT id, state, model FROM fusillade.requests WHERE batch_id IS NULL ORDER BY created_at DESC LIMIT 1"
+        )
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
 
-    assert!(row.is_some(), "A fusillade request row should exist");
-    let row = row.unwrap();
-    let id: uuid::Uuid = sqlx::Row::get(&row, "id");
-    let state: &str = sqlx::Row::get(&row, "state");
-    let model: &str = sqlx::Row::get(&row, "model");
-
-    assert_eq!(state, "completed", "Request should be in completed state");
-    assert_eq!(model, "gpt-4o");
+        if let Some(row) = row {
+            id = sqlx::Row::get(&row, "id");
+            final_state = sqlx::Row::get::<String, _>(&row, "state");
+            let model: &str = sqlx::Row::get(&row, "model");
+            assert_eq!(model, "gpt-4o");
+            if final_state == "completed" {
+                break;
+            }
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(final_state, "completed", "Request should reach completed state");
 
     // Now retrieve it via GET /v1/responses/{id}
     let response_id = format!("resp_{}", id);
@@ -245,23 +252,28 @@ async fn test_responses_api_creates_retrievable_response(pool: PgPool) {
         "Responses API request should succeed"
     );
 
-    // Verify a row exists in fusillade
-    let row = sqlx::query(
-        "SELECT r.id, r.state, r.model FROM fusillade.requests r JOIN fusillade.request_templates t ON r.template_id = t.id WHERE r.batch_id IS NULL AND t.endpoint LIKE '%responses%' ORDER BY r.created_at DESC LIMIT 1"
-    )
-    .fetch_optional(&pool)
-    .await
-    .unwrap();
+    // Poll until the outlet handler completes the row
+    let start = std::time::Instant::now();
+    let mut id = uuid::Uuid::nil();
+    let mut final_state = String::new();
+    while start.elapsed() < std::time::Duration::from_secs(5) {
+        let row = sqlx::query(
+            "SELECT r.id, r.state FROM fusillade.requests r JOIN fusillade.request_templates t ON r.template_id = t.id WHERE r.batch_id IS NULL AND t.endpoint LIKE '%responses%' ORDER BY r.created_at DESC LIMIT 1"
+        )
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
 
-    assert!(
-        row.is_some(),
-        "A fusillade request row should exist for /v1/responses"
-    );
-    let row = row.unwrap();
-    let id: uuid::Uuid = sqlx::Row::get(&row, "id");
-    let state: &str = sqlx::Row::get(&row, "state");
-
-    assert_eq!(state, "completed");
+        if let Some(row) = row {
+            id = sqlx::Row::get(&row, "id");
+            final_state = sqlx::Row::get::<String, _>(&row, "state");
+            if final_state == "completed" {
+                break;
+            }
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(final_state, "completed");
 
     // Retrieve via GET
     let response_id = format!("resp_{}", id);
