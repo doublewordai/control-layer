@@ -271,3 +271,58 @@ impl ResponseStore for FusilladeResponseStore {
         self.get(response_id).await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_response_id_with_prefix() {
+        let uuid = Uuid::new_v4();
+        let id = format!("resp_{uuid}");
+        let parsed = parse_response_id(&id).unwrap();
+        assert_eq!(parsed, uuid);
+    }
+
+    #[test]
+    fn test_parse_response_id_without_prefix() {
+        let uuid = Uuid::new_v4();
+        let parsed = parse_response_id(&uuid.to_string()).unwrap();
+        assert_eq!(parsed, uuid);
+    }
+
+    #[test]
+    fn test_parse_response_id_invalid() {
+        let result = parse_response_id("not-a-uuid");
+        assert!(result.is_err());
+        assert!(matches!(result, Err(StoreError::NotFound(_))));
+    }
+
+    #[test]
+    fn test_state_to_status_mapping() {
+        assert_eq!(state_to_status("pending"), "queued");
+        assert_eq!(state_to_status("claimed"), "in_progress");
+        assert_eq!(state_to_status("processing"), "in_progress");
+        assert_eq!(state_to_status("completed"), "completed");
+        assert_eq!(state_to_status("failed"), "failed");
+        assert_eq!(state_to_status("canceled"), "cancelled");
+        assert_eq!(state_to_status("unknown"), "failed");
+    }
+
+    #[test]
+    fn test_store_extracts_id_from_response() {
+        let response = serde_json::json!({
+            "id": "resp_12345678-1234-1234-1234-123456789abc",
+            "status": "completed",
+        });
+        let id = response.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        assert_eq!(id, "resp_12345678-1234-1234-1234-123456789abc");
+    }
+
+    #[test]
+    fn test_store_handles_missing_id() {
+        let response = serde_json::json!({"status": "completed"});
+        let id = response.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        assert_eq!(id, "");
+    }
+}

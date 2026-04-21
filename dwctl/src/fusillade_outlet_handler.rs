@@ -105,3 +105,61 @@ impl RequestHandler for FusilladeOutletHandler {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use std::collections::HashMap;
+    use std::time::{Duration, SystemTime};
+
+    fn make_request_data(headers: HashMap<String, Vec<Bytes>>) -> RequestData {
+        RequestData {
+            correlation_id: 1,
+            timestamp: SystemTime::now(),
+            method: axum::http::Method::POST,
+            uri: "/v1/responses".parse().unwrap(),
+            headers,
+            body: None,
+            trace_id: None,
+            span_id: None,
+        }
+    }
+
+    #[test]
+    fn test_extract_response_id_present() {
+        let mut headers = HashMap::new();
+        headers.insert(
+            ONWARDS_RESPONSE_ID_HEADER.to_string(),
+            vec![Bytes::from("resp_12345678-1234-1234-1234-123456789abc")],
+        );
+        let request = make_request_data(headers);
+        let id = FusilladeOutletHandler::extract_response_id(&request);
+        assert_eq!(
+            id,
+            Some("resp_12345678-1234-1234-1234-123456789abc".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_response_id_absent() {
+        let request = make_request_data(HashMap::new());
+        let id = FusilladeOutletHandler::extract_response_id(&request);
+        assert!(id.is_none());
+    }
+
+    #[test]
+    fn test_extract_response_id_skips_fusillade_header() {
+        // When X-Fusillade-Request-Id is present, the handler should skip
+        // (tested in handle_response, not extract — but verify extraction still works)
+        let mut headers = HashMap::new();
+        headers.insert(
+            "x-fusillade-request-id".to_string(),
+            vec![Bytes::from("some-batch-id")],
+        );
+        // No onwards header → extraction returns None
+        let request = make_request_data(headers);
+        let id = FusilladeOutletHandler::extract_response_id(&request);
+        assert!(id.is_none());
+    }
+}
