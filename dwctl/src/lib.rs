@@ -159,6 +159,7 @@ mod openapi;
 mod payment_providers;
 mod probes;
 mod request_logging;
+pub mod response_store;
 pub mod sample_files;
 mod static_assets;
 mod sync;
@@ -291,6 +292,9 @@ where
     /// Encryption key for connection credentials, derived once at startup.
     /// `None` means connections encryption is unavailable.
     pub connections_encryption_key: Option<Vec<u8>>,
+    /// Response store for Open Responses API lifecycle tracking.
+    /// Reads/writes to fusillade's requests table.
+    pub response_store: Arc<crate::response_store::FusilladeResponseStore>,
 }
 
 impl<P> AppState<P>
@@ -1340,6 +1344,8 @@ pub async fn build_router(
                 .route("/files/{file_id}", delete(api::handlers::files::delete_file))
                 .route("/files/{file_id}/content", get(api::handlers::files::get_file_content))
                 .route("/files/{file_id}/cost-estimate", get(api::handlers::files::get_file_cost_estimate))
+                // Responses retrieval (Open Responses API)
+                .route("/responses/{response_id}", get(api::handlers::responses::get_response))
                 // Batches management
                 .route("/batches", post(api::handlers::batches::create_batch))
                 .route("/batches", get(api::handlers::batches::list_batches))
@@ -2382,11 +2388,38 @@ impl Application {
         let reqwest_client = reqwest::Client::new();
         let tool_executor = crate::tool_executor::HttpToolExecutor::new(reqwest_client, Some(Arc::new(db_pools.write().clone())));
 
+        // Register onwards as a fusillade daemon so realtime requests get a valid daemon_id
+        let onwards_daemon_id = uuid::Uuid::new_v4();
+        let fusillade_write_pool = bg_services.request_manager.pool().clone();
+        sqlx::query(
+            "INSERT INTO daemons (id, hostname, pid, version, config_snapshot, status, started_at, last_heartbeat)
+             VALUES ($1, $2, $3, $4, $5, 'running', NOW(), NOW())",
+        )
+        .bind(onwards_daemon_id)
+        .bind(fusillade::daemon::types::get_hostname())
+        .bind(fusillade::daemon::types::get_pid())
+        .bind(fusillade::daemon::types::get_version())
+        .bind(serde_json::json!({"type": "onwards"}))
+        .execute(&fusillade_write_pool)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "Failed to register onwards daemon (table may not exist yet)");
+            sqlx::postgres::PgQueryResult::default()
+        });
+        tracing::info!(daemon_id = %onwards_daemon_id, "Registered onwards as fusillade daemon");
+
+        // Create the response store backed by fusillade's requests table
+        let response_store = Arc::new(crate::response_store::FusilladeResponseStore::new(
+            fusillade_write_pool,
+            crate::response_store::OnwardsDaemonId(onwards_daemon_id),
+        ));
+
         // Build onwards router from targets with body transform, response sanitization, and tool executor.
         let onwards_app_state = onwards::AppState::with_transform(bg_services.onwards_targets.clone(), body_transform)
             .with_response_transform(onwards::create_openai_sanitizer())
             .with_streaming_header("x-fusillade-stream")
-            .with_tool_executor(Arc::new(tool_executor));
+            .with_tool_executor(Arc::new(tool_executor))
+            .with_response_store(response_store.clone() as Arc<dyn onwards::ResponseStore>);
         let onwards_router = if bg_services.onwards_targets.strict_mode {
             tracing::info!("Strict mode enabled - using typed request validation");
             onwards::strict::build_strict_router(onwards_app_state)
@@ -2407,6 +2440,7 @@ impl Application {
             .maybe_outlet_db(outlet_pools.clone())
             .limiters(limiters)
             .maybe_connections_encryption_key(bg_services.connections_encryption_key.clone())
+            .response_store(response_store)
             .build();
 
         if let Some(config_path) = config_path {
