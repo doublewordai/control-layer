@@ -71,7 +71,8 @@ pub async fn responses_middleware(
     let model = request_value["model"].as_str().unwrap_or("unknown");
     let endpoint = parts.uri.path();
 
-    // Create the pending fusillade rows
+    // Create the pending fusillade rows. If this fails (e.g., fusillade not configured),
+    // proceed without tracking — the request still proxies, just won't be retrievable.
     let response_id = match response_store::create_pending(
         &state.pool,
         &request_value,
@@ -81,24 +82,24 @@ pub async fn responses_middleware(
     )
     .await
     {
-        Ok(id) => id,
+        Ok(id) => {
+            tracing::debug!(response_id = %id, model = %model, "Created pending response");
+            Some(id)
+        }
         Err(e) => {
-            tracing::error!(error = %e, "Failed to create pending response in fusillade");
-            return Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(Body::empty())
-                .unwrap();
+            tracing::warn!(error = %e, "Failed to create pending response in fusillade, proceeding without tracking");
+            None
         }
     };
 
-    tracing::debug!(response_id = %response_id, model = %model, "Created pending response");
-
-    // Reconstruct the request with the response ID header
+    // Reconstruct the request, attaching the response ID header if tracking succeeded
     let mut req = Request::from_parts(parts, Body::from(body_bytes));
-    req.headers_mut().insert(
-        ONWARDS_RESPONSE_ID_HEADER,
-        response_id.parse().expect("response_id is valid header value"),
-    );
+    if let Some(ref id) = response_id {
+        req.headers_mut().insert(
+            ONWARDS_RESPONSE_ID_HEADER,
+            id.parse().expect("response_id is valid header value"),
+        );
+    }
 
     next.run(req).await
 }
