@@ -1,7 +1,8 @@
 //! Axum middleware that creates pending response records in fusillade before
 //! onwards proxies the request.
 //!
-//! Applied to the onwards router for `/v1/responses` requests only. Sets the
+//! Applied to the onwards router for all inference POST requests
+//! (`/v1/responses`, `/v1/chat/completions`, `/v1/embeddings`). Sets the
 //! `X-Onwards-Response-Id` header so the `FusilladeOutletHandler` knows which
 //! row to update with the captured response body.
 
@@ -33,11 +34,16 @@ pub async fn responses_middleware(
     req: Request<Body>,
     next: Next,
 ) -> Response {
-    // Only intercept POST requests to /responses (the path within the /ai/v1 nest)
-    let is_responses_post =
-        req.method() == axum::http::Method::POST && req.uri().path().ends_with("/responses");
+    // Only intercept POST requests to inference endpoints.
+    // These paths are relative to the /ai/v1 nest where the middleware is applied.
+    let is_post = req.method() == axum::http::Method::POST;
+    let path = req.uri().path();
+    let is_inference_request = is_post
+        && (path.ends_with("/responses")
+            || path.ends_with("/chat/completions")
+            || path.ends_with("/embeddings"));
 
-    if !is_responses_post {
+    if !is_inference_request {
         return next.run(req).await;
     }
 
@@ -71,13 +77,14 @@ pub async fn responses_middleware(
     };
 
     let model = request_value["model"].as_str().unwrap_or("unknown");
+    let endpoint = parts.uri.path();
 
     // Create the pending fusillade rows
     let response_id = match response_store::create_pending(
         &state.pool,
         &request_value,
         model,
-        "/v1/responses",
+        endpoint,
         state.daemon_id,
     )
     .await
