@@ -156,6 +156,125 @@ pub async fn fail_response(
     Ok(())
 }
 
+/// Create a batch of 1 in fusillade for async/flex processing.
+///
+/// Creates a file, template, batch, and request row. The fusillade daemon
+/// will pick up the pending request and process it.
+///
+/// Returns `(response_id, request_id)` where response_id is `resp_<uuid>`.
+pub async fn create_batch_of_1(
+    pool: &PgPool,
+    request: &serde_json::Value,
+    model: &str,
+    endpoint: &str,
+    completion_window: &str,
+) -> Result<(String, Uuid), StoreError> {
+    let file_id = Uuid::new_v4();
+    let template_id = Uuid::new_v4();
+    let batch_id = Uuid::new_v4();
+    let request_id = Uuid::new_v4();
+    let output_file_id = Uuid::new_v4();
+    let error_file_id = Uuid::new_v4();
+    let now = Utc::now();
+    let body = request.to_string();
+
+    // Parse completion window to compute expires_at
+    let std_duration = humantime::parse_duration(completion_window)
+        .map_err(|e| StoreError::StorageError(format!("Invalid completion_window: {e}")))?;
+    let chrono_duration = chrono::Duration::from_std(std_duration)
+        .map_err(|e| StoreError::StorageError(format!("Duration conversion error: {e}")))?;
+    let expires_at = now + chrono_duration;
+
+    // Create file record (purpose = "batch")
+    sqlx::query(
+        "INSERT INTO files (id, name, status, uploaded_by, purpose, created_at, updated_at)
+         VALUES ($1, 'responses_api_single', 'processed', '', 'batch', $2, $2)",
+    )
+    .bind(file_id)
+    .bind(now)
+    .execute(pool)
+    .await
+    .map_err(|e| StoreError::StorageError(format!("Failed to create file: {e}")))?;
+
+    // Create virtual output/error files
+    for (fid, purpose) in [(output_file_id, "batch_output"), (error_file_id, "batch_error")] {
+        sqlx::query(
+            "INSERT INTO files (id, name, status, uploaded_by, purpose, created_at, updated_at)
+             VALUES ($1, $2, 'processed', '', $2, $3, $3)",
+        )
+        .bind(fid)
+        .bind(purpose)
+        .bind(now)
+        .execute(pool)
+        .await
+        .map_err(|e| StoreError::StorageError(format!("Failed to create {purpose} file: {e}")))?;
+    }
+
+    // Create template
+    sqlx::query(
+        "INSERT INTO request_templates (id, file_id, custom_id, endpoint, method, path, body, model, api_key)
+         VALUES ($1, $2, NULL, $3, 'POST', $3, $4, $5, '')",
+    )
+    .bind(template_id)
+    .bind(file_id)
+    .bind(endpoint)
+    .bind(&body)
+    .bind(model)
+    .execute(pool)
+    .await
+    .map_err(|e| StoreError::StorageError(format!("Failed to create template: {e}")))?;
+
+    // Create batch
+    sqlx::query(
+        "INSERT INTO batches (id, file_id, endpoint, completion_window, created_by, expires_at, output_file_id, error_file_id, total_requests, created_at)
+         VALUES ($1, $2, $3, $4, '', $5, $6, $7, 1, $8)",
+    )
+    .bind(batch_id)
+    .bind(file_id)
+    .bind(endpoint)
+    .bind(completion_window)
+    .bind(expires_at)
+    .bind(output_file_id)
+    .bind(error_file_id)
+    .bind(now)
+    .execute(pool)
+    .await
+    .map_err(|e| StoreError::StorageError(format!("Failed to create batch: {e}")))?;
+
+    // Create request in pending state (daemon will claim it)
+    sqlx::query(
+        "INSERT INTO requests (id, batch_id, template_id, model, custom_id, state)
+         VALUES ($1, $2, $3, $4, NULL, 'pending')",
+    )
+    .bind(request_id)
+    .bind(batch_id)
+    .bind(template_id)
+    .bind(model)
+    .execute(pool)
+    .await
+    .map_err(|e| StoreError::StorageError(format!("Failed to create request: {e}")))?;
+
+    // Mark batch as started (so daemon sees it as active)
+    sqlx::query(
+        "UPDATE batches SET requests_started_at = $2, pending_requests = 1 WHERE id = $1",
+    )
+    .bind(batch_id)
+    .bind(now)
+    .execute(pool)
+    .await
+    .map_err(|e| StoreError::StorageError(format!("Failed to activate batch: {e}")))?;
+
+    let response_id = format!("resp_{request_id}");
+    tracing::debug!(
+        response_id = %response_id,
+        batch_id = %batch_id,
+        completion_window = %completion_window,
+        "Created batch of 1 for async processing"
+    );
+
+    Ok((response_id, request_id))
+}
+
 /// Parse a response ID like "resp_<uuid>" into a UUID.
 fn parse_response_id(response_id: &str) -> Result<Uuid, StoreError> {
     let uuid_str = response_id.strip_prefix("resp_").unwrap_or(response_id);
