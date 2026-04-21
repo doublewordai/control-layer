@@ -403,6 +403,80 @@ async fn test_flex_background_returns_202_with_queued_status(pool: PgPool) {
     assert!(batch_id.is_some(), "Async request should have a batch_id");
 }
 
+/// Test that flex + background=false holds the connection and returns the
+/// completed response once the daemon finishes processing.
+#[sqlx::test]
+#[test_log::test]
+async fn test_flex_blocking_waits_for_completion(pool: PgPool) {
+    let mock_server = wiremock::MockServer::start().await;
+    mount_chat_completions_mock(&mock_server).await;
+
+    let (server, api_key, _bg) = setup_ai_test(pool.clone(), &mock_server, true).await;
+
+    // Spawn a task that will simulate the daemon: after a short delay, find
+    // the pending request in fusillade and mark it as completed.
+    let pool_clone = pool.clone();
+    let daemon_task = tokio::spawn(async move {
+        // Wait for the request to appear
+        let start = std::time::Instant::now();
+        loop {
+            let row = sqlx::query(
+                "SELECT id FROM fusillade.requests WHERE state = 'pending' AND batch_id IS NOT NULL ORDER BY created_at DESC LIMIT 1"
+            )
+            .fetch_optional(&pool_clone)
+            .await
+            .unwrap();
+
+            if let Some(row) = row {
+                let id: uuid::Uuid = sqlx::Row::get(&row, "id");
+                // Simulate daemon completing the request
+                sqlx::query(
+                    "UPDATE fusillade.requests SET state = 'completed', response_status = 200,
+                     response_body = '{\"output\": [{\"type\": \"message\", \"content\": \"flex result\"}], \"usage\": {\"input_tokens\": 5, \"output_tokens\": 3}}',
+                     completed_at = NOW()
+                     WHERE id = $1",
+                )
+                .bind(id)
+                .execute(&pool_clone)
+                .await
+                .unwrap();
+                return;
+            }
+
+            if start.elapsed() > std::time::Duration::from_secs(5) {
+                panic!("Daemon simulator: no pending request appeared");
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+    });
+
+    // Make a blocking flex request — this should hold the connection
+    // until the simulated daemon completes it
+    let response = server
+        .post("/ai/v1/responses")
+        .add_header("Authorization", &format!("Bearer {}", api_key))
+        .add_header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "model": "gpt-4o",
+            "input": "Process this synchronously at flex pricing",
+            "service_tier": "flex"
+        }))
+        .await;
+
+    // Wait for daemon simulator to finish
+    daemon_task.await.unwrap();
+
+    assert_eq!(
+        response.status_code(),
+        200,
+        "Blocking flex should return 200 after daemon completes"
+    );
+
+    let body: serde_json::Value = response.json();
+    assert_eq!(body["status"].as_str(), Some("completed"));
+    assert_eq!(body["object"].as_str(), Some("response"));
+}
+
 /// Test that priority + background=true returns 202, then the spawned task
 /// completes the request and it's retrievable via GET.
 #[sqlx::test]

@@ -156,6 +156,52 @@ pub async fn fail_response(
     Ok(())
 }
 
+/// Poll a fusillade request until it reaches a terminal state (completed/failed/canceled).
+///
+/// Returns the full Response object once terminal, or an error if the timeout is reached.
+pub async fn poll_until_complete(
+    pool: &PgPool,
+    response_id: &str,
+    poll_interval: std::time::Duration,
+    timeout: std::time::Duration,
+) -> Result<serde_json::Value, StoreError> {
+    let id = parse_response_id(response_id)?;
+    let start = std::time::Instant::now();
+
+    loop {
+        let row = sqlx::query(
+            "SELECT r.id, r.state, r.model, t.body, r.response_body, r.response_status,
+                    r.error, r.created_at, r.completed_at, r.failed_at, r.batch_id
+             FROM requests r
+             LEFT JOIN request_templates t ON r.template_id = t.id
+             WHERE r.id = $1",
+        )
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| StoreError::StorageError(format!("Failed to poll request: {e}")))?;
+
+        if let Some(ref row) = row {
+            let state: &str = row.get("state");
+            match state {
+                "completed" | "failed" | "canceled" => {
+                    return Ok(row_to_response_object(row));
+                }
+                _ => {}
+            }
+        }
+
+        if start.elapsed() >= timeout {
+            return Err(StoreError::StorageError(format!(
+                "Timeout waiting for request {response_id} to complete after {:?}",
+                timeout
+            )));
+        }
+
+        tokio::time::sleep(poll_interval).await;
+    }
+}
+
 /// Create a batch of 1 in fusillade for async/flex processing.
 ///
 /// Creates a file, template, batch, and request row. The fusillade daemon

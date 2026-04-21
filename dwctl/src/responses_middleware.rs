@@ -250,23 +250,39 @@ async fn handle_flex(
         tracing::debug!(response_id = %response_id, "Enqueued flex request");
         (StatusCode::ACCEPTED, Json(response_body)).into_response()
     } else {
-        // Phase 3: hold connection and poll until daemon completes.
-        // For now, return 202.
-        // TODO: implement polling/LISTEN-NOTIFY for blocking flex
-        tracing::warn!(
-            response_id = %response_id,
-            "Blocking flex (background=false) not yet implemented, returning 202"
-        );
-        let response_body = serde_json::json!({
-            "id": response_id,
-            "object": "response",
-            "status": "queued",
-            "model": model,
-            "background": false,
-            "service_tier": "flex",
-            "output": [],
-        });
-        (StatusCode::ACCEPTED, Json(response_body)).into_response()
+        // Blocking flex: hold the connection and poll until the daemon completes.
+        tracing::debug!(response_id = %response_id, "Blocking flex — polling until daemon completes");
+
+        let poll_interval = std::time::Duration::from_millis(500);
+        let timeout = std::time::Duration::from_secs(3600); // 1h matches completion_window
+
+        match response_store::poll_until_complete(
+            &state.pool,
+            &response_id,
+            poll_interval,
+            timeout,
+        )
+        .await
+        {
+            Ok(response_obj) => {
+                let status_code = if response_obj["status"].as_str() == Some("completed") {
+                    StatusCode::OK
+                } else {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                };
+                (status_code, Json(response_obj)).into_response()
+            }
+            Err(e) => {
+                tracing::error!(error = %e, response_id = %response_id, "Blocking flex poll failed");
+                let response_body = serde_json::json!({
+                    "error": {
+                        "message": format!("Request timed out: {e}"),
+                        "type": "server_error",
+                    }
+                });
+                (StatusCode::GATEWAY_TIMEOUT, Json(response_body)).into_response()
+            }
+        }
     }
 }
 
