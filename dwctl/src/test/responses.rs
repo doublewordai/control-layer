@@ -403,10 +403,11 @@ async fn test_flex_background_returns_202_with_queued_status(pool: PgPool) {
     assert!(batch_id.is_some(), "Async request should have a batch_id");
 }
 
-/// Test that priority + background=true returns 202 with in_progress status.
+/// Test that priority + background=true returns 202, then the spawned task
+/// completes the request and it's retrievable via GET.
 #[sqlx::test]
 #[test_log::test]
-async fn test_priority_background_returns_202(pool: PgPool) {
+async fn test_priority_background_completes_and_is_retrievable(pool: PgPool) {
     let mock_server = wiremock::MockServer::start().await;
     mount_chat_completions_mock(&mock_server).await;
 
@@ -433,5 +434,31 @@ async fn test_priority_background_returns_202(pool: PgPool) {
     let body: serde_json::Value = response.json();
     assert_eq!(body["status"].as_str(), Some("in_progress"));
     assert_eq!(body["background"].as_bool(), Some(true));
-    assert!(body["id"].as_str().unwrap().starts_with("resp_"));
+    let resp_id = body["id"].as_str().unwrap();
+    assert!(resp_id.starts_with("resp_"));
+
+    // Poll GET /v1/responses/{id} until it transitions to completed
+    // (the spawned task proxies through onwards, outlet handler writes the body)
+    let start = std::time::Instant::now();
+    let mut final_status = String::new();
+    while start.elapsed() < std::time::Duration::from_secs(5) {
+        let retrieve = server
+            .get(&format!("/ai/v1/responses/{}", resp_id))
+            .add_header("Authorization", &format!("Bearer {}", api_key))
+            .await;
+
+        if retrieve.status_code() == 200 {
+            let resp: serde_json::Value = retrieve.json();
+            final_status = resp["status"].as_str().unwrap_or("").to_string();
+            if final_status == "completed" {
+                break;
+            }
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    }
+
+    assert_eq!(
+        final_status, "completed",
+        "Background priority request should eventually complete"
+    );
 }
