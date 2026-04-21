@@ -334,7 +334,9 @@ async fn test_strict_mode_allows_chat_completions(pool: PgPool) {
 
     // Verify response structure
     let body: serde_json::Value = serde_json::from_str(&body_text).expect("Response body should be valid JSON");
-    assert_eq!(body["id"].as_str(), Some("chatcmpl-strict-test"));
+    // The response ID is rewritten by the responses middleware to use the fusillade ID
+    let id = body["id"].as_str().unwrap();
+    assert!(id.starts_with("resp_"), "Response ID should be fusillade ID, got: {id}");
     assert_eq!(body["object"].as_str(), Some("chat.completion"));
     assert_eq!(body["model"].as_str(), Some("gpt-4"));
     assert!(body["choices"].is_array());

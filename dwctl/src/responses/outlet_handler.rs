@@ -1,24 +1,28 @@
-//! Outlet `RequestHandler` that writes captured response bodies back to
-//! fusillade's `requests` table.
+//! Outlet `RequestHandler` that enqueues response completion jobs via underway.
 //!
 //! This handler is added to outlet's `MultiHandler` alongside the existing
-//! `PostgresHandler` (which writes to `http_analytics`). It completes the
-//! response lifecycle that the responses middleware started.
+//! `PostgresHandler` (which writes to `http_analytics`). It enqueues a
+//! `CompleteResponseJob` which updates the fusillade row with the response
+//! body/status. Using underway ensures the completion retries if the
+//! `CreateResponseJob` hasn't created the row yet.
 
 use outlet::{RequestData, RequestHandler, ResponseData};
-use sqlx::PgPool;
+use std::sync::Arc;
+use underway::Job;
 
-use crate::response_store::{self, ONWARDS_RESPONSE_ID_HEADER};
+use super::jobs::CompleteResponseInput;
+use super::store::ONWARDS_RESPONSE_ID_HEADER;
+use crate::tasks::TaskState;
 
-/// Outlet handler that updates fusillade request rows with captured response data.
+/// Outlet handler that enqueues completion jobs for fusillade-tracked responses.
 #[derive(Clone)]
 pub struct FusilladeOutletHandler {
-    pool: PgPool,
+    job: Arc<Job<CompleteResponseInput, TaskState>>,
 }
 
 impl FusilladeOutletHandler {
-    pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+    pub fn new(job: Arc<Job<CompleteResponseInput, TaskState>>) -> Self {
+        Self { job }
     }
 
     /// Extract the onwards response ID from request headers, if present.
@@ -36,7 +40,7 @@ impl RequestHandler for FusilladeOutletHandler {
     async fn handle_request(&self, _data: RequestData) {}
 
     fn handle_response(&self, request_data: RequestData, response_data: ResponseData) -> impl std::future::Future<Output = ()> + Send {
-        let pool = self.pool.clone();
+        let job = self.job.clone();
 
         async move {
             // Skip batch requests — the daemon handles its own completion
@@ -47,41 +51,26 @@ impl RequestHandler for FusilladeOutletHandler {
             // Check for the onwards response ID header (set by responses middleware)
             let response_id = match Self::extract_response_id(&request_data) {
                 Some(id) => id,
-                None => return, // Not a tracked response
+                None => return,
             };
 
             let status_code = response_data.status.as_u16();
-            let body_str = response_data.body.as_ref().and_then(|b| std::str::from_utf8(b).ok()).unwrap_or("");
+            let response_body = response_data
+                .body
+                .as_ref()
+                .and_then(|b| std::str::from_utf8(b).ok())
+                .unwrap_or("")
+                .to_string();
 
-            if (200..300).contains(&status_code) {
-                if let Err(e) = response_store::complete_response(&pool, &response_id, body_str, status_code).await {
-                    tracing::warn!(
-                        error = %e,
-                        response_id = %response_id,
-                        "Failed to complete response in fusillade"
-                    );
-                } else {
-                    tracing::debug!(
-                        response_id = %response_id,
-                        status_code = status_code,
-                        body_size = body_str.len(),
-                        "Response completed in fusillade"
-                    );
-                }
-            } else if let Err(e) =
-                response_store::fail_response(&pool, &response_id, &format!("Upstream returned {status_code}: {body_str}")).await
+            if let Err(e) = job
+                .enqueue(&CompleteResponseInput {
+                    response_id: response_id.clone(),
+                    status_code,
+                    response_body,
+                })
+                .await
             {
-                tracing::warn!(
-                    error = %e,
-                    response_id = %response_id,
-                    "Failed to mark response as failed in fusillade"
-                );
-            } else {
-                tracing::debug!(
-                    response_id = %response_id,
-                    status_code = status_code,
-                    "Response marked as failed in fusillade"
-                );
+                tracing::warn!(error = %e, response_id = %response_id, "Failed to enqueue complete-response job");
             }
         }
     }
@@ -128,11 +117,8 @@ mod tests {
 
     #[test]
     fn test_extract_response_id_skips_fusillade_header() {
-        // When X-Fusillade-Request-Id is present, the handler should skip
-        // (tested in handle_response, not extract — but verify extraction still works)
         let mut headers = HashMap::new();
         headers.insert("x-fusillade-request-id".to_string(), vec![Bytes::from("some-batch-id")]);
-        // No onwards header → extraction returns None
         let request = make_request_data(headers);
         let id = FusilladeOutletHandler::extract_response_id(&request);
         assert!(id.is_none());

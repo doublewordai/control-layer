@@ -17,6 +17,7 @@ use crate::api::handlers::batches::{CascadeBatchStateInput, CreateBatchInput, bu
 use crate::connections::sync::{
     ActivateBatchInput, IngestFileInput, SyncConnectionInput, build_activate_batch_job, build_ingest_file_job, build_sync_connection_job,
 };
+use crate::responses::jobs::{CompleteResponseInput, CreateResponseInput, build_complete_response_job, build_create_response_job};
 
 /// A lazily-initialized, shared job reference using `Weak` to avoid reference
 /// cycles. Each `Job` owns a cloned `TaskState`, and `TaskState` holds `Weak`
@@ -100,6 +101,8 @@ pub struct TaskRunner<P: PoolProvider + Clone + 'static = sqlx_pool_router::DbPo
     pub sync_connection_job: Arc<Job<SyncConnectionInput, TaskState<P>>>,
     pub ingest_file_job: Arc<Job<IngestFileInput, TaskState<P>>>,
     pub activate_batch_job: Arc<Job<ActivateBatchInput, TaskState<P>>>,
+    pub create_response_job: Arc<Job<CreateResponseInput, TaskState<P>>>,
+    pub complete_response_job: Arc<Job<CompleteResponseInput, TaskState<P>>>,
 }
 
 impl<P: PoolProvider + Clone + Send + Sync + 'static> TaskRunner<P> {
@@ -121,6 +124,8 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> TaskRunner<P> {
         };
         let ingest_file_job = Arc::new(build_ingest_file_job(pool.clone(), state.clone()).await?);
         let activate_batch_job = Arc::new(build_activate_batch_job(pool.clone(), state.clone()).await?);
+        let create_response_job = Arc::new(build_create_response_job(pool.clone(), state.clone()).await?);
+        let complete_response_job = Arc::new(build_complete_response_job(pool.clone(), state.clone()).await?);
         let sync_connection_job = Arc::new(build_sync_connection_job(pool, state.clone()).await?);
 
         // Wire weak cross-references. All jobs share the same Arc<OnceLock>,
@@ -144,6 +149,8 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> TaskRunner<P> {
             sync_connection_job,
             ingest_file_job,
             activate_batch_job,
+            create_response_job,
+            complete_response_job,
         })
     }
 
@@ -191,6 +198,33 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> TaskRunner<P> {
                     }),
                 ));
             }
+        }
+
+        // Response lifecycle workers — handle create-response and complete-response jobs
+        // from the responses middleware and outlet handler. Always at least 1.
+        {
+            let mut worker = self.create_response_job.worker();
+            worker.set_shutdown_token(shutdown_token.clone());
+            handles.push((
+                "create-response-worker",
+                tokio::spawn(async move {
+                    if let Err(e) = worker.run().await {
+                        tracing::error!(error = %e, "Create-response worker error");
+                    }
+                }),
+            ));
+        }
+        {
+            let mut worker = self.complete_response_job.worker();
+            worker.set_shutdown_token(shutdown_token.clone());
+            handles.push((
+                "complete-response-worker",
+                tokio::spawn(async move {
+                    if let Err(e) = worker.run().await {
+                        tracing::error!(error = %e, "Complete-response worker error");
+                    }
+                }),
+            ));
         }
 
         if !sync_config.enabled {

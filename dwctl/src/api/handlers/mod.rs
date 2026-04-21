@@ -48,7 +48,6 @@ pub mod probes;
 pub mod provider_display_configs;
 pub mod queue;
 pub mod requests;
-pub mod responses;
 pub mod sla_capacity;
 pub mod static_assets;
 pub mod support;

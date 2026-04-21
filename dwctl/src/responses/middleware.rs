@@ -22,13 +22,15 @@ use axum::{
 };
 use sqlx::PgPool;
 
-use crate::response_store::{self, ONWARDS_RESPONSE_ID_HEADER, OnwardsDaemonId};
+use super::jobs::CreateResponseInput;
+use super::store::{self as response_store, ONWARDS_RESPONSE_ID_HEADER, OnwardsDaemonId};
 
 /// State for the responses middleware.
 #[derive(Clone)]
 pub struct ResponsesMiddlewareState {
     pub pool: PgPool,
     pub daemon_id: OnwardsDaemonId,
+    pub create_response_job: std::sync::Arc<underway::Job<CreateResponseInput, crate::tasks::TaskState>>,
 }
 
 /// Middleware that routes inference requests based on service_tier and background.
@@ -66,7 +68,7 @@ pub async fn responses_middleware(State(state): State<ResponsesMiddlewareState>,
     let endpoint = parts.uri.path().to_string();
     let is_responses_api = endpoint.ends_with("/responses");
 
-    // Extract bearer token for batch attribution
+    // Extract bearer token for auth check and batch attribution
     let api_key = parts
         .headers
         .get("authorization")
@@ -93,7 +95,20 @@ pub async fn responses_middleware(State(state): State<ResponsesMiddlewareState>,
     );
 
     match service_tier {
-        ServiceTier::Realtime => handle_realtime(&state, &request_value, model, &endpoint, background, parts, body_bytes, next).await,
+        ServiceTier::Realtime => {
+            handle_realtime(
+                &state,
+                &request_value,
+                model,
+                &endpoint,
+                background,
+                api_key.as_deref(),
+                parts,
+                body_bytes,
+                next,
+            )
+            .await
+        }
         ServiceTier::Flex => handle_flex(&state, &request_value, model, &endpoint, background, api_key.as_deref()).await,
     }
 }
@@ -127,7 +142,8 @@ fn resolve_service_tier(tier: Option<&str>) -> ServiceTier {
 
 /// Handle a realtime request (priority/default/auto).
 ///
-/// Creates a `processing` row and proxies via onwards.
+/// Enqueues a CreateResponseJob (validates API key, creates fusillade row) and
+/// proxies via onwards. The job runs in parallel with the proxy.
 /// With `background=true`, returns 202 immediately and spawns the proxy as a background task.
 #[allow(clippy::too_many_arguments)]
 async fn handle_realtime(
@@ -136,33 +152,41 @@ async fn handle_realtime(
     model: &str,
     endpoint: &str,
     background: bool,
+    api_key: Option<&str>,
     parts: axum::http::request::Parts,
     body_bytes: bytes::Bytes,
     next: Next,
 ) -> Response {
-    // Create the pending fusillade row (processing state, onwards is the daemon).
-    // If this fails, proceed without tracking.
-    let response_id = match response_store::create_pending(&state.pool, request_value, model, endpoint, state.daemon_id).await {
-        Ok(id) => {
-            tracing::debug!(response_id = %id, "Created pending response (priority)");
-            Some(id)
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "Failed to create pending response, proceeding without tracking");
-            None
-        }
-    };
+    // Generate response ID upfront (needed for both paths)
+    let resp_id = format!("resp_{}", uuid::Uuid::new_v4());
 
-    // Reconstruct the request, attaching the response ID header if tracking succeeded
-    let mut req = Request::from_parts(parts, Body::from(body_bytes));
-    if let Some(ref id) = response_id {
-        req.headers_mut()
-            .insert(ONWARDS_RESPONSE_ID_HEADER, id.parse().expect("response_id is valid header value"));
+    // Enqueue the create-response job (validates key, creates fusillade row).
+    // This runs in the background via underway — doesn't block the proxy.
+    let enqueue_result = state
+        .create_response_job
+        .enqueue(&CreateResponseInput {
+            response_id: resp_id.clone(),
+            request_body: request_value.to_string(),
+            model: model.to_string(),
+            endpoint: endpoint.to_string(),
+            api_key: api_key.map(|s| s.to_string()),
+            daemon_id: state.daemon_id.0,
+        })
+        .await;
+
+    if let Err(e) = enqueue_result {
+        tracing::warn!(error = %e, "Failed to enqueue create-response job, proceeding without tracking");
     }
+
+    // Attach the response ID header
+    let mut req = Request::from_parts(parts, Body::from(body_bytes));
+    req.headers_mut().insert(
+        ONWARDS_RESPONSE_ID_HEADER,
+        resp_id.parse().expect("response_id is valid header value"),
+    );
 
     if background {
         // Return 202 immediately, proxy in background
-        let resp_id = response_id.unwrap_or_else(|| format!("resp_{}", uuid::Uuid::new_v4()));
         let response_body = serde_json::json!({
             "id": resp_id,
             "object": "response",
@@ -171,25 +195,19 @@ async fn handle_realtime(
             "background": true,
             "output": [],
         });
+
         tokio::spawn(async move {
             let response = next.run(req).await;
-            // Consume the response body so outlet's tee-stream captures all chunks.
-            // Without this, dropping the response would drop the stream before
-            // outlet finishes reading, resulting in an empty body in fusillade.
+            // Consume the body so outlet's tee-stream captures all chunks
             let (_parts, body) = response.into_parts();
             let _ = axum::body::to_bytes(body, usize::MAX).await;
-            // outlet handler will update the row on completion
         });
+
         (StatusCode::ACCEPTED, Json(response_body)).into_response()
     } else {
-        // Blocking: proxy normally, outlet handler writes body on completion.
-        // Patch the response ID to use our fusillade ID so GET /v1/responses/{id} works.
+        // Blocking: proxy via onwards, then patch response ID
         let resp = next.run(req).await;
-        if let Some(ref our_id) = response_id {
-            patch_response_id(resp, our_id).await
-        } else {
-            resp
-        }
+        patch_response_id(resp, &resp_id).await
     }
 }
 

@@ -151,7 +151,6 @@ mod email;
 pub mod encryption;
 mod error_enrichment;
 pub mod errors;
-mod fusillade_outlet_handler;
 mod leader_election;
 pub mod limits;
 mod metrics;
@@ -160,8 +159,7 @@ mod openapi;
 mod payment_providers;
 mod probes;
 mod request_logging;
-pub mod response_store;
-mod responses_middleware;
+pub mod responses;
 pub mod sample_files;
 mod static_assets;
 mod sync;
@@ -296,7 +294,7 @@ where
     pub connections_encryption_key: Option<Vec<u8>>,
     /// Response store for Open Responses API lifecycle tracking.
     /// Reads/writes to fusillade's requests table.
-    pub response_store: Arc<crate::response_store::FusilladeResponseStore>,
+    pub response_store: Arc<crate::responses::store::FusilladeResponseStore>,
 }
 
 impl<P> AppState<P>
@@ -974,7 +972,7 @@ pub async fn build_router(
     analytics_sender: Option<request_logging::batcher::AnalyticsSender>,
     metrics_recorder: Option<GenAiMetrics>,
     strict_mode: bool,
-    responses_middleware_state: Option<crate::responses_middleware::ResponsesMiddlewareState>,
+    responses_middleware_state: Option<crate::responses::middleware::ResponsesMiddlewareState>,
 ) -> anyhow::Result<Router> {
     let config = state.current_config();
 
@@ -1014,9 +1012,10 @@ pub async fn build_router(
             multi_handler = multi_handler.with(analytics_handler);
         }
 
-        // Add FusilladeOutletHandler to write response bodies back to fusillade
+        // Add FusilladeOutletHandler to enqueue response completion jobs
         if let Some(ref rms) = responses_middleware_state {
-            let fusillade_handler = crate::fusillade_outlet_handler::FusilladeOutletHandler::new(rms.pool.clone());
+            let fusillade_handler =
+                crate::responses::outlet_handler::FusilladeOutletHandler::new(state.task_runner.complete_response_job.clone());
             multi_handler = multi_handler.with(fusillade_handler);
         }
 
@@ -1354,7 +1353,7 @@ pub async fn build_router(
                 .route("/files/{file_id}/content", get(api::handlers::files::get_file_content))
                 .route("/files/{file_id}/cost-estimate", get(api::handlers::files::get_file_cost_estimate))
                 // Responses retrieval (Open Responses API)
-                .route("/responses/{response_id}", get(api::handlers::responses::get_response))
+                .route("/responses/{response_id}", get(crate::responses::handler::get_response))
                 // Batches management
                 .route("/batches", post(api::handlers::batches::create_batch))
                 .route("/batches", get(api::handlers::batches::list_batches))
@@ -1411,7 +1410,7 @@ pub async fn build_router(
     let onwards_router = if let Some(rms) = responses_middleware_state {
         onwards_router.layer(middleware::from_fn_with_state(
             rms,
-            crate::responses_middleware::responses_middleware,
+            crate::responses::middleware::responses_middleware,
         ))
     } else {
         onwards_router
@@ -2468,12 +2467,13 @@ impl Application {
         });
 
         // Create the response store (read-only, for ResponseStore trait + GET handler)
-        let response_store = Arc::new(crate::response_store::FusilladeResponseStore::new(fusillade_write_pool.clone()));
+        let response_store = Arc::new(crate::responses::store::FusilladeResponseStore::new(fusillade_write_pool.clone()));
 
-        // Responses middleware state (writes pending rows before onwards)
-        let responses_middleware_state = crate::responses_middleware::ResponsesMiddlewareState {
+        // Responses middleware state (enqueues create-response jobs via underway)
+        let responses_middleware_state = crate::responses::middleware::ResponsesMiddlewareState {
             pool: fusillade_write_pool.clone(),
-            daemon_id: crate::response_store::OnwardsDaemonId(onwards_daemon_id),
+            daemon_id: crate::responses::store::OnwardsDaemonId(onwards_daemon_id),
+            create_response_job: bg_services.task_runner.create_response_job.clone(),
         };
 
         // Build onwards router from targets with body transform, response sanitization, and tool executor.

@@ -907,7 +907,7 @@ async fn test_request_logging_disabled(pool: PgPool) {
         .request_manager(request_manager)
         .task_runner(task_runner)
         .limiters(limiters)
-        .response_store(std::sync::Arc::new(crate::response_store::FusilladeResponseStore::new(
+        .response_store(std::sync::Arc::new(crate::responses::store::FusilladeResponseStore::new(
             pool.clone(),
         )))
         .build();
@@ -1275,7 +1275,7 @@ async fn test_build_router_with_metrics_disabled(pool: PgPool) {
         .request_manager(request_manager)
         .task_runner(task_runner)
         .limiters(limiters)
-        .response_store(std::sync::Arc::new(crate::response_store::FusilladeResponseStore::new(
+        .response_store(std::sync::Arc::new(crate::responses::store::FusilladeResponseStore::new(
             fusillade_pool,
         )))
         .build();
@@ -1335,7 +1335,7 @@ async fn test_build_router_with_metrics_enabled(pool: PgPool) {
         .request_manager(request_manager)
         .task_runner(task_runner)
         .limiters(limiters)
-        .response_store(std::sync::Arc::new(crate::response_store::FusilladeResponseStore::new(
+        .response_store(std::sync::Arc::new(crate::responses::store::FusilladeResponseStore::new(
             fusillade_pool,
         )))
         .build();

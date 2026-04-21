@@ -42,6 +42,22 @@ impl FusilladeResponseStore {
     }
 }
 
+/// Create a pending response in fusillade with a pre-generated response ID.
+///
+/// Used by the background path where the ID is generated before the task is spawned.
+pub async fn create_pending_with_id(
+    pool: &PgPool,
+    response_id: &str,
+    request: &serde_json::Value,
+    model: &str,
+    endpoint: &str,
+    daemon_id: OnwardsDaemonId,
+) -> Result<(), StoreError> {
+    let id = parse_response_id(response_id)?;
+    create_pending_inner(pool, id, request, model, endpoint, daemon_id).await?;
+    Ok(())
+}
+
 /// Create a pending response in fusillade (template + request rows).
 ///
 /// Called by the responses middleware before onwards proxies the request.
@@ -54,6 +70,19 @@ pub async fn create_pending(
     daemon_id: OnwardsDaemonId,
 ) -> Result<String, StoreError> {
     let id = Uuid::new_v4();
+    create_pending_inner(pool, id, request, model, endpoint, daemon_id).await?;
+    Ok(format!("resp_{id}"))
+}
+
+async fn create_pending_inner(
+    pool: &PgPool,
+    id: Uuid,
+    request: &serde_json::Value,
+    model: &str,
+    endpoint: &str,
+    daemon_id: OnwardsDaemonId,
+) -> Result<(), StoreError> {
+    let id = id;
     let now = Utc::now();
     let body = request.to_string();
 
@@ -87,7 +116,7 @@ pub async fn create_pending(
     .await
     .map_err(|e| StoreError::StorageError(format!("Failed to insert request: {e}")))?;
 
-    Ok(format!("resp_{id}"))
+    Ok(())
 }
 
 /// Mark a response as completed with the response body.
@@ -218,14 +247,12 @@ pub async fn create_batch_of_1(
     // Look up user from API key for batch attribution.
     // api_keys lives in the public schema (dwctl), not the fusillade schema.
     let created_by = if let Some(key) = api_key {
-        let row = sqlx::query(
-            "SELECT user_id FROM public.api_keys WHERE secret = $1 AND is_deleted = false LIMIT 1",
-        )
-        .bind(key)
-        .fetch_optional(pool)
-        .await
-        .ok()
-        .flatten();
+        let row = sqlx::query("SELECT user_id FROM public.api_keys WHERE secret = $1 AND is_deleted = false LIMIT 1")
+            .bind(key)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten();
 
         match row {
             Some(row) => {
