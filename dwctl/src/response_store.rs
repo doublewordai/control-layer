@@ -75,11 +75,13 @@ pub async fn create_pending(
     // (endpoint, method, path, body, api_key) live on request_templates.
     sqlx::query(
         "INSERT INTO requests (id, batch_id, template_id, model, custom_id, state, daemon_id, claimed_at, started_at)
-         VALUES ($1, NULL, $1, $2, NULL, 'processing', $3, $4, $4)",
+         VALUES ($1, NULL, $2, $3, NULL, 'processing', $4, $5, $6)",
     )
     .bind(id)
+    .bind(id) // template_id = same as request id
     .bind(model)
     .bind(daemon_id.0)
+    .bind(now)
     .bind(now)
     .execute(pool)
     .await
@@ -202,6 +204,7 @@ pub async fn create_batch_of_1(
     model: &str,
     endpoint: &str,
     completion_window: &str,
+    api_key: Option<&str>,
 ) -> Result<(String, Uuid), StoreError> {
     let file_id = Uuid::new_v4();
     let template_id = Uuid::new_v4();
@@ -211,6 +214,29 @@ pub async fn create_batch_of_1(
     let error_file_id = Uuid::new_v4();
     let now = Utc::now();
     let body = request.to_string();
+
+    // Look up user from API key for batch attribution.
+    // api_keys lives in the public schema (dwctl), not the fusillade schema.
+    let created_by = if let Some(key) = api_key {
+        let row = sqlx::query(
+            "SELECT user_id FROM public.api_keys WHERE secret = $1 AND is_deleted = false LIMIT 1",
+        )
+        .bind(key)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten();
+
+        match row {
+            Some(row) => {
+                let user_id: Uuid = row.get("user_id");
+                user_id.to_string()
+            }
+            None => String::new(),
+        }
+    } else {
+        String::new()
+    };
 
     // Parse completion window to compute expires_at
     let std_duration =
@@ -222,9 +248,10 @@ pub async fn create_batch_of_1(
     // Create file record (purpose = "batch")
     sqlx::query(
         "INSERT INTO files (id, name, status, uploaded_by, purpose, created_at, updated_at)
-         VALUES ($1, 'responses_api_single', 'processed', '', 'batch', $2, $2)",
+         VALUES ($1, 'responses_api_single', 'processed', $2, 'batch', $3, $3)",
     )
     .bind(file_id)
+    .bind(&created_by)
     .bind(now)
     .execute(pool)
     .await
@@ -258,19 +285,21 @@ pub async fn create_batch_of_1(
     .await
     .map_err(|e| StoreError::StorageError(format!("Failed to create template: {e}")))?;
 
-    // Create batch
+    // Create batch with user attribution
     sqlx::query(
-        "INSERT INTO batches (id, file_id, endpoint, completion_window, created_by, expires_at, output_file_id, error_file_id, total_requests, created_at)
-         VALUES ($1, $2, $3, $4, '', $5, $6, $7, 1, $8)",
+        "INSERT INTO batches (id, file_id, endpoint, completion_window, created_by, expires_at, output_file_id, error_file_id, total_requests, created_at, api_key)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1, $9, $10)",
     )
     .bind(batch_id)
     .bind(file_id)
     .bind(endpoint)
     .bind(completion_window)
+    .bind(&created_by)
     .bind(expires_at)
     .bind(output_file_id)
     .bind(error_file_id)
     .bind(now)
+    .bind(api_key.unwrap_or(""))
     .execute(pool)
     .await
     .map_err(|e| StoreError::StorageError(format!("Failed to create batch: {e}")))?;

@@ -66,6 +66,14 @@ pub async fn responses_middleware(State(state): State<ResponsesMiddlewareState>,
     let endpoint = parts.uri.path().to_string();
     let is_responses_api = endpoint.ends_with("/responses");
 
+    // Extract bearer token for batch attribution
+    let api_key = parts
+        .headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .map(|s| s.to_string());
+
     // Only the Responses API supports service_tier and background.
     // Chat completions and embeddings always use realtime tier.
     let (service_tier, background) = if is_responses_api {
@@ -86,7 +94,7 @@ pub async fn responses_middleware(State(state): State<ResponsesMiddlewareState>,
 
     match service_tier {
         ServiceTier::Realtime => handle_realtime(&state, &request_value, model, &endpoint, background, parts, body_bytes, next).await,
-        ServiceTier::Flex => handle_flex(&state, &request_value, model, &endpoint, background).await,
+        ServiceTier::Flex => handle_flex(&state, &request_value, model, &endpoint, background, api_key.as_deref()).await,
     }
 }
 
@@ -164,13 +172,24 @@ async fn handle_realtime(
             "output": [],
         });
         tokio::spawn(async move {
-            let _response = next.run(req).await;
+            let response = next.run(req).await;
+            // Consume the response body so outlet's tee-stream captures all chunks.
+            // Without this, dropping the response would drop the stream before
+            // outlet finishes reading, resulting in an empty body in fusillade.
+            let (_parts, body) = response.into_parts();
+            let _ = axum::body::to_bytes(body, usize::MAX).await;
             // outlet handler will update the row on completion
         });
         (StatusCode::ACCEPTED, Json(response_body)).into_response()
     } else {
-        // Blocking: proxy normally, outlet handler writes body on completion
-        next.run(req).await
+        // Blocking: proxy normally, outlet handler writes body on completion.
+        // Patch the response ID to use our fusillade ID so GET /v1/responses/{id} works.
+        let resp = next.run(req).await;
+        if let Some(ref our_id) = response_id {
+            patch_response_id(resp, our_id).await
+        } else {
+            resp
+        }
     }
 }
 
@@ -185,8 +204,9 @@ async fn handle_flex(
     model: &str,
     endpoint: &str,
     background: bool,
+    api_key: Option<&str>,
 ) -> Response {
-    let result = response_store::create_batch_of_1(&state.pool, request_value, model, endpoint, "1h").await;
+    let result = response_store::create_batch_of_1(&state.pool, request_value, model, endpoint, "1h", api_key).await;
 
     let (response_id, _request_id) = match result {
         Ok(ids) => ids,
@@ -249,6 +269,38 @@ async fn handle_flex(
                 (StatusCode::GATEWAY_TIMEOUT, Json(response_body)).into_response()
             }
         }
+    }
+}
+
+/// Patch the `id` field in a JSON response body to use our fusillade ID.
+/// If the body can't be parsed or is streaming, returns the response unchanged.
+async fn patch_response_id(response: Response, fusillade_id: &str) -> Response {
+    let (parts, body) = response.into_parts();
+
+    // Only patch JSON responses (not streaming SSE)
+    let is_json = parts
+        .headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.contains("application/json"));
+
+    if !is_json {
+        return Response::from_parts(parts, body);
+    }
+
+    match axum::body::to_bytes(body, usize::MAX).await {
+        Ok(bytes) => {
+            if let Ok(mut json) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                if json.get("id").is_some() {
+                    json["id"] = serde_json::Value::String(fusillade_id.to_string());
+                }
+                let patched = serde_json::to_vec(&json).unwrap_or_else(|_| bytes.to_vec());
+                Response::from_parts(parts, Body::from(patched))
+            } else {
+                Response::from_parts(parts, Body::from(bytes))
+            }
+        }
+        Err(_) => Response::from_parts(parts, Body::empty()),
     }
 }
 

@@ -208,6 +208,68 @@ async fn test_chat_completion_creates_retrievable_response(pool: PgPool) {
     assert_eq!(body["status"].as_str(), Some("completed"));
     assert_eq!(body["model"].as_str(), Some("gpt-4o"));
     assert_eq!(body["object"].as_str(), Some("response"));
+
+    // Verify the response body was captured (not empty)
+    let db_row = sqlx::query("SELECT length(response_body) as body_len FROM fusillade.requests WHERE id = $1")
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let body_len: i32 = sqlx::Row::get(&db_row, "body_len");
+    assert!(
+        body_len > 0,
+        "Response body should be captured by outlet handler, got length {body_len}"
+    );
+}
+
+/// Test that the blocking response ID returned to the client matches the fusillade ID.
+#[sqlx::test]
+#[test_log::test]
+async fn test_blocking_response_id_matches_fusillade_id(pool: PgPool) {
+    let mock_server = wiremock::MockServer::start().await;
+    mount_chat_completions_mock(&mock_server).await;
+
+    let (server, api_key, _bg) = setup_ai_test(pool.clone(), &mock_server, true).await;
+
+    let response = server
+        .post("/ai/v1/chat/completions")
+        .add_header("Authorization", &format!("Bearer {}", api_key))
+        .add_header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "Hi"}],
+            "service_tier": "priority"
+        }))
+        .await;
+
+    assert_eq!(response.status_code(), 200);
+    let body: serde_json::Value = response.json();
+    let client_id = body["id"].as_str().unwrap();
+
+    // The ID returned to the client should be a fusillade resp_ ID
+    assert!(
+        client_id.starts_with("resp_"),
+        "Client should receive fusillade ID, got: {client_id}"
+    );
+
+    // And it should be retrievable
+    let start = std::time::Instant::now();
+    let mut found = false;
+    while start.elapsed() < std::time::Duration::from_secs(5) {
+        let retrieve = server
+            .get(&format!("/ai/v1/responses/{}", client_id))
+            .add_header("Authorization", &format!("Bearer {}", api_key))
+            .await;
+        if retrieve.status_code() == 200 {
+            let r: serde_json::Value = retrieve.json();
+            if r["status"].as_str() == Some("completed") {
+                found = true;
+                break;
+            }
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    }
+    assert!(found, "Response should be retrievable by the client-facing ID");
 }
 
 /// Test that POST /v1/responses with service_tier=priority (via adapter) creates a retrievable row.
@@ -375,6 +437,15 @@ async fn test_flex_background_returns_202_with_queued_status(pool: PgPool) {
 
     assert_eq!(state, "pending", "Async request should be in pending state");
     assert!(batch_id.is_some(), "Async request should have a batch_id");
+
+    // Verify batch has user attribution (created_by should not be empty)
+    let batch_row = sqlx::query("SELECT created_by FROM fusillade.batches WHERE id = $1")
+        .bind(batch_id.unwrap())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let created_by: String = sqlx::Row::get(&batch_row, "created_by");
+    assert!(!created_by.is_empty(), "Flex batch should have created_by set for user attribution");
 }
 
 /// Test that flex + background=false holds the connection and returns the

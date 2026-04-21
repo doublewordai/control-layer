@@ -2429,6 +2429,44 @@ impl Application {
         });
         tracing::info!(daemon_id = %onwards_daemon_id, "Registered onwards as fusillade daemon");
 
+        // Spawn a background task to send periodic heartbeats for the onwards daemon.
+        // Without this, fusillade's stale daemon detection would unclaim our processing
+        // rows after stale_daemon_threshold_ms (default 30s).
+        let heartbeat_pool = fusillade_write_pool.clone();
+        let heartbeat_daemon_id = onwards_daemon_id;
+        let heartbeat_shutdown = bg_services.shutdown_token();
+        bg_services.spawn("onwards-daemon-heartbeat", async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        let result = sqlx::query(
+                            "UPDATE daemons SET last_heartbeat = NOW() WHERE id = $1",
+                        )
+                        .bind(heartbeat_daemon_id)
+                        .execute(&heartbeat_pool)
+                        .await;
+
+                        if let Err(e) = result {
+                            tracing::warn!(error = %e, "Failed to send onwards daemon heartbeat");
+                        }
+                    }
+                    _ = heartbeat_shutdown.cancelled() => {
+                        // Mark daemon as dead on shutdown
+                        let _ = sqlx::query(
+                            "UPDATE daemons SET status = 'dead', stopped_at = NOW() WHERE id = $1",
+                        )
+                        .bind(heartbeat_daemon_id)
+                        .execute(&heartbeat_pool)
+                        .await;
+                        tracing::info!(daemon_id = %heartbeat_daemon_id, "Onwards daemon marked as dead");
+                        break;
+                    }
+                }
+            }
+            Ok(())
+        });
+
         // Create the response store (read-only, for ResponseStore trait + GET handler)
         let response_store = Arc::new(crate::response_store::FusilladeResponseStore::new(fusillade_write_pool.clone()));
 
