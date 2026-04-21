@@ -254,9 +254,10 @@ pub async fn create_batch_of_1(
     .await
     .map_err(|e| StoreError::StorageError(format!("Failed to create request: {e}")))?;
 
-    // Mark batch as started (so daemon sees it as active)
+    // Mark batch as started so daemon sees it as active.
+    // The pending_requests counter is maintained by triggers when requests are inserted.
     sqlx::query(
-        "UPDATE batches SET requests_started_at = $2, pending_requests = 1 WHERE id = $1",
+        "UPDATE batches SET requests_started_at = $2 WHERE id = $1",
     )
     .bind(batch_id)
     .bind(now)

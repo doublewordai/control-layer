@@ -149,8 +149,8 @@ async fn mount_chat_completions_mock(mock_server: &wiremock::MockServer) {
         .await;
 }
 
-/// Test that POST /v1/chat/completions creates a fusillade row and
-/// GET /v1/responses/{id} retrieves it.
+/// Test that POST /v1/chat/completions with service_tier=priority creates a fusillade row
+/// and GET /v1/responses/{id} retrieves it.
 #[sqlx::test]
 #[test_log::test]
 async fn test_chat_completion_creates_retrievable_response(pool: PgPool) {
@@ -159,14 +159,15 @@ async fn test_chat_completion_creates_retrievable_response(pool: PgPool) {
 
     let (server, api_key, _bg) = setup_ai_test(pool.clone(), &mock_server, true).await;
 
-    // Make a chat completion request
+    // Make a chat completion request with priority tier (realtime)
     let response = server
         .post("/ai/v1/chat/completions")
         .add_header("Authorization", &format!("Bearer {}", api_key))
         .add_header("Content-Type", "application/json")
         .json(&serde_json::json!({
             "model": "gpt-4o",
-            "messages": [{"role": "user", "content": "Hello"}]
+            "messages": [{"role": "user", "content": "Hello"}],
+            "service_tier": "priority"
         }))
         .await;
 
@@ -217,7 +218,7 @@ async fn test_chat_completion_creates_retrievable_response(pool: PgPool) {
     assert_eq!(body["object"].as_str(), Some("response"));
 }
 
-/// Test that POST /v1/responses (via adapter) creates a retrievable row.
+/// Test that POST /v1/responses with service_tier=priority (via adapter) creates a retrievable row.
 #[sqlx::test]
 #[test_log::test]
 async fn test_responses_api_creates_retrievable_response(pool: PgPool) {
@@ -226,14 +227,15 @@ async fn test_responses_api_creates_retrievable_response(pool: PgPool) {
 
     let (server, api_key, _bg) = setup_ai_test(pool.clone(), &mock_server, true).await;
 
-    // Make a responses API request (adapter mode converts to chat completions)
+    // Make a responses API request with priority tier (adapter mode, realtime)
     let response = server
         .post("/ai/v1/responses")
         .add_header("Authorization", &format!("Bearer {}", api_key))
         .add_header("Content-Type", "application/json")
         .json(&serde_json::json!({
             "model": "gpt-4o",
-            "input": "Hello from responses API"
+            "input": "Hello from responses API",
+            "service_tier": "priority"
         }))
         .await;
 
@@ -332,4 +334,139 @@ async fn test_fusillade_header_skips_row_creation(pool: PgPool) {
         before.0, after.0,
         "Requests with X-Fusillade-Request-Id should not create new fusillade rows"
     );
+}
+
+/// Test that a default service_tier (async) request with background=true returns 202
+/// and creates a batch of 1 in fusillade.
+#[sqlx::test]
+#[test_log::test]
+async fn test_async_background_returns_202_with_queued_status(pool: PgPool) {
+    let mock_server = wiremock::MockServer::start().await;
+    mount_chat_completions_mock(&mock_server).await;
+
+    let (server, api_key, _bg) = setup_ai_test(pool.clone(), &mock_server, true).await;
+
+    // Make a responses API request with default tier + background=true
+    let response = server
+        .post("/ai/v1/responses")
+        .add_header("Authorization", &format!("Bearer {}", api_key))
+        .add_header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "model": "gpt-4o",
+            "input": "Process this asynchronously",
+            "background": true
+        }))
+        .await;
+
+    assert_eq!(
+        response.status_code(),
+        202,
+        "Async background request should return 202"
+    );
+
+    let body: serde_json::Value = response.json();
+    assert_eq!(body["status"].as_str(), Some("queued"));
+    assert_eq!(body["object"].as_str(), Some("response"));
+    assert!(body["id"].as_str().unwrap().starts_with("resp_"));
+    assert_eq!(body["background"].as_bool(), Some(true));
+
+    // Verify the request was created in fusillade with a batch
+    let resp_id = body["id"].as_str().unwrap();
+    let uuid_str = resp_id.strip_prefix("resp_").unwrap();
+    let request_id: uuid::Uuid = uuid_str.parse().unwrap();
+
+    let row = sqlx::query("SELECT state, batch_id FROM fusillade.requests WHERE id = $1")
+        .bind(request_id)
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+
+    assert!(row.is_some(), "Request row should exist in fusillade");
+    let row = row.unwrap();
+    let state: &str = sqlx::Row::get(&row, "state");
+    let batch_id: Option<uuid::Uuid> = sqlx::Row::get(&row, "batch_id");
+
+    assert_eq!(state, "pending", "Async request should be in pending state");
+    assert!(batch_id.is_some(), "Async request should have a batch_id");
+}
+
+/// Test that a flex service_tier request with background=true returns 202
+/// and creates a batch with 24h window.
+#[sqlx::test]
+#[test_log::test]
+async fn test_flex_background_returns_202(pool: PgPool) {
+    let mock_server = wiremock::MockServer::start().await;
+    mount_chat_completions_mock(&mock_server).await;
+
+    let (server, api_key, _bg) = setup_ai_test(pool.clone(), &mock_server, true).await;
+
+    let response = server
+        .post("/ai/v1/responses")
+        .add_header("Authorization", &format!("Bearer {}", api_key))
+        .add_header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "model": "gpt-4o",
+            "input": "Process this at batch pricing",
+            "service_tier": "flex",
+            "background": true
+        }))
+        .await;
+
+    assert_eq!(response.status_code(), 202);
+
+    let body: serde_json::Value = response.json();
+    assert_eq!(body["status"].as_str(), Some("queued"));
+    assert_eq!(body["service_tier"].as_str(), Some("flex"));
+
+    // Verify the batch has 24h completion window
+    let resp_id = body["id"].as_str().unwrap();
+    let uuid_str = resp_id.strip_prefix("resp_").unwrap();
+    let request_id: uuid::Uuid = uuid_str.parse().unwrap();
+
+    let row = sqlx::query(
+        "SELECT b.completion_window FROM fusillade.requests r
+         JOIN fusillade.batches b ON r.batch_id = b.id
+         WHERE r.id = $1",
+    )
+    .bind(request_id)
+    .fetch_optional(&pool)
+    .await
+    .unwrap();
+
+    let row = row.expect("Batch row should exist");
+    let completion_window: String = sqlx::Row::get(&row, "completion_window");
+    assert_eq!(completion_window, "24h");
+}
+
+/// Test that priority + background=true returns 202 with in_progress status.
+#[sqlx::test]
+#[test_log::test]
+async fn test_priority_background_returns_202(pool: PgPool) {
+    let mock_server = wiremock::MockServer::start().await;
+    mount_chat_completions_mock(&mock_server).await;
+
+    let (server, api_key, _bg) = setup_ai_test(pool.clone(), &mock_server, true).await;
+
+    let response = server
+        .post("/ai/v1/responses")
+        .add_header("Authorization", &format!("Bearer {}", api_key))
+        .add_header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "model": "gpt-4o",
+            "input": "Process in background but at realtime priority",
+            "service_tier": "priority",
+            "background": true
+        }))
+        .await;
+
+    assert_eq!(
+        response.status_code(),
+        202,
+        "Priority background should return 202"
+    );
+
+    let body: serde_json::Value = response.json();
+    assert_eq!(body["status"].as_str(), Some("in_progress"));
+    assert_eq!(body["background"].as_bool(), Some(true));
+    assert!(body["id"].as_str().unwrap().starts_with("resp_"));
 }
