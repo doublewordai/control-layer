@@ -1,4 +1,5 @@
 pub mod databases;
+pub mod responses;
 pub mod sla;
 pub mod strict_mode;
 pub mod utils;

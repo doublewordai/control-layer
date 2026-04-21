@@ -111,7 +111,7 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use std::collections::HashMap;
-    use std::time::{Duration, SystemTime};
+    use std::time::SystemTime;
 
     fn make_request_data(headers: HashMap<String, Vec<Bytes>>) -> RequestData {
         RequestData {

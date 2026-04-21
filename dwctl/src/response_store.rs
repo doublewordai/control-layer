@@ -73,14 +73,14 @@ pub async fn create_pending(
     .await
     .map_err(|e| StoreError::StorageError(format!("Failed to insert template: {e}")))?;
 
-    // Insert request row in processing state (onwards is the daemon)
+    // Insert request row in processing state (onwards is the daemon).
+    // Only model and custom_id are denormalized on requests; other fields
+    // (endpoint, method, path, body, api_key) live on request_templates.
     sqlx::query(
-        "INSERT INTO requests (id, batch_id, template_id, endpoint, method, path, body, model, api_key, state, daemon_id, claimed_at, started_at)
-         VALUES ($1, NULL, $1, $2, 'POST', $2, $3, $4, '', 'processing', $5, $6, $6)",
+        "INSERT INTO requests (id, batch_id, template_id, model, custom_id, state, daemon_id, claimed_at, started_at)
+         VALUES ($1, NULL, $1, $2, NULL, 'processing', $3, $4, $4)",
     )
     .bind(id)
-    .bind(endpoint)
-    .bind(&body)
     .bind(model)
     .bind(daemon_id.0)
     .bind(now)
@@ -239,10 +239,11 @@ impl ResponseStore for FusilladeResponseStore {
         let id = parse_response_id(response_id)?;
 
         let row = sqlx::query(
-            "SELECT id, state, model, body, response_body, response_status,
-                    error, created_at, completed_at, failed_at, batch_id
-             FROM requests
-             WHERE id = $1",
+            "SELECT r.id, r.state, r.model, t.body, r.response_body, r.response_status,
+                    r.error, r.created_at, r.completed_at, r.failed_at, r.batch_id
+             FROM requests r
+             LEFT JOIN request_templates t ON r.template_id = t.id
+             WHERE r.id = $1",
         )
         .bind(id)
         .fetch_optional(&self.pool)
