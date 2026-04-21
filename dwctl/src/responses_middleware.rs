@@ -13,16 +13,16 @@
 //! - `flex` (batch): same as default but with 24h completion window and batch pricing.
 
 use axum::{
+    Json,
     body::Body,
     extract::State,
     http::{Request, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
-    Json,
 };
 use sqlx::PgPool;
 
-use crate::response_store::{self, OnwardsDaemonId, ONWARDS_RESPONSE_ID_HEADER};
+use crate::response_store::{self, ONWARDS_RESPONSE_ID_HEADER, OnwardsDaemonId};
 
 /// State for the responses middleware.
 #[derive(Clone)]
@@ -33,11 +33,7 @@ pub struct ResponsesMiddlewareState {
 
 /// Middleware that routes inference requests based on service_tier and background.
 #[tracing::instrument(skip_all)]
-pub async fn responses_middleware(
-    State(state): State<ResponsesMiddlewareState>,
-    req: Request<Body>,
-    next: Next,
-) -> Response {
+pub async fn responses_middleware(State(state): State<ResponsesMiddlewareState>, req: Request<Body>, next: Next) -> Response {
     // Only intercept POST requests to inference endpoints.
     if !should_intercept(req.method(), req.uri().path()) {
         return next.run(req).await;
@@ -54,10 +50,7 @@ pub async fn responses_middleware(
         Ok(bytes) => bytes,
         Err(e) => {
             tracing::error!(error = %e, "Failed to read request body in responses middleware");
-            return Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .body(Body::empty())
-                .unwrap();
+            return Response::builder().status(StatusCode::BAD_REQUEST).body(Body::empty()).unwrap();
         }
     };
 
@@ -65,10 +58,7 @@ pub async fn responses_middleware(
         Ok(v) => v,
         Err(e) => {
             tracing::error!(error = %e, "Failed to parse request body in responses middleware");
-            return Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .body(Body::empty())
-                .unwrap();
+            return Response::builder().status(StatusCode::BAD_REQUEST).body(Body::empty()).unwrap();
         }
     };
 
@@ -95,12 +85,8 @@ pub async fn responses_middleware(
     );
 
     match service_tier {
-        ServiceTier::Realtime => {
-            handle_realtime(&state, &request_value, model, &endpoint, background, parts, body_bytes, next).await
-        }
-        ServiceTier::Flex => {
-            handle_flex(&state, &request_value, model, &endpoint, background).await
-        }
+        ServiceTier::Realtime => handle_realtime(&state, &request_value, model, &endpoint, background, parts, body_bytes, next).await,
+        ServiceTier::Flex => handle_flex(&state, &request_value, model, &endpoint, background).await,
     }
 }
 
@@ -135,6 +121,7 @@ fn resolve_service_tier(tier: Option<&str>) -> ServiceTier {
 ///
 /// Creates a `processing` row and proxies via onwards.
 /// With `background=true`, returns 202 immediately and spawns the proxy as a background task.
+#[allow(clippy::too_many_arguments)]
 async fn handle_realtime(
     state: &ResponsesMiddlewareState,
     request_value: &serde_json::Value,
@@ -147,15 +134,7 @@ async fn handle_realtime(
 ) -> Response {
     // Create the pending fusillade row (processing state, onwards is the daemon).
     // If this fails, proceed without tracking.
-    let response_id = match response_store::create_pending(
-        &state.pool,
-        request_value,
-        model,
-        endpoint,
-        state.daemon_id,
-    )
-    .await
-    {
+    let response_id = match response_store::create_pending(&state.pool, request_value, model, endpoint, state.daemon_id).await {
         Ok(id) => {
             tracing::debug!(response_id = %id, "Created pending response (priority)");
             Some(id)
@@ -169,10 +148,8 @@ async fn handle_realtime(
     // Reconstruct the request, attaching the response ID header if tracking succeeded
     let mut req = Request::from_parts(parts, Body::from(body_bytes));
     if let Some(ref id) = response_id {
-        req.headers_mut().insert(
-            ONWARDS_RESPONSE_ID_HEADER,
-            id.parse().expect("response_id is valid header value"),
-        );
+        req.headers_mut()
+            .insert(ONWARDS_RESPONSE_ID_HEADER, id.parse().expect("response_id is valid header value"));
     }
 
     if background {
@@ -209,14 +186,7 @@ async fn handle_flex(
     endpoint: &str,
     background: bool,
 ) -> Response {
-    let result = response_store::create_batch_of_1(
-        &state.pool,
-        request_value,
-        model,
-        endpoint,
-        "1h",
-    )
-    .await;
+    let result = response_store::create_batch_of_1(&state.pool, request_value, model, endpoint, "1h").await;
 
     let (response_id, _request_id) = match result {
         Ok(ids) => ids,
@@ -259,14 +229,7 @@ async fn handle_flex(
         let poll_interval = std::time::Duration::from_millis(500);
         let timeout = std::time::Duration::from_secs(3600); // 1h matches completion_window
 
-        match response_store::poll_until_complete(
-            &state.pool,
-            &response_id,
-            poll_interval,
-            timeout,
-        )
-        .await
-        {
+        match response_store::poll_until_complete(&state.pool, &response_id, poll_interval, timeout).await {
             Ok(response_obj) => {
                 let status_code = if response_obj["status"].as_str() == Some("completed") {
                     StatusCode::OK
@@ -292,9 +255,7 @@ async fn handle_flex(
 /// Check if a request should be intercepted by this middleware.
 pub(crate) fn should_intercept(method: &axum::http::Method, path: &str) -> bool {
     method == axum::http::Method::POST
-        && (path.ends_with("/responses")
-            || path.ends_with("/chat/completions")
-            || path.ends_with("/embeddings"))
+        && (path.ends_with("/responses") || path.ends_with("/chat/completions") || path.ends_with("/embeddings"))
 }
 
 #[cfg(test)]
@@ -309,18 +270,12 @@ mod tests {
 
     #[test]
     fn test_should_intercept_chat_completions() {
-        assert!(should_intercept(
-            &axum::http::Method::POST,
-            "/v1/chat/completions"
-        ));
+        assert!(should_intercept(&axum::http::Method::POST, "/v1/chat/completions"));
     }
 
     #[test]
     fn test_should_intercept_embeddings() {
-        assert!(should_intercept(
-            &axum::http::Method::POST,
-            "/v1/embeddings"
-        ));
+        assert!(should_intercept(&axum::http::Method::POST, "/v1/embeddings"));
     }
 
     #[test]

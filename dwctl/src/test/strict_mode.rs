@@ -916,7 +916,11 @@ async fn test_strict_mode_allows_responses(pool: PgPool) {
         }))
         .await;
 
-    assert_eq!(response.status_code(), 200, "Expected 200 for /v1/responses in strict mode with priority tier");
+    assert_eq!(
+        response.status_code(),
+        200,
+        "Expected 200 for /v1/responses in strict mode with priority tier"
+    );
 
     let body: serde_json::Value = response.json();
     // Response ID may be overwritten by the fusillade store if configured, or the provider's ID

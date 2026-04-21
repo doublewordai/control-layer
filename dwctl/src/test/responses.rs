@@ -62,10 +62,7 @@ async fn setup_ai_test(
     // Assign model to default group
     let group_id = "00000000-0000-0000-0000-000000000000";
     server
-        .post(&format!(
-            "/admin/api/v1/groups/{}/models/{}",
-            group_id, deployment_id
-        ))
+        .post(&format!("/admin/api/v1/groups/{}/models/{}", group_id, deployment_id))
         .add_header(&admin_headers[0].0, &admin_headers[0].1)
         .add_header(&admin_headers[1].0, &admin_headers[1].1)
         .await;
@@ -124,27 +121,25 @@ async fn setup_ai_test(
 async fn mount_chat_completions_mock(mock_server: &wiremock::MockServer) {
     wiremock::Mock::given(wiremock::matchers::method("POST"))
         .and(wiremock::matchers::path("/chat/completions"))
-        .respond_with(
-            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "id": "chatcmpl-test123",
-                "object": "chat.completion",
-                "created": 1700000000,
-                "model": "gpt-4o",
-                "choices": [{
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": "Hello from the test!"
-                    },
-                    "finish_reason": "stop"
-                }],
-                "usage": {
-                    "prompt_tokens": 10,
-                    "completion_tokens": 5,
-                    "total_tokens": 15
-                }
-            })),
-        )
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test123",
+            "object": "chat.completion",
+            "created": 1700000000,
+            "model": "gpt-4o",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "Hello from the test!"
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "total_tokens": 15
+            }
+        })))
         .mount(mock_server)
         .await;
 }
@@ -171,11 +166,7 @@ async fn test_chat_completion_creates_retrievable_response(pool: PgPool) {
         }))
         .await;
 
-    assert_eq!(
-        response.status_code(),
-        200,
-        "Chat completion should succeed"
-    );
+    assert_eq!(response.status_code(), 200, "Chat completion should succeed");
 
     // The outlet handler runs asynchronously in a background task, so poll
     // until the row transitions from 'processing' to 'completed'.
@@ -183,12 +174,10 @@ async fn test_chat_completion_creates_retrievable_response(pool: PgPool) {
     let mut id = uuid::Uuid::nil();
     let mut final_state = String::new();
     while start.elapsed() < std::time::Duration::from_secs(5) {
-        let row = sqlx::query(
-            "SELECT id, state, model FROM fusillade.requests WHERE batch_id IS NULL ORDER BY created_at DESC LIMIT 1"
-        )
-        .fetch_optional(&pool)
-        .await
-        .unwrap();
+        let row = sqlx::query("SELECT id, state, model FROM fusillade.requests WHERE batch_id IS NULL ORDER BY created_at DESC LIMIT 1")
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
 
         if let Some(row) = row {
             id = sqlx::Row::get(&row, "id");
@@ -212,11 +201,7 @@ async fn test_chat_completion_creates_retrievable_response(pool: PgPool) {
 
     // Note: GET /responses/{id} is on the batches router which requires auth
     // but uses the same state. Check it returns a valid response.
-    assert_eq!(
-        retrieve_response.status_code(),
-        200,
-        "GET /v1/responses/{{id}} should return 200"
-    );
+    assert_eq!(retrieve_response.status_code(), 200, "GET /v1/responses/{{id}} should return 200");
 
     let body: serde_json::Value = retrieve_response.json();
     assert_eq!(body["id"].as_str(), Some(response_id.as_str()));
@@ -246,11 +231,7 @@ async fn test_responses_api_creates_retrievable_response(pool: PgPool) {
         }))
         .await;
 
-    assert_eq!(
-        response.status_code(),
-        200,
-        "Responses API request should succeed"
-    );
+    assert_eq!(response.status_code(), 200, "Responses API request should succeed");
 
     // Poll until the outlet handler completes the row
     let start = std::time::Instant::now();
@@ -326,10 +307,7 @@ async fn test_fusillade_header_skips_row_creation(pool: PgPool) {
         .post("/ai/v1/chat/completions")
         .add_header("Authorization", &format!("Bearer {}", api_key))
         .add_header("Content-Type", "application/json")
-        .add_header(
-            "X-Fusillade-Request-Id",
-            &uuid::Uuid::new_v4().to_string(),
-        )
+        .add_header("X-Fusillade-Request-Id", &uuid::Uuid::new_v4().to_string())
         .json(&serde_json::json!({
             "model": "gpt-4o",
             "messages": [{"role": "user", "content": "Hello from batch"}]
@@ -371,11 +349,7 @@ async fn test_flex_background_returns_202_with_queued_status(pool: PgPool) {
         }))
         .await;
 
-    assert_eq!(
-        response.status_code(),
-        202,
-        "Async background request should return 202"
-    );
+    assert_eq!(response.status_code(), 202, "Async background request should return 202");
 
     let body: serde_json::Value = response.json();
     assert_eq!(body["status"].as_str(), Some("queued"));
@@ -421,7 +395,7 @@ async fn test_flex_blocking_waits_for_completion(pool: PgPool) {
         let start = std::time::Instant::now();
         loop {
             let row = sqlx::query(
-                "SELECT id FROM fusillade.requests WHERE state = 'pending' AND batch_id IS NOT NULL ORDER BY created_at DESC LIMIT 1"
+                "SELECT id FROM fusillade.requests WHERE state = 'pending' AND batch_id IS NOT NULL ORDER BY created_at DESC LIMIT 1",
             )
             .fetch_optional(&pool_clone)
             .await
@@ -499,11 +473,7 @@ async fn test_priority_background_completes_and_is_retrievable(pool: PgPool) {
         }))
         .await;
 
-    assert_eq!(
-        response.status_code(),
-        202,
-        "Priority background should return 202"
-    );
+    assert_eq!(response.status_code(), 202, "Priority background should return 202");
 
     let body: serde_json::Value = response.json();
     assert_eq!(body["status"].as_str(), Some("in_progress"));
@@ -531,8 +501,5 @@ async fn test_priority_background_completes_and_is_retrievable(pool: PgPool) {
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
     }
 
-    assert_eq!(
-        final_status, "completed",
-        "Background priority request should eventually complete"
-    );
+    assert_eq!(final_status, "completed", "Background priority request should eventually complete");
 }

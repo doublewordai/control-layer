@@ -151,6 +151,7 @@ mod email;
 pub mod encryption;
 mod error_enrichment;
 pub mod errors;
+mod fusillade_outlet_handler;
 mod leader_election;
 pub mod limits;
 mod metrics;
@@ -158,7 +159,6 @@ mod notifications;
 mod openapi;
 mod payment_providers;
 mod probes;
-mod fusillade_outlet_handler;
 mod request_logging;
 pub mod response_store;
 mod responses_middleware;
@@ -1417,7 +1417,6 @@ pub async fn build_router(
         onwards_router
     };
 
-
     // Build the app with admin API and onwards proxy nested. serve the (restricted) openai spec.
     // Strict mode requires different nesting:
     // - Batches routes (no /v1 prefix) need to be at /ai/v1/files, /ai/v1/batches
@@ -2431,9 +2430,7 @@ impl Application {
         tracing::info!(daemon_id = %onwards_daemon_id, "Registered onwards as fusillade daemon");
 
         // Create the response store (read-only, for ResponseStore trait + GET handler)
-        let response_store = Arc::new(crate::response_store::FusilladeResponseStore::new(
-            fusillade_write_pool.clone(),
-        ));
+        let response_store = Arc::new(crate::response_store::FusilladeResponseStore::new(fusillade_write_pool.clone()));
 
         // Responses middleware state (writes pending rows before onwards)
         let responses_middleware_state = crate::responses_middleware::ResponsesMiddlewareState {

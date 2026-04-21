@@ -37,10 +37,7 @@ impl FusilladeResponseStore {
     }
 
     /// Retrieve a response by ID. Used by the GET /v1/responses/{id} handler.
-    pub async fn get_response(
-        &self,
-        response_id: &str,
-    ) -> Result<Option<serde_json::Value>, StoreError> {
+    pub async fn get_response(&self, response_id: &str) -> Result<Option<serde_json::Value>, StoreError> {
         self.get(response_id).await
     }
 }
@@ -94,12 +91,7 @@ pub async fn create_pending(
 /// Mark a response as completed with the response body.
 ///
 /// Called by the `FusilladeOutletHandler` after outlet captures the response.
-pub async fn complete_response(
-    pool: &PgPool,
-    response_id: &str,
-    response_body: &str,
-    status_code: u16,
-) -> Result<(), StoreError> {
+pub async fn complete_response(pool: &PgPool, response_id: &str, response_body: &str, status_code: u16) -> Result<(), StoreError> {
     let id = parse_response_id(response_id)?;
     let size = response_body.len() as i64;
 
@@ -126,11 +118,7 @@ pub async fn complete_response(
 /// Mark a response as failed.
 ///
 /// Called by the `FusilladeOutletHandler` when the upstream returns an error.
-pub async fn fail_response(
-    pool: &PgPool,
-    response_id: &str,
-    error: &str,
-) -> Result<(), StoreError> {
+pub async fn fail_response(pool: &PgPool, response_id: &str, error: &str) -> Result<(), StoreError> {
     let id = parse_response_id(response_id)?;
 
     let error_json = serde_json::json!({
@@ -225,10 +213,10 @@ pub async fn create_batch_of_1(
     let body = request.to_string();
 
     // Parse completion window to compute expires_at
-    let std_duration = humantime::parse_duration(completion_window)
-        .map_err(|e| StoreError::StorageError(format!("Invalid completion_window: {e}")))?;
-    let chrono_duration = chrono::Duration::from_std(std_duration)
-        .map_err(|e| StoreError::StorageError(format!("Duration conversion error: {e}")))?;
+    let std_duration =
+        humantime::parse_duration(completion_window).map_err(|e| StoreError::StorageError(format!("Invalid completion_window: {e}")))?;
+    let chrono_duration =
+        chrono::Duration::from_std(std_duration).map_err(|e| StoreError::StorageError(format!("Duration conversion error: {e}")))?;
     let expires_at = now + chrono_duration;
 
     // Create file record (purpose = "batch")
@@ -302,14 +290,12 @@ pub async fn create_batch_of_1(
 
     // Mark batch as started so daemon sees it as active.
     // The pending_requests counter is maintained by triggers when requests are inserted.
-    sqlx::query(
-        "UPDATE batches SET requests_started_at = $2 WHERE id = $1",
-    )
-    .bind(batch_id)
-    .bind(now)
-    .execute(pool)
-    .await
-    .map_err(|e| StoreError::StorageError(format!("Failed to activate batch: {e}")))?;
+    sqlx::query("UPDATE batches SET requests_started_at = $2 WHERE id = $1")
+        .bind(batch_id)
+        .bind(now)
+        .execute(pool)
+        .await
+        .map_err(|e| StoreError::StorageError(format!("Failed to activate batch: {e}")))?;
 
     let response_id = format!("resp_{request_id}");
     tracing::debug!(
@@ -325,8 +311,7 @@ pub async fn create_batch_of_1(
 /// Parse a response ID like "resp_<uuid>" into a UUID.
 fn parse_response_id(response_id: &str) -> Result<Uuid, StoreError> {
     let uuid_str = response_id.strip_prefix("resp_").unwrap_or(response_id);
-    Uuid::parse_str(uuid_str)
-        .map_err(|e| StoreError::NotFound(format!("Invalid response ID: {e}")))
+    Uuid::parse_str(uuid_str).map_err(|e| StoreError::NotFound(format!("Invalid response ID: {e}")))
 }
 
 /// Map a fusillade request state to an Open Responses API status.
@@ -364,22 +349,22 @@ fn row_to_response_object(row: &sqlx::postgres::PgRow) -> serde_json::Value {
 
     if status == "completed" {
         let response_body: Option<String> = row.get("response_body");
-        if let Some(ref body) = response_body {
-            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(body) {
-                if let Some(output) = parsed.get("output") {
-                    resp["output"] = output.clone();
-                }
-                if let Some(usage) = parsed.get("usage") {
-                    resp["usage"] = usage.clone();
-                }
-                // ChatCompletion format (batch results)
-                if parsed.get("choices").is_some() {
-                    resp["output"] = serde_json::json!([{
-                        "type": "message",
-                        "role": "assistant",
-                        "content": parsed
-                    }]);
-                }
+        if let Some(ref body) = response_body
+            && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(body)
+        {
+            if let Some(output) = parsed.get("output") {
+                resp["output"] = output.clone();
+            }
+            if let Some(usage) = parsed.get("usage") {
+                resp["usage"] = usage.clone();
+            }
+            // ChatCompletion format (batch results)
+            if parsed.get("choices").is_some() {
+                resp["output"] = serde_json::json!([{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": parsed
+                }]);
             }
         }
         let completed_at: Option<DateTime<Utc>> = row.get("completed_at");
@@ -423,18 +408,11 @@ impl ResponseStore for FusilladeResponseStore {
         // The adapter calls this after constructing the final response.
         // The row already exists (created by middleware), and the outlet handler
         // will write the response body. Just return the existing ID.
-        let id = response
-            .get("id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
+        let id = response.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
         Ok(id)
     }
 
-    async fn get_context(
-        &self,
-        response_id: &str,
-    ) -> Result<Option<serde_json::Value>, StoreError> {
+    async fn get_context(&self, response_id: &str) -> Result<Option<serde_json::Value>, StoreError> {
         self.get(response_id).await
     }
 }
