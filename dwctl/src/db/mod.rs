@@ -87,6 +87,7 @@
 //! dwctl::migrator().run(&pool).await?;
 //! ```
 
+pub mod audit;
 pub mod embedded;
 pub mod errors;
 pub mod handlers;
