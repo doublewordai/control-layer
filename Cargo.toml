@@ -2,3 +2,7 @@
 members = ["dwctl"]
 resolver = "2"
 
+# Uncomment to test with local onwards changes:
+# [patch.crates-io]
+# onwards = { path = "../onwards" }
+
