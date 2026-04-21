@@ -251,6 +251,9 @@ async fn handle_flex(
         (StatusCode::ACCEPTED, Json(response_body)).into_response()
     } else {
         // Blocking flex: hold the connection and poll until the daemon completes.
+        // If the client disconnects, the future is dropped but the batch remains
+        // in fusillade — the daemon still processes it and the client can poll
+        // GET /v1/responses/{id} later.
         tracing::debug!(response_id = %response_id, "Blocking flex — polling until daemon completes");
 
         let poll_interval = std::time::Duration::from_millis(500);
