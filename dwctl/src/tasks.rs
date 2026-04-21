@@ -13,7 +13,7 @@ use sqlx_pool_router::PoolProvider;
 use tokio_util::sync::CancellationToken;
 use underway::Job;
 
-use crate::api::handlers::batches::{CascadeBatchStateInput, CreateBatchInput, build_cascade_batch_state_job, build_create_batch_job};
+use crate::api::handlers::batches::{CreateBatchInput, build_create_batch_job};
 use crate::connections::sync::{
     ActivateBatchInput, IngestFileInput, SyncConnectionInput, build_activate_batch_job, build_ingest_file_job, build_sync_connection_job,
 };
@@ -46,8 +46,6 @@ pub struct TaskState<P: PoolProvider + Clone = sqlx_pool_router::DbPools> {
     pub activate_batch_job: WeakJobRef<ActivateBatchInput, P>,
     /// Weak reference to the CreateBatchInput job so ActivateBatchJob can enqueue populate.
     pub create_batch_job: WeakJobRef<CreateBatchInput, P>,
-    /// Weak reference to the CascadeBatchState job so cancel/delete handlers can enqueue cleanup.
-    pub cascade_batch_state_job: WeakJobRef<CascadeBatchStateInput, P>,
 }
 
 impl<P: PoolProvider + Clone> TaskState<P> {
@@ -77,15 +75,6 @@ impl<P: PoolProvider + Clone> TaskState<P> {
             .upgrade()
             .ok_or_else(|| anyhow::anyhow!("create_batch_job dropped (TaskRunner gone)"))
     }
-
-    /// Get the cascade batch state job.
-    pub fn get_cascade_batch_state_job(&self) -> anyhow::Result<Arc<Job<CascadeBatchStateInput, TaskState<P>>>> {
-        self.cascade_batch_state_job
-            .get()
-            .ok_or_else(|| anyhow::anyhow!("cascade_batch_state_job not initialized"))?
-            .upgrade()
-            .ok_or_else(|| anyhow::anyhow!("cascade_batch_state_job dropped (TaskRunner gone)"))
-    }
 }
 
 /// Manages underway jobs and worker lifecycle.
@@ -94,9 +83,6 @@ impl<P: PoolProvider + Clone> TaskState<P> {
 /// holds `Weak` references back, so dropping TaskRunner cleans up properly.
 pub struct TaskRunner<P: PoolProvider + Clone + 'static = sqlx_pool_router::DbPools> {
     pub create_batch_job: Arc<Job<CreateBatchInput, TaskState<P>>>,
-    /// `None` when `cascade_batch_state_workers` is 0 (avoids opening
-    /// PgListener connections during Job construction in test environments).
-    pub cascade_batch_state_job: Option<Arc<Job<CascadeBatchStateInput, TaskState<P>>>>,
     pub sync_connection_job: Arc<Job<SyncConnectionInput, TaskState<P>>>,
     pub ingest_file_job: Arc<Job<IngestFileInput, TaskState<P>>>,
     pub activate_batch_job: Arc<Job<ActivateBatchInput, TaskState<P>>>,
@@ -107,18 +93,8 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> TaskRunner<P> {
     ///
     /// All jobs share a single TaskState with `Weak` cross-references that are
     /// set after construction, breaking the reference cycle.
-    pub async fn new(pool: PgPool, state: TaskState<P>, task_config: &crate::config::TaskWorkersConfig) -> Result<Self> {
+    pub async fn new(pool: PgPool, state: TaskState<P>) -> Result<Self> {
         let create_batch_job = Arc::new(build_create_batch_job(pool.clone(), state.clone()).await?);
-        let cascade_batch_state_job = if task_config.cascade_batch_state_workers > 0 {
-            let job = Arc::new(build_cascade_batch_state_job(pool.clone(), state.clone()).await?);
-            state
-                .cascade_batch_state_job
-                .set(Arc::downgrade(&job))
-                .map_err(|_| anyhow::anyhow!("cascade_batch_state_job OnceLock already set"))?;
-            Some(job)
-        } else {
-            None
-        };
         let ingest_file_job = Arc::new(build_ingest_file_job(pool.clone(), state.clone()).await?);
         let activate_batch_job = Arc::new(build_activate_batch_job(pool.clone(), state.clone()).await?);
         let sync_connection_job = Arc::new(build_sync_connection_job(pool, state.clone()).await?);
@@ -140,7 +116,6 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> TaskRunner<P> {
 
         Ok(Self {
             create_batch_job,
-            cascade_batch_state_job,
             sync_connection_job,
             ingest_file_job,
             activate_batch_job,
@@ -149,49 +124,29 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> TaskRunner<P> {
 
     /// Start the underway workers with the given shutdown token and config.
     ///
-    /// Task workers (create-batch, cascade-batch-state) always run.
-    /// Sync workers (discovery, ingest, activate) are gated by `sync_config.enabled`.
+    /// The batch creation worker always runs (1 worker). Sync/ingest/activate
+    /// workers are controlled by `sync_config`:
+    /// - `enabled: false` -> no sync workers (API-only replica)
+    /// - Worker counts control concurrency per pipeline stage
     pub fn start(
         &self,
         shutdown_token: CancellationToken,
-        task_config: &crate::config::TaskWorkersConfig,
         sync_config: &crate::config::SyncWorkersConfig,
     ) -> Vec<(&'static str, tokio::task::JoinHandle<()>)> {
         let mut handles: Vec<(&'static str, tokio::task::JoinHandle<()>)> = Vec::new();
 
-        // Batch creation workers — handles both API-triggered and
-        // sync-triggered batch population. Always at least 1: without a
-        // worker, enqueued batch populations hang indefinitely.
-        let create_batch_workers = task_config.create_batch_workers.max(1);
-        for i in 0..create_batch_workers {
-            let mut worker = self.create_batch_job.worker();
-            worker.set_shutdown_token(shutdown_token.clone());
-            handles.push((
-                "create-batch-worker",
-                tokio::spawn(async move {
-                    if let Err(e) = worker.run().await {
-                        tracing::error!(error = %e, worker = i, "Create-batch worker error");
-                    }
-                }),
-            ));
-        }
-
-        // Cascade-batch-state workers — updates child request states after
-        // a batch is cancelled/deleted.
-        if let Some(ref job) = self.cascade_batch_state_job {
-            for i in 0..task_config.cascade_batch_state_workers {
-                let mut worker = job.worker();
-                worker.set_shutdown_token(shutdown_token.clone());
-                handles.push((
-                    "cascade-batch-state-worker",
-                    tokio::spawn(async move {
-                        if let Err(e) = worker.run().await {
-                            tracing::error!(error = %e, worker = i, "Cascade-batch-state worker error");
-                        }
-                    }),
-                ));
-            }
-        }
+        // Batch creation worker always runs (1 worker) — handles both
+        // API-triggered and sync-triggered batch population.
+        let mut create_batch_worker = self.create_batch_job.worker();
+        create_batch_worker.set_shutdown_token(shutdown_token.clone());
+        handles.push((
+            "create-batch-worker",
+            tokio::spawn(async move {
+                if let Err(e) = create_batch_worker.run().await {
+                    tracing::error!(error = %e, "Create-batch worker error");
+                }
+            }),
+        ));
 
         if !sync_config.enabled {
             tracing::info!("Sync workers disabled on this instance");

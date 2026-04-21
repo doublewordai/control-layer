@@ -159,6 +159,7 @@ mod openapi;
 mod payment_providers;
 mod probes;
 mod request_logging;
+mod retention;
 pub mod sample_files;
 mod static_assets;
 mod sync;
@@ -1888,18 +1889,18 @@ async fn setup_background_services(
     let fusillade_pool_for_metrics = fusillade_pools.write().clone();
 
     // Initialize the fusillade request manager (for batch processing)
+    let mut fusillade_daemon_config = config
+        .background_services
+        .batch_daemon
+        .to_fusillade_config_with_limits(Some(model_capacity_limits.clone()));
+    retention::apply_to_fusillade_config(&config.background_services.retention, &mut fusillade_daemon_config);
+
     let request_manager = Arc::new(
-        fusillade::PostgresRequestManager::new(
-            fusillade_pools,
-            config
-                .background_services
-                .batch_daemon
-                .to_fusillade_config_with_limits(Some(model_capacity_limits.clone())),
-        )
-        .with_download_buffer_size(config.batches.files.download_buffer_size)
-        .with_batch_insert_strategy(BatchInsertStrategy::Batched {
-            batch_size: config.batches.files.batch_insert_size,
-        }),
+        fusillade::PostgresRequestManager::new(fusillade_pools, fusillade_daemon_config)
+            .with_download_buffer_size(config.batches.files.download_buffer_size)
+            .with_batch_insert_strategy(BatchInsertStrategy::Batched {
+                batch_size: config.batches.files.batch_insert_size,
+            }),
     );
 
     let is_leader: bool;
@@ -2235,14 +2236,9 @@ async fn setup_background_services(
         ingest_file_job: Arc::new(std::sync::OnceLock::new()),
         activate_batch_job: Arc::new(std::sync::OnceLock::new()),
         create_batch_job: Arc::new(std::sync::OnceLock::new()),
-        cascade_batch_state_job: Arc::new(std::sync::OnceLock::new()),
     };
-    let task_runner = Arc::new(tasks::TaskRunner::new(underway_pool, task_state, &config.background_services.task_workers).await?);
-    for (name, handle) in task_runner.start(
-        shutdown_token.clone(),
-        &config.background_services.task_workers,
-        &config.background_services.sync_workers,
-    ) {
+    let task_runner = Arc::new(tasks::TaskRunner::new(underway_pool, task_state).await?);
+    for (name, handle) in task_runner.start(shutdown_token.clone(), &config.background_services.sync_workers) {
         background_tasks.spawn(name, async move { handle.await.map_err(|e| anyhow::anyhow!("{}", e)) });
     }
 

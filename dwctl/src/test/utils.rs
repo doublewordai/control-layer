@@ -49,19 +49,11 @@ pub async fn create_test_app_state_with_config(pool: PgPool, config: crate::conf
         ingest_file_job: std::sync::Arc::new(std::sync::OnceLock::new()),
         activate_batch_job: std::sync::Arc::new(std::sync::OnceLock::new()),
         create_batch_job: std::sync::Arc::new(std::sync::OnceLock::new()),
-        cascade_batch_state_job: std::sync::Arc::new(std::sync::OnceLock::new()),
     };
     let task_runner = std::sync::Arc::new(
-        crate::tasks::TaskRunner::new(
-            pool,
-            task_state,
-            &crate::config::TaskWorkersConfig {
-                create_batch_workers: 0,
-                cascade_batch_state_workers: 0,
-            },
-        )
-        .await
-        .expect("Failed to create task runner"),
+        crate::tasks::TaskRunner::new(pool, task_state)
+            .await
+            .expect("Failed to create task runner"),
     );
 
     crate::AppState::builder()
@@ -113,19 +105,11 @@ pub async fn create_test_app_state_with_fusillade(pool: PgPool, config: crate::c
         ingest_file_job: std::sync::Arc::new(std::sync::OnceLock::new()),
         activate_batch_job: std::sync::Arc::new(std::sync::OnceLock::new()),
         create_batch_job: std::sync::Arc::new(std::sync::OnceLock::new()),
-        cascade_batch_state_job: std::sync::Arc::new(std::sync::OnceLock::new()),
     };
     let task_runner = std::sync::Arc::new(
-        crate::tasks::TaskRunner::new(
-            pool,
-            task_state,
-            &crate::config::TaskWorkersConfig {
-                create_batch_workers: 0,
-                cascade_batch_state_workers: 0,
-            },
-        )
-        .await
-        .expect("Failed to create task runner"),
+        crate::tasks::TaskRunner::new(pool, task_state)
+            .await
+            .expect("Failed to create task runner"),
     );
 
     crate::AppState::builder()
@@ -265,10 +249,6 @@ pub fn create_test_config() -> crate::config::Config {
             sync_workers: crate::config::SyncWorkersConfig {
                 enabled: false,
                 ..Default::default()
-            },
-            task_workers: crate::config::TaskWorkersConfig {
-                create_batch_workers: 0,
-                cascade_batch_state_workers: 0,
             },
             ..Default::default()
         },

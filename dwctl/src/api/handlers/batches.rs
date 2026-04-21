@@ -99,97 +99,6 @@ pub async fn build_create_batch_job<P: sqlx_pool_router::PoolProvider + Clone + 
 }
 
 // ---------------------------------------------------------------------------
-// Background task: cascade batch state to child requests
-// ---------------------------------------------------------------------------
-
-/// Target state for cascading to child requests. Local mirror of
-/// `fusillade::CascadeTargetState` with serde support for underway
-/// JSON serialization.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum CascadeTarget {
-    Canceled,
-    Failed,
-}
-
-impl CascadeTarget {
-    fn to_fusillade(self) -> fusillade::CascadeTargetState {
-        match self {
-            CascadeTarget::Canceled => fusillade::CascadeTargetState::Canceled,
-            CascadeTarget::Failed => fusillade::CascadeTargetState::Failed,
-        }
-    }
-
-    fn as_str(self) -> &'static str {
-        match self {
-            CascadeTarget::Canceled => "canceled",
-            CascadeTarget::Failed => "failed",
-        }
-    }
-}
-
-/// Input for the cascade-batch-state background job.
-///
-/// After a batch is cancelled (or otherwise terminates), this job updates
-/// child requests that are still in-flight (pending/claimed/processing) to
-/// the target state. This is done asynchronously so the cancel API stays
-/// O(1) while the child rows are cleaned up in the background.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct CascadeBatchStateInput {
-    pub batch_id: Uuid,
-    pub target_state: CascadeTarget,
-}
-
-/// Build the underway job for cascading batch state to child requests.
-pub async fn build_cascade_batch_state_job<P: sqlx_pool_router::PoolProvider + Clone + Send + Sync + 'static>(
-    pool: sqlx::PgPool,
-    state: crate::tasks::TaskState<P>,
-) -> anyhow::Result<underway::Job<CascadeBatchStateInput, crate::tasks::TaskState<P>>> {
-    use underway::Job;
-    use underway::job::To;
-    use underway::task::Error as TaskError;
-
-    Job::<CascadeBatchStateInput, _>::builder()
-        .state(state)
-        .step(|cx, input: CascadeBatchStateInput| async move {
-            let batch_id = fusillade::BatchId(input.batch_id);
-
-            match cx
-                .state
-                .request_manager
-                .cascade_batch_state_to_requests(batch_id, input.target_state.to_fusillade())
-                .await
-            {
-                Ok(updated) => {
-                    if updated > 0 {
-                        tracing::info!(
-                            batch_id = %input.batch_id,
-                            target_state = input.target_state.as_str(),
-                            updated,
-                            "Cascaded batch state to child requests"
-                        );
-                    }
-                    To::done()
-                }
-                Err(e) => {
-                    tracing::error!(
-                        batch_id = %input.batch_id,
-                        target_state = input.target_state.as_str(),
-                        error = %e,
-                        "Failed to cascade batch state to child requests"
-                    );
-                    Err(TaskError::Retryable(e.to_string()))
-                }
-            }
-        })
-        .name("cascade-batch-state")
-        .pool(pool)
-        .build()
-        .await
-        .map_err(Into::into)
-}
-
-// ---------------------------------------------------------------------------
 
 /// Check if the current user "owns" a batch, considering org context.
 /// Returns true if the batch creator matches the user's ID or their active organization.
@@ -204,27 +113,6 @@ fn is_batch_owner(current_user: &CurrentUser, created_by: &str) -> bool {
         return true;
     }
     false
-}
-
-/// Enqueue a background job to transition in-flight child requests to
-/// the given target state. Best-effort: logs a warning on failure so the
-/// caller (cancel/delete handler) can still return a success response.
-async fn enqueue_cascade_batch_state<P: PoolProvider>(state: &AppState<P>, batch_id: Uuid, target_state: CascadeTarget) {
-    let Some(ref job) = state.task_runner.cascade_batch_state_job else {
-        tracing::debug!(
-            batch_id = %batch_id,
-            "cascade-batch-state job not configured, skipping enqueue"
-        );
-        return;
-    };
-    if let Err(e) = job.enqueue(&CascadeBatchStateInput { batch_id, target_state }).await {
-        tracing::warn!(
-            batch_id = %batch_id,
-            target_state = target_state.as_str(),
-            error = %e,
-            "Failed to enqueue cascade-batch-state job (child requests will remain in old state)"
-        );
-    }
 }
 
 /// Helper function to convert fusillade Batch to OpenAI BatchResponse
@@ -265,7 +153,14 @@ fn to_batch_response_enriched(batch: fusillade::Batch, creator_email: Option<&st
 
     // Build user-facing metadata: filter out internal dw_* keys.
     // Keep request_source, created_by_email, context_name, context_type for backwards compat.
-    let internal_keys = ["dw_source_id", "dw_source_name", "dw_sync_id", "dw_external_key", "created_by"];
+    let internal_keys = [
+        "dw_source_id",
+        "dw_source_name",
+        "dw_sync_id",
+        "dw_external_key",
+        "created_by",
+        crate::retention::RETENTION_TTL_METADATA_KEY,
+    ];
     let mut metadata: HashMap<String, String> = raw_metadata
         .into_iter()
         .filter(|(k, _)| !internal_keys.contains(&k.as_str()))
@@ -610,11 +505,21 @@ pub async fn create_batch<P: PoolProvider>(
     // Strip reserved keys that are injected server-side during response enrichment
     // to prevent user-supplied values from colliding with system fields.
     let mut metadata_map = req.metadata.unwrap_or_default();
-    for key in &["created_by_email", "context_name", "context_type", "request_source", "created_by"] {
+    for key in &[
+        "created_by_email",
+        "context_name",
+        "context_type",
+        "request_source",
+        "created_by",
+        crate::retention::RETENTION_TTL_METADATA_KEY,
+    ] {
         metadata_map.remove(*key);
     }
     metadata_map.insert("request_source".to_string(), request_source.to_string());
     metadata_map.insert("created_by".to_string(), current_user.id.to_string());
+    if let Some(ttl_seconds) = crate::retention::default_batch_artifact_ttl_seconds(&config) {
+        metadata_map.insert(crate::retention::RETENTION_TTL_METADATA_KEY.to_string(), ttl_seconds.to_string());
+    }
     let metadata = serde_json::to_value(metadata_map).ok();
 
     // Create batch input — created_by uses org ID when in org context for ownership scoping
@@ -1254,9 +1159,6 @@ pub async fn cancel_batch<P: PoolProvider>(
             operation: format!("cancel batch: {}", e),
         })?;
 
-    // Enqueue background cleanup of child request states
-    enqueue_cascade_batch_state(&state, batch_id, CascadeTarget::Canceled).await;
-
     // Fetch updated batch to get latest status
     let batch = state
         .request_manager
@@ -1321,7 +1223,7 @@ pub async fn delete_batch<P: PoolProvider>(
         });
     }
 
-    // Delete the batch (also sets cancelling_at/cancelled_at if not already terminal)
+    // Delete the batch
     state
         .request_manager
         .delete_batch(fusillade::BatchId(batch_id))
@@ -1329,9 +1231,6 @@ pub async fn delete_batch<P: PoolProvider>(
         .map_err(|e| Error::Internal {
             operation: format!("delete batch: {}", e),
         })?;
-
-    // Enqueue background cleanup of child request states
-    enqueue_cascade_batch_state(&state, batch_id, CascadeTarget::Canceled).await;
 
     tracing::debug!("Batch {} deleted", batch_id);
 
@@ -4015,147 +3914,5 @@ mod tests {
             3880,
             "Reasoning tokens should match in list analytics"
         );
-    }
-
-    /// Helper: insert a batch with `n` pending requests directly into fusillade tables.
-    /// Returns (batch_id, request_ids).
-    async fn insert_batch_with_pending_requests(pool: &PgPool, user_id: Uuid, n: usize) -> (Uuid, Vec<Uuid>) {
-        let file_id = Uuid::new_v4();
-        let batch_id = Uuid::new_v4();
-
-        sqlx::query(
-            "INSERT INTO fusillade.files (id, name, status, created_at, updated_at) VALUES ($1, 'test.jsonl', 'processed', NOW(), NOW())",
-        )
-        .bind(file_id)
-        .execute(pool)
-        .await
-        .expect("insert file");
-
-        sqlx::query(
-            "INSERT INTO fusillade.batches (id, created_by, file_id, endpoint, completion_window, expires_at, created_at, total_requests) VALUES ($1, $2, $3, '/v1/chat/completions', '24h', NOW() + interval '24 hours', NOW(), $4)",
-        )
-        .bind(batch_id)
-        .bind(user_id.to_string())
-        .bind(file_id)
-        .bind(n as i32)
-        .execute(pool)
-        .await
-        .expect("insert batch");
-
-        let mut request_ids = Vec::new();
-        for i in 0..n {
-            let template_id = Uuid::new_v4();
-            let request_id = Uuid::new_v4();
-            let body = serde_json::json!({"model": "test-model", "messages": [{"role": "user", "content": format!("Test {}", i)}]});
-
-            sqlx::query(
-                "INSERT INTO fusillade.request_templates (id, file_id, model, api_key, endpoint, path, body, custom_id, method) VALUES ($1, $2, 'test-model', 'test-key', 'http://test', '/v1/chat/completions', $3, $4, 'POST')",
-            )
-            .bind(template_id)
-            .bind(file_id)
-            .bind(serde_json::to_string(&body).unwrap())
-            .bind(format!("req-{i}"))
-            .execute(pool)
-            .await
-            .expect("insert template");
-
-            sqlx::query(
-                "INSERT INTO fusillade.requests (id, batch_id, template_id, model, state, created_at) VALUES ($1, $2, $3, 'test-model', 'pending', NOW())",
-            )
-            .bind(request_id)
-            .bind(batch_id)
-            .bind(template_id)
-            .execute(pool)
-            .await
-            .expect("insert request");
-
-            request_ids.push(request_id);
-        }
-
-        (batch_id, request_ids)
-    }
-
-    /// Verify that cancel_batch + cascade_batch_state_to_requests transitions
-    /// pending child requests to canceled. We call the cascade function directly
-    /// rather than relying on the background worker — the enqueue wiring is
-    /// structural and visible in the handler code; testing the actual state
-    /// transition avoids the pool-contention issues that background workers
-    /// cause in CI's parallel test environment.
-    #[sqlx::test]
-    #[test_log::test]
-    async fn test_cancel_batch_cascades_state_to_child_requests(pool: PgPool) {
-        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
-        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
-        let auth = add_auth_headers(&user);
-
-        let (batch_id, request_ids) = insert_batch_with_pending_requests(&pool, user.id, 5).await;
-
-        // Verify all start as pending
-        let pending_count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*)::bigint FROM fusillade.requests WHERE id = ANY($1) AND state = 'pending'")
-                .bind(&request_ids)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(pending_count, 5, "all requests should start as pending");
-
-        // Cancel the batch via the API (enqueues the cascade job)
-        let resp = app
-            .post(&format!("/ai/v1/batches/{batch_id}/cancel"))
-            .add_header(&auth[0].0, &auth[0].1)
-            .add_header(&auth[1].0, &auth[1].1)
-            .await;
-        resp.assert_status_ok();
-
-        // Simulate what the background worker does: call cascade directly
-        let updated = _bg_services
-            .request_manager
-            .cascade_batch_state_to_requests(fusillade::BatchId(batch_id), fusillade::CascadeTargetState::Canceled)
-            .await
-            .expect("cascade should succeed");
-        assert_eq!(updated, 5, "all 5 pending requests should be transitioned");
-
-        // Verify final state
-        let canceled_count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*)::bigint FROM fusillade.requests WHERE id = ANY($1) AND state = 'canceled'")
-                .bind(&request_ids)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(canceled_count, 5, "all requests should now be canceled");
-    }
-
-    #[sqlx::test]
-    #[test_log::test]
-    async fn test_delete_batch_cascades_state_to_child_requests(pool: PgPool) {
-        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
-        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser, Role::PlatformManager]).await;
-        let auth = add_auth_headers(&user);
-
-        let (batch_id, request_ids) = insert_batch_with_pending_requests(&pool, user.id, 5).await;
-
-        // Delete the batch via the API (enqueues the cascade job)
-        let resp = app
-            .delete(&format!("/ai/v1/batches/{batch_id}"))
-            .add_header(&auth[0].0, &auth[0].1)
-            .add_header(&auth[1].0, &auth[1].1)
-            .await;
-        resp.assert_status(StatusCode::NO_CONTENT);
-
-        // Simulate what the background worker does
-        let updated = _bg_services
-            .request_manager
-            .cascade_batch_state_to_requests(fusillade::BatchId(batch_id), fusillade::CascadeTargetState::Canceled)
-            .await
-            .expect("cascade should succeed");
-        assert_eq!(updated, 5);
-
-        let canceled_count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*)::bigint FROM fusillade.requests WHERE id = ANY($1) AND state = 'canceled'")
-                .bind(&request_ids)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(canceled_count, 5, "all requests should now be canceled");
     }
 }
