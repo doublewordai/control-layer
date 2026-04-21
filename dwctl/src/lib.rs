@@ -158,8 +158,10 @@ mod notifications;
 mod openapi;
 mod payment_providers;
 mod probes;
+mod fusillade_outlet_handler;
 mod request_logging;
 pub mod response_store;
+mod responses_middleware;
 pub mod sample_files;
 mod static_assets;
 mod sync;
@@ -972,6 +974,7 @@ pub async fn build_router(
     analytics_sender: Option<request_logging::batcher::AnalyticsSender>,
     metrics_recorder: Option<GenAiMetrics>,
     strict_mode: bool,
+    responses_middleware_state: Option<crate::responses_middleware::ResponsesMiddlewareState>,
 ) -> anyhow::Result<Router> {
     let config = state.current_config();
 
@@ -1009,6 +1012,12 @@ pub async fn build_router(
         if let Some(sender) = analytics_sender {
             let analytics_handler = request_logging::AnalyticsHandler::new(sender, uuid::Uuid::new_v4(), config.as_ref().clone());
             multi_handler = multi_handler.with(analytics_handler);
+        }
+
+        // Add FusilladeOutletHandler to write response bodies back to fusillade
+        if let Some(ref rms) = responses_middleware_state {
+            let fusillade_handler = crate::fusillade_outlet_handler::FusilladeOutletHandler::new(rms.pool.clone());
+            multi_handler = multi_handler.with(fusillade_handler);
         }
 
         // Only create layer if at least one handler is enabled (should always be true here)
@@ -1395,6 +1404,19 @@ pub async fn build_router(
     } else {
         onwards_router
     };
+
+    // Apply responses middleware to create pending fusillade rows for /v1/responses requests.
+    // This runs BEFORE outlet (outer layer executes first), so the X-Onwards-Response-Id
+    // header is set before outlet captures the request and passes it to FusilladeOutletHandler.
+    let onwards_router = if let Some(rms) = responses_middleware_state {
+        onwards_router.layer(middleware::from_fn_with_state(
+            rms,
+            crate::responses_middleware::responses_middleware,
+        ))
+    } else {
+        onwards_router
+    };
+
 
     // Build the app with admin API and onwards proxy nested. serve the (restricted) openai spec.
     // Strict mode requires different nesting:
@@ -2408,11 +2430,16 @@ impl Application {
         });
         tracing::info!(daemon_id = %onwards_daemon_id, "Registered onwards as fusillade daemon");
 
-        // Create the response store backed by fusillade's requests table
+        // Create the response store (read-only, for ResponseStore trait + GET handler)
         let response_store = Arc::new(crate::response_store::FusilladeResponseStore::new(
-            fusillade_write_pool,
-            crate::response_store::OnwardsDaemonId(onwards_daemon_id),
+            fusillade_write_pool.clone(),
         ));
+
+        // Responses middleware state (writes pending rows before onwards)
+        let responses_middleware_state = crate::responses_middleware::ResponsesMiddlewareState {
+            pool: fusillade_write_pool.clone(),
+            daemon_id: crate::response_store::OnwardsDaemonId(onwards_daemon_id),
+        };
 
         // Build onwards router from targets with body transform, response sanitization, and tool executor.
         let onwards_app_state = onwards::AppState::with_transform(bg_services.onwards_targets.clone(), body_transform)
@@ -2456,6 +2483,7 @@ impl Application {
             bg_services.analytics_sender.clone(),
             metrics_recorder,
             bg_services.onwards_targets.strict_mode,
+            Some(responses_middleware_state),
         )
         .await?;
 

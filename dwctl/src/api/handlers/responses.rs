@@ -24,7 +24,7 @@ pub async fn get_response<P: PoolProvider>(
         .await
         .map_err(|e| {
             tracing::error!(error = %e, "Failed to retrieve response");
-            Error::Database(crate::db::errors::DbError::Other(e.to_string()))
+            Error::Database(crate::db::errors::DbError::Other(anyhow::anyhow!("{e}")))
         })?;
 
     match response {

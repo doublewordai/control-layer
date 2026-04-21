@@ -1,9 +1,13 @@
-//! Fusillade-backed implementation of onwards' `ResponseStore` trait.
+//! Fusillade-backed implementation of onwards' `ResponseStore` trait (read-only)
+//! and standalone functions for creating/completing response records.
 //!
-//! Writes every Open Responses API request into fusillade's `request_templates`
-//! and `requests` tables so that `GET /v1/responses/{id}` can retrieve them.
-//! Onwards registers as a fusillade daemon, so realtime requests get a real
-//! `daemon_id` and satisfy the existing CHECK constraints.
+//! The `ResponseStore` trait implementation handles read operations only:
+//! - `get()` for `GET /v1/responses/{id}`
+//! - `get_context()` for `previous_response_id` resolution
+//! - `store()` for the adapter's post-completion persistence
+//!
+//! Write operations (creating pending records, completing/failing them) are handled
+//! by the responses middleware and `FusilladeOutletHandler` respectively.
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -11,19 +15,25 @@ use onwards::{ResponseStore, StoreError};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
+/// Header set by the responses middleware so the outlet handler knows which
+/// fusillade row to update with the response body.
+pub const ONWARDS_RESPONSE_ID_HEADER: &str = "x-onwards-response-id";
+
 /// A fusillade daemon ID assigned to this onwards instance.
 #[derive(Debug, Clone, Copy)]
 pub struct OnwardsDaemonId(pub Uuid);
 
 /// ResponseStore implementation backed by fusillade's requests table.
+///
+/// Read-only — lifecycle management (create/complete/fail) is handled by
+/// the responses middleware and FusilladeOutletHandler.
 pub struct FusilladeResponseStore {
     pool: PgPool,
-    daemon_id: OnwardsDaemonId,
 }
 
 impl FusilladeResponseStore {
-    pub fn new(pool: PgPool, daemon_id: OnwardsDaemonId) -> Self {
-        Self { pool, daemon_id }
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
     }
 
     /// Retrieve a response by ID. Used by the GET /v1/responses/{id} handler.
@@ -33,6 +43,117 @@ impl FusilladeResponseStore {
     ) -> Result<Option<serde_json::Value>, StoreError> {
         self.get(response_id).await
     }
+}
+
+/// Create a pending response in fusillade (template + request rows).
+///
+/// Called by the responses middleware before onwards proxies the request.
+/// Returns the response ID (e.g., `resp_<uuid>`).
+pub async fn create_pending(
+    pool: &PgPool,
+    request: &serde_json::Value,
+    model: &str,
+    endpoint: &str,
+    daemon_id: OnwardsDaemonId,
+) -> Result<String, StoreError> {
+    let id = Uuid::new_v4();
+    let now = Utc::now();
+    let body = request.to_string();
+
+    // Insert template row (stores the original request body, file_id = NULL)
+    sqlx::query(
+        "INSERT INTO request_templates (id, file_id, custom_id, endpoint, method, path, body, model, api_key)
+         VALUES ($1, NULL, NULL, $2, 'POST', $2, $3, $4, '')",
+    )
+    .bind(id)
+    .bind(endpoint)
+    .bind(&body)
+    .bind(model)
+    .execute(pool)
+    .await
+    .map_err(|e| StoreError::StorageError(format!("Failed to insert template: {e}")))?;
+
+    // Insert request row in processing state (onwards is the daemon)
+    sqlx::query(
+        "INSERT INTO requests (id, batch_id, template_id, endpoint, method, path, body, model, api_key, state, daemon_id, claimed_at, started_at)
+         VALUES ($1, NULL, $1, $2, 'POST', $2, $3, $4, '', 'processing', $5, $6, $6)",
+    )
+    .bind(id)
+    .bind(endpoint)
+    .bind(&body)
+    .bind(model)
+    .bind(daemon_id.0)
+    .bind(now)
+    .execute(pool)
+    .await
+    .map_err(|e| StoreError::StorageError(format!("Failed to insert request: {e}")))?;
+
+    Ok(format!("resp_{id}"))
+}
+
+/// Mark a response as completed with the response body.
+///
+/// Called by the `FusilladeOutletHandler` after outlet captures the response.
+pub async fn complete_response(
+    pool: &PgPool,
+    response_id: &str,
+    response_body: &str,
+    status_code: u16,
+) -> Result<(), StoreError> {
+    let id = parse_response_id(response_id)?;
+    let size = response_body.len() as i64;
+
+    sqlx::query(
+        "UPDATE requests
+         SET state = 'completed',
+             response_status = $2,
+             response_body = $3,
+             response_size = $4,
+             completed_at = NOW()
+         WHERE id = $1 AND state = 'processing'",
+    )
+    .bind(id)
+    .bind(status_code as i16)
+    .bind(response_body)
+    .bind(size)
+    .execute(pool)
+    .await
+    .map_err(|e| StoreError::StorageError(format!("Failed to complete request: {e}")))?;
+
+    Ok(())
+}
+
+/// Mark a response as failed.
+///
+/// Called by the `FusilladeOutletHandler` when the upstream returns an error.
+pub async fn fail_response(
+    pool: &PgPool,
+    response_id: &str,
+    error: &str,
+) -> Result<(), StoreError> {
+    let id = parse_response_id(response_id)?;
+
+    let error_json = serde_json::json!({
+        "type": "NonRetriableHttpStatus",
+        "status": 500,
+        "message": error,
+    })
+    .to_string();
+
+    sqlx::query(
+        "UPDATE requests
+         SET state = 'failed',
+             error = $2,
+             failed_at = NOW()
+         WHERE id = $1 AND state = 'processing'",
+    )
+    .bind(id)
+    .bind(&error_json)
+    .execute(pool)
+    .await
+    .map_err(|e| StoreError::StorageError(format!("Failed to mark request failed: {e}")))?;
+
+    Ok(())
 }
 
 /// Parse a response ID like "resp_<uuid>" into a UUID.
@@ -85,6 +206,7 @@ fn row_to_response_object(row: &sqlx::postgres::PgRow) -> serde_json::Value {
                 if let Some(usage) = parsed.get("usage") {
                     resp["usage"] = usage.clone();
                 }
+                // ChatCompletion format (batch results)
                 if parsed.get("choices").is_some() {
                     resp["output"] = serde_json::json!([{
                         "type": "message",
@@ -113,104 +235,6 @@ fn row_to_response_object(row: &sqlx::postgres::PgRow) -> serde_json::Value {
 
 #[async_trait]
 impl ResponseStore for FusilladeResponseStore {
-    async fn create_pending(
-        &self,
-        request: &serde_json::Value,
-        model: &str,
-        endpoint: &str,
-    ) -> Result<String, StoreError> {
-        let id = Uuid::new_v4();
-        let now = Utc::now();
-        let body = request.to_string();
-        let daemon_id = self.daemon_id.0;
-
-        // Insert template row (stores the original request body, file_id = NULL)
-        sqlx::query(
-            "INSERT INTO request_templates (id, file_id, custom_id, endpoint, method, path, body, model, api_key)
-             VALUES ($1, NULL, NULL, $2, 'POST', $2, $3, $4, '')",
-        )
-        .bind(id)
-        .bind(endpoint)
-        .bind(&body)
-        .bind(model)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| StoreError::StorageError(format!("Failed to insert template: {e}")))?;
-
-        // Insert request row in processing state (onwards is the daemon)
-        sqlx::query(
-            "INSERT INTO requests (id, batch_id, template_id, endpoint, method, path, body, model, api_key, state, daemon_id, claimed_at, started_at)
-             VALUES ($1, NULL, $1, $2, 'POST', $2, $3, $4, '', 'processing', $5, $6, $6)",
-        )
-        .bind(id)
-        .bind(endpoint)
-        .bind(&body)
-        .bind(model)
-        .bind(daemon_id)
-        .bind(now)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| StoreError::StorageError(format!("Failed to insert request: {e}")))?;
-
-        Ok(format!("resp_{id}"))
-    }
-
-    async fn complete(
-        &self,
-        response_id: &str,
-        response: &serde_json::Value,
-        status_code: u16,
-    ) -> Result<(), StoreError> {
-        let id = parse_response_id(response_id)?;
-        let body = response.to_string();
-        let size = body.len() as i64;
-
-        sqlx::query(
-            "UPDATE requests
-             SET state = 'completed',
-                 response_status = $2,
-                 response_body = $3,
-                 response_size = $4,
-                 completed_at = NOW()
-             WHERE id = $1 AND state = 'processing'",
-        )
-        .bind(id)
-        .bind(status_code as i16)
-        .bind(&body)
-        .bind(size)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| StoreError::StorageError(format!("Failed to complete request: {e}")))?;
-
-        Ok(())
-    }
-
-    async fn fail(&self, response_id: &str, error: &str) -> Result<(), StoreError> {
-        let id = parse_response_id(response_id)?;
-
-        let error_json = serde_json::json!({
-            "type": "NonRetriableHttpStatus",
-            "status": 500,
-            "message": error,
-        })
-        .to_string();
-
-        sqlx::query(
-            "UPDATE requests
-             SET state = 'failed',
-                 error = $2,
-                 failed_at = NOW()
-             WHERE id = $1 AND state = 'processing'",
-        )
-        .bind(id)
-        .bind(&error_json)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| StoreError::StorageError(format!("Failed to mark request failed: {e}")))?;
-
-        Ok(())
-    }
-
     async fn get(&self, response_id: &str) -> Result<Option<serde_json::Value>, StoreError> {
         let id = parse_response_id(response_id)?;
 
@@ -229,16 +253,14 @@ impl ResponseStore for FusilladeResponseStore {
     }
 
     async fn store(&self, response: &serde_json::Value) -> Result<String, StoreError> {
+        // The adapter calls this after constructing the final response.
+        // The row already exists (created by middleware), and the outlet handler
+        // will write the response body. Just return the existing ID.
         let id = response
             .get("id")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-
-        if !id.is_empty() {
-            self.complete(&id, response, 200).await?;
-        }
-
         Ok(id)
     }
 
