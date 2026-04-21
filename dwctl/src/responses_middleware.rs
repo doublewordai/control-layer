@@ -35,15 +35,7 @@ pub async fn responses_middleware(
     next: Next,
 ) -> Response {
     // Only intercept POST requests to inference endpoints.
-    // These paths are relative to the /ai/v1 nest where the middleware is applied.
-    let is_post = req.method() == axum::http::Method::POST;
-    let path = req.uri().path();
-    let is_inference_request = is_post
-        && (path.ends_with("/responses")
-            || path.ends_with("/chat/completions")
-            || path.ends_with("/embeddings"));
-
-    if !is_inference_request {
+    if !should_intercept(req.method(), req.uri().path()) {
         return next.run(req).await;
     }
 
@@ -109,4 +101,69 @@ pub async fn responses_middleware(
     );
 
     next.run(req).await
+}
+
+/// Check if a request should be intercepted by this middleware.
+/// Exported for testing.
+pub(crate) fn should_intercept(method: &axum::http::Method, path: &str) -> bool {
+    method == axum::http::Method::POST
+        && (path.ends_with("/responses")
+            || path.ends_with("/chat/completions")
+            || path.ends_with("/embeddings"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_should_intercept_responses() {
+        assert!(should_intercept(&axum::http::Method::POST, "/v1/responses"));
+        assert!(should_intercept(&axum::http::Method::POST, "/responses"));
+    }
+
+    #[test]
+    fn test_should_intercept_chat_completions() {
+        assert!(should_intercept(
+            &axum::http::Method::POST,
+            "/v1/chat/completions"
+        ));
+        assert!(should_intercept(
+            &axum::http::Method::POST,
+            "/chat/completions"
+        ));
+    }
+
+    #[test]
+    fn test_should_intercept_embeddings() {
+        assert!(should_intercept(
+            &axum::http::Method::POST,
+            "/v1/embeddings"
+        ));
+    }
+
+    #[test]
+    fn test_should_not_intercept_get() {
+        assert!(!should_intercept(&axum::http::Method::GET, "/v1/responses"));
+        assert!(!should_intercept(
+            &axum::http::Method::GET,
+            "/v1/chat/completions"
+        ));
+    }
+
+    #[test]
+    fn test_should_not_intercept_models() {
+        assert!(!should_intercept(&axum::http::Method::GET, "/v1/models"));
+        assert!(!should_intercept(&axum::http::Method::POST, "/v1/models"));
+    }
+
+    #[test]
+    fn test_should_not_intercept_batches() {
+        assert!(!should_intercept(&axum::http::Method::POST, "/v1/batches"));
+    }
+
+    #[test]
+    fn test_should_not_intercept_files() {
+        assert!(!should_intercept(&axum::http::Method::POST, "/v1/files"));
+    }
 }

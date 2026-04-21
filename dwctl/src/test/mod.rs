@@ -906,6 +906,9 @@ async fn test_request_logging_disabled(pool: PgPool) {
         .request_manager(request_manager)
         .task_runner(task_runner)
         .limiters(limiters)
+        .response_store(std::sync::Arc::new(
+            crate::response_store::FusilladeResponseStore::new(pool.clone()),
+        ))
         .build();
     let onwards_router = axum::Router::new(); // Empty onwards router for testing
     let router = super::build_router(&mut app_state, onwards_router, None, None, false, None)
@@ -1264,12 +1267,16 @@ async fn test_build_router_with_metrics_disabled(pool: PgPool) {
         .await
         .expect("Failed to create task runner"),
     );
+    let fusillade_pool = request_manager.pool().clone();
     let mut app_state = AppState::builder()
         .db(DbPools::new(pool))
         .config(shared_config)
         .request_manager(request_manager)
         .task_runner(task_runner)
         .limiters(limiters)
+        .response_store(std::sync::Arc::new(
+            crate::response_store::FusilladeResponseStore::new(fusillade_pool),
+        ))
         .build();
 
     let onwards_router = axum::Router::new();
@@ -1320,12 +1327,16 @@ async fn test_build_router_with_metrics_enabled(pool: PgPool) {
         .await
         .expect("Failed to create task runner"),
     );
+    let fusillade_pool = request_manager.pool().clone();
     let mut app_state = AppState::builder()
         .db(DbPools::new(pool))
         .config(shared_config)
         .request_manager(request_manager)
         .task_runner(task_runner)
         .limiters(limiters)
+        .response_store(std::sync::Arc::new(
+            crate::response_store::FusilladeResponseStore::new(fusillade_pool),
+        ))
         .build();
 
     let onwards_router = axum::Router::new();
