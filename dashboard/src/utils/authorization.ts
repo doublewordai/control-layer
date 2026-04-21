@@ -1,6 +1,6 @@
 import { useMemo } from "react";
-import type { Role } from "../api/control-layer/types";
-import { useUser } from "../api/control-layer/hooks";
+import type { ConfigResponse, Role } from "../api/control-layer/types";
+import { useConfig, useUser } from "../api/control-layer/hooks";
 
 export type PagePermission =
   | "models"
@@ -106,11 +106,39 @@ export function hasPermission(
   return userRoles.some((role) => ROLE_PERMISSIONS[role]?.includes(permission));
 }
 
+function isRouteEnabledByConfig(
+  path: string,
+  config?: ConfigResponse,
+): boolean {
+  if (!config) {
+    return true;
+  }
+
+  if (path === "/async") {
+    return Boolean(
+      config.batches?.enabled && config.batches.async_requests?.enabled,
+    );
+  }
+
+  if (path === "/batches") {
+    return Boolean(config.batches?.enabled);
+  }
+
+  return true;
+}
+
 /**
  * Check if user can access a specific route path
  */
-export function canAccessRoute(userRoles: Role[], path: string): boolean {
+export function canAccessRoute(
+  userRoles: Role[],
+  path: string,
+  config?: ConfigResponse,
+): boolean {
   const permission = ROUTE_PERMISSIONS[path];
+  if (!isRouteEnabledByConfig(path, config)) {
+    return false;
+  }
   if (!permission) {
     return true;
   }
@@ -120,18 +148,22 @@ export function canAccessRoute(userRoles: Role[], path: string): boolean {
 /**
  * Get the first accessible route for a user (fallback when current route is restricted)
  */
-export function getFirstAccessibleRoute(userRoles: Role[]): string {
-  // Priority order for fallback routes - batches first if user has access
+export function getFirstAccessibleRoute(
+  userRoles: Role[],
+  config?: ConfigResponse,
+): string {
+  // Priority order for fallback routes mirrors the primary nav layout.
   const fallbackOrder: string[] = [
-    "/batches",
     "/models",
+    "/async",
+    "/batches",
     "/playground",
     "/api-keys",
     "/profile",
   ];
 
   for (const route of fallbackOrder) {
-    if (canAccessRoute(userRoles, route)) {
+    if (canAccessRoute(userRoles, route, config)) {
       return route;
     }
   }
@@ -144,7 +176,9 @@ export function getFirstAccessibleRoute(userRoles: Role[]): string {
  * Hook to check user permissions
  */
 export function useAuthorization() {
-  const { data: currentUser, isLoading } = useUser("current");
+  const { data: currentUser, isLoading: userLoading } = useUser("current");
+  const { data: config, isLoading: configLoading } = useConfig();
+  const isLoading = userLoading || configLoading;
 
   const permissions = useMemo(() => {
     if (!currentUser?.roles) {
@@ -165,10 +199,11 @@ export function useAuthorization() {
       userRoles,
       hasPermission: (permission: PagePermission) =>
         hasPermission(userRoles, permission),
-      canAccessRoute: (path: string) => canAccessRoute(userRoles, path),
-      getFirstAccessibleRoute: (): string => getFirstAccessibleRoute(userRoles),
+      canAccessRoute: (path: string) => canAccessRoute(userRoles, path, config),
+      getFirstAccessibleRoute: (): string =>
+        getFirstAccessibleRoute(userRoles, config),
     };
-  }, [currentUser, isLoading]);
+  }, [config, currentUser, isLoading]);
 
   return permissions;
 }
