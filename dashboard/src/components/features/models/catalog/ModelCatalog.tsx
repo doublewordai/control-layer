@@ -575,8 +575,14 @@ function SectionTable({
 
     const directionMultiplier = sortDirection === "asc" ? 1 : -1;
 
-    const compareReleasedAt = (a: Model, b: Model) =>
-      (a.metadata?.released_at || "").localeCompare(b.metadata?.released_at || "");
+    const compareReleasedAt = (a: Model, b: Model) => {
+      const aDate = a.metadata?.released_at;
+      const bDate = b.metadata?.released_at;
+      if (!aDate && !bDate) return 0;
+      if (!aDate) return 1;
+      if (!bDate) return -1;
+      return aDate.localeCompare(bDate);
+    };
 
     return [...models].sort((a, b) => {
       let comparison = 0;
@@ -828,6 +834,8 @@ export const ModelCatalog: React.FC = () => {
     include: "pricing",
     is_composite: true,
     search: debouncedSearch || undefined,
+    sort: "released_at",
+    sort_direction: "desc",
   });
   const { data: providerDisplayConfigs = [] } = useProviderDisplayConfigs();
 
