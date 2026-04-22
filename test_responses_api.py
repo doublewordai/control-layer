@@ -19,7 +19,7 @@ client = OpenAI(
     base_url="http://localhost:3001/ai/v1",
 )
 
-MODEL = "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
+MODEL = "Qwen/Qwen3.5-9B-dottxt"
 INPUT = "What is 2+2? Reply in one word."
 
 

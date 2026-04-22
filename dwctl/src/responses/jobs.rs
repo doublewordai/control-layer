@@ -73,7 +73,7 @@ pub async fn build_create_response_job<P: sqlx_pool_router::PoolProvider + Clone
             let request_value: serde_json::Value =
                 serde_json::from_str(&input.request_body).map_err(|e| TaskError::Fatal(format!("Failed to parse request body: {e}")))?;
 
-            // Create the fusillade rows via Storage trait methods
+            // Create the daemon request via fusillade's Storage trait
             if let Err(e) = response_store::create_pending_with_id(
                 &cx.state.request_manager,
                 &input.response_id,
@@ -136,11 +136,9 @@ pub async fn build_complete_response_job<P: sqlx_pool_router::PoolProvider + Clo
     Job::<CompleteResponseInput, _>::builder()
         .state(state)
         .step(|cx, input: CompleteResponseInput| async move {
-            let fusillade_pool = cx.state.request_manager.pool();
-
             if (200..300).contains(&input.status_code) {
                 if let Err(e) =
-                    response_store::complete_response(fusillade_pool, &input.response_id, &input.response_body, input.status_code).await
+                    response_store::complete_response(&cx.state.request_manager, &input.response_id, &input.response_body, input.status_code).await
                 {
                     tracing::error!(
                         response_id = %input.response_id,
@@ -158,7 +156,7 @@ pub async fn build_complete_response_job<P: sqlx_pool_router::PoolProvider + Clo
                 );
             } else {
                 let error_msg = format!("Upstream returned {}: {}", input.status_code, input.response_body);
-                if let Err(e) = response_store::fail_response(fusillade_pool, &input.response_id, &error_msg).await {
+                if let Err(e) = response_store::fail_response(&cx.state.request_manager, &input.response_id, &error_msg).await {
                     tracing::error!(
                         response_id = %input.response_id,
                         error = %e,
