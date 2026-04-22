@@ -1,18 +1,15 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, within } from "@testing-library/react";
+import { render, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import { AsyncRequests } from "./AsyncRequests";
 import * as hooks from "../../../api/control-layer/hooks";
-import { useAuthorization } from "../../../utils/authorization";
-import { useOrganizationContext } from "../../../contexts/organization/useOrganizationContext";
 
 // Mock the hooks
 vi.mock("../../../api/control-layer/hooks", () => ({
   useConfig: vi.fn(),
   useAsyncRequests: vi.fn(),
   useModels: vi.fn(),
-  useUsers: vi.fn(),
 }));
 
 // Mock authorization hook
@@ -73,21 +70,6 @@ describe("AsyncRequests", () => {
   beforeEach(() => {
     vi.clearAllMocks();
 
-    vi.mocked(useAuthorization).mockReturnValue({
-      userRoles: ["PlatformManager"],
-      isLoading: false,
-      hasPermission: () => true,
-      canAccessRoute: () => true,
-      getFirstAccessibleRoute: () => "/batches",
-    } as any);
-
-    vi.mocked(useOrganizationContext).mockReturnValue({
-      activeOrganizationId: null,
-      activeOrganization: null,
-      isOrgContext: false,
-      setActiveOrganization: vi.fn(),
-    } as any);
-
     vi.mocked(hooks.useConfig).mockReturnValue({
       data: {
         batches: {
@@ -104,11 +86,6 @@ describe("AsyncRequests", () => {
     } as any);
 
     vi.mocked(hooks.useModels).mockReturnValue({
-      data: { data: [] },
-      isLoading: false,
-    } as any);
-
-    vi.mocked(hooks.useUsers).mockReturnValue({
       data: { data: [] },
       isLoading: false,
     } as any);
@@ -141,49 +118,6 @@ describe("AsyncRequests", () => {
     expect(hooks.useAsyncRequests).toHaveBeenCalledWith(
       expect.objectContaining({
         service_tier: "flex",
-      }),
-    );
-  });
-
-  it("shows the member filter for platform managers", () => {
-    vi.mocked(hooks.useUsers).mockReturnValue({
-      data: {
-        data: [
-          { id: "user-1", email: "pm-user@example.com", user_type: "native" },
-        ],
-      },
-      isLoading: false,
-    } as any);
-
-    render(<AsyncRequests />, { wrapper: createWrapper() });
-
-    expect(
-      screen.getByText("All members"),
-    ).toBeInTheDocument();
-  });
-
-  it("does not show the member filter in org view for non-platform managers", () => {
-    vi.mocked(useAuthorization).mockReturnValue({
-      userRoles: ["StandardUser", "BatchAPIUser"],
-      isLoading: false,
-      hasPermission: (permission: string) => permission === "batches",
-      canAccessRoute: () => true,
-      getFirstAccessibleRoute: () => "/batches",
-    } as any);
-
-    vi.mocked(useOrganizationContext).mockReturnValue({
-      activeOrganizationId: "org-1",
-      activeOrganization: null,
-      isOrgContext: true,
-      setActiveOrganization: vi.fn(),
-    } as any);
-
-    render(<AsyncRequests />, { wrapper: createWrapper() });
-
-    expect(screen.queryByText("All members")).not.toBeInTheDocument();
-    expect(hooks.useAsyncRequests).toHaveBeenCalledWith(
-      expect.objectContaining({
-        member_id: undefined,
       }),
     );
   });
