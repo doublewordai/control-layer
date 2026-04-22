@@ -2,7 +2,4 @@
 members = ["dwctl"]
 resolver = "2"
 
-# Remove before merging — use published onwards once PR #179 is released
-[patch.crates-io]
-onwards = { path = "../onwards" }
 
