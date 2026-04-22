@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.42.2](https://github.com/doublewordai/control-layer/compare/v8.42.1...v8.42.2) (2026-04-22)
+
+
+### Bug Fixes
+
+* fmt changelog ([007cc7d](https://github.com/doublewordai/control-layer/commit/007cc7dd78003203818b10eeb2a346b0c2fb2898))
+
 ## [8.42.1](https://github.com/doublewordai/control-layer/compare/v8.42.0...v8.42.1) (2026-04-22)
 
 
