@@ -1639,6 +1639,7 @@ export interface AsyncRequestsListQuery {
   skip?: number;
   limit?: number;
   completion_window?: string;
+  service_tier?: string;
   status?: string;
   model?: string;
   member_id?: string;

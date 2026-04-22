@@ -112,12 +112,12 @@ describe("AsyncRequests", () => {
     ).toBeInTheDocument();
   });
 
-  it("passes completion_window from config to the query", () => {
+  it("passes service_tier=flex to the query", () => {
     render(<AsyncRequests />, { wrapper: createWrapper() });
 
     expect(hooks.useAsyncRequests).toHaveBeenCalledWith(
       expect.objectContaining({
-        completion_window: "1h",
+        service_tier: "flex",
       }),
     );
   });

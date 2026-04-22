@@ -2119,6 +2119,8 @@ const asyncRequestsApi = {
     if (options?.limit) params.set("limit", options.limit.toString());
     if (options?.completion_window)
       params.set("completion_window", options.completion_window);
+    if (options?.service_tier)
+      params.set("service_tier", options.service_tier);
     if (options?.status) params.set("status", options.status);
     if (options?.model) params.set("model", options.model);
     if (options?.member_id) params.set("member_id", options.member_id);

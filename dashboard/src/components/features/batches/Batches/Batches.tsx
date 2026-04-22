@@ -97,7 +97,6 @@ export function Batches({
   const queryClient = useQueryClient();
   const { userRoles, hasPermission } = useAuthorization();
   const { isOrgContext, activeOrganizationId } = useOrganizationContext();
-
   const { data: appConfig } = useConfig();
   const asyncCompletionWindow =
     appConfig?.batches?.async_requests?.completion_window ?? "1h";

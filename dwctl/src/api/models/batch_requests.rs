@@ -30,6 +30,9 @@ pub struct ListBatchRequestsQuery {
     /// Filter to requests created before this timestamp
     pub created_before: Option<DateTime<Utc>>,
 
+    /// Filter by service tier (e.g., "auto", "default", "flex", "priority")
+    pub service_tier: Option<String>,
+
     /// Sort active requests first (default: true)
     pub active_first: Option<bool>,
 }

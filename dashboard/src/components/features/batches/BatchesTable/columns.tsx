@@ -141,14 +141,6 @@ export const createBatchColumns = (
       ]
     : []),
   {
-    accessorKey: "completion_window",
-    header: "Completion Window",
-    cell: ({ row }) => {
-      const window = row.getValue("completion_window") as string;
-      return <span className="text-sm text-doubleword-neutral-900">{window}</span>;
-    },
-  },
-  {
     accessorKey: "status",
     header: "Status",
     cell: ({ row }) => {
