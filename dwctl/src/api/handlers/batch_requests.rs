@@ -328,6 +328,61 @@ struct EmailRow {
 mod tests {
     use crate::{api::models::users::Role, test::utils::*};
     use sqlx::PgPool;
+    use uuid::Uuid;
+
+    async fn insert_batch_request(
+        pool: &PgPool,
+        created_by: Uuid,
+        model: &str,
+    ) -> Uuid {
+        let file_id = Uuid::new_v4();
+        let batch_id = Uuid::new_v4();
+        let template_id = Uuid::new_v4();
+        let request_id = Uuid::new_v4();
+        let body = serde_json::json!({"model": model, "messages": [{"role": "user", "content": "hi"}]});
+
+        sqlx::query(
+            "INSERT INTO fusillade.files (id, name, status, created_at, updated_at) VALUES ($1, 'test.jsonl', 'processed', NOW(), NOW())",
+        )
+        .bind(file_id)
+        .execute(pool)
+        .await
+        .expect("insert file");
+
+        sqlx::query(
+            "INSERT INTO fusillade.batches (id, created_by, file_id, endpoint, completion_window, expires_at, created_at, total_requests) VALUES ($1, $2, $3, '/v1/chat/completions', '24h', NOW() + interval '24 hours', NOW(), 1)",
+        )
+        .bind(batch_id)
+        .bind(created_by.to_string())
+        .bind(file_id)
+        .execute(pool)
+        .await
+        .expect("insert batch");
+
+        sqlx::query(
+            "INSERT INTO fusillade.request_templates (id, file_id, model, api_key, endpoint, path, body, custom_id, method) VALUES ($1, $2, $3, 'test-key', 'http://test', '/v1/chat/completions', $4, 'req-0', 'POST')",
+        )
+        .bind(template_id)
+        .bind(file_id)
+        .bind(model)
+        .bind(serde_json::to_string(&body).unwrap())
+        .execute(pool)
+        .await
+        .expect("insert template");
+
+        sqlx::query(
+            "INSERT INTO fusillade.requests (id, batch_id, template_id, model, state, created_at) VALUES ($1, $2, $3, $4, 'pending', NOW())",
+        )
+        .bind(request_id)
+        .bind(batch_id)
+        .bind(template_id)
+        .bind(model)
+        .execute(pool)
+        .await
+        .expect("insert request");
+
+        request_id
+    }
 
     #[sqlx::test]
     #[test_log::test]
@@ -373,6 +428,42 @@ mod tests {
 
     #[sqlx::test]
     #[test_log::test]
+    async fn test_member_id_filter_allowed_in_org_context_and_scopes_results(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+
+        let owner = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let org = create_test_org(&pool, owner.id).await;
+        let member_a = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let member_b = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+
+        add_org_member(&pool, org.id, member_a.id, "member").await;
+        add_org_member(&pool, org.id, member_b.id, "member").await;
+
+        let request_a = insert_batch_request(&pool, member_a.id, "model-a").await;
+        let _request_b = insert_batch_request(&pool, member_b.id, "model-b").await;
+
+        let auth = add_auth_headers(&owner);
+        let response = app
+            .get(&format!(
+                "/admin/api/v1/batches/requests?member_id={}",
+                member_a.id
+            ))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .add_header("X-Organization-Id", &org.id.to_string())
+            .await;
+
+        response.assert_status_ok();
+        let body: serde_json::Value = response.json();
+        let data = body["data"].as_array().expect("response data should be an array");
+        assert_eq!(body["total_count"], 1);
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0]["id"], request_a.to_string());
+        assert_eq!(data[0]["created_by_email"], member_a.email);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
     async fn test_get_batch_request_returns_404_for_missing(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
@@ -394,51 +485,7 @@ mod tests {
         let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
         let auth = add_auth_headers(&user);
 
-        // Insert a fusillade batch + request owned by the test user directly, mirroring
-        // the approach used in batches.rs tests.
-        let file_id = uuid::Uuid::new_v4();
-        let batch_id = uuid::Uuid::new_v4();
-        let template_id = uuid::Uuid::new_v4();
-        let request_id = uuid::Uuid::new_v4();
-        let body = serde_json::json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}]});
-
-        sqlx::query(
-            "INSERT INTO fusillade.files (id, name, status, created_at, updated_at) VALUES ($1, 'test.jsonl', 'processed', NOW(), NOW())",
-        )
-        .bind(file_id)
-        .execute(&pool)
-        .await
-        .expect("insert file");
-
-        sqlx::query(
-            "INSERT INTO fusillade.batches (id, created_by, file_id, endpoint, completion_window, expires_at, created_at, total_requests) VALUES ($1, $2, $3, '/v1/chat/completions', '24h', NOW() + interval '24 hours', NOW(), 1)",
-        )
-        .bind(batch_id)
-        .bind(user.id.to_string())
-        .bind(file_id)
-        .execute(&pool)
-        .await
-        .expect("insert batch");
-
-        sqlx::query(
-            "INSERT INTO fusillade.request_templates (id, file_id, model, api_key, endpoint, path, body, custom_id, method) VALUES ($1, $2, 'test-model', 'test-key', 'http://test', '/v1/chat/completions', $3, 'req-0', 'POST')",
-        )
-        .bind(template_id)
-        .bind(file_id)
-        .bind(serde_json::to_string(&body).unwrap())
-        .execute(&pool)
-        .await
-        .expect("insert template");
-
-        sqlx::query(
-            "INSERT INTO fusillade.requests (id, batch_id, template_id, model, state, created_at) VALUES ($1, $2, $3, 'test-model', 'pending', NOW())",
-        )
-        .bind(request_id)
-        .bind(batch_id)
-        .bind(template_id)
-        .execute(&pool)
-        .await
-        .expect("insert request");
+        let request_id = insert_batch_request(&pool, user.id, "test-model").await;
 
         let response = app
             .get(&format!("/admin/api/v1/batches/requests/{}", request_id))

@@ -215,6 +215,8 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
     endpoint: endpointId,
     group: groupId,
     is_composite: isCompositeFilter,
+    sort: "released_at",
+    sort_direction: "desc",
     enabled: canViewAnalytics,
   });
 

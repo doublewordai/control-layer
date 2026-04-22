@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useMemo } from "react";
 import { useNavigate } from "react-router-dom";
 import { Code, Play, X, Filter, Clock, DollarSign, Check, ChevronsUpDown, Users } from "lucide-react";
 import { type ColumnDef } from "@tanstack/react-table";
@@ -287,7 +287,7 @@ export function AsyncRequests() {
     enabled: useServerSideMemberSearch,
   });
 
-  const memberList = (() => {
+  const memberList = useMemo(() => {
     if (isOrgContext && orgMembers) {
       return orgMembers
         .filter((m) => m.status === "active" && m.user)
@@ -307,7 +307,7 @@ export function AsyncRequests() {
     }
 
     return [];
-  })();
+  }, [isOrgContext, orgMembers, useServerSideMemberSearch, searchedUsers]);
 
   // Models for filter and display
   const { data: modelsData } = useModels({ accessible: true, limit: 100 });
