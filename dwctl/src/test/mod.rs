@@ -901,15 +901,16 @@ async fn test_request_logging_disabled(pool: PgPool) {
         .await
         .expect("Failed to create task runner"),
     );
+    let response_store = std::sync::Arc::new(crate::responses::store::FusilladeResponseStore::new(
+        request_manager.clone(),
+    ));
     let mut app_state = AppState::builder()
         .db(DbPools::new(pool.clone()))
         .config(shared_config)
         .request_manager(request_manager)
         .task_runner(task_runner)
         .limiters(limiters)
-        .response_store(std::sync::Arc::new(crate::responses::store::FusilladeResponseStore::new(
-            request_manager.clone(),
-        )))
+        .response_store(response_store)
         .build();
     let onwards_router = axum::Router::new(); // Empty onwards router for testing
     let router = super::build_router(&mut app_state, onwards_router, None, None, false, None)

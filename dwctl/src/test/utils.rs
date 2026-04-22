@@ -51,7 +51,6 @@ pub async fn create_test_app_state_with_config(pool: PgPool, config: crate::conf
         create_batch_job: std::sync::Arc::new(std::sync::OnceLock::new()),
         cascade_batch_state_job: std::sync::Arc::new(std::sync::OnceLock::new()),
     };
-    let fusillade_pool = request_manager.pool().clone();
     let task_runner = std::sync::Arc::new(
         crate::tasks::TaskRunner::new(
             pool,
@@ -65,15 +64,16 @@ pub async fn create_test_app_state_with_config(pool: PgPool, config: crate::conf
         .expect("Failed to create task runner"),
     );
 
+    let response_store = std::sync::Arc::new(crate::responses::store::FusilladeResponseStore::new(
+        request_manager.clone(),
+    ));
     crate::AppState::builder()
         .db(test_pools)
         .config(shared_config)
         .request_manager(request_manager)
         .task_runner(task_runner)
         .limiters(limiters)
-        .response_store(std::sync::Arc::new(crate::responses::store::FusilladeResponseStore::new(
-            request_manager.clone(),
-        )))
+        .response_store(response_store)
         .build()
 }
 
@@ -119,7 +119,6 @@ pub async fn create_test_app_state_with_fusillade(pool: PgPool, config: crate::c
         create_batch_job: std::sync::Arc::new(std::sync::OnceLock::new()),
         cascade_batch_state_job: std::sync::Arc::new(std::sync::OnceLock::new()),
     };
-    let fusillade_pool = request_manager.pool().clone();
     let task_runner = std::sync::Arc::new(
         crate::tasks::TaskRunner::new(
             pool,
@@ -133,15 +132,16 @@ pub async fn create_test_app_state_with_fusillade(pool: PgPool, config: crate::c
         .expect("Failed to create task runner"),
     );
 
+    let response_store = std::sync::Arc::new(crate::responses::store::FusilladeResponseStore::new(
+        request_manager.clone(),
+    ));
     crate::AppState::builder()
         .db(test_pools)
         .config(shared_config)
         .request_manager(request_manager)
         .task_runner(task_runner)
         .limiters(limiters)
-        .response_store(std::sync::Arc::new(crate::responses::store::FusilladeResponseStore::new(
-            request_manager.clone(),
-        )))
+        .response_store(response_store)
         .build()
 }
 
