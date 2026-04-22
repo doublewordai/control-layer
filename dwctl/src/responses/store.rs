@@ -38,7 +38,21 @@ impl FusilladeResponseStore {
 
     /// Retrieve a response by ID. Used by the GET /v1/responses/{id} handler.
     pub async fn get_response(&self, response_id: &str) -> Result<Option<serde_json::Value>, StoreError> {
-        self.get(response_id).await
+        let id = parse_response_id(response_id)?;
+
+        let row = sqlx::query(
+            "SELECT r.id, r.state, r.model, t.body, r.response_body, r.response_status,
+                    r.error, r.created_at, r.completed_at, r.failed_at, r.batch_id
+             FROM requests r
+             LEFT JOIN request_templates t ON r.template_id = t.id
+             WHERE r.id = $1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StoreError::StorageError(format!("Failed to fetch request: {e}")))?;
+
+        Ok(row.as_ref().map(row_to_response_object))
     }
 }
 
@@ -442,24 +456,6 @@ fn row_to_response_object(row: &sqlx::postgres::PgRow) -> serde_json::Value {
 
 #[async_trait]
 impl ResponseStore for FusilladeResponseStore {
-    async fn get(&self, response_id: &str) -> Result<Option<serde_json::Value>, StoreError> {
-        let id = parse_response_id(response_id)?;
-
-        let row = sqlx::query(
-            "SELECT r.id, r.state, r.model, t.body, r.response_body, r.response_status,
-                    r.error, r.created_at, r.completed_at, r.failed_at, r.batch_id
-             FROM requests r
-             LEFT JOIN request_templates t ON r.template_id = t.id
-             WHERE r.id = $1",
-        )
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| StoreError::StorageError(format!("Failed to fetch request: {e}")))?;
-
-        Ok(row.as_ref().map(row_to_response_object))
-    }
-
     async fn store(&self, response: &serde_json::Value) -> Result<String, StoreError> {
         // The adapter calls this after constructing the final response.
         // The row already exists (created by middleware), and the outlet handler
@@ -469,7 +465,7 @@ impl ResponseStore for FusilladeResponseStore {
     }
 
     async fn get_context(&self, response_id: &str) -> Result<Option<serde_json::Value>, StoreError> {
-        self.get(response_id).await
+        self.get_response(response_id).await
     }
 }
 

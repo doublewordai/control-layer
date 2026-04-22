@@ -5,7 +5,6 @@
 //! - `CompleteResponseJob`: updates the request with response body/status or marks it failed
 
 use serde::{Deserialize, Serialize};
-use sqlx::Row;
 use uuid::Uuid;
 
 use super::store::{self as response_store, OnwardsDaemonId};
