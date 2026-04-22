@@ -100,6 +100,7 @@ database:
 #### Component Database Isolation
 
 Components can optionally use dedicated databases instead of schemas. This is useful for:
+
 - Isolating workloads (batch processing won't affect main app)
 - Independent scaling and backups
 - Using different database instances for different components
@@ -146,6 +147,7 @@ database:
 Control Layer supports two authentication methods:
 
 ### Native Authentication
+
 Username/password authentication with session cookies. Users can register and log in directly through the Control Layer UI or API.
 
 ### Proxy Header Authentication
@@ -157,11 +159,13 @@ Accepts user identity from HTTP headers set by an upstream authentication proxy 
 You can configure authentication in two ways:
 
 **Single Header Mode (Simple)**
+
 - Send only `x-doubleword-user` header with the user's email
 - The email must be unique per user
 - Example: `x-doubleword-user: "user@example.com"`
 
 **Dual Header Mode (Federated Identity)**
+
 - Send both `x-doubleword-user` (unique identifier from IdP) and `x-doubleword-email` (email address)
 - Allows multiple accounts with the same email from different identity providers
 - The combination of (email, external_user_id) must be unique
@@ -191,6 +195,7 @@ Control Layer uses an additive role-based access control system where users can 
 ### Role Types
 
 #### StandardUser (Base Role)
+
 - **Required for all users** - Cannot be removed
 - Enables basic authentication and login functionality
 - Provides access to user's own profile and data
@@ -198,6 +203,7 @@ Control Layer uses an additive role-based access control system where users can 
 - Foundation role that all other roles build upon
 
 #### PlatformManager
+
 - **Administrative access** to most platform functionality
 - Can create, update, and delete users
 - Can manage groups and group memberships
@@ -206,6 +212,7 @@ Control Layer uses an additive role-based access control system where users can 
 - **Cannot** view private request data (requires RequestViewer)
 
 #### RequestViewer
+
 - **Read-only access** to request logs and analytics
 - Can view all requests that have transited the gateway
 - Useful for auditing, monitoring, and analytics purposes
