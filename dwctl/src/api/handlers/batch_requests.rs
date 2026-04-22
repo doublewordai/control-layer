@@ -20,6 +20,7 @@ use crate::{
         users::CurrentUser,
     },
     auth::permissions::{RequiresPermission, can_read_all_resources, operation, resource},
+    db::handlers::Organizations,
     errors::{Error, Result},
     types::Resource,
 };
@@ -67,10 +68,25 @@ pub async fn list_batch_requests<P: PoolProvider>(
     // Build ownership filter.
     // member_id is available in org context for any member, or in personal context for platform managers.
     let created_by_filter: Option<String> = if let Some(member_id) = query.member_id {
-        if current_user.active_organization.is_none() && !can_read_all {
-            return Err(Error::BadRequest {
-                message: "member_id filter is only available in organization context or for platform managers".to_string(),
-            });
+        match current_user.active_organization {
+            Some(org_id) => {
+                let mut read_conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+                let is_member = Organizations::new(&mut read_conn)
+                    .get_user_org_role(member_id, org_id)
+                    .await
+                    .map_err(Error::Database)?
+                    .is_some();
+
+                if !is_member {
+                    return Ok(Json(PaginatedResponse::new(vec![], 0, skip, limit)));
+                }
+            }
+            None if !can_read_all => {
+                return Err(Error::BadRequest {
+                    message: "member_id filter is only available in organization context or for platform managers".to_string(),
+                });
+            }
+            None => {}
         }
         Some(member_id.to_string())
     } else if can_read_all {
@@ -330,11 +346,7 @@ mod tests {
     use sqlx::PgPool;
     use uuid::Uuid;
 
-    async fn insert_batch_request(
-        pool: &PgPool,
-        created_by: Uuid,
-        model: &str,
-    ) -> Uuid {
+    async fn insert_batch_request(pool: &PgPool, created_by: Uuid, model: &str) -> Uuid {
         let file_id = Uuid::new_v4();
         let batch_id = Uuid::new_v4();
         let template_id = Uuid::new_v4();
@@ -435,19 +447,18 @@ mod tests {
         let org = create_test_org(&pool, owner.id).await;
         let member_a = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
         let member_b = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let outsider = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
 
         add_org_member(&pool, org.id, member_a.id, "member").await;
         add_org_member(&pool, org.id, member_b.id, "member").await;
 
         let request_a = insert_batch_request(&pool, member_a.id, "model-a").await;
         let _request_b = insert_batch_request(&pool, member_b.id, "model-b").await;
+        let _outsider_request = insert_batch_request(&pool, outsider.id, "model-outsider").await;
 
         let auth = add_auth_headers(&owner);
         let response = app
-            .get(&format!(
-                "/admin/api/v1/batches/requests?member_id={}",
-                member_a.id
-            ))
+            .get(&format!("/admin/api/v1/batches/requests?member_id={}", member_a.id))
             .add_header(&auth[0].0, &auth[0].1)
             .add_header(&auth[1].0, &auth[1].1)
             .add_header("X-Organization-Id", &org.id.to_string())
@@ -460,6 +471,21 @@ mod tests {
         assert_eq!(data.len(), 1);
         assert_eq!(data[0]["id"], request_a.to_string());
         assert_eq!(data[0]["created_by_email"], member_a.email);
+
+        let outsider_response = app
+            .get(&format!("/admin/api/v1/batches/requests?member_id={}", outsider.id))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .add_header("X-Organization-Id", &org.id.to_string())
+            .await;
+
+        outsider_response.assert_status_ok();
+        let outsider_body: serde_json::Value = outsider_response.json();
+        assert_eq!(outsider_body["total_count"], 0);
+        assert!(
+            outsider_body["data"].as_array().is_some_and(|rows| rows.is_empty()),
+            "outsider member_id should not expose any org-external requests"
+        );
     }
 
     #[sqlx::test]
