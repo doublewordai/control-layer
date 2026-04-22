@@ -28,7 +28,7 @@ import {
   CommandList,
 } from "../../ui/command";
 import { cn } from "../../../lib/utils";
-import { useAsyncRequests, useModels, useConfig } from "../../../api/control-layer/hooks";
+import { useAsyncRequests, useModels } from "../../../api/control-layer/hooks";
 import { useAuthorization } from "../../../utils/authorization";
 import type {
   AsyncRequest,
@@ -251,10 +251,6 @@ export function AsyncRequests() {
   const isPlatformManager = hasPermission("manage-models");
   const { isOrgContext, activeOrganizationId } = useOrganizationContext();
   const showUserColumn = isPlatformManager || isOrgContext;
-  const { data: config } = useConfig();
-  const asyncCompletionWindow =
-    config?.batches?.async_requests?.completion_window ?? "1h";
-
   // Filters
   const [statusFilter, setStatusFilter] = useState<
     AsyncRequestStatus | "all"
@@ -286,7 +282,7 @@ export function AsyncRequests() {
   const columns = createColumns(showUserColumn, modelDisplayNames);
 
   const { data, isLoading } = useAsyncRequests({
-    completion_window: asyncCompletionWindow,
+    service_tier: "flex",
     active_first: sortActiveFirst,
     status: statusFilter !== "all" ? statusFilter : undefined,
     model: modelFilter.length > 0 ? modelFilter.join(",") : undefined,
@@ -506,7 +502,6 @@ export function AsyncRequests() {
         isOpen={createModalOpen}
         onClose={() => setCreateModalOpen(false)}
         onSuccess={() => setCreateModalOpen(false)}
-        completionWindow={asyncCompletionWindow}
       />
 
       <ApiExamples

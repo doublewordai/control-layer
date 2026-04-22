@@ -48,7 +48,6 @@ import {
   useBatches,
   useOrganizationMembers,
   useUsers,
-  useConfig,
 } from "../../../../api/control-layer/hooks";
 import { dwctlApi } from "../../../../api/control-layer/client";
 import type { FileObject, Batch } from "../types";
@@ -97,10 +96,6 @@ export function Batches({
   const queryClient = useQueryClient();
   const { userRoles, hasPermission } = useAuthorization();
   const { isOrgContext, activeOrganizationId } = useOrganizationContext();
-
-  const { data: appConfig } = useConfig();
-  const asyncCompletionWindow =
-    appConfig?.batches?.async_requests?.completion_window ?? "1h";
 
   // Show User column for PlatformManagers (see all batches) or in org context (see org members)
   const isPlatformManager = userRoles.includes("PlatformManager");
@@ -274,7 +269,7 @@ export function Batches({
     created_after: dateRange?.from.toISOString(),
     created_before: dateRange?.to.toISOString(),
     active_first: sortActiveFirst || undefined,
-    exclude_completion_window: hideAsync ? asyncCompletionWindow : undefined,
+    exclude_completion_window: hideAsync ? "1h" : undefined,
     ...batchesPagination.queryParams,
   });
 
@@ -536,7 +531,6 @@ export function Batches({
     onRowClick: handleBatchClick,
     showUserColumn,
     showTypeColumn: !hideAsync,
-    asyncCompletionWindow,
   });
 
   // Searchable member filter combobox - shared between batches and files tabs

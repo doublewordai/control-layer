@@ -33,8 +33,6 @@ interface ColumnActions {
   showUserColumn?: boolean;
   /** Show the Type column (hidden when "Batch only" filter is on) */
   showTypeColumn?: boolean;
-  /** Completion window that identifies async batches (default: "1h") */
-  asyncCompletionWindow?: string;
 }
 
 const getStatusColor = (status: BatchStatus) => {
@@ -119,7 +117,7 @@ export const createBatchColumns = (
           header: "Type",
           cell: ({ row }: { row: { original: Batch } }) => {
             const batch = row.original;
-            const isAsync = batch.completion_window === (actions.asyncCompletionWindow ?? "1h");
+            const isAsync = batch.completion_window !== "24h";
             return (
               <Tooltip>
                 <TooltipTrigger asChild>
@@ -140,14 +138,6 @@ export const createBatchColumns = (
         } as ColumnDef<Batch>,
       ]
     : []),
-  {
-    accessorKey: "completion_window",
-    header: "Completion Window",
-    cell: ({ row }) => {
-      const window = row.getValue("completion_window") as string;
-      return <span className="text-sm text-doubleword-neutral-900">{window}</span>;
-    },
-  },
   {
     accessorKey: "status",
     header: "Status",
