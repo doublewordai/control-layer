@@ -57,7 +57,7 @@ import {
 import { Skeleton } from "../../../ui/skeleton";
 import { ApiExamples } from "../../../modals";
 import { CatalogIcon } from "./CatalogIcon";
-import { getModelOrder } from "./catalogPresentation";
+
 
 const EVERYONE_GROUP_ID = "00000000-0000-0000-0000-000000000000";
 
@@ -558,19 +558,9 @@ function SectionTable({
       return a - b;
     };
 
-    // Default: sort by provider name, then model order, then alias
+    // Default: preserve server-side order (released_at desc, nulls last)
     if (!sortField) {
-      return [...models].sort((a, b) => {
-        const keyA = (a.metadata?.provider?.trim() || "Other").toLowerCase();
-        const keyB = (b.metadata?.provider?.trim() || "Other").toLowerCase();
-        if (keyA !== keyB) return keyA.localeCompare(keyB);
-        const orderA = getModelOrder(a);
-        const orderB = getModelOrder(b);
-        if (orderA != null && orderB != null && orderA !== orderB) return orderA - orderB;
-        if (orderA != null) return -1;
-        if (orderB != null) return 1;
-        return a.alias.localeCompare(b.alias);
-      });
+      return models;
     }
 
     const directionMultiplier = sortDirection === "asc" ? 1 : -1;
