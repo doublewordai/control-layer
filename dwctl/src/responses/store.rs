@@ -245,7 +245,8 @@ pub async fn create_batch_of_1(
     pool: &PgPool,
     request: &serde_json::Value,
     model: &str,
-    endpoint: &str,
+    base_url: &str,
+    path: &str,
     completion_window: &str,
     api_key: Option<&str>,
 ) -> Result<(String, Uuid), StoreError> {
@@ -315,11 +316,12 @@ pub async fn create_batch_of_1(
     // Create template
     sqlx::query(
         "INSERT INTO request_templates (id, file_id, custom_id, endpoint, method, path, body, model, api_key)
-         VALUES ($1, $2, NULL, $3, 'POST', $3, $4, $5, '')",
+         VALUES ($1, $2, NULL, $3, 'POST', $4, $5, $6, '')",
     )
     .bind(template_id)
     .bind(file_id)
-    .bind(endpoint)
+    .bind(base_url)
+    .bind(path)
     .bind(&body)
     .bind(model)
     .execute(pool)
@@ -333,7 +335,7 @@ pub async fn create_batch_of_1(
     )
     .bind(batch_id)
     .bind(file_id)
-    .bind(endpoint)
+    .bind(path)
     .bind(completion_window)
     .bind(&created_by)
     .bind(expires_at)

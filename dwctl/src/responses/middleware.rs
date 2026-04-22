@@ -31,6 +31,10 @@ pub struct ResponsesMiddlewareState {
     pub pool: PgPool,
     pub daemon_id: OnwardsDaemonId,
     pub create_response_job: std::sync::Arc<underway::Job<CreateResponseInput, crate::tasks::TaskState>>,
+    /// Base URL for loopback requests (e.g., "http://0.0.0.0:3001/ai").
+    /// Flex batches are routed back through dwctl so onwards handles the
+    /// responses→chat completions conversion.
+    pub loopback_base_url: String,
 }
 
 /// Middleware that routes inference requests based on service_tier and background.
@@ -109,7 +113,7 @@ pub async fn responses_middleware(State(state): State<ResponsesMiddlewareState>,
             )
             .await
         }
-        ServiceTier::Flex => handle_flex(&state, &request_value, model, &endpoint, background, api_key.as_deref()).await,
+        ServiceTier::Flex => handle_flex(&state, &request_value, model, &endpoint, background, api_key.as_deref(), &state.loopback_base_url).await,
     }
 }
 
@@ -223,8 +227,9 @@ async fn handle_flex(
     endpoint: &str,
     background: bool,
     api_key: Option<&str>,
+    loopback_base_url: &str,
 ) -> Response {
-    let result = response_store::create_batch_of_1(&state.pool, request_value, model, endpoint, "1h", api_key).await;
+    let result = response_store::create_batch_of_1(&state.pool, request_value, model, loopback_base_url, endpoint, "1h", api_key).await;
 
     let (response_id, _request_id) = match result {
         Ok(ids) => ids,
