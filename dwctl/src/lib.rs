@@ -2475,6 +2475,7 @@ impl Application {
             daemon_id: crate::responses::store::OnwardsDaemonId(onwards_daemon_id),
             create_response_job: bg_services.task_runner.create_response_job.clone(),
             loopback_base_url: format!("http://{}/ai", config.bind_address()),
+            dwctl_pool: (*db_pools).write().clone(),
         };
 
         // Build onwards router from targets with body transform, response sanitization, and tool executor.

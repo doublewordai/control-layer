@@ -38,6 +38,8 @@ pub struct ResponsesMiddlewareState<P: PoolProvider + Clone = sqlx_pool_router::
     /// Flex batches are routed back through dwctl so onwards handles the
     /// responses→chat completions conversion.
     pub loopback_base_url: String,
+    /// dwctl database pool for model access validation.
+    pub dwctl_pool: sqlx::PgPool,
 }
 
 /// Middleware that routes inference requests based on service_tier and background.
@@ -239,6 +241,18 @@ async fn handle_flex<P: PoolProvider + Clone + Send + Sync + 'static>(
     api_key: Option<&str>,
     loopback_base_url: &str,
 ) -> Response {
+    // Validate model access before creating the batch
+    if let Some(key) = api_key {
+        if let Err(msg) = crate::error_enrichment::validate_api_key_model_access(
+            state.dwctl_pool.clone(), key, model,
+        ).await {
+            return Response::builder()
+                .status(StatusCode::FORBIDDEN)
+                .body(Body::from(serde_json::json!({"error": {"message": msg, "type": "invalid_request_error"}}).to_string()))
+                .unwrap();
+        }
+    }
+
     let result = response_store::create_batch_of_1(&state.request_manager, request_value, model, loopback_base_url, endpoint, "1h", api_key).await;
 
     let (response_id, _request_id) = match result {

@@ -236,7 +236,7 @@ pub async fn get_batch_request<P: PoolProvider>(
     // Check ownership — fetch-then-check pattern matches get_batch handler.
     // The response is discarded on failure (returns 404, no data leakage).
     let can_read_all = can_read_all_resources(&current_user, Resource::Batches);
-    if !can_read_all && !is_batch_owner(&current_user, &detail.batch_created_by) {
+    if !can_read_all && !detail.batch_created_by.as_deref().is_some_and(|cb| is_batch_owner(&current_user, cb)) {
         return Err(Error::NotFound {
             resource: "BatchRequest".to_string(),
             id: request_id.to_string(),
@@ -266,7 +266,9 @@ pub async fn get_batch_request<P: PoolProvider>(
     // Look up the creator's email via UUID primary-key lookup (org IDs and unparseable
     // values return None without a query). Uses the primary pool to avoid replica lag
     // right after batch creation.
-    let created_by_email = if let Ok(created_by_uuid) = Uuid::parse_str(&detail.batch_created_by) {
+    let created_by_email = if let Some(ref batch_created_by) = detail.batch_created_by
+        && let Ok(created_by_uuid) = Uuid::parse_str(batch_created_by)
+    {
         sqlx::query_as::<_, EmailRow>("SELECT id::text as user_id, email FROM users WHERE id = $1")
             .bind(created_by_uuid)
             .fetch_optional(state.db.write())
@@ -282,7 +284,7 @@ pub async fn get_batch_request<P: PoolProvider>(
 
     Ok(Json(BatchRequestDetail {
         id: detail.id,
-        batch_id: detail.batch_id,
+        batch_id: detail.batch_id.unwrap_or_default(),
         model: detail.model,
         status: detail.status,
         created_at: detail.created_at,
@@ -298,8 +300,8 @@ pub async fn get_batch_request<P: PoolProvider>(
         body: detail.body.unwrap_or_default(),
         response_body: detail.response_body,
         error: detail.error,
-        completion_window: detail.completion_window,
-        batch_created_by: detail.batch_created_by,
+        completion_window: detail.completion_window.unwrap_or_default(),
+        batch_created_by: detail.batch_created_by.unwrap_or_default(),
         created_by_email,
     }))
 }

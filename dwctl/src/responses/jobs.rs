@@ -45,19 +45,15 @@ pub async fn build_create_response_job<P: sqlx_pool_router::PoolProvider + Clone
     Job::<CreateResponseInput, _>::builder()
         .state(state)
         .step(|cx, input: CreateResponseInput| async move {
-            // Validate the API key exists (lightweight auth gate)
+            // Validate API key and model access before creating the request
             if let Some(ref key) = input.api_key {
-                let key_exists = sqlx::query("SELECT 1 FROM public.api_keys WHERE secret = $1 AND is_deleted = false LIMIT 1")
-                    .bind(key)
-                    .fetch_optional(&cx.state.dwctl_pool)
-                    .await
-                    .map_err(|e| TaskError::Retryable(format!("API key lookup failed: {e}")))?
-                    .is_some();
-
-                if !key_exists {
+                if let Err(msg) = crate::error_enrichment::validate_api_key_model_access(
+                    cx.state.dwctl_pool.clone(), key, &input.model,
+                ).await {
                     tracing::debug!(
                         response_id = %input.response_id,
-                        "Skipping response creation — invalid API key"
+                        error = %msg,
+                        "Skipping response creation — model access denied"
                     );
                     return To::done();
                 }
