@@ -349,8 +349,8 @@ pub async fn create_batch_of_1(
 
     // Create request in pending state (daemon will claim it)
     sqlx::query(
-        "INSERT INTO requests (id, batch_id, template_id, model, custom_id, state)
-         VALUES ($1, $2, $3, $4, NULL, 'pending')",
+        "INSERT INTO requests (id, batch_id, template_id, model, custom_id, state, service_tier)
+         VALUES ($1, $2, $3, $4, NULL, 'pending', 'flex')",
     )
     .bind(request_id)
     .bind(batch_id)

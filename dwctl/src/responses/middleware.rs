@@ -69,8 +69,11 @@ pub async fn responses_middleware(State(state): State<ResponsesMiddlewareState>,
     };
 
     let model = request_value["model"].as_str().unwrap_or("unknown");
-    let endpoint = parts.uri.path().to_string();
-    let is_responses_api = endpoint.ends_with("/responses");
+    let nested_path = parts.uri.path();
+    let is_responses_api = nested_path.ends_with("/responses");
+    // The router is nested at /ai/v1, so the path here is e.g. "/responses".
+    // Prepend /v1 for the full API path used by the loopback and fusillade templates.
+    let endpoint = format!("/v1{nested_path}");
 
     // Extract bearer token for auth check and batch attribution
     let api_key = parts
