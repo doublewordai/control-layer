@@ -64,11 +64,12 @@ pub async fn list_batch_requests<P: PoolProvider>(
     let limit = query.pagination.limit();
     let can_read_all = can_read_all_resources(&current_user, Resource::Batches);
 
-    // Build ownership filter — member_id only allowed for users with ReadAll permission
+    // Build ownership filter.
+    // member_id is available in org context for any member, or in personal context for platform managers.
     let created_by_filter: Option<String> = if let Some(member_id) = query.member_id {
-        if !can_read_all {
+        if current_user.active_organization.is_none() && !can_read_all {
             return Err(Error::BadRequest {
-                message: "member_id filter requires platform manager permissions".to_string(),
+                message: "member_id filter is only available in organization context or for platform managers".to_string(),
             });
         }
         Some(member_id.to_string())
@@ -357,7 +358,7 @@ mod tests {
 
     #[sqlx::test]
     #[test_log::test]
-    async fn test_member_id_filter_rejected_for_non_pm(pool: PgPool) {
+    async fn test_member_id_filter_rejected_outside_org_context_for_non_pm(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
 
