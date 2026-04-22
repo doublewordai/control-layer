@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.42.0](https://github.com/doublewordai/control-layer/compare/v8.41.0...v8.42.0) (2026-04-22)
+
+
+### Features
+
+* upgrade fusillade 16.3.0 and switch async view to service_tier=flex ([#1009](https://github.com/doublewordai/control-layer/issues/1009)) ([c98bc38](https://github.com/doublewordai/control-layer/commit/c98bc386e1de4b19e3732a6771f613cd90c90c13))
+
 ## [8.41.0](https://github.com/doublewordai/control-layer/compare/v8.40.1...v8.41.0) (2026-04-17)
 
 
