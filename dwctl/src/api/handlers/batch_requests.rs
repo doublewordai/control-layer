@@ -99,6 +99,7 @@ pub async fn list_batch_requests<P: PoolProvider>(
             models,
             created_after: query.created_after,
             created_before: query.created_before,
+            service_tier: query.service_tier.clone(),
             active_first: query.active_first.unwrap_or(true),
             skip,
             limit,
