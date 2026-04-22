@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.42.3](https://github.com/doublewordai/control-layer/compare/v8.42.2...v8.42.3) (2026-04-22)
+
+
+### Bug Fixes
+
+* models sort ([#1016](https://github.com/doublewordai/control-layer/issues/1016)) ([2bd3635](https://github.com/doublewordai/control-layer/commit/2bd36356dff5cc393448366d43673598004fd129))
+
 ## [8.42.2](https://github.com/doublewordai/control-layer/compare/v8.42.1...v8.42.2) (2026-04-22)
 
 
