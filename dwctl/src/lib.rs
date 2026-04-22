@@ -294,7 +294,7 @@ where
     pub connections_encryption_key: Option<Vec<u8>>,
     /// Response store for Open Responses API lifecycle tracking.
     /// Reads/writes to fusillade's requests table.
-    pub response_store: Arc<crate::responses::store::FusilladeResponseStore>,
+    pub response_store: Arc<crate::responses::store::FusilladeResponseStore<P>>,
 }
 
 impl<P> AppState<P>
@@ -2466,12 +2466,12 @@ impl Application {
             Ok(())
         });
 
-        // Create the response store (read-only, for ResponseStore trait + GET handler)
-        let response_store = Arc::new(crate::responses::store::FusilladeResponseStore::new(fusillade_write_pool.clone()));
+        // Create the response store (backed by request_manager for reads via Storage trait)
+        let response_store = Arc::new(crate::responses::store::FusilladeResponseStore::new(bg_services.request_manager.clone()));
 
         // Responses middleware state (enqueues create-response jobs via underway)
         let responses_middleware_state = crate::responses::middleware::ResponsesMiddlewareState {
-            pool: fusillade_write_pool.clone(),
+            request_manager: bg_services.request_manager.clone(),
             daemon_id: crate::responses::store::OnwardsDaemonId(onwards_daemon_id),
             create_response_job: bg_services.task_runner.create_response_job.clone(),
             loopback_base_url: format!("http://{}/ai", config.bind_address()),

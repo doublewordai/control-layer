@@ -12,6 +12,8 @@
 //!   and polls until complete (Phase 3). With `background=true`, returns 202 immediately.
 //! - `flex` (batch): same as default but with 24h completion window and batch pricing.
 
+use std::sync::Arc;
+
 use axum::{
     Json,
     body::Body,
@@ -20,17 +22,18 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
-use sqlx::PgPool;
+use fusillade::{PostgresRequestManager, ReqwestHttpClient};
+use sqlx_pool_router::PoolProvider;
 
 use super::jobs::CreateResponseInput;
 use super::store::{self as response_store, ONWARDS_RESPONSE_ID_HEADER, OnwardsDaemonId};
 
 /// State for the responses middleware.
 #[derive(Clone)]
-pub struct ResponsesMiddlewareState {
-    pub pool: PgPool,
+pub struct ResponsesMiddlewareState<P: PoolProvider + Clone = sqlx_pool_router::DbPools> {
+    pub request_manager: Arc<PostgresRequestManager<P, ReqwestHttpClient>>,
     pub daemon_id: OnwardsDaemonId,
-    pub create_response_job: std::sync::Arc<underway::Job<CreateResponseInput, crate::tasks::TaskState>>,
+    pub create_response_job: Arc<underway::Job<CreateResponseInput, crate::tasks::TaskState>>,
     /// Base URL for loopback requests (e.g., "http://0.0.0.0:3001/ai").
     /// Flex batches are routed back through dwctl so onwards handles the
     /// responses→chat completions conversion.
@@ -39,7 +42,11 @@ pub struct ResponsesMiddlewareState {
 
 /// Middleware that routes inference requests based on service_tier and background.
 #[tracing::instrument(skip_all)]
-pub async fn responses_middleware(State(state): State<ResponsesMiddlewareState>, req: Request<Body>, next: Next) -> Response {
+pub async fn responses_middleware<P: PoolProvider + Clone + Send + Sync + 'static>(
+    State(state): State<ResponsesMiddlewareState<P>>,
+    req: Request<Body>,
+    next: Next,
+) -> Response {
     // Only intercept POST requests to inference endpoints.
     if !should_intercept(req.method(), req.uri().path()) {
         return next.run(req).await;
@@ -153,8 +160,8 @@ fn resolve_service_tier(tier: Option<&str>) -> ServiceTier {
 /// proxies via onwards. The job runs in parallel with the proxy.
 /// With `background=true`, returns 202 immediately and spawns the proxy as a background task.
 #[allow(clippy::too_many_arguments)]
-async fn handle_realtime(
-    state: &ResponsesMiddlewareState,
+async fn handle_realtime<P: PoolProvider + Clone + Send + Sync + 'static>(
+    state: &ResponsesMiddlewareState<P>,
     request_value: &serde_json::Value,
     model: &str,
     endpoint: &str,
@@ -223,8 +230,8 @@ async fn handle_realtime(
 /// The fusillade daemon will pick it up and process it at async pricing.
 /// With `background=false`, holds the connection and polls until complete (Phase 3).
 /// With `background=true`, returns 202 immediately.
-async fn handle_flex(
-    state: &ResponsesMiddlewareState,
+async fn handle_flex<P: PoolProvider + Clone + Send + Sync + 'static>(
+    state: &ResponsesMiddlewareState<P>,
     request_value: &serde_json::Value,
     model: &str,
     endpoint: &str,
@@ -232,7 +239,7 @@ async fn handle_flex(
     api_key: Option<&str>,
     loopback_base_url: &str,
 ) -> Response {
-    let result = response_store::create_batch_of_1(&state.pool, request_value, model, loopback_base_url, endpoint, "1h", api_key).await;
+    let result = response_store::create_batch_of_1(&state.request_manager, request_value, model, loopback_base_url, endpoint, "1h", api_key).await;
 
     let (response_id, _request_id) = match result {
         Ok(ids) => ids,
@@ -275,7 +282,7 @@ async fn handle_flex(
         let poll_interval = std::time::Duration::from_millis(500);
         let timeout = std::time::Duration::from_secs(3600); // 1h matches completion_window
 
-        match response_store::poll_until_complete(&state.pool, &response_id, poll_interval, timeout).await {
+        match response_store::poll_until_complete(&state.request_manager, &response_id, poll_interval, timeout).await {
             Ok(response_obj) => {
                 let status_code = if response_obj["status"].as_str() == Some("completed") {
                     StatusCode::OK

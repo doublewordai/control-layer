@@ -73,10 +73,9 @@ pub async fn build_create_response_job<P: sqlx_pool_router::PoolProvider + Clone
             let request_value: serde_json::Value =
                 serde_json::from_str(&input.request_body).map_err(|e| TaskError::Fatal(format!("Failed to parse request body: {e}")))?;
 
-            // Create the fusillade rows
-            let fusillade_pool = cx.state.request_manager.pool();
+            // Create the fusillade rows via Storage trait methods
             if let Err(e) = response_store::create_pending_with_id(
-                fusillade_pool,
+                &cx.state.request_manager,
                 &input.response_id,
                 &request_value,
                 &input.model,
