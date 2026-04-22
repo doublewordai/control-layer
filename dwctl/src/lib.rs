@@ -1013,7 +1013,7 @@ pub async fn build_router(
         }
 
         // Add FusilladeOutletHandler to enqueue response completion jobs
-        if let Some(ref rms) = responses_middleware_state {
+        if responses_middleware_state.is_some() {
             let fusillade_handler =
                 crate::responses::outlet_handler::FusilladeOutletHandler::new(state.task_runner.complete_response_job.clone());
             multi_handler = multi_handler.with(fusillade_handler);
