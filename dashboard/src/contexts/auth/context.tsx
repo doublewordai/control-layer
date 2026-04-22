@@ -54,7 +54,14 @@ export function AuthProvider({ children }: AuthProviderProps) {
             const onboardingKey = `onboarding_completed_${user.id}`;
             if (!localStorage.getItem(onboardingKey)) {
               localStorage.setItem(onboardingKey, "true");
-              window.location.href = user.onboarding_redirect_url;
+              // Preserve query params (e.g. utm_source) through onboarding redirect
+              const onboardingUrl = new URL(user.onboarding_redirect_url, window.location.origin);
+              const currentParams = new URLSearchParams(window.location.search);
+              currentParams.delete("redirect");
+              currentParams.forEach((v, k) => {
+                if (!onboardingUrl.searchParams.has(k)) onboardingUrl.searchParams.set(k, v);
+              });
+              window.location.href = onboardingUrl.toString();
               return;
             }
           } catch {

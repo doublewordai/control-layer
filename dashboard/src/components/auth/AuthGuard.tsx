@@ -20,13 +20,19 @@ export function AuthGuard({ children, requireAuth = false }: AuthGuardProps) {
 
   // If auth is required but user is not authenticated, redirect to login
   if (requireAuth && !isAuthenticated) {
-    return <Navigate to="/login" replace />;
+    return <Navigate to={`/login${window.location.search}`} replace />;
   }
 
   // If auth is not required (login/register pages) but user is authenticated, redirect
   if (!requireAuth && isAuthenticated) {
     const redirect = searchParams.get("redirect");
-    return <Navigate to={redirect || "/"} replace />;
+    const target = redirect || "/";
+    // Preserve non-redirect query params (e.g. utm_source) through the redirect
+    const preserved = new URLSearchParams(searchParams);
+    preserved.delete("redirect");
+    const qs = preserved.toString();
+    const separator = target.includes("?") ? "&" : "?";
+    return <Navigate to={qs ? `${target}${separator}${qs}` : target} replace />;
   }
 
   return <>{children}</>;

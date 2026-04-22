@@ -39,7 +39,12 @@ export function LoginForm() {
       await login({ email, password });
       const redirect = searchParams.get("redirect");
       if (redirect) {
-        navigate(redirect);
+        // Preserve non-redirect query params (e.g. utm_source) through login
+        const preserved = new URLSearchParams(searchParams);
+        preserved.delete("redirect");
+        const qs = preserved.toString();
+        const separator = redirect.includes("?") ? "&" : "?";
+        navigate(qs ? `${redirect}${separator}${qs}` : redirect);
       }
       toast.success("Login successful!");
     } catch (error) {

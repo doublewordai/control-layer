@@ -33,22 +33,24 @@ export function ProtectedRoute({
     );
   }
 
+  const search = window.location.search;
+
   // If not authenticated, redirect to login page (will work for both native and proxy auth)
   if (!isAuthenticated) {
-    return <Navigate to="/login" replace />;
+    return <Navigate to={`/login${search}`} replace />;
   }
 
   // Check if required feature flag is enabled
   if (requiredFeatureFlag && !isFeatureEnabled(requiredFeatureFlag)) {
     const fallbackRoute = getFirstAccessibleRoute();
-    return <Navigate to={fallbackRoute} replace />;
+    return <Navigate to={`${fallbackRoute}${search}`} replace />;
   }
 
   // Check if user can access this route
   if (!canAccessRoute(path)) {
     // Redirect to the first accessible route
     const fallbackRoute = getFirstAccessibleRoute();
-    return <Navigate to={fallbackRoute} replace />;
+    return <Navigate to={`${fallbackRoute}${search}`} replace />;
   }
 
   return <>{children}</>;

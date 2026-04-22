@@ -268,11 +268,16 @@ function RootRedirect() {
 
   // If not authenticated, redirect to login page (will work for both native and proxy auth)
   if (!isAuthenticated) {
-    return <Navigate to="/login" replace />;
+    return <Navigate to={`/login${window.location.search}`} replace />;
   }
 
   // If authenticated, redirect to first accessible route
-  return <Navigate to={getFirstAccessibleRoute()} replace />;
+  return (
+    <Navigate
+      to={`${getFirstAccessibleRoute()}${window.location.search}`}
+      replace
+    />
+  );
 }
 
 
