@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.42.1](https://github.com/doublewordai/control-layer/compare/v8.42.0...v8.42.1) (2026-04-22)
+
+
+### Bug Fixes
+
+* updated readme formatting ([41f0e63](https://github.com/doublewordai/control-layer/commit/41f0e634506ea48a0699c6956dcd2eab4ab2fa73))
+
 ## [8.42.0](https://github.com/doublewordai/control-layer/compare/v8.41.0...v8.42.0) (2026-04-22)
 
 
