@@ -202,6 +202,8 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
     endpoint: endpointId,
     group: groupId,
     is_composite: isCompositeFilter,
+    sort: "released_at",
+    sort_direction: "desc",
   });
 
   // Load metrics lazily in the background so model cards render immediately
@@ -213,6 +215,8 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
     endpoint: endpointId,
     group: groupId,
     is_composite: isCompositeFilter,
+    sort: "released_at",
+    sort_direction: "desc",
     enabled: canViewAnalytics,
   });
 
