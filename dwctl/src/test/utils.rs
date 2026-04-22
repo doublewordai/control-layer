@@ -72,7 +72,7 @@ pub async fn create_test_app_state_with_config(pool: PgPool, config: crate::conf
         .task_runner(task_runner)
         .limiters(limiters)
         .response_store(std::sync::Arc::new(crate::responses::store::FusilladeResponseStore::new(
-            fusillade_pool,
+            request_manager.clone(),
         )))
         .build()
 }
@@ -140,7 +140,7 @@ pub async fn create_test_app_state_with_fusillade(pool: PgPool, config: crate::c
         .task_runner(task_runner)
         .limiters(limiters)
         .response_store(std::sync::Arc::new(crate::responses::store::FusilladeResponseStore::new(
-            fusillade_pool,
+            request_manager.clone(),
         )))
         .build()
 }

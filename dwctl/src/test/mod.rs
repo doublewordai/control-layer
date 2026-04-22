@@ -908,7 +908,7 @@ async fn test_request_logging_disabled(pool: PgPool) {
         .task_runner(task_runner)
         .limiters(limiters)
         .response_store(std::sync::Arc::new(crate::responses::store::FusilladeResponseStore::new(
-            pool.clone(),
+            request_manager.clone(),
         )))
         .build();
     let onwards_router = axum::Router::new(); // Empty onwards router for testing
@@ -1268,16 +1268,16 @@ async fn test_build_router_with_metrics_disabled(pool: PgPool) {
         .await
         .expect("Failed to create task runner"),
     );
-    let fusillade_pool = request_manager.pool().clone();
+    let response_store = std::sync::Arc::new(crate::responses::store::FusilladeResponseStore::new(
+        request_manager.clone(),
+    ));
     let mut app_state = AppState::builder()
         .db(DbPools::new(pool))
         .config(shared_config)
         .request_manager(request_manager)
         .task_runner(task_runner)
         .limiters(limiters)
-        .response_store(std::sync::Arc::new(crate::responses::store::FusilladeResponseStore::new(
-            fusillade_pool,
-        )))
+        .response_store(response_store)
         .build();
 
     let onwards_router = axum::Router::new();
@@ -1328,16 +1328,16 @@ async fn test_build_router_with_metrics_enabled(pool: PgPool) {
         .await
         .expect("Failed to create task runner"),
     );
-    let fusillade_pool = request_manager.pool().clone();
+    let response_store = std::sync::Arc::new(crate::responses::store::FusilladeResponseStore::new(
+        request_manager.clone(),
+    ));
     let mut app_state = AppState::builder()
         .db(DbPools::new(pool))
         .config(shared_config)
         .request_manager(request_manager)
         .task_runner(task_runner)
         .limiters(limiters)
-        .response_store(std::sync::Arc::new(crate::responses::store::FusilladeResponseStore::new(
-            fusillade_pool,
-        )))
+        .response_store(response_store)
         .build();
 
     let onwards_router = axum::Router::new();
