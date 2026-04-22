@@ -1,6 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, within } from "@testing-library/react";
-import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import { AsyncRequests } from "./AsyncRequests";
@@ -13,7 +12,6 @@ vi.mock("../../../api/control-layer/hooks", () => ({
   useConfig: vi.fn(),
   useAsyncRequests: vi.fn(),
   useModels: vi.fn(),
-  useOrganizationMembers: vi.fn(),
   useUsers: vi.fn(),
 }));
 
@@ -110,11 +108,6 @@ describe("AsyncRequests", () => {
       isLoading: false,
     } as any);
 
-    vi.mocked(hooks.useOrganizationMembers).mockReturnValue({
-      data: [],
-      isLoading: false,
-    } as any);
-
     vi.mocked(hooks.useUsers).mockReturnValue({
       data: { data: [] },
       isLoading: false,
@@ -169,9 +162,7 @@ describe("AsyncRequests", () => {
     ).toBeInTheDocument();
   });
 
-  it("passes member_id to the query when a member is selected in org view", async () => {
-    const user = userEvent.setup();
-
+  it("does not show the member filter in org view for non-platform managers", () => {
     vi.mocked(useAuthorization).mockReturnValue({
       userRoles: ["StandardUser", "BatchAPIUser"],
       isLoading: false,
@@ -187,25 +178,12 @@ describe("AsyncRequests", () => {
       setActiveOrganization: vi.fn(),
     } as any);
 
-    vi.mocked(hooks.useOrganizationMembers).mockReturnValue({
-      data: [
-        {
-          id: "member-1",
-          status: "active",
-          user: { id: "user-123", email: "member@example.com" },
-        },
-      ],
-      isLoading: false,
-    } as any);
-
     render(<AsyncRequests />, { wrapper: createWrapper() });
 
-    await user.click(screen.getByText("All members"));
-    await user.click(screen.getByText("member@example.com"));
-
-    expect(hooks.useAsyncRequests).toHaveBeenLastCalledWith(
+    expect(screen.queryByText("All members")).not.toBeInTheDocument();
+    expect(hooks.useAsyncRequests).toHaveBeenCalledWith(
       expect.objectContaining({
-        member_id: "user-123",
+        member_id: undefined,
       }),
     );
   });

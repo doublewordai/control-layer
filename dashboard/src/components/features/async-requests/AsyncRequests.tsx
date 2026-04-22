@@ -31,7 +31,6 @@ import { cn } from "../../../lib/utils";
 import {
   useAsyncRequests,
   useModels,
-  useOrganizationMembers,
   useUsers,
 } from "../../../api/control-layer/hooks";
 import { useAuthorization } from "../../../utils/authorization";
@@ -257,7 +256,7 @@ export function AsyncRequests() {
   const isPlatformManager = hasPermission("manage-models");
   const { isOrgContext, activeOrganizationId } = useOrganizationContext();
   const showUserColumn = isPlatformManager || isOrgContext;
-  const showMemberFilter = isOrgContext || (isPlatformManager && !isOrgContext);
+  const showMemberFilter = isPlatformManager && !isOrgContext;
   const useServerSideMemberSearch = isPlatformManager && !isOrgContext;
   // Filters
   const [statusFilter, setStatusFilter] = useState<
@@ -278,9 +277,6 @@ export function AsyncRequests() {
   >(undefined);
   const [memberPopoverOpen, setMemberPopoverOpen] = useState(false);
 
-  const { data: orgMembers } = useOrganizationMembers(
-    activeOrganizationId || "",
-  );
   const { data: searchedUsers } = useUsers({
     search: debouncedMemberSearch,
     limit: 50,
@@ -288,12 +284,6 @@ export function AsyncRequests() {
   });
 
   const memberList = useMemo(() => {
-    if (isOrgContext && orgMembers) {
-      return orgMembers
-        .filter((m) => m.status === "active" && m.user)
-        .map((m) => ({ id: m.user!.id, email: m.user!.email }));
-    }
-
     if (useServerSideMemberSearch && searchedUsers?.data) {
       const seen = new Set<string>();
       return searchedUsers.data
@@ -307,7 +297,7 @@ export function AsyncRequests() {
     }
 
     return [];
-  }, [isOrgContext, orgMembers, useServerSideMemberSearch, searchedUsers]);
+  }, [useServerSideMemberSearch, searchedUsers]);
 
   // Models for filter and display
   const { data: modelsData } = useModels({ accessible: true, limit: 100 });
@@ -317,6 +307,10 @@ export function AsyncRequests() {
   );
   const [modelPopoverOpen, setModelPopoverOpen] = useState(false);
 
+  // Server-side offset pagination
+  const pagination = useServerPagination({ defaultPageSize: 10 });
+  const { handleReset } = pagination;
+
   // Reset filters when org context changes
   useEffect(() => {
     setStatusFilter("all");
@@ -325,10 +319,8 @@ export function AsyncRequests() {
     setSelectedMemberEmail(undefined);
     setMemberSearch("");
     setDateRange(undefined);
-  }, [activeOrganizationId]);
-
-  // Server-side offset pagination
-  const pagination = useServerPagination({ defaultPageSize: 10 });
+    handleReset();
+  }, [activeOrganizationId, handleReset]);
 
   const columns = createColumns(showUserColumn, modelDisplayNames);
 
