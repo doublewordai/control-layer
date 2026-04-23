@@ -122,26 +122,64 @@ export function getFormatBadges(model: Model): string[] {
  */
 export type PricingContext = "async" | "batch";
 
-function tariffMatchesContext(
+/**
+ * Rank a tariff for the given pricing context. Lower score = better match.
+ *
+ * The ranking is intentionally total so that the result of
+ * `pickTariffForContext` is independent of the order in which the backend
+ * returns tariffs. When multiple tariffs match the ideal shape (e.g. two
+ * realtime tariffs) we break ties by input price (cheaper wins) so behaviour
+ * is still deterministic.
+ *
+ * Preference order:
+ *
+ *   Async context
+ *     1. realtime
+ *     2. batch + 1h
+ *     3. any other batch (24h / 48h / null) — fallback so the cell isn't blank
+ *     4. anything else visible
+ *
+ *   Batch context
+ *     1. batch + 24h
+ *     2. batch + 48h
+ *     3. batch + null  (legacy rows that predate completion_window)
+ *     4. batch + 1h    (fallback only)
+ *     5. realtime      (fallback only)
+ *     6. anything else visible
+ */
+function tariffPriority(
   tariff: Pick<ModelTariff, "api_key_purpose" | "completion_window">,
   context: PricingContext,
-): boolean {
+): number {
   const purpose = tariff.api_key_purpose ?? "realtime";
+  const window = tariff.completion_window;
+
   if (context === "async") {
-    return purpose === "realtime" || (purpose === "batch" && tariff.completion_window === "1h");
+    if (purpose === "realtime") return 0;
+    if (purpose === "batch" && window === "1h") return 1;
+    if (purpose === "batch") return 2;
+    return 10;
   }
+
   // context === "batch"
-  return (
-    purpose === "batch" &&
-    (tariff.completion_window == null || tariff.completion_window === "24h" ||
-      tariff.completion_window === "48h")
-  );
+  if (purpose === "batch" && window === "24h") return 0;
+  if (purpose === "batch" && window === "48h") return 1;
+  if (purpose === "batch" && window == null) return 2;
+  if (purpose === "batch" && window === "1h") return 3;
+  if (purpose === "realtime") return 4;
+  return 10;
 }
 
 /**
  * Pick the tariff that best represents the given pricing context for a model.
- * Falls back across tariffs if the preferred combination isn't available so
- * that the cost column always has something to show when any pricing exists.
+ *
+ * Visible tariffs (non-playground, active) are scored with `tariffPriority`
+ * and the lowest-scoring one is returned. If multiple tariffs tie on score
+ * (e.g. a model with two realtime rows) the cheaper input price wins so the
+ * catalog's "from $X/M" aggregation stays stable.
+ *
+ * Returns `null` when the model has no user-facing tariffs at all — callers
+ * render a dash in that case.
  */
 export function pickTariffForContext(
   tariffs: ModelTariff[] | undefined | null,
@@ -153,19 +191,21 @@ export function pickTariffForContext(
   );
   if (visible.length === 0) return null;
 
-  const preferred = visible.find((t) => tariffMatchesContext(t, context));
-  if (preferred) return preferred;
-
-  // Fallbacks: if the user asked for batch but we only have realtime, still
-  // show something rather than a dash.
-  if (context === "batch") {
-    const anyBatch = visible.find((t) => t.api_key_purpose === "batch");
-    if (anyBatch) return anyBatch;
-  } else {
-    const anyRealtime = visible.find((t) => t.api_key_purpose === "realtime");
-    if (anyRealtime) return anyRealtime;
+  let best: ModelTariff | null = null;
+  let bestScore = Infinity;
+  let bestPrice = Infinity;
+  for (const t of visible) {
+    const score = tariffPriority(t, context);
+    if (score > bestScore) continue;
+    const price = parseFloat(t.input_price_per_token);
+    const priceKey = Number.isFinite(price) ? price : Infinity;
+    if (score < bestScore || priceKey < bestPrice) {
+      best = t;
+      bestScore = score;
+      bestPrice = priceKey;
+    }
   }
-  return visible[0];
+  return best;
 }
 
 export interface AggregatedFamily {

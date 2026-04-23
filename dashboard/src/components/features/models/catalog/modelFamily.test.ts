@@ -153,25 +153,83 @@ describe("pickTariffForContext", () => {
     api_key_purpose: "playground",
   });
 
-  it("picks the realtime tariff for async context", () => {
+  it("picks the realtime tariff for async context regardless of input order", () => {
     expect(
       pickTariffForContext([realtime, async1h, batch24h, playground], "async")
+        ?.id,
+    ).toBe("rt");
+    // The bug was that find() returned whichever matching tariff came first
+    // in the array, so the realtime preference was order-dependent.
+    expect(
+      pickTariffForContext([async1h, realtime, batch24h, playground], "async")
+        ?.id,
+    ).toBe("rt");
+    expect(
+      pickTariffForContext([batch24h, async1h, realtime, playground], "async")
         ?.id,
     ).toBe("rt");
   });
 
   it("picks the 1h batch tariff when no realtime tariff exists", () => {
     expect(pickTariffForContext([async1h, batch24h], "async")?.id).toBe("a1");
+    expect(pickTariffForContext([batch24h, async1h], "async")?.id).toBe("a1");
   });
 
-  it("picks the 24h batch tariff for batch context", () => {
+  it("falls back to a 24h batch tariff for async when no realtime/1h exists", () => {
+    expect(pickTariffForContext([batch24h], "async")?.id).toBe("b24");
+  });
+
+  it("picks the 24h batch tariff for batch context regardless of input order", () => {
     expect(
       pickTariffForContext([realtime, async1h, batch24h], "batch")?.id,
     ).toBe("b24");
+    expect(
+      pickTariffForContext([batch24h, async1h, realtime], "batch")?.id,
+    ).toBe("b24");
+    expect(
+      pickTariffForContext([async1h, batch24h, realtime], "batch")?.id,
+    ).toBe("b24");
+  });
+
+  it("falls back to the 1h batch tariff for batch context when no 24h exists", () => {
+    expect(pickTariffForContext([realtime, async1h], "batch")?.id).toBe("a1");
+  });
+
+  it("falls back to a realtime tariff for batch context when no batch tariff exists", () => {
+    expect(pickTariffForContext([realtime], "batch")?.id).toBe("rt");
+  });
+
+  it("breaks ties between equally-ranked tariffs by cheaper input price", () => {
+    const cheapRealtime = buildTariff({
+      id: "rt-cheap",
+      api_key_purpose: "realtime",
+      input_price_per_token: "0.0000005",
+      output_price_per_token: "0.0000010",
+    });
+    const expensiveRealtime = buildTariff({
+      id: "rt-expensive",
+      api_key_purpose: "realtime",
+      input_price_per_token: "0.0000020",
+      output_price_per_token: "0.0000040",
+    });
+    expect(
+      pickTariffForContext([expensiveRealtime, cheapRealtime], "async")?.id,
+    ).toBe("rt-cheap");
+    expect(
+      pickTariffForContext([cheapRealtime, expensiveRealtime], "async")?.id,
+    ).toBe("rt-cheap");
   });
 
   it("ignores playground tariffs", () => {
     expect(pickTariffForContext([playground], "async")).toBeNull();
+  });
+
+  it("ignores inactive tariffs", () => {
+    const inactive = buildTariff({
+      id: "rt-old",
+      is_active: false,
+    });
+    expect(pickTariffForContext([inactive], "async")).toBeNull();
   });
 
   it("returns null for models without tariffs", () => {
