@@ -53,14 +53,16 @@ export function AuthProvider({ children }: AuthProviderProps) {
           try {
             const onboardingKey = `onboarding_completed_${user.id}`;
             if (!localStorage.getItem(onboardingKey)) {
-              localStorage.setItem(onboardingKey, "true");
-              // Preserve query params (e.g. utm_source) through onboarding redirect
+              // Build the URL first so a malformed onboarding_redirect_url
+              // doesn't leave the completion flag set permanently.
               const onboardingUrl = new URL(user.onboarding_redirect_url, window.location.origin);
               const currentParams = new URLSearchParams(window.location.search);
-              currentParams.delete("redirect");
               currentParams.forEach((v, k) => {
-                if (!onboardingUrl.searchParams.has(k)) onboardingUrl.searchParams.set(k, v);
+                if (k !== "redirect" && !onboardingUrl.searchParams.has(k)) {
+                  onboardingUrl.searchParams.set(k, v);
+                }
               });
+              localStorage.setItem(onboardingKey, "true");
               window.location.href = onboardingUrl.toString();
               return;
             }

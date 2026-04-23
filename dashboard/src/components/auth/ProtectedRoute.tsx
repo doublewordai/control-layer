@@ -1,4 +1,4 @@
-import { Navigate } from "react-router-dom";
+import { Navigate, useLocation } from "react-router-dom";
 import type { ReactNode } from "react";
 import { useAuth } from "../../contexts/auth";
 import { useAuthorization } from "../../utils/authorization";
@@ -23,6 +23,7 @@ export function ProtectedRoute({
     isLoading: authorizationLoading,
   } = useAuthorization();
   const { isFeatureEnabled } = useSettings();
+  const { search } = useLocation();
 
   // Show loading state while checking authentication or permissions
   if (authLoading || authorizationLoading) {
@@ -32,8 +33,6 @@ export function ProtectedRoute({
       </div>
     );
   }
-
-  const search = window.location.search;
 
   // If not authenticated, redirect to login page (will work for both native and proxy auth)
   if (!isAuthenticated) {

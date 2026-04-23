@@ -1,5 +1,6 @@
-import { Navigate, useSearchParams } from "react-router-dom";
+import { Navigate, useLocation, useSearchParams } from "react-router-dom";
 import { useAuth } from "../../contexts/auth";
+import { mergePreservedParams } from "../../utils/url";
 
 interface AuthGuardProps {
   children: React.ReactNode;
@@ -9,6 +10,7 @@ interface AuthGuardProps {
 export function AuthGuard({ children, requireAuth = false }: AuthGuardProps) {
   const { isAuthenticated, isLoading } = useAuth();
   const [searchParams] = useSearchParams();
+  const { search } = useLocation();
 
   if (isLoading) {
     return (
@@ -20,19 +22,14 @@ export function AuthGuard({ children, requireAuth = false }: AuthGuardProps) {
 
   // If auth is required but user is not authenticated, redirect to login
   if (requireAuth && !isAuthenticated) {
-    return <Navigate to={`/login${window.location.search}`} replace />;
+    return <Navigate to={`/login${search}`} replace />;
   }
 
   // If auth is not required (login/register pages) but user is authenticated, redirect
   if (!requireAuth && isAuthenticated) {
     const redirect = searchParams.get("redirect");
     const target = redirect || "/";
-    // Preserve non-redirect query params (e.g. utm_source) through the redirect
-    const preserved = new URLSearchParams(searchParams);
-    preserved.delete("redirect");
-    const qs = preserved.toString();
-    const separator = target.includes("?") ? "&" : "?";
-    return <Navigate to={qs ? `${target}${separator}${qs}` : target} replace />;
+    return <Navigate to={mergePreservedParams(target, searchParams)} replace />;
   }
 
   return <>{children}</>;

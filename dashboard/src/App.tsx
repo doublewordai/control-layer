@@ -1,4 +1,4 @@
-import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
+import { BrowserRouter, Routes, Route, Navigate, useLocation } from "react-router-dom";
 import { Component, useEffect, Suspense, type ReactNode } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ReactQueryDevtools } from "@tanstack/react-query-devtools";
@@ -256,6 +256,7 @@ function RootRedirect() {
   const { isAuthenticated, isLoading } = useAuth();
   const { getFirstAccessibleRoute, isLoading: authorizationLoading } =
     useAuthorization();
+  const { search } = useLocation();
 
   // Show loading if either auth or authorization is loading
   if (isLoading || authorizationLoading) {
@@ -268,13 +269,13 @@ function RootRedirect() {
 
   // If not authenticated, redirect to login page (will work for both native and proxy auth)
   if (!isAuthenticated) {
-    return <Navigate to={`/login${window.location.search}`} replace />;
+    return <Navigate to={`/login${search}`} replace />;
   }
 
   // If authenticated, redirect to first accessible route
   return (
     <Navigate
-      to={`${getFirstAccessibleRoute()}${window.location.search}`}
+      to={`${getFirstAccessibleRoute()}${search}`}
       replace
     />
   );
