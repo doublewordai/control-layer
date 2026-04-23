@@ -2482,6 +2482,7 @@ impl Application {
         let onwards_app_state = onwards::AppState::with_transform(bg_services.onwards_targets.clone(), body_transform)
             .with_response_transform(onwards::create_openai_sanitizer())
             .with_streaming_header("x-fusillade-stream")
+            .with_response_id_header("x-fusillade-request-id")
             .with_tool_executor(Arc::new(tool_executor))
             .with_response_store(response_store.clone() as Arc<dyn onwards::ResponseStore>);
         let onwards_router = if bg_services.onwards_targets.strict_mode {

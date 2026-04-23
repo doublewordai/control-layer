@@ -194,8 +194,17 @@ async fn handle_realtime<P: PoolProvider + Clone + Send + Sync + 'static>(
         tracing::warn!(error = %e, "Failed to enqueue create-response job, proceeding without tracking");
     }
 
-    // Attach the response ID header
+    // Attach the response ID as x-fusillade-request-id so that onwards uses
+    // it as the response object's `id` field (configured via response_id_header).
+    // Strip the "resp_" prefix — onwards re-adds it.
+    let raw_id = resp_id.strip_prefix("resp_").unwrap_or(&resp_id);
     let mut req = Request::from_parts(parts, Body::from(body_bytes));
+    req.headers_mut().insert(
+        "x-fusillade-request-id",
+        raw_id.parse().expect("response_id is valid header value"),
+    );
+    // Keep the full resp_id on the outlet header so FusilladeOutletHandler can
+    // correlate the response with the fusillade row.
     req.headers_mut().insert(
         ONWARDS_RESPONSE_ID_HEADER,
         resp_id.parse().expect("response_id is valid header value"),
@@ -221,9 +230,9 @@ async fn handle_realtime<P: PoolProvider + Clone + Send + Sync + 'static>(
 
         (StatusCode::ACCEPTED, Json(response_body)).into_response()
     } else {
-        // Blocking: proxy via onwards, then patch response ID
-        let resp = next.run(req).await;
-        patch_response_id(resp, &resp_id).await
+        // Blocking: proxy via onwards — the response ID is already baked
+        // into the response body by onwards (via response_id_header config).
+        next.run(req).await
     }
 }
 
@@ -316,38 +325,6 @@ async fn handle_flex<P: PoolProvider + Clone + Send + Sync + 'static>(
                 (StatusCode::GATEWAY_TIMEOUT, Json(response_body)).into_response()
             }
         }
-    }
-}
-
-/// Patch the `id` field in a JSON response body to use our fusillade ID.
-/// If the body can't be parsed or is streaming, returns the response unchanged.
-async fn patch_response_id(response: Response, fusillade_id: &str) -> Response {
-    let (parts, body) = response.into_parts();
-
-    // Only patch JSON responses (not streaming SSE)
-    let is_json = parts
-        .headers
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|ct| ct.contains("application/json"));
-
-    if !is_json {
-        return Response::from_parts(parts, body);
-    }
-
-    match axum::body::to_bytes(body, usize::MAX).await {
-        Ok(bytes) => {
-            if let Ok(mut json) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-                if json.get("id").is_some() {
-                    json["id"] = serde_json::Value::String(fusillade_id.to_string());
-                }
-                let patched = serde_json::to_vec(&json).unwrap_or_else(|_| bytes.to_vec());
-                Response::from_parts(parts, Body::from(patched))
-            } else {
-                Response::from_parts(parts, Body::from(bytes))
-            }
-        }
-        Err(_) => Response::from_parts(parts, Body::empty()),
     }
 }
 

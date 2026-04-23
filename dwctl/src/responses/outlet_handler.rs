@@ -43,8 +43,11 @@ impl RequestHandler for FusilladeOutletHandler {
         let job = self.job.clone();
 
         async move {
-            // Skip batch requests — the daemon handles its own completion
-            if request_data.headers.contains_key("x-fusillade-request-id") {
+            // Skip batch requests — the daemon handles its own completion.
+            // Batch requests have both x-fusillade-request-id and x-fusillade-batch-id.
+            // Realtime requests only have x-fusillade-request-id (set by the
+            // responses middleware for ID override) and should NOT be skipped.
+            if request_data.headers.contains_key("x-fusillade-batch-id") {
                 return;
             }
 
@@ -116,11 +119,17 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_response_id_skips_fusillade_header() {
+    fn test_extract_response_id_not_skipped_for_realtime_with_fusillade_header() {
+        // Realtime requests have x-fusillade-request-id (for ID override) but
+        // NOT x-fusillade-batch-id — they should still be processed.
         let mut headers = HashMap::new();
-        headers.insert("x-fusillade-request-id".to_string(), vec![Bytes::from("some-batch-id")]);
+        headers.insert("x-fusillade-request-id".to_string(), vec![Bytes::from("some-id")]);
+        headers.insert(
+            ONWARDS_RESPONSE_ID_HEADER.to_string(),
+            vec![Bytes::from("resp_12345678-1234-1234-1234-123456789abc")],
+        );
         let request = make_request_data(headers);
         let id = FusilladeOutletHandler::extract_response_id(&request);
-        assert!(id.is_none());
+        assert_eq!(id, Some("resp_12345678-1234-1234-1234-123456789abc".to_string()));
     }
 }
