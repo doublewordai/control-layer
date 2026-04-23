@@ -623,7 +623,8 @@ async fn setup_database(
         };
 
         let main_settings = config.database.main_pool_settings();
-        let connect_opts = PgConnectOptions::from_str(&database_url)?.log_slow_statements(log::LevelFilter::Warn, slow_threshold);
+        let connect_opts = db::audit::with_application_name(PgConnectOptions::from_str(&database_url)?, db::audit::MAIN_APPLICATION_NAME)
+            .log_slow_statements(log::LevelFilter::Warn, slow_threshold);
         let pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(main_settings.max_connections)
             .min_connections(main_settings.min_connections)
@@ -652,7 +653,8 @@ async fn setup_database(
     } else if let Some(replica_url) = config.database.external_replica_url() {
         info!("Setting up read replica pool");
         let replica_settings = config.database.main_replica_pool_settings();
-        let replica_opts = PgConnectOptions::from_str(replica_url)?.log_slow_statements(log::LevelFilter::Warn, slow_threshold);
+        let replica_opts = db::audit::with_application_name(PgConnectOptions::from_str(replica_url)?, db::audit::MAIN_APPLICATION_NAME)
+            .log_slow_statements(log::LevelFilter::Warn, slow_threshold);
         let replica_pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(replica_settings.max_connections)
             .min_connections(replica_settings.min_connections)
@@ -684,6 +686,7 @@ async fn setup_database(
     // Uses eager connection (connect_with) to respect min_connections at startup
     async fn create_schema_pool(
         schema: String,
+        application_name: &str,
         opts: sqlx::postgres::PgConnectOptions,
         settings: &config::PoolSettings,
     ) -> Result<sqlx::PgPool, sqlx::Error> {
@@ -693,7 +696,7 @@ async fn setup_database(
         let search_path_key = "search_path".to_string();
         let search_path_value = schema.clone();
         info!("Setting search_path={} via connection options for schema pool", schema);
-        let opts_with_schema = opts.options([(search_path_key, search_path_value)]);
+        let opts_with_schema = db::audit::with_application_name(opts, application_name).options([(search_path_key, search_path_value)]);
 
         sqlx::postgres::PgPoolOptions::new()
             .max_connections(settings.max_connections)
@@ -720,7 +723,13 @@ async fn setup_database(
             name, pool: pool_settings, ..
         } => {
             // Create primary pool using main's connection, with schema-specific search_path
-            let primary = create_schema_pool(name.clone(), main_connect_opts.clone(), pool_settings).await?;
+            let primary = create_schema_pool(
+                name.clone(),
+                db::audit::FUSILLADE_APPLICATION_NAME,
+                main_connect_opts.clone(),
+                pool_settings,
+            )
+            .await?;
             primary.execute(&*format!("CREATE SCHEMA IF NOT EXISTS {name}")).await?;
 
             // Create replica pool if main has one configured (inherits main's replica connection)
@@ -728,7 +737,13 @@ async fn setup_database(
                 info!("Setting up fusillade read replica (schema mode)");
                 let replica_opts = db_pools.read().connect_options().as_ref().clone();
                 let replica_pool_settings = config.database.fusillade().replica_pool_settings();
-                let replica = create_schema_pool(name.clone(), replica_opts, replica_pool_settings).await?;
+                let replica = create_schema_pool(
+                    name.clone(),
+                    db::audit::FUSILLADE_APPLICATION_NAME,
+                    replica_opts,
+                    replica_pool_settings,
+                )
+                .await?;
                 DbPools::with_replica(primary, replica)
             } else {
                 DbPools::new(primary)
@@ -741,7 +756,8 @@ async fn setup_database(
             ..
         } => {
             info!("Using dedicated database for fusillade");
-            let connect_opts = PgConnectOptions::from_str(url)?.log_slow_statements(log::LevelFilter::Warn, slow_threshold);
+            let connect_opts = db::audit::with_application_name(PgConnectOptions::from_str(url)?, db::audit::FUSILLADE_APPLICATION_NAME)
+                .log_slow_statements(log::LevelFilter::Warn, slow_threshold);
             let primary = sqlx::postgres::PgPoolOptions::new()
                 .max_connections(pool_settings.max_connections)
                 .min_connections(pool_settings.min_connections)
@@ -762,7 +778,9 @@ async fn setup_database(
             if let Some(replica_url) = replica_url {
                 info!("Setting up fusillade read replica");
                 let replica_pool_settings = config.database.fusillade().replica_pool_settings();
-                let replica_opts = PgConnectOptions::from_str(replica_url)?.log_slow_statements(log::LevelFilter::Warn, slow_threshold);
+                let replica_opts =
+                    db::audit::with_application_name(PgConnectOptions::from_str(replica_url)?, db::audit::FUSILLADE_APPLICATION_NAME)
+                        .log_slow_statements(log::LevelFilter::Warn, slow_threshold);
                 let replica = sqlx::postgres::PgPoolOptions::new()
                     .max_connections(replica_pool_settings.max_connections)
                     .min_connections(replica_pool_settings.min_connections)
@@ -786,6 +804,15 @@ async fn setup_database(
         }
     };
     fusillade::migrator().run(&*fusillade_pools).await?;
+    db::audit::log_postgres_audit_status("control-layer", db_pools.write()).await;
+    match config.database.fusillade() {
+        config::ComponentDb::Schema { .. } => {
+            info!("Fusillade uses the main PostgreSQL database in schema mode; audit settings are inherited");
+        }
+        config::ComponentDb::Dedicated { .. } => {
+            db::audit::log_postgres_audit_status("control-layer/fusillade", fusillade_pools.write()).await;
+        }
+    }
 
     // Run underway migrations (background task queue)
     underway::run_migrations(&*db_pools).await?;
@@ -798,7 +825,13 @@ async fn setup_database(
                 name, pool: pool_settings, ..
             } => {
                 // Create primary pool using main's connection, with schema-specific search_path
-                let primary = create_schema_pool(name.clone(), main_connect_opts.clone(), pool_settings).await?;
+                let primary = create_schema_pool(
+                    name.clone(),
+                    db::audit::OUTLET_APPLICATION_NAME,
+                    main_connect_opts.clone(),
+                    pool_settings,
+                )
+                .await?;
                 primary.execute(&*format!("CREATE SCHEMA IF NOT EXISTS {name}")).await?;
 
                 // Create replica pool if main has one configured (inherits main's replica connection)
@@ -806,7 +839,13 @@ async fn setup_database(
                     info!("Setting up outlet read replica (schema mode)");
                     let replica_opts = db_pools.read().connect_options().as_ref().clone();
                     let replica_pool_settings = config.database.outlet().replica_pool_settings();
-                    let replica = create_schema_pool(name.clone(), replica_opts, replica_pool_settings).await?;
+                    let replica = create_schema_pool(
+                        name.clone(),
+                        db::audit::OUTLET_APPLICATION_NAME,
+                        replica_opts,
+                        replica_pool_settings,
+                    )
+                    .await?;
                     DbPools::with_replica(primary, replica)
                 } else {
                     DbPools::new(primary)
@@ -819,7 +858,8 @@ async fn setup_database(
                 ..
             } => {
                 info!("Using dedicated database for outlet");
-                let connect_opts = PgConnectOptions::from_str(url)?.log_slow_statements(log::LevelFilter::Warn, slow_threshold);
+                let connect_opts = db::audit::with_application_name(PgConnectOptions::from_str(url)?, db::audit::OUTLET_APPLICATION_NAME)
+                    .log_slow_statements(log::LevelFilter::Warn, slow_threshold);
                 let primary = sqlx::postgres::PgPoolOptions::new()
                     .max_connections(pool_settings.max_connections)
                     .min_connections(pool_settings.min_connections)
@@ -840,7 +880,9 @@ async fn setup_database(
                 if let Some(replica_url) = replica_url {
                     info!("Setting up outlet read replica");
                     let replica_pool_settings = config.database.outlet().replica_pool_settings();
-                    let replica_opts = PgConnectOptions::from_str(replica_url)?.log_slow_statements(log::LevelFilter::Warn, slow_threshold);
+                    let replica_opts =
+                        db::audit::with_application_name(PgConnectOptions::from_str(replica_url)?, db::audit::OUTLET_APPLICATION_NAME)
+                            .log_slow_statements(log::LevelFilter::Warn, slow_threshold);
                     let replica = sqlx::postgres::PgPoolOptions::new()
                         .max_connections(replica_pool_settings.max_connections)
                         .min_connections(replica_pool_settings.min_connections)
@@ -865,6 +907,14 @@ async fn setup_database(
         };
         outlet_postgres::migrator().run(&*pools).await?;
 
+        match config.database.outlet() {
+            config::ComponentDb::Schema { .. } => {
+                info!("Outlet uses the main PostgreSQL database in schema mode; audit settings are inherited");
+            }
+            config::ComponentDb::Dedicated { .. } => {
+                db::audit::log_postgres_audit_status("control-layer/outlet", pools.write()).await;
+            }
+        }
         Some(pools)
     } else {
         info!("Skipping outlet pool setup (logging disabled)");
