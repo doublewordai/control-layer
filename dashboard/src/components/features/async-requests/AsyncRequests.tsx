@@ -1,6 +1,6 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useMemo } from "react";
 import { useNavigate } from "react-router-dom";
-import { Code, Play, X, Filter, Clock, DollarSign, Check, ChevronsUpDown } from "lucide-react";
+import { Code, Play, X, Filter, Clock, DollarSign, Check, ChevronsUpDown, Users } from "lucide-react";
 import { type ColumnDef } from "@tanstack/react-table";
 import { Button } from "../../ui/button";
 import { DataTable } from "../../ui/data-table";
@@ -28,7 +28,11 @@ import {
   CommandList,
 } from "../../ui/command";
 import { cn } from "../../../lib/utils";
-import { useAsyncRequests, useModels } from "../../../api/control-layer/hooks";
+import {
+  useAsyncRequests,
+  useModels,
+  useUsers,
+} from "../../../api/control-layer/hooks";
 import { useAuthorization } from "../../../utils/authorization";
 import type {
   AsyncRequest,
@@ -37,6 +41,7 @@ import type {
 import { CreateAsyncModal } from "../../modals/CreateAsyncModal/CreateAsyncModal";
 import { ApiExamples } from "../../modals";
 import { useBootstrapContent } from "../../../hooks/use-bootstrap-content";
+import { useDebounce } from "../../../hooks/useDebounce";
 import { useOrganizationContext } from "../../../contexts/organization/useOrganizationContext";
 import { useServerPagination } from "../../../hooks/useServerPagination";
 import { formatTimestamp, formatLongDuration, copyToClipboard } from "../../../utils";
@@ -251,15 +256,48 @@ export function AsyncRequests() {
   const isPlatformManager = hasPermission("manage-models");
   const { isOrgContext, activeOrganizationId } = useOrganizationContext();
   const showUserColumn = isPlatformManager || isOrgContext;
+  const showMemberFilter = isPlatformManager && !isOrgContext;
+  const useServerSideMemberSearch = isPlatformManager && !isOrgContext;
   // Filters
   const [statusFilter, setStatusFilter] = useState<
     AsyncRequestStatus | "all"
   >("all");
   const [modelFilter, setModelFilter] = useState<string[]>([]);
+  const [selectedMemberId, setSelectedMemberId] = useState<string | undefined>(
+    undefined,
+  );
+  const [selectedMemberEmail, setSelectedMemberEmail] = useState<
+    string | undefined
+  >(undefined);
+  const [memberSearch, setMemberSearch] = useState("");
+  const debouncedMemberSearch = useDebounce(memberSearch, 300);
   const [sortActiveFirst, setSortActiveFirst] = useState(true);
   const [dateRange, setDateRange] = useState<
     { from: Date; to: Date } | undefined
   >(undefined);
+  const [memberPopoverOpen, setMemberPopoverOpen] = useState(false);
+
+  const { data: searchedUsers } = useUsers({
+    search: debouncedMemberSearch,
+    limit: 50,
+    enabled: useServerSideMemberSearch,
+  });
+
+  const memberList = useMemo(() => {
+    if (useServerSideMemberSearch && searchedUsers?.data) {
+      const seen = new Set<string>();
+      return searchedUsers.data
+        .filter((u) => u.user_type !== "organization")
+        .filter((u) => {
+          if (seen.has(u.email)) return false;
+          seen.add(u.email);
+          return true;
+        })
+        .map((u) => ({ id: u.id, email: u.email }));
+    }
+
+    return [];
+  }, [useServerSideMemberSearch, searchedUsers]);
 
   // Models for filter and display
   const { data: modelsData } = useModels({ accessible: true, limit: 100 });
@@ -269,15 +307,20 @@ export function AsyncRequests() {
   );
   const [modelPopoverOpen, setModelPopoverOpen] = useState(false);
 
+  // Server-side offset pagination
+  const pagination = useServerPagination({ defaultPageSize: 10 });
+  const { handleReset } = pagination;
+
   // Reset filters when org context changes
   useEffect(() => {
     setStatusFilter("all");
     setModelFilter([]);
+    setSelectedMemberId(undefined);
+    setSelectedMemberEmail(undefined);
+    setMemberSearch("");
     setDateRange(undefined);
-  }, [activeOrganizationId]);
-
-  // Server-side offset pagination
-  const pagination = useServerPagination({ defaultPageSize: 10 });
+    handleReset();
+  }, [activeOrganizationId, handleReset]);
 
   const columns = createColumns(showUserColumn, modelDisplayNames);
 
@@ -286,6 +329,7 @@ export function AsyncRequests() {
     active_first: sortActiveFirst,
     status: statusFilter !== "all" ? statusFilter : undefined,
     model: modelFilter.length > 0 ? modelFilter.join(",") : undefined,
+    member_id: selectedMemberId,
     created_after: dateRange?.from.toISOString(),
     created_before: dateRange?.to.toISOString(),
     ...pagination.queryParams,
@@ -293,6 +337,12 @@ export function AsyncRequests() {
 
   const requests = data?.data ?? [];
   const totalCount = data?.total_count ?? 0;
+  const displayedMemberEmail =
+    selectedMemberEmail ||
+    memberList.find((m) => m.id === selectedMemberId)?.email;
+  const showMemberCombobox =
+    showMemberFilter &&
+    (useServerSideMemberSearch || memberList.length > 0);
 
   return (
     <div className="py-4 px-6">
@@ -390,6 +440,86 @@ export function AsyncRequests() {
                 <SelectItem value="canceled">Cancelled</SelectItem>
               </SelectContent>
             </Select>
+            {showMemberCombobox && (
+              <Popover
+                open={memberPopoverOpen}
+                onOpenChange={setMemberPopoverOpen}
+              >
+                <PopoverTrigger asChild>
+                  <Button
+                    variant="outline"
+                    role="combobox"
+                    aria-expanded={memberPopoverOpen}
+                    className="w-[220px] h-9 justify-between font-normal"
+                  >
+                    <div className="flex items-center gap-1.5 truncate">
+                      <Users className="w-3.5 h-3.5 shrink-0 text-gray-500" />
+                      <span className="truncate">
+                        {displayedMemberEmail || "All members"}
+                      </span>
+                    </div>
+                    <ChevronsUpDown className="ml-1 h-3.5 w-3.5 shrink-0 opacity-50" />
+                  </Button>
+                </PopoverTrigger>
+                <PopoverContent className="w-[280px] p-0" align="start">
+                  <Command shouldFilter={!useServerSideMemberSearch}>
+                    <CommandInput
+                      placeholder="Search by email..."
+                      value={useServerSideMemberSearch ? memberSearch : undefined}
+                      onValueChange={
+                        useServerSideMemberSearch ? setMemberSearch : undefined
+                      }
+                    />
+                    <CommandList>
+                      <CommandEmpty>No members found.</CommandEmpty>
+                      <CommandGroup>
+                        <CommandItem
+                          value="all-members"
+                          onSelect={() => {
+                            setSelectedMemberId(undefined);
+                            setSelectedMemberEmail(undefined);
+                            setMemberSearch("");
+                            setMemberPopoverOpen(false);
+                            pagination.handleReset();
+                          }}
+                        >
+                          <Check
+                            className={cn(
+                              "mr-2 h-4 w-4",
+                              !selectedMemberId ? "opacity-100" : "opacity-0",
+                            )}
+                          />
+                          All members
+                        </CommandItem>
+                        {memberList.map((member) => (
+                          <CommandItem
+                            key={member.id}
+                            value={member.email}
+                            onSelect={() => {
+                              setSelectedMemberId(member.id);
+                              setSelectedMemberEmail(member.email);
+                              setMemberSearch("");
+                              setMemberPopoverOpen(false);
+                              pagination.handleReset();
+                            }}
+                          >
+                            <Check
+                              className={cn(
+                                "mr-2 h-4 w-4",
+                                selectedMemberId === member.id
+                                  ? "opacity-100"
+                                  : "opacity-0",
+                              )}
+                            />
+                            <span className="truncate">{member.email}</span>
+                          </CommandItem>
+                        ))}
+                      </CommandGroup>
+                    </CommandList>
+                  </Command>
+                </PopoverContent>
+              </Popover>
+            )}
             <Popover open={modelPopoverOpen} onOpenChange={setModelPopoverOpen}>
               <PopoverTrigger asChild>
                 <Button
