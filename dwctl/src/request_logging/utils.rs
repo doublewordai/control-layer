@@ -257,6 +257,16 @@ pub(crate) fn decompress_response_if_needed(
         .map(|s| s.trim().to_lowercase());
 
     match content_encoding.as_deref() {
+        Some("gzip") => {
+            let mut decompressed = Vec::new();
+            flate2::read::GzDecoder::new(bytes)
+                .read_to_end(&mut decompressed)
+                .map_err(|e| SerializationError {
+                    fallback_data: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes),
+                    error: Box::new(e),
+                })?;
+            Ok(decompressed)
+        }
         Some("br") | Some("brotli") => {
             let mut decompressed = Vec::new();
             brotli::Decompressor::new(bytes, 4096)
@@ -517,12 +527,42 @@ mod tests {
     fn test_decompress_response_unknown_encoding() {
         let data = b"hello world";
         let mut headers = HashMap::new();
-        headers.insert("content-encoding".to_string(), vec![Bytes::from("gzip")]);
+        headers.insert("content-encoding".to_string(), vec![Bytes::from("deflate")]);
 
         let result = decompress_response_if_needed(data, &headers).unwrap();
 
         // Unknown encoding should pass through unchanged
         assert_eq!(result, data);
+    }
+
+    #[test]
+    fn test_decompress_response_gzip() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write as _;
+
+        let original = b"hello world";
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(original).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let mut headers = HashMap::new();
+        headers.insert("content-encoding".to_string(), vec![Bytes::from("gzip")]);
+
+        let result = decompress_response_if_needed(&compressed, &headers).unwrap();
+
+        assert_eq!(result, original);
+    }
+
+    #[test]
+    fn test_decompress_response_gzip_invalid_data() {
+        let data = b"not valid gzip";
+        let mut headers = HashMap::new();
+        headers.insert("content-encoding".to_string(), vec![Bytes::from("gzip")]);
+
+        let result = decompress_response_if_needed(data, &headers);
+
+        assert!(result.is_err());
     }
 
     // ===== Fusillade Request ID Tests =====
