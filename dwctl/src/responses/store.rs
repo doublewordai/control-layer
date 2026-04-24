@@ -146,6 +146,32 @@ pub async fn poll_until_complete<P: PoolProvider + Clone>(
     }
 }
 
+/// Look up the user ID from an API key for batch/response attribution.
+///
+/// Returns `Some(user_id)` if the key is found, `None` otherwise.
+pub async fn lookup_created_by(pool: &sqlx::PgPool, api_key: Option<&str>) -> Option<String> {
+    let key = api_key?;
+    match sqlx::query("SELECT user_id FROM public.api_keys WHERE secret = $1 AND is_deleted = false LIMIT 1")
+        .bind(key)
+        .fetch_optional(pool)
+        .await
+    {
+        Ok(Some(row)) => {
+            use sqlx::Row;
+            let user_id: Uuid = row.get("user_id");
+            Some(user_id.to_string())
+        }
+        Ok(None) => {
+            tracing::warn!(key_prefix = &key[..8.min(key.len())], "API key not found for attribution");
+            None
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to look up API key for attribution");
+            None
+        }
+    }
+}
+
 /// Create a batch of 1 in fusillade for async/flex processing.
 ///
 /// Uses fusillade's `create_file` + `create_batch` methods.
@@ -164,32 +190,7 @@ pub async fn create_batch_of_1<P: PoolProvider + Clone>(
     let pool = request_manager.pool();
     let body = request.to_string();
 
-    // Look up user from API key for batch attribution.
-    // api_keys lives in the public schema (dwctl), not the fusillade schema.
-    let created_by = if let Some(key) = api_key {
-        match sqlx::query("SELECT user_id FROM public.api_keys WHERE secret = $1 AND is_deleted = false LIMIT 1")
-            .bind(key)
-            .fetch_optional(pool)
-            .await
-        {
-            Ok(Some(row)) => {
-                use sqlx::Row;
-                let user_id: Uuid = row.get("user_id");
-                user_id.to_string()
-            }
-            Ok(None) => {
-                tracing::warn!(key_prefix = &key[..8.min(key.len())], "API key not found for batch attribution");
-                String::new()
-            }
-            Err(e) => {
-                tracing::error!(error = %e, "Failed to look up API key for batch attribution");
-                String::new()
-            }
-        }
-    } else {
-        tracing::warn!("No API key provided for batch attribution");
-        String::new()
-    };
+    let created_by = lookup_created_by(pool, api_key).await.unwrap_or_default();
 
     let template = RequestTemplateInput {
         custom_id: None,

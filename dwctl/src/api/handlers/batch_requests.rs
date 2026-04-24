@@ -100,6 +100,7 @@ pub async fn list_batch_requests<P: PoolProvider>(
             created_after: query.created_after,
             created_before: query.created_before,
             service_tier: query.service_tier.clone(),
+            require_service_tier: query.require_service_tier.unwrap_or(false),
             active_first: query.active_first.unwrap_or(true),
             skip,
             limit,
@@ -141,7 +142,7 @@ pub async fn list_batch_requests<P: PoolProvider>(
     let unique_creator_ids: Vec<String> = result
         .data
         .iter()
-        .map(|r| r.batch_created_by.clone())
+        .filter_map(|r| r.batch_created_by.as_ref().cloned())
         .collect::<std::collections::HashSet<_>>()
         .into_iter()
         .collect();
@@ -167,10 +168,10 @@ pub async fn list_batch_requests<P: PoolProvider>(
         .into_iter()
         .map(|r| {
             let a = analytics_map.get(&r.id);
-            let email = email_map.get(&r.batch_created_by).cloned();
+            let email: Option<String> = r.batch_created_by.as_ref().and_then(|id| email_map.get(id)).cloned();
             BatchRequestSummary {
                 id: r.id,
-                batch_id: r.batch_id,
+                batch_id: r.batch_id.unwrap_or(Uuid::nil()),
                 model: r.model,
                 status: r.status,
                 created_at: r.created_at,
@@ -178,6 +179,7 @@ pub async fn list_batch_requests<P: PoolProvider>(
                 failed_at: r.failed_at,
                 duration_ms: r.duration_ms,
                 response_status: r.response_status,
+                service_tier: r.service_tier,
                 prompt_tokens: a.and_then(|a| a.prompt_tokens),
                 completion_tokens: a.and_then(|a| a.completion_tokens),
                 reasoning_tokens: a.and_then(|a| a.reasoning_tokens),
@@ -284,7 +286,7 @@ pub async fn get_batch_request<P: PoolProvider>(
 
     Ok(Json(BatchRequestDetail {
         id: detail.id,
-        batch_id: detail.batch_id.unwrap_or_default(),
+        batch_id: detail.batch_id.unwrap_or(Uuid::nil()),
         model: detail.model,
         status: detail.status,
         created_at: detail.created_at,
@@ -292,6 +294,7 @@ pub async fn get_batch_request<P: PoolProvider>(
         failed_at: detail.failed_at,
         duration_ms: detail.duration_ms,
         response_status: detail.response_status,
+        service_tier: detail.service_tier,
         prompt_tokens: analytics.as_ref().and_then(|a| a.prompt_tokens),
         completion_tokens: analytics.as_ref().and_then(|a| a.completion_tokens),
         reasoning_tokens: analytics.as_ref().and_then(|a| a.reasoning_tokens),
@@ -300,8 +303,8 @@ pub async fn get_batch_request<P: PoolProvider>(
         body: detail.body.unwrap_or_default(),
         response_body: detail.response_body,
         error: detail.error,
-        completion_window: detail.completion_window.unwrap_or_default(),
-        batch_created_by: detail.batch_created_by.unwrap_or_default(),
+        completion_window: detail.completion_window,
+        batch_created_by: detail.batch_created_by,
         created_by_email,
     }))
 }

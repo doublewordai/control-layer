@@ -1619,6 +1619,7 @@ export interface AsyncRequest {
   failed_at: string | null;
   duration_ms: number | null;
   response_status: number | null;
+  service_tier: string | null;
   prompt_tokens: number | null;
   completion_tokens: number | null;
   reasoning_tokens: number | null;
@@ -1631,8 +1632,8 @@ export interface AsyncRequestDetail extends AsyncRequest {
   body: string;
   response_body: string | null;
   error: string | null;
-  completion_window: string;
-  batch_created_by: string;
+  completion_window: string | null;
+  batch_created_by: string | null;
 }
 
 export interface AsyncRequestsListQuery {
@@ -1645,5 +1646,6 @@ export interface AsyncRequestsListQuery {
   member_id?: string;
   created_after?: string;
   created_before?: string;
+  require_service_tier?: boolean;
   active_first?: boolean;
 }

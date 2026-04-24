@@ -2128,6 +2128,8 @@ const asyncRequestsApi = {
       params.set("created_after", options.created_after);
     if (options?.created_before)
       params.set("created_before", options.created_before);
+    if (options?.require_service_tier)
+      params.set("require_service_tier", "true");
     if (options?.active_first !== undefined)
       params.set("active_first", options.active_first.toString());
 

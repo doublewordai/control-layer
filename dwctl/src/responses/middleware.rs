@@ -110,22 +110,72 @@ pub async fn responses_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
         "Routing inference request"
     );
 
+    // Generate the request ID upfront — known before any DB calls or proxying.
+    let request_id = uuid::Uuid::new_v4();
+    let resp_id = format!("resp_{request_id}");
+    let completion_window = match service_tier {
+        ServiceTier::Flex => "1h",
+        ServiceTier::Realtime => "0s",
+    };
+
+    // Validate model access for flex requests (realtime is validated by onwards).
+    if matches!(service_tier, ServiceTier::Flex) {
+        if let Some(key) = api_key.as_deref() {
+            if let Err(msg) = crate::error_enrichment::validate_api_key_model_access(
+                state.dwctl_pool.clone(), key, model,
+            ).await {
+                return Response::builder()
+                    .status(StatusCode::FORBIDDEN)
+                    .body(Body::from(serde_json::json!({"error": {"message": msg, "type": "invalid_request_error"}}).to_string()))
+                    .unwrap();
+            }
+        }
+    }
+
+    // Resolve created_by upfront for background/flex (row must exist before
+    // returning 202). For realtime non-background, defer to the background task.
+    let needs_sync_attribution = background || matches!(service_tier, ServiceTier::Flex);
+    let created_by = if needs_sync_attribution {
+        response_store::lookup_created_by(&state.dwctl_pool, api_key.as_deref()).await
+    } else {
+        None
+    };
+
+    // Build the batch input (shared by both tiers).
+    let initial_state = match service_tier {
+        ServiceTier::Realtime => "processing", // Daemon won't claim; outlet handler completes
+        ServiceTier::Flex => "pending",        // Daemon claims and processes
+    };
+
+    let batch_input = fusillade::CreateSingleRequestBatchInput {
+        request_id,
+        body: request_value.to_string(),
+        model: model.to_string(),
+        base_url: state.loopback_base_url.clone(),
+        endpoint: endpoint.clone(),
+        completion_window: completion_window.to_string(),
+        initial_state: initial_state.to_string(),
+        api_key: api_key.clone(),
+        created_by,
+    };
+
     match service_tier {
         ServiceTier::Realtime => {
             handle_realtime(
                 &state,
-                &request_value,
+                batch_input,
+                &resp_id,
                 model,
-                &endpoint,
                 background,
-                api_key.as_deref(),
                 parts,
                 body_bytes,
                 next,
             )
             .await
         }
-        ServiceTier::Flex => handle_flex(&state, &request_value, model, &endpoint, background, api_key.as_deref(), &state.loopback_base_url).await,
+        ServiceTier::Flex => {
+            handle_flex(&state, batch_input, &resp_id, model, background).await
+        }
     }
 }
 
@@ -158,60 +208,59 @@ fn resolve_service_tier(tier: Option<&str>) -> ServiceTier {
 
 /// Handle a realtime request (priority/default/auto).
 ///
-/// Enqueues a CreateResponseJob (validates API key, creates fusillade row) and
-/// proxies via onwards. The job runs in parallel with the proxy.
-/// With `background=true`, returns 202 immediately and spawns the proxy as a background task.
+/// For `background=true`: creates the batch row synchronously (so the client
+/// can immediately poll by ID), then spawns the proxy in the background.
+/// For `background=false`: fires off batch creation in the background and
+/// proxies immediately — the outlet handler completes the row.
 #[allow(clippy::too_many_arguments)]
 async fn handle_realtime<P: PoolProvider + Clone + Send + Sync + 'static>(
     state: &ResponsesMiddlewareState<P>,
-    request_value: &serde_json::Value,
+    batch_input: fusillade::CreateSingleRequestBatchInput,
+    resp_id: &str,
     model: &str,
-    endpoint: &str,
     background: bool,
-    api_key: Option<&str>,
     parts: axum::http::request::Parts,
     body_bytes: bytes::Bytes,
     next: Next,
 ) -> Response {
-    // Generate response ID upfront (needed for both paths)
-    let resp_id = format!("resp_{}", uuid::Uuid::new_v4());
+    let rm = state.request_manager.clone();
 
-    // Enqueue the create-response job (validates key, creates fusillade row).
-    // This runs in the background via underway — doesn't block the proxy.
-    let enqueue_result = state
-        .create_response_job
-        .enqueue(&CreateResponseInput {
-            response_id: resp_id.clone(),
-            request_body: request_value.to_string(),
-            model: model.to_string(),
-            endpoint: endpoint.to_string(),
-            api_key: api_key.map(|s| s.to_string()),
-            daemon_id: state.daemon_id.0,
-        })
-        .await;
-
-    if let Err(e) = enqueue_result {
-        tracing::warn!(error = %e, "Failed to enqueue create-response job, proceeding without tracking");
+    if background {
+        // Background mode: create batch synchronously so the row exists
+        // before we return the 202 (client will poll immediately).
+        // created_by was resolved upfront by the caller.
+        if let Err(e) = fusillade::Storage::create_single_request_batch(&*rm, batch_input).await {
+            tracing::warn!(error = %e, "Failed to create realtime tracking batch");
+        }
+    } else {
+        // Blocking mode: fire-and-forget — resolve created_by and create
+        // the batch in the background to avoid any latency on the proxy path.
+        let dwctl_pool = state.dwctl_pool.clone();
+        let api_key = batch_input.api_key.clone();
+        let mut input = batch_input;
+        tokio::spawn(async move {
+            input.created_by = response_store::lookup_created_by(&dwctl_pool, api_key.as_deref()).await;
+            if let Err(e) = fusillade::Storage::create_single_request_batch(&*rm, input).await {
+                tracing::warn!(error = %e, "Failed to create realtime tracking batch");
+            }
+        });
     }
 
     // Attach the response ID as x-fusillade-request-id so that onwards uses
     // it as the response object's `id` field (configured via response_id_header).
     // Strip the "resp_" prefix — onwards re-adds it.
-    let raw_id = resp_id.strip_prefix("resp_").unwrap_or(&resp_id);
+    let raw_id = resp_id.strip_prefix("resp_").unwrap_or(resp_id);
     let mut req = Request::from_parts(parts, Body::from(body_bytes));
     req.headers_mut().insert(
         "x-fusillade-request-id",
         raw_id.parse().expect("response_id is valid header value"),
     );
-    // Keep the full resp_id on the outlet header so FusilladeOutletHandler can
-    // correlate the response with the fusillade row.
     req.headers_mut().insert(
         ONWARDS_RESPONSE_ID_HEADER,
         resp_id.parse().expect("response_id is valid header value"),
     );
 
     if background {
-        // Return 202 immediately, proxy in background
         let response_body = serde_json::json!({
             "id": resp_id,
             "object": "response",
@@ -223,69 +272,50 @@ async fn handle_realtime<P: PoolProvider + Clone + Send + Sync + 'static>(
 
         tokio::spawn(async move {
             let response = next.run(req).await;
-            // Consume the body so outlet's tee-stream captures all chunks
             let (_parts, body) = response.into_parts();
             let _ = axum::body::to_bytes(body, usize::MAX).await;
         });
 
         (StatusCode::ACCEPTED, Json(response_body)).into_response()
     } else {
-        // Blocking: proxy via onwards — the response ID is already baked
-        // into the response body by onwards (via response_id_header config).
         next.run(req).await
     }
 }
 
-/// Handle a flex request by creating a batch of 1 in fusillade (1h completion window).
+/// Handle a flex request by creating a batch in fusillade.
 ///
-/// The fusillade daemon will pick it up and process it at async pricing.
-/// With `background=false`, holds the connection and polls until complete (Phase 3).
+/// The fusillade daemon picks up the pending request and processes it.
+/// With `background=false`, holds the connection and polls until complete.
 /// With `background=true`, returns 202 immediately.
 async fn handle_flex<P: PoolProvider + Clone + Send + Sync + 'static>(
     state: &ResponsesMiddlewareState<P>,
-    request_value: &serde_json::Value,
+    mut batch_input: fusillade::CreateSingleRequestBatchInput,
+    resp_id: &str,
     model: &str,
-    endpoint: &str,
     background: bool,
-    api_key: Option<&str>,
-    loopback_base_url: &str,
 ) -> Response {
-    // Validate model access before creating the batch
-    if let Some(key) = api_key {
-        if let Err(msg) = crate::error_enrichment::validate_api_key_model_access(
-            state.dwctl_pool.clone(), key, model,
-        ).await {
-            return Response::builder()
-                .status(StatusCode::FORBIDDEN)
-                .body(Body::from(serde_json::json!({"error": {"message": msg, "type": "invalid_request_error"}}).to_string()))
-                .unwrap();
-        }
+    // Flex needs the batch created synchronously (daemon must find the row).
+    if let Err(e) =
+        fusillade::Storage::create_single_request_batch(&*state.request_manager, batch_input).await
+    {
+        tracing::error!(error = %e, "Failed to create flex batch in fusillade");
+        return Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .body(Body::from(
+                serde_json::json!({
+                    "error": {
+                        "message": "Failed to enqueue request",
+                        "type": "server_error",
+                    }
+                })
+                .to_string(),
+            ))
+            .unwrap();
     }
-
-    let result = response_store::create_batch_of_1(&state.request_manager, request_value, model, loopback_base_url, endpoint, "1h", api_key).await;
-
-    let (response_id, _request_id) = match result {
-        Ok(ids) => ids,
-        Err(e) => {
-            tracing::error!(error = %e, "Failed to create flex batch in fusillade");
-            return Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(Body::from(
-                    serde_json::json!({
-                        "error": {
-                            "message": "Failed to enqueue request",
-                            "type": "server_error",
-                        }
-                    })
-                    .to_string(),
-                ))
-                .unwrap();
-        }
-    };
 
     if background {
         let response_body = serde_json::json!({
-            "id": response_id,
+            "id": resp_id,
             "object": "response",
             "status": "queued",
             "model": model,
@@ -293,19 +323,15 @@ async fn handle_flex<P: PoolProvider + Clone + Send + Sync + 'static>(
             "service_tier": "flex",
             "output": [],
         });
-        tracing::debug!(response_id = %response_id, "Enqueued flex request");
+        tracing::debug!(response_id = %resp_id, "Enqueued flex request");
         (StatusCode::ACCEPTED, Json(response_body)).into_response()
     } else {
-        // Blocking flex: hold the connection and poll until the daemon completes.
-        // If the client disconnects, the future is dropped but the batch remains
-        // in fusillade — the daemon still processes it and the client can poll
-        // GET /v1/responses/{id} later.
-        tracing::debug!(response_id = %response_id, "Blocking flex — polling until daemon completes");
+        tracing::debug!(response_id = %resp_id, "Blocking flex — polling until daemon completes");
 
         let poll_interval = std::time::Duration::from_millis(500);
-        let timeout = std::time::Duration::from_secs(3600); // 1h matches completion_window
+        let timeout = std::time::Duration::from_secs(3600);
 
-        match response_store::poll_until_complete(&state.request_manager, &response_id, poll_interval, timeout).await {
+        match response_store::poll_until_complete(&state.request_manager, resp_id, poll_interval, timeout).await {
             Ok(response_obj) => {
                 let status_code = if response_obj["status"].as_str() == Some("completed") {
                     StatusCode::OK
@@ -315,7 +341,7 @@ async fn handle_flex<P: PoolProvider + Clone + Send + Sync + 'static>(
                 (status_code, Json(response_obj)).into_response()
             }
             Err(e) => {
-                tracing::error!(error = %e, response_id = %response_id, "Blocking flex poll failed");
+                tracing::error!(error = %e, response_id = %resp_id, "Blocking flex poll failed");
                 let response_body = serde_json::json!({
                     "error": {
                         "message": format!("Request timed out: {e}"),

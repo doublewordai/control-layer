@@ -2,3 +2,7 @@
 members = ["dwctl"]
 resolver = "2"
 
+# Remove before merging — use published fusillade once changes are released
+[patch.crates-io]
+fusillade = { path = "../fusillade" }
+

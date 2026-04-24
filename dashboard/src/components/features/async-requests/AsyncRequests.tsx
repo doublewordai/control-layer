@@ -162,6 +162,19 @@ function createColumns(
     },
   },
   {
+    accessorKey: "service_tier",
+    header: "Tier",
+    cell: ({ row }) => {
+      const tier = row.getValue("service_tier") as string | null;
+      if (!tier) return <span className="text-sm text-doubleword-neutral-600">-</span>;
+      return (
+        <span className="text-sm text-doubleword-neutral-900">
+          {tier}
+        </span>
+      );
+    },
+  },
+  {
     id: "tokens",
     header: "Tokens",
     cell: ({ row }) => {
@@ -285,7 +298,7 @@ export function AsyncRequests() {
   const columns = createColumns(showUserColumn, modelDisplayNames);
 
   const { data, isLoading } = useAsyncRequests({
-    service_tier: "flex",
+    require_service_tier: true,
     active_first: sortActiveFirst,
     status: statusFilter !== "all" ? statusFilter : undefined,
     model: modelFilter.length > 0 ? modelFilter.join(",") : undefined,
@@ -302,10 +315,10 @@ export function AsyncRequests() {
       <div className="mb-4 flex flex-col sm:flex-row sm:items-end sm:justify-between gap-4">
         <div>
           <h1 className="text-3xl font-bold text-doubleword-neutral-900">
-            Async
+            Responses
           </h1>
           <p className="text-doubleword-neutral-600 mt-1">
-            View and manage async requests
+            View and manage responses
           </p>
         </div>
         <div className="flex items-center gap-2">
