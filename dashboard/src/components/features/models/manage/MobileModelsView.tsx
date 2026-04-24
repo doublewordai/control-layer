@@ -2,14 +2,34 @@ import React, { useState, useMemo } from "react";
 import type { Model, ProviderDisplayConfig } from "../../../../api/control-layer/types";
 import { CatalogIcon } from "../catalog/CatalogIcon";
 
-const CAPABILITY_FILTERS: { key: string; label: string }[] = [
-  { key: "text", label: "Generative" },
-  { key: "embeddings", label: "Embedding" },
-  { key: "ocr", label: "OCR" },
-  { key: "vision", label: "Vision" },
-  { key: "reasoning", label: "Reasoning" },
-  { key: "enhanced_structured_generation", label: "Enhanced Structured Generation" },
+type FilterType = "category" | "capability";
+
+const FILTERS: { key: string; label: string; type: FilterType }[] = [
+  { key: "generation", label: "Generative", type: "category" },
+  { key: "embedding", label: "Embedding", type: "category" },
+  { key: "ocr", label: "OCR", type: "category" },
+  { key: "vision", label: "Vision", type: "capability" },
+  { key: "reasoning", label: "Reasoning", type: "capability" },
+  { key: "enhanced_structured_generation", label: "Enhanced Structured Generation", type: "capability" },
 ];
+
+function getModelCategory(model: Model): string | null {
+  if (model.metadata?.display_category) return model.metadata.display_category;
+  if (model.model_type === "EMBEDDINGS") return "embedding";
+  if (model.model_type === "CHAT" || model.model_type === "RERANKER") return "generation";
+  return null;
+}
+
+function matchesFilter(model: Model, key: string, type: FilterType): boolean {
+  if (type === "category") return getModelCategory(model) === key;
+  return model.capabilities?.includes(key) ?? false;
+}
+
+function sortByNewest(models: Model[]): Model[] {
+  return [...models].sort((a, b) =>
+    (b.metadata?.released_at || "").localeCompare(a.metadata?.released_at || ""),
+  );
+}
 
 interface SwimlaneCardProps {
   model: Model;
@@ -77,59 +97,67 @@ export const MobileModelsView: React.FC<MobileModelsViewProps> = ({
   providerConfigMap,
   onNavigate,
 }) => {
-  const [capFilter, setCapFilter] = useState<string>("all");
+  const [activeFilter, setActiveFilter] = useState<string>("all");
 
   const filtered = useMemo(() => {
-    if (capFilter === "all") return models;
-    return models.filter((m) => m.capabilities?.includes(capFilter));
-  }, [models, capFilter]);
+    if (activeFilter === "all") return models;
+    const filter = FILTERS.find((f) => f.key === activeFilter);
+    if (!filter) return models;
+    return models.filter((m) => matchesFilter(m, filter.key, filter.type));
+  }, [models, activeFilter]);
 
   const newModels = useMemo(
-    () =>
-      [...filtered]
-        .filter((m) => m.metadata?.released_at)
-        .sort((a, b) =>
-          (b.metadata?.released_at || "").localeCompare(
-            a.metadata?.released_at || "",
-          ),
-        )
-        .slice(0, 4),
+    () => sortByNewest(filtered).slice(0, 4),
     [filtered],
   );
 
   const providerGroups = useMemo(() => {
-    const groups: Record<string, Model[]> = {};
+    const groups: Record<string, { displayName: string; models: Model[] }> = {};
     filtered.forEach((m) => {
-      const provider = m.metadata?.provider || "Other";
-      if (!groups[provider]) groups[provider] = [];
-      groups[provider].push(m);
+      const rawProvider = m.metadata?.provider || "Other";
+      const key = rawProvider.toLowerCase().trim();
+      if (!groups[key]) {
+        const config = providerConfigMap.get(key);
+        groups[key] = {
+          displayName: config?.display_name || rawProvider,
+          models: [],
+        };
+      }
+      groups[key].models.push(m);
     });
-    return Object.entries(groups).sort((a, b) => b[1].length - a[1].length);
-  }, [filtered]);
+    // Sort lanes by model count desc, then sort models within each lane newest-first
+    return Object.entries(groups)
+      .sort((a, b) => b[1].models.length - a[1].models.length)
+      .map(([key, { displayName, models: laneModels }]) => ({
+        key,
+        displayName,
+        models: sortByNewest(laneModels),
+      }));
+  }, [filtered, providerConfigMap]);
 
   return (
     <div className="pb-6">
-      {/* Capability filter chips */}
+      {/* Filter chips */}
       <div className="flex gap-1 overflow-x-auto px-4 pt-1 pb-3 swimlane-scroll">
         <button
           className={`shrink-0 px-3 py-1.5 rounded-md text-xs font-medium transition-colors ${
-            capFilter === "all"
+            activeFilter === "all"
               ? "bg-primary text-primary-foreground shadow-sm"
               : "bg-background text-muted-foreground hover:bg-muted"
           }`}
-          onClick={() => setCapFilter("all")}
+          onClick={() => setActiveFilter("all")}
         >
           All
         </button>
-        {CAPABILITY_FILTERS.map(({ key, label }) => (
+        {FILTERS.map(({ key, label }) => (
           <button
             key={key}
             className={`shrink-0 px-3 py-1.5 rounded-md text-xs font-medium transition-colors ${
-              capFilter === key
+              activeFilter === key
                 ? "bg-primary text-primary-foreground shadow-sm"
                 : "bg-background text-muted-foreground hover:bg-muted"
             }`}
-            onClick={() => setCapFilter(key)}
+            onClick={() => setActiveFilter(key)}
           >
             {label}
           </button>
@@ -138,7 +166,7 @@ export const MobileModelsView: React.FC<MobileModelsViewProps> = ({
 
       {filtered.length === 0 ? (
         <div className="text-center py-12 text-gray-500 text-sm">
-          No models with this capability
+          No models match this filter
         </div>
       ) : (
         <>
@@ -150,15 +178,14 @@ export const MobileModelsView: React.FC<MobileModelsViewProps> = ({
             />
           )}
 
-          {providerGroups.map(([provider, providerModels]) => {
-            const providerKey = provider.toLowerCase().trim();
-            const config = providerConfigMap.get(providerKey);
+          {providerGroups.map(({ key, displayName, models: laneModels }) => {
+            const config = providerConfigMap.get(key);
             return (
               <Swimlane
-                key={provider}
-                title={config?.display_name || provider}
-                titleIcon={config?.icon ?? providerKey}
-                models={providerModels}
+                key={key}
+                title={displayName}
+                titleIcon={config?.icon ?? key}
+                models={laneModels}
                 onNavigate={onNavigate}
               />
             );
