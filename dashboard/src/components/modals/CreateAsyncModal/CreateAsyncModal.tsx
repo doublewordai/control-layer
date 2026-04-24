@@ -30,6 +30,7 @@ interface CreateAsyncModalProps {
   onClose: () => void;
   onSuccess: () => void;
   completionWindow?: string;
+  defaultModel?: string;
 }
 
 export function CreateAsyncModal({
@@ -37,11 +38,12 @@ export function CreateAsyncModal({
   onClose,
   onSuccess,
   completionWindow = "1h",
+  defaultModel,
 }: CreateAsyncModalProps) {
   const [activeTab, setActiveTab] = useState<"compose" | "upload">("compose");
 
   // Compose state
-  const [model, setModel] = useState<string>("");
+  const [model, setModel] = useState<string>(defaultModel ?? "");
   const [prompts, setPrompts] = useState<string>("");
   const [temperature, setTemperature] = useState<string>("0.7");
   const [maxTokens, setMaxTokens] = useState<string>("4096");
@@ -73,6 +75,12 @@ export function CreateAsyncModal({
     enabled: isOpen && activeTab === "upload",
   });
   const availableFiles = filesResponse?.data || [];
+
+  useEffect(() => {
+    if (isOpen && defaultModel) {
+      setModel(defaultModel);
+    }
+  }, [isOpen, defaultModel]);
 
   useEffect(() => {
     if (availableFiles.length > 0 && !hasLoadedFiles) {

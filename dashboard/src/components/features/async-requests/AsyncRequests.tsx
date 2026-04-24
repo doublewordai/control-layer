@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import { Code, Play, X, Filter, Clock, DollarSign, Check, ChevronsUpDown } from "lucide-react";
 import { type ColumnDef } from "@tanstack/react-table";
 import { Button } from "../../ui/button";
@@ -244,7 +244,10 @@ function createColumns(
 
 export function AsyncRequests() {
   const navigate = useNavigate();
-  const [createModalOpen, setCreateModalOpen] = useState(false);
+  const [searchParams, setSearchParams] = useSearchParams();
+  const createParam = searchParams.get("create");
+  const modelParam = searchParams.get("model");
+  const [createModalOpen, setCreateModalOpen] = useState(createParam === "true");
   const [showApiExamples, setShowApiExamples] = useState(false);
   const bootstrapBanner = useBootstrapContent();
   const { hasPermission } = useAuthorization();
@@ -500,8 +503,29 @@ export function AsyncRequests() {
 
       <CreateAsyncModal
         isOpen={createModalOpen}
-        onClose={() => setCreateModalOpen(false)}
-        onSuccess={() => setCreateModalOpen(false)}
+        onClose={() => {
+          setCreateModalOpen(false);
+          if (createParam) {
+            setSearchParams((prev) => {
+              const next = new URLSearchParams(prev);
+              next.delete("create");
+              next.delete("model");
+              return next;
+            }, { replace: true });
+          }
+        }}
+        onSuccess={() => {
+          setCreateModalOpen(false);
+          if (createParam) {
+            setSearchParams((prev) => {
+              const next = new URLSearchParams(prev);
+              next.delete("create");
+              next.delete("model");
+              return next;
+            }, { replace: true });
+          }
+        }}
+        defaultModel={modelParam ?? undefined}
       />
 
       <ApiExamples

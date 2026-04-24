@@ -886,11 +886,11 @@ export const ModelCatalog: React.FC = () => {
     <div className="p-3 md:p-4">
       {/* Header */}
       <div className="mb-3">
-        <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
+        <div className={`flex ${isMobile ? "flex-col items-center text-center" : "flex-col md:flex-row md:items-center md:justify-between"} gap-4`}>
           <h1 className="text-2xl md:text-3xl font-bold text-doubleword-neutral-900">
             Models
           </h1>
-          <div className="flex items-center gap-3">
+          <div className={`flex items-center gap-3 ${isMobile ? "w-full" : ""}`}>
             {canManageGroups && !isMobile && (
               <div className="flex items-center gap-2">
                 <span className="text-sm text-muted-foreground">Group:</span>
@@ -985,7 +985,7 @@ export const ModelCatalog: React.FC = () => {
                 </Popover>
               </div>
             )}
-            <div className="relative">
+            <div className={`relative ${isMobile ? "w-full" : ""}`}>
               <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 text-gray-400 w-4 h-4 z-10 pointer-events-none" />
               <Input
                 type="text"
