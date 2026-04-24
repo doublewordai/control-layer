@@ -1,29 +1,52 @@
 import React, { useState, useMemo } from "react";
+import {
+  Eye,
+  Layers,
+  Brain,
+  Braces,
+  MessageSquare,
+  Zap,
+  Wrench,
+} from "lucide-react";
 import type { Model, ProviderDisplayConfig } from "../../../../api/control-layer/types";
 import { CatalogIcon } from "../catalog/CatalogIcon";
 
+const CAPABILITY_ICONS: Record<string, React.FC<{ className?: string }>> = {
+  vision: Eye,
+  embeddings: Layers,
+  reasoning: Brain,
+  enhanced_structured_generation: Braces,
+  text: MessageSquare,
+  streaming: Zap,
+  tool_use: Wrench,
+};
+
 interface SwimlaneCardProps {
   model: Model;
-  subtitle: string;
   onTap: () => void;
 }
 
 const SwimlaneCard: React.FC<SwimlaneCardProps> = ({
   model,
-  subtitle,
   onTap,
 }) => (
   <button
     className="shrink-0 w-[130px] bg-white border border-gray-200 rounded-xl overflow-hidden text-left active:scale-[0.97] transition-transform"
     onClick={onTap}
   >
-    <div className="px-3 pt-3 pb-3">
-      <div className="text-xs font-semibold text-gray-900 truncate">
+    <div className="px-3 pt-2.5 pb-2.5">
+      <div className="text-[11px] font-semibold text-gray-900 leading-tight break-words line-clamp-2 min-h-[28px]">
         {model.alias}
       </div>
-      <div className="text-[10px] text-gray-500 mt-0.5 truncate">
-        {subtitle}
-      </div>
+      {model.capabilities && model.capabilities.length > 0 && (
+        <div className="flex gap-1.5 mt-1.5">
+          {model.capabilities.map((cap) => {
+            const Icon = CAPABILITY_ICONS[cap];
+            if (!Icon) return null;
+            return <Icon key={cap} className="h-3 w-3 text-gray-400" />;
+          })}
+        </div>
+      )}
     </div>
   </button>
 );
@@ -32,7 +55,6 @@ interface SwimlaneProps {
   title: string;
   titleIcon?: string;
   models: Model[];
-  subtitleFn: (model: Model) => string;
   onNavigate: (modelId: string) => void;
 }
 
@@ -40,7 +62,6 @@ const Swimlane: React.FC<SwimlaneProps> = ({
   title,
   titleIcon,
   models,
-  subtitleFn,
   onNavigate,
 }) => (
   <div className="mt-5">
@@ -57,19 +78,12 @@ const Swimlane: React.FC<SwimlaneProps> = ({
         <SwimlaneCard
           key={model.id}
           model={model}
-          subtitle={subtitleFn(model)}
           onTap={() => onNavigate(model.id)}
         />
       ))}
     </div>
   </div>
 );
-
-function capsLabel(model: Model): string {
-  const caps = model.capabilities?.slice(0, 2);
-  if (!caps || caps.length === 0) return model.metadata?.provider || "";
-  return caps.map((c) => c.charAt(0).toUpperCase() + c.slice(1)).join(", ");
-}
 
 export interface MobileModelsViewProps {
   models: Model[];
@@ -157,7 +171,6 @@ export const MobileModelsView: React.FC<MobileModelsViewProps> = ({
             <Swimlane
               title="New"
               models={newModels}
-              subtitleFn={(m) => m.metadata?.provider || ""}
               onNavigate={onNavigate}
             />
           )}
@@ -171,7 +184,6 @@ export const MobileModelsView: React.FC<MobileModelsViewProps> = ({
                 title={config?.display_name || provider}
                 titleIcon={config?.icon ?? providerKey}
                 models={providerModels}
-                subtitleFn={capsLabel}
                 onNavigate={onNavigate}
               />
             );
