@@ -57,6 +57,8 @@ import {
 import { Skeleton } from "../../../ui/skeleton";
 import { ApiExamples } from "../../../modals";
 import { CatalogIcon } from "./CatalogIcon";
+import { useIsMobile } from "../../../../hooks/use-mobile";
+import { MobileModelsView } from "../manage/MobileModelsView";
 
 
 const EVERYONE_GROUP_ID = "00000000-0000-0000-0000-000000000000";
@@ -780,6 +782,7 @@ function LoadingSkeleton() {
 
 export const ModelCatalog: React.FC = () => {
   const navigate = useNavigate();
+  const isMobile = useIsMobile();
   const { hasPermission } = useAuthorization();
   const canManageGroups = hasPermission("manage-groups");
 
@@ -1005,6 +1008,11 @@ export const ModelCatalog: React.FC = () => {
             ? "No models matching your filters"
             : "No models available"}
         </div>
+      ) : isMobile ? (
+        <MobileModelsView
+          models={data?.data || []}
+          onNavigate={(id) => navigate(`/models/${id}`)}
+        />
       ) : (
         <div className="space-y-4">
           {sections.map((section) => (
