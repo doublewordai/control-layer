@@ -10,7 +10,6 @@ import {
   Eye,
   Trash2,
   Box,
-  Zap,
   FastForward,
 } from "lucide-react";
 import { Button } from "../../../ui/button";
@@ -128,7 +127,7 @@ export const createBatchColumns = (
                     {isAsync ? (
                       <FastForward className="h-4 w-4" />
                     ) : (
-                      <Zap className="h-4 w-4" />
+                      <Box className="h-4 w-4" />
                     )}
                   </span>
                 </TooltipTrigger>
