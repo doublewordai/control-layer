@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.43.0](https://github.com/doublewordai/control-layer/compare/v8.42.3...v8.43.0) (2026-04-24)
+
+
+### Features
+
+* mobile swimlane view for models page ([#1022](https://github.com/doublewordai/control-layer/issues/1022)) ([4237a96](https://github.com/doublewordai/control-layer/commit/4237a96f5a045f012e753e49d66c786cc4147f35))
+
 ## [8.42.3](https://github.com/doublewordai/control-layer/compare/v8.42.2...v8.42.3) (2026-04-22)
 
 
