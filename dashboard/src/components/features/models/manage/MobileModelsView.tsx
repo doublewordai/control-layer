@@ -13,11 +13,10 @@ const FILTERS: { key: string; label: string; type: FilterType }[] = [
   { key: "enhanced_structured_generation", label: "Enhanced Structured Generation", type: "capability" },
 ];
 
-function getModelCategory(model: Model): string | null {
+function getModelCategory(model: Model): string {
   if (model.metadata?.display_category) return model.metadata.display_category;
   if (model.model_type === "EMBEDDINGS") return "embedding";
-  if (model.model_type === "CHAT" || model.model_type === "RERANKER") return "generation";
-  return null;
+  return "generation";
 }
 
 function matchesFilter(model: Model, key: string, type: FilterType): boolean {
