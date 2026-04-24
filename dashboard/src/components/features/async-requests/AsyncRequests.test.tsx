@@ -112,12 +112,12 @@ describe("AsyncRequests", () => {
     ).toBeInTheDocument();
   });
 
-  it("passes service_tier=flex to the query", () => {
+  it("passes require_service_tier=true to the query", () => {
     render(<AsyncRequests />, { wrapper: createWrapper() });
 
     expect(hooks.useAsyncRequests).toHaveBeenCalledWith(
       expect.objectContaining({
-        service_tier: "flex",
+        require_service_tier: true,
       }),
     );
   });
