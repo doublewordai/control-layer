@@ -133,7 +133,13 @@ pub async fn build_complete_response_job<P: sqlx_pool_router::PoolProvider + Clo
 ) -> anyhow::Result<underway::Job<CompleteResponseInput, crate::tasks::TaskState<P>>> {
     use underway::Job;
     use underway::job::To;
-    use underway::task::Error as TaskError;
+    use underway::task::{Error as TaskError, RetryPolicy};
+
+    // Tight retries to ride out the create-response vs complete-response race.
+    // Both jobs are enqueued within ~50ms of each other; if complete-response
+    // wins, the fusillade row isn't there yet and we need to retry quickly.
+    // Default is 5 attempts at 1s/2s/4s/8s — way too slow for realtime flows.
+    let retry_policy = RetryPolicy::builder().max_attempts(10).initial_interval_ms(100).build();
 
     Job::<CompleteResponseInput, _>::builder()
         .state(state)
@@ -181,6 +187,7 @@ pub async fn build_complete_response_job<P: sqlx_pool_router::PoolProvider + Clo
 
             To::done()
         })
+        .retry_policy(retry_policy)
         .name("complete-response")
         .pool(pool)
         .build()
