@@ -41,11 +41,11 @@ const SwimlaneCard: React.FC<SwimlaneCardProps> = ({
 }) => (
   <button
     aria-label={`View ${model.display_name || model.alias}`}
-    className="shrink-0 w-[130px] bg-white border border-gray-200 rounded-xl overflow-hidden text-left active:scale-[0.97] transition-transform"
+    className="shrink-0 w-[130px] h-[52px] bg-white border border-gray-200 rounded-xl overflow-hidden text-left active:scale-[0.97] transition-transform"
     onClick={onTap}
   >
-    <div className="px-3 pt-2.5 pb-2.5">
-      <div className="text-[11px] font-semibold text-gray-900 leading-tight break-words line-clamp-2">
+    <div className="px-3 pt-2.5 pb-2.5 h-full flex items-center">
+      <div className="text-[11px] font-normal text-gray-900 leading-tight break-words line-clamp-2">
         {model.display_name || model.alias}
       </div>
     </div>
