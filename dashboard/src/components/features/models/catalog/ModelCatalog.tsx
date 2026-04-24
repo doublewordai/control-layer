@@ -1011,6 +1011,7 @@ export const ModelCatalog: React.FC = () => {
       ) : isMobile ? (
         <MobileModelsView
           models={data?.data || []}
+          providerConfigMap={providerConfigMap}
           onNavigate={(id) => navigate(`/models/${id}`)}
         />
       ) : (
