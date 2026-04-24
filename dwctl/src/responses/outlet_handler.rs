@@ -103,6 +103,18 @@ impl RequestHandler for FusilladeOutletHandler {
             let endpoint = Self::header_str(&request_data, "x-onwards-endpoint").unwrap_or("").to_string();
             let api_key = Self::extract_api_key(&request_data);
 
+            if endpoint.is_empty() {
+                // The responses middleware always sets x-onwards-endpoint when
+                // it intercepts. If we get here without it, complete-response
+                // would synthesize a row with an empty endpoint that the
+                // /responses lookup queries can't find. Log loudly.
+                tracing::warn!(
+                    response_id = %response_id,
+                    uri = %request_data.uri,
+                    "Missing x-onwards-endpoint header on captured request — complete-response will fail"
+                );
+            }
+
             if let Err(e) = job
                 .enqueue(&CompleteResponseInput {
                     response_id: response_id.clone(),

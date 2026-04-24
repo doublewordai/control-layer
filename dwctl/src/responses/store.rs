@@ -111,6 +111,21 @@ pub async fn complete_response_idempotent<P: PoolProvider + Clone>(
             // failed UPDATE and our INSERT, the INSERT will hit a PK conflict.
             // Treat that as "create-response got there first" and just retry
             // the UPDATE.
+            tracing::info!(
+                response_id = %response_id,
+                model = %create_ctx.model,
+                endpoint = %create_ctx.endpoint,
+                "complete-response synthesizing row (create-response hasn't run yet)"
+            );
+            if create_ctx.endpoint.is_empty() {
+                // We'd create a row with an empty endpoint — that's broken
+                // upstream (responses middleware should always set the
+                // x-onwards-endpoint header). Better to fail loudly than
+                // silently insert a row that's hard to find later.
+                return Err(StoreError::StorageError(
+                    "Cannot synthesize request row: empty endpoint in CreateContext (x-onwards-endpoint header missing upstream)".into(),
+                ));
+            }
             let created_by = lookup_created_by(dwctl_pool, create_ctx.api_key).await;
             let batch_input = fusillade::CreateSingleRequestBatchInput {
                 request_id: create_ctx.request_id,

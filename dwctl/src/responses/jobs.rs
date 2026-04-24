@@ -113,6 +113,17 @@ pub async fn build_create_response_job<P: sqlx_pool_router::PoolProvider + Clone
             };
 
             if let Err(e) = fusillade::Storage::create_single_request_batch(&*cx.state.request_manager, batch_input).await {
+                // The pre-check is best-effort — complete-response can insert
+                // the row in the TOCTOU window between request_exists and this
+                // INSERT. Re-check; if it now exists we lost the race, our
+                // work is done, no need to retry and no need to log loudly.
+                if let Ok(true) = response_store::request_exists(&cx.state.request_manager, input.request_id).await {
+                    tracing::debug!(
+                        request_id = %input.request_id,
+                        "create-response lost race after pre-check — row now exists, done"
+                    );
+                    return To::done();
+                }
                 tracing::error!(
                     request_id = %input.request_id,
                     error = %e,
