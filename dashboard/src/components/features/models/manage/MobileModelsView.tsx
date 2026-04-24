@@ -5,16 +5,12 @@ import { CatalogIcon } from "../catalog/CatalogIcon";
 interface SwimlaneCardProps {
   model: Model;
   subtitle: string;
-  providerIcon?: string;
-  providerLabel: string;
   onTap: () => void;
 }
 
 const SwimlaneCard: React.FC<SwimlaneCardProps> = ({
   model,
   subtitle,
-  providerIcon,
-  providerLabel,
   onTap,
 }) => (
   <button
@@ -22,8 +18,7 @@ const SwimlaneCard: React.FC<SwimlaneCardProps> = ({
     onClick={onTap}
   >
     <div className="px-3 pt-3 pb-3">
-      <div className="flex items-center justify-between mb-2">
-        <CatalogIcon icon={providerIcon} label={providerLabel} size="sm" />
+      <div className="flex items-center justify-end mb-1.5">
         <div
           className={`h-1.5 w-1.5 rounded-full ${
             model.status?.last_success === true
@@ -49,7 +44,6 @@ interface SwimlaneProps {
   titleIcon?: string;
   models: Model[];
   subtitleFn: (model: Model) => string;
-  providerConfigMap: Map<string, ProviderDisplayConfig>;
   onNavigate: (modelId: string) => void;
 }
 
@@ -58,7 +52,6 @@ const Swimlane: React.FC<SwimlaneProps> = ({
   titleIcon,
   models,
   subtitleFn,
-  providerConfigMap,
   onNavigate,
 }) => (
   <div className="mt-5">
@@ -71,20 +64,14 @@ const Swimlane: React.FC<SwimlaneProps> = ({
       </h3>
     </div>
     <div className="flex gap-3 overflow-x-auto px-4 pb-1 swimlane-scroll">
-      {models.map((model) => {
-        const providerKey = (model.metadata?.provider || "").toLowerCase().trim();
-        const config = providerConfigMap.get(providerKey);
-        return (
-          <SwimlaneCard
-            key={model.id}
-            model={model}
-            subtitle={subtitleFn(model)}
-            providerIcon={config?.icon ?? providerKey}
-            providerLabel={config?.display_name || model.metadata?.provider || "Other"}
-            onTap={() => onNavigate(model.id)}
-          />
-        );
-      })}
+      {models.map((model) => (
+        <SwimlaneCard
+          key={model.id}
+          model={model}
+          subtitle={subtitleFn(model)}
+          onTap={() => onNavigate(model.id)}
+        />
+      ))}
     </div>
   </div>
 );
@@ -182,7 +169,6 @@ export const MobileModelsView: React.FC<MobileModelsViewProps> = ({
               title="New"
               models={newModels}
               subtitleFn={(m) => m.metadata?.provider || ""}
-              providerConfigMap={providerConfigMap}
               onNavigate={onNavigate}
             />
           )}
@@ -197,7 +183,6 @@ export const MobileModelsView: React.FC<MobileModelsViewProps> = ({
                 titleIcon={config?.icon ?? providerKey}
                 models={providerModels}
                 subtitleFn={capsLabel}
-                providerConfigMap={providerConfigMap}
                 onNavigate={onNavigate}
               />
             );
