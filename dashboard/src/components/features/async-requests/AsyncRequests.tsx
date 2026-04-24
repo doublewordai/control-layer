@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
-import { Code, Play, X, Filter, Clock, DollarSign, Check, ChevronsUpDown } from "lucide-react";
+import { Code, Play, X, Filter, Clock, DollarSign, Check, ChevronsUpDown, Zap, FastForward } from "lucide-react";
 import { type ColumnDef } from "@tanstack/react-table";
 import { Button } from "../../ui/button";
 import { DataTable } from "../../ui/data-table";
@@ -167,10 +167,16 @@ function createColumns(
     cell: ({ row }) => {
       const tier = row.getValue("service_tier") as string | null;
       if (!tier) return <span className="text-sm text-doubleword-neutral-600">-</span>;
+      const Icon = tier === "flex" ? FastForward : Zap;
       return (
-        <span className="text-sm text-doubleword-neutral-900">
-          {tier}
-        </span>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <span className="inline-flex text-doubleword-neutral-600">
+              <Icon className="h-4 w-4" />
+            </span>
+          </TooltipTrigger>
+          <TooltipContent side="top">{tier}</TooltipContent>
+        </Tooltip>
       );
     },
   },

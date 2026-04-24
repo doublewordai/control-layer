@@ -11,6 +11,7 @@ import {
   Trash2,
   Box,
   Zap,
+  FastForward,
 } from "lucide-react";
 import { Button } from "../../../ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "../../../ui/tooltip";
@@ -125,14 +126,14 @@ export const createBatchColumns = (
                 <TooltipTrigger asChild>
                   <span className="inline-flex text-doubleword-neutral-600">
                     {isAsync ? (
-                      <Zap className="h-4 w-4" />
+                      <FastForward className="h-4 w-4" />
                     ) : (
-                      <Box className="h-4 w-4" />
+                      <Zap className="h-4 w-4" />
                     )}
                   </span>
                 </TooltipTrigger>
                 <TooltipContent side="top">
-                  {isAsync ? "Async" : "Batch"}
+                  {isAsync ? "Flex" : "Realtime"}
                 </TooltipContent>
               </Tooltip>
             );
