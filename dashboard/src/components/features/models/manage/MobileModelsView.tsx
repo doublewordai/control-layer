@@ -5,20 +5,16 @@ import {
   Brain,
   Braces,
   MessageSquare,
-  Zap,
-  Wrench,
 } from "lucide-react";
 import type { Model, ProviderDisplayConfig } from "../../../../api/control-layer/types";
 import { CatalogIcon } from "../catalog/CatalogIcon";
 
 const CAPABILITY_ICONS: Record<string, React.FC<{ className?: string }>> = {
-  vision: Eye,
-  embeddings: Layers,
-  reasoning: Brain,
-  enhanced_structured_generation: Braces,
   text: MessageSquare,
-  streaming: Zap,
-  tool_use: Wrench,
+  vision: Eye,
+  reasoning: Brain,
+  embeddings: Layers,
+  enhanced_structured_generation: Braces,
 };
 
 interface SwimlaneCardProps {
