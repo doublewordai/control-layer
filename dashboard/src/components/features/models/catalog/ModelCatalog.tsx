@@ -891,7 +891,7 @@ export const ModelCatalog: React.FC = () => {
             Models
           </h1>
           <div className="flex items-center gap-3">
-            {canManageGroups && (
+            {canManageGroups && !isMobile && (
               <div className="flex items-center gap-2">
                 <span className="text-sm text-muted-foreground">Group:</span>
                 <Popover>

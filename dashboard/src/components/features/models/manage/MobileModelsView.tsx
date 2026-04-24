@@ -1,23 +1,14 @@
 import React, { useState, useMemo } from "react";
-import {
-  Eye,
-  Layers,
-  Brain,
-  Braces,
-  MessageSquare,
-} from "lucide-react";
 import type { Model, ProviderDisplayConfig } from "../../../../api/control-layer/types";
 import { CatalogIcon } from "../catalog/CatalogIcon";
 
-const CAPABILITY_CONFIG: Record<string, { icon: React.FC<{ className?: string }>; label: string }> = {
-  text: { icon: MessageSquare, label: "Text" },
-  vision: { icon: Eye, label: "Vision" },
-  reasoning: { icon: Brain, label: "Reasoning" },
-  embeddings: { icon: Layers, label: "Embeddings" },
-  enhanced_structured_generation: { icon: Braces, label: "Structured" },
-};
-
-const FILTER_KEYS = Object.keys(CAPABILITY_CONFIG);
+const CAPABILITY_FILTERS: { key: string; label: string }[] = [
+  { key: "text", label: "Text" },
+  { key: "vision", label: "Vision" },
+  { key: "reasoning", label: "Reasoning" },
+  { key: "embeddings", label: "Embeddings" },
+  { key: "enhanced_structured_generation", label: "Structured" },
+];
 
 interface SwimlaneCardProps {
   model: Model;
@@ -33,19 +24,9 @@ const SwimlaneCard: React.FC<SwimlaneCardProps> = ({
     onClick={onTap}
   >
     <div className="px-3 pt-2.5 pb-2.5">
-      <div className="text-[11px] font-semibold text-gray-900 leading-tight break-words line-clamp-2 min-h-[28px]">
-        {model.alias}
+      <div className="text-[11px] font-semibold text-gray-900 leading-tight break-words line-clamp-2">
+        {model.display_name || model.alias}
       </div>
-      {model.capabilities && model.capabilities.length > 0 && (
-        <div className="flex gap-1.5 mt-1.5">
-          {model.capabilities.map((cap) => {
-            const config = CAPABILITY_CONFIG[cap];
-            if (!config) return null;
-            const Icon = config.icon;
-            return <Icon key={cap} className="h-3 w-3 text-gray-400" />;
-          })}
-        </div>
-      )}
     </div>
   </button>
 );
@@ -128,28 +109,28 @@ export const MobileModelsView: React.FC<MobileModelsViewProps> = ({
   return (
     <div className="pb-6">
       {/* Capability filter chips */}
-      <div className="flex gap-2 overflow-x-auto px-4 pt-1 pb-3 swimlane-scroll">
+      <div className="flex gap-1 overflow-x-auto px-4 pt-1 pb-3 swimlane-scroll">
         <button
-          className={`shrink-0 px-3.5 py-1.5 rounded-full text-xs font-medium transition-colors ${
+          className={`shrink-0 px-3 py-1.5 rounded-md text-xs font-medium transition-colors ${
             capFilter === "all"
-              ? "bg-doubleword-background-dark text-white"
-              : "bg-gray-100 text-gray-600 border border-gray-200"
+              ? "bg-primary text-primary-foreground shadow-sm"
+              : "bg-background text-muted-foreground hover:bg-muted"
           }`}
           onClick={() => setCapFilter("all")}
         >
           All
         </button>
-        {FILTER_KEYS.map((cap) => (
+        {CAPABILITY_FILTERS.map(({ key, label }) => (
           <button
-            key={cap}
-            className={`shrink-0 px-3.5 py-1.5 rounded-full text-xs font-medium transition-colors ${
-              capFilter === cap
-                ? "bg-doubleword-background-dark text-white"
-                : "bg-gray-100 text-gray-600 border border-gray-200"
+            key={key}
+            className={`shrink-0 px-3 py-1.5 rounded-md text-xs font-medium transition-colors ${
+              capFilter === key
+                ? "bg-primary text-primary-foreground shadow-sm"
+                : "bg-background text-muted-foreground hover:bg-muted"
             }`}
-            onClick={() => setCapFilter(cap)}
+            onClick={() => setCapFilter(key)}
           >
-            {CAPABILITY_CONFIG[cap].label}
+            {label}
           </button>
         ))}
       </div>
