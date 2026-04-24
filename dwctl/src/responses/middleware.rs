@@ -119,17 +119,32 @@ pub async fn responses_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
         ServiceTier::Realtime => "0s",
     };
 
-    // Validate model access for flex requests (realtime is validated by onwards).
-    if matches!(service_tier, ServiceTier::Flex)
-        && let Some(key) = api_key.as_deref()
-        && let Err(msg) = crate::error_enrichment::validate_api_key_model_access(state.dwctl_pool.clone(), key, model).await
-    {
-        return Response::builder()
-            .status(StatusCode::FORBIDDEN)
-            .body(Body::from(
-                serde_json::json!({"error": {"message": msg, "type": "invalid_request_error"}}).to_string(),
-            ))
-            .unwrap();
+    // Validate API key for flex requests (realtime is validated by onwards).
+    // Flex requests bypass onwards entirely — the daemon processes them later —
+    // so we must enforce auth here.
+    if matches!(service_tier, ServiceTier::Flex) {
+        match api_key.as_deref() {
+            None => {
+                return Response::builder()
+                    .status(StatusCode::UNAUTHORIZED)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"error": {"message": "API key required", "type": "invalid_request_error"}}).to_string(),
+                    ))
+                    .unwrap();
+            }
+            Some(key) => {
+                if let Err(msg) = crate::error_enrichment::validate_api_key_model_access(state.dwctl_pool.clone(), key, model).await {
+                    return Response::builder()
+                        .status(StatusCode::FORBIDDEN)
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::json!({"error": {"message": msg, "type": "invalid_request_error"}}).to_string(),
+                        ))
+                        .unwrap();
+                }
+            }
+        }
     }
 
     // Resolve created_by upfront for background/flex (row must exist before
