@@ -13,6 +13,7 @@ import {
   CardTitle,
 } from "../ui/card";
 import { useAuth } from "../../contexts/auth";
+import { mergePreservedParams } from "../../utils/url";
 import {
   useRegistrationInfo,
   useLoginInfo,
@@ -39,7 +40,7 @@ export function LoginForm() {
       await login({ email, password });
       const redirect = searchParams.get("redirect");
       if (redirect) {
-        navigate(redirect);
+        navigate(mergePreservedParams(redirect, searchParams));
       }
       toast.success("Login successful!");
     } catch (error) {
