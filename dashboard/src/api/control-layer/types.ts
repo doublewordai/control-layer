@@ -1611,7 +1611,7 @@ export type AsyncRequestStatus =
 
 export interface AsyncRequest {
   id: string;
-  batch_id: string;
+  batch_id: string | null;
   model: string;
   status: AsyncRequestStatus;
   created_at: string;

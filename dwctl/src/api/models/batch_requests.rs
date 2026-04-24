@@ -45,7 +45,7 @@ pub struct ListBatchRequestsQuery {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct BatchRequestSummary {
     pub id: Uuid,
-    pub batch_id: Uuid,
+    pub batch_id: Option<Uuid>,
     pub model: String,
     pub status: String,
     pub created_at: DateTime<Utc>,
@@ -67,7 +67,7 @@ pub struct BatchRequestSummary {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct BatchRequestDetail {
     pub id: Uuid,
-    pub batch_id: Uuid,
+    pub batch_id: Option<Uuid>,
     pub model: String,
     pub status: String,
     pub created_at: DateTime<Utc>,

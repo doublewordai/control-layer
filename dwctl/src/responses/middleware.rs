@@ -5,12 +5,13 @@
 //!
 //! ## Routing
 //!
-//! - `priority` (realtime): creates a `processing` row, proxies via onwards.
+//! - `priority` / `default` / `auto` (realtime): creates a batch of 1 with
+//!   `completion_window=0s` in `processing` state, proxies via onwards.
 //!   With `background=true`, returns 202 and spawns the proxy as a background task.
-//! - `default` / `auto` (async): creates a batch of 1 with 1h completion window.
-//!   The fusillade daemon picks it up. With `background=false`, holds the connection
-//!   and polls until complete (Phase 3). With `background=true`, returns 202 immediately.
-//! - `flex` (batch): same as default but with 24h completion window and batch pricing.
+//! - `flex` (async): creates a batch of 1 with `completion_window=1h` in
+//!   `pending` state. The fusillade daemon picks it up. With `background=false`,
+//!   holds the connection and polls until complete. With `background=true`,
+//!   returns 202 immediately.
 
 use std::sync::Arc;
 

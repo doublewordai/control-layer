@@ -171,7 +171,7 @@ pub async fn list_batch_requests<P: PoolProvider>(
             let email: Option<String> = r.batch_created_by.as_ref().and_then(|id| email_map.get(id)).cloned();
             BatchRequestSummary {
                 id: r.id,
-                batch_id: r.batch_id.unwrap_or(Uuid::nil()),
+                batch_id: r.batch_id,
                 model: r.model,
                 status: r.status,
                 created_at: r.created_at,
@@ -291,7 +291,7 @@ pub async fn get_batch_request<P: PoolProvider>(
 
     Ok(Json(BatchRequestDetail {
         id: detail.id,
-        batch_id: detail.batch_id.unwrap_or(Uuid::nil()),
+        batch_id: detail.batch_id,
         model: detail.model,
         status: detail.status,
         created_at: detail.created_at,

@@ -927,7 +927,6 @@ async fn test_strict_mode_allows_responses(pool: PgPool) {
     let body: serde_json::Value = response.json();
     // Response ID may be overwritten by the fusillade store if configured, or the provider's ID
     assert_eq!(body["object"].as_str(), Some("response"));
-    assert_eq!(body["object"].as_str(), Some("response"));
     assert_eq!(body["status"].as_str(), Some("completed"));
     assert!(body["output"].is_array());
     assert!(body["usage"].is_object());
