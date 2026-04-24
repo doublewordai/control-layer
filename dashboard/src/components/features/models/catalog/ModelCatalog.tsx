@@ -57,6 +57,8 @@ import {
 import { Skeleton } from "../../../ui/skeleton";
 import { ApiExamples } from "../../../modals";
 import { CatalogIcon } from "./CatalogIcon";
+import { useIsMobile } from "../../../../hooks/use-mobile";
+import { MobileModelsView } from "../manage/MobileModelsView";
 
 
 const EVERYONE_GROUP_ID = "00000000-0000-0000-0000-000000000000";
@@ -780,6 +782,7 @@ function LoadingSkeleton() {
 
 export const ModelCatalog: React.FC = () => {
   const navigate = useNavigate();
+  const isMobile = useIsMobile();
   const { hasPermission } = useAuthorization();
   const canManageGroups = hasPermission("manage-groups");
 
@@ -887,8 +890,8 @@ export const ModelCatalog: React.FC = () => {
           <h1 className="text-2xl md:text-3xl font-bold text-doubleword-neutral-900">
             Models
           </h1>
-          <div className="flex items-center gap-3">
-            {canManageGroups && (
+          <div className={`flex items-center gap-3 ${isMobile ? "w-full justify-center" : ""}`}>
+            {canManageGroups && !isMobile && (
               <div className="flex items-center gap-2">
                 <span className="text-sm text-muted-foreground">Group:</span>
                 <Popover>
@@ -982,7 +985,7 @@ export const ModelCatalog: React.FC = () => {
                 </Popover>
               </div>
             )}
-            <div className="relative">
+            <div className={`relative ${isMobile ? "w-full" : ""}`}>
               <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 text-gray-400 w-4 h-4 z-10 pointer-events-none" />
               <Input
                 type="text"
@@ -1005,6 +1008,12 @@ export const ModelCatalog: React.FC = () => {
             ? "No models matching your filters"
             : "No models available"}
         </div>
+      ) : isMobile ? (
+        <MobileModelsView
+          models={data?.data || []}
+          providerConfigMap={providerConfigMap}
+          onNavigate={(id) => navigate(`/models/${id}`)}
+        />
       ) : (
         <div className="space-y-4">
           {sections.map((section) => (
