@@ -3,11 +3,12 @@ import type { Model, ProviderDisplayConfig } from "../../../../api/control-layer
 import { CatalogIcon } from "../catalog/CatalogIcon";
 
 const CAPABILITY_FILTERS: { key: string; label: string }[] = [
-  { key: "text", label: "Text" },
+  { key: "text", label: "Generative" },
+  { key: "embeddings", label: "Embedding" },
+  { key: "ocr", label: "OCR" },
   { key: "vision", label: "Vision" },
   { key: "reasoning", label: "Reasoning" },
-  { key: "embeddings", label: "Embeddings" },
-  { key: "enhanced_structured_generation", label: "Structured" },
+  { key: "enhanced_structured_generation", label: "Enhanced Structured Generation" },
 ];
 
 interface SwimlaneCardProps {
