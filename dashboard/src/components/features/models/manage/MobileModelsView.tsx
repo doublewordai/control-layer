@@ -74,15 +74,16 @@ const Swimlane: React.FC<SwimlaneProps> = ({
         {title}
       </h3>
     </div>
-    <div className="flex gap-3 overflow-x-auto px-4 pb-1 swimlane-scroll">
+    <ul role="list" className="flex gap-3 overflow-x-auto px-4 pb-1 swimlane-scroll list-none m-0 p-0">
       {models.map((model) => (
-        <SwimlaneCard
-          key={model.id}
-          model={model}
-          onTap={() => onNavigate(model.id)}
-        />
+        <li key={model.id} role="listitem">
+          <SwimlaneCard
+            model={model}
+            onTap={() => onNavigate(model.id)}
+          />
+        </li>
       ))}
-    </div>
+    </ul>
   </div>
 );
 
@@ -140,6 +141,7 @@ export const MobileModelsView: React.FC<MobileModelsViewProps> = ({
       {/* Filter chips */}
       <div className="flex gap-1 overflow-x-auto px-4 pt-1 pb-3 swimlane-scroll">
         <button
+          aria-pressed={activeFilter === "all"}
           className={`shrink-0 px-3 py-1.5 rounded-md text-xs font-medium transition-colors ${
             activeFilter === "all"
               ? "bg-primary text-primary-foreground shadow-sm"
@@ -152,6 +154,7 @@ export const MobileModelsView: React.FC<MobileModelsViewProps> = ({
         {FILTERS.map(({ key, label }) => (
           <button
             key={key}
+            aria-pressed={activeFilter === key}
             className={`shrink-0 px-3 py-1.5 rounded-md text-xs font-medium transition-colors ${
               activeFilter === key
                 ? "bg-primary text-primary-foreground shadow-sm"
