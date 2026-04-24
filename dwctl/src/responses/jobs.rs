@@ -47,9 +47,9 @@ pub async fn build_create_response_job<P: sqlx_pool_router::PoolProvider + Clone
         .step(|cx, input: CreateResponseInput| async move {
             // Validate API key and model access before creating the request
             if let Some(ref key) = input.api_key {
-                if let Err(msg) = crate::error_enrichment::validate_api_key_model_access(
-                    cx.state.dwctl_pool.clone(), key, &input.model,
-                ).await {
+                if let Err(msg) =
+                    crate::error_enrichment::validate_api_key_model_access(cx.state.dwctl_pool.clone(), key, &input.model).await
+                {
                     tracing::debug!(
                         response_id = %input.response_id,
                         error = %msg,
@@ -133,8 +133,13 @@ pub async fn build_complete_response_job<P: sqlx_pool_router::PoolProvider + Clo
         .state(state)
         .step(|cx, input: CompleteResponseInput| async move {
             if (200..300).contains(&input.status_code) {
-                if let Err(e) =
-                    response_store::complete_response(&cx.state.request_manager, &input.response_id, &input.response_body, input.status_code).await
+                if let Err(e) = response_store::complete_response(
+                    &cx.state.request_manager,
+                    &input.response_id,
+                    &input.response_body,
+                    input.status_code,
+                )
+                .await
                 {
                     tracing::error!(
                         response_id = %input.response_id,

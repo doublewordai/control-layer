@@ -8,8 +8,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use fusillade::{
-    BatchInput, CreateDaemonRequestInput, DaemonId, PostgresRequestManager, RequestId,
-    RequestTemplateInput, ReqwestHttpClient, Storage,
+    BatchInput, CreateDaemonRequestInput, DaemonId, PostgresRequestManager, RequestId, RequestTemplateInput, ReqwestHttpClient, Storage,
 };
 use onwards::{ResponseStore, StoreError};
 use sqlx_pool_router::PoolProvider;
@@ -121,14 +120,12 @@ pub async fn poll_until_complete<P: PoolProvider + Clone>(
 
     loop {
         match request_manager.get_request_detail(RequestId(id)).await {
-            Ok(detail) => {
-                match detail.status.as_str() {
-                    "completed" | "failed" | "canceled" => {
-                        return Ok(detail_to_response_object(&detail));
-                    }
-                    _ => {}
+            Ok(detail) => match detail.status.as_str() {
+                "completed" | "failed" | "canceled" => {
+                    return Ok(detail_to_response_object(&detail));
                 }
-            }
+                _ => {}
+            },
             Err(fusillade::FusilladeError::RequestNotFound(_)) => {}
             Err(e) => {
                 return Err(StoreError::StorageError(format!("Failed to poll request: {e}")));
@@ -296,13 +293,13 @@ fn detail_to_response_object(detail: &fusillade::RequestDetail) -> serde_json::V
         resp["completed_at"] = serde_json::json!(detail.completed_at.map(|t| t.timestamp()));
     }
 
-    if status == "failed" {
-        if let Some(ref err) = detail.error {
-            resp["error"] = serde_json::json!({
-                "type": "server_error",
-                "message": err,
-            });
-        }
+    if status == "failed"
+        && let Some(ref err) = detail.error
+    {
+        resp["error"] = serde_json::json!({
+            "type": "server_error",
+            "message": err,
+        });
     }
 
     resp

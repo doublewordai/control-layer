@@ -2467,7 +2467,9 @@ impl Application {
         });
 
         // Create the response store (backed by request_manager for reads via Storage trait)
-        let response_store = Arc::new(crate::responses::store::FusilladeResponseStore::new(bg_services.request_manager.clone()));
+        let response_store = Arc::new(crate::responses::store::FusilladeResponseStore::new(
+            bg_services.request_manager.clone(),
+        ));
 
         // Responses middleware state (enqueues create-response jobs via underway)
         let responses_middleware_state = crate::responses::middleware::ResponsesMiddlewareState {

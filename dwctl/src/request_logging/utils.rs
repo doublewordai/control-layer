@@ -138,8 +138,7 @@ pub(crate) fn parse_responses_non_streaming_response(body_str: &str) -> Result<A
     // serialized by onwards' ResponsesResponse which has a different schema
     // (e.g. required fields that async-openai marks optional, different
     // enum representations for service_tier, truncation, etc.).
-    let value: serde_json::Value = serde_json::from_str(body_str)
-        .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+    let value: serde_json::Value = serde_json::from_str(body_str).map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
 
     // Verify this looks like a Responses API object.
     if value.get("object").and_then(|v| v.as_str()) != Some("response") {
@@ -168,10 +167,16 @@ pub(crate) fn parse_responses_non_streaming_response(body_str: &str) -> Result<A
             output_tokens: u.get("output_tokens")?.as_u64()? as u32,
             total_tokens: u.get("total_tokens")?.as_u64()? as u32,
             input_tokens_details: InputTokenDetails {
-                cached_tokens: u.pointer("/input_tokens_details/cached_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+                cached_tokens: u
+                    .pointer("/input_tokens_details/cached_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as u32,
             },
             output_tokens_details: OutputTokenDetails {
-                reasoning_tokens: u.pointer("/output_tokens_details/reasoning_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+                reasoning_tokens: u
+                    .pointer("/output_tokens_details/reasoning_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as u32,
             },
         })
     });
@@ -537,8 +542,8 @@ mod tests {
 
     #[test]
     fn test_decompress_response_gzip() {
-        use flate2::write::GzEncoder;
         use flate2::Compression;
+        use flate2::write::GzEncoder;
         use std::io::Write as _;
 
         let original = b"hello world";

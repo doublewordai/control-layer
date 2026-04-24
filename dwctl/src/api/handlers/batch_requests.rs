@@ -238,7 +238,12 @@ pub async fn get_batch_request<P: PoolProvider>(
     // Check ownership — fetch-then-check pattern matches get_batch handler.
     // The response is discarded on failure (returns 404, no data leakage).
     let can_read_all = can_read_all_resources(&current_user, Resource::Batches);
-    if !can_read_all && !detail.batch_created_by.as_deref().is_some_and(|cb| is_batch_owner(&current_user, cb)) {
+    if !can_read_all
+        && !detail
+            .batch_created_by
+            .as_deref()
+            .is_some_and(|cb| is_batch_owner(&current_user, cb))
+    {
         return Err(Error::NotFound {
             resource: "BatchRequest".to_string(),
             id: request_id.to_string(),

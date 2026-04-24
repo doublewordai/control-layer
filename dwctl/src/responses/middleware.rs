@@ -119,17 +119,16 @@ pub async fn responses_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     };
 
     // Validate model access for flex requests (realtime is validated by onwards).
-    if matches!(service_tier, ServiceTier::Flex) {
-        if let Some(key) = api_key.as_deref() {
-            if let Err(msg) = crate::error_enrichment::validate_api_key_model_access(
-                state.dwctl_pool.clone(), key, model,
-            ).await {
-                return Response::builder()
-                    .status(StatusCode::FORBIDDEN)
-                    .body(Body::from(serde_json::json!({"error": {"message": msg, "type": "invalid_request_error"}}).to_string()))
-                    .unwrap();
-            }
-        }
+    if matches!(service_tier, ServiceTier::Flex)
+        && let Some(key) = api_key.as_deref()
+        && let Err(msg) = crate::error_enrichment::validate_api_key_model_access(state.dwctl_pool.clone(), key, model).await
+    {
+        return Response::builder()
+            .status(StatusCode::FORBIDDEN)
+            .body(Body::from(
+                serde_json::json!({"error": {"message": msg, "type": "invalid_request_error"}}).to_string(),
+            ))
+            .unwrap();
     }
 
     // Resolve created_by upfront for background/flex (row must exist before
@@ -160,22 +159,8 @@ pub async fn responses_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     };
 
     match service_tier {
-        ServiceTier::Realtime => {
-            handle_realtime(
-                &state,
-                batch_input,
-                &resp_id,
-                model,
-                background,
-                parts,
-                body_bytes,
-                next,
-            )
-            .await
-        }
-        ServiceTier::Flex => {
-            handle_flex(&state, batch_input, &resp_id, model, background).await
-        }
+        ServiceTier::Realtime => handle_realtime(&state, batch_input, &resp_id, model, background, parts, body_bytes, next).await,
+        ServiceTier::Flex => handle_flex(&state, batch_input, &resp_id, model, background).await,
     }
 }
 
@@ -251,10 +236,8 @@ async fn handle_realtime<P: PoolProvider + Clone + Send + Sync + 'static>(
     // Strip the "resp_" prefix — onwards re-adds it.
     let raw_id = resp_id.strip_prefix("resp_").unwrap_or(resp_id);
     let mut req = Request::from_parts(parts, Body::from(body_bytes));
-    req.headers_mut().insert(
-        "x-fusillade-request-id",
-        raw_id.parse().expect("response_id is valid header value"),
-    );
+    req.headers_mut()
+        .insert("x-fusillade-request-id", raw_id.parse().expect("response_id is valid header value"));
     req.headers_mut().insert(
         ONWARDS_RESPONSE_ID_HEADER,
         resp_id.parse().expect("response_id is valid header value"),
@@ -289,15 +272,13 @@ async fn handle_realtime<P: PoolProvider + Clone + Send + Sync + 'static>(
 /// With `background=true`, returns 202 immediately.
 async fn handle_flex<P: PoolProvider + Clone + Send + Sync + 'static>(
     state: &ResponsesMiddlewareState<P>,
-    mut batch_input: fusillade::CreateSingleRequestBatchInput,
+    batch_input: fusillade::CreateSingleRequestBatchInput,
     resp_id: &str,
     model: &str,
     background: bool,
 ) -> Response {
     // Flex needs the batch created synchronously (daemon must find the row).
-    if let Err(e) =
-        fusillade::Storage::create_single_request_batch(&*state.request_manager, batch_input).await
-    {
+    if let Err(e) = fusillade::Storage::create_single_request_batch(&*state.request_manager, batch_input).await {
         tracing::error!(error = %e, "Failed to create flex batch in fusillade");
         return Response::builder()
             .status(StatusCode::INTERNAL_SERVER_ERROR)

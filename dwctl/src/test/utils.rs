@@ -64,9 +64,7 @@ pub async fn create_test_app_state_with_config(pool: PgPool, config: crate::conf
         .expect("Failed to create task runner"),
     );
 
-    let response_store = std::sync::Arc::new(crate::responses::store::FusilladeResponseStore::new(
-        request_manager.clone(),
-    ));
+    let response_store = std::sync::Arc::new(crate::responses::store::FusilladeResponseStore::new(request_manager.clone()));
     crate::AppState::builder()
         .db(test_pools)
         .config(shared_config)
@@ -132,9 +130,7 @@ pub async fn create_test_app_state_with_fusillade(pool: PgPool, config: crate::c
         .expect("Failed to create task runner"),
     );
 
-    let response_store = std::sync::Arc::new(crate::responses::store::FusilladeResponseStore::new(
-        request_manager.clone(),
-    ));
+    let response_store = std::sync::Arc::new(crate::responses::store::FusilladeResponseStore::new(request_manager.clone()));
     crate::AppState::builder()
         .db(test_pools)
         .config(shared_config)
