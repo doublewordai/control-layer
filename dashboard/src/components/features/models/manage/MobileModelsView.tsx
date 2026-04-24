@@ -9,13 +9,15 @@ import {
 import type { Model, ProviderDisplayConfig } from "../../../../api/control-layer/types";
 import { CatalogIcon } from "../catalog/CatalogIcon";
 
-const CAPABILITY_ICONS: Record<string, React.FC<{ className?: string }>> = {
-  text: MessageSquare,
-  vision: Eye,
-  reasoning: Brain,
-  embeddings: Layers,
-  enhanced_structured_generation: Braces,
+const CAPABILITY_CONFIG: Record<string, { icon: React.FC<{ className?: string }>; label: string }> = {
+  text: { icon: MessageSquare, label: "Text" },
+  vision: { icon: Eye, label: "Vision" },
+  reasoning: { icon: Brain, label: "Reasoning" },
+  embeddings: { icon: Layers, label: "Embeddings" },
+  enhanced_structured_generation: { icon: Braces, label: "Structured" },
 };
+
+const FILTER_KEYS = Object.keys(CAPABILITY_CONFIG);
 
 interface SwimlaneCardProps {
   model: Model;
@@ -37,8 +39,9 @@ const SwimlaneCard: React.FC<SwimlaneCardProps> = ({
       {model.capabilities && model.capabilities.length > 0 && (
         <div className="flex gap-1.5 mt-1.5">
           {model.capabilities.map((cap) => {
-            const Icon = CAPABILITY_ICONS[cap];
-            if (!Icon) return null;
+            const config = CAPABILITY_CONFIG[cap];
+            if (!config) return null;
+            const Icon = config.icon;
             return <Icon key={cap} className="h-3 w-3 text-gray-400" />;
           })}
         </div>
@@ -94,12 +97,6 @@ export const MobileModelsView: React.FC<MobileModelsViewProps> = ({
 }) => {
   const [capFilter, setCapFilter] = useState<string>("all");
 
-  const capabilities = useMemo(() => {
-    const caps = new Set<string>();
-    models.forEach((m) => m.capabilities?.forEach((c) => caps.add(c)));
-    return Array.from(caps).sort();
-  }, [models]);
-
   const filtered = useMemo(() => {
     if (capFilter === "all") return models;
     return models.filter((m) => m.capabilities?.includes(capFilter));
@@ -142,7 +139,7 @@ export const MobileModelsView: React.FC<MobileModelsViewProps> = ({
         >
           All
         </button>
-        {capabilities.map((cap) => (
+        {FILTER_KEYS.map((cap) => (
           <button
             key={cap}
             className={`shrink-0 px-3.5 py-1.5 rounded-full text-xs font-medium transition-colors ${
@@ -152,7 +149,7 @@ export const MobileModelsView: React.FC<MobileModelsViewProps> = ({
             }`}
             onClick={() => setCapFilter(cap)}
           >
-            {cap.charAt(0).toUpperCase() + cap.slice(1)}
+            {CAPABILITY_CONFIG[cap].label}
           </button>
         ))}
       </div>
