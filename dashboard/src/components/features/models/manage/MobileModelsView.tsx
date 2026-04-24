@@ -40,6 +40,7 @@ const SwimlaneCard: React.FC<SwimlaneCardProps> = ({
   onTap,
 }) => (
   <button
+    aria-label={`View ${model.display_name || model.alias}`}
     className="shrink-0 w-[130px] bg-white border border-gray-200 rounded-xl overflow-hidden text-left active:scale-[0.97] transition-transform"
     onClick={onTap}
   >
@@ -73,7 +74,7 @@ const Swimlane: React.FC<SwimlaneProps> = ({
         {title}
       </h3>
     </div>
-    <ul role="list" className="flex gap-3 overflow-x-auto px-4 pb-1 swimlane-scroll list-none m-0 p-0">
+    <ul role="list" className="flex gap-3 overflow-x-auto px-4 pb-1 swimlane-scroll list-none m-0">
       {models.map((model) => (
         <li key={model.id} role="listitem">
           <SwimlaneCard
@@ -106,10 +107,11 @@ export const MobileModelsView: React.FC<MobileModelsViewProps> = ({
     return models.filter((m) => matchesFilter(m, filter.key, filter.type));
   }, [models, activeFilter]);
 
-  const newModels = useMemo(
-    () => sortByNewest(filtered).slice(0, 3),
-    [filtered],
-  );
+  const newModels = useMemo(() => {
+    const withDate = filtered.filter((m) => m.metadata?.released_at);
+    if (withDate.length === 0) return [];
+    return sortByNewest(withDate).slice(0, 3);
+  }, [filtered]);
 
   const providerGroups = useMemo(() => {
     const groups: Record<string, { displayName: string; models: Model[] }> = {};
@@ -125,7 +127,6 @@ export const MobileModelsView: React.FC<MobileModelsViewProps> = ({
       }
       groups[key].models.push(m);
     });
-    // Sort lanes by model count desc, then sort models within each lane newest-first
     return Object.entries(groups)
       .sort((a, b) => b[1].models.length - a[1].models.length)
       .map(([key, { displayName, models: laneModels }]) => ({

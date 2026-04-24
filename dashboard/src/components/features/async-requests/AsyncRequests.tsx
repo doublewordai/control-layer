@@ -514,17 +514,7 @@ export function AsyncRequests() {
             }, { replace: true });
           }
         }}
-        onSuccess={() => {
-          setCreateModalOpen(false);
-          if (createParam) {
-            setSearchParams((prev) => {
-              const next = new URLSearchParams(prev);
-              next.delete("create");
-              next.delete("model");
-              return next;
-            }, { replace: true });
-          }
-        }}
+        onSuccess={() => setCreateModalOpen(false)}
         defaultModel={modelParam ?? undefined}
       />
 
