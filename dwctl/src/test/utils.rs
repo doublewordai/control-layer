@@ -204,8 +204,15 @@ pub fn create_test_config() -> crate::config::Config {
             // Cap the underway pool in tests — the production default of 100
             // per-instance multiplies badly under `#[sqlx::test]` parallelism
             // and exhausts postgres's max_connections.
+            //
+            // Each running underway worker holds two PgListener connections
+            // (shutdown + task-change), and `TaskRunner::start` always spawns
+            // at least one create-batch worker (see `.max(1)` in tasks.rs).
+            // setup_ai_test enables response_workers=1 which adds another
+            // 2 workers = 6 long-lived listeners. 10 gives transient `run_every`
+            // / enqueue / dequeue acquires room to breathe.
             underway_pool: PoolSettings {
-                max_connections: 4,
+                max_connections: 10,
                 min_connections: 0,
                 ..Default::default()
             },
