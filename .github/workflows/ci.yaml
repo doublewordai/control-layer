@@ -137,17 +137,6 @@ jobs:
           cargo install sqlx-cli --no-default-features --features native-tls,postgres --locked
           cargo install cargo-llvm-cov --locked
 
-      # Raise max_connections so parallel sqlx::test instances don't exhaust the default 100.
-      - name: Tune postgres for parallel tests
-        run: |
-          CID=$(docker ps -q --filter ancestor=postgres:latest)
-          docker exec "$CID" psql -U postgres -c "ALTER SYSTEM SET max_connections = 300"
-          docker restart "$CID"
-          for _ in $(seq 1 30); do
-            docker exec "$CID" pg_isready -U postgres && break
-            sleep 1
-          done
-
       - name: Run backend CI pipeline
         id: ci-step
         env:

@@ -201,7 +201,14 @@ pub fn create_test_config() -> crate::config::Config {
                 },
                 replica_pool: None,
             },
-            underway_pool: crate::config::default_underway_pool(),
+            // Cap the underway pool in tests — the production default of 100
+            // per-instance multiplies badly under `#[sqlx::test]` parallelism
+            // and exhausts postgres's max_connections.
+            underway_pool: PoolSettings {
+                max_connections: 4,
+                min_connections: 0,
+                ..Default::default()
+            },
         },
         slow_statement_threshold_ms: 1000,
         host: "127.0.0.1".to_string(),
