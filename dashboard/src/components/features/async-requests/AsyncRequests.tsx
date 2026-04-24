@@ -163,7 +163,7 @@ function createColumns(
   },
   {
     accessorKey: "service_tier",
-    header: "Tier",
+    header: "Service Tier",
     cell: ({ row }) => {
       const tier = row.getValue("service_tier") as string | null;
       if (!tier) return <span className="text-sm text-doubleword-neutral-600">-</span>;
@@ -278,6 +278,7 @@ export function AsyncRequests() {
     AsyncRequestStatus | "all"
   >("all");
   const [modelFilter, setModelFilter] = useState<string[]>([]);
+  const [tierFilter, setTierFilter] = useState<string[]>(["flex", "priority"]);
   const [sortActiveFirst, setSortActiveFirst] = useState(true);
   const [dateRange, setDateRange] = useState<
     { from: Date; to: Date } | undefined
@@ -295,6 +296,7 @@ export function AsyncRequests() {
   useEffect(() => {
     setStatusFilter("all");
     setModelFilter([]);
+    setTierFilter(["flex", "priority"]);
     setDateRange(undefined);
   }, [activeOrganizationId]);
 
@@ -304,7 +306,7 @@ export function AsyncRequests() {
   const columns = createColumns(showUserColumn, modelDisplayNames);
 
   const { data, isLoading } = useAsyncRequests({
-    require_service_tier: true,
+    service_tiers: tierFilter.length > 0 ? tierFilter.join(",") : undefined,
     active_first: sortActiveFirst,
     status: statusFilter !== "all" ? statusFilter : undefined,
     model: modelFilter.length > 0 ? modelFilter.join(",") : undefined,
@@ -412,6 +414,49 @@ export function AsyncRequests() {
                 <SelectItem value="canceled">Cancelled</SelectItem>
               </SelectContent>
             </Select>
+            <Popover>
+              <PopoverTrigger asChild>
+                <Button
+                  variant="outline"
+                  className="h-9 justify-between font-normal"
+                >
+                  <div className="flex items-center gap-1.5 truncate">
+                    <Filter className="w-3.5 h-3.5 shrink-0 text-gray-500" />
+                    <span className="truncate">
+                      {tierFilter.length === 2
+                        ? "All tiers"
+                        : tierFilter.length === 1
+                          ? tierFilter[0].charAt(0).toUpperCase() + tierFilter[0].slice(1)
+                          : "No tiers"}
+                    </span>
+                  </div>
+                  <ChevronsUpDown className="ml-1 h-3.5 w-3.5 shrink-0 opacity-50" />
+                </Button>
+              </PopoverTrigger>
+              <PopoverContent className="w-[160px] p-2" align="start">
+                {(["flex", "priority"] as const).map((tier) => (
+                  <label
+                    key={tier}
+                    className="flex items-center gap-2 px-2 py-1.5 text-sm cursor-pointer rounded hover:bg-gray-50"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={tierFilter.includes(tier)}
+                      onChange={() => {
+                        setTierFilter((prev) =>
+                          prev.includes(tier)
+                            ? prev.filter((t) => t !== tier)
+                            : [...prev, tier],
+                        );
+                        pagination.handleReset();
+                      }}
+                      className="rounded border-gray-300"
+                    />
+                    {tier === "flex" ? "Flex" : "Realtime"}
+                  </label>
+                ))}
+              </PopoverContent>
+            </Popover>
             <Popover open={modelPopoverOpen} onOpenChange={setModelPopoverOpen}>
               <PopoverTrigger asChild>
                 <Button
