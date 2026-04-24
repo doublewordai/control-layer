@@ -96,7 +96,7 @@ describe("AsyncRequests", () => {
       wrapper: createWrapper(),
     });
     expect(
-      within(container).getByRole("heading", { level: 1, name: /async/i }),
+      within(container).getByRole("heading", { level: 1, name: /responses/i }),
     ).toBeInTheDocument();
   });
 
