@@ -75,6 +75,94 @@ pub async fn fail_response<P: PoolProvider + Clone>(
     Ok(())
 }
 
+/// Returns true if a fusillade request with this id already exists.
+///
+/// Used by `create-response` to skip work when `complete-response` has already
+/// raced ahead and inserted the row itself.
+pub async fn request_exists<P: PoolProvider + Clone>(
+    request_manager: &PostgresRequestManager<P, ReqwestHttpClient>,
+    request_id: Uuid,
+) -> Result<bool, StoreError> {
+    match request_manager.get_request_detail(RequestId(request_id)).await {
+        Ok(_) => Ok(true),
+        Err(fusillade::FusilladeError::RequestNotFound(_)) => Ok(false),
+        Err(e) => Err(StoreError::StorageError(format!("Failed to check request existence: {e}"))),
+    }
+}
+
+/// Context required to create a fusillade single-request batch.
+///
+/// Carried by `complete-response` so it can create-then-complete when it
+/// races ahead of `create-response`.
+pub struct CreateContext<'a> {
+    pub request_id: Uuid,
+    pub request_body: &'a str,
+    pub model: &'a str,
+    pub endpoint: &'a str,
+    pub base_url: &'a str,
+    pub api_key: Option<&'a str>,
+}
+
+/// Mark a response as completed, creating the row first if it doesn't exist.
+///
+/// The two-job lifecycle (create-response, complete-response) can race —
+/// they're enqueued within ~50ms of each other and run on independent
+/// underway queues. This helper tolerates either ordering: if the UPDATE
+/// finds nothing, we synthesize the row with the supplied context and
+/// retry the UPDATE.
+pub async fn complete_response_idempotent<P: PoolProvider + Clone>(
+    request_manager: &PostgresRequestManager<P, ReqwestHttpClient>,
+    dwctl_pool: &sqlx::PgPool,
+    response_id: &str,
+    response_body: &str,
+    status_code: u16,
+    create_ctx: CreateContext<'_>,
+) -> Result<(), StoreError> {
+    let id = parse_response_id(response_id)?;
+
+    match request_manager.complete_request(RequestId(id), response_body, status_code).await {
+        Ok(()) => Ok(()),
+        Err(fusillade::FusilladeError::RequestNotFound(_)) => {
+            // create-response hasn't run yet (or failed). Synthesize the row.
+            // create-response may also be racing us — if it wins between our
+            // failed UPDATE and our INSERT, the INSERT will hit a PK conflict.
+            // Treat that as "create-response got there first" and just retry
+            // the UPDATE.
+            let created_by = lookup_created_by(dwctl_pool, create_ctx.api_key).await;
+            let batch_input = fusillade::CreateSingleRequestBatchInput {
+                request_id: create_ctx.request_id,
+                body: create_ctx.request_body.to_string(),
+                model: create_ctx.model.to_string(),
+                base_url: create_ctx.base_url.to_string(),
+                endpoint: create_ctx.endpoint.to_string(),
+                completion_window: "0s".to_string(),
+                initial_state: "processing".to_string(),
+                api_key: create_ctx.api_key.map(String::from),
+                created_by,
+            };
+            if let Err(e) = request_manager.create_single_request_batch(batch_input).await {
+                // Don't fail loudly here — the next UPDATE attempt is the
+                // ground truth. If the row exists (we lost the race to create),
+                // UPDATE will succeed. If it doesn't, UPDATE will fail with
+                // RequestNotFound and we'll surface that.
+                tracing::debug!(
+                    response_id = %response_id,
+                    error = %e,
+                    "Synthetic create from complete-response failed (likely create-response won the race) — proceeding to UPDATE"
+                );
+            }
+
+            request_manager
+                .complete_request(RequestId(id), response_body, status_code)
+                .await
+                .map_err(|e| StoreError::StorageError(format!("Failed to complete after create: {e}")))?;
+
+            Ok(())
+        }
+        Err(e) => Err(StoreError::StorageError(format!("Failed to complete request: {e}"))),
+    }
+}
+
 /// Poll a fusillade request until it reaches a terminal state (completed/failed/canceled).
 pub async fn poll_until_complete<P: PoolProvider + Clone>(
     request_manager: &PostgresRequestManager<P, ReqwestHttpClient>,

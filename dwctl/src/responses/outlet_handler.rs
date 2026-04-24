@@ -9,6 +9,7 @@
 use outlet::{RequestData, RequestHandler, ResponseData};
 use std::sync::Arc;
 use underway::Job;
+use uuid::Uuid;
 
 use super::jobs::CompleteResponseInput;
 use super::store::ONWARDS_RESPONSE_ID_HEADER;
@@ -27,12 +28,23 @@ impl FusilladeOutletHandler {
 
     /// Extract the onwards response ID from request headers, if present.
     fn extract_response_id(request: &RequestData) -> Option<String> {
-        request
-            .headers
-            .get(ONWARDS_RESPONSE_ID_HEADER)
-            .and_then(|values| values.first())
-            .and_then(|bytes| std::str::from_utf8(bytes).ok())
-            .map(|s| s.to_string())
+        Self::header_str(request, ONWARDS_RESPONSE_ID_HEADER).map(String::from)
+    }
+
+    /// Extract the raw fusillade request UUID from `x-fusillade-request-id`.
+    fn extract_request_id(request: &RequestData) -> Option<Uuid> {
+        Self::header_str(request, "x-fusillade-request-id").and_then(|s| Uuid::parse_str(s).ok())
+    }
+
+    /// Extract the bearer token from the Authorization header.
+    fn extract_api_key(request: &RequestData) -> Option<String> {
+        Self::header_str(request, "authorization")
+            .and_then(|s| s.strip_prefix("Bearer "))
+            .map(String::from)
+    }
+
+    fn header_str<'a>(request: &'a RequestData, name: &str) -> Option<&'a str> {
+        request.headers.get(name).and_then(|values| values.first()).and_then(|bytes| std::str::from_utf8(bytes).ok())
     }
 }
 
@@ -57,6 +69,17 @@ impl RequestHandler for FusilladeOutletHandler {
                 None => return,
             };
 
+            // We also need the raw request UUID for the create-if-missing path.
+            // The responses middleware always sets both headers together; if it's
+            // missing here something upstream is broken — bail out.
+            let request_id = match Self::extract_request_id(&request_data) {
+                Some(id) => id,
+                None => {
+                    tracing::warn!(response_id = %response_id, "Missing x-fusillade-request-id header on response — skipping enqueue");
+                    return;
+                }
+            };
+
             let status_code = response_data.status.as_u16();
             let response_body = response_data
                 .body
@@ -65,11 +88,31 @@ impl RequestHandler for FusilladeOutletHandler {
                 .unwrap_or("")
                 .to_string();
 
+            // Context used by complete-response if it has to synthesize the row
+            // (i.e., raced ahead of create-response). The middleware sets these
+            // headers explicitly so we don't have to parse the body or guess
+            // path nesting.
+            let request_body = request_data
+                .body
+                .as_ref()
+                .and_then(|b| std::str::from_utf8(b).ok())
+                .unwrap_or("")
+                .to_string();
+            let model = Self::header_str(&request_data, "x-onwards-model").unwrap_or("unknown").to_string();
+            let endpoint = Self::header_str(&request_data, "x-onwards-endpoint").unwrap_or("").to_string();
+            let api_key = Self::extract_api_key(&request_data);
+
             if let Err(e) = job
                 .enqueue(&CompleteResponseInput {
                     response_id: response_id.clone(),
                     status_code,
                     response_body,
+                    request_id,
+                    request_body,
+                    model,
+                    endpoint,
+                    base_url: String::new(),
+                    api_key,
                 })
                 .await
             {
@@ -131,5 +174,51 @@ mod tests {
         let request = make_request_data(headers);
         let id = FusilladeOutletHandler::extract_response_id(&request);
         assert_eq!(id, Some("resp_12345678-1234-1234-1234-123456789abc".to_string()));
+    }
+
+    #[test]
+    fn test_extract_request_id_present() {
+        let mut headers = HashMap::new();
+        let uuid_str = "12345678-1234-1234-1234-123456789abc";
+        headers.insert("x-fusillade-request-id".to_string(), vec![Bytes::from(uuid_str)]);
+        let request = make_request_data(headers);
+        let id = FusilladeOutletHandler::extract_request_id(&request);
+        assert_eq!(id, Some(Uuid::parse_str(uuid_str).unwrap()));
+    }
+
+    #[test]
+    fn test_extract_request_id_absent() {
+        let request = make_request_data(HashMap::new());
+        assert!(FusilladeOutletHandler::extract_request_id(&request).is_none());
+    }
+
+    #[test]
+    fn test_extract_request_id_invalid_uuid() {
+        let mut headers = HashMap::new();
+        headers.insert("x-fusillade-request-id".to_string(), vec![Bytes::from("not-a-uuid")]);
+        let request = make_request_data(headers);
+        assert!(FusilladeOutletHandler::extract_request_id(&request).is_none());
+    }
+
+    #[test]
+    fn test_extract_api_key_strips_bearer_prefix() {
+        let mut headers = HashMap::new();
+        headers.insert("authorization".to_string(), vec![Bytes::from("Bearer sk-test-123")]);
+        let request = make_request_data(headers);
+        assert_eq!(FusilladeOutletHandler::extract_api_key(&request), Some("sk-test-123".to_string()));
+    }
+
+    #[test]
+    fn test_extract_api_key_without_bearer_prefix_is_none() {
+        let mut headers = HashMap::new();
+        headers.insert("authorization".to_string(), vec![Bytes::from("sk-test-123")]);
+        let request = make_request_data(headers);
+        assert!(FusilladeOutletHandler::extract_api_key(&request).is_none());
+    }
+
+    #[test]
+    fn test_extract_api_key_absent() {
+        let request = make_request_data(HashMap::new());
+        assert!(FusilladeOutletHandler::extract_api_key(&request).is_none());
     }
 }

@@ -67,6 +67,27 @@ pub async fn build_create_response_job<P: sqlx_pool_router::PoolProvider + Clone
                 return To::done();
             }
 
+            // Idempotency: complete-response can race ahead and create the row
+            // itself. If the request already exists, we have nothing to do.
+            match response_store::request_exists(&cx.state.request_manager, input.request_id).await {
+                Ok(true) => {
+                    tracing::debug!(
+                        request_id = %input.request_id,
+                        "Skipping response creation — row already exists (complete-response won the race)"
+                    );
+                    return To::done();
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::error!(
+                        request_id = %input.request_id,
+                        error = %e,
+                        "Failed to check for existing request before create"
+                    );
+                    return Err(TaskError::Retryable(e.to_string()));
+                }
+            }
+
             // Resolve attribution from the API key.
             let created_by = response_store::lookup_created_by(&cx.state.dwctl_pool, input.api_key.as_deref()).await;
 
@@ -115,7 +136,10 @@ pub async fn build_create_response_job<P: sqlx_pool_router::PoolProvider + Clone
 
 /// Input for the complete-response background job.
 ///
-/// Enqueued by the FusilladeOutletHandler after outlet captures the response body.
+/// Enqueued by the FusilladeOutletHandler after outlet captures the response
+/// body. Carries enough context to create the fusillade row from scratch in
+/// case create-response hasn't run yet — see
+/// [`super::store::complete_response_idempotent`].
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CompleteResponseInput {
     /// Response ID (e.g., `resp_<uuid>`)
@@ -124,6 +148,23 @@ pub struct CompleteResponseInput {
     pub status_code: u16,
     /// Response body as string (may be large for non-streaming responses)
     pub response_body: String,
+
+    // Fields below are used only when create-response hasn't run yet and
+    // we need to synthesize the row ourselves.
+
+    /// Pre-generated request UUID (matches `response_id` minus prefix).
+    pub request_id: Uuid,
+    /// Original request body (JSON string).
+    pub request_body: String,
+    /// Model name from the request.
+    pub model: String,
+    /// Request endpoint (e.g., `/v1/responses`, `/v1/chat/completions`).
+    pub endpoint: String,
+    /// Loopback base URL (only used by the daemon for non-realtime; pass
+    /// empty string when not relevant).
+    pub base_url: String,
+    /// Bearer token from the Authorization header — used for attribution.
+    pub api_key: Option<String>,
 }
 
 /// Build the underway job for completing response records.
@@ -133,23 +174,27 @@ pub async fn build_complete_response_job<P: sqlx_pool_router::PoolProvider + Clo
 ) -> anyhow::Result<underway::Job<CompleteResponseInput, crate::tasks::TaskState<P>>> {
     use underway::Job;
     use underway::job::To;
-    use underway::task::{Error as TaskError, RetryPolicy};
-
-    // Tight retries to ride out the create-response vs complete-response race.
-    // Both jobs are enqueued within ~50ms of each other; if complete-response
-    // wins, the fusillade row isn't there yet and we need to retry quickly.
-    // Default is 5 attempts at 1s/2s/4s/8s — way too slow for realtime flows.
-    let retry_policy = RetryPolicy::builder().max_attempts(10).initial_interval_ms(100).build();
+    use underway::task::Error as TaskError;
 
     Job::<CompleteResponseInput, _>::builder()
         .state(state)
         .step(|cx, input: CompleteResponseInput| async move {
             if (200..300).contains(&input.status_code) {
-                if let Err(e) = response_store::complete_response(
+                let create_ctx = response_store::CreateContext {
+                    request_id: input.request_id,
+                    request_body: &input.request_body,
+                    model: &input.model,
+                    endpoint: &input.endpoint,
+                    base_url: &input.base_url,
+                    api_key: input.api_key.as_deref(),
+                };
+                if let Err(e) = response_store::complete_response_idempotent(
                     &cx.state.request_manager,
+                    &cx.state.dwctl_pool,
                     &input.response_id,
                     &input.response_body,
                     input.status_code,
+                    create_ctx,
                 )
                 .await
                 {
@@ -187,7 +232,6 @@ pub async fn build_complete_response_job<P: sqlx_pool_router::PoolProvider + Clo
 
             To::done()
         })
-        .retry_policy(retry_policy)
         .name("complete-response")
         .pool(pool)
         .build()

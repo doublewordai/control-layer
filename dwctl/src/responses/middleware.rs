@@ -228,6 +228,11 @@ async fn handle_realtime<P: PoolProvider + Clone + Send + Sync + 'static>(
 ) -> Response {
     let rm = state.request_manager.clone();
 
+    // Capture endpoint before consuming batch_input — needed downstream as a
+    // header so the outlet handler can synthesize the row if create-response
+    // hasn't run yet.
+    let endpoint_for_header = batch_input.endpoint.clone();
+
     if background {
         // Background mode: create batch synchronously so the row exists
         // before we return the 202 (client will poll immediately).
@@ -263,6 +268,14 @@ async fn handle_realtime<P: PoolProvider + Clone + Send + Sync + 'static>(
         ONWARDS_RESPONSE_ID_HEADER,
         resp_id.parse().expect("response_id is valid header value"),
     );
+    // The outlet handler reads these to synthesize the fusillade row if
+    // create-response hasn't run yet (race).
+    if let Ok(value) = endpoint_for_header.parse() {
+        req.headers_mut().insert("x-onwards-endpoint", value);
+    }
+    if let Ok(value) = model.parse() {
+        req.headers_mut().insert("x-onwards-model", value);
+    }
 
     if background {
         let response_body = serde_json::json!({
