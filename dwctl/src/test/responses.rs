@@ -20,6 +20,7 @@ async fn setup_ai_test(
     let mut config = create_test_config();
     config.onwards.strict_mode = strict_mode;
     config.background_services.onwards_sync.enabled = true;
+    config.background_services.task_workers.response_workers = 1;
 
     let app = crate::Application::new_with_pool(config, Some(pool.clone()), None)
         .await
