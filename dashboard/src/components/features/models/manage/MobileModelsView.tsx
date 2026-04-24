@@ -18,17 +18,6 @@ const SwimlaneCard: React.FC<SwimlaneCardProps> = ({
     onClick={onTap}
   >
     <div className="px-3 pt-3 pb-3">
-      <div className="flex items-center justify-end mb-1.5">
-        <div
-          className={`h-1.5 w-1.5 rounded-full ${
-            model.status?.last_success === true
-              ? "bg-green-500"
-              : model.status?.last_success === false
-                ? "bg-red-500"
-                : "bg-gray-300"
-          }`}
-        />
-      </div>
       <div className="text-xs font-semibold text-gray-900 truncate">
         {model.alias}
       </div>
