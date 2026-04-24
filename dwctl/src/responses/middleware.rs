@@ -26,6 +26,7 @@ use axum::{
 use fusillade::{PostgresRequestManager, ReqwestHttpClient};
 use sqlx_pool_router::PoolProvider;
 
+use super::jobs::CreateResponseInput;
 use super::store::{self as response_store, ONWARDS_RESPONSE_ID_HEADER, OnwardsDaemonId};
 
 /// State for the responses middleware.
@@ -39,6 +40,9 @@ pub struct ResponsesMiddlewareState<P: PoolProvider + Clone = sqlx_pool_router::
     pub loopback_base_url: String,
     /// dwctl database pool for model access validation.
     pub dwctl_pool: sqlx::PgPool,
+    /// Underway job used to create the realtime tracking batch asynchronously
+    /// on the blocking (non-background) path.
+    pub create_response_job: Arc<underway::Job<CreateResponseInput, crate::tasks::TaskState<P>>>,
 }
 
 /// Middleware that routes inference requests based on service_tier and background.
@@ -232,17 +236,20 @@ async fn handle_realtime<P: PoolProvider + Clone + Send + Sync + 'static>(
             tracing::warn!(error = %e, "Failed to create realtime tracking batch");
         }
     } else {
-        // Blocking mode: fire-and-forget — resolve created_by and create
-        // the batch in the background to avoid any latency on the proxy path.
-        let dwctl_pool = state.dwctl_pool.clone();
-        let api_key = batch_input.api_key.clone();
-        let mut input = batch_input;
-        tokio::spawn(async move {
-            input.created_by = response_store::lookup_created_by(&dwctl_pool, api_key.as_deref()).await;
-            if let Err(e) = fusillade::Storage::create_single_request_batch(&*rm, input).await {
-                tracing::warn!(error = %e, "Failed to create realtime tracking batch");
-            }
-        });
+        // Blocking mode: enqueue the create-response underway job so a crash
+        // between proxying and the DB insert still leaves a retryable record.
+        // The job resolves attribution and calls create_single_request_batch.
+        let job_input = CreateResponseInput {
+            request_id: batch_input.request_id,
+            body: batch_input.body,
+            model: batch_input.model,
+            base_url: batch_input.base_url,
+            endpoint: batch_input.endpoint,
+            api_key: batch_input.api_key,
+        };
+        if let Err(e) = state.create_response_job.enqueue(&job_input).await {
+            tracing::warn!(error = %e, "Failed to enqueue create-response job");
+        }
     }
 
     // Attach the response ID as x-fusillade-request-id so that onwards uses

@@ -7,9 +7,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use fusillade::{
-    BatchInput, CreateDaemonRequestInput, DaemonId, PostgresRequestManager, RequestId, RequestTemplateInput, ReqwestHttpClient, Storage,
-};
+use fusillade::{BatchInput, PostgresRequestManager, RequestId, RequestTemplateInput, ReqwestHttpClient, Storage};
 use onwards::{ResponseStore, StoreError};
 use sqlx_pool_router::PoolProvider;
 use uuid::Uuid;
@@ -42,37 +40,6 @@ impl<P: PoolProvider + Clone> FusilladeResponseStore<P> {
             Err(e) => Err(StoreError::StorageError(format!("Failed to fetch request: {e}"))),
         }
     }
-}
-
-/// Create a daemon-managed request in fusillade with a pre-generated response ID.
-///
-/// The request is created in "processing" state with batch_id=NULL since
-/// onwards is the daemon and is about to proxy it.
-pub async fn create_pending_with_id<P: PoolProvider + Clone>(
-    request_manager: &PostgresRequestManager<P, ReqwestHttpClient>,
-    response_id: &str,
-    request: &serde_json::Value,
-    model: &str,
-    endpoint: &str,
-    daemon_id: OnwardsDaemonId,
-) -> Result<(), StoreError> {
-    let id = parse_response_id(response_id)?;
-
-    request_manager
-        .create_daemon_request(CreateDaemonRequestInput {
-            id: Some(id),
-            body: request.to_string(),
-            model: model.to_string(),
-            endpoint: endpoint.to_string(),
-            method: "POST".to_string(),
-            path: endpoint.to_string(),
-            api_key: String::new(),
-            daemon_id: DaemonId(daemon_id.0),
-        })
-        .await
-        .map_err(|e| StoreError::StorageError(format!("Failed to create daemon request: {e}")))?;
-
-    Ok(())
 }
 
 /// Mark a response as completed with the response body.

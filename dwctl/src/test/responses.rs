@@ -175,16 +175,20 @@ async fn test_chat_completion_creates_retrievable_response(pool: PgPool) {
     let mut id = uuid::Uuid::nil();
     let mut final_state = String::new();
     while start.elapsed() < std::time::Duration::from_secs(5) {
-        let row = sqlx::query("SELECT id, state, model FROM fusillade.requests WHERE batch_id IS NULL ORDER BY created_at DESC LIMIT 1")
-            .fetch_optional(&pool)
-            .await
-            .unwrap();
+        let row = sqlx::query(
+            "SELECT id, state, model, batch_id FROM fusillade.requests WHERE model = 'gpt-4o' ORDER BY created_at DESC LIMIT 1",
+        )
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
 
         if let Some(row) = row {
             id = sqlx::Row::get(&row, "id");
             final_state = sqlx::Row::get::<String, _>(&row, "state");
-            let model: &str = sqlx::Row::get(&row, "model");
-            assert_eq!(model, "gpt-4o");
+            let batch_id: Option<uuid::Uuid> = sqlx::Row::get(&row, "batch_id");
+            // Realtime requests are now tracked via a single-request batch created
+            // by the create-response underway job — the row must have a batch_id.
+            assert!(batch_id.is_some(), "Realtime request should be tracked via a single-request batch");
             if final_state == "completed" {
                 break;
             }
@@ -302,7 +306,10 @@ async fn test_responses_api_creates_retrievable_response(pool: PgPool) {
     let mut final_state = String::new();
     while start.elapsed() < std::time::Duration::from_secs(5) {
         let row = sqlx::query(
-            "SELECT r.id, r.state FROM fusillade.requests r JOIN fusillade.request_templates t ON r.template_id = t.id WHERE r.batch_id IS NULL AND t.endpoint LIKE '%responses%' ORDER BY r.created_at DESC LIMIT 1"
+            "SELECT r.id, r.state, r.batch_id FROM fusillade.requests r \
+             JOIN fusillade.request_templates t ON r.template_id = t.id \
+             WHERE t.endpoint LIKE '%responses%' \
+             ORDER BY r.created_at DESC LIMIT 1",
         )
         .fetch_optional(&pool)
         .await
@@ -311,6 +318,8 @@ async fn test_responses_api_creates_retrievable_response(pool: PgPool) {
         if let Some(row) = row {
             id = sqlx::Row::get(&row, "id");
             final_state = sqlx::Row::get::<String, _>(&row, "state");
+            let batch_id: Option<uuid::Uuid> = sqlx::Row::get(&row, "batch_id");
+            assert!(batch_id.is_some(), "Realtime request should be tracked via a single-request batch");
             if final_state == "completed" {
                 break;
             }
@@ -360,7 +369,7 @@ async fn test_fusillade_header_skips_row_creation(pool: PgPool) {
     let (server, api_key, _bg) = setup_ai_test(pool.clone(), &mock_server, true).await;
 
     // Count existing rows
-    let before: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM fusillade.requests WHERE batch_id IS NULL")
+    let before: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM fusillade.requests")
         .fetch_one(&pool)
         .await
         .unwrap();
@@ -378,7 +387,7 @@ async fn test_fusillade_header_skips_row_creation(pool: PgPool) {
         .await;
 
     // Count rows after — should be the same (no new row created)
-    let after: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM fusillade.requests WHERE batch_id IS NULL")
+    let after: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM fusillade.requests")
         .fetch_one(&pool)
         .await
         .unwrap();
