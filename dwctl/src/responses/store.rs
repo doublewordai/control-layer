@@ -261,13 +261,21 @@ fn state_to_status(state: &str) -> &'static str {
 fn detail_to_response_object(detail: &fusillade::RequestDetail) -> serde_json::Value {
     let status = state_to_status(&detail.status);
 
+    // Derive background from the stored request body if available.
+    let background = detail
+        .body
+        .as_deref()
+        .and_then(|b| serde_json::from_str::<serde_json::Value>(b).ok())
+        .and_then(|v| v.get("background")?.as_bool())
+        .unwrap_or(false);
+
     let mut resp = serde_json::json!({
         "id": format!("resp_{}", detail.id),
         "object": "response",
         "created_at": detail.created_at.timestamp(),
         "status": status,
         "model": detail.model,
-        "background": true,
+        "background": background,
         "output": [],
     });
 

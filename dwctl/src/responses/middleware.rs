@@ -26,7 +26,6 @@ use axum::{
 use fusillade::{PostgresRequestManager, ReqwestHttpClient};
 use sqlx_pool_router::PoolProvider;
 
-use super::jobs::CreateResponseInput;
 use super::store::{self as response_store, ONWARDS_RESPONSE_ID_HEADER, OnwardsDaemonId};
 
 /// State for the responses middleware.
@@ -34,8 +33,7 @@ use super::store::{self as response_store, ONWARDS_RESPONSE_ID_HEADER, OnwardsDa
 pub struct ResponsesMiddlewareState<P: PoolProvider + Clone = sqlx_pool_router::DbPools> {
     pub request_manager: Arc<PostgresRequestManager<P, ReqwestHttpClient>>,
     pub daemon_id: OnwardsDaemonId,
-    pub create_response_job: Arc<underway::Job<CreateResponseInput, crate::tasks::TaskState>>,
-    /// Base URL for loopback requests (e.g., "http://0.0.0.0:3001/ai").
+    /// Base URL for loopback requests (e.g., "http://127.0.0.1:3001/ai").
     /// Flex batches are routed back through dwctl so onwards handles the
     /// responses→chat completions conversion.
     pub loopback_base_url: String,

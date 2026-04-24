@@ -10,12 +10,18 @@ Tests all 4 execution modes:
 Also tests default/auto tiers (should behave like realtime).
 """
 
+import os
+
 from openai import OpenAI
 from time import sleep
 import sys
 
+API_KEY = os.getenv("OPENAI_API_KEY")
+if not API_KEY:
+    raise RuntimeError("Set OPENAI_API_KEY in the environment before running this test script.")
+
 client = OpenAI(
-    api_key="sk-enA72TQohOeu-SKC8uNbN6x2XNV6RqIJrKCbV7asRVE",
+    api_key=API_KEY,
     base_url="http://127.0.0.1:3001/ai/v1",
 )
 

@@ -162,10 +162,17 @@ pub(crate) fn parse_responses_non_streaming_response(body_str: &str) -> Result<A
     // Extract usage if present.
     let usage = value.get("usage").and_then(|u| {
         use async_openai::types::responses::{InputTokenDetails, OutputTokenDetails, ResponseUsage};
+        let input_tokens = u.get("input_tokens")?.as_u64()? as u32;
+        let output_tokens = u.get("output_tokens")?.as_u64()? as u32;
+        let total_tokens = u
+            .get("total_tokens")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32)
+            .unwrap_or(input_tokens + output_tokens);
         Some(ResponseUsage {
-            input_tokens: u.get("input_tokens")?.as_u64()? as u32,
-            output_tokens: u.get("output_tokens")?.as_u64()? as u32,
-            total_tokens: u.get("total_tokens")?.as_u64()? as u32,
+            input_tokens,
+            output_tokens,
+            total_tokens,
             input_tokens_details: InputTokenDetails {
                 cached_tokens: u
                     .pointer("/input_tokens_details/cached_tokens")

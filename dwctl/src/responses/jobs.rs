@@ -1,7 +1,7 @@
 //! Underway jobs for Open Responses API lifecycle management.
 //!
-//! Two jobs handle the full request lifecycle:
-//! - `CreateResponseJob`: validates API key, creates fusillade template + request rows
+//! Two jobs handle the response lifecycle:
+//! - `CreateResponseJob`: validates API key, creates fusillade daemon request rows
 //! - `CompleteResponseJob`: updates the request with response body/status or marks it failed
 
 use serde::{Deserialize, Serialize};
@@ -15,8 +15,8 @@ use super::store::{self as response_store, OnwardsDaemonId};
 
 /// Input for the create-response background job.
 ///
-/// Enqueued by the responses middleware. The job validates the API key,
-/// then creates the fusillade template + request rows.
+/// The job validates the API key, then creates the fusillade daemon request row.
+/// Currently used by the realtime non-background path to defer row creation.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CreateResponseInput {
     /// Pre-generated response ID (e.g., `resp_<uuid>`)

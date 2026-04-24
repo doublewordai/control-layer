@@ -201,30 +201,32 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> TaskRunner<P> {
         }
 
         // Response lifecycle workers — handle create-response and complete-response jobs
-        // from the responses middleware and outlet handler. Always at least 1.
-        {
-            let mut worker = self.create_response_job.worker();
-            worker.set_shutdown_token(shutdown_token.clone());
-            handles.push((
-                "create-response-worker",
-                tokio::spawn(async move {
-                    if let Err(e) = worker.run().await {
-                        tracing::error!(error = %e, "Create-response worker error");
-                    }
-                }),
-            ));
-        }
-        {
-            let mut worker = self.complete_response_job.worker();
-            worker.set_shutdown_token(shutdown_token.clone());
-            handles.push((
-                "complete-response-worker",
-                tokio::spawn(async move {
-                    if let Err(e) = worker.run().await {
-                        tracing::error!(error = %e, "Complete-response worker error");
-                    }
-                }),
-            ));
+        // from the responses middleware and outlet handler.
+        if task_config.response_workers > 0 {
+            for _ in 0..task_config.response_workers {
+                let mut worker = self.create_response_job.worker();
+                worker.set_shutdown_token(shutdown_token.clone());
+                handles.push((
+                    "create-response-worker",
+                    tokio::spawn(async move {
+                        if let Err(e) = worker.run().await {
+                            tracing::error!(error = %e, "Create-response worker error");
+                        }
+                    }),
+                ));
+            }
+            for _ in 0..task_config.response_workers {
+                let mut worker = self.complete_response_job.worker();
+                worker.set_shutdown_token(shutdown_token.clone());
+                handles.push((
+                    "complete-response-worker",
+                    tokio::spawn(async move {
+                        if let Err(e) = worker.run().await {
+                            tracing::error!(error = %e, "Complete-response worker error");
+                        }
+                    }),
+                ));
+            }
         }
 
         if !sync_config.enabled {

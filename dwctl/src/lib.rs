@@ -2411,7 +2411,7 @@ impl Application {
         // Register onwards as a fusillade daemon so realtime requests get a valid daemon_id
         let onwards_daemon_id = uuid::Uuid::new_v4();
         let fusillade_write_pool = bg_services.request_manager.pool().clone();
-        sqlx::query(
+        let daemon_insert_result = sqlx::query(
             "INSERT INTO daemons (id, hostname, pid, version, config_snapshot, status, started_at, last_heartbeat)
              VALUES ($1, $2, $3, $4, $5, 'running', NOW(), NOW())",
         )
@@ -2421,16 +2421,24 @@ impl Application {
         .bind(fusillade::daemon::types::get_version())
         .bind(serde_json::json!({"type": "onwards"}))
         .execute(&fusillade_write_pool)
-        .await
-        .unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "Failed to register onwards daemon (table may not exist yet)");
-            sqlx::postgres::PgQueryResult::default()
-        });
-        tracing::info!(daemon_id = %onwards_daemon_id, "Registered onwards as fusillade daemon");
+        .await;
+
+        let daemon_registered = match &daemon_insert_result {
+            Ok(_) => {
+                tracing::info!(daemon_id = %onwards_daemon_id, "Registered onwards as fusillade daemon");
+                true
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to register onwards daemon (table may not exist yet)");
+                false
+            }
+        };
 
         // Spawn a background task to send periodic heartbeats for the onwards daemon.
         // Without this, fusillade's stale daemon detection would unclaim our processing
         // rows after stale_daemon_threshold_ms (default 30s).
+        // Only spawn if the daemon was successfully registered.
+        if daemon_registered {
         let heartbeat_pool = fusillade_write_pool.clone();
         let heartbeat_daemon_id = onwards_daemon_id;
         let heartbeat_shutdown = bg_services.shutdown_token();
@@ -2465,6 +2473,7 @@ impl Application {
             }
             Ok(())
         });
+        } // daemon_registered
 
         // Create the response store (backed by request_manager for reads via Storage trait)
         let response_store = Arc::new(crate::responses::store::FusilladeResponseStore::new(
@@ -2475,8 +2484,15 @@ impl Application {
         let responses_middleware_state = crate::responses::middleware::ResponsesMiddlewareState {
             request_manager: bg_services.request_manager.clone(),
             daemon_id: crate::responses::store::OnwardsDaemonId(onwards_daemon_id),
-            create_response_job: bg_services.task_runner.create_response_job.clone(),
-            loopback_base_url: format!("http://{}/ai", config.bind_address()),
+            loopback_base_url: {
+                let addr = config.bind_address();
+                let addr = if addr.starts_with("0.0.0.0:") {
+                    addr.replacen("0.0.0.0", "127.0.0.1", 1)
+                } else {
+                    addr
+                };
+                format!("http://{addr}/ai")
+            },
             dwctl_pool: (*db_pools).write().clone(),
         };
 
