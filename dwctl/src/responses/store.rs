@@ -42,23 +42,6 @@ impl<P: PoolProvider + Clone> FusilladeResponseStore<P> {
     }
 }
 
-/// Mark a response as completed with the response body.
-pub async fn complete_response<P: PoolProvider + Clone>(
-    request_manager: &PostgresRequestManager<P, ReqwestHttpClient>,
-    response_id: &str,
-    response_body: &str,
-    status_code: u16,
-) -> Result<(), StoreError> {
-    let id = parse_response_id(response_id)?;
-
-    request_manager
-        .complete_request(RequestId(id), response_body, status_code)
-        .await
-        .map_err(|e| StoreError::StorageError(format!("Failed to complete request: {e}")))?;
-
-    Ok(())
-}
-
 /// Mark a response as failed.
 pub async fn fail_response<P: PoolProvider + Clone>(
     request_manager: &PostgresRequestManager<P, ReqwestHttpClient>,

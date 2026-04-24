@@ -2,9 +2,10 @@
 //!
 //! This handler is added to outlet's `MultiHandler` alongside the existing
 //! `PostgresHandler` (which writes to `http_analytics`). It enqueues a
-//! `CompleteResponseJob` which updates the fusillade row with the response
-//! body/status. Using underway ensures the completion retries if the
-//! `CreateResponseJob` hasn't created the row yet.
+//! `CompleteResponseJob` carrying both the response data and enough request
+//! context to synthesize the fusillade row from scratch — `CompleteResponseJob`
+//! and `CreateResponseJob` are race-tolerant: whichever wins, the final state
+//! is correct.
 
 use outlet::{RequestData, RequestHandler, ResponseData};
 use std::sync::Arc;

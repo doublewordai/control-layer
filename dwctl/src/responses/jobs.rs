@@ -1,8 +1,14 @@
 //! Underway jobs for Open Responses API lifecycle management.
 //!
-//! Two jobs handle the response lifecycle:
-//! - `CreateResponseJob`: validates API key, creates the realtime tracking batch in fusillade
-//! - `CompleteResponseJob`: updates the request with response body/status or marks it failed
+//! Two jobs handle the response lifecycle. Both are idempotent and tolerate
+//! the create/complete race in either direction:
+//!
+//! - `CreateResponseJob`: validates API key, no-ops if the row already exists
+//!   (complete-response won the race), otherwise creates the realtime tracking
+//!   batch in fusillade.
+//! - `CompleteResponseJob`: updates the row to `completed`. If the row doesn't
+//!   exist yet (create-response hasn't run), synthesizes it first using the
+//!   request context carried in the job payload.
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
