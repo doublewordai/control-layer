@@ -107,7 +107,7 @@ export const MobileModelsView: React.FC<MobileModelsViewProps> = ({
   }, [models, activeFilter]);
 
   const newModels = useMemo(
-    () => sortByNewest(filtered).slice(0, 4),
+    () => sortByNewest(filtered).slice(0, 3),
     [filtered],
   );
 
