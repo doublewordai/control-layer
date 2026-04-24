@@ -349,6 +349,14 @@
   }
 }
 
+.swimlane-scroll {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+.swimlane-scroll::-webkit-scrollbar {
+  display: none;
+}
+
 .modal-scrollbar::-webkit-scrollbar {
   width: 8px;
   height: 8px;

@@ -1,5 +1,19 @@
 import "@testing-library/jest-dom";
 
+// Polyfill matchMedia for useIsMobile hook
+if (typeof window !== "undefined" && !window.matchMedia) {
+  window.matchMedia = (query: string) => ({
+    matches: false,
+    media: query,
+    onchange: null,
+    addListener: () => {},
+    removeListener: () => {},
+    addEventListener: () => {},
+    removeEventListener: () => {},
+    dispatchEvent: () => false,
+  });
+}
+
 // Polyfill ResizeObserver for Radix UI and other libs in Vitest/JSDOM
 if (typeof window !== "undefined" && !window.ResizeObserver) {
   window.ResizeObserver = class {

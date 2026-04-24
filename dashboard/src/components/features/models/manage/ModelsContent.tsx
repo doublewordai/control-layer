@@ -60,9 +60,11 @@ import {
   TooltipTrigger,
 } from "../../../ui/tooltip";
 import { StatusRow } from "./StatusRow";
+import { MobileModelsView } from "./MobileModelsView";
 import { Markdown } from "../../../ui/markdown";
 import { isBatchDenied, isPlaygroundDenied, isRealtimeDenied } from "../../../../utils/modelAccess";
 import { copyToClipboard } from "../../../../utils/clipboard";
+import { useIsMobile } from "../../../../hooks/use-mobile";
 
 const COMPLETION_WINDOWS: Record<
   string,
@@ -166,6 +168,7 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
   onClearFilters,
 }) => {
   const navigate = useNavigate();
+  const isMobile = useIsMobile();
   const { data: config } = useConfig();
   const globalBatchWindows = useMemo(
     () => config?.batches?.allowed_completion_windows ?? ["24h"],
@@ -362,6 +365,24 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
             Clear filters
           </Button>
         </div>
+      ) : isMobile ? (
+        <>
+          <MobileModelsView
+            models={filteredModels}
+            onNavigate={(modelId) =>
+              navigate(
+                `/models/manage/${modelId}?from=${encodeURIComponent("/models/manage")}`,
+              )
+            }
+          />
+          <TablePagination
+            itemName="models"
+            itemsPerPage={pagination.pageSize}
+            currentPage={pagination.page}
+            onPageChange={pagination.handlePageChange}
+            totalItems={rawModelsData?.total_count || 0}
+          />
+        </>
       ) : (
         <>
           <div
