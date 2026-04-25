@@ -99,7 +99,10 @@ pub async fn list_batch_requests<P: PoolProvider>(
             models,
             created_after: query.created_after,
             created_before: query.created_before,
-            service_tier: query.service_tier.clone(),
+            service_tiers: query
+                .service_tiers
+                .as_ref()
+                .map(|s| s.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect()),
             active_first: query.active_first.unwrap_or(true),
             skip,
             limit,
@@ -141,7 +144,7 @@ pub async fn list_batch_requests<P: PoolProvider>(
     let unique_creator_ids: Vec<String> = result
         .data
         .iter()
-        .map(|r| r.batch_created_by.clone())
+        .filter_map(|r| r.batch_created_by.as_ref().cloned())
         .collect::<std::collections::HashSet<_>>()
         .into_iter()
         .collect();
@@ -167,7 +170,7 @@ pub async fn list_batch_requests<P: PoolProvider>(
         .into_iter()
         .map(|r| {
             let a = analytics_map.get(&r.id);
-            let email = email_map.get(&r.batch_created_by).cloned();
+            let email: Option<String> = r.batch_created_by.as_ref().and_then(|id| email_map.get(id)).cloned();
             BatchRequestSummary {
                 id: r.id,
                 batch_id: r.batch_id,
@@ -178,6 +181,7 @@ pub async fn list_batch_requests<P: PoolProvider>(
                 failed_at: r.failed_at,
                 duration_ms: r.duration_ms,
                 response_status: r.response_status,
+                service_tier: r.service_tier,
                 prompt_tokens: a.and_then(|a| a.prompt_tokens),
                 completion_tokens: a.and_then(|a| a.completion_tokens),
                 reasoning_tokens: a.and_then(|a| a.reasoning_tokens),
@@ -236,7 +240,12 @@ pub async fn get_batch_request<P: PoolProvider>(
     // Check ownership — fetch-then-check pattern matches get_batch handler.
     // The response is discarded on failure (returns 404, no data leakage).
     let can_read_all = can_read_all_resources(&current_user, Resource::Batches);
-    if !can_read_all && !is_batch_owner(&current_user, &detail.batch_created_by) {
+    if !can_read_all
+        && !detail
+            .batch_created_by
+            .as_deref()
+            .is_some_and(|cb| is_batch_owner(&current_user, cb))
+    {
         return Err(Error::NotFound {
             resource: "BatchRequest".to_string(),
             id: request_id.to_string(),
@@ -266,7 +275,9 @@ pub async fn get_batch_request<P: PoolProvider>(
     // Look up the creator's email via UUID primary-key lookup (org IDs and unparseable
     // values return None without a query). Uses the primary pool to avoid replica lag
     // right after batch creation.
-    let created_by_email = if let Ok(created_by_uuid) = Uuid::parse_str(&detail.batch_created_by) {
+    let created_by_email = if let Some(ref batch_created_by) = detail.batch_created_by
+        && let Ok(created_by_uuid) = Uuid::parse_str(batch_created_by)
+    {
         sqlx::query_as::<_, EmailRow>("SELECT id::text as user_id, email FROM users WHERE id = $1")
             .bind(created_by_uuid)
             .fetch_optional(state.db.write())
@@ -290,6 +301,7 @@ pub async fn get_batch_request<P: PoolProvider>(
         failed_at: detail.failed_at,
         duration_ms: detail.duration_ms,
         response_status: detail.response_status,
+        service_tier: detail.service_tier,
         prompt_tokens: analytics.as_ref().and_then(|a| a.prompt_tokens),
         completion_tokens: analytics.as_ref().and_then(|a| a.completion_tokens),
         reasoning_tokens: analytics.as_ref().and_then(|a| a.reasoning_tokens),

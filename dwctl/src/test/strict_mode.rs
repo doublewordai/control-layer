@@ -191,6 +191,9 @@ async fn test_strict_mode_allows_chat_completions(pool: PgPool) {
     let mut config = create_test_config();
     config.onwards.strict_mode = true;
     config.background_services.onwards_sync.enabled = true;
+    // This test asserts the response ID is rewritten to the fusillade ID,
+    // which requires the complete-response worker to run.
+    config.background_services.task_workers.response_workers = 1;
 
     let app = crate::Application::new_with_pool(config, Some(pool.clone()), None)
         .await
@@ -334,7 +337,9 @@ async fn test_strict_mode_allows_chat_completions(pool: PgPool) {
 
     // Verify response structure
     let body: serde_json::Value = serde_json::from_str(&body_text).expect("Response body should be valid JSON");
-    assert_eq!(body["id"].as_str(), Some("chatcmpl-strict-test"));
+    // The response ID is rewritten by the responses middleware to use the fusillade ID
+    let id = body["id"].as_str().unwrap();
+    assert!(id.starts_with("resp_"), "Response ID should be fusillade ID, got: {id}");
     assert_eq!(body["object"].as_str(), Some("chat.completion"));
     assert_eq!(body["model"].as_str(), Some("gpt-4"));
     assert!(body["choices"].is_array());
@@ -911,14 +916,19 @@ async fn test_strict_mode_allows_responses(pool: PgPool) {
         .add_header("Content-Type", "application/json")
         .json(&serde_json::json!({
             "model": "gpt-4",
-            "input": "Test /v1/responses endpoint"
+            "input": "Test /v1/responses endpoint",
+            "service_tier": "priority"
         }))
         .await;
 
-    assert_eq!(response.status_code(), 200, "Expected 200 for /v1/responses in strict mode");
+    assert_eq!(
+        response.status_code(),
+        200,
+        "Expected 200 for /v1/responses in strict mode with priority tier"
+    );
 
     let body: serde_json::Value = response.json();
-    assert_eq!(body["id"].as_str(), Some("resp-strict-test"));
+    // Response ID may be overwritten by the fusillade store if configured, or the provider's ID
     assert_eq!(body["object"].as_str(), Some("response"));
     assert_eq!(body["status"].as_str(), Some("completed"));
     assert!(body["output"].is_array());

@@ -169,6 +169,30 @@ pub async fn check_user_has_model_access(pool: PgPool, user_id: UserId, model_al
     Ok(result)
 }
 
+/// Validate that the bearer token's user has access to the specified model.
+///
+/// Returns `Ok(())` if access is granted, or an error message if not.
+/// Used by the responses middleware to fail fast on invalid model access
+/// before creating fusillade rows.
+pub async fn validate_api_key_model_access(pool: PgPool, api_key: &str, model: &str) -> Result<(), String> {
+    let user_id = get_user_id_of_api_key(pool.clone(), api_key)
+        .await
+        .map_err(|_| "Invalid API key".to_string())?;
+
+    let has_access = check_user_has_model_access(pool, user_id, model)
+        .await
+        .map_err(|e| format!("Failed to check model access: {e}"))?;
+
+    if !has_access {
+        return Err(format!(
+            "You do not have access to '{}'. Please contact your administrator to request access.",
+            model
+        ));
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

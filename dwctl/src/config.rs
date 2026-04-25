@@ -1716,6 +1716,10 @@ pub struct TaskWorkersConfig {
     /// Number of cascade-batch-state workers (default: 1).
     /// Updates child request states after a batch is cancelled or deleted.
     pub cascade_batch_state_workers: usize,
+    /// Number of response lifecycle workers (default: 1).
+    /// Handles create-response and complete-response jobs from the responses
+    /// middleware and outlet handler. Set to 0 to disable.
+    pub response_workers: usize,
 }
 
 impl Default for TaskWorkersConfig {
@@ -1723,6 +1727,7 @@ impl Default for TaskWorkersConfig {
         Self {
             create_batch_workers: 1,
             cascade_batch_state_workers: 1,
+            response_workers: 1,
         }
     }
 }

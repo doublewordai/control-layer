@@ -1611,7 +1611,7 @@ export type AsyncRequestStatus =
 
 export interface AsyncRequest {
   id: string;
-  batch_id: string;
+  batch_id: string | null;
   model: string;
   status: AsyncRequestStatus;
   created_at: string;
@@ -1619,6 +1619,7 @@ export interface AsyncRequest {
   failed_at: string | null;
   duration_ms: number | null;
   response_status: number | null;
+  service_tier: string | null;
   prompt_tokens: number | null;
   completion_tokens: number | null;
   reasoning_tokens: number | null;
@@ -1631,15 +1632,15 @@ export interface AsyncRequestDetail extends AsyncRequest {
   body: string;
   response_body: string | null;
   error: string | null;
-  completion_window: string;
-  batch_created_by: string;
+  completion_window: string | null;
+  batch_created_by: string | null;
 }
 
 export interface AsyncRequestsListQuery {
   skip?: number;
   limit?: number;
   completion_window?: string;
-  service_tier?: string;
+  service_tiers?: string;
   status?: string;
   model?: string;
   member_id?: string;

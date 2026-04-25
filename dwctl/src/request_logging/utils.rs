@@ -119,13 +119,111 @@ pub(crate) fn parse_non_streaming_response(body_str: &str) -> Result<AiResponse,
 
 /// Parses a non-streaming /v1/responses response body.
 ///
+/// Tries strict deserialization into [`Response`] first. If that fails (e.g.
+/// because the response was serialized by onwards' own `ResponsesResponse`
+/// schema which differs from async-openai's), falls back to extracting usage
+/// fields from raw JSON and constructing a minimal [`Response`].
+///
 /// # Errors
-/// Returns error if JSON deserialization into [`Response`] fails.
+/// Returns error if the body is not valid JSON with an `"object": "response"` field.
 #[instrument(skip_all, name = "dwctl.parse_responses_non_streaming")]
 pub(crate) fn parse_responses_non_streaming_response(body_str: &str) -> Result<AiResponse, Box<dyn std::error::Error>> {
-    serde_json::from_str::<Response>(body_str)
-        .map(AiResponse::Responses)
-        .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+    // Fast path: try strict deserialization.
+    match serde_json::from_str::<Response>(body_str) {
+        Ok(response) => return Ok(AiResponse::Responses(response)),
+        Err(e) => tracing::debug!(error = %e, "async-openai Response deserialization failed, using fallback"),
+    }
+
+    // Slow path: extract fields from raw JSON. This handles responses
+    // serialized by onwards' ResponsesResponse which has a different schema
+    // (e.g. required fields that async-openai marks optional, different
+    // enum representations for service_tier, truncation, etc.).
+    let value: serde_json::Value = serde_json::from_str(body_str).map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+
+    // Verify this looks like a Responses API object.
+    if value.get("object").and_then(|v| v.as_str()) != Some("response") {
+        return Err("Not a Responses API response object".into());
+    }
+
+    let model = value.get("model").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+    let status_str = value.get("status").and_then(|v| v.as_str()).unwrap_or("completed");
+    let status = match status_str {
+        "completed" => async_openai::types::responses::Status::Completed,
+        "failed" => async_openai::types::responses::Status::Failed,
+        "in_progress" => async_openai::types::responses::Status::InProgress,
+        "cancelled" => async_openai::types::responses::Status::Cancelled,
+        "queued" => async_openai::types::responses::Status::Queued,
+        "incomplete" => async_openai::types::responses::Status::Incomplete,
+        _ => async_openai::types::responses::Status::Completed,
+    };
+    let created_at = value.get("created_at").and_then(|v| v.as_u64()).unwrap_or(0);
+    let id = value.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+    // Extract usage if present.
+    let usage = value.get("usage").and_then(|u| {
+        use async_openai::types::responses::{InputTokenDetails, OutputTokenDetails, ResponseUsage};
+        let input_tokens = u.get("input_tokens")?.as_u64()? as u32;
+        let output_tokens = u.get("output_tokens")?.as_u64()? as u32;
+        let total_tokens = u
+            .get("total_tokens")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32)
+            .unwrap_or(input_tokens + output_tokens);
+        Some(ResponseUsage {
+            input_tokens,
+            output_tokens,
+            total_tokens,
+            input_tokens_details: InputTokenDetails {
+                cached_tokens: u
+                    .pointer("/input_tokens_details/cached_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as u32,
+            },
+            output_tokens_details: OutputTokenDetails {
+                reasoning_tokens: u
+                    .pointer("/output_tokens_details/reasoning_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as u32,
+            },
+        })
+    });
+
+    let response = Response {
+        id,
+        object: "response".to_string(),
+        created_at,
+        status,
+        model,
+        output: vec![],
+        usage,
+        // All remaining fields are Option — None by default.
+        background: None,
+        billing: None,
+        conversation: None,
+        completed_at: None,
+        error: None,
+        incomplete_details: None,
+        instructions: None,
+        max_output_tokens: None,
+        metadata: None,
+        parallel_tool_calls: None,
+        previous_response_id: None,
+        prompt: None,
+        prompt_cache_key: None,
+        prompt_cache_retention: None,
+        reasoning: None,
+        safety_identifier: None,
+        service_tier: None,
+        temperature: None,
+        text: None,
+        tool_choice: None,
+        tools: None,
+        top_logprobs: None,
+        top_p: None,
+        truncation: None,
+    };
+
+    Ok(AiResponse::Responses(response))
 }
 
 /// Parses a streaming /v1/responses SSE body into collected events.
@@ -171,6 +269,16 @@ pub(crate) fn decompress_response_if_needed(
         .map(|s| s.trim().to_lowercase());
 
     match content_encoding.as_deref() {
+        Some("gzip") => {
+            let mut decompressed = Vec::new();
+            flate2::read::GzDecoder::new(bytes)
+                .read_to_end(&mut decompressed)
+                .map_err(|e| SerializationError {
+                    fallback_data: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes),
+                    error: Box::new(e),
+                })?;
+            Ok(decompressed)
+        }
         Some("br") | Some("brotli") => {
             let mut decompressed = Vec::new();
             brotli::Decompressor::new(bytes, 4096)
@@ -431,12 +539,42 @@ mod tests {
     fn test_decompress_response_unknown_encoding() {
         let data = b"hello world";
         let mut headers = HashMap::new();
-        headers.insert("content-encoding".to_string(), vec![Bytes::from("gzip")]);
+        headers.insert("content-encoding".to_string(), vec![Bytes::from("deflate")]);
 
         let result = decompress_response_if_needed(data, &headers).unwrap();
 
         // Unknown encoding should pass through unchanged
         assert_eq!(result, data);
+    }
+
+    #[test]
+    fn test_decompress_response_gzip() {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        use std::io::Write as _;
+
+        let original = b"hello world";
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(original).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let mut headers = HashMap::new();
+        headers.insert("content-encoding".to_string(), vec![Bytes::from("gzip")]);
+
+        let result = decompress_response_if_needed(&compressed, &headers).unwrap();
+
+        assert_eq!(result, original);
+    }
+
+    #[test]
+    fn test_decompress_response_gzip_invalid_data() {
+        let data = b"not valid gzip";
+        let mut headers = HashMap::new();
+        headers.insert("content-encoding".to_string(), vec![Bytes::from("gzip")]);
+
+        let result = decompress_response_if_needed(data, &headers);
+
+        assert!(result.is_err());
     }
 
     // ===== Fusillade Request ID Tests =====

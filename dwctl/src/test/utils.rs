@@ -58,18 +58,21 @@ pub async fn create_test_app_state_with_config(pool: PgPool, config: crate::conf
             &crate::config::TaskWorkersConfig {
                 create_batch_workers: 0,
                 cascade_batch_state_workers: 0,
+                response_workers: 0,
             },
         )
         .await
         .expect("Failed to create task runner"),
     );
 
+    let response_store = std::sync::Arc::new(crate::responses::store::FusilladeResponseStore::new(request_manager.clone()));
     crate::AppState::builder()
         .db(test_pools)
         .config(shared_config)
         .request_manager(request_manager)
         .task_runner(task_runner)
         .limiters(limiters)
+        .response_store(response_store)
         .build()
 }
 
@@ -122,18 +125,21 @@ pub async fn create_test_app_state_with_fusillade(pool: PgPool, config: crate::c
             &crate::config::TaskWorkersConfig {
                 create_batch_workers: 0,
                 cascade_batch_state_workers: 0,
+                response_workers: 0,
             },
         )
         .await
         .expect("Failed to create task runner"),
     );
 
+    let response_store = std::sync::Arc::new(crate::responses::store::FusilladeResponseStore::new(request_manager.clone()));
     crate::AppState::builder()
         .db(test_pools)
         .config(shared_config)
         .request_manager(request_manager)
         .task_runner(task_runner)
         .limiters(limiters)
+        .response_store(response_store)
         .build()
 }
 
@@ -195,7 +201,21 @@ pub fn create_test_config() -> crate::config::Config {
                 },
                 replica_pool: None,
             },
-            underway_pool: crate::config::default_underway_pool(),
+            // Cap the underway pool in tests — the production default of 100
+            // per-instance multiplies badly under `#[sqlx::test]` parallelism
+            // and exhausts postgres's max_connections.
+            //
+            // Each running underway worker holds two PgListener connections
+            // (shutdown + task-change), and `TaskRunner::start` always spawns
+            // at least one create-batch worker (see `.max(1)` in tasks.rs).
+            // setup_ai_test enables response_workers=1 which adds another
+            // 2 workers = 6 long-lived listeners. 10 gives transient `run_every`
+            // / enqueue / dequeue acquires room to breathe.
+            underway_pool: PoolSettings {
+                max_connections: 10,
+                min_connections: 0,
+                ..Default::default()
+            },
         },
         slow_statement_threshold_ms: 1000,
         host: "127.0.0.1".to_string(),
@@ -269,6 +289,7 @@ pub fn create_test_config() -> crate::config::Config {
             task_workers: crate::config::TaskWorkersConfig {
                 create_batch_workers: 0,
                 cascade_batch_state_workers: 0,
+                response_workers: 0,
             },
             ..Default::default()
         },

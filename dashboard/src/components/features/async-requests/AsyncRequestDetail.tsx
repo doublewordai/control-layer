@@ -145,7 +145,7 @@ export function AsyncRequestDetail() {
             </div>
           </div>
         </div>
-        {status === "failed" && (
+        {status === "failed" && request.batch_id && (
           <RetryButton batchId={request.batch_id} requestId={request.id} />
         )}
       </div>

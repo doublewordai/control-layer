@@ -96,7 +96,7 @@ describe("AsyncRequests", () => {
       wrapper: createWrapper(),
     });
     expect(
-      within(container).getByRole("heading", { level: 1, name: /async/i }),
+      within(container).getByRole("heading", { level: 1, name: /responses/i }),
     ).toBeInTheDocument();
   });
 
@@ -112,12 +112,12 @@ describe("AsyncRequests", () => {
     ).toBeInTheDocument();
   });
 
-  it("passes service_tier=flex to the query", () => {
+  it("passes service_tiers=flex,priority to the query", () => {
     render(<AsyncRequests />, { wrapper: createWrapper() });
 
     expect(hooks.useAsyncRequests).toHaveBeenCalledWith(
       expect.objectContaining({
-        service_tier: "flex",
+        service_tiers: "flex,priority",
       }),
     );
   });

@@ -101,7 +101,7 @@ export function AppSidebar() {
     {
       path: "/async",
       icon: Zap,
-      label: "Async",
+      label: "Responses",
       demoOnly: false,
       hidden:
         config !== undefined &&

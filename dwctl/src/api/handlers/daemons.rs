@@ -173,7 +173,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_list_daemons_returns_empty_list_when_no_daemons(pool: PgPool) {
+    async fn test_list_daemons_returns_onwards_daemon(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user(&pool, Role::PlatformManager).await;
 
@@ -187,8 +187,11 @@ mod tests {
         response.assert_status(StatusCode::OK);
         let json: ListDaemonsResponse = response.json();
 
-        // Since we're not running background daemons in tests (false parameter to create_test_app),
-        // we should get an empty list
-        assert_eq!(json.daemons.len(), 0);
+        // Application startup registers onwards as a fusillade daemon so
+        // realtime requests get a valid daemon_id. No other daemons run in
+        // tests (batch/probe/sync workers are all disabled).
+        assert_eq!(json.daemons.len(), 1);
+        assert_eq!(json.daemons[0].config["type"], "onwards");
+        assert_eq!(json.daemons[0].status, DaemonStatus::Running);
     }
 }

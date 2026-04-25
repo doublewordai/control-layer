@@ -30,8 +30,8 @@ pub struct ListBatchRequestsQuery {
     /// Filter to requests created before this timestamp
     pub created_before: Option<DateTime<Utc>>,
 
-    /// Filter by service tier (e.g., "auto", "default", "flex", "priority")
-    pub service_tier: Option<String>,
+    /// Filter by service tier(s), comma-separated (e.g., "flex,priority")
+    pub service_tiers: Option<String>,
 
     /// Sort active requests first (default: true)
     pub active_first: Option<bool>,
@@ -42,7 +42,7 @@ pub struct ListBatchRequestsQuery {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct BatchRequestSummary {
     pub id: Uuid,
-    pub batch_id: Uuid,
+    pub batch_id: Option<Uuid>,
     pub model: String,
     pub status: String,
     pub created_at: DateTime<Utc>,
@@ -50,6 +50,7 @@ pub struct BatchRequestSummary {
     pub failed_at: Option<DateTime<Utc>>,
     pub duration_ms: Option<f64>,
     pub response_status: Option<i16>,
+    pub service_tier: Option<String>,
     pub prompt_tokens: Option<i64>,
     pub completion_tokens: Option<i64>,
     pub reasoning_tokens: Option<i64>,
@@ -63,7 +64,7 @@ pub struct BatchRequestSummary {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct BatchRequestDetail {
     pub id: Uuid,
-    pub batch_id: Uuid,
+    pub batch_id: Option<Uuid>,
     pub model: String,
     pub status: String,
     pub created_at: DateTime<Utc>,
@@ -71,6 +72,7 @@ pub struct BatchRequestDetail {
     pub failed_at: Option<DateTime<Utc>>,
     pub duration_ms: Option<f64>,
     pub response_status: Option<i16>,
+    pub service_tier: Option<String>,
     pub prompt_tokens: Option<i64>,
     pub completion_tokens: Option<i64>,
     pub reasoning_tokens: Option<i64>,
@@ -79,7 +81,7 @@ pub struct BatchRequestDetail {
     pub body: String,
     pub response_body: Option<String>,
     pub error: Option<String>,
-    pub completion_window: String,
-    pub batch_created_by: String,
+    pub completion_window: Option<String>,
+    pub batch_created_by: Option<String>,
     pub created_by_email: Option<String>,
 }

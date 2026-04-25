@@ -151,7 +151,7 @@ impl PaymentProvider for StripeProvider {
             }])
             .automatic_tax(CreateCheckoutSessionAutomaticTax::new(true))
             .mode(CheckoutSessionMode::Payment)
-            .ui_mode(CheckoutSessionUiMode::Hosted)
+            .ui_mode(CheckoutSessionUiMode::HostedPage)
             .expand(vec!["line_items".to_string()])
             .tax_id_collection(CreateCheckoutSessionTaxIdCollection::new(true))
             .name_collection(CreateCheckoutSessionNameCollection {
@@ -426,7 +426,7 @@ impl PaymentProvider for StripeProvider {
             .success_url(success_url)
             .client_reference_id(payer.id.to_string())
             .mode(CheckoutSessionMode::Setup)
-            .ui_mode(CheckoutSessionUiMode::Hosted)
+            .ui_mode(CheckoutSessionUiMode::HostedPage)
             .tax_id_collection(CreateCheckoutSessionTaxIdCollection::new(true))
             .name_collection(CreateCheckoutSessionNameCollection {
                 business: Some(CreateCheckoutSessionNameCollectionBusiness::new(true)),

@@ -101,25 +101,29 @@ jobs:
     if: (github.event_name == 'pull_request' && !startsWith(github.head_ref, 'release-please--')) || github.event_name == 'merge_group'
     runs-on: depot-ubuntu-24.04-16
 
-    services:
-      postgres:
-        image: postgres:latest
-        env:
-          POSTGRES_DB: test
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_HOST_AUTH_METHOD: trust
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 1s
-          --health-timeout 5s
-          --health-retries 5
-        ports:
-          - 5432:5432
+    # Postgres is started manually below (not via `services:`) so we can pass
+    # `-c max_connections=300` — the 16-core runner runs `#[sqlx::test]`
+    # tests with high parallelism, and each one opens its own pools + underway
+    # PgListener connections, so the default 100 is insufficient.
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
+
+      - name: Start Postgres
+        run: |
+          docker run -d --name postgres \
+            -e POSTGRES_DB=test \
+            -e POSTGRES_USER=postgres \
+            -e POSTGRES_PASSWORD=postgres \
+            -e POSTGRES_HOST_AUTH_METHOD=trust \
+            -p 5432:5432 \
+            postgres:latest \
+            -c max_connections=300
+          for _ in $(seq 1 30); do
+            docker exec postgres pg_isready -U postgres && break
+            sleep 1
+          done
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
