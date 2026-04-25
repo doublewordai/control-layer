@@ -138,24 +138,35 @@ pub async fn complete_response_idempotent<P: PoolProvider + Clone>(
                 api_key: create_ctx.api_key.map(String::from),
                 created_by,
             };
-            if let Err(e) = request_manager.create_single_request_batch(batch_input).await {
-                // Don't fail loudly here — the next UPDATE attempt is the
-                // ground truth. If the row exists (we lost the race to create),
-                // UPDATE will succeed. If it doesn't, UPDATE will fail with
-                // RequestNotFound and we'll surface that.
-                tracing::debug!(
-                    response_id = %response_id,
-                    error = %e,
-                    "Synthetic create from complete-response failed (likely create-response won the race) — proceeding to UPDATE"
-                );
+            match request_manager.create_single_request_batch(batch_input).await {
+                Ok(_) => {
+                    tracing::info!(
+                        response_id = %response_id,
+                        "Synthetic create from complete-response succeeded — row now exists in 'processing'"
+                    );
+                }
+                Err(e) => {
+                    // Don't fail loudly here — the next UPDATE attempt is the
+                    // ground truth. If the row exists (we lost the race to
+                    // create), UPDATE will succeed.
+                    tracing::info!(
+                        response_id = %response_id,
+                        error = %e,
+                        "Synthetic create from complete-response failed (likely create-response won the race) — proceeding to UPDATE"
+                    );
+                }
             }
 
-            request_manager
-                .complete_request(RequestId(id), response_body, status_code)
-                .await
-                .map_err(|e| StoreError::StorageError(format!("Failed to complete after create: {e}")))?;
-
-            Ok(())
+            match request_manager.complete_request(RequestId(id), response_body, status_code).await {
+                Ok(()) => {
+                    tracing::info!(response_id = %response_id, "Second-attempt UPDATE succeeded — row now 'completed'");
+                    Ok(())
+                }
+                Err(e) => {
+                    tracing::warn!(response_id = %response_id, error = %e, "Second-attempt UPDATE failed");
+                    Err(StoreError::StorageError(format!("Failed to complete after create: {e}")))
+                }
+            }
         }
         Err(e) => Err(StoreError::StorageError(format!("Failed to complete request: {e}"))),
     }

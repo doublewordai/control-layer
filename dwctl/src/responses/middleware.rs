@@ -252,6 +252,12 @@ async fn handle_realtime<P: PoolProvider + Clone + Send + Sync + 'static>(
             endpoint: batch_input.endpoint,
             api_key: batch_input.api_key,
         };
+        tracing::debug!(
+            request_id = %job_input.request_id,
+            model = %job_input.model,
+            endpoint = %job_input.endpoint,
+            "responses_middleware enqueueing create-response job"
+        );
         if let Err(e) = state.create_response_job.enqueue(&job_input).await {
             tracing::warn!(error = %e, "Failed to enqueue create-response job");
         }

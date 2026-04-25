@@ -305,10 +305,14 @@ async fn test_responses_api_creates_retrievable_response(pool: PgPool) {
     let mut id = uuid::Uuid::nil();
     let mut final_state = String::new();
     while start.elapsed() < std::time::Duration::from_secs(5) {
+        // Note: in fusillade's request_templates table, the `endpoint` column
+        // stores the loopback base URL (e.g. http://localhost:.../ai) and the
+        // `path` column stores the API route (e.g. /v1/responses). Filter on
+        // `path`, not `endpoint`.
         let row = sqlx::query(
             "SELECT r.id, r.state, r.batch_id FROM fusillade.requests r \
              JOIN fusillade.request_templates t ON r.template_id = t.id \
-             WHERE t.endpoint LIKE '%responses%' \
+             WHERE t.path LIKE '%responses%' \
              ORDER BY r.created_at DESC LIMIT 1",
         )
         .fetch_optional(&pool)

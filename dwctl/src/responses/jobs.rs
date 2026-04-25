@@ -97,6 +97,13 @@ pub async fn build_create_response_job<P: sqlx_pool_router::PoolProvider + Clone
             // Resolve attribution from the API key.
             let created_by = response_store::lookup_created_by(&cx.state.dwctl_pool, input.api_key.as_deref()).await;
 
+            tracing::debug!(
+                request_id = %input.request_id,
+                model = %input.model,
+                endpoint = %input.endpoint,
+                "create-response inserting fusillade row"
+            );
+
             let batch_input = fusillade::CreateSingleRequestBatchInput {
                 request_id: input.request_id,
                 body: input.body,
