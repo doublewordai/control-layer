@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.44.0](https://github.com/doublewordai/control-layer/compare/v8.43.0...v8.44.0) (2026-04-25)
+
+
+### Features
+
+* service_tier and background handlers ([#1007](https://github.com/doublewordai/control-layer/issues/1007)) ([43e4239](https://github.com/doublewordai/control-layer/commit/43e4239ccb7f033ccb94f6f47dbd97c96a4c9531))
+
 ## [8.43.0](https://github.com/doublewordai/control-layer/compare/v8.42.3...v8.43.0) (2026-04-24)
 
 
