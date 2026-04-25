@@ -27,6 +27,10 @@ use super::store::{self as response_store};
 /// `complete-response` job then transitions it to `"completed"`.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CreateResponseInput {
+    /// Pre-generated batch UUID; becomes the fusillade batch's primary key.
+    /// Must match the `x-fusillade-batch-id` header attached to the proxied
+    /// request so the http_analytics row links back to the same batch.
+    pub batch_id: Uuid,
     /// Pre-generated request UUID; becomes the fusillade request's primary key.
     pub request_id: Uuid,
     /// The full request body as JSON string.
@@ -105,6 +109,7 @@ pub async fn build_create_response_job<P: sqlx_pool_router::PoolProvider + Clone
             );
 
             let batch_input = fusillade::CreateSingleRequestBatchInput {
+                batch_id: input.batch_id,
                 request_id: input.request_id,
                 body: input.body,
                 model: input.model.clone(),
@@ -175,6 +180,8 @@ pub struct CompleteResponseInput {
 
     // Fields below are used only when create-response hasn't run yet and
     // we need to synthesize the row ourselves.
+    /// Pre-generated batch UUID (extracted from `x-fusillade-batch-id`).
+    pub batch_id: Uuid,
     /// Pre-generated request UUID (matches `response_id` minus prefix).
     pub request_id: Uuid,
     /// Original request body (JSON string).
@@ -204,6 +211,7 @@ pub async fn build_complete_response_job<P: sqlx_pool_router::PoolProvider + Clo
         .step(|cx, input: CompleteResponseInput| async move {
             if (200..300).contains(&input.status_code) {
                 let create_ctx = response_store::CreateContext {
+                    batch_id: input.batch_id,
                     request_id: input.request_id,
                     request_body: &input.request_body,
                     model: &input.model,

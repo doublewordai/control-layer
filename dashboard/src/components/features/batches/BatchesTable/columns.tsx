@@ -11,6 +11,7 @@ import {
   Trash2,
   Box,
   FastForward,
+  Zap,
 } from "lucide-react";
 import { Button } from "../../../ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "../../../ui/tooltip";
@@ -119,21 +120,24 @@ export const createBatchColumns = (
           header: "Type",
           cell: ({ row }: { row: { original: Batch } }) => {
             const batch = row.original;
-            const isAsync = batch.completion_window === (actions.asyncCompletionWindow ?? "1h");
+            // Three classes today: realtime tracking rows ("0s"), flex/async
+            // ("1h" by default), and regular batches (anything else, typically
+            // "24h"). Anything unrecognised falls into the batch bucket.
+            const asyncWindow = actions.asyncCompletionWindow ?? "1h";
+            const { Icon, label } =
+              batch.completion_window === "0s"
+                ? { Icon: Zap, label: "Realtime" }
+                : batch.completion_window === asyncWindow
+                  ? { Icon: FastForward, label: "Async" }
+                  : { Icon: Box, label: "Batch" };
             return (
               <Tooltip>
                 <TooltipTrigger asChild>
                   <span className="inline-flex text-doubleword-neutral-600">
-                    {isAsync ? (
-                      <FastForward className="h-4 w-4" />
-                    ) : (
-                      <Box className="h-4 w-4" />
-                    )}
+                    <Icon className="h-4 w-4" />
                   </span>
                 </TooltipTrigger>
-                <TooltipContent side="top">
-                  {isAsync ? "Flex" : "Realtime"}
-                </TooltipContent>
+                <TooltipContent side="top">{label}</TooltipContent>
               </Tooltip>
             );
           },

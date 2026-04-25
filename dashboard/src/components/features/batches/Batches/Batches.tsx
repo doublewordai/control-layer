@@ -63,6 +63,13 @@ import { useBootstrapContent } from "@/hooks/use-bootstrap-content";
 import { ApiExamples } from "../../../modals";
 import { cn } from "@/lib/utils";
 
+// Window strings forwarded as-is to the backend `completion_window` filter.
+// Flex/async uses the configurable async window (default "1h"); regular batch
+// jobs use "24h". Realtime tracking rows ("0s") are intentionally omitted
+// from the UI selector — they're queryable via the API but live on the Async
+// Requests page in the dashboard.
+const BATCH_COMPLETION_WINDOW = "24h";
+
 /**
  * Props for the Batches component.
  * All modal operations are handled by parent container to prevent
@@ -162,7 +169,13 @@ export function Batches({
 
   // Batch-specific filters
   const [statusFilter, setStatusFilter] = useState<BatchStatus | "all">("all");
-  const [hideAsync, setHideAsync] = useState(false);
+  // Completion-window multi-select. Maps directly to the backend
+  // `completion_window` query param (comma-separated). Default hides the
+  // realtime tracking rows ("0s") and async/flex requests ("1h") that the
+  // Open Responses API creates — those have their own page in Async Requests.
+  const [completionWindowFilter, setCompletionWindowFilter] = useState<
+    string[]
+  >([BATCH_COMPLETION_WINDOW]);
   const [sortActiveFirst, setSortActiveFirst] = useState(true);
   const [dateRange, setDateRange] = useState<
     { from: Date; to: Date } | undefined
@@ -264,6 +277,13 @@ export function Batches({
     enabled: activeTab === "files" || !!batchFileFilter,
   });
 
+  // Empty selection means "no filter" — same UX as AsyncRequests so the user
+  // can't accidentally end up with a query that matches nothing.
+  const completionWindowParam =
+    completionWindowFilter.length > 0
+      ? completionWindowFilter.join(",")
+      : undefined;
+
   // Paginated batches query - include analytics to avoid N+1 requests
   const { data: batchesResponse, isLoading: batchesLoading } = useBatches({
     search: debouncedBatchSearch.trim() || undefined,
@@ -273,7 +293,7 @@ export function Batches({
     created_after: dateRange?.from.toISOString(),
     created_before: dateRange?.to.toISOString(),
     active_first: sortActiveFirst || undefined,
-    exclude_completion_window: hideAsync ? asyncCompletionWindow : undefined,
+    completion_window: completionWindowParam,
     ...batchesPagination.queryParams,
   });
 
@@ -351,6 +371,7 @@ export function Batches({
         created_after: dateRange?.from.toISOString(),
         created_before: dateRange?.to.toISOString(),
         active_first: sortActiveFirst || undefined,
+        completion_window: completionWindowParam,
         limit: batchesPagination.pageSize + 1,
         after: nextCursor,
       };
@@ -365,6 +386,7 @@ export function Batches({
     batchesHasMore,
     batchesPagination.page,
     batchesPagination.pageSize,
+    completionWindowParam,
     debouncedBatchSearch,
     selectedMemberId,
     statusFilter,
@@ -534,7 +556,9 @@ export function Batches({
     getInputFile,
     onRowClick: handleBatchClick,
     showUserColumn,
-    showTypeColumn: !hideAsync,
+    // Always show the type column now — its purpose is to disambiguate the
+    // three completion-window classes when more than one is selected.
+    showTypeColumn: true,
     asyncCompletionWindow,
   });
 
@@ -810,22 +834,60 @@ export function Batches({
                     Active first
                   </label>
                 </div>
-                <div className="flex items-center gap-1.5">
-                  <Switch
-                    id="hide-async"
-                    checked={hideAsync}
-                    onCheckedChange={(checked) => {
-                      setHideAsync(checked);
-                      batchesPagination.handleFirstPage();
-                    }}
-                  />
-                  <label
-                    htmlFor="hide-async"
-                    className="text-sm text-gray-600 cursor-pointer select-none"
-                  >
-                    Batch only
-                  </label>
-                </div>
+                <Popover>
+                  <PopoverTrigger asChild>
+                    <Button
+                      variant="outline"
+                      className="h-9 justify-between font-normal"
+                    >
+                      <div className="flex items-center gap-1.5 truncate">
+                        <Filter className="w-3.5 h-3.5 shrink-0 text-gray-500" />
+                        <span className="truncate">
+                          {completionWindowFilter.length === 0
+                            ? "All windows"
+                            : completionWindowFilter
+                                .map((w) =>
+                                  w === asyncCompletionWindow
+                                    ? "Async"
+                                    : w === BATCH_COMPLETION_WINDOW
+                                      ? "Batch"
+                                      : w,
+                                )
+                                .join(", ")}
+                        </span>
+                      </div>
+                      <ChevronsUpDown className="ml-1 h-3.5 w-3.5 shrink-0 opacity-50" />
+                    </Button>
+                  </PopoverTrigger>
+                  <PopoverContent className="w-[160px] p-2" align="start">
+                    {(
+                      [
+                        { window: BATCH_COMPLETION_WINDOW, label: "Batch" },
+                        { window: asyncCompletionWindow, label: "Async" },
+                      ] as const
+                    ).map(({ window, label }) => (
+                      <label
+                        key={window}
+                        className="flex items-center gap-2 px-2 py-1.5 text-sm cursor-pointer rounded hover:bg-gray-50"
+                      >
+                        <input
+                          type="checkbox"
+                          checked={completionWindowFilter.includes(window)}
+                          onChange={() => {
+                            setCompletionWindowFilter((prev) =>
+                              prev.includes(window)
+                                ? prev.filter((w) => w !== window)
+                                : [...prev, window],
+                            );
+                            batchesPagination.handleFirstPage();
+                          }}
+                          className="rounded border-gray-300"
+                        />
+                        {label}
+                      </label>
+                    ))}
+                  </PopoverContent>
+                </Popover>
                 {memberFilterCombobox}
                 <Select
                   value={statusFilter}
