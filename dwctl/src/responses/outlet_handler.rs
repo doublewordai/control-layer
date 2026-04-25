@@ -45,7 +45,11 @@ impl FusilladeOutletHandler {
     }
 
     fn header_str<'a>(request: &'a RequestData, name: &str) -> Option<&'a str> {
-        request.headers.get(name).and_then(|values| values.first()).and_then(|bytes| std::str::from_utf8(bytes).ok())
+        request
+            .headers
+            .get(name)
+            .and_then(|values| values.first())
+            .and_then(|bytes| std::str::from_utf8(bytes).ok())
     }
 }
 

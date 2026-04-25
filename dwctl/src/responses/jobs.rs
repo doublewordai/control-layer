@@ -175,7 +175,6 @@ pub struct CompleteResponseInput {
 
     // Fields below are used only when create-response hasn't run yet and
     // we need to synthesize the row ourselves.
-
     /// Pre-generated request UUID (matches `response_id` minus prefix).
     pub request_id: Uuid,
     /// Original request body (JSON string).
