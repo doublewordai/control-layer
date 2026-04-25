@@ -191,6 +191,17 @@ pub async fn build_cascade_batch_state_job<P: sqlx_pool_router::PoolProvider + C
 
 // ---------------------------------------------------------------------------
 
+/// Parse the comma-separated `completion_window` query param into the vec of
+/// values passed to fusillade. Returns `None` (no filter) when the param is
+/// missing or contains only whitespace. Values are forwarded as-is so callers
+/// can match any window string fusillade understands (e.g. `"24h"`, `"1h"`,
+/// `"0s"`, `"7d"`).
+fn parse_completion_window_filter(raw: Option<&str>) -> Option<Vec<String>> {
+    let raw = raw?;
+    let windows: Vec<String> = raw.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect();
+    if windows.is_empty() { None } else { Some(windows) }
+}
+
 /// Check if the current user "owns" a batch, considering org context.
 /// Returns true if the batch creator matches the user's ID or their active organization.
 fn is_batch_owner(current_user: &CurrentUser, created_by: &str) -> bool {
@@ -1622,6 +1633,11 @@ pub async fn list_batches<P: PoolProvider>(
         None
     };
 
+    // Parse the comma-separated `completion_window` filter into the list
+    // passed to fusillade. An empty/whitespace-only param is treated as "no
+    // filter" so callers can send `completion_window=` to disable the default.
+    let completion_windows = parse_completion_window_filter(query.completion_window.as_deref());
+
     // Fetch batches with ownership filtering, search, and cursor-based pagination
     let batches = state
         .request_manager
@@ -1635,7 +1651,7 @@ pub async fn list_batches<P: PoolProvider>(
             created_after: query.created_after,
             created_before: query.created_before,
             active_first: query.active_first,
-            exclude_completion_window: query.exclude_completion_window.clone(),
+            completion_windows,
         })
         .await
         .map_err(|e| Error::Internal {

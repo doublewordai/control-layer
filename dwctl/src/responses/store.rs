@@ -78,6 +78,7 @@ pub async fn request_exists<P: PoolProvider + Clone>(
 /// Carried by `complete-response` so it can create-then-complete when it
 /// races ahead of `create-response`.
 pub struct CreateContext<'a> {
+    pub batch_id: Uuid,
     pub request_id: Uuid,
     pub request_body: &'a str,
     pub model: &'a str,
@@ -128,6 +129,7 @@ pub async fn complete_response_idempotent<P: PoolProvider + Clone>(
             }
             let created_by = lookup_created_by(dwctl_pool, create_ctx.api_key).await;
             let batch_input = fusillade::CreateSingleRequestBatchInput {
+                batch_id: create_ctx.batch_id,
                 request_id: create_ctx.request_id,
                 body: create_ctx.request_body.to_string(),
                 model: create_ctx.model.to_string(),

@@ -328,9 +328,16 @@ pub struct ListBatchesQuery {
     #[serde(default)]
     pub active_first: bool,
 
-    /// Exclude batches with this completion window (e.g., "1h" to hide async batches).
-    /// Applied server-side for accurate pagination.
-    pub exclude_completion_window: Option<String>,
+    /// Comma-separated completion windows to include. Common values:
+    /// - `24h` — long-running batch jobs
+    /// - `1h` — async flex requests
+    /// - `0s` — realtime tracking rows for the Open Responses API
+    ///
+    /// When omitted the server returns batches with any completion window; the
+    /// dashboard sends `completion_window=24h` by default so realtime tracking
+    /// rows don't pollute the Batches view.
+    #[param(example = "24h,1h")]
+    pub completion_window: Option<String>,
 }
 
 /// Query parameters for batch results

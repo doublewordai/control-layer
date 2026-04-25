@@ -37,6 +37,11 @@ impl FusilladeOutletHandler {
         Self::header_str(request, "x-fusillade-request-id").and_then(|s| Uuid::parse_str(s).ok())
     }
 
+    /// Extract the raw fusillade batch UUID from `x-fusillade-batch-id`.
+    fn extract_batch_id(request: &RequestData) -> Option<Uuid> {
+        Self::header_str(request, "x-fusillade-batch-id").and_then(|s| Uuid::parse_str(s).ok())
+    }
+
     /// Extract the bearer token from the Authorization header.
     fn extract_api_key(request: &RequestData) -> Option<String> {
         Self::header_str(request, "authorization")
@@ -85,6 +90,18 @@ impl RequestHandler for FusilladeOutletHandler {
                 }
             };
 
+            // Same story for the batch_id — middleware always sets it alongside
+            // request_id. If it's missing, complete-response would synthesize a
+            // row with a fresh batch_id that doesn't match what create-response
+            // used, breaking the analytics join.
+            let batch_id = match Self::extract_batch_id(&request_data) {
+                Some(id) => id,
+                None => {
+                    tracing::warn!(response_id = %response_id, "Missing x-fusillade-batch-id header on response — skipping enqueue");
+                    return;
+                }
+            };
+
             let status_code = response_data.status.as_u16();
             let response_body = response_data
                 .body
@@ -124,6 +141,7 @@ impl RequestHandler for FusilladeOutletHandler {
                     response_id: response_id.clone(),
                     status_code,
                     response_body,
+                    batch_id,
                     request_id,
                     request_body,
                     model,
