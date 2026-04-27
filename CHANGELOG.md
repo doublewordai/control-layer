@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.44.1](https://github.com/doublewordai/control-layer/compare/v8.44.0...v8.44.1) (2026-04-27)
+
+
+### Bug Fixes
+
+* batch id attribution and completion window filtering ([#1025](https://github.com/doublewordai/control-layer/issues/1025)) ([2928686](https://github.com/doublewordai/control-layer/commit/29286866bbe40991c09b3a601899ca841d23d41b))
+
 ## [8.44.0](https://github.com/doublewordai/control-layer/compare/v8.43.0...v8.44.0) (2026-04-25)
 
 
