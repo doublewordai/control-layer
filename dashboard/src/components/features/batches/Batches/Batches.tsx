@@ -64,10 +64,10 @@ import { ApiExamples } from "../../../modals";
 import { cn } from "@/lib/utils";
 
 // Window strings forwarded as-is to the backend `completion_window` filter.
-// Flex/async uses the configurable async window (default "1h"); regular batch
-// jobs use "24h". Realtime tracking rows ("0s") are intentionally omitted
-// from the UI selector — they're queryable via the API but live on the Async
-// Requests page in the dashboard.
+// Async uses the configurable async window (default "1h"); regular batch jobs
+// use "24h". Realtime tracking rows ("0s") are intentionally omitted from
+// the UI selector — they're queryable via the API but live on the Responses
+// page in the dashboard.
 const BATCH_COMPLETION_WINDOW = "24h";
 
 /**

@@ -65,15 +65,10 @@ impl RequestHandler for FusilladeOutletHandler {
         let job = self.job.clone();
 
         async move {
-            // Skip batch requests — the daemon handles its own completion.
-            // Batch requests have both x-fusillade-request-id and x-fusillade-batch-id.
-            // Realtime requests only have x-fusillade-request-id (set by the
-            // responses middleware for ID override) and should NOT be skipped.
-            if request_data.headers.contains_key("x-fusillade-batch-id") {
-                return;
-            }
-
-            // Check for the onwards response ID header (set by responses middleware)
+            // Only the responses middleware sets `x-onwards-response-id`, so
+            // its absence means this is either a daemon-driven fusillade batch
+            // request (the daemon handles its own completion) or some other
+            // non-responses traffic — nothing for us to do.
             let response_id = match Self::extract_response_id(&request_data) {
                 Some(id) => id,
                 None => return,
