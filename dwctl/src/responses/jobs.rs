@@ -209,57 +209,44 @@ pub async fn build_complete_response_job<P: sqlx_pool_router::PoolProvider + Clo
     Job::<CompleteResponseInput, _>::builder()
         .state(state)
         .step(|cx, input: CompleteResponseInput| async move {
-            if (200..300).contains(&input.status_code) {
-                let create_ctx = response_store::CreateContext {
-                    batch_id: input.batch_id,
-                    request_id: input.request_id,
-                    request_body: &input.request_body,
-                    model: &input.model,
-                    endpoint: &input.endpoint,
-                    base_url: &input.base_url,
-                    api_key: input.api_key.as_deref(),
-                };
-                if let Err(e) = response_store::complete_response_idempotent(
-                    &cx.state.request_manager,
-                    &cx.state.dwctl_pool,
-                    &input.response_id,
-                    &input.response_body,
-                    input.status_code,
-                    create_ctx,
-                )
-                .await
-                {
-                    tracing::error!(
-                        response_id = %input.response_id,
-                        error = %e,
-                        "Failed to complete response in fusillade"
-                    );
-                    return Err(TaskError::Retryable(e.to_string()));
-                }
-
-                tracing::debug!(
+            // Store all responses (success and error) via complete_response_idempotent.
+            // Previously, non-2xx responses used fail_request which hardcoded status 500,
+            // losing the real upstream status code (e.g. 403 became 500). By using
+            // complete_request for all statuses, the actual HTTP status and response
+            // body are preserved for callers to inspect.
+            let create_ctx = response_store::CreateContext {
+                batch_id: input.batch_id,
+                request_id: input.request_id,
+                request_body: &input.request_body,
+                model: &input.model,
+                endpoint: &input.endpoint,
+                base_url: &input.base_url,
+                api_key: input.api_key.as_deref(),
+            };
+            if let Err(e) = response_store::complete_response_idempotent(
+                &cx.state.request_manager,
+                &cx.state.dwctl_pool,
+                &input.response_id,
+                &input.response_body,
+                input.status_code,
+                create_ctx,
+            )
+            .await
+            {
+                tracing::error!(
                     response_id = %input.response_id,
-                    status_code = input.status_code,
-                    body_size = input.response_body.len(),
-                    "Response completed in fusillade"
+                    error = %e,
+                    "Failed to complete response in fusillade"
                 );
-            } else {
-                let error_msg = format!("Upstream returned {}: {}", input.status_code, input.response_body);
-                if let Err(e) = response_store::fail_response(&cx.state.request_manager, &input.response_id, &error_msg).await {
-                    tracing::error!(
-                        response_id = %input.response_id,
-                        error = %e,
-                        "Failed to mark response as failed in fusillade"
-                    );
-                    return Err(TaskError::Retryable(e.to_string()));
-                }
-
-                tracing::debug!(
-                    response_id = %input.response_id,
-                    status_code = input.status_code,
-                    "Response marked as failed in fusillade"
-                );
+                return Err(TaskError::Retryable(e.to_string()));
             }
+
+            tracing::debug!(
+                response_id = %input.response_id,
+                status_code = input.status_code,
+                body_size = input.response_body.len(),
+                "Response completed in fusillade"
+            );
 
             To::done()
         })

@@ -373,7 +373,13 @@ async fn handle_flex<P: PoolProvider + Clone + Send + Sync + 'static>(
                 let status_code = if response_obj["status"].as_str() == Some("completed") {
                     StatusCode::OK
                 } else {
-                    StatusCode::INTERNAL_SERVER_ERROR
+                    // Extract the real HTTP status from the error's code field,
+                    // which is populated by detail_to_response_object from the
+                    // upstream response status.
+                    response_obj["error"]["code"]
+                        .as_u64()
+                        .and_then(|c| StatusCode::from_u16(c as u16).ok())
+                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
                 };
                 (status_code, Json(response_obj)).into_response()
             }

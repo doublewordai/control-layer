@@ -305,6 +305,75 @@ pub async fn create_batch_of_1<P: PoolProvider + Clone>(
     Ok((response_id, request_id))
 }
 
+/// Extract error type and message from an upstream response body and status code.
+///
+/// Tries to parse the body as an OpenAI error envelope (`{"error": {"message": ...}}`).
+/// Falls back to the raw body text with a status-appropriate error type.
+fn extract_upstream_error(status: u16, body: &str) -> (&'static str, String) {
+    // Try OpenAI error envelope: {"error": {"message": "...", "type": "..."}}
+    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(body)
+        && let Some(error) = parsed.get("error")
+    {
+        let message = error.get("message").and_then(|m| m.as_str()).unwrap_or(body);
+        return (status_to_error_type(status, None), message.to_string());
+    }
+    (status_to_error_type(status, None), body.to_string())
+}
+
+/// Extract the error type and message from a fusillade error string.
+///
+/// The error column may contain a serialized `FailureReason` JSON envelope
+/// (e.g. `{"type":"NonRetriableHttpStatus","details":{"status":403,"body":"{...}"}}`).
+/// When the body is an OpenAI-compatible error envelope, unwrap it so callers
+/// see the upstream error directly. Falls back to "server_error" with the raw
+/// string for any other format.
+fn parse_failure_error(err: &str) -> (&'static str, String) {
+    // Try to parse as FailureReason envelope
+    if let Ok(reason) = serde_json::from_str::<serde_json::Value>(err)
+        && let Some(details) = reason.get("details")
+    {
+        let status = details.get("status").and_then(|s| s.as_u64()).unwrap_or(500) as u16;
+        if let Some(body) = details.get("body").and_then(|b| b.as_str()) {
+            // Try to parse the body as an OpenAI error envelope
+            if let Some((error_type, message)) = parse_openai_error(body) {
+                return (status_to_error_type(status, Some(error_type)), message);
+            }
+            // Body isn't OpenAI format — use it directly
+            return (status_to_error_type(status, None), body.to_string());
+        }
+    }
+
+    // Not a FailureReason envelope — try as raw OpenAI error
+    if let Some((_, message)) = parse_openai_error(err) {
+        return ("server_error", message);
+    }
+
+    ("server_error", err.to_string())
+}
+
+/// Try to extract type and message from an OpenAI-compatible error body:
+/// `{"error": {"message": "...", "type": "...", ...}}`
+fn parse_openai_error(body: &str) -> Option<(&'static str, String)> {
+    let parsed: serde_json::Value = serde_json::from_str(body).ok()?;
+    let error = parsed.get("error")?;
+    let message = error.get("message")?.as_str()?;
+    // Return a placeholder type — the caller uses the HTTP status to pick the real one
+    Some(("_parsed", message.to_string()))
+}
+
+/// Map an HTTP status code to an Open Responses API error type.
+fn status_to_error_type(status: u16, _parsed_type: Option<&str>) -> &'static str {
+    match status {
+        400 => "invalid_request_error",
+        401 => "authentication_error",
+        402 => "insufficient_credits",
+        403 => "permission_error",
+        404 => "not_found_error",
+        429 => "rate_limit_error",
+        _ => "server_error",
+    }
+}
+
 /// Parse a response ID like "resp_<uuid>" into a UUID.
 fn parse_response_id(response_id: &str) -> Result<Uuid, StoreError> {
     let uuid_str = response_id.strip_prefix("resp_").unwrap_or(response_id);
@@ -346,7 +415,23 @@ fn detail_to_response_object(detail: &fusillade::RequestDetail) -> serde_json::V
     });
 
     if status == "completed" {
-        if let Some(ref body) = detail.response_body
+        let response_status = detail.response_status.unwrap_or(200) as u16;
+        let is_error_response = response_status >= 400;
+
+        if is_error_response {
+            // Non-2xx responses stored via complete_request preserve the real
+            // upstream status and body. Surface the error to callers instead
+            // of treating it as a successful completion.
+            resp["status"] = serde_json::json!("failed");
+            if let Some(ref body) = detail.response_body {
+                let (error_type, message) = extract_upstream_error(response_status, body);
+                resp["error"] = serde_json::json!({
+                    "type": error_type,
+                    "code": response_status,
+                    "message": message,
+                });
+            }
+        } else if let Some(ref body) = detail.response_body
             && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(body)
         {
             if let Some(output) = parsed.get("output") {
@@ -370,9 +455,13 @@ fn detail_to_response_object(detail: &fusillade::RequestDetail) -> serde_json::V
     if status == "failed"
         && let Some(ref err) = detail.error
     {
+        // Legacy path: errors stored via fail_request have the error in the
+        // `error` column. Try to parse structured FailureReason to extract the
+        // real error body instead of showing raw serialized JSON.
+        let (error_type, message) = parse_failure_error(err);
         resp["error"] = serde_json::json!({
-            "type": "server_error",
-            "message": err,
+            "type": error_type,
+            "message": message,
         });
     }
 
@@ -443,5 +532,64 @@ mod tests {
         let response = serde_json::json!({"status": "completed"});
         let id = response.get("id").and_then(|v| v.as_str()).unwrap_or("");
         assert_eq!(id, "");
+    }
+
+    #[test]
+    fn test_extract_upstream_error_openai_format() {
+        let body = r#"{"error":{"message":"Forbidden","type":"invalid_request_error","param":null,"code":"forbidden"}}"#;
+        let (error_type, message) = extract_upstream_error(403, body);
+        assert_eq!(error_type, "permission_error");
+        assert_eq!(message, "Forbidden");
+    }
+
+    #[test]
+    fn test_extract_upstream_error_rate_limit() {
+        let body = r#"{"error":{"message":"Rate limit exceeded","type":"rate_limit_error","code":"rate_limit"}}"#;
+        let (error_type, message) = extract_upstream_error(429, body);
+        assert_eq!(error_type, "rate_limit_error");
+        assert_eq!(message, "Rate limit exceeded");
+    }
+
+    #[test]
+    fn test_extract_upstream_error_plain_text() {
+        let (error_type, message) = extract_upstream_error(402, "Account balance too low");
+        assert_eq!(error_type, "insufficient_credits");
+        assert_eq!(message, "Account balance too low");
+    }
+
+    #[test]
+    fn test_extract_upstream_error_server_error() {
+        let body = r#"{"error":{"message":"Internal error"}}"#;
+        let (error_type, message) = extract_upstream_error(500, body);
+        assert_eq!(error_type, "server_error");
+        assert_eq!(message, "Internal error");
+    }
+
+    #[test]
+    fn test_parse_failure_error_legacy_format() {
+        // Legacy FailureReason envelope with OpenAI body
+        let err = r#"{"type":"NonRetriableHttpStatus","details":{"status":403,"body":"{\"error\":{\"message\":\"Forbidden\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":\"forbidden\"}}"}}"#;
+        let (error_type, message) = parse_failure_error(err);
+        assert_eq!(error_type, "permission_error");
+        assert_eq!(message, "Forbidden");
+    }
+
+    #[test]
+    fn test_parse_failure_error_plain_string() {
+        let (error_type, message) = parse_failure_error("some unknown error");
+        assert_eq!(error_type, "server_error");
+        assert_eq!(message, "some unknown error");
+    }
+
+    #[test]
+    fn test_status_to_error_type_mapping() {
+        assert_eq!(status_to_error_type(400, None), "invalid_request_error");
+        assert_eq!(status_to_error_type(401, None), "authentication_error");
+        assert_eq!(status_to_error_type(402, None), "insufficient_credits");
+        assert_eq!(status_to_error_type(403, None), "permission_error");
+        assert_eq!(status_to_error_type(404, None), "not_found_error");
+        assert_eq!(status_to_error_type(429, None), "rate_limit_error");
+        assert_eq!(status_to_error_type(500, None), "server_error");
+        assert_eq!(status_to_error_type(503, None), "server_error");
     }
 }
