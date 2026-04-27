@@ -283,8 +283,10 @@ async fn handle_realtime<P: PoolProvider + Clone + Send + Sync + 'static>(
     // x-fusillade-batch-id wires this realtime tracking row up to its
     // http_analytics row so total_cost / token aggregates show up in the
     // Batches view (analytics_handler reads this header).
-    req.headers_mut()
-        .insert("x-fusillade-batch-id", batch_id.to_string().parse().expect("batch_id is valid header value"));
+    req.headers_mut().insert(
+        "x-fusillade-batch-id",
+        batch_id.to_string().parse().expect("batch_id is valid header value"),
+    );
     req.headers_mut().insert(
         ONWARDS_RESPONSE_ID_HEADER,
         resp_id.parse().expect("response_id is valid header value"),
