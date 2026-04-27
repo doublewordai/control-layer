@@ -118,4 +118,86 @@ mod tests {
         // Should be empty when no requests exist
         assert_eq!(counts.len(), 0, "Should have no pending requests");
     }
+
+    #[sqlx::test]
+    async fn test_pending_request_counts_excludes_priority_service_tier(pool: PgPool) {
+        use fusillade::{CreateSingleRequestBatchInput, Storage};
+        use sqlx::postgres::PgConnectOptions;
+        use sqlx_pool_router::TestDbPools;
+
+        let (server, _bg): (TestServer, _) = create_test_app(pool.clone(), false).await;
+        let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+
+        // Connect a request_manager to the same `fusillade` schema the app
+        // uses. Migrations are already run by the app's setup_database.
+        let base_opts: PgConnectOptions = pool.connect_options().as_ref().clone();
+        let fusillade_pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .min_connections(0)
+            .connect_with(base_opts.options([("search_path", "fusillade")]))
+            .await
+            .expect("Failed to create fusillade pool");
+        let fusillade_pools = TestDbPools::new(fusillade_pool.clone()).await.expect("TestDbPools");
+        let request_manager = fusillade::PostgresRequestManager::new(fusillade_pools, Default::default());
+
+        // Create three single-request batches for the same model with
+        // different completion windows. fusillade derives service_tier from
+        // completion_window:
+        //   "24h" → service_tier IS NULL (batch tier — counted)
+        //   "1h"  → service_tier = 'flex'   (counted)
+        //   "0s"  → service_tier = 'priority' (EXCLUDED — managed externally)
+        let model = "test-model";
+        let mut batch_ids = Vec::new();
+        for completion_window in ["24h", "1h", "0s"] {
+            let batch_id = uuid::Uuid::new_v4();
+            request_manager
+                .create_single_request_batch(CreateSingleRequestBatchInput {
+                    batch_id: Some(batch_id),
+                    request_id: uuid::Uuid::new_v4(),
+                    body: r#"{"input":"x"}"#.to_string(),
+                    model: model.to_string(),
+                    base_url: "http://localhost".to_string(),
+                    endpoint: "/v1/chat/completions".to_string(),
+                    completion_window: completion_window.to_string(),
+                    initial_state: "pending".to_string(),
+                    api_key: None,
+                    created_by: None,
+                })
+                .await
+                .expect("create single-request batch");
+            batch_ids.push(batch_id);
+        }
+
+        // Pin all expires_at into the configured 24h window so the deadline
+        // predicate matches deterministically regardless of the original
+        // completion_window.
+        for batch_id in &batch_ids {
+            sqlx::query("UPDATE batches SET expires_at = NOW() + interval '30 minutes' WHERE id = $1")
+                .bind(batch_id)
+                .execute(&fusillade_pool)
+                .await
+                .expect("pin expires_at");
+        }
+
+        let response = server
+            .get("/admin/api/v1/monitoring/pending-request-counts")
+            .add_header(&add_auth_headers(&admin)[0].0, &add_auth_headers(&admin)[0].1)
+            .add_header(&add_auth_headers(&admin)[1].0, &add_auth_headers(&admin)[1].1)
+            .await;
+
+        response.assert_status_ok();
+        let counts: HashMap<String, HashMap<String, i64>> = response.json();
+
+        // The default test config queries the "24h" window only. All three
+        // batches expire in 30 min so they all fall inside it. Priority must
+        // be excluded; batch + flex remain.
+        let model_counts = counts
+            .get(model)
+            .unwrap_or_else(|| panic!("expected '{model}' in response, got {counts:?}"));
+        let count_24h = *model_counts.get("24h").unwrap_or(&0);
+        assert_eq!(
+            count_24h, 2,
+            "expected 2 (batch + flex) within 24h window — priority must be excluded; got {count_24h} ({model_counts:?})"
+        );
+    }
 }
