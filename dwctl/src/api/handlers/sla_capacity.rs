@@ -190,6 +190,7 @@ pub(crate) async fn reserve_capacity<P: sqlx_pool_router::PoolProvider>(
 ) -> Result<Vec<Uuid>, CapacityError> {
     use crate::db::handlers::BatchCapacityReservations;
     use fusillade::Storage;
+    use fusillade::request::ServiceTierFilter;
 
     let mut tx = dwctl_pool
         .begin()
@@ -230,8 +231,17 @@ pub(crate) async fn reserve_capacity<P: sqlx_pool_router::PoolProvider>(
     let states = vec!["pending".to_string(), "claimed".to_string(), "processing".to_string()];
     let model_filter: Vec<String> = input.file_model_counts.keys().cloned().collect();
 
+    // Exclude realtime (`priority`) requests: they're processed externally
+    // (not via the fusillade daemon) and should not consume batch capacity
+    // when admitting new batches.
     let pending_counts: HashMap<String, HashMap<String, i64>> = request_manager
-        .get_pending_request_counts_by_model_and_window(&windows, &states, &model_filter, true)
+        .get_pending_request_counts_by_model_and_window(
+            &windows,
+            &states,
+            &model_filter,
+            &ServiceTierFilter::Exclude(vec![Some("priority".to_string())]),
+            true,
+        )
         .await
         .map_err(|e| CapacityError::Internal(format!("get pending counts: {e}")))?;
 

@@ -4,6 +4,7 @@
 
 use axum::{extract::State, response::Json};
 use fusillade::Storage;
+use fusillade::request::ServiceTierFilter;
 use sqlx_pool_router::PoolProvider;
 use std::collections::HashMap;
 
@@ -25,6 +26,9 @@ type PendingCountsByModelAndWindow = HashMap<String, HashMap<String, i64>>;
 /// - Escalated requests (racing duplicate requests)
 /// - Requests without a template_id
 /// - Requests in batches being cancelled
+/// - Realtime requests (`service_tier = 'priority'`), which are managed
+///   externally rather than by the fusillade daemon and so should not drive
+///   GPU scheduling decisions.
 ///
 /// Useful for monitoring queue depth and load distribution across models.
 #[utoipa::path(
@@ -52,10 +56,17 @@ pub async fn get_pending_request_counts<P: PoolProvider>(
         .collect::<Vec<_>>();
     let states = vec!["pending".to_string(), "claimed".to_string(), "processing".to_string()]; // Include claimed and processing to get a more complete picture of queue depth
     let model_filter: Vec<String> = Vec::new();
+    let service_tier_filter = ServiceTierFilter::Exclude(vec![Some("priority".to_string())]);
 
     let counts = state
         .request_manager
-        .get_pending_request_counts_by_model_and_window(&windows, &states, &model_filter, false)
+        .get_pending_request_counts_by_model_and_window(
+            &windows,
+            &states,
+            &model_filter,
+            &service_tier_filter,
+            false,
+        )
         .await
         .map_err(|e| Error::Internal {
             operation: format!("get pending request counts: {}", e),
