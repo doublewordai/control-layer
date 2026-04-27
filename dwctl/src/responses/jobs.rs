@@ -109,7 +109,7 @@ pub async fn build_create_response_job<P: sqlx_pool_router::PoolProvider + Clone
             );
 
             let batch_input = fusillade::CreateSingleRequestBatchInput {
-                batch_id: input.batch_id,
+                batch_id: Some(input.batch_id),
                 request_id: input.request_id,
                 body: input.body,
                 model: input.model.clone(),

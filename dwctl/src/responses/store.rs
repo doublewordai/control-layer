@@ -129,7 +129,7 @@ pub async fn complete_response_idempotent<P: PoolProvider + Clone>(
             }
             let created_by = lookup_created_by(dwctl_pool, create_ctx.api_key).await;
             let batch_input = fusillade::CreateSingleRequestBatchInput {
-                batch_id: create_ctx.batch_id,
+                batch_id: Some(create_ctx.batch_id),
                 request_id: create_ctx.request_id,
                 body: create_ctx.request_body.to_string(),
                 model: create_ctx.model.to_string(),

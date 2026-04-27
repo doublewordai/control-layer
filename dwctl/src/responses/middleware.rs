@@ -170,7 +170,7 @@ pub async fn responses_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     };
 
     let batch_input = fusillade::CreateSingleRequestBatchInput {
-        batch_id,
+        batch_id: Some(batch_id),
         request_id,
         body: request_value.to_string(),
         model: model.to_string(),
@@ -236,8 +236,10 @@ async fn handle_realtime<P: PoolProvider + Clone + Send + Sync + 'static>(
 
     // Capture batch_id and endpoint before consuming batch_input — both flow
     // downstream as request headers (batch_id for analytics association, the
-    // endpoint so the outlet handler can synthesize the row on race).
-    let batch_id = batch_input.batch_id;
+    // endpoint so the outlet handler can synthesize the row on race). The
+    // middleware always sets `Some(...)`, but the field is optional to keep
+    // fusillade's API friendly for callers that don't need a pre-generated id.
+    let batch_id = batch_input.batch_id.expect("responses middleware always sets Some(batch_id)");
     let endpoint_for_header = batch_input.endpoint.clone();
 
     if background {
@@ -252,7 +254,7 @@ async fn handle_realtime<P: PoolProvider + Clone + Send + Sync + 'static>(
         // between proxying and the DB insert still leaves a retryable record.
         // The job resolves attribution and calls create_single_request_batch.
         let job_input = CreateResponseInput {
-            batch_id: batch_input.batch_id,
+            batch_id,
             request_id: batch_input.request_id,
             body: batch_input.body,
             model: batch_input.model,
