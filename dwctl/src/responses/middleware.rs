@@ -183,7 +183,7 @@ pub async fn responses_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     };
 
     match service_tier {
-        ServiceTier::Realtime => handle_realtime(&state, batch_input, &resp_id, model, background, parts, body_bytes, next).await,
+        ServiceTier::Realtime => handle_realtime(&state, batch_input, batch_id, &resp_id, model, background, parts, body_bytes, next).await,
         ServiceTier::Flex => handle_flex(&state, batch_input, &resp_id, model, background).await,
     }
 }
@@ -225,6 +225,7 @@ fn resolve_service_tier(tier: Option<&str>) -> ServiceTier {
 async fn handle_realtime<P: PoolProvider + Clone + Send + Sync + 'static>(
     state: &ResponsesMiddlewareState<P>,
     batch_input: fusillade::CreateSingleRequestBatchInput,
+    batch_id: uuid::Uuid,
     resp_id: &str,
     model: &str,
     background: bool,
@@ -234,12 +235,10 @@ async fn handle_realtime<P: PoolProvider + Clone + Send + Sync + 'static>(
 ) -> Response {
     let rm = state.request_manager.clone();
 
-    // Capture batch_id and endpoint before consuming batch_input — both flow
-    // downstream as request headers (batch_id for analytics association, the
-    // endpoint so the outlet handler can synthesize the row on race). The
-    // middleware always sets `Some(...)`, but the field is optional to keep
-    // fusillade's API friendly for callers that don't need a pre-generated id.
-    let batch_id = batch_input.batch_id.expect("responses middleware always sets Some(batch_id)");
+    // batch_id is passed in explicitly (rather than re-extracted from
+    // batch_input) so the type system enforces its presence — fusillade's
+    // `batch_id` field is `Option<Uuid>` to keep its API friendly for callers
+    // that don't need a pre-generated id, but here we always have one.
     let endpoint_for_header = batch_input.endpoint.clone();
 
     if background {

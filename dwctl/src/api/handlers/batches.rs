@@ -1860,6 +1860,7 @@ pub async fn list_batches<P: PoolProvider>(
 
 #[cfg(test)]
 mod tests {
+    use super::parse_completion_window_filter;
     use crate::api::models::batches::CreateBatchRequest;
     use crate::api::models::users::Role;
     use crate::db::handlers::Credits;
@@ -1872,6 +1873,49 @@ mod tests {
     use sqlx::PgPool;
     use std::collections::HashMap;
     use uuid::Uuid;
+
+    // -------------------------------------------------------------------------
+    // parse_completion_window_filter — pure parsing, no DB needed.
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn parse_completion_window_filter_returns_none_when_param_missing() {
+        assert_eq!(parse_completion_window_filter(None), None);
+    }
+
+    #[test]
+    fn parse_completion_window_filter_returns_none_when_param_empty() {
+        assert_eq!(parse_completion_window_filter(Some("")), None);
+    }
+
+    #[test]
+    fn parse_completion_window_filter_returns_none_when_param_whitespace_only() {
+        assert_eq!(parse_completion_window_filter(Some("   \t  ")), None);
+    }
+
+    #[test]
+    fn parse_completion_window_filter_parses_single_value() {
+        assert_eq!(
+            parse_completion_window_filter(Some("24h")),
+            Some(vec!["24h".to_string()])
+        );
+    }
+
+    #[test]
+    fn parse_completion_window_filter_parses_comma_separated_values() {
+        assert_eq!(
+            parse_completion_window_filter(Some("24h,1h")),
+            Some(vec!["24h".to_string(), "1h".to_string()])
+        );
+    }
+
+    #[test]
+    fn parse_completion_window_filter_trims_and_drops_empty_entries() {
+        assert_eq!(
+            parse_completion_window_filter(Some(" 24h , , 1h ,   ")),
+            Some(vec!["24h".to_string(), "1h".to_string()])
+        );
+    }
 
     #[sqlx::test]
     #[test_log::test]
