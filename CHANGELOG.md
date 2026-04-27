@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.44.2](https://github.com/doublewordai/control-layer/compare/v8.44.1...v8.44.2) (2026-04-27)
+
+
+### Bug Fixes
+
+* filter priority from queue metrics ([#1029](https://github.com/doublewordai/control-layer/issues/1029)) ([89c92d5](https://github.com/doublewordai/control-layer/commit/89c92d57c6151e5e26818abd5b93c91a6e68db7d))
+
 ## [8.44.1](https://github.com/doublewordai/control-layer/compare/v8.44.0...v8.44.1) (2026-04-27)
 
 
