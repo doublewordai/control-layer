@@ -310,20 +310,21 @@ pub async fn create_batch_of_1<P: PoolProvider + Clone>(
 /// Tries to parse the body as an OpenAI error envelope (`{"error": {"message": ...}}`).
 /// Falls back to the raw body text with a status-appropriate error type.
 fn extract_upstream_error(status: u16, body: &str) -> (&'static str, String) {
-    // Try OpenAI error envelope: {"error": {"message": "...", "type": "..."}}
-    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(body)
-        && let Some(error) = parsed.get("error")
-    {
-        let message = error.get("message").and_then(|m| m.as_str()).unwrap_or(body);
-        return (status_to_error_type(status, None), message.to_string());
+    if let Some(message) = parse_openai_error(body) {
+        return (status_to_error_type(status), message);
     }
-    (status_to_error_type(status, None), body.to_string())
+    (status_to_error_type(status), body.to_string())
 }
 
 /// Extract the error type and message from a fusillade error string.
 ///
-/// The error column may contain a serialized `FailureReason` JSON envelope
-/// (e.g. `{"type":"NonRetriableHttpStatus","details":{"status":403,"body":"{...}"}}`).
+/// The error column may contain:
+/// 1. A serialized `FailureReason` JSON envelope
+///    (e.g. `{"type":"NonRetriableHttpStatus","details":{"status":403,"body":"{...}"}}`)
+/// 2. A legacy "Upstream returned {status}: {body}" string
+/// 3. A raw OpenAI error envelope
+/// 4. Plain text
+///
 /// When the body is an OpenAI-compatible error envelope, unwrap it so callers
 /// see the upstream error directly. Falls back to "server_error" with the raw
 /// string for any other format.
@@ -334,35 +335,44 @@ fn parse_failure_error(err: &str) -> (&'static str, String) {
     {
         let status = details.get("status").and_then(|s| s.as_u64()).unwrap_or(500) as u16;
         if let Some(body) = details.get("body").and_then(|b| b.as_str()) {
-            // Try to parse the body as an OpenAI error envelope
-            if let Some((error_type, message)) = parse_openai_error(body) {
-                return (status_to_error_type(status, Some(error_type)), message);
+            if let Some(message) = parse_openai_error(body) {
+                return (status_to_error_type(status), message);
             }
-            // Body isn't OpenAI format — use it directly
-            return (status_to_error_type(status, None), body.to_string());
+            return (status_to_error_type(status), body.to_string());
         }
     }
 
+    // Try legacy "Upstream returned {status}: {body}" format
+    if let Some(rest) = err.strip_prefix("Upstream returned ")
+        && let Some(colon_pos) = rest.find(": ")
+        && let Ok(status) = rest[..colon_pos].parse::<u16>()
+    {
+        let body = &rest[colon_pos + 2..];
+        if let Some(message) = parse_openai_error(body) {
+            return (status_to_error_type(status), message);
+        }
+        return (status_to_error_type(status), body.to_string());
+    }
+
     // Not a FailureReason envelope — try as raw OpenAI error
-    if let Some((_, message)) = parse_openai_error(err) {
+    if let Some(message) = parse_openai_error(err) {
         return ("server_error", message);
     }
 
     ("server_error", err.to_string())
 }
 
-/// Try to extract type and message from an OpenAI-compatible error body:
+/// Try to extract the message from an OpenAI-compatible error body:
 /// `{"error": {"message": "...", "type": "...", ...}}`
-fn parse_openai_error(body: &str) -> Option<(&'static str, String)> {
+fn parse_openai_error(body: &str) -> Option<String> {
     let parsed: serde_json::Value = serde_json::from_str(body).ok()?;
     let error = parsed.get("error")?;
     let message = error.get("message")?.as_str()?;
-    // Return a placeholder type — the caller uses the HTTP status to pick the real one
-    Some(("_parsed", message.to_string()))
+    Some(message.to_string())
 }
 
 /// Map an HTTP status code to an Open Responses API error type.
-fn status_to_error_type(status: u16, _parsed_type: Option<&str>) -> &'static str {
+fn status_to_error_type(status: u16) -> &'static str {
     match status {
         400 => "invalid_request_error",
         401 => "authentication_error",
@@ -582,14 +592,24 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_failure_error_legacy_upstream_returned_format() {
+        // Legacy format: "Upstream returned {status}: {body}"
+        let err =
+            r#"Upstream returned 403: {"error":{"message":"Forbidden","type":"invalid_request_error","param":null,"code":"forbidden"}}"#;
+        let (error_type, message) = parse_failure_error(err);
+        assert_eq!(error_type, "permission_error");
+        assert_eq!(message, "Forbidden");
+    }
+
+    #[test]
     fn test_status_to_error_type_mapping() {
-        assert_eq!(status_to_error_type(400, None), "invalid_request_error");
-        assert_eq!(status_to_error_type(401, None), "authentication_error");
-        assert_eq!(status_to_error_type(402, None), "insufficient_credits");
-        assert_eq!(status_to_error_type(403, None), "permission_error");
-        assert_eq!(status_to_error_type(404, None), "not_found_error");
-        assert_eq!(status_to_error_type(429, None), "rate_limit_error");
-        assert_eq!(status_to_error_type(500, None), "server_error");
-        assert_eq!(status_to_error_type(503, None), "server_error");
+        assert_eq!(status_to_error_type(400), "invalid_request_error");
+        assert_eq!(status_to_error_type(401), "authentication_error");
+        assert_eq!(status_to_error_type(402), "insufficient_credits");
+        assert_eq!(status_to_error_type(403), "permission_error");
+        assert_eq!(status_to_error_type(404), "not_found_error");
+        assert_eq!(status_to_error_type(429), "rate_limit_error");
+        assert_eq!(status_to_error_type(500), "server_error");
+        assert_eq!(status_to_error_type(503), "server_error");
     }
 }
