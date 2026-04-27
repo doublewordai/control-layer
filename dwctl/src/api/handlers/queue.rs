@@ -60,13 +60,7 @@ pub async fn get_pending_request_counts<P: PoolProvider>(
 
     let counts = state
         .request_manager
-        .get_pending_request_counts_by_model_and_window(
-            &windows,
-            &states,
-            &model_filter,
-            &service_tier_filter,
-            false,
-        )
+        .get_pending_request_counts_by_model_and_window(&windows, &states, &model_filter, &service_tier_filter, false)
         .await
         .map_err(|e| Error::Internal {
             operation: format!("get pending request counts: {}", e),
