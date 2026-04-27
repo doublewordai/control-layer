@@ -57,9 +57,6 @@ const ApiExamplesModal: React.FC<ApiExamplesModalProps> = ({
 }) => {
   const [selectedLanguage, setSelectedLanguage] = useState<Language>("python");
   const [exampleType, setExampleType] = useState<ExampleType>(defaultTab);
-  const [asyncMethod, setAsyncMethod] = useState<"autobatcher" | "jsonl">(
-    "autobatcher",
-  );
   const [selectedModelId, setSelectedModelId] = useState<string>(
     initialModel?.id || "",
   );
@@ -122,10 +119,13 @@ const ApiExamplesModal: React.FC<ApiExamplesModalProps> = ({
     [allModels],
   );
 
-  // Completion window is determined by tab — async uses configured window
+  // Async window is informational only (shown in the tab aria-label) — the
+  // Async tab now drives an Open Responses + service_tier="flex" snippet
+  // rather than a JSONL workflow with a different completion_window.
   const asyncWindow =
     config?.batches?.async_requests?.completion_window ?? "1h";
-  const completionWindow = exampleType === "async" ? asyncWindow : "24h";
+
+  const isEmbeddingsModel = model?.model_type?.toLowerCase() === "embeddings";
 
   const createApiKeyMutation = useCreateApiKey();
 
@@ -168,9 +168,6 @@ const ApiExamplesModal: React.FC<ApiExamplesModalProps> = ({
     }
   };
 
-  const isEmbeddingsModel =
-    model?.model_type?.toLowerCase() === "embeddings";
-
   const getExampleJsonl = () => {
     const modelAlias = model?.alias || "model-name";
     if (isEmbeddingsModel) {
@@ -202,53 +199,76 @@ const ApiExamplesModal: React.FC<ApiExamplesModalProps> = ({
     return base.endsWith("/v1") ? base : `${base}/v1`;
   };
 
-  const generateAutobatcherCode = (language: Language) => {
+  /** Open Responses snippet with `service_tier="flex"` and `background=True`,
+   *  including a poll loop until the request reaches a terminal state. Used
+   *  for the Async tab — distinct from Batch's JSONL workflow. */
+  const generateAsyncResponsesCode = (language: Language): string => {
     const keyValue = apiKey || "your-api-key-here";
     const modelAlias = model?.alias || "model-name";
+
     if (language === "python") {
-      return `import asyncio
-from autobatcher import AsyncOpenAI
+      return `from openai import OpenAI
+from time import sleep
 
+client = OpenAI(
+    api_key="${keyValue}",
+    base_url="${getBaseUrl()}"
+)
 
-async def main():
-    client = AsyncOpenAI(api_key="${keyValue}")
+resp = client.responses.create(
+    model="${modelAlias}",
+    input="Write a very long novel about otters in space.",
+    service_tier="flex",
+    background=True,
+)
 
-    response = await client.chat.completions.create(
-        model="${modelAlias}",
-        messages=[{"role": "user", "content": "Explain quantum computing"}],
-    )
+while resp.status in {"queued", "in_progress"}:
+    print(f"Current status: {resp.status}")
+    sleep(2)
+    resp = client.responses.retrieve(resp.id)
 
-    print(response.choices[0].message.content)
+print(f"Final status: {resp.status}\\nOutput:\\n{resp.output_text}")`;
+    }
 
-
-asyncio.run(main())`;
-    } else if (language === "javascript") {
+    if (language === "javascript") {
       return `import OpenAI from 'openai';
 
 const client = new OpenAI({
-    baseURL: '${getBaseUrl()}',
-    apiKey: '${keyValue}'
+    apiKey: '${keyValue}',
+    baseURL: '${getBaseUrl()}'
 });
 
-const response = await client.chat.completions.create({
+let resp = await client.responses.create({
     model: '${modelAlias}',
-    messages: [
-        { role: 'user', content: 'Explain quantum computing' }
-    ]
+    input: 'Write a very long novel about otters in space.',
+    service_tier: 'flex',
+    background: true,
 });
 
-console.log(response.choices[0].message.content);`;
-    } else {
-      return `curl ${getBaseUrl()}/chat/completions \\
-  -H "Content-Type: application/json" \\
+while (['queued', 'in_progress'].includes(resp.status)) {
+    console.log(\`Current status: \${resp.status}\`);
+    await new Promise((r) => setTimeout(r, 2000));
+    resp = await client.responses.retrieve(resp.id);
+}
+
+console.log(\`Final status: \${resp.status}\\nOutput:\\n\${resp.output_text}\`);`;
+    }
+
+    // curl
+    return `# Submit a background flex response — capture the id from the response body
+curl ${getBaseUrl()}/responses \\
   -H "Authorization: Bearer ${keyValue}" \\
+  -H "Content-Type: application/json" \\
   -d '{
     "model": "${modelAlias}",
-    "messages": [
-      {"role": "user", "content": "Explain quantum computing"}
-    ]
-  }'`;
-    }
+    "input": "Write a very long novel about otters in space.",
+    "service_tier": "flex",
+    "background": true
+  }'
+
+# Poll until terminal (replace YOUR_RESP_ID with the id returned above)
+curl ${getBaseUrl()}/responses/YOUR_RESP_ID \\
+  -H "Authorization: Bearer ${keyValue}"`;
   };
 
   const generateBatchApiCode = (language: Language) => {
@@ -277,7 +297,7 @@ print(f"File ID: {batch_file.id}")
 batch = client.batches.create(
     input_file_id=batch_file.id,
     endpoint="${batchEndpoint}",
-    completion_window="${completionWindow}"
+    completion_window="24h"
 )
 
 print(f"Batch ID: {batch.id}")
@@ -308,7 +328,7 @@ async function runBatch() {
     const batch = await client.batches.create({
         input_file_id: batchFile.id,
         endpoint: '${batchEndpoint}',
-        completion_window: '${completionWindow}'
+        completion_window: '24h'
     });
 
     console.log('Batch ID:', batch.id);
@@ -333,7 +353,7 @@ curl ${getBaseUrl().replace("/v1", "")}/ai/v1/batches \\
   -d '{
     "input_file_id": "YOUR_FILE_ID",
     "endpoint": "${batchEndpoint}",
-    "completion_window": "${completionWindow}"
+    "completion_window": "24h"
   }'
 
 # Step 3: Check batch status (use the batch ID from step 2)
@@ -386,6 +406,7 @@ client = OpenAI(
     base_url="${getBaseUrl()}"
 )
 
+# Or use client.responses.create(...) if you prefer the Open Responses API
 response = client.chat.completions.create(
     model="${model.alias}",
     messages=[
@@ -439,6 +460,7 @@ const client = new OpenAI({
     baseURL: '${getBaseUrl()}'
 });
 
+// Or use client.responses.create(...) if you prefer the Open Responses API
 const response = await client.chat.completions.create({
     model: '${model.alias}',
     messages: [
@@ -470,7 +492,8 @@ console.log(response.choices[0].message.content);`;
     "documents": ["Paris is the capital of France.", "London is the capital of England."]
   }'`;
     }
-    return `curl ${getBaseUrl()}/chat/completions \\
+    return `# Or POST to ${getBaseUrl()}/responses if you prefer the Open Responses API
+curl ${getBaseUrl()}/chat/completions \\
   -H "Authorization: Bearer ${keyValue}" \\
   -H "Content-Type: application/json" \\
   -d '{
@@ -485,15 +508,14 @@ console.log(response.choices[0].message.content);`;
   };
 
   const getCurrentCode = () => {
-    if (isAutobatcher) {
-      return generateAutobatcherCode("python");
-    }
-    if (exampleType === "batch" || exampleType === "async") {
+    if (exampleType === "batch") {
       return generateBatchApiCode(selectedLanguage);
+    }
+    if (exampleType === "async") {
+      return generateAsyncResponsesCode(selectedLanguage);
     }
 
     if (!model) return "";
-
     const modelType = (model.model_type?.toLowerCase() || "chat") as ModelType;
 
     switch (selectedLanguage) {
@@ -547,8 +569,6 @@ console.log(response.choices[0].message.content);`;
     }
   };
 
-  const isAutobatcher = exampleType === "async" && asyncMethod === "autobatcher";
-
   return (
     <Dialog open={isOpen} onOpenChange={onClose}>
       <DialogContent className="sm:max-w-4xl max-h-[90vh] overflow-y-auto overflow-x-hidden">
@@ -583,154 +603,95 @@ console.log(response.choices[0].message.content);`;
 
         {model && (
           <div className="w-full overflow-hidden">
-            {/* Example Type Selection — Three tabs + async method selector */}
-            <div className="mb-6">
-              <div className="flex items-center justify-between">
-                <ToggleGroup
-                  type="single"
-                  value={exampleType}
-                  onValueChange={(value) =>
-                    value && setExampleType(value as ExampleType)
-                  }
-                  className="inline-flex"
-                  variant="outline"
-                  size="sm"
-                >
-                  {!isBatchDenied(model) && (
-                    <ToggleGroupItem
-                      value="batch"
-                      aria-label="Batch API (24h)"
-                      className="px-5 py-1.5"
-                    >
-                      Batch
-                    </ToggleGroupItem>
-                  )}
-                  {!isBatchDenied(model) && config?.batches?.async_requests?.enabled && (
-                    <ToggleGroupItem
-                      value="async"
-                      aria-label={`Async API (${asyncWindow})`}
-                      className="px-5 py-1.5"
-                    >
-                      Async
-                    </ToggleGroupItem>
-                  )}
-                  {!isRealtimeDenied(model) && (
-                    <ToggleGroupItem
-                      value="realtime"
-                      aria-label="Realtime API"
-                      className="px-5 py-1.5"
-                    >
-                      Realtime
-                    </ToggleGroupItem>
-                  )}
-                </ToggleGroup>
-
-                {/* Async method selector — inline on the right */}
-                {exampleType === "async" && (
-                  <div className="flex items-center gap-2">
-                    <ToggleGroup
-                      type="single"
-                      value={asyncMethod}
-                      onValueChange={(value) =>
-                        value && setAsyncMethod(value as "autobatcher" | "jsonl")
-                      }
-                      className="inline-flex"
-                      variant="outline"
-                      size="sm"
-                    >
-                      <ToggleGroupItem
-                        value="autobatcher"
-                        aria-label="Autobatcher"
-                        className="px-4 py-1.5"
-                      >
-                        Autobatcher
-                      </ToggleGroupItem>
-                      <ToggleGroupItem
-                        value="jsonl"
-                        aria-label="JSONL"
-                        className="px-4 py-1.5"
-                      >
-                        JSONL
-                      </ToggleGroupItem>
-                    </ToggleGroup>
-                  </div>
+            {/* Tab selector — Batch / Async / Realtime */}
+            <div className="mb-4">
+              <ToggleGroup
+                type="single"
+                value={exampleType}
+                onValueChange={(value) =>
+                  value && setExampleType(value as ExampleType)
+                }
+                className="inline-flex"
+                variant="outline"
+                size="sm"
+              >
+                {!isBatchDenied(model) && (
+                  <ToggleGroupItem
+                    value="batch"
+                    aria-label="Batch API (24h)"
+                    className="px-5 py-1.5"
+                  >
+                    Batch
+                  </ToggleGroupItem>
                 )}
-              </div>
-
-              {/* JSONL example for batch tab or async+jsonl method */}
-              {(exampleType === "batch" || (exampleType === "async" && asyncMethod === "jsonl")) && (
-                <div className="mt-4 space-y-3">
-                  <div className="bg-white border border-gray-200 rounded-lg overflow-hidden max-w-full">
-                    <div className="bg-gray-50 px-4 py-2 border-b border-gray-200 flex items-center justify-between">
-                      <div className="flex items-center gap-2">
-                        <Code className="w-4 h-4 text-gray-600" />
-                        <span className="text-sm font-medium text-gray-700">
-                          batch_requests.jsonl
-                        </span>
-                      </div>
-                      <div className="flex items-center gap-2">
-                        <button
-                          onClick={() =>
-                            copyToClipboard(getExampleJsonl(), "jsonl")
-                          }
-                          className="flex items-center gap-1 px-2 py-1 text-xs text-gray-500 hover:text-gray-700 hover:bg-gray-100 rounded transition-colors"
-                        >
-                          <Copy className="w-3 h-3" />
-                          {copiedCode === "jsonl" ? "Copied!" : "Copy"}
-                        </button>
-                        <button
-                          onClick={downloadJsonl}
-                          className="flex items-center gap-1 px-2 py-1 text-xs text-gray-500 hover:text-gray-700 hover:bg-gray-100 rounded transition-colors"
-                        >
-                          <Download className="w-3 h-3" />
-                          Download
-                        </button>
-                      </div>
-                    </div>
-                    <div className="overflow-x-auto max-w-full">
-                      <CodeBlock language="json">
-                        {getExampleJsonl()}
-                      </CodeBlock>
-                    </div>
-                  </div>
-                  {config?.docs_jsonl_url && (
-                    <a
-                      href={config.docs_jsonl_url}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="text-sm text-blue-600 hover:text-blue-700 hover:underline inline-flex items-center gap-1"
-                    >
-                      How to create a JSONL file
-                      <ExternalLink className="w-3 h-3" />
-                    </a>
-                  )}
-                </div>
-              )}
+                {!isBatchDenied(model) && config?.batches?.async_requests?.enabled && (
+                  <ToggleGroupItem
+                    value="async"
+                    aria-label={`Async API (${asyncWindow})`}
+                    className="px-5 py-1.5"
+                  >
+                    Async
+                  </ToggleGroupItem>
+                )}
+                {!isRealtimeDenied(model) && (
+                  <ToggleGroupItem
+                    value="realtime"
+                    aria-label="Realtime API"
+                    className="px-5 py-1.5"
+                  >
+                    Realtime
+                  </ToggleGroupItem>
+                )}
+              </ToggleGroup>
             </div>
 
-            {/* Install snippet for autobatcher */}
-            {isAutobatcher && (
-              <div className="bg-white border border-gray-200 rounded-lg overflow-hidden max-w-full mb-3">
-                <div className="bg-gray-50 px-4 py-2 border-b border-gray-200 flex items-center justify-between">
-                  <div className="flex items-center gap-2">
-                    <Code className="w-4 h-4 text-gray-600" />
-                    <span className="text-sm font-medium text-gray-700">
-                      Shell
-                    </span>
+            {/* JSONL preview — only relevant for the Batch JSONL workflow */}
+            {exampleType === "batch" && (
+              <div className="mb-4 space-y-3">
+                <div className="bg-white border border-gray-200 rounded-lg overflow-hidden max-w-full">
+                  <div className="bg-gray-50 px-4 py-2 border-b border-gray-200 flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <Code className="w-4 h-4 text-gray-600" />
+                      <span className="text-sm font-medium text-gray-700">
+                        batch_requests.jsonl
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <button
+                        onClick={() =>
+                          copyToClipboard(getExampleJsonl(), "jsonl")
+                        }
+                        className="flex items-center gap-1 px-2 py-1 text-xs text-gray-500 hover:text-gray-700 hover:bg-gray-100 rounded transition-colors"
+                      >
+                        <Copy className="w-3 h-3" />
+                        {copiedCode === "jsonl" ? "Copied!" : "Copy"}
+                      </button>
+                      <button
+                        onClick={downloadJsonl}
+                        className="flex items-center gap-1 px-2 py-1 text-xs text-gray-500 hover:text-gray-700 hover:bg-gray-100 rounded transition-colors"
+                      >
+                        <Download className="w-3 h-3" />
+                        Download
+                      </button>
+                    </div>
                   </div>
-                  <button
-                    onClick={() =>
-                      copyToClipboard("pip install autobatcher", "install")
-                    }
-                    className="flex items-center gap-1 px-2 py-1 text-xs text-gray-500 hover:text-gray-700 hover:bg-gray-100 rounded transition-colors"
+                  <div className="overflow-x-auto max-w-full">
+                    <CodeBlock language="json">
+                      {getExampleJsonl()}
+                    </CodeBlock>
+                  </div>
+                </div>
+                {config?.docs_jsonl_url && (
+                  <a
+                    href={config.docs_jsonl_url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-sm text-blue-600 hover:text-blue-700 hover:underline inline-flex items-center gap-1"
                   >
-                    <Copy className="w-3 h-3" />
-                    {copiedCode === "install" ? "Copied!" : "Copy"}
-                  </button>
-                </div>
-                <div className="overflow-x-auto max-w-full">
-                  <CodeBlock language="bash">pip install autobatcher</CodeBlock>
-                </div>
+                    How to create a JSONL file
+                    <ExternalLink className="w-3 h-3" />
+                  </a>
+                )}
               </div>
             )}
 
@@ -739,65 +700,57 @@ console.log(response.choices[0].message.content);`;
               <div className="bg-gray-50 px-4 py-3 border-b border-gray-200 flex items-center justify-between">
                 <div className="flex items-center gap-2">
                   <Code className="w-4 h-4 text-gray-600" />
-                  {isAutobatcher ? (
-                    <span className="text-sm font-medium text-gray-700">
-                      Python
-                    </span>
-                  ) : (
-                    <>
-                      <Select
-                        value={selectedLanguage}
-                        onValueChange={(value) =>
-                          setSelectedLanguage(value as Language)
-                        }
-                      >
-                        <SelectTrigger
-                          size="sm"
-                          className="h-7 border-0 bg-transparent shadow-none hover:bg-gray-100 focus-visible:ring-0"
-                        >
-                          <SelectValue>
-                            <span className="text-sm font-medium text-gray-700">
-                              {selectedLanguage.charAt(0).toUpperCase() +
-                                selectedLanguage.slice(1)}
-                            </span>
-                          </SelectValue>
-                        </SelectTrigger>
-                        <SelectContent>
-                          <SelectItem value="python">Python</SelectItem>
-                          <SelectItem value="javascript">JavaScript</SelectItem>
-                          <SelectItem value="curl">cURL</SelectItem>
-                        </SelectContent>
-                      </Select>
-                      <div className="relative">
-                        <button
-                          onMouseEnter={() => setShowInfoTooltip(true)}
-                          onMouseLeave={() => setShowInfoTooltip(false)}
-                          className="p-1 text-gray-400 hover:text-gray-600 transition-colors"
-                        >
-                          <Info className="w-4 h-4" />
-                        </button>
+                  <Select
+                    value={selectedLanguage}
+                    onValueChange={(value) =>
+                      setSelectedLanguage(value as Language)
+                    }
+                  >
+                    <SelectTrigger
+                      size="sm"
+                      className="h-7 border-0 bg-transparent shadow-none hover:bg-gray-100 focus-visible:ring-0"
+                    >
+                      <SelectValue>
+                        <span className="text-sm font-medium text-gray-700">
+                          {selectedLanguage.charAt(0).toUpperCase() +
+                            selectedLanguage.slice(1)}
+                        </span>
+                      </SelectValue>
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="python">Python</SelectItem>
+                      <SelectItem value="javascript">JavaScript</SelectItem>
+                      <SelectItem value="curl">cURL</SelectItem>
+                    </SelectContent>
+                  </Select>
+                  <div className="relative">
+                    <button
+                      onMouseEnter={() => setShowInfoTooltip(true)}
+                      onMouseLeave={() => setShowInfoTooltip(false)}
+                      className="p-1 text-gray-400 hover:text-gray-600 transition-colors"
+                    >
+                      <Info className="w-4 h-4" />
+                    </button>
 
-                        {showInfoTooltip && (
-                          <div className="absolute left-0 top-full mt-2 w-64 bg-gray-900 text-white text-xs rounded-lg p-3 shadow-lg z-10">
-                            <div className="space-y-2">
-                              <div className="font-medium">
-                                {getInstallationInfo(selectedLanguage)?.title}
-                              </div>
-                              <div className="text-gray-300">
-                                {getInstallationInfo(selectedLanguage)?.description}
-                              </div>
-                              {getInstallationInfo(selectedLanguage)?.command && (
-                                <div className="bg-gray-800 rounded px-2 py-1 font-mono">
-                                  {getInstallationInfo(selectedLanguage)?.command}
-                                </div>
-                              )}
-                            </div>
-                            <div className="absolute -top-1 left-4 w-2 h-2 bg-gray-900 rotate-45"></div>
+                    {showInfoTooltip && (
+                      <div className="absolute left-0 top-full mt-2 w-64 bg-gray-900 text-white text-xs rounded-lg p-3 shadow-lg z-10">
+                        <div className="space-y-2">
+                          <div className="font-medium">
+                            {getInstallationInfo(selectedLanguage)?.title}
                           </div>
-                        )}
+                          <div className="text-gray-300">
+                            {getInstallationInfo(selectedLanguage)?.description}
+                          </div>
+                          {getInstallationInfo(selectedLanguage)?.command && (
+                            <div className="bg-gray-800 rounded px-2 py-1 font-mono">
+                              {getInstallationInfo(selectedLanguage)?.command}
+                            </div>
+                          )}
+                        </div>
+                        <div className="absolute -top-1 left-4 w-2 h-2 bg-gray-900 rotate-45"></div>
                       </div>
-                    </>
-                  )}
+                    )}
+                  </div>
                 </div>
                 <div className="flex items-center gap-2">
                   {!apiKey && (
@@ -900,9 +853,7 @@ console.log(response.choices[0].message.content);`;
               <div className="overflow-x-auto max-w-full">
                 <CodeBlock
                   language={
-                    (isAutobatcher
-                      ? "python"
-                      : getLanguageForHighlighting(selectedLanguage)) as
+                    getLanguageForHighlighting(selectedLanguage) as
                       | "python"
                       | "javascript"
                       | "bash"

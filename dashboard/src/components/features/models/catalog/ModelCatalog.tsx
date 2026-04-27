@@ -1042,6 +1042,7 @@ export const ModelCatalog: React.FC = () => {
         isOpen={apiExamplesModel !== null}
         onClose={() => setApiExamplesModel(null)}
         model={apiExamplesModel}
+        defaultTab="realtime"
       />
     </div>
   );

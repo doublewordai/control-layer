@@ -285,6 +285,7 @@ export const ModelDetail: React.FC = () => {
         isOpen={showApiExamples}
         onClose={() => setShowApiExamples(false)}
         model={model}
+        defaultTab="realtime"
       />
     </div>
   );
