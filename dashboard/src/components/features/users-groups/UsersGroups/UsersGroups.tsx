@@ -613,9 +613,11 @@ const UsersGroups: React.FC = () => {
                       />
                     </div>
                   </div>
-                  <p className="text-sm text-doubleword-neutral-600 mb-4 wrap-break-word">
-                    {group.description}
-                  </p>
+                  {group.description && (
+                    <p className="text-sm text-doubleword-neutral-600 mb-4 wrap-break-word">
+                      {group.description}
+                    </p>
+                  )}
                   <div className="flex items-center justify-start pt-4 border-t border-doubleword-neutral-100">
                     <div className="flex -space-x-2">
                       {group.memberIds.slice(0, 4).map((memberId) => {

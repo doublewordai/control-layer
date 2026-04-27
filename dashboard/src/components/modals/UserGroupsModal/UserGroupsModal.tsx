@@ -207,8 +207,8 @@ export const UserGroupsModal: React.FC<UserGroupsModalProps> = ({
                           {group.name}
                         </h4>
                         <p className="text-sm text-gray-500">
-                          {group.description} • {group.users?.length || 0}{" "}
-                          members
+                          {group.description && `${group.description} • `}
+                          {group.users?.length || 0} members
                         </p>
                       </div>
                     </div>
