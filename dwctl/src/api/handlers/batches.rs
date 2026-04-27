@@ -1895,10 +1895,7 @@ mod tests {
 
     #[test]
     fn parse_completion_window_filter_parses_single_value() {
-        assert_eq!(
-            parse_completion_window_filter(Some("24h")),
-            Some(vec!["24h".to_string()])
-        );
+        assert_eq!(parse_completion_window_filter(Some("24h")), Some(vec!["24h".to_string()]));
     }
 
     #[test]
