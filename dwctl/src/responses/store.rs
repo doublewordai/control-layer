@@ -336,12 +336,13 @@ fn parse_failure_error(err: &str) -> (&'static str, String, Option<u16>) {
     if let Ok(reason) = serde_json::from_str::<serde_json::Value>(err)
         && let Some(details) = reason.get("details")
     {
-        let status = details.get("status").and_then(|s| s.as_u64()).unwrap_or(500) as u16;
+        let status = details.get("status").and_then(|s| s.as_u64()).and_then(|s| u16::try_from(s).ok());
+        let error_type = status_to_error_type(status.unwrap_or(500));
         if let Some(body) = details.get("body").and_then(|b| b.as_str()) {
             if let Some(message) = parse_openai_error(body) {
-                return (status_to_error_type(status), message, Some(status));
+                return (error_type, message, status);
             }
-            return (status_to_error_type(status), body.to_string(), Some(status));
+            return (error_type, body.to_string(), status);
         }
     }
 
@@ -428,7 +429,10 @@ fn detail_to_response_object(detail: &fusillade::RequestDetail) -> serde_json::V
     });
 
     if status == "completed" {
-        let response_status = detail.response_status.unwrap_or(200) as u16;
+        let response_status = match detail.response_status {
+            Some(s) => u16::try_from(s).unwrap_or(500),
+            None => 200,
+        };
         let is_error_response = response_status >= 400;
 
         if is_error_response {

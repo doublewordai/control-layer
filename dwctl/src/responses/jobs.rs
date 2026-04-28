@@ -241,12 +241,21 @@ pub async fn build_complete_response_job<P: sqlx_pool_router::PoolProvider + Clo
                 return Err(TaskError::Retryable(e.to_string()));
             }
 
-            tracing::debug!(
-                response_id = %input.response_id,
-                status_code = input.status_code,
-                body_size = input.response_body.len(),
-                "Response completed in fusillade"
-            );
+            if input.status_code >= 400 {
+                tracing::debug!(
+                    response_id = %input.response_id,
+                    status_code = input.status_code,
+                    body_size = input.response_body.len(),
+                    "Upstream error response stored in fusillade"
+                );
+            } else {
+                tracing::debug!(
+                    response_id = %input.response_id,
+                    status_code = input.status_code,
+                    body_size = input.response_body.len(),
+                    "Response completed in fusillade"
+                );
+            }
 
             To::done()
         })
