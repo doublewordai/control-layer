@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.44.3](https://github.com/doublewordai/control-layer/compare/v8.44.2...v8.44.3) (2026-04-28)
+
+
+### Bug Fixes
+
+* preserve upstream error codes instead of wrapping as 500 ([#1031](https://github.com/doublewordai/control-layer/issues/1031)) ([ddd7079](https://github.com/doublewordai/control-layer/commit/ddd7079c1af3e12e6b4e4d7e7f10a5dd7824731f))
+
 ## [8.44.2](https://github.com/doublewordai/control-layer/compare/v8.44.1...v8.44.2) (2026-04-27)
 
 
