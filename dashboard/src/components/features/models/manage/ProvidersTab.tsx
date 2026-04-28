@@ -394,9 +394,18 @@ const AddProviderModal: React.FC<{
   modelId: string;
   existingComponentIds: string[];
   isPriorityMode: boolean;
-}> = ({ open, onClose, modelId, existingComponentIds, isPriorityMode }) => {
+  strictModeEnabled: boolean;
+}> = ({
+  open,
+  onClose,
+  modelId,
+  existingComponentIds,
+  isPriorityMode,
+  strictModeEnabled,
+}) => {
   const [selectedModel, setSelectedModel] = useState<string>("");
   const [weight, setWeight] = useState<string>("50");
+  const [trusted, setTrusted] = useState<string>("untrusted");
 
   const { data: modelsData, isLoading: modelsLoading } = useModels({
     limit: 100,
@@ -404,6 +413,7 @@ const AddProviderModal: React.FC<{
   });
 
   const addMutation = useAddModelComponent();
+  const updateModelMutation = useUpdateModel();
 
   // Filter out composite models and already added models
   const availableModels =
@@ -425,9 +435,17 @@ const AddProviderModal: React.FC<{
           ...(isPriorityMode ? {} : { weight: parseInt(weight, 10) }),
         },
       });
+      // Set trusted flag if strict mode is enabled
+      if (strictModeEnabled) {
+        await updateModelMutation.mutateAsync({
+          id: selectedModel,
+          data: { trusted: trusted === "trusted" },
+        });
+      }
       onClose();
       setSelectedModel("");
       setWeight("50");
+      setTrusted("untrusted");
     } catch {
       // Error handled by mutation
     }
@@ -437,6 +455,7 @@ const AddProviderModal: React.FC<{
     onClose();
     setSelectedModel("");
     setWeight("50");
+    setTrusted("untrusted");
   };
 
   return (
@@ -514,6 +533,48 @@ const AddProviderModal: React.FC<{
                 placeholder="1-100"
               />
               <p className="text-xs text-gray-500">Value from 1 to 100.</p>
+            </div>
+          )}
+
+          {/* Trust level - only in strict mode */}
+          {strictModeEnabled && (
+            <div className="space-y-2">
+              <div className="flex items-center gap-1">
+                <label className="text-sm font-medium text-gray-700">
+                  Trust Level
+                </label>
+                <HoverCard openDelay={100} closeDelay={50}>
+                  <HoverCardTrigger asChild>
+                    <Info className="h-3 w-3 text-gray-400 hover:text-gray-600 cursor-help" />
+                  </HoverCardTrigger>
+                  <HoverCardContent className="w-64" sideOffset={5}>
+                    <p className="text-sm text-muted-foreground">
+                      Trusted providers bypass error sanitization, returning full
+                      error details from the upstream provider. Untrusted
+                      providers have their errors sanitized.
+                    </p>
+                  </HoverCardContent>
+                </HoverCard>
+              </div>
+              <Select value={trusted} onValueChange={setTrusted}>
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="untrusted">
+                    <div className="flex items-center gap-2">
+                      <ShieldOff className="h-4 w-4 text-gray-400" />
+                      <span>Untrusted</span>
+                    </div>
+                  </SelectItem>
+                  <SelectItem value="trusted">
+                    <div className="flex items-center gap-2">
+                      <Shield className="h-4 w-4 text-blue-600" />
+                      <span>Trusted</span>
+                    </div>
+                  </SelectItem>
+                </SelectContent>
+              </Select>
             </div>
           )}
         </div>
@@ -1423,6 +1484,7 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
         modelId={model.id}
         existingComponentIds={components?.map((c) => c.model.id) || []}
         isPriorityMode={isPriorityMode}
+        strictModeEnabled={strictModeEnabled}
       />
 
       <EditWeightModal
