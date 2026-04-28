@@ -328,7 +328,10 @@ fn extract_upstream_error(status: u16, body: &str) -> (&'static str, String) {
 /// When the body is an OpenAI-compatible error envelope, unwrap it so callers
 /// see the upstream error directly. Falls back to "server_error" with the raw
 /// string for any other format.
-fn parse_failure_error(err: &str) -> (&'static str, String) {
+///
+/// Returns `(error_type, message, status_code)` where status_code is extracted
+/// from the FailureReason envelope or legacy prefix when available.
+fn parse_failure_error(err: &str) -> (&'static str, String, Option<u16>) {
     // Try to parse as FailureReason envelope
     if let Ok(reason) = serde_json::from_str::<serde_json::Value>(err)
         && let Some(details) = reason.get("details")
@@ -336,9 +339,9 @@ fn parse_failure_error(err: &str) -> (&'static str, String) {
         let status = details.get("status").and_then(|s| s.as_u64()).unwrap_or(500) as u16;
         if let Some(body) = details.get("body").and_then(|b| b.as_str()) {
             if let Some(message) = parse_openai_error(body) {
-                return (status_to_error_type(status), message);
+                return (status_to_error_type(status), message, Some(status));
             }
-            return (status_to_error_type(status), body.to_string());
+            return (status_to_error_type(status), body.to_string(), Some(status));
         }
     }
 
@@ -349,17 +352,17 @@ fn parse_failure_error(err: &str) -> (&'static str, String) {
     {
         let body = &rest[colon_pos + 2..];
         if let Some(message) = parse_openai_error(body) {
-            return (status_to_error_type(status), message);
+            return (status_to_error_type(status), message, Some(status));
         }
-        return (status_to_error_type(status), body.to_string());
+        return (status_to_error_type(status), body.to_string(), Some(status));
     }
 
     // Not a FailureReason envelope — try as raw OpenAI error
     if let Some(message) = parse_openai_error(err) {
-        return ("server_error", message);
+        return ("server_error", message, None);
     }
 
-    ("server_error", err.to_string())
+    ("server_error", err.to_string(), None)
 }
 
 /// Try to extract the message from an OpenAI-compatible error body:
@@ -433,14 +436,19 @@ fn detail_to_response_object(detail: &fusillade::RequestDetail) -> serde_json::V
             // upstream status and body. Surface the error to callers instead
             // of treating it as a successful completion.
             resp["status"] = serde_json::json!("failed");
-            if let Some(ref body) = detail.response_body {
-                let (error_type, message) = extract_upstream_error(response_status, body);
-                resp["error"] = serde_json::json!({
-                    "type": error_type,
-                    "code": response_status,
-                    "message": message,
-                });
-            }
+            let (error_type, message) = if let Some(ref body) = detail.response_body {
+                extract_upstream_error(response_status, body)
+            } else {
+                (
+                    status_to_error_type(response_status),
+                    format!("Upstream returned {response_status}"),
+                )
+            };
+            resp["error"] = serde_json::json!({
+                "type": error_type,
+                "code": response_status,
+                "message": message,
+            });
         } else if let Some(ref body) = detail.response_body
             && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(body)
         {
@@ -468,11 +476,15 @@ fn detail_to_response_object(detail: &fusillade::RequestDetail) -> serde_json::V
         // Legacy path: errors stored via fail_request have the error in the
         // `error` column. Try to parse structured FailureReason to extract the
         // real error body instead of showing raw serialized JSON.
-        let (error_type, message) = parse_failure_error(err);
-        resp["error"] = serde_json::json!({
+        let (error_type, message, status_code) = parse_failure_error(err);
+        let mut error_obj = serde_json::json!({
             "type": error_type,
             "message": message,
         });
+        if let Some(code) = status_code {
+            error_obj["code"] = serde_json::json!(code);
+        }
+        resp["error"] = error_obj;
     }
 
     resp
@@ -579,16 +591,18 @@ mod tests {
     fn test_parse_failure_error_legacy_format() {
         // Legacy FailureReason envelope with OpenAI body
         let err = r#"{"type":"NonRetriableHttpStatus","details":{"status":403,"body":"{\"error\":{\"message\":\"Forbidden\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":\"forbidden\"}}"}}"#;
-        let (error_type, message) = parse_failure_error(err);
+        let (error_type, message, status_code) = parse_failure_error(err);
         assert_eq!(error_type, "permission_error");
         assert_eq!(message, "Forbidden");
+        assert_eq!(status_code, Some(403));
     }
 
     #[test]
     fn test_parse_failure_error_plain_string() {
-        let (error_type, message) = parse_failure_error("some unknown error");
+        let (error_type, message, status_code) = parse_failure_error("some unknown error");
         assert_eq!(error_type, "server_error");
         assert_eq!(message, "some unknown error");
+        assert_eq!(status_code, None);
     }
 
     #[test]
@@ -596,9 +610,10 @@ mod tests {
         // Legacy format: "Upstream returned {status}: {body}"
         let err =
             r#"Upstream returned 403: {"error":{"message":"Forbidden","type":"invalid_request_error","param":null,"code":"forbidden"}}"#;
-        let (error_type, message) = parse_failure_error(err);
+        let (error_type, message, status_code) = parse_failure_error(err);
         assert_eq!(error_type, "permission_error");
         assert_eq!(message, "Forbidden");
+        assert_eq!(status_code, Some(403));
     }
 
     #[test]
