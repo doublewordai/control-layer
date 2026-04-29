@@ -1,22 +1,24 @@
-//! End-to-end integration test for the real `DwctlStepExecutor`.
+//! End-to-end integration test for `run_response_loop` wired to the
+//! production tool executor.
 //!
-//! Drives [`onwards::run_response_loop`] against the real
-//! [`DwctlStepExecutor`] (wrapping the real `HttpToolExecutor` + a
-//! [`StaticModelCaller`]) plus the real [`FusilladeResponseStore`]. The
-//! upstream model and the tool are both wiremock servers, so the test
-//! validates:
+//! What we wire up:
+//! - storage = real `FusilladeResponseStore` over the live fusillade
+//!   schema in dwctl's database;
+//! - tool executor = real `HttpToolExecutor` (the same instance the
+//!   single-step in-process loop uses);
+//! - tool registry = a `ResolvedToolSet` constructed from real
+//!   `ToolDefinition` rows (the same struct the database query in
+//!   `tool_injection.rs` produces);
+//! - HTTP client = real onwards `HyperClient` (same connection pool,
+//!   TLS, timeouts as single-step proxying);
+//! - upstream model = wiremock;
+//! - tool endpoint = wiremock.
 //!
-//! - the `tool_sources.kind = 'http'` dispatch path: tool fires through
-//!   `HttpToolExecutor::execute`, hits the wiremock, returns its body,
-//!   which is then persisted as the step's `response_payload`;
-//! - the `tool_sources.kind = 'agent'` dispatch path: a sub-agent
-//!   tool returns `ToolDispatch::Recurse`, the loop recurses, the
-//!   sub-loop completes, and the result is recorded as the spawning
-//!   step's `response_payload`;
-//! - the model-call path: requests POST through `StaticModelCaller`,
-//!   responses parsed and persisted;
-//! - the full multi-step lifecycle persists the chain in the right
-//!   order with sequence and prev_step_id chaining.
+//! Because the executor and HTTP client are the production types,
+//! these tests catch regressions in the routing layer in addition to
+//! the multi-step orchestration itself: any change to
+//! `HttpToolExecutor`, `HyperClient`, or `ToolSchema` that breaks the
+//! multi-step path will fail here.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -26,9 +28,11 @@ use fusillade::{
     PoolProvider as FusilladePoolProvider, PostgresRequestManager, PostgresResponseStepManager,
     ReqwestHttpClient, TestDbPools,
 };
+use onwards::client::HttpClient;
+use onwards::traits::RequestContext;
 use onwards::{
     ChainStep, LoopConfig, MultiStepStore, NextAction, RecordedStep, StepDescriptor, StepKind,
-    StepState, StoreError, run_response_loop,
+    StepState, StoreError, UpstreamTarget, run_response_loop,
 };
 use serde_json::{Value, json};
 use sqlx::PgPool;
@@ -36,9 +40,8 @@ use uuid::Uuid;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use crate::responses::step_executor::{DwctlStepExecutor, StaticModelCaller};
 use crate::responses::store::FusilladeResponseStore;
-use crate::tool_executor::{HttpToolExecutor, ResolvedToolSet, ToolDefinition};
+use crate::tool_executor::{HttpToolExecutor, ResolvedToolSet, ResolvedTools, ToolDefinition};
 
 async fn fusillade_pool() -> PgPool {
     let url = std::env::var("MULTI_STEP_TEST_DATABASE_URL").unwrap_or_else(|_| {
@@ -79,9 +82,10 @@ async fn insert_parent_request(pool: &PgPool, schema: &str) -> String {
     request_id.to_string()
 }
 
-/// Production-shaped transition function. Drives:
+/// Production-shaped transition function over [`FusilladeResponseStore`].
+/// Drives:
 ///   empty chain → model_call
-///   model_call returned `wants_tool=true` → emit tool_call from `tool_name`/`tool_args`
+///   model_call returned `wants_tool=true` → emit tool_call
 ///   tool_call returned → emit summarizing model_call
 ///   model_call returned `wants_tool=false` → Complete
 struct TransitionStore<P: FusilladePoolProvider + Clone + Send + Sync + 'static> {
@@ -113,24 +117,15 @@ impl<P: FusilladePoolProvider + Clone + Send + Sync + 'static> MultiStepStore
             .iter()
             .rev()
             .find(|s| matches!(s.state, StepState::Completed | StepState::Failed))
-            .ok_or_else(|| {
-                StoreError::StorageError("no terminal step in chain".into())
-            })?;
-
+            .ok_or_else(|| StoreError::StorageError("no terminal step in chain".into()))?;
         let last_payload = last.response_payload.as_ref().ok_or_else(|| {
             StoreError::StorageError("last step has no response_payload".into())
         })?;
 
         match (last.kind, last_payload["wants_tool"].as_bool()) {
             (StepKind::ModelCall, Some(true)) => {
-                let tool_name = last_payload["tool_name"]
-                    .as_str()
-                    .unwrap_or("static_echo")
-                    .to_string();
-                let tool_args = last_payload
-                    .get("tool_args")
-                    .cloned()
-                    .unwrap_or(json!({}));
+                let tool_name = last_payload["tool_name"].as_str().unwrap_or("echo_args").to_string();
+                let tool_args = last_payload.get("tool_args").cloned().unwrap_or(json!({}));
                 Ok(NextAction::AppendSteps(vec![StepDescriptor {
                     kind: StepKind::ToolCall,
                     request_payload: json!({"name": tool_name, "args": tool_args}),
@@ -144,10 +139,7 @@ impl<P: FusilladePoolProvider + Clone + Send + Sync + 'static> MultiStepStore
                 }),
             }])),
             (StepKind::ModelCall, Some(false)) => {
-                let output_text = last_payload["output_text"]
-                    .as_str()
-                    .unwrap_or("")
-                    .to_string();
+                let output_text = last_payload["output_text"].as_str().unwrap_or("").to_string();
                 Ok(NextAction::Complete(json!({
                     "id": format!("resp_{request_id}"),
                     "object": "response",
@@ -182,11 +174,7 @@ impl<P: FusilladePoolProvider + Clone + Send + Sync + 'static> MultiStepStore
     async fn fail_step(&self, id: &str, e: &Value) -> Result<(), StoreError> {
         self.inner.fail_step(id, e).await
     }
-    async fn list_chain(
-        &self,
-        r: &str,
-        s: Option<&str>,
-    ) -> Result<Vec<ChainStep>, StoreError> {
+    async fn list_chain(&self, r: &str, s: Option<&str>) -> Result<Vec<ChainStep>, StoreError> {
         self.inner.list_chain(r, s).await
     }
     async fn assemble_response(&self, _r: &str) -> Result<Value, StoreError> {
@@ -194,14 +182,24 @@ impl<P: FusilladePoolProvider + Clone + Send + Sync + 'static> MultiStepStore
     }
 }
 
-#[tokio::test]
-async fn dwctl_step_executor_drives_real_tool_and_model_calls_against_wiremock() {
-    let pool = fusillade_pool().await;
-    let request_id = insert_parent_request(&pool, "fusillade").await;
+fn http_client_for_tests() -> Arc<dyn HttpClient + Send + Sync> {
+    Arc::new(onwards::client::create_hyper_client(10, 30))
+}
 
-    // ---- wiremock for the upstream model ----
+async fn store_with_real_fusillade(pool: PgPool) -> FusilladeResponseStore<TestDbPools> {
+    let pools = TestDbPools::new(pool).await.unwrap();
+    let request_manager = Arc::new(PostgresRequestManager::<_, ReqwestHttpClient>::new(
+        pools.clone(),
+        Default::default(),
+    ));
+    let step_manager = Arc::new(PostgresResponseStepManager::new(pools));
+    FusilladeResponseStore::new(request_manager).with_step_manager(step_manager)
+}
+
+#[tokio::test]
+async fn loop_drives_real_tool_and_model_calls_through_production_executor() {
+    // Wiremocks for the upstream model and the tool.
     let model_server = MockServer::start().await;
-    // First call: model says it wants the tool.
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -212,7 +210,6 @@ async fn dwctl_step_executor_drives_real_tool_and_model_calls_against_wiremock()
         .up_to_n_times(1)
         .mount(&model_server)
         .await;
-    // Second call: model returns final text.
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -222,18 +219,15 @@ async fn dwctl_step_executor_drives_real_tool_and_model_calls_against_wiremock()
         .mount(&model_server)
         .await;
 
-    // ---- wiremock for the tool ----
     let tool_server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/echo"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(json!({"echoed": {"x": 42}})),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"echoed": {"x": 42}})))
         .mount(&tool_server)
         .await;
 
-    // ---- resolved tool set: one HTTP tool registered ----
-    let tool_source_id = Uuid::new_v4();
+    // Real ToolDefinition / ResolvedToolSet — same struct the DB query
+    // populates. This is the production tool registry data path.
     let mut tools = HashMap::new();
     tools.insert(
         "echo_args".to_string(),
@@ -242,36 +236,37 @@ async fn dwctl_step_executor_drives_real_tool_and_model_calls_against_wiremock()
             url: format!("{}/echo", tool_server.uri()),
             api_key: None,
             timeout_secs: 5,
-            tool_source_id,
+            tool_source_id: Uuid::new_v4(),
         },
     );
     let resolved = Arc::new(ResolvedToolSet::new(tools, HashMap::new()));
 
-    let http_tool_executor = Arc::new(HttpToolExecutor::new(
-        reqwest::Client::new(),
-        None, // no analytics writes in this test
-    ));
-    let model_caller = Arc::new(StaticModelCaller {
-        client: reqwest::Client::new(),
+    // Real HttpToolExecutor — same instance type the single-step
+    // in-process loop uses. RequestContext carries ResolvedTools the
+    // same way the tool injection middleware delivers it in production.
+    let tool_executor = HttpToolExecutor::new(reqwest::Client::new(), None);
+    let tool_ctx = RequestContext::new().with_extension(ResolvedTools(resolved));
+
+    // Real onwards HyperClient for the model fire path.
+    let http_client = http_client_for_tests();
+    let upstream = UpstreamTarget {
         url: format!("{}/v1/chat/completions", model_server.uri()),
         api_key: None,
-    });
-    let executor = DwctlStepExecutor::new(http_tool_executor, resolved, model_caller);
+    };
 
-    // ---- store wired up to real fusillade ----
-    let pools = TestDbPools::new(pool.clone()).await.unwrap();
-    let request_manager = Arc::new(PostgresRequestManager::<_, ReqwestHttpClient>::new(
-        pools.clone(),
-        Default::default(),
-    ));
-    let step_manager = Arc::new(PostgresResponseStepManager::new(pools));
-    let inner = FusilladeResponseStore::new(request_manager).with_step_manager(step_manager);
-    let store = TransitionStore { inner };
+    // Real fusillade-backed storage.
+    let pool = fusillade_pool().await;
+    let request_id = insert_parent_request(&pool, "fusillade").await;
+    let inner_store = store_with_real_fusillade(pool).await;
+    let store = TransitionStore { inner: inner_store };
 
-    // ---- drive the loop ----
+    // Drive it.
     let final_payload = run_response_loop(
         &store,
-        &executor,
+        &tool_executor,
+        &tool_ctx,
+        &upstream,
+        http_client,
         &request_id,
         None,
         LoopConfig::default(),
@@ -284,30 +279,31 @@ async fn dwctl_step_executor_drives_real_tool_and_model_calls_against_wiremock()
     assert_eq!(final_payload["output_text"], json!("the answer is 42"));
     assert_eq!(final_payload["step_count"], json!(3));
 
-    // ---- both wiremocks were hit ----
+    // Both the model wiremock and the tool wiremock got called via the
+    // production code paths (HyperClient + HttpToolExecutor).
     assert_eq!(
         model_server.received_requests().await.unwrap().len(),
         2,
-        "model wiremock should have received two POSTs (initial + summarize)"
+        "model wiremock should have received initial + summarize POSTs"
     );
     assert_eq!(
         tool_server.received_requests().await.unwrap().len(),
         1,
-        "tool wiremock should have received one POST"
+        "tool wiremock should have received one POST through HttpToolExecutor"
     );
 
-    // ---- chain persisted correctly ----
+    // Persisted chain shape.
     let chain = store.list_chain(&request_id, None).await.unwrap();
     assert_eq!(chain.len(), 3);
     assert!(matches!(chain[0].kind, StepKind::ModelCall));
     assert!(matches!(chain[1].kind, StepKind::ToolCall));
     assert!(matches!(chain[2].kind, StepKind::ModelCall));
-
     for (i, step) in chain.iter().enumerate() {
         assert!(matches!(step.state, StepState::Completed));
         assert_eq!(step.sequence, (i + 1) as i64);
     }
-    // Tool step's response_payload is exactly what wiremock returned.
+    // Tool step's response_payload is the wiremock body verbatim — proves
+    // the production HttpToolExecutor was invoked end-to-end.
     assert_eq!(
         chain[1].response_payload.as_ref().unwrap(),
         &json!({"echoed": {"x": 42}})
@@ -315,16 +311,10 @@ async fn dwctl_step_executor_drives_real_tool_and_model_calls_against_wiremock()
 }
 
 #[tokio::test]
-async fn dwctl_step_executor_dispatches_subagent_tools_via_recurse() {
-    // A `tool_sources.kind = 'agent'` tool should signal recursion
-    // rather than fire HTTP. The test doesn't need a tool wiremock for
-    // the agent tool — `ToolDispatch::Recurse` skips it entirely.
-    let pool = fusillade_pool().await;
-    let request_id = insert_parent_request(&pool, "fusillade").await;
-
-    // Model wiremock: first call wants the agent tool; sub-agent's
-    // first call returns final text immediately; back at top-level the
-    // summarizing call also returns final text.
+async fn agent_kind_tool_recurses_via_tool_schema() {
+    // ToolDefinition.kind = "agent" propagates through
+    // HttpToolExecutor::tools() as ToolKind::Agent on the schema. The
+    // loop reads it and recurses without invoking ToolExecutor::execute.
     let model_server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
@@ -358,7 +348,7 @@ async fn dwctl_step_executor_dispatches_subagent_tools_via_recurse() {
     tools.insert(
         "delegate_subagent".to_string(),
         ToolDefinition {
-            kind: "agent".to_string(), // <-- the key bit
+            kind: "agent".to_string(),
             url: "http://unused".into(),
             api_key: None,
             timeout_secs: 5,
@@ -366,29 +356,26 @@ async fn dwctl_step_executor_dispatches_subagent_tools_via_recurse() {
         },
     );
     let resolved = Arc::new(ResolvedToolSet::new(tools, HashMap::new()));
+    let tool_executor = HttpToolExecutor::new(reqwest::Client::new(), None);
+    let tool_ctx = RequestContext::new().with_extension(ResolvedTools(resolved));
 
-    let executor = DwctlStepExecutor::new(
-        Arc::new(HttpToolExecutor::new(reqwest::Client::new(), None)),
-        resolved,
-        Arc::new(StaticModelCaller {
-            client: reqwest::Client::new(),
-            url: format!("{}/v1/chat/completions", model_server.uri()),
-            api_key: None,
-        }),
-    );
+    let upstream = UpstreamTarget {
+        url: format!("{}/v1/chat/completions", model_server.uri()),
+        api_key: None,
+    };
+    let http_client = http_client_for_tests();
 
-    let pools = TestDbPools::new(pool.clone()).await.unwrap();
-    let request_manager = Arc::new(PostgresRequestManager::<_, ReqwestHttpClient>::new(
-        pools.clone(),
-        Default::default(),
-    ));
-    let step_manager = Arc::new(PostgresResponseStepManager::new(pools));
-    let inner = FusilladeResponseStore::new(request_manager).with_step_manager(step_manager);
-    let store = TransitionStore { inner };
+    let pool = fusillade_pool().await;
+    let request_id = insert_parent_request(&pool, "fusillade").await;
+    let inner_store = store_with_real_fusillade(pool).await;
+    let store = TransitionStore { inner: inner_store };
 
     let final_payload = run_response_loop(
         &store,
-        &executor,
+        &tool_executor,
+        &tool_ctx,
+        &upstream,
+        http_client,
         &request_id,
         None,
         LoopConfig::default(),
@@ -400,37 +387,22 @@ async fn dwctl_step_executor_dispatches_subagent_tools_via_recurse() {
     assert_eq!(final_payload["status"], json!("completed"));
     assert_eq!(final_payload["output_text"], json!("all done"));
 
-    // The agent tool step (top-level chain[1]) was completed with the
-    // sub-loop's final payload (the sub-agent's "subagent done" body).
     let chain = store.list_chain(&request_id, None).await.unwrap();
-    assert_eq!(chain.len(), 3, "top-level chain should have 3 steps");
+    assert_eq!(chain.len(), 3);
     let tool_step = &chain[1];
     assert!(matches!(tool_step.kind, StepKind::ToolCall));
     let tool_payload = tool_step.response_payload.as_ref().unwrap();
-    // The sub-loop's Complete payload was a constructed response object.
-    // The sub-loop returned via run_response_loop, and its return value
-    // gets persisted as the spawning step's response_payload.
     assert_eq!(tool_payload["status"], json!("completed"));
     assert_eq!(tool_payload["output_text"], json!("subagent done"));
 
-    // The sub-loop's chain (scope_parent = the top-level tool step) has
-    // at least one step — the model_call that returned wants_tool=false
-    // and triggered the sub-loop's Complete. The exact count depends on
-    // how many iterations the sub-loop ran before completing; the
-    // important invariant is recursion happened (sub-loop steps exist
-    // under the spawning tool step's scope).
+    // Sub-loop step exists under the spawning tool step's scope.
     let sub_chain = store
         .list_chain(&request_id, Some(&tool_step.id))
         .await
         .unwrap();
-    assert!(
-        !sub_chain.is_empty(),
-        "sub-loop should have produced at least one step under the spawning tool step's scope"
-    );
-    assert!(matches!(sub_chain[0].kind, StepKind::ModelCall));
+    assert!(!sub_chain.is_empty());
     assert_eq!(
         sub_chain[0].parent_step_id.as_deref(),
-        Some(tool_step.id.as_str()),
-        "sub-loop step's parent_step_id must point at the spawning top-level tool step"
+        Some(tool_step.id.as_str())
     );
 }

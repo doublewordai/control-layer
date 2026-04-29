@@ -11,7 +11,7 @@
 
 use async_trait::async_trait;
 use chrono::Utc;
-use onwards::traits::{RequestContext, ToolError, ToolExecutor, ToolSchema};
+use onwards::traits::{RequestContext, ToolError, ToolExecutor, ToolKind, ToolSchema};
 use serde_json::Value;
 use sqlx::PgPool;
 use std::collections::HashMap;
@@ -64,17 +64,29 @@ impl ResolvedToolSet {
     /// Convert resolved tools into `ToolSchema` values for onwards.
     pub fn to_tool_schemas(&self) -> Vec<ToolSchema> {
         self.tools
-            .keys()
-            .map(|name| {
+            .iter()
+            .map(|(name, def)| {
                 let (description, parameters) = self.metadata.get(name).cloned().unwrap_or((None, None));
                 ToolSchema {
                     name: name.clone(),
                     description: description.unwrap_or_default(),
                     parameters: parameters.unwrap_or(serde_json::json!({"type": "object"})),
                     strict: false,
+                    kind: tool_kind_from_str(&def.kind),
                 }
             })
             .collect()
+    }
+}
+
+/// Translate the `tool_sources.kind` text column into onwards' typed
+/// [`ToolKind`]. Unknown values fall back to `Http` so an unrecognized
+/// kind in the database doesn't surface as a runtime panic — the loop's
+/// HTTP path is the safer default.
+fn tool_kind_from_str(kind: &str) -> ToolKind {
+    match kind {
+        "agent" => ToolKind::Agent,
+        _ => ToolKind::Http,
     }
 }
 
