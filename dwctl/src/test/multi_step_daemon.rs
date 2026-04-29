@@ -42,6 +42,7 @@ async fn fusillade_pool() -> PgPool {
 }
 
 #[tokio::test]
+#[ignore = "requires a live dwctl boot to apply fusillade migrations to the dwctl DB; see test docstring"]
 async fn daemon_claim_runs_multi_step_loop_end_to_end() {
     // Wiremocks for upstream model + tool.
     let model_server = MockServer::start().await;

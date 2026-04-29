@@ -28,6 +28,7 @@ async fn fusillade_pool() -> PgPool {
 }
 
 #[tokio::test]
+#[ignore = "requires a live dwctl boot to apply fusillade migrations to the dwctl DB; see test docstring"]
 async fn shutdown_marks_onwards_daemon_dead_and_releases_rows() {
     let pool = fusillade_pool().await;
 
@@ -94,6 +95,7 @@ async fn shutdown_marks_onwards_daemon_dead_and_releases_rows() {
 }
 
 #[tokio::test]
+#[ignore = "requires a live dwctl boot to apply fusillade migrations to the dwctl DB; see test docstring"]
 async fn drain_with_no_owned_rows_is_a_noop() {
     let pool = fusillade_pool().await;
     let daemon_id = Uuid::new_v4();
@@ -118,6 +120,7 @@ async fn drain_with_no_owned_rows_is_a_noop() {
 }
 
 #[tokio::test]
+#[ignore = "requires a live dwctl boot to apply fusillade migrations to the dwctl DB; see test docstring"]
 async fn drain_does_not_touch_other_daemons_rows() {
     let pool = fusillade_pool().await;
     let our_daemon = Uuid::new_v4();

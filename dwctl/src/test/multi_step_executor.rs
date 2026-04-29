@@ -197,6 +197,7 @@ async fn store_with_real_fusillade(pool: PgPool) -> FusilladeResponseStore<TestD
 }
 
 #[tokio::test]
+#[ignore = "requires a live dwctl boot to apply fusillade migrations to the dwctl DB; see test docstring"]
 async fn loop_drives_real_tool_and_model_calls_through_production_executor() {
     // Wiremocks for the upstream model and the tool.
     let model_server = MockServer::start().await;
@@ -312,6 +313,7 @@ async fn loop_drives_real_tool_and_model_calls_through_production_executor() {
 }
 
 #[tokio::test]
+#[ignore = "requires a live dwctl boot to apply fusillade migrations to the dwctl DB; see test docstring"]
 async fn agent_kind_tool_recurses_via_tool_schema() {
     // ToolDefinition.kind = "agent" propagates through
     // HttpToolExecutor::tools() as ToolKind::Agent on the schema. The
