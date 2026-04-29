@@ -48,6 +48,7 @@ use onwards::traits::{RequestContext, ToolExecutor};
 use onwards::{LoopConfig, LoopError, MultiStepStore, UpstreamTarget};
 
 use crate::responses::store::FusilladeResponseStore;
+use crate::tool_executor::ResolvedTools;
 
 /// Dispatches per-claim work to the multi-step loop for `/v1/responses`
 /// requests, falling through to [`DefaultRequestProcessor`] for
@@ -57,7 +58,8 @@ use crate::responses::store::FusilladeResponseStore;
 /// production [`HttpToolExecutor`] with context-injecting shims (the
 /// daemon path doesn't have request-scoped middleware to populate
 /// `RequestContext.extensions::<ResolvedTools>`, so the test wraps with
-/// an injector). Production wiring uses `HttpToolExecutor` directly.
+/// an injector). Production wiring uses `HttpToolExecutor` directly +
+/// the [`tool_resolver`](Self::tool_resolver) field below.
 pub struct DwctlRequestProcessor<P, T>
 where
     P: FusilladePool + Clone + Send + Sync + 'static,
@@ -67,10 +69,51 @@ where
     pub tool_executor: Arc<T>,
     pub http_client: Arc<dyn HttpClient + Send + Sync>,
     pub loop_config: LoopConfig,
+    /// Tool resolver for the daemon path. Tools today are scoped per
+    /// (api_key, model alias) — same as the realtime middleware path —
+    /// so the daemon resolves the same tool set the original request
+    /// would have seen. `None` means no DB-backed resolution; the
+    /// processor will run the loop with whatever tools the
+    /// `tool_executor` discovers from an empty context (used by the
+    /// daemon-test fixture that injects ResolvedTools through its own
+    /// shim).
+    pub tool_resolver: Option<Arc<dyn DaemonToolResolver>>,
     /// Default processor used for non-`/v1/responses` endpoints. Owns
     /// no state — declared as a field so the trait dispatch below has
     /// a stable receiver.
     pub default: DefaultRequestProcessor,
+}
+
+/// Resolve the tool set for a daemon-claimed request. Called once per
+/// `/v1/responses` claim before the loop runs. The default production
+/// implementation (see [`DbToolResolver`]) runs the same DB join the
+/// realtime middleware does, scoped to the row's API key and model
+/// alias.
+#[async_trait]
+pub trait DaemonToolResolver: Send + Sync {
+    async fn resolve(
+        &self,
+        api_key: &str,
+        model_alias: &str,
+    ) -> Result<Option<crate::tool_executor::ResolvedToolSet>, anyhow::Error>;
+}
+
+/// Production [`DaemonToolResolver`] backed by the same query the
+/// realtime tool injection middleware uses.
+pub struct DbToolResolver {
+    pub pool: sqlx::PgPool,
+}
+
+#[async_trait]
+impl DaemonToolResolver for DbToolResolver {
+    async fn resolve(
+        &self,
+        api_key: &str,
+        model_alias: &str,
+    ) -> Result<Option<crate::tool_executor::ResolvedToolSet>, anyhow::Error> {
+        crate::tool_injection::resolve_tools_for_request(&self.pool, api_key, Some(model_alias))
+            .await
+    }
 }
 
 impl<P, T> DwctlRequestProcessor<P, T>
@@ -89,8 +132,18 @@ where
             tool_executor,
             http_client,
             loop_config,
+            tool_resolver: None,
             default: DefaultRequestProcessor,
         }
+    }
+
+    /// Wire in the production tool resolver. Without this, the daemon
+    /// path runs the loop with no resolved tools — fine for tests, but
+    /// in production this should always be set so multi-step requests
+    /// see the same tools their original API key + model alias would.
+    pub fn with_tool_resolver(mut self, resolver: Arc<dyn DaemonToolResolver>) -> Self {
+        self.tool_resolver = Some(resolver);
+        self
     }
 }
 
@@ -152,17 +205,40 @@ where
             },
         };
 
-        // Tools resolved by middleware aren't accessible inside the
-        // daemon — middleware runs only on the inline request path.
-        // For daemon-driven multi-step responses, the tool registry is
-        // discovered fresh via HttpToolExecutor::tools() against an
-        // empty RequestContext. Tools that require per-request resolved
-        // state should be added via with_extension on a context built
-        // here from the request's metadata; for now we pass an empty
-        // context, which means any tool requiring middleware-injected
-        // state will be unavailable in the daemon path. Wiring this is
-        // a follow-up.
-        let tool_ctx = RequestContext::new().with_model(request.data.model.clone());
+        // Build the per-request RequestContext the same way the
+        // realtime middleware does. Tools today are scoped per
+        // (api_key, model_alias); the resolver runs the same DB join
+        // and produces a ResolvedToolSet, which is injected into the
+        // context via the same `ResolvedTools` extension that
+        // HttpToolExecutor reads at execute() time. This means
+        // daemon-driven multi-step requests see exactly the same
+        // tool set their original /v1/responses POST would have seen
+        // — no daemon-vs-realtime tool-availability divergence.
+        let mut tool_ctx = RequestContext::new().with_model(request.data.model.clone());
+        if let Some(resolver) = &self.tool_resolver {
+            match resolver
+                .resolve(&request.data.api_key, &request.data.model)
+                .await
+            {
+                Ok(Some(resolved)) => {
+                    tool_ctx = tool_ctx.with_extension(ResolvedTools(Arc::new(resolved)));
+                }
+                Ok(None) => {
+                    tracing::debug!(
+                        request_id = %request.data.id,
+                        model = %request.data.model,
+                        "no tools resolved for daemon-driven /v1/responses request"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        request_id = %request.data.id,
+                        "tool resolution failed for daemon path; running loop with no tools"
+                    );
+                }
+            }
+        }
 
         let result = onwards::run_response_loop(
             &*self.response_store,

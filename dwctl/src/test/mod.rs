@@ -2,6 +2,7 @@ pub mod databases;
 pub mod multi_step_daemon;
 pub mod multi_step_executor;
 pub mod responses;
+pub mod sigterm_drain;
 pub mod sla;
 pub mod strict_mode;
 pub mod utils;

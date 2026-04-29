@@ -1671,6 +1671,15 @@ pub struct BackgroundServices {
     /// `setup_background_services` so the manager's processor (which
     /// dwctl wires later in `Application::new_with_pool`) can use it.
     step_manager: Arc<fusillade::PostgresResponseStepManager<DbPools>>,
+    /// The onwards-instance daemon id registered in the `daemons` table
+    /// for realtime / inline-loop attribution. The graceful-shutdown
+    /// drain (`shutdown()`) marks this row Dead and releases any
+    /// in-progress rows it owns back to `pending` so the next pod picks
+    /// them up immediately rather than waiting for stale-daemon
+    /// detection (~30s).
+    onwards_daemon_id: Option<Uuid>,
+    /// Fusillade write pool retained for the SIGTERM drain queries.
+    fusillade_write_pool: Option<sqlx::PgPool>,
     task_runner: Arc<tasks::TaskRunner>,
     is_leader: bool,
     onwards_targets: onwards::target::Targets,
@@ -1749,10 +1758,94 @@ impl BackgroundServices {
         self.shutdown_token.clone()
     }
 
-    /// Gracefully shutdown all background tasks
+    /// Gracefully shutdown all background tasks.
+    ///
+    /// Implements the SIGTERM drain protocol from
+    /// `fusillade/docs/plans/2026-04-28-multi-step-responses.md` (COR-353):
+    ///
+    /// 1. Signal all in-process tasks to stop accepting new work
+    ///    (`shutdown_token.cancel()`). The fusillade batch daemon stops
+    ///    claiming and waits for in-flight workers to finish their
+    ///    current loop iteration; it then marks its own daemon row Dead
+    ///    via the `Running -> Dead` typestate transition.
+    /// 2. Drain the **onwards-instance daemon** registration: this row
+    ///    is created manually for realtime/inline-loop attribution and
+    ///    is not managed by fusillade's daemon lifecycle, so we mark it
+    ///    Dead explicitly + release any rows it owns back to pending.
+    ///    Without this, the rows would wait for fusillade's stale-
+    ///    daemon detection (default ~30s) before the next pod picks
+    ///    them up.
+    ///
+    /// The drain is best-effort and logs errors rather than failing
+    /// shutdown — a slow/missing drain falls back to time-based
+    /// reclaim, which is correct just slower.
     pub async fn shutdown(mut self) {
         // Signal all background tasks to shutdown
         self.shutdown_token.cancel();
+
+        // Drain the onwards-instance daemon registration before joining
+        // tasks: this is the SIGTERM drain that gives the next pod
+        // immediate ownership of any rows we still hold. We do this
+        // BEFORE waiting for tasks because the unclaim is independent
+        // of in-flight task completion — it just touches DB state.
+        if let (Some(daemon_id), Some(pool)) = (
+            self.onwards_daemon_id,
+            self.fusillade_write_pool.as_ref(),
+        ) {
+            // Mark our daemon row Dead. fusillade's reclaim query
+            // (`unclaim_stale_requests`) treats `daemons.status='dead'`
+            // as the immediate-reclaim signal, so as soon as this
+            // commits the next claim cycle on any other instance will
+            // see our rows.
+            //
+            // The `dead_timestamp_check` constraint on `daemons`
+            // requires `stopped_at IS NOT NULL` when status='dead', so
+            // we set it explicitly here.
+            let mark_dead = sqlx::query(
+                "UPDATE daemons SET status = 'dead', stopped_at = NOW() \
+                 WHERE id = $1",
+            )
+            .bind(daemon_id)
+            .execute(pool)
+            .await;
+            if let Err(e) = mark_dead {
+                tracing::warn!(error = %e, daemon_id = %daemon_id,
+                    "SIGTERM drain: failed to mark onwards daemon Dead — \
+                     rows will be reclaimed via stale-daemon detection");
+            } else {
+                tracing::info!(daemon_id = %daemon_id, "SIGTERM drain: marked onwards daemon Dead");
+            }
+
+            // Explicitly release any rows we own back to pending so the
+            // next pod's claim cycle picks them up immediately rather
+            // than waiting for the time-based fallback path. The
+            // typestate constraints on `requests` require we clear
+            // claimed_at/started_at when going back to pending.
+            let unclaim = sqlx::query(
+                "UPDATE requests \
+                 SET state = 'pending', daemon_id = NULL, claimed_at = NULL, started_at = NULL \
+                 WHERE daemon_id = $1 AND state IN ('claimed', 'processing')",
+            )
+            .bind(daemon_id)
+            .execute(pool)
+            .await;
+            match unclaim {
+                Ok(result) => {
+                    if result.rows_affected() > 0 {
+                        tracing::info!(
+                            daemon_id = %daemon_id,
+                            rows_released = result.rows_affected(),
+                            "SIGTERM drain: released claimed/processing rows back to pending"
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, daemon_id = %daemon_id,
+                        "SIGTERM drain: failed to unclaim rows — \
+                         rows will be reclaimed via stale-daemon detection");
+                }
+            }
+        }
 
         // Wait for all background tasks to complete and check for errors
         while let Some(result) = self.background_tasks.join_next_with_id().await {
@@ -2300,6 +2393,11 @@ async fn setup_background_services(
         shutdown_token,
         drop_guard: Some(drop_guard),
         connections_encryption_key: encryption_key.clone(),
+        // Application::new_with_pool wires these once the onwards-
+        // instance daemon row is registered. Kept Optional here so
+        // tests that bypass that wiring still construct cleanly.
+        onwards_daemon_id: None,
+        fusillade_write_pool: None,
     })
 }
 
@@ -2439,6 +2537,11 @@ impl Application {
         let daemon_registered = match &daemon_insert_result {
             Ok(_) => {
                 tracing::info!(daemon_id = %onwards_daemon_id, "Registered onwards as fusillade daemon");
+                // Stash on bg_services so the SIGTERM drain in
+                // BackgroundServices::shutdown can mark this row Dead
+                // and release its claimed rows.
+                bg_services.onwards_daemon_id = Some(onwards_daemon_id);
+                bg_services.fusillade_write_pool = Some(fusillade_write_pool.clone());
                 true
             }
             Err(e) => {
@@ -2518,6 +2621,10 @@ impl Application {
         ));
         let multi_step_http_client: Arc<dyn onwards::client::HttpClient + Send + Sync> =
             Arc::new(onwards::client::create_hyper_client(10, 30));
+        let tool_resolver: Arc<dyn crate::responses::processor::DaemonToolResolver> =
+            Arc::new(crate::responses::processor::DbToolResolver {
+                pool: (*db_pools).write().clone(),
+            });
         let multi_step_processor = Arc::new(
             crate::responses::processor::DwctlRequestProcessor::new(
                 response_store.clone(),
@@ -2527,7 +2634,8 @@ impl Application {
                     max_response_step_depth: config.responses.max_response_step_depth,
                     max_response_iterations: config.responses.max_response_iterations,
                 },
-            ),
+            )
+            .with_tool_resolver(tool_resolver),
         );
         if let Err(e) = bg_services.request_manager.set_processor(multi_step_processor) {
             tracing::warn!(error = e, "Multi-step processor was already set; skipping");
