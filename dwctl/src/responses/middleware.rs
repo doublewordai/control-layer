@@ -26,6 +26,8 @@ use axum::{
 use fusillade::{PostgresRequestManager, ReqwestHttpClient};
 use sqlx_pool_router::PoolProvider;
 
+use fusillade::Storage;
+
 use super::jobs::CreateResponseInput;
 use super::store::{self as response_store, ONWARDS_RESPONSE_ID_HEADER, OnwardsDaemonId};
 
@@ -43,6 +45,14 @@ pub struct ResponsesMiddlewareState<P: PoolProvider + Clone = sqlx_pool_router::
     /// Underway job used to create the realtime tracking batch asynchronously
     /// on the blocking (non-background) path.
     pub create_response_job: Arc<underway::Job<CreateResponseInput, crate::tasks::TaskState<P>>>,
+    /// Multi-step warm-path streaming pieces. When the user sends
+    /// `stream: true` (and not `background: true`) on `/v1/responses`,
+    /// the middleware routes the request through
+    /// [`super::streaming::run_inline_streaming`] using these.
+    pub response_store: Arc<super::store::FusilladeResponseStore<P>>,
+    pub multi_step_tool_executor: Arc<crate::tool_executor::HttpToolExecutor>,
+    pub multi_step_http_client: Arc<dyn onwards::client::HttpClient + Send + Sync>,
+    pub loop_config: onwards::LoopConfig,
 }
 
 /// Middleware that routes inference requests based on service_tier and background.
@@ -104,6 +114,27 @@ pub async fn responses_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     } else {
         (ServiceTier::Realtime, false)
     };
+
+    // Multi-step warm-path streaming dispatch. Triggers when the user
+    // wants live token streaming (stream=true, no background). Routes
+    // around onwards' single-step proxy and runs run_response_loop
+    // inline so token deltas + tool boundaries flow through the SSE
+    // response. Only applies to /v1/responses — chat completions and
+    // embeddings keep their existing single-step proxy path.
+    let stream_requested = is_responses_api
+        && !background
+        && request_value["stream"].as_bool().unwrap_or(false);
+    if stream_requested
+        && let Some(resp) = try_warm_path_stream(
+            &state,
+            &request_value,
+            api_key.as_deref(),
+            model,
+        )
+        .await
+    {
+        return resp;
+    }
 
     tracing::debug!(
         model = %model,
@@ -401,6 +432,94 @@ async fn handle_flex<P: PoolProvider + Clone + Send + Sync + 'static>(
 pub(crate) fn should_intercept(method: &axum::http::Method, path: &str) -> bool {
     method == axum::http::Method::POST
         && (path.ends_with("/responses") || path.ends_with("/chat/completions") || path.ends_with("/embeddings"))
+}
+
+/// Attempt to dispatch a `/v1/responses` request through the warm-path
+/// streaming handler. Returns `Some(response)` if the dispatch
+/// succeeded; `None` if the request can't be served via the warm path
+/// (no API key, missing tool resolution, etc.) and should fall through
+/// to the standard single-step / daemon paths.
+async fn try_warm_path_stream<P: PoolProvider + Clone + Send + Sync + 'static>(
+    state: &ResponsesMiddlewareState<P>,
+    request_value: &serde_json::Value,
+    api_key: Option<&str>,
+    model: &str,
+) -> Option<Response> {
+    let api_key = api_key?;
+
+    // Insert the parent fusillade row in `processing` state owned by
+    // this onwards instance so the batch daemon doesn't double-claim.
+    // Body is the raw user request — the multi-step transition function
+    // reads it back to drive next_action_for.
+    let request_id = uuid::Uuid::new_v4();
+    let batch_id = uuid::Uuid::new_v4();
+    let body_str = request_value.to_string();
+    let batch_input = fusillade::CreateSingleRequestBatchInput {
+        batch_id: Some(batch_id),
+        request_id,
+        body: body_str.clone(),
+        model: model.to_string(),
+        base_url: state.loopback_base_url.clone(),
+        endpoint: "/v1/responses".to_string(),
+        completion_window: "0s".to_string(),
+        initial_state: "processing".to_string(),
+        api_key: Some(api_key.to_string()),
+        created_by: response_store::lookup_created_by(&state.dwctl_pool, Some(api_key)).await,
+    };
+    if let Err(e) = state
+        .request_manager
+        .create_single_request_batch(batch_input)
+        .await
+    {
+        tracing::error!(error = %e, "warm-path streaming: failed to create fusillade row");
+        return None;
+    }
+
+    // Resolve the per-request tool set (same DB query as the
+    // single-step middleware). Build a ResolvedToolSet ready to inject
+    // into the loop's RequestContext.
+    let resolved = match crate::tool_injection::resolve_tools_for_request(
+        &state.dwctl_pool,
+        api_key,
+        Some(model),
+    )
+    .await
+    {
+        Ok(Some(set)) => Arc::new(set),
+        Ok(None) => Arc::new(crate::tool_executor::ResolvedToolSet::new(
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+        )),
+        Err(e) => {
+            tracing::warn!(error = %e, "warm-path streaming: tool resolution failed; running with no tools");
+            Arc::new(crate::tool_executor::ResolvedToolSet::new(
+                std::collections::HashMap::new(),
+                std::collections::HashMap::new(),
+            ))
+        }
+    };
+
+    // Upstream URL for model_calls: use the loopback so the multi-step
+    // loop's chat-completions HTTP fire is routed through onwards'
+    // existing target picker / load balancer, exactly the same way a
+    // single-step request would be. The Bearer token is the user's
+    // API key (validated by onwards on its way through).
+    let upstream = onwards::UpstreamTarget {
+        url: format!("{}/v1/chat/completions", state.loopback_base_url),
+        api_key: Some(api_key.to_string()),
+    };
+
+    let sse = super::streaming::run_inline_streaming(
+        state.response_store.clone(),
+        state.multi_step_tool_executor.clone(),
+        resolved,
+        state.multi_step_http_client.clone(),
+        upstream,
+        state.loop_config,
+        request_id.to_string(),
+        model.to_string(),
+    );
+    Some(sse.into_response())
 }
 
 #[cfg(test)]

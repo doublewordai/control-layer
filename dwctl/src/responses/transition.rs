@@ -65,6 +65,11 @@ pub(crate) struct ParsedRequest {
     pub model: String,
     pub initial_messages: Vec<Value>,
     pub tools: Option<Value>,
+    /// User's `stream` flag from the parent body. Propagated verbatim
+    /// onto every model_call request_payload we construct so the
+    /// upstream HTTP fire honors the user's choice (and the loop
+    /// forwards token deltas to the sink only when this is true).
+    pub stream: bool,
 }
 
 pub(crate) fn parse_parent_request(body: &str) -> Result<ParsedRequest, String> {
@@ -89,11 +94,13 @@ pub(crate) fn parse_parent_request(body: &str) -> Result<ParsedRequest, String> 
     };
 
     let tools = v.get("tools").cloned();
+    let stream = v.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
 
     Ok(ParsedRequest {
         model,
         initial_messages,
         tools,
+        stream,
     })
 }
 
@@ -212,6 +219,7 @@ pub(crate) fn prepare_initial_model_call(parsed: &ParsedRequest) -> StepDescript
     let mut payload = json!({
         "model": parsed.model,
         "messages": parsed.initial_messages,
+        "stream": parsed.stream,
     });
     if let Some(tools) = &parsed.tools {
         payload["tools"] = tools.clone();
@@ -233,6 +241,7 @@ pub(crate) fn prepare_followup_model_call(
     let mut payload = json!({
         "model": parsed.model,
         "messages": messages,
+        "stream": parsed.stream,
     });
     if let Some(tools) = &parsed.tools {
         payload["tools"] = tools.clone();
@@ -352,6 +361,7 @@ mod tests {
             model: "m".into(),
             initial_messages: vec![json!({"role":"user","content":"hi"})],
             tools: None,
+            stream: false,
         };
         match decide_next_action(&parsed, &[]) {
             NextAction::AppendSteps(steps) => {
@@ -369,6 +379,7 @@ mod tests {
             model: "m".into(),
             initial_messages: vec![],
             tools: None,
+            stream: false,
         };
         let response = json!({
             "choices": [{
@@ -400,6 +411,7 @@ mod tests {
             model: "m".into(),
             initial_messages: vec![],
             tools: None,
+            stream: false,
         };
         let response = json!({
             "choices": [{
@@ -419,6 +431,7 @@ mod tests {
             model: "m".into(),
             initial_messages: vec![json!({"role":"user","content":"hi"})],
             tools: None,
+            stream: false,
         };
         let model_response = json!({
             "choices": [{
@@ -453,6 +466,7 @@ mod tests {
             model: "m".into(),
             initial_messages: vec![],
             tools: None,
+            stream: false,
         };
         let mut s = step("s1", 1, StepKind::ModelCall, StepState::Failed, None);
         s.error = Some(json!({"type": "upstream_500"}));

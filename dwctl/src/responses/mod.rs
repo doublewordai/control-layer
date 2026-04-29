@@ -16,4 +16,5 @@ pub mod middleware;
 pub mod outlet_handler;
 pub mod processor;
 pub mod store;
+pub mod streaming;
 pub mod transition;

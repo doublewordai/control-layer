@@ -58,6 +58,13 @@ impl<P: PoolProvider + Clone> FusilladeResponseStore<P> {
         self
     }
 
+    /// Borrow the inner request_manager. Used by the warm-path SSE
+    /// handler to call `complete_request` / `fail_request` directly
+    /// after running the loop inline.
+    pub fn request_manager(&self) -> &PostgresRequestManager<P, ReqwestHttpClient> {
+        &self.request_manager
+    }
+
     fn require_step_manager(&self) -> Result<&PostgresResponseStepManager<P>, StoreError> {
         self.step_manager.as_deref().ok_or_else(|| {
             StoreError::StorageError(

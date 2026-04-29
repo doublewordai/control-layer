@@ -2625,15 +2625,20 @@ impl Application {
             Arc::new(crate::responses::processor::DbToolResolver {
                 pool: (*db_pools).write().clone(),
             });
+        let multi_step_loop_config = onwards::LoopConfig {
+            max_response_step_depth: config.responses.max_response_step_depth,
+            max_response_iterations: config.responses.max_response_iterations,
+        };
+        // Clone the executor + client so the middleware state can use
+        // them for warm-path streaming. The daemon processor takes its
+        // own owned references — they all share the same underlying
+        // pool / connection state.
         let multi_step_processor = Arc::new(
             crate::responses::processor::DwctlRequestProcessor::new(
                 response_store.clone(),
-                multi_step_tool_executor,
-                multi_step_http_client,
-                onwards::LoopConfig {
-                    max_response_step_depth: config.responses.max_response_step_depth,
-                    max_response_iterations: config.responses.max_response_iterations,
-                },
+                multi_step_tool_executor.clone(),
+                multi_step_http_client.clone(),
+                multi_step_loop_config,
             )
             .with_tool_resolver(tool_resolver),
         );
@@ -2656,6 +2661,10 @@ impl Application {
             },
             dwctl_pool: (*db_pools).write().clone(),
             create_response_job: bg_services.task_runner.create_response_job.clone(),
+            response_store: response_store.clone(),
+            multi_step_tool_executor,
+            multi_step_http_client,
+            loop_config: multi_step_loop_config,
         };
 
         // Build onwards router from targets with body transform, response sanitization, and tool executor.

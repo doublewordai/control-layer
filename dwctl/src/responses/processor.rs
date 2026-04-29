@@ -240,12 +240,17 @@ where
             }
         }
 
+        // Daemon path: no event sink — the user's HTTP connection is
+        // long gone by the time we claim. Streaming requests use the
+        // warm path (responses::streaming module) which runs the loop
+        // inline with a sink wired to the SSE response.
         let result = onwards::run_response_loop(
             &*self.response_store,
             &*self.tool_executor,
             &tool_ctx,
             &upstream,
             self.http_client.clone(),
+            None,
             &request_id,
             None,
             self.loop_config,
