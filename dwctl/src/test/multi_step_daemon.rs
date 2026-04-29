@@ -264,23 +264,27 @@ async fn daemon_claim_runs_multi_step_loop_end_to_end() {
     );
 
     // Walk the response_steps table directly and confirm the chain shape.
-    let steps = sqlx::query!(
+    // Use the runtime sqlx::query (not the macro) so compile-time check
+    // doesn't need the fusillade schema in the DATABASE_URL connection —
+    // fusillade migrations are applied programmatically by the dwctl
+    // binary, not by the dwctl/migrations/ folder that sqlx prepare sees.
+    let steps: Vec<(String, String)> = sqlx::query_as(
         r#"
-        SELECT step_kind AS "step_kind!", state AS "state!", step_sequence AS "step_sequence!"
+        SELECT step_kind, state
         FROM fusillade.response_steps
         WHERE request_id = $1
         ORDER BY step_sequence
         "#,
-        *request_id
     )
+    .bind(*request_id)
     .fetch_all(&pool)
     .await
     .unwrap();
     assert_eq!(steps.len(), 3, "expected 3 steps, got {steps:?}");
-    assert_eq!(steps[0].step_kind, "model_call");
-    assert_eq!(steps[1].step_kind, "tool_call");
-    assert_eq!(steps[2].step_kind, "model_call");
-    assert!(steps.iter().all(|s| s.state == "completed"));
+    assert_eq!(steps[0].0, "model_call");
+    assert_eq!(steps[1].0, "tool_call");
+    assert_eq!(steps[2].0, "model_call");
+    assert!(steps.iter().all(|s| s.1 == "completed"));
 
     // The parent row's response_body holds the assembled OpenAI Response
     // JSON. Spot-check the shape.
