@@ -136,13 +136,7 @@ pub(crate) fn build_messages_from_chain(
                 let call_id = step
                     .response_payload
                     .as_ref()
-                    .and_then(|_p| {
-                        // The tool_call step's request_payload carried
-                        // the call_id; on the chain we only have the
-                        // response. Fall back to a synthesized id so
-                        // the upstream model can still correlate.
-                        Some("unknown".to_string())
-                    })
+                    .map(|_p| "unknown".to_string())
                     .unwrap_or_else(|| format!("step_{}", step.sequence));
                 let content = step
                     .response_payload

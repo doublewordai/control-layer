@@ -267,7 +267,7 @@ async fn daemon_claim_runs_multi_step_loop_end_to_end() {
     let steps = sqlx::query!(
         r#"
         SELECT step_kind AS "step_kind!", state AS "state!", step_sequence AS "step_sequence!"
-        FROM response_steps
+        FROM fusillade.response_steps
         WHERE request_id = $1
         ORDER BY step_sequence
         "#,

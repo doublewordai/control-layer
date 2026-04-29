@@ -1,15 +1,3 @@
 [workspace]
 members = ["dwctl"]
 resolver = "2"
-
-# Local overrides for the multi-step responses initiative. The fusillade and
-# onwards crates have unreleased changes (response_steps storage layer +
-# RequestProcessor hook in fusillade, multi-step orchestration loop + extended
-# ResponseStore trait in onwards). Pointing the workspace at sibling checkouts
-# lets us prove the bridge wiring compiles + runs end-to-end before the
-# upstream releases land.
-#
-# Remove these patches once the upstream releases are published.
-[patch.crates-io]
-fusillade = { path = "../fusillade" }
-onwards = { path = "../onwards" }
