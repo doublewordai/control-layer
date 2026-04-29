@@ -593,26 +593,33 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> ResponseStore for Fusillad
     }
 }
 
-// MultiStepStore implementation: storage primitives + chain walk backed by
-// fusillade's PostgresResponseStepManager. The transition function
-// (`next_action_for`) and the assembly logic (`assemble_response`) are NOT
-// implemented here yet — those require the Open Responses domain logic
-// that is the focus of follow-up issues COR-346 / 347 / 348 and so are
-// represented here by `unimplemented!` markers. Calling them at runtime
-// before they're wired will panic — the loop will not invoke them until
-// the transition function path lands.
+// MultiStepStore implementation: storage primitives + chain walk backed
+// by fusillade's PostgresResponseStepManager, plus the Open Responses
+// transition function (next_action_for) and assembly (assemble_response)
+// living in the sibling `transition` and `assembly` modules.
 #[async_trait]
 impl<P: PoolProvider + Clone + Send + Sync + 'static> MultiStepStore
     for FusilladeResponseStore<P>
 {
     async fn next_action_for(
         &self,
-        _request_id: &str,
-        _scope_parent: Option<&str>,
+        request_id: &str,
+        scope_parent: Option<&str>,
     ) -> Result<onwards::NextAction, StoreError> {
-        Err(StoreError::StorageError(
-            "next_action_for not yet implemented (COR-346)".into(),
-        ))
+        let parent_uuid = parse_response_id(request_id)?;
+        let detail = self
+            .request_manager
+            .get_request_detail(RequestId(parent_uuid))
+            .await
+            .map_err(|e| StoreError::StorageError(format!("fetch parent request: {e}")))?;
+        let body = detail.body.ok_or_else(|| {
+            StoreError::StorageError("parent request body has been purged".into())
+        })?;
+        let parsed = super::transition::parse_parent_request(&body)
+            .map_err(StoreError::StorageError)?;
+        let chain =
+            <Self as MultiStepStore>::list_chain(self, request_id, scope_parent).await?;
+        Ok(super::transition::decide_next_action(&parsed, &chain))
     }
 
     async fn record_step(
@@ -713,11 +720,11 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> MultiStepStore
 
     async fn assemble_response(
         &self,
-        _request_id: &str,
+        request_id: &str,
     ) -> Result<serde_json::Value, StoreError> {
-        Err(StoreError::StorageError(
-            "assemble_response not yet implemented (COR-348)".into(),
-        ))
+        let chain =
+            <Self as MultiStepStore>::list_chain(self, request_id, None).await?;
+        Ok(super::assembly::assemble_from_chain(request_id, &chain))
     }
 }
 

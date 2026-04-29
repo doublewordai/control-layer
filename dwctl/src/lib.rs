@@ -1666,6 +1666,11 @@ async fn inject_trace_id(request: axum::extract::Request, next: middleware::Next
 /// the shutdown token, signaling all tasks to stop.
 pub struct BackgroundServices {
     request_manager: Arc<fusillade::PostgresRequestManager<DbPools, fusillade::ReqwestHttpClient>>,
+    /// Step storage for multi-step responses, sharing the same fusillade
+    /// pool as the request manager. Constructed in
+    /// `setup_background_services` so the manager's processor (which
+    /// dwctl wires later in `Application::new_with_pool`) can use it.
+    step_manager: Arc<fusillade::PostgresResponseStepManager<DbPools>>,
     task_runner: Arc<tasks::TaskRunner>,
     is_leader: bool,
     onwards_targets: onwards::target::Targets,
@@ -1910,8 +1915,11 @@ async fn setup_background_services(
 
     let probe_scheduler = probes::ProbeScheduler::new(pool.clone(), config.clone());
 
-    // Clone fusillade pools for metrics before moving into request manager
+    // Clone fusillade pools for metrics + multi-step step manager before
+    // moving into request manager. Both later consumers need the
+    // PoolProvider to share state with the request manager's pool.
     let fusillade_pool_for_metrics = fusillade_pools.write().clone();
+    let fusillade_pools_for_steps = fusillade_pools.clone();
 
     // Initialize the fusillade request manager (for batch processing)
     let request_manager = Arc::new(
@@ -2274,8 +2282,13 @@ async fn setup_background_services(
 
     let (background_tasks, task_names) = background_tasks.into_parts();
 
+    let step_manager = Arc::new(fusillade::PostgresResponseStepManager::new(
+        fusillade_pools_for_steps,
+    ));
+
     Ok(BackgroundServices {
         request_manager,
+        step_manager,
         task_runner,
         is_leader,
         onwards_targets: initial_targets,
@@ -2476,9 +2489,49 @@ impl Application {
         } // daemon_registered
 
         // Create the response store (backed by request_manager for reads via Storage trait)
-        let response_store = Arc::new(crate::responses::store::FusilladeResponseStore::new(
-            bg_services.request_manager.clone(),
+        let response_store = Arc::new(
+            crate::responses::store::FusilladeResponseStore::new(
+                bg_services.request_manager.clone(),
+            )
+            .with_step_manager(bg_services.step_manager.clone()),
+        );
+
+        // Wire the multi-step orchestration dispatcher. The processor
+        // matches on `request.data.endpoint`: `/v1/responses` runs the
+        // multi-step loop (transition function + tool executor + model
+        // HTTP fire), everything else falls through to fusillade's
+        // DefaultRequestProcessor — the existing batch path is byte-
+        // for-byte unchanged.
+        //
+        // Late-wired via set_processor: the response_store needs the
+        // request_manager (for parent-body fetches), the processor
+        // needs the response_store, and the request_manager needs the
+        // processor. Constructing the manager first then attaching the
+        // processor breaks the would-be construction cycle. The
+        // resulting Arc graph is shaped manager → processor → store →
+        // manager, which is a memory cycle in principle, but these
+        // objects live for the entire app lifetime so it never matters
+        // in practice.
+        let multi_step_tool_executor = Arc::new(crate::tool_executor::HttpToolExecutor::new(
+            reqwest::Client::new(),
+            Some(Arc::new(db_pools.write().clone())),
         ));
+        let multi_step_http_client: Arc<dyn onwards::client::HttpClient + Send + Sync> =
+            Arc::new(onwards::client::create_hyper_client(10, 30));
+        let multi_step_processor = Arc::new(
+            crate::responses::processor::DwctlRequestProcessor::new(
+                response_store.clone(),
+                multi_step_tool_executor,
+                multi_step_http_client,
+                onwards::LoopConfig {
+                    max_response_step_depth: config.responses.max_response_step_depth,
+                    max_response_iterations: config.responses.max_response_iterations,
+                },
+            ),
+        );
+        if let Err(e) = bg_services.request_manager.set_processor(multi_step_processor) {
+            tracing::warn!(error = e, "Multi-step processor was already set; skipping");
+        }
 
         // Responses middleware state (enqueues create-response jobs via underway)
         let responses_middleware_state = crate::responses::middleware::ResponsesMiddlewareState {

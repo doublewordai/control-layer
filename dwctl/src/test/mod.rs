@@ -1,4 +1,5 @@
 pub mod databases;
+pub mod multi_step_daemon;
 pub mod multi_step_executor;
 pub mod responses;
 pub mod sla;

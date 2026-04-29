@@ -9,8 +9,11 @@
 //! - **store**: Functions for reading/writing fusillade rows + `ResponseStore` trait impl
 //! - **handler**: `GET /ai/v1/responses/{id}` HTTP handler
 
+pub mod assembly;
 pub mod handler;
 pub mod jobs;
 pub mod middleware;
 pub mod outlet_handler;
+pub mod processor;
 pub mod store;
+pub mod transition;
