@@ -35,6 +35,12 @@ pub struct ToolDefinition {
     pub timeout_secs: u64,
     /// Foreign key into `tool_sources` for analytics.
     pub tool_source_id: Uuid,
+    /// Tool dispatch kind from `tool_sources.kind`. `"http"` (default) =
+    /// fire HTTP request. `"agent"` = sub-agent dispatch (handled by the
+    /// multi-step loop's `StepExecutor::dispatch_tool_call` returning
+    /// `ToolDispatch::Recurse`). Single-step `HttpToolExecutor` ignores
+    /// this field.
+    pub kind: String,
 }
 
 /// Full set of tools resolved for a single request.
@@ -250,6 +256,7 @@ mod tests {
         tools.insert(
             tool_name.to_string(),
             ToolDefinition {
+                kind: "http".to_string(),
                 url: format!("{server_url}/tool"),
                 api_key,
                 timeout_secs: 5,
@@ -347,6 +354,7 @@ mod tests {
         tools.insert(
             "my_tool".to_string(),
             ToolDefinition {
+                kind: "http".to_string(),
                 url: "http://example.com".to_string(),
                 api_key: None,
                 timeout_secs: 5,
@@ -401,6 +409,7 @@ mod tests {
         tools.insert(
             "test_tool".to_string(),
             ToolDefinition {
+                kind: "http".to_string(),
                 url: format!("{}/tool", server.uri()),
                 api_key: None,
                 timeout_secs: 1,
@@ -427,6 +436,7 @@ mod tests {
         tools.insert(
             "weather".to_string(),
             ToolDefinition {
+                kind: "http".to_string(),
                 url: "http://example.com".to_string(),
                 api_key: None,
                 timeout_secs: 30,

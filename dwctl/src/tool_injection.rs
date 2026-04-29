@@ -109,7 +109,8 @@ async fn resolve_tools_for_request(db: &PgPool, bearer_token: &str, model_alias:
             ts.parameters,
             ts.url          AS "url!",
             ts.api_key,
-            ts.timeout_secs AS "timeout_secs!"
+            ts.timeout_secs AS "timeout_secs!",
+            ts.kind         AS "kind!"
         FROM api_keys ak
         INNER JOIN user_groups ug ON ug.user_id = ak.user_id
         INNER JOIN deployment_groups dg ON dg.group_id = ug.group_id
@@ -144,6 +145,7 @@ async fn resolve_tools_for_request(db: &PgPool, bearer_token: &str, model_alias:
                 api_key: row.api_key,
                 timeout_secs: row.timeout_secs as u64,
                 tool_source_id: row.tool_source_id,
+                kind: row.kind,
             },
         );
         metadata.insert(name, (row.description, row.parameters));
