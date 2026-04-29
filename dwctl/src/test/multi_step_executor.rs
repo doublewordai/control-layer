@@ -43,16 +43,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use crate::responses::store::FusilladeResponseStore;
 use crate::tool_executor::{HttpToolExecutor, ResolvedToolSet, ResolvedTools, ToolDefinition};
 
-async fn fusillade_pool() -> PgPool {
-    let url = std::env::var("MULTI_STEP_TEST_DATABASE_URL").unwrap_or_else(|_| {
-        "postgres://postgres:password@localhost:5432/dwctl?options=-c%20search_path%3Dfusillade"
-            .into()
-    });
-    PgPool::connect(&url).await.expect(
-        "connect to dwctl's fusillade schema; run `cargo run` once first \
-         so dwctl applies its migrations and the fusillade schema exists",
-    )
-}
+use crate::test::utils::setup_fusillade_pool;
 
 async fn insert_parent_request(pool: &PgPool, schema: &str) -> String {
     let template_id = Uuid::new_v4();
@@ -196,9 +187,8 @@ async fn store_with_real_fusillade(pool: PgPool) -> FusilladeResponseStore<TestD
     FusilladeResponseStore::new(request_manager).with_step_manager(step_manager)
 }
 
-#[tokio::test]
-#[ignore = "requires a live dwctl boot to apply fusillade migrations to the dwctl DB; see test docstring"]
-async fn loop_drives_real_tool_and_model_calls_through_production_executor() {
+#[sqlx::test]
+async fn loop_drives_real_tool_and_model_calls_through_production_executor(pool: PgPool) {
     // Wiremocks for the upstream model and the tool.
     let model_server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -256,7 +246,7 @@ async fn loop_drives_real_tool_and_model_calls_through_production_executor() {
     };
 
     // Real fusillade-backed storage.
-    let pool = fusillade_pool().await;
+    let pool = setup_fusillade_pool(&pool).await;
     let request_id = insert_parent_request(&pool, "fusillade").await;
     let inner_store = store_with_real_fusillade(pool).await;
     let store = TransitionStore { inner: inner_store };
@@ -312,9 +302,8 @@ async fn loop_drives_real_tool_and_model_calls_through_production_executor() {
     );
 }
 
-#[tokio::test]
-#[ignore = "requires a live dwctl boot to apply fusillade migrations to the dwctl DB; see test docstring"]
-async fn agent_kind_tool_recurses_via_tool_schema() {
+#[sqlx::test]
+async fn agent_kind_tool_recurses_via_tool_schema(pool: PgPool) {
     // ToolDefinition.kind = "agent" propagates through
     // HttpToolExecutor::tools() as ToolKind::Agent on the schema. The
     // loop reads it and recurses without invoking ToolExecutor::execute.
@@ -368,7 +357,7 @@ async fn agent_kind_tool_recurses_via_tool_schema() {
     };
     let http_client = http_client_for_tests();
 
-    let pool = fusillade_pool().await;
+    let pool = setup_fusillade_pool(&pool).await;
     let request_id = insert_parent_request(&pool, "fusillade").await;
     let inner_store = store_with_real_fusillade(pool).await;
     let store = TransitionStore { inner: inner_store };

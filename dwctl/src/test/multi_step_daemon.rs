@@ -31,19 +31,10 @@ use crate::responses::processor::DwctlRequestProcessor;
 use crate::responses::store::FusilladeResponseStore;
 use crate::tool_executor::{HttpToolExecutor, ResolvedToolSet, ResolvedTools, ToolDefinition};
 
-async fn fusillade_pool() -> PgPool {
-    let url = std::env::var("MULTI_STEP_TEST_DATABASE_URL").unwrap_or_else(|_| {
-        "postgres://postgres:password@localhost:5432/dwctl?options=-c%20search_path%3Dfusillade"
-            .into()
-    });
-    PgPool::connect(&url).await.expect(
-        "connect to dwctl's fusillade schema; run `cargo run` once first",
-    )
-}
+use crate::test::utils::setup_fusillade_pool;
 
-#[tokio::test]
-#[ignore = "requires a live dwctl boot to apply fusillade migrations to the dwctl DB; see test docstring"]
-async fn daemon_claim_runs_multi_step_loop_end_to_end() {
+#[sqlx::test]
+async fn daemon_claim_runs_multi_step_loop_end_to_end(pool: PgPool) {
     // Wiremocks for upstream model + tool.
     let model_server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -82,7 +73,7 @@ async fn daemon_claim_runs_multi_step_loop_end_to_end() {
         .mount(&tool_server)
         .await;
 
-    let pool = fusillade_pool().await;
+    let pool = setup_fusillade_pool(&pool).await;
     let test_pools = TestDbPools::new(pool.clone()).await.unwrap();
 
     // Build the request_manager exactly the way Application::new_with_pool

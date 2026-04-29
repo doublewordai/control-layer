@@ -14,23 +14,14 @@
 //! Both guarantees are best-effort (errors logged, shutdown proceeds);
 //! the test asserts the happy path.
 
-use std::sync::Arc;
-
 use sqlx::PgPool;
 use uuid::Uuid;
 
-async fn fusillade_pool() -> PgPool {
-    let url = std::env::var("MULTI_STEP_TEST_DATABASE_URL").unwrap_or_else(|_| {
-        "postgres://postgres:password@localhost:5432/dwctl?options=-c%20search_path%3Dfusillade"
-            .into()
-    });
-    PgPool::connect(&url).await.expect("connect to fusillade schema")
-}
+use crate::test::utils::setup_fusillade_pool;
 
-#[tokio::test]
-#[ignore = "requires a live dwctl boot to apply fusillade migrations to the dwctl DB; see test docstring"]
-async fn shutdown_marks_onwards_daemon_dead_and_releases_rows() {
-    let pool = fusillade_pool().await;
+#[sqlx::test]
+async fn shutdown_marks_onwards_daemon_dead_and_releases_rows(pool: PgPool) {
+    let pool = setup_fusillade_pool(&pool).await;
 
     let daemon_id = Uuid::new_v4();
     let template_id = Uuid::new_v4();
@@ -94,10 +85,9 @@ async fn shutdown_marks_onwards_daemon_dead_and_releases_rows() {
     assert_eq!(row.2, None, "started_at should be cleared");
 }
 
-#[tokio::test]
-#[ignore = "requires a live dwctl boot to apply fusillade migrations to the dwctl DB; see test docstring"]
-async fn drain_with_no_owned_rows_is_a_noop() {
-    let pool = fusillade_pool().await;
+#[sqlx::test]
+async fn drain_with_no_owned_rows_is_a_noop(pool: PgPool) {
+    let pool = setup_fusillade_pool(&pool).await;
     let daemon_id = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO daemons (id, hostname, pid, version, config_snapshot, status, started_at, last_heartbeat) \
@@ -119,10 +109,9 @@ async fn drain_with_no_owned_rows_is_a_noop() {
     assert_eq!(status, "dead");
 }
 
-#[tokio::test]
-#[ignore = "requires a live dwctl boot to apply fusillade migrations to the dwctl DB; see test docstring"]
-async fn drain_does_not_touch_other_daemons_rows() {
-    let pool = fusillade_pool().await;
+#[sqlx::test]
+async fn drain_does_not_touch_other_daemons_rows(pool: PgPool) {
+    let pool = setup_fusillade_pool(&pool).await;
     let our_daemon = Uuid::new_v4();
     let other_daemon = Uuid::new_v4();
     let template_id = Uuid::new_v4();
@@ -199,7 +188,3 @@ async fn drain_onwards_daemon(pool: &PgPool, daemon_id: Uuid) {
     .await;
 }
 
-// Marks `Arc` as used at the file level so a stray import doesn't trip
-// dead_code under cfg variations.
-#[allow(dead_code)]
-fn _unused_marker(_: Arc<()>) {}
