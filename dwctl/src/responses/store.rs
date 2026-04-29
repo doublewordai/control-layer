@@ -8,11 +8,14 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use fusillade::{
-    BatchInput, CreateStepInput, PostgresRequestManager, PostgresResponseStepManager,
-    RequestId, RequestTemplateInput, ReqwestHttpClient, ResponseStepStore, StepId, StepKind,
-    Storage,
+    BatchInput, CreateStepInput, PostgresRequestManager, PostgresResponseStepManager, RequestId,
+    RequestTemplateInput, ReqwestHttpClient, ResponseStep, ResponseStepStore, StepId,
+    StepKind as FusilladeStepKind, StepState as FusilladeStepState, Storage,
 };
-use onwards::{ResponseStore, StepDescriptor, StepKind as OnwardsStepKind, StoreError};
+use onwards::{
+    ChainStep, MultiStepStore, RecordedStep, ResponseStore, StepDescriptor,
+    StepKind as OnwardsStepKind, StepState as OnwardsStepState, StoreError,
+};
 use sqlx_pool_router::PoolProvider;
 use uuid::Uuid;
 
@@ -83,10 +86,40 @@ fn parse_step_id(raw: &str) -> Result<StepId, StoreError> {
         .map_err(|_| StoreError::NotFound(raw.to_string()))
 }
 
-fn map_step_kind(kind: OnwardsStepKind) -> StepKind {
+fn map_step_kind(kind: OnwardsStepKind) -> FusilladeStepKind {
     match kind {
-        OnwardsStepKind::ModelCall => StepKind::ModelCall,
-        OnwardsStepKind::ToolCall => StepKind::ToolCall,
+        OnwardsStepKind::ModelCall => FusilladeStepKind::ModelCall,
+        OnwardsStepKind::ToolCall => FusilladeStepKind::ToolCall,
+    }
+}
+
+fn map_kind_back(kind: FusilladeStepKind) -> OnwardsStepKind {
+    match kind {
+        FusilladeStepKind::ModelCall => OnwardsStepKind::ModelCall,
+        FusilladeStepKind::ToolCall => OnwardsStepKind::ToolCall,
+    }
+}
+
+fn map_state_back(state: FusilladeStepState) -> OnwardsStepState {
+    match state {
+        FusilladeStepState::Pending => OnwardsStepState::Pending,
+        FusilladeStepState::Processing => OnwardsStepState::Processing,
+        FusilladeStepState::Completed => OnwardsStepState::Completed,
+        FusilladeStepState::Failed => OnwardsStepState::Failed,
+        FusilladeStepState::Canceled => OnwardsStepState::Canceled,
+    }
+}
+
+fn step_to_chain(step: ResponseStep) -> ChainStep {
+    ChainStep {
+        id: step.id.0.to_string(),
+        kind: map_kind_back(step.step_kind),
+        state: map_state_back(step.state),
+        sequence: step.step_sequence,
+        prev_step_id: step.prev_step_id.map(|s| s.0.to_string()),
+        parent_step_id: step.parent_step_id.map(|s| s.0.to_string()),
+        response_payload: step.response_payload,
+        error: step.error,
     }
 }
 
@@ -558,17 +591,29 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> ResponseStore for Fusillad
     async fn get_context(&self, response_id: &str) -> Result<Option<serde_json::Value>, StoreError> {
         self.get_response(response_id).await
     }
+}
 
-    // --------------------------------------------------------------
-    // Multi-step orchestration: storage primitives backed by fusillade's
-    // PostgresResponseStepManager. The transition function
-    // (`next_action_for`) and the assembly logic (`assemble_response`)
-    // are NOT implemented here yet — those require the Open Responses
-    // domain logic that is the focus of follow-up issues COR-346 / 347
-    // / 348. The defaults from the trait return
-    // `StoreError::StorageError("not implemented")`, which the loop
-    // surfaces as `LoopError::Store` so the response fails cleanly.
-    // --------------------------------------------------------------
+// MultiStepStore implementation: storage primitives + chain walk backed by
+// fusillade's PostgresResponseStepManager. The transition function
+// (`next_action_for`) and the assembly logic (`assemble_response`) are NOT
+// implemented here yet — those require the Open Responses domain logic
+// that is the focus of follow-up issues COR-346 / 347 / 348 and so are
+// represented here by `unimplemented!` markers. Calling them at runtime
+// before they're wired will panic — the loop will not invoke them until
+// the transition function path lands.
+#[async_trait]
+impl<P: PoolProvider + Clone + Send + Sync + 'static> MultiStepStore
+    for FusilladeResponseStore<P>
+{
+    async fn next_action_for(
+        &self,
+        _request_id: &str,
+        _scope_parent: Option<&str>,
+    ) -> Result<onwards::NextAction, StoreError> {
+        Err(StoreError::StorageError(
+            "next_action_for not yet implemented (COR-346)".into(),
+        ))
+    }
 
     async fn record_step(
         &self,
@@ -576,13 +621,27 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> ResponseStore for Fusillad
         scope_parent: Option<&str>,
         prev_step: Option<&str>,
         descriptor: &StepDescriptor,
-        sequence: i64,
-    ) -> Result<String, StoreError> {
+    ) -> Result<RecordedStep, StoreError> {
         let step_manager = self.require_step_manager()?;
         let request_uuid = parse_response_id(request_id)?;
-
         let parent_step_id = scope_parent.map(parse_step_id).transpose()?;
         let prev_step_id = prev_step.map(parse_step_id).transpose()?;
+
+        // Compute the next sequence atomically with the insert. The chain
+        // walk + insert run on the same write pool, so under crash recovery
+        // the UNIQUE (request_id, parent_step_id, prev_step_id, step_kind)
+        // constraint backstops any race; the sequence value will simply be
+        // assigned to whichever insert wins.
+        //
+        // A future optimization is a per-(request_id) sequence stored in
+        // the parent requests row updated via UPDATE ... SET step_seq =
+        // step_seq + 1 RETURNING step_seq; that avoids the chain walk
+        // entirely. Out of scope for this PR.
+        let chain = step_manager
+            .list_chain(RequestId(request_uuid))
+            .await
+            .map_err(map_fusillade_err)?;
+        let sequence = chain.iter().map(|s| s.step_sequence).max().unwrap_or(0) + 1;
 
         let id = step_manager
             .create_step(CreateStepInput {
@@ -597,7 +656,10 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> ResponseStore for Fusillad
             .await
             .map_err(map_fusillade_err)?;
 
-        Ok(id.0.to_string())
+        Ok(RecordedStep {
+            id: id.0.to_string(),
+            sequence,
+        })
     }
 
     async fn mark_step_processing(&self, step_id: &str) -> Result<(), StoreError> {
@@ -632,32 +694,31 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> ResponseStore for Fusillad
             .map_err(map_fusillade_err)
     }
 
-    async fn next_sequence(&self, request_id: &str) -> Result<i64, StoreError> {
-        // Sequences are monotonic per request_id and global across nesting
-        // levels (the `step_sequence` column doubles as the
-        // `Last-Event-ID` cursor). We compute the next value as
-        // `MAX(step_sequence) + 1` from the chain walk.
+    async fn list_chain(
+        &self,
+        request_id: &str,
+        scope_parent: Option<&str>,
+    ) -> Result<Vec<ChainStep>, StoreError> {
         let step_manager = self.require_step_manager()?;
         let request_uuid = parse_response_id(request_id)?;
-        let chain = step_manager
-            .list_chain(RequestId(request_uuid))
+        let parent_step_id = scope_parent.map(parse_step_id).transpose()?;
+
+        let steps = step_manager
+            .list_scope(RequestId(request_uuid), parent_step_id)
             .await
             .map_err(map_fusillade_err)?;
-        Ok(chain.iter().map(|s| s.step_sequence).max().unwrap_or(0) + 1)
+
+        Ok(steps.into_iter().map(step_to_chain).collect())
     }
 
-    // next_action_for, execute_model_call, execute_tool_call, and
-    // assemble_response intentionally fall through to the trait defaults
-    // (which return StoreError::StorageError("not implemented")). Wiring
-    // those up is the focus of follow-up issues COR-346 / COR-347 /
-    // COR-348 — the transition function in particular is the heart of
-    // the Open Responses domain logic and warrants a focused review of
-    // its own.
-    //
-    // The point of having the storage primitives implemented now is so
-    // that those follow-up PRs only need to add the domain logic, not
-    // also re-prove that the bridge wiring compiles and persists
-    // correctly.
+    async fn assemble_response(
+        &self,
+        _request_id: &str,
+    ) -> Result<serde_json::Value, StoreError> {
+        Err(StoreError::StorageError(
+            "assemble_response not yet implemented (COR-348)".into(),
+        ))
+    }
 }
 
 #[cfg(test)]
