@@ -2515,9 +2515,19 @@ impl Application {
         // Embeddings don't support streaming.
         let body_transform: onwards::BodyTransformFn = Arc::new(request_logging::stream_usage::stream_usage_transform);
 
-        // Create the HTTP tool executor.
+        // Create the HTTP tool executor. The reqwest::Client and
+        // dwctl pool here are shared with the multi-step processor's
+        // executor below — cloning a reqwest::Client is cheap and
+        // shares its connection pool / TLS root cert cache, and the
+        // PgPool clone shares the underlying connection pool. Building
+        // separate clients/pools would double TLS init cost per test
+        // and add unnecessary parallelism pressure.
         let reqwest_client = reqwest::Client::new();
-        let tool_executor = crate::tool_executor::HttpToolExecutor::new(reqwest_client, Some(Arc::new(db_pools.write().clone())));
+        let tool_executor_pool = Arc::new(db_pools.write().clone());
+        let tool_executor = crate::tool_executor::HttpToolExecutor::new(
+            reqwest_client.clone(),
+            Some(tool_executor_pool.clone()),
+        );
 
         // Register onwards as a fusillade daemon so realtime requests get a valid daemon_id.
         // Skipped in tests: each `#[sqlx::test]` calls `Application::new_with_pool`
@@ -2626,8 +2636,8 @@ impl Application {
         // objects live for the entire app lifetime so it never matters
         // in practice.
         let multi_step_tool_executor = Arc::new(crate::tool_executor::HttpToolExecutor::new(
-            reqwest::Client::new(),
-            Some(Arc::new(db_pools.write().clone())),
+            reqwest_client,
+            Some(tool_executor_pool),
         ));
         let multi_step_http_client: Arc<dyn onwards::client::HttpClient + Send + Sync> =
             Arc::new(onwards::client::create_hyper_client(10, 30));
@@ -2652,8 +2662,25 @@ impl Application {
             )
             .with_tool_resolver(tool_resolver),
         );
-        if let Err(e) = bg_services.request_manager.set_processor(multi_step_processor) {
-            tracing::warn!(error = e, "Multi-step processor was already set; skipping");
+        // Skipped in tests: this wiring forms an Arc cycle
+        // (request_manager → processor.OnceLock → response_store →
+        // request_manager) that's harmless in production where the app
+        // lives forever, but in `#[sqlx::test]` tests the cycle keeps
+        // each test's pool clones alive past test teardown, which
+        // blocks sqlx's `DROP DATABASE` cleanup with "database is being
+        // accessed by other users". That cleanup then holds the
+        // master pool slot for ~5s, exhausting the master pool's
+        // hardcoded max=20 across parallel tests and failing api_keys/
+        // auth tests with PoolTimedOut. The daemon path isn't exercised
+        // in unit tests anyway — multi-step integration coverage lives
+        // in the dedicated test/multi_step_*.rs modules with their own
+        // isolated setup.
+        if !cfg!(test) {
+            if let Err(e) = bg_services.request_manager.set_processor(multi_step_processor) {
+                tracing::warn!(error = e, "Multi-step processor was already set; skipping");
+            }
+        } else {
+            let _ = multi_step_processor;
         }
 
         // Responses middleware state (enqueues create-response jobs via underway)
