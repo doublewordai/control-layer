@@ -102,9 +102,13 @@ jobs:
     runs-on: depot-ubuntu-24.04-16
 
     # Postgres is started manually below (not via `services:`) so we can pass
-    # `-c max_connections=300` — the 16-core runner runs `#[sqlx::test]`
+    # `-c max_connections=500` — the 16-core runner runs `#[sqlx::test]`
     # tests with high parallelism, and each one opens its own pools + underway
-    # PgListener connections, so the default 100 is insufficient.
+    # PgListener connections, so the default 100 is insufficient. Bumped from
+    # 300 -> 500 because the multi-step daemon-style integration tests spawn
+    # background tasks (heartbeat, claim loop, batch polling) that hold extra
+    # connections for the test's lifetime, pushing peak usage past 300 under
+    # llvm-cov instrumentation.
 
     steps:
       - name: Checkout code
@@ -119,7 +123,7 @@ jobs:
             -e POSTGRES_HOST_AUTH_METHOD=trust \
             -p 5432:5432 \
             postgres:latest \
-            -c max_connections=300
+            -c max_connections=500
           for _ in $(seq 1 30); do
             docker exec postgres pg_isready -U postgres && break
             sleep 1
