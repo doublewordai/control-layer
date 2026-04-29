@@ -35,9 +35,7 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use futures::stream::Stream;
 use onwards::client::HttpClient;
 use onwards::traits::RequestContext;
-use onwards::{
-    EventSink, EventSinkError, LoopConfig, LoopError, LoopEvent, MultiStepStore, UpstreamTarget,
-};
+use onwards::{EventSink, EventSinkError, LoopConfig, LoopError, LoopEvent, MultiStepStore, UpstreamTarget};
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -67,9 +65,7 @@ impl SseEventSink {
 #[async_trait]
 impl EventSink for SseEventSink {
     async fn emit(&self, event: LoopEvent) -> Result<(), EventSinkError> {
-        let data_str = serde_json::to_string(&event.data).map_err(|e| {
-            EventSinkError(format!("serialize SSE data: {e}"))
-        })?;
+        let data_str = serde_json::to_string(&event.data).map_err(|e| EventSinkError(format!("serialize SSE data: {e}")))?;
         let sse_event = Event::default()
             .id(event.sequence.to_string())
             .event(event.kind.as_str())
@@ -148,9 +144,7 @@ where
                 }
             }
             Err(LoopError::Failed(payload)) => {
-                if let Err(e) =
-                    persist_terminal_failed(&response_store, &request_id, payload).await
-                {
+                if let Err(e) = persist_terminal_failed(&response_store, &request_id, payload).await {
                     tracing::warn!(error = %e, "Failed to persist warm-path failure state");
                 }
             }
@@ -159,9 +153,7 @@ where
                     "type": "loop_error",
                     "message": other.to_string(),
                 });
-                if let Err(e) =
-                    persist_terminal_failed(&response_store, &request_id, &payload).await
-                {
+                if let Err(e) = persist_terminal_failed(&response_store, &request_id, &payload).await {
                     tracing::warn!(error = %e, "Failed to persist warm-path error state");
                 }
             }
@@ -174,10 +166,7 @@ where
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
-async fn persist_terminal_completed<P>(
-    response_store: &FusilladeResponseStore<P>,
-    request_id: &str,
-) -> Result<(), String>
+async fn persist_terminal_completed<P>(response_store: &FusilladeResponseStore<P>, request_id: &str) -> Result<(), String>
 where
     P: fusillade::PoolProvider + Clone + Send + Sync + 'static,
 {
@@ -190,11 +179,7 @@ where
     finalize_request_row(response_store, request_id, 200, assembled).await
 }
 
-async fn persist_terminal_failed<P>(
-    response_store: &FusilladeResponseStore<P>,
-    request_id: &str,
-    error: &Value,
-) -> Result<(), String>
+async fn persist_terminal_failed<P>(response_store: &FusilladeResponseStore<P>, request_id: &str, error: &Value) -> Result<(), String>
 where
     P: fusillade::PoolProvider + Clone + Send + Sync + 'static,
 {

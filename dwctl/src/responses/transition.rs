@@ -110,10 +110,7 @@ pub(crate) fn parse_parent_request(body: &str) -> Result<ParsedRequest, String> 
 ///    - the assistant message from the model_call's response, and
 ///    - one `tool` message per completed tool_call (carrying the tool's
 ///      output as `content`).
-pub(crate) fn build_messages_from_chain(
-    initial: &[Value],
-    chain: &[ChainStep],
-) -> Vec<Value> {
+pub(crate) fn build_messages_from_chain(initial: &[Value], chain: &[ChainStep]) -> Vec<Value> {
     let mut messages: Vec<Value> = initial.to_vec();
 
     let mut i = 0;
@@ -190,11 +187,7 @@ pub(crate) fn extract_tool_calls(model_response: &Value) -> Vec<StepDescriptor> 
                 Some(other) => other.clone(),
                 None => json!({}),
             };
-            let call_id = call
-                .get("id")
-                .and_then(|x| x.as_str())
-                .unwrap_or("call_unknown")
-                .to_string();
+            let call_id = call.get("id").and_then(|x| x.as_str()).unwrap_or("call_unknown").to_string();
             Some(StepDescriptor {
                 kind: StepKind::ToolCall,
                 request_payload: json!({
@@ -227,10 +220,7 @@ pub(crate) fn prepare_initial_model_call(parsed: &ParsedRequest) -> StepDescript
 /// Build the `request_payload` for a follow-up model_call (after one or
 /// more tool_calls completed) by reconstructing the running messages
 /// list from the chain.
-pub(crate) fn prepare_followup_model_call(
-    parsed: &ParsedRequest,
-    chain: &[ChainStep],
-) -> StepDescriptor {
+pub(crate) fn prepare_followup_model_call(parsed: &ParsedRequest, chain: &[ChainStep]) -> StepDescriptor {
     let messages = build_messages_from_chain(&parsed.initial_messages, chain);
     let mut payload = json!({
         "model": parsed.model,
@@ -252,10 +242,7 @@ pub(crate) fn prepare_followup_model_call(
 ///
 /// Returns the action the loop should take. Pure function over its inputs;
 /// no I/O.
-pub(crate) fn decide_next_action(
-    parsed: &ParsedRequest,
-    chain: &[ChainStep],
-) -> NextAction {
+pub(crate) fn decide_next_action(parsed: &ParsedRequest, chain: &[ChainStep]) -> NextAction {
     if chain.is_empty() {
         return NextAction::AppendSteps(vec![prepare_initial_model_call(parsed)]);
     }
@@ -279,20 +266,12 @@ pub(crate) fn decide_next_action(
     };
 
     if matches!(last.state, StepState::Failed) {
-        return NextAction::Fail(
-            last.error
-                .clone()
-                .unwrap_or_else(|| json!({"type": "step_failed"})),
-        );
+        return NextAction::Fail(last.error.clone().unwrap_or_else(|| json!({"type": "step_failed"})));
     }
 
     match last.kind {
         StepKind::ModelCall => {
-            let response = last
-                .response_payload
-                .as_ref()
-                .cloned()
-                .unwrap_or_else(|| json!({}));
+            let response = last.response_payload.as_ref().cloned().unwrap_or_else(|| json!({}));
             let tool_calls = extract_tool_calls(&response);
             if tool_calls.is_empty() {
                 // No tool calls — the model returned final output.
@@ -315,13 +294,7 @@ pub(crate) fn decide_next_action(
 mod tests {
     use super::*;
 
-    fn step(
-        id: &str,
-        seq: i64,
-        kind: StepKind,
-        state: StepState,
-        response: Option<Value>,
-    ) -> ChainStep {
+    fn step(id: &str, seq: i64, kind: StepKind, state: StepState, response: Option<Value>) -> ChainStep {
         ChainStep {
             id: id.into(),
             kind,

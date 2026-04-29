@@ -16,11 +16,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use fusillade::{
-    BatchInput, PostgresRequestManager, PostgresResponseStepManager, RequestId,
-    RequestTemplateInput, ReqwestHttpClient, TestDbPools,
-};
 use fusillade::manager::{DaemonExecutor, Storage};
+use fusillade::{
+    BatchInput, PostgresRequestManager, PostgresResponseStepManager, RequestId, RequestTemplateInput, ReqwestHttpClient, TestDbPools,
+};
 use onwards::client::HttpClient;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -99,14 +98,9 @@ async fn daemon_claim_runs_multi_step_loop_end_to_end(pool: PgPool) {
         ..Default::default()
     };
 
-    let request_manager = Arc::new(PostgresRequestManager::<_, ReqwestHttpClient>::new(
-        test_pools.clone(),
-        config,
-    ));
+    let request_manager = Arc::new(PostgresRequestManager::<_, ReqwestHttpClient>::new(test_pools.clone(), config));
     let step_manager = Arc::new(PostgresResponseStepManager::new(test_pools));
-    let response_store = Arc::new(
-        FusilladeResponseStore::new(request_manager.clone()).with_step_manager(step_manager),
-    );
+    let response_store = Arc::new(FusilladeResponseStore::new(request_manager.clone()).with_step_manager(step_manager));
 
     // Tool registry with a single HTTP tool pointing at our wiremock.
     let mut tools = HashMap::new();
@@ -133,14 +127,10 @@ async fn daemon_claim_runs_multi_step_loop_end_to_end(pool: PgPool) {
 
     #[async_trait::async_trait]
     impl onwards::traits::ToolExecutor for InjectingExecutor {
-        async fn tools(
-            &self,
-            _ctx: &onwards::traits::RequestContext,
-        ) -> Vec<onwards::traits::ToolSchema> {
+        async fn tools(&self, _ctx: &onwards::traits::RequestContext) -> Vec<onwards::traits::ToolSchema> {
             // Inject tools into a fresh context that delegates to the inner
             // executor's discovery.
-            let ctx = onwards::traits::RequestContext::new()
-                .with_extension(ResolvedTools(self.tools.clone()));
+            let ctx = onwards::traits::RequestContext::new().with_extension(ResolvedTools(self.tools.clone()));
             self.inner.tools(&ctx).await
         }
         async fn execute(
@@ -150,8 +140,7 @@ async fn daemon_claim_runs_multi_step_loop_end_to_end(pool: PgPool) {
             arguments: &serde_json::Value,
             _ctx: &onwards::traits::RequestContext,
         ) -> Result<serde_json::Value, onwards::traits::ToolError> {
-            let ctx = onwards::traits::RequestContext::new()
-                .with_extension(ResolvedTools(self.tools.clone()));
+            let ctx = onwards::traits::RequestContext::new().with_extension(ResolvedTools(self.tools.clone()));
             self.inner.execute(tool_name, tool_call_id, arguments, &ctx).await
         }
     }
@@ -160,8 +149,7 @@ async fn daemon_claim_runs_multi_step_loop_end_to_end(pool: PgPool) {
         inner: Arc::new(HttpToolExecutor::new(reqwest::Client::new(), None)),
         tools: resolved_tools,
     });
-    let http_client: Arc<dyn HttpClient + Send + Sync> =
-        Arc::new(onwards::client::create_hyper_client(10, 30));
+    let http_client: Arc<dyn HttpClient + Send + Sync> = Arc::new(onwards::client::create_hyper_client(10, 30));
 
     let processor = Arc::new(DwctlRequestProcessor::new(
         response_store.clone(),
@@ -169,17 +157,12 @@ async fn daemon_claim_runs_multi_step_loop_end_to_end(pool: PgPool) {
         http_client,
         onwards::LoopConfig::default(),
     ));
-    request_manager
-        .set_processor(processor)
-        .expect("attach multi-step processor");
+    request_manager.set_processor(processor).expect("attach multi-step processor");
 
     // Start the daemon — from this point on it'll claim any /v1/responses
     // row in pending state and run it through the multi-step loop.
     let shutdown_token = tokio_util::sync::CancellationToken::new();
-    let _daemon_handle = request_manager
-        .clone()
-        .run(shutdown_token.clone())
-        .expect("start daemon");
+    let _daemon_handle = request_manager.clone().run(shutdown_token.clone()).expect("start daemon");
 
     // Insert a pending request through the manager's normal create_batch
     // path (single-row batch wrapping the responses request).
@@ -222,10 +205,7 @@ async fn daemon_claim_runs_multi_step_loop_end_to_end(pool: PgPool) {
     // Poll until the daemon completes the request.
     let start = Instant::now();
     let detail = loop {
-        let detail = request_manager
-            .get_request_detail(RequestId(*request_id))
-            .await
-            .unwrap();
+        let detail = request_manager.get_request_detail(RequestId(*request_id)).await.unwrap();
         if detail.status == "completed" || detail.status == "failed" {
             break detail;
         }

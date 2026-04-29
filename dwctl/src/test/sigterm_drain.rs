@@ -151,12 +151,11 @@ async fn drain_does_not_touch_other_daemons_rows(pool: PgPool) {
     drain_onwards_daemon(&pool, our_daemon).await;
 
     // The OTHER daemon's row is untouched.
-    let row: (String, Option<Uuid>) =
-        sqlx::query_as("SELECT state, daemon_id FROM requests WHERE id = $1")
-            .bind(other_request)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let row: (String, Option<Uuid>) = sqlx::query_as("SELECT state, daemon_id FROM requests WHERE id = $1")
+        .bind(other_request)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     assert_eq!(row.0, "processing", "other daemon's row should be untouched");
     assert_eq!(row.1, Some(other_daemon));
     let other_status: String = sqlx::query_scalar("SELECT status FROM daemons WHERE id = $1")
@@ -171,12 +170,10 @@ async fn drain_does_not_touch_other_daemons_rows(pool: PgPool) {
 /// Kept inline so the test can exercise it without spinning up a full
 /// `Application`.
 async fn drain_onwards_daemon(pool: &PgPool, daemon_id: Uuid) {
-    let _ = sqlx::query(
-        "UPDATE daemons SET status = 'dead', stopped_at = NOW() WHERE id = $1",
-    )
-    .bind(daemon_id)
-    .execute(pool)
-    .await;
+    let _ = sqlx::query("UPDATE daemons SET status = 'dead', stopped_at = NOW() WHERE id = $1")
+        .bind(daemon_id)
+        .execute(pool)
+        .await;
 
     let _ = sqlx::query(
         "UPDATE requests \
@@ -187,4 +184,3 @@ async fn drain_onwards_daemon(pool: &PgPool, daemon_id: Uuid) {
     .execute(pool)
     .await;
 }
-

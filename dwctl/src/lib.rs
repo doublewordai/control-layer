@@ -1788,10 +1788,7 @@ impl BackgroundServices {
         // immediate ownership of any rows we still hold. We do this
         // BEFORE waiting for tasks because the unclaim is independent
         // of in-flight task completion — it just touches DB state.
-        if let (Some(daemon_id), Some(pool)) = (
-            self.onwards_daemon_id,
-            self.fusillade_write_pool.as_ref(),
-        ) {
+        if let (Some(daemon_id), Some(pool)) = (self.onwards_daemon_id, self.fusillade_write_pool.as_ref()) {
             // Mark our daemon row Dead. fusillade's reclaim query
             // (`unclaim_stale_requests`) treats `daemons.status='dead'`
             // as the immediate-reclaim signal, so as soon as this
@@ -2375,9 +2372,7 @@ async fn setup_background_services(
 
     let (background_tasks, task_names) = background_tasks.into_parts();
 
-    let step_manager = Arc::new(fusillade::PostgresResponseStepManager::new(
-        fusillade_pools_for_steps,
-    ));
+    let step_manager = Arc::new(fusillade::PostgresResponseStepManager::new(fusillade_pools_for_steps));
 
     Ok(BackgroundServices {
         request_manager,
@@ -2524,10 +2519,7 @@ impl Application {
         // and add unnecessary parallelism pressure.
         let reqwest_client = reqwest::Client::new();
         let tool_executor_pool = Arc::new(db_pools.write().clone());
-        let tool_executor = crate::tool_executor::HttpToolExecutor::new(
-            reqwest_client.clone(),
-            Some(tool_executor_pool.clone()),
-        );
+        let tool_executor = crate::tool_executor::HttpToolExecutor::new(reqwest_client.clone(), Some(tool_executor_pool.clone()));
 
         // Register onwards as a fusillade daemon so realtime requests get a valid daemon_id.
         let onwards_daemon_id = uuid::Uuid::new_v4();
@@ -2603,10 +2595,8 @@ impl Application {
 
         // Create the response store (backed by request_manager for reads via Storage trait)
         let response_store = Arc::new(
-            crate::responses::store::FusilladeResponseStore::new(
-                bg_services.request_manager.clone(),
-            )
-            .with_step_manager(bg_services.step_manager.clone()),
+            crate::responses::store::FusilladeResponseStore::new(bg_services.request_manager.clone())
+                .with_step_manager(bg_services.step_manager.clone()),
         );
 
         // Wire the multi-step orchestration dispatcher. The processor

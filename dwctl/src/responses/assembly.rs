@@ -52,16 +52,9 @@ pub(crate) fn assemble_from_chain(request_id: &str, chain: &[ChainStep]) -> Valu
 
                 // Stash tool_calls so subsequent tool_call output items
                 // can pair with them by call_id.
-                if let Some(tool_calls) = assistant
-                    .and_then(|m| m.get("tool_calls"))
-                    .and_then(|v| v.as_array())
-                {
+                if let Some(tool_calls) = assistant.and_then(|m| m.get("tool_calls")).and_then(|v| v.as_array()) {
                     for call in tool_calls {
-                        let call_id = call
-                            .get("id")
-                            .and_then(|x| x.as_str())
-                            .unwrap_or("call_unknown")
-                            .to_string();
+                        let call_id = call.get("id").and_then(|x| x.as_str()).unwrap_or("call_unknown").to_string();
                         let name = call
                             .get("function")
                             .and_then(|f| f.get("name"))

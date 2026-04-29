@@ -25,14 +25,13 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use fusillade::{
-    PoolProvider as FusilladePoolProvider, PostgresRequestManager, PostgresResponseStepManager,
-    ReqwestHttpClient, TestDbPools,
+    PoolProvider as FusilladePoolProvider, PostgresRequestManager, PostgresResponseStepManager, ReqwestHttpClient, TestDbPools,
 };
 use onwards::client::HttpClient;
 use onwards::traits::RequestContext;
 use onwards::{
-    ChainStep, LoopConfig, MultiStepStore, NextAction, RecordedStep, StepDescriptor, StepKind,
-    StepState, StoreError, UpstreamTarget, run_response_loop,
+    ChainStep, LoopConfig, MultiStepStore, NextAction, RecordedStep, StepDescriptor, StepKind, StepState, StoreError, UpstreamTarget,
+    run_response_loop,
 };
 use serde_json::{Value, json};
 use sqlx::PgPool;
@@ -84,14 +83,8 @@ struct TransitionStore<P: FusilladePoolProvider + Clone + Send + Sync + 'static>
 }
 
 #[async_trait]
-impl<P: FusilladePoolProvider + Clone + Send + Sync + 'static> MultiStepStore
-    for TransitionStore<P>
-{
-    async fn next_action_for(
-        &self,
-        request_id: &str,
-        scope_parent: Option<&str>,
-    ) -> Result<NextAction, StoreError> {
+impl<P: FusilladePoolProvider + Clone + Send + Sync + 'static> MultiStepStore for TransitionStore<P> {
+    async fn next_action_for(&self, request_id: &str, scope_parent: Option<&str>) -> Result<NextAction, StoreError> {
         let chain = self.inner.list_chain(request_id, scope_parent).await?;
 
         if chain.is_empty() {
@@ -109,9 +102,10 @@ impl<P: FusilladePoolProvider + Clone + Send + Sync + 'static> MultiStepStore
             .rev()
             .find(|s| matches!(s.state, StepState::Completed | StepState::Failed))
             .ok_or_else(|| StoreError::StorageError("no terminal step in chain".into()))?;
-        let last_payload = last.response_payload.as_ref().ok_or_else(|| {
-            StoreError::StorageError("last step has no response_payload".into())
-        })?;
+        let last_payload = last
+            .response_payload
+            .as_ref()
+            .ok_or_else(|| StoreError::StorageError("last step has no response_payload".into()))?;
 
         match (last.kind, last_payload["wants_tool"].as_bool()) {
             (StepKind::ModelCall, Some(true)) => {
@@ -147,13 +141,7 @@ impl<P: FusilladePoolProvider + Clone + Send + Sync + 'static> MultiStepStore
         }
     }
 
-    async fn record_step(
-        &self,
-        r: &str,
-        s: Option<&str>,
-        p: Option<&str>,
-        d: &StepDescriptor,
-    ) -> Result<RecordedStep, StoreError> {
+    async fn record_step(&self, r: &str, s: Option<&str>, p: Option<&str>, d: &StepDescriptor) -> Result<RecordedStep, StoreError> {
         self.inner.record_step(r, s, p, d).await
     }
     async fn mark_step_processing(&self, id: &str) -> Result<(), StoreError> {
@@ -296,10 +284,7 @@ async fn loop_drives_real_tool_and_model_calls_through_production_executor(pool:
     }
     // Tool step's response_payload is the wiremock body verbatim — proves
     // the production HttpToolExecutor was invoked end-to-end.
-    assert_eq!(
-        chain[1].response_payload.as_ref().unwrap(),
-        &json!({"echoed": {"x": 42}})
-    );
+    assert_eq!(chain[1].response_payload.as_ref().unwrap(), &json!({"echoed": {"x": 42}}));
 }
 
 #[sqlx::test]
@@ -389,13 +374,7 @@ async fn agent_kind_tool_recurses_via_tool_schema(pool: PgPool) {
     assert_eq!(tool_payload["output_text"], json!("subagent done"));
 
     // Sub-loop step exists under the spawning tool step's scope.
-    let sub_chain = store
-        .list_chain(&request_id, Some(&tool_step.id))
-        .await
-        .unwrap();
+    let sub_chain = store.list_chain(&request_id, Some(&tool_step.id)).await.unwrap();
     assert!(!sub_chain.is_empty());
-    assert_eq!(
-        sub_chain[0].parent_step_id.as_deref(),
-        Some(tool_step.id.as_str())
-    );
+    assert_eq!(sub_chain[0].parent_step_id.as_deref(), Some(tool_step.id.as_str()));
 }

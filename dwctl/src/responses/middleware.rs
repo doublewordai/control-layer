@@ -121,18 +121,8 @@ pub async fn responses_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     // inline so token deltas + tool boundaries flow through the SSE
     // response. Only applies to /v1/responses — chat completions and
     // embeddings keep their existing single-step proxy path.
-    let stream_requested = is_responses_api
-        && !background
-        && request_value["stream"].as_bool().unwrap_or(false);
-    if stream_requested
-        && let Some(resp) = try_warm_path_stream(
-            &state,
-            &request_value,
-            api_key.as_deref(),
-            model,
-        )
-        .await
-    {
+    let stream_requested = is_responses_api && !background && request_value["stream"].as_bool().unwrap_or(false);
+    if stream_requested && let Some(resp) = try_warm_path_stream(&state, &request_value, api_key.as_deref(), model).await {
         return resp;
     }
 
@@ -466,11 +456,7 @@ async fn try_warm_path_stream<P: PoolProvider + Clone + Send + Sync + 'static>(
         api_key: Some(api_key.to_string()),
         created_by: response_store::lookup_created_by(&state.dwctl_pool, Some(api_key)).await,
     };
-    if let Err(e) = state
-        .request_manager
-        .create_single_request_batch(batch_input)
-        .await
-    {
+    if let Err(e) = state.request_manager.create_single_request_batch(batch_input).await {
         tracing::error!(error = %e, "warm-path streaming: failed to create fusillade row");
         return None;
     }
@@ -478,13 +464,7 @@ async fn try_warm_path_stream<P: PoolProvider + Clone + Send + Sync + 'static>(
     // Resolve the per-request tool set (same DB query as the
     // single-step middleware). Build a ResolvedToolSet ready to inject
     // into the loop's RequestContext.
-    let resolved = match crate::tool_injection::resolve_tools_for_request(
-        &state.dwctl_pool,
-        api_key,
-        Some(model),
-    )
-    .await
-    {
+    let resolved = match crate::tool_injection::resolve_tools_for_request(&state.dwctl_pool, api_key, Some(model)).await {
         Ok(Some(set)) => Arc::new(set),
         Ok(None) => Arc::new(crate::tool_executor::ResolvedToolSet::new(
             std::collections::HashMap::new(),

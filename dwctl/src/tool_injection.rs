@@ -99,7 +99,11 @@ fn extract_bearer_token(request: &Request<Body>) -> Option<String> {
 /// Resolve the effective tool set for a request identified by its API key secret and model alias.
 ///
 /// Returns `None` if no tools are configured for this deployment/group combination.
-pub async fn resolve_tools_for_request(db: &PgPool, bearer_token: &str, model_alias: Option<&str>) -> anyhow::Result<Option<ResolvedToolSet>> {
+pub async fn resolve_tools_for_request(
+    db: &PgPool,
+    bearer_token: &str,
+    model_alias: Option<&str>,
+) -> anyhow::Result<Option<ResolvedToolSet>> {
     let rows = sqlx::query!(
         r#"
         SELECT DISTINCT

@@ -8,13 +8,12 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use fusillade::{
-    BatchInput, CreateStepInput, PostgresRequestManager, PostgresResponseStepManager, RequestId,
-    RequestTemplateInput, ReqwestHttpClient, ResponseStep, ResponseStepStore, StepId,
-    StepKind as FusilladeStepKind, StepState as FusilladeStepState, Storage,
+    BatchInput, CreateStepInput, PostgresRequestManager, PostgresResponseStepManager, RequestId, RequestTemplateInput, ReqwestHttpClient,
+    ResponseStep, ResponseStepStore, StepId, StepKind as FusilladeStepKind, StepState as FusilladeStepState, Storage,
 };
 use onwards::{
-    ChainStep, MultiStepStore, RecordedStep, ResponseStore, StepDescriptor,
-    StepKind as OnwardsStepKind, StepState as OnwardsStepState, StoreError,
+    ChainStep, MultiStepStore, RecordedStep, ResponseStore, StepDescriptor, StepKind as OnwardsStepKind, StepState as OnwardsStepState,
+    StoreError,
 };
 use sqlx_pool_router::PoolProvider;
 use uuid::Uuid;
@@ -50,10 +49,7 @@ impl<P: PoolProvider + Clone> FusilladeResponseStore<P> {
     /// `complete_step` / `fail_step` / `next_sequence` methods are
     /// backed by real persistence rather than the trait's
     /// "not implemented" default.
-    pub fn with_step_manager(
-        mut self,
-        step_manager: Arc<PostgresResponseStepManager<P>>,
-    ) -> Self {
+    pub fn with_step_manager(mut self, step_manager: Arc<PostgresResponseStepManager<P>>) -> Self {
         self.step_manager = Some(step_manager);
         self
     }
@@ -605,27 +601,19 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> ResponseStore for Fusillad
 // transition function (next_action_for) and assembly (assemble_response)
 // living in the sibling `transition` and `assembly` modules.
 #[async_trait]
-impl<P: PoolProvider + Clone + Send + Sync + 'static> MultiStepStore
-    for FusilladeResponseStore<P>
-{
-    async fn next_action_for(
-        &self,
-        request_id: &str,
-        scope_parent: Option<&str>,
-    ) -> Result<onwards::NextAction, StoreError> {
+impl<P: PoolProvider + Clone + Send + Sync + 'static> MultiStepStore for FusilladeResponseStore<P> {
+    async fn next_action_for(&self, request_id: &str, scope_parent: Option<&str>) -> Result<onwards::NextAction, StoreError> {
         let parent_uuid = parse_response_id(request_id)?;
         let detail = self
             .request_manager
             .get_request_detail(RequestId(parent_uuid))
             .await
             .map_err(|e| StoreError::StorageError(format!("fetch parent request: {e}")))?;
-        let body = detail.body.ok_or_else(|| {
-            StoreError::StorageError("parent request body has been purged".into())
-        })?;
-        let parsed = super::transition::parse_parent_request(&body)
-            .map_err(StoreError::StorageError)?;
-        let chain =
-            <Self as MultiStepStore>::list_chain(self, request_id, scope_parent).await?;
+        let body = detail
+            .body
+            .ok_or_else(|| StoreError::StorageError("parent request body has been purged".into()))?;
+        let parsed = super::transition::parse_parent_request(&body).map_err(StoreError::StorageError)?;
+        let chain = <Self as MultiStepStore>::list_chain(self, request_id, scope_parent).await?;
         Ok(super::transition::decide_next_action(&parsed, &chain))
     }
 
@@ -651,10 +639,7 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> MultiStepStore
         // the parent requests row updated via UPDATE ... SET step_seq =
         // step_seq + 1 RETURNING step_seq; that avoids the chain walk
         // entirely. Out of scope for this PR.
-        let chain = step_manager
-            .list_chain(RequestId(request_uuid))
-            .await
-            .map_err(map_fusillade_err)?;
+        let chain = step_manager.list_chain(RequestId(request_uuid)).await.map_err(map_fusillade_err)?;
         let sequence = chain.iter().map(|s| s.step_sequence).max().unwrap_or(0) + 1;
 
         let id = step_manager
@@ -684,11 +669,7 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> MultiStepStore
             .map_err(map_fusillade_err)
     }
 
-    async fn complete_step(
-        &self,
-        step_id: &str,
-        payload: &serde_json::Value,
-    ) -> Result<(), StoreError> {
+    async fn complete_step(&self, step_id: &str, payload: &serde_json::Value) -> Result<(), StoreError> {
         let step_manager = self.require_step_manager()?;
         step_manager
             .complete_step(parse_step_id(step_id)?, payload.clone())
@@ -696,11 +677,7 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> MultiStepStore
             .map_err(map_fusillade_err)
     }
 
-    async fn fail_step(
-        &self,
-        step_id: &str,
-        error: &serde_json::Value,
-    ) -> Result<(), StoreError> {
+    async fn fail_step(&self, step_id: &str, error: &serde_json::Value) -> Result<(), StoreError> {
         let step_manager = self.require_step_manager()?;
         step_manager
             .fail_step(parse_step_id(step_id)?, error.clone())
@@ -708,11 +685,7 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> MultiStepStore
             .map_err(map_fusillade_err)
     }
 
-    async fn list_chain(
-        &self,
-        request_id: &str,
-        scope_parent: Option<&str>,
-    ) -> Result<Vec<ChainStep>, StoreError> {
+    async fn list_chain(&self, request_id: &str, scope_parent: Option<&str>) -> Result<Vec<ChainStep>, StoreError> {
         let step_manager = self.require_step_manager()?;
         let request_uuid = parse_response_id(request_id)?;
         let parent_step_id = scope_parent.map(parse_step_id).transpose()?;
@@ -725,12 +698,8 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> MultiStepStore
         Ok(steps.into_iter().map(step_to_chain).collect())
     }
 
-    async fn assemble_response(
-        &self,
-        request_id: &str,
-    ) -> Result<serde_json::Value, StoreError> {
-        let chain =
-            <Self as MultiStepStore>::list_chain(self, request_id, None).await?;
+    async fn assemble_response(&self, request_id: &str) -> Result<serde_json::Value, StoreError> {
+        let chain = <Self as MultiStepStore>::list_chain(self, request_id, None).await?;
         Ok(super::assembly::assemble_from_chain(request_id, &chain))
     }
 }

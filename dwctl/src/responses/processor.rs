@@ -36,12 +36,9 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use fusillade::request::{Canceled, Claimed, Completed, Failed, Request, RequestCompletionResult};
 use fusillade::{
-    CancellationFuture, DefaultRequestProcessor, FailureReason, PoolProvider as FusilladePool,
-    RequestProcessor, ShouldRetry, Storage,
-};
-use fusillade::request::{
-    Canceled, Claimed, Completed, Failed, Request, RequestCompletionResult,
+    CancellationFuture, DefaultRequestProcessor, FailureReason, PoolProvider as FusilladePool, RequestProcessor, ShouldRetry, Storage,
 };
 use onwards::client::HttpClient;
 use onwards::traits::{RequestContext, ToolExecutor};
@@ -91,11 +88,7 @@ where
 /// alias.
 #[async_trait]
 pub trait DaemonToolResolver: Send + Sync {
-    async fn resolve(
-        &self,
-        api_key: &str,
-        model_alias: &str,
-    ) -> Result<Option<crate::tool_executor::ResolvedToolSet>, anyhow::Error>;
+    async fn resolve(&self, api_key: &str, model_alias: &str) -> Result<Option<crate::tool_executor::ResolvedToolSet>, anyhow::Error>;
 }
 
 /// Production [`DaemonToolResolver`] backed by the same query the
@@ -106,13 +99,8 @@ pub struct DbToolResolver {
 
 #[async_trait]
 impl DaemonToolResolver for DbToolResolver {
-    async fn resolve(
-        &self,
-        api_key: &str,
-        model_alias: &str,
-    ) -> Result<Option<crate::tool_executor::ResolvedToolSet>, anyhow::Error> {
-        crate::tool_injection::resolve_tools_for_request(&self.pool, api_key, Some(model_alias))
-            .await
+    async fn resolve(&self, api_key: &str, model_alias: &str) -> Result<Option<crate::tool_executor::ResolvedToolSet>, anyhow::Error> {
+        crate::tool_injection::resolve_tools_for_request(&self.pool, api_key, Some(model_alias)).await
     }
 }
 
@@ -169,10 +157,7 @@ where
         // match on `path`. Subpaths (e.g. `/v1/responses/...`) and other
         // routes flow through the default processor unchanged.
         if request.data.path != "/v1/responses" {
-            return self
-                .default
-                .process(request, http, storage, should_retry, cancellation)
-                .await;
+            return self.default.process(request, http, storage, should_retry, cancellation).await;
         }
 
         // The cancellation future is owned by the daemon. The
@@ -216,10 +201,7 @@ where
         // — no daemon-vs-realtime tool-availability divergence.
         let mut tool_ctx = RequestContext::new().with_model(request.data.model.clone());
         if let Some(resolver) = &self.tool_resolver {
-            match resolver
-                .resolve(&request.data.api_key, &request.data.model)
-                .await
-            {
+            match resolver.resolve(&request.data.api_key, &request.data.model).await {
                 Ok(Some(resolved)) => {
                     tool_ctx = tool_ctx.with_extension(ResolvedTools(Arc::new(resolved)));
                 }
@@ -270,14 +252,9 @@ where
                     .response_store
                     .assemble_response(&request_id)
                     .await
-                    .map_err(|e| fusillade::FusilladeError::Other(anyhow::anyhow!(
-                        "assemble_response after loop: {e}"
-                    )))?;
-                let body = serde_json::to_string(&assembled).map_err(|e| {
-                    fusillade::FusilladeError::Other(anyhow::anyhow!(
-                        "serialize assembled response: {e}"
-                    ))
-                })?;
+                    .map_err(|e| fusillade::FusilladeError::Other(anyhow::anyhow!("assemble_response after loop: {e}")))?;
+                let body = serde_json::to_string(&assembled)
+                    .map_err(|e| fusillade::FusilladeError::Other(anyhow::anyhow!("serialize assembled response: {e}")))?;
                 let completed = Request {
                     data: request.data.clone(),
                     state: Completed {
@@ -297,10 +274,7 @@ where
                 let failed = Request {
                     data: request.data.clone(),
                     state: Failed {
-                        reason: FailureReason::NonRetriableHttpStatus {
-                            status: 500,
-                            body,
-                        },
+                        reason: FailureReason::NonRetriableHttpStatus { status: 500, body },
                         failed_at: chrono::Utc::now(),
                         retry_attempt: request.state.retry_attempt,
                         batch_expires_at: request.state.batch_expires_at,
