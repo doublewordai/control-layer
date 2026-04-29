@@ -2530,29 +2530,19 @@ impl Application {
         );
 
         // Register onwards as a fusillade daemon so realtime requests get a valid daemon_id.
-        // Skipped in tests: each `#[sqlx::test]` calls `Application::new_with_pool`
-        // and rarely triggers explicit shutdown, so the heartbeat task spawned
-        // below would leak across tests, accumulating live connections on the
-        // shared fusillade pool and starving the per-test sqlx setup pool.
-        // Same gating pattern used for the probe scheduler's LISTEN/NOTIFY.
         let onwards_daemon_id = uuid::Uuid::new_v4();
         let fusillade_write_pool = bg_services.request_manager.pool().clone();
-        let daemon_insert_result = if cfg!(test) {
-            tracing::debug!("Skipping onwards daemon registration in test mode");
-            Err(sqlx::Error::Protocol("skipped in test mode".into()))
-        } else {
-            sqlx::query(
-                "INSERT INTO daemons (id, hostname, pid, version, config_snapshot, status, started_at, last_heartbeat)
-                 VALUES ($1, $2, $3, $4, $5, 'running', NOW(), NOW())",
-            )
-            .bind(onwards_daemon_id)
-            .bind(fusillade::daemon::types::get_hostname())
-            .bind(fusillade::daemon::types::get_pid())
-            .bind(fusillade::daemon::types::get_version())
-            .bind(serde_json::json!({"type": "onwards"}))
-            .execute(&fusillade_write_pool)
-            .await
-        };
+        let daemon_insert_result = sqlx::query(
+            "INSERT INTO daemons (id, hostname, pid, version, config_snapshot, status, started_at, last_heartbeat)
+             VALUES ($1, $2, $3, $4, $5, 'running', NOW(), NOW())",
+        )
+        .bind(onwards_daemon_id)
+        .bind(fusillade::daemon::types::get_hostname())
+        .bind(fusillade::daemon::types::get_pid())
+        .bind(fusillade::daemon::types::get_version())
+        .bind(serde_json::json!({"type": "onwards"}))
+        .execute(&fusillade_write_pool)
+        .await;
 
         let daemon_registered = match &daemon_insert_result {
             Ok(_) => {
