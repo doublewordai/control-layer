@@ -295,6 +295,11 @@ where
     /// Response store for Open Responses API lifecycle tracking.
     /// Reads/writes to fusillade's requests table.
     pub response_store: Arc<crate::responses::store::FusilladeResponseStore<P>>,
+    /// Multi-step response_steps storage. Optional so deployments that
+    /// don't use the multi-step Open Responses path can omit the
+    /// wiring; the GET /v1/responses/{id} handler degrades to 404 in
+    /// that case rather than panicking.
+    pub response_step_manager: Option<Arc<fusillade::PostgresResponseStepManager<P>>>,
 }
 
 impl<P> AppState<P>
@@ -2712,6 +2717,7 @@ impl Application {
             .limiters(limiters)
             .maybe_connections_encryption_key(bg_services.connections_encryption_key.clone())
             .response_store(response_store)
+            .response_step_manager(bg_services.step_manager.clone())
             .build();
 
         if let Some(config_path) = config_path {

@@ -12,7 +12,7 @@ use axum::{
     extract::{Path, State},
     http::HeaderMap,
 };
-use fusillade::Storage;
+use fusillade::{ResponseStepStore, Storage};
 use onwards::StoreError;
 use sqlx_pool_router::PoolProvider;
 
@@ -21,8 +21,9 @@ use crate::errors::{Error, Result};
 
 /// Retrieve a response by ID.
 ///
-/// Authenticates via Bearer API key. Returns the Open Responses API Response
-/// object only if the response's batch is owned by the API key's user.
+/// Authenticates via Bearer API key. The response_id is the head step's
+/// uuid (with optional `resp_` prefix); the head step's sub-request
+/// fusillade row carries `batch_created_by` for ownership.
 #[tracing::instrument(skip_all)]
 pub async fn get_response<P: PoolProvider>(
     State(state): State<AppState<P>>,
@@ -44,17 +45,35 @@ pub async fn get_response<P: PoolProvider>(
         .map_err(|e| Error::Database(e.into()))?
         .ok_or_else(|| Error::Unauthenticated { message: None })?;
 
-    // Parse the response ID to a UUID for fusillade lookup.
+    // Parse the response ID to a head_step UUID. After the
+    // response_steps re-anchoring (fusillade 16.8) `resp_<id>` is the
+    // head step's id, NOT a fusillade.requests id.
     let uuid_str = response_id.strip_prefix("resp_").unwrap_or(&response_id);
-    let request_id = uuid::Uuid::parse_str(uuid_str).map_err(|_| Error::NotFound {
+    let head_step_uuid = uuid::Uuid::parse_str(uuid_str).map_err(|_| Error::NotFound {
         resource: "response".to_string(),
         id: response_id.clone(),
     })?;
 
-    // Fetch the request detail from fusillade (includes batch_created_by).
+    // Resolve the row that carries `batch_created_by` for ownership.
+    // Two paths, mirroring `FusilladeResponseStore::get_response`:
+    //   * Multi-step — head step → its sub-request fusillade row.
+    //   * Single-step — the id is itself a fusillade.requests row
+    //     (chat completions / embeddings retrieved via the same GET).
+    // The auth resolution happens here on the row that's actually
+    // backing this response; `response_store.get_response` then
+    // assembles the API envelope.
+    let auth_request_id = match state.response_step_manager.as_ref() {
+        Some(step_manager) => match step_manager.get_step(fusillade::StepId(head_step_uuid)).await {
+            Ok(Some(head_step)) => head_step.request_id.unwrap_or(fusillade::RequestId(head_step_uuid)),
+            Ok(None) => fusillade::RequestId(head_step_uuid),
+            Err(e) => return Err(Error::Database(crate::db::errors::DbError::Other(anyhow::anyhow!("{e}")))),
+        },
+        None => fusillade::RequestId(head_step_uuid),
+    };
+
     let detail = state
         .request_manager
-        .get_request_detail(fusillade::RequestId(request_id))
+        .get_request_detail(auth_request_id)
         .await
         .map_err(|e| match e {
             fusillade::FusilladeError::RequestNotFound(_) => Error::NotFound {

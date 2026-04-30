@@ -26,8 +26,6 @@ use axum::{
 use fusillade::{PostgresRequestManager, ReqwestHttpClient};
 use sqlx_pool_router::PoolProvider;
 
-use fusillade::Storage;
-
 use super::jobs::CreateResponseInput;
 use super::store::{self as response_store, ONWARDS_RESPONSE_ID_HEADER, OnwardsDaemonId};
 
@@ -126,8 +124,7 @@ pub async fn responses_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     if request_value.get("tools").is_none()
         && is_responses_api
         && let Some(key) = api_key.as_deref()
-        && let Ok(Some(resolved)) =
-            crate::tool_injection::resolve_tools_for_request(&state.dwctl_pool, key, Some(model)).await
+        && let Ok(Some(resolved)) = crate::tool_injection::resolve_tools_for_request(&state.dwctl_pool, key, Some(model)).await
     {
         let openai_tools = resolved.to_openai_tools_array();
         if !openai_tools.is_empty() {
@@ -159,12 +156,15 @@ pub async fn responses_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     if stream_requested && let Some(resp) = try_warm_path_stream(&state, &request_value, api_key.as_deref(), model).await {
         return resp;
     }
-    if is_responses_api && !background && !stream_requested
+    if is_responses_api
+        && !background
+        && !stream_requested
         && let Some(resp) = try_warm_path_blocking(&state, &request_value, api_key.as_deref(), model).await
     {
         return resp;
     }
-    if is_responses_api && background
+    if is_responses_api
+        && background
         && let Some(resp) = try_warm_path_background(&state, &request_value, api_key.as_deref(), model).await
     {
         return resp;
@@ -480,58 +480,7 @@ async fn try_warm_path_stream<P: PoolProvider + Clone + Send + Sync + 'static>(
     model: &str,
 ) -> Option<Response> {
     let api_key = api_key?;
-
-    // Insert the parent fusillade row in `processing` state owned by
-    // this onwards instance so the batch daemon doesn't double-claim.
-    // Body is the raw user request — the multi-step transition function
-    // reads it back to drive next_action_for.
-    let request_id = uuid::Uuid::new_v4();
-    let batch_id = uuid::Uuid::new_v4();
-    let body_str = request_value.to_string();
-    let batch_input = fusillade::CreateSingleRequestBatchInput {
-        batch_id: Some(batch_id),
-        request_id,
-        body: body_str.clone(),
-        model: model.to_string(),
-        base_url: state.loopback_base_url.clone(),
-        endpoint: "/v1/responses".to_string(),
-        completion_window: "0s".to_string(),
-        initial_state: "processing".to_string(),
-        api_key: Some(api_key.to_string()),
-        created_by: response_store::lookup_created_by(&state.dwctl_pool, Some(api_key)).await,
-    };
-    if let Err(e) = state.request_manager.create_single_request_batch(batch_input).await {
-        tracing::error!(error = %e, "warm-path streaming: failed to create fusillade row");
-        return None;
-    }
-
-    // Resolve the per-request tool set (same DB query as the
-    // single-step middleware). Build a ResolvedToolSet ready to inject
-    // into the loop's RequestContext.
-    let resolved = match crate::tool_injection::resolve_tools_for_request(&state.dwctl_pool, api_key, Some(model)).await {
-        Ok(Some(set)) => Arc::new(set),
-        Ok(None) => Arc::new(crate::tool_executor::ResolvedToolSet::new(
-            std::collections::HashMap::new(),
-            std::collections::HashMap::new(),
-        )),
-        Err(e) => {
-            tracing::warn!(error = %e, "warm-path streaming: tool resolution failed; running with no tools");
-            Arc::new(crate::tool_executor::ResolvedToolSet::new(
-                std::collections::HashMap::new(),
-                std::collections::HashMap::new(),
-            ))
-        }
-    };
-
-    // Upstream URL for model_calls: use the loopback so the multi-step
-    // loop's chat-completions HTTP fire is routed through onwards'
-    // existing target picker / load balancer, exactly the same way a
-    // single-step request would be. The Bearer token is the user's
-    // API key (validated by onwards on its way through).
-    let upstream = onwards::UpstreamTarget {
-        url: format!("{}/v1/chat/completions", state.loopback_base_url),
-        api_key: Some(api_key.to_string()),
-    };
+    let (head_step_uuid, resolved, upstream) = warm_path_setup(state, request_value, api_key, model).await?;
 
     let sse = super::streaming::run_inline_streaming(
         state.response_store.clone(),
@@ -540,7 +489,7 @@ async fn try_warm_path_stream<P: PoolProvider + Clone + Send + Sync + 'static>(
         state.multi_step_http_client.clone(),
         upstream,
         state.loop_config,
-        request_id.to_string(),
+        head_step_uuid.to_string(),
         model.to_string(),
     );
     Some(sse.into_response())
@@ -631,34 +580,35 @@ async fn try_warm_path_background<P: PoolProvider + Clone + Send + Sync + 'stati
     Some((StatusCode::ACCEPTED, Json(response_body)).into_response())
 }
 
-/// Shared setup for the three warm paths: insert the parent fusillade
-/// row in `processing` state owned by this onwards instance, resolve
-/// per-request tools, and build the upstream target.
+/// Shared setup for the three warm paths: register the per-response
+/// context in the side-channel so the bridge's `next_action_for` /
+/// `record_step` can re-parse the original body and stamp api_key /
+/// created_by / base_url on per-step sub-request rows; resolve
+/// per-request tools; build the upstream target.
+///
+/// Returns the head-step UUID — the caller surfaces it to the user as
+/// `resp_<id>` and threads its string form into `run_response_loop` as
+/// the loop's `request_id` parameter. Crucially, **no parent
+/// `/v1/responses` fusillade row is created**: the response identity is
+/// purely the head step, and per-step sub-request rows are minted
+/// inside `record_step` for each model_call. This is the key shape
+/// change vs the pre-16.8 bridge — it's what lets the dashboard
+/// listing query show one row per response (the head's sub-request)
+/// with real analytics, instead of a parent row with zero usage.
 async fn warm_path_setup<P: PoolProvider + Clone + Send + Sync + 'static>(
     state: &ResponsesMiddlewareState<P>,
     request_value: &serde_json::Value,
     api_key: &str,
     model: &str,
 ) -> Option<(uuid::Uuid, Arc<crate::tool_executor::ResolvedToolSet>, onwards::UpstreamTarget)> {
-    let request_id = uuid::Uuid::new_v4();
-    let batch_id = uuid::Uuid::new_v4();
-    let body_str = request_value.to_string();
-    let batch_input = fusillade::CreateSingleRequestBatchInput {
-        batch_id: Some(batch_id),
-        request_id,
-        body: body_str,
-        model: model.to_string(),
-        base_url: state.loopback_base_url.clone(),
-        endpoint: "/v1/responses".to_string(),
-        completion_window: "0s".to_string(),
-        initial_state: "processing".to_string(),
+    let created_by = response_store::lookup_created_by(&state.dwctl_pool, Some(api_key)).await;
+    let pending = response_store::PendingResponseInput {
+        body: request_value.to_string(),
         api_key: Some(api_key.to_string()),
-        created_by: response_store::lookup_created_by(&state.dwctl_pool, Some(api_key)).await,
+        created_by,
+        base_url: state.loopback_base_url.clone(),
     };
-    if let Err(e) = state.request_manager.create_single_request_batch(batch_input).await {
-        tracing::error!(error = %e, "warm-path: failed to create fusillade row");
-        return None;
-    }
+    let head_step_uuid = state.response_store.register_pending(pending);
 
     let resolved = match crate::tool_injection::resolve_tools_for_request(&state.dwctl_pool, api_key, Some(model)).await {
         Ok(Some(set)) => Arc::new(set),
@@ -680,7 +630,7 @@ async fn warm_path_setup<P: PoolProvider + Clone + Send + Sync + 'static>(
         api_key: Some(api_key.to_string()),
     };
 
-    Some((request_id, resolved, upstream))
+    Some((head_step_uuid, resolved, upstream))
 }
 
 #[cfg(test)]

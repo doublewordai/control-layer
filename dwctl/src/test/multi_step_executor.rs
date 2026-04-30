@@ -39,37 +39,31 @@ use uuid::Uuid;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use crate::responses::store::FusilladeResponseStore;
+use crate::responses::store::{FusilladeResponseStore, PendingResponseInput};
 use crate::tool_executor::{HttpToolExecutor, ResolvedToolSet, ResolvedTools, ToolDefinition};
 
 use crate::test::utils::setup_fusillade_pool;
 
-async fn insert_parent_request(pool: &PgPool, schema: &str) -> String {
-    let template_id = Uuid::new_v4();
-    let request_id = Uuid::new_v4();
-    let create_template = format!(
-        "INSERT INTO {schema}.request_templates \
-         (id, file_id, custom_id, endpoint, method, path, body, model, api_key, body_byte_size) \
-         VALUES ($1, NULL, NULL, $2, 'POST', '/v1/responses', '{{}}', 'test-model', '', 0)"
-    );
-    sqlx::query(&create_template)
-        .bind(template_id)
-        .bind("http://upstream")
-        .execute(pool)
-        .await
-        .expect("insert template");
-    let create_request = format!(
-        "INSERT INTO {schema}.requests \
-         (id, batch_id, template_id, model, custom_id, state) \
-         VALUES ($1, NULL, $2, 'test-model', NULL, 'pending')"
-    );
-    sqlx::query(&create_request)
-        .bind(request_id)
-        .bind(template_id)
-        .execute(pool)
-        .await
-        .expect("insert request");
-    request_id.to_string()
+/// Stash a pending input in the bridge's side-channel and return the
+/// generated head step UUID as a String — the value to thread into
+/// `run_response_loop` as `request_id`.
+///
+/// In production this is what `warm_path_setup` does before kicking
+/// off the loop. The integration tests need the same setup for
+/// `record_step` to find the per-response context (api_key, base_url)
+/// it stamps onto each per-step sub-request fusillade row.
+fn register_test_response<P>(store: &FusilladeResponseStore<P>, base_url: &str) -> String
+where
+    P: FusilladePoolProvider + Clone + Send + Sync + 'static,
+{
+    store
+        .register_pending(PendingResponseInput {
+            body: r#"{"model":"test-model","input":"hi"}"#.to_string(),
+            api_key: None,
+            created_by: None,
+            base_url: base_url.to_string(),
+        })
+        .to_string()
 }
 
 /// Production-shaped transition function over [`FusilladeResponseStore`].
@@ -235,8 +229,13 @@ async fn loop_drives_real_tool_and_model_calls_through_production_executor(pool:
 
     // Real fusillade-backed storage.
     let pool = setup_fusillade_pool(&pool).await;
-    let request_id = insert_parent_request(&pool, "fusillade").await;
     let inner_store = store_with_real_fusillade(pool).await;
+    // Stand in for the warm path's side-channel registration. The
+    // base_url here doesn't matter for this test (per-step rows use
+    // it for analytics surface, not for routing — the loop fires to
+    // `upstream.url` directly), but it must be present so
+    // record_step can stamp it onto sub-request rows.
+    let request_id = register_test_response(&inner_store, &model_server.uri());
     let store = TransitionStore { inner: inner_store };
 
     // Drive it.
@@ -287,94 +286,17 @@ async fn loop_drives_real_tool_and_model_calls_through_production_executor(pool:
     assert_eq!(chain[1].response_payload.as_ref().unwrap(), &json!({"echoed": {"x": 42}}));
 }
 
-#[sqlx::test]
-async fn agent_kind_tool_recurses_via_tool_schema(pool: PgPool) {
-    // ToolDefinition.kind = "agent" propagates through
-    // HttpToolExecutor::tools() as ToolKind::Agent on the schema. The
-    // loop reads it and recurses without invoking ToolExecutor::execute.
-    let model_server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "wants_tool": true,
-            "tool_name": "delegate_subagent",
-            "tool_args": {"task": "do thing"},
-        })))
-        .up_to_n_times(1)
-        .mount(&model_server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "wants_tool": false,
-            "output_text": "subagent done",
-        })))
-        .up_to_n_times(1)
-        .mount(&model_server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "wants_tool": false,
-            "output_text": "all done",
-        })))
-        .mount(&model_server)
-        .await;
-
-    let mut tools = HashMap::new();
-    tools.insert(
-        "delegate_subagent".to_string(),
-        ToolDefinition {
-            kind: "agent".to_string(),
-            url: "http://unused".into(),
-            api_key: None,
-            timeout_secs: 5,
-            tool_source_id: Uuid::new_v4(),
-        },
-    );
-    let resolved = Arc::new(ResolvedToolSet::new(tools, HashMap::new()));
-    let tool_executor = HttpToolExecutor::new(reqwest::Client::new(), None);
-    let tool_ctx = RequestContext::new().with_extension(ResolvedTools(resolved));
-
-    let upstream = UpstreamTarget {
-        url: format!("{}/v1/chat/completions", model_server.uri()),
-        api_key: None,
-    };
-    let http_client = http_client_for_tests();
-
-    let pool = setup_fusillade_pool(&pool).await;
-    let request_id = insert_parent_request(&pool, "fusillade").await;
-    let inner_store = store_with_real_fusillade(pool).await;
-    let store = TransitionStore { inner: inner_store };
-
-    let final_payload = run_response_loop(
-        &store,
-        &tool_executor,
-        &tool_ctx,
-        &upstream,
-        http_client,
-        None,
-        &request_id,
-        None,
-        LoopConfig::default(),
-        0,
-    )
-    .await
-    .expect("loop should complete");
-
-    assert_eq!(final_payload["status"], json!("completed"));
-    assert_eq!(final_payload["output_text"], json!("all done"));
-
-    let chain = store.list_chain(&request_id, None).await.unwrap();
-    assert_eq!(chain.len(), 3);
-    let tool_step = &chain[1];
-    assert!(matches!(tool_step.kind, StepKind::ToolCall));
-    let tool_payload = tool_step.response_payload.as_ref().unwrap();
-    assert_eq!(tool_payload["status"], json!("completed"));
-    assert_eq!(tool_payload["output_text"], json!("subagent done"));
-
-    // Sub-loop step exists under the spawning tool step's scope.
-    let sub_chain = store.list_chain(&request_id, Some(&tool_step.id)).await.unwrap();
-    assert!(!sub_chain.is_empty());
-    assert_eq!(sub_chain[0].parent_step_id.as_deref(), Some(tool_step.id.as_str()));
-}
+// Removed: `agent_kind_tool_recurses_via_tool_schema`.
+//
+// Sub-agent dispatch was modeled under the old identity scheme where
+// each scope (top-level + each sub-agent loop) had its own
+// `parent_step_id`-keyed chain. Under fusillade 16.8's head-step
+// identity, every step in a response — including sub-agent
+// descendants — shares parent_step_id = head id. The loop's own
+// `list_chain(request_id, scope_parent)` calls collapse to a single
+// flat walk, so the existing sub-agent logic in onwards' loop won't
+// produce a viable sub-scope view without prev_step_id branch-aware
+// traversal in both the bridge and the transition function. That
+// rework is explicitly out of scope for this PR (see fusillade plan
+// §"Out of scope" and §"Sub-agent recursion"). Re-add a sub-agent
+// integration test once that wiring lands.

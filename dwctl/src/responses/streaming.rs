@@ -159,6 +159,12 @@ where
             }
         }
 
+        // The pending input was registered by warm_path_setup so the
+        // bridge could re-parse the user body on every iteration.
+        // The loop has terminated — drop the side-channel entry so the
+        // map doesn't grow unbounded.
+        response_store.unregister_pending(&request_id);
+
         drop(tx);
     });
 
@@ -171,12 +177,18 @@ where
     P: fusillade::PoolProvider + Clone + Send + Sync + 'static,
 {
     // Assemble the final response JSON from the chain (same path the
-    // daemon processor uses), then transition the fusillade row.
+    // daemon processor uses), then write it onto the head step's
+    // sub-request fusillade row — the listing-visible row for this
+    // response. There's no longer a parent /v1/responses row to
+    // finalize after the schema re-anchoring (fusillade 16.8).
     let assembled = response_store
         .assemble_response(request_id)
         .await
         .map_err(|e| format!("assemble: {e}"))?;
-    finalize_request_row(response_store, request_id, 200, assembled).await
+    response_store
+        .finalize_head_request(request_id, 200, assembled)
+        .await
+        .map_err(|e| format!("finalize head: {e}"))
 }
 
 /// Run the multi-step loop inline and return the final assembled
@@ -223,7 +235,7 @@ where
     )
     .await;
 
-    match result {
+    let outcome = match result {
         Ok(_) => {
             if let Err(e) = persist_terminal_completed(&response_store, &request_id).await {
                 tracing::warn!(error = %e, "Failed to persist warm-path-blocking terminal state");
@@ -249,39 +261,21 @@ where
             }
             Err(payload)
         }
-    }
+    };
+
+    // Drop the side-channel entry — it was registered by
+    // warm_path_setup so the bridge could re-parse the user body on
+    // every iteration; the loop has terminated.
+    response_store.unregister_pending(&request_id);
+    outcome
 }
 
 async fn persist_terminal_failed<P>(response_store: &FusilladeResponseStore<P>, request_id: &str, error: &Value) -> Result<(), String>
 where
     P: fusillade::PoolProvider + Clone + Send + Sync + 'static,
 {
-    finalize_request_row(response_store, request_id, 500, error.clone()).await
-}
-
-async fn finalize_request_row<P>(
-    response_store: &FusilladeResponseStore<P>,
-    request_id: &str,
-    status_code: u16,
-    body: Value,
-) -> Result<(), String>
-where
-    P: fusillade::PoolProvider + Clone + Send + Sync + 'static,
-{
-    use fusillade::{RequestId, Storage};
-    let body_str = serde_json::to_string(&body).map_err(|e| format!("serialize: {e}"))?;
-    let id = uuid::Uuid::parse_str(request_id).map_err(|e| format!("parse request_id: {e}"))?;
-    if status_code == 200 {
-        response_store
-            .request_manager()
-            .complete_request(RequestId(id), &body_str, status_code)
-            .await
-            .map_err(|e| format!("complete_request: {e}"))
-    } else {
-        response_store
-            .request_manager()
-            .fail_request(RequestId(id), &body_str, status_code)
-            .await
-            .map_err(|e| format!("fail_request: {e}"))
-    }
+    response_store
+        .finalize_head_request(request_id, 500, error.clone())
+        .await
+        .map_err(|e| format!("finalize head: {e}"))
 }

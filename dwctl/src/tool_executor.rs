@@ -86,8 +86,8 @@ impl ResolvedToolSet {
     /// loop runs no tool_call steps.
     pub fn to_openai_tools_array(&self) -> Vec<serde_json::Value> {
         self.tools
-            .iter()
-            .map(|(name, _def)| {
+            .keys()
+            .map(|name| {
                 let (description, parameters) = self.metadata.get(name).cloned().unwrap_or((None, None));
                 serde_json::json!({
                     "type": "function",
