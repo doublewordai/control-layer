@@ -82,7 +82,7 @@ pub async fn responses_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
         }
     };
 
-    let request_value: serde_json::Value = match serde_json::from_slice(&body_bytes) {
+    let mut request_value: serde_json::Value = match serde_json::from_slice(&body_bytes) {
         Ok(v) => v,
         Err(e) => {
             tracing::error!(error = %e, "Failed to parse request body in responses middleware");
@@ -90,7 +90,8 @@ pub async fn responses_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
         }
     };
 
-    let model = request_value["model"].as_str().unwrap_or("unknown");
+    let model = request_value["model"].as_str().unwrap_or("unknown").to_string();
+    let model = model.as_str();
     let nested_path = parts.uri.path();
     let is_responses_api = nested_path.ends_with("/responses");
     // The router is nested at /ai/v1, so the path here is e.g. "/responses".
@@ -104,6 +105,35 @@ pub async fn responses_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.strip_prefix("Bearer "))
         .map(|s| s.to_string());
+
+    // Inject server-side resolved tools into the request body so the
+    // multi-step path's transition function (which reads `body["tools"]`
+    // and forwards them to upstream model_call payloads) sees them.
+    // Without this, tools registered in the dwctl tool registry never
+    // reach the model — it can't issue real tool_calls and the loop
+    // runs as a single model_call.
+    //
+    // The single-step (onwards-routed) path injects tools via the
+    // strict-mode handlers; the multi-step path bypasses onwards for
+    // model_calls so we have to do it here. Skipped if the user
+    // already supplied tools (their list takes precedence).
+    //
+    // The cross-cutting `tool_injection_middleware` runs *inside* this
+    // layer (axum applies later-added layers as outer wrappers, so
+    // when responses_middleware fires, tool_injection hasn't yet
+    // populated request.extensions::<ResolvedTools>). We do the same
+    // DB resolve directly here.
+    if request_value.get("tools").is_none()
+        && is_responses_api
+        && let Some(key) = api_key.as_deref()
+        && let Ok(Some(resolved)) =
+            crate::tool_injection::resolve_tools_for_request(&state.dwctl_pool, key, Some(model)).await
+    {
+        let openai_tools = resolved.to_openai_tools_array();
+        if !openai_tools.is_empty() {
+            request_value["tools"] = serde_json::Value::Array(openai_tools);
+        }
+    }
 
     // Only the Responses API supports service_tier and background.
     // Chat completions and embeddings always use realtime tier.

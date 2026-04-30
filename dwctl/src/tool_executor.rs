@@ -77,6 +77,29 @@ impl ResolvedToolSet {
             })
             .collect()
     }
+
+    /// Render the resolved tool set in OpenAI Chat Completions
+    /// `tools: [{ type: "function", function: {...} }]` format. This is
+    /// what the multi-step path's transition function picks up from
+    /// `body["tools"]` and forwards to the upstream model_call payload
+    /// — without it, registered tools never reach the model and the
+    /// loop runs no tool_call steps.
+    pub fn to_openai_tools_array(&self) -> Vec<serde_json::Value> {
+        self.tools
+            .iter()
+            .map(|(name, _def)| {
+                let (description, parameters) = self.metadata.get(name).cloned().unwrap_or((None, None));
+                serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "description": description.unwrap_or_default(),
+                        "parameters": parameters.unwrap_or(serde_json::json!({"type": "object"})),
+                    }
+                })
+            })
+            .collect()
+    }
 }
 
 /// Translate the `tool_sources.kind` text column into onwards' typed
