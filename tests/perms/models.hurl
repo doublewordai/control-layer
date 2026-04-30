@@ -841,7 +841,7 @@ dwctl_session: {{user_jwt}}
 HTTP 200
 [Asserts]
 jsonpath "$.data" isCollection
-jsonpath "$.data" count == 2
+jsonpath "$.data" count == 5
 jsonpath "$.data[*].id" contains "{{user1_model_id}}"
 jsonpath "$.data[*].id" contains "{{public_model_id}}"
 jsonpath "$.data[*].id" not contains "{{user2_model_id}}"
