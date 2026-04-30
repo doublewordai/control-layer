@@ -4,6 +4,7 @@ import { Code, Play, X, Filter, Clock, DollarSign, Check, ChevronsUpDown, Zap, F
 import { type ColumnDef } from "@tanstack/react-table";
 import { Button } from "../../ui/button";
 import { DataTable } from "../../ui/data-table";
+import { SafeHTML } from "../../ui/safe-html";
 import { Switch } from "../../ui/switch";
 import {
   Tooltip,
@@ -343,12 +344,10 @@ export function AsyncRequests() {
         </div>
       </div>
 
-      {/* Bootstrap banner - content from trusted server-side source (bootstrap.js) */}
+      {/* Bootstrap banner - content sourced from public/bootstrap.js, sanitized with DOMPurify before render. */}
       {bootstrapBanner.content && !bootstrapBanner.isClosed && (
         <div className="relative mb-6">
-          <div
-            dangerouslySetInnerHTML={{ __html: bootstrapBanner.content }}
-          />
+          <SafeHTML html={bootstrapBanner.content} />
           <button
             onClick={bootstrapBanner.close}
             className="absolute top-3 right-3 rounded-sm opacity-50 transition-opacity hover:opacity-100 focus:ring-2 focus:ring-ring focus:ring-offset-2 focus:outline-hidden"

@@ -41,6 +41,7 @@ import {
 import { Switch } from "../../../ui/switch";
 import { DateTimeRangeSelector } from "../../../ui/date-time-range-selector";
 import { DataTable } from "../../../ui/data-table";
+import { SafeHTML } from "../../../ui/safe-html";
 import { createFileColumns } from "../FilesTable/columns";
 import { createBatchColumns } from "../BatchesTable/columns";
 import {
@@ -731,12 +732,10 @@ export function Batches({
           </div>
         </div>
 
-        {/* Bootstrap Banner */}
+        {/* Bootstrap Banner - content sourced from public/bootstrap.js, sanitized with DOMPurify before render. */}
         {bootstrapBanner.content && !bootstrapBanner.isClosed && (
           <div className="relative mb-6">
-            <div
-              dangerouslySetInnerHTML={{ __html: bootstrapBanner.content }}
-            />
+            <SafeHTML html={bootstrapBanner.content} />
             <button
               onClick={bootstrapBanner.close}
               className="absolute top-3 right-3 rounded-sm opacity-50 transition-opacity hover:opacity-100 focus:ring-2 focus:ring-ring focus:ring-offset-2 focus:outline-hidden"
