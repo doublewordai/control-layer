@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.45.0](https://github.com/doublewordai/control-layer/compare/v8.44.3...v8.45.0) (2026-04-30)
+
+
+### Features
+
+* dwctl migration for multi-step response analytics linkage ([#1036](https://github.com/doublewordai/control-layer/issues/1036)) ([d9eb4bd](https://github.com/doublewordai/control-layer/commit/d9eb4bd562b507183cf8cb2dc6f64fab78b7bff9))
+
 ## [8.44.3](https://github.com/doublewordai/control-layer/compare/v8.44.2...v8.44.3) (2026-04-28)
 
 
