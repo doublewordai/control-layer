@@ -11,6 +11,13 @@ import { cn } from "@/lib/utils";
 // Format: { THEME_NAME: CSS_SELECTOR }
 const THEMES = { light: "", dark: ".dark" } as const;
 
+// Defensive validation for the values we interpolate into a generated <style>
+// block. Keys are CSS custom-property names; colors are CSS color values.
+// Anything outside these character classes is dropped to prevent CSS-injection
+// (e.g. closing the rule and starting a new one, embedding @import, etc.).
+const VALID_CSS_VAR_KEY = /^[A-Za-z0-9_-]+$/;
+const VALID_CSS_COLOR_VALUE = /^[A-Za-z0-9 ,.()#%/_-]+$/;
+
 export type ChartConfig = {
   [k in string]: {
     label?: React.ReactNode;
@@ -75,28 +82,34 @@ const ChartStyle = ({ id, config }: { id: string; config: ChartConfig }) => {
     return null;
   }
 
-  return (
-    <style
-      dangerouslySetInnerHTML={{
-        __html: Object.entries(THEMES)
-          .map(
-            ([theme, prefix]) => `
-${prefix} [data-chart=${id}] {
-${colorConfig
-  .map(([key, itemConfig]) => {
-    const color =
-      itemConfig.theme?.[theme as keyof typeof itemConfig.theme] ||
-      itemConfig.color;
-    return color ? `  --color-${key}: ${color};` : null;
-  })
-  .join("\n")}
-}
-`,
-          )
-          .join("\n"),
-      }}
-    />
-  );
+  // Drop any entries whose key or color would not survive a strict CSS
+  // identifier / color regex. Chart configs are author-supplied today, but
+  // refusing to interpolate untrusted-looking strings closes the
+  // CSS-injection vector and silences react/no-danger concerns about this
+  // <style> tag.
+  const safeId = VALID_CSS_VAR_KEY.test(id) ? id : "";
+  if (!safeId) {
+    return null;
+  }
+
+  const css = Object.entries(THEMES)
+    .map(([theme, prefix]) => {
+      const decls = colorConfig
+        .map(([key, itemConfig]) => {
+          if (!VALID_CSS_VAR_KEY.test(key)) return null;
+          const color =
+            itemConfig.theme?.[theme as keyof typeof itemConfig.theme] ||
+            itemConfig.color;
+          if (!color || !VALID_CSS_COLOR_VALUE.test(color)) return null;
+          return `  --color-${key}: ${color};`;
+        })
+        .filter(Boolean)
+        .join("\n");
+      return `\n${prefix} [data-chart=${safeId}] {\n${decls}\n}\n`;
+    })
+    .join("\n");
+
+  return <style dangerouslySetInnerHTML={{ __html: css }} />;
 };
 
 const ChartTooltip = Tooltip;
