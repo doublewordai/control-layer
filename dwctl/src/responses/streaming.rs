@@ -179,6 +179,79 @@ where
     finalize_request_row(response_store, request_id, 200, assembled).await
 }
 
+/// Run the multi-step loop inline and return the final assembled
+/// response as a single JSON value. Used by the warm-path blocking
+/// handler when the user requested `stream: false, background: false`
+/// on `/v1/responses` — we still need full multi-step orchestration
+/// (tools, sub-agents) but the user expects one HTTP response, not an
+/// SSE stream.
+///
+/// On success, returns the final response JSON; on failure, returns
+/// the loop's error payload as JSON. Persistence of the parent
+/// fusillade row happens here (same `complete_request` /
+/// `fail_request` calls the streaming path uses) so subsequent
+/// `GET /v1/responses/{id}` retrievals see the same data.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_inline_blocking<P>(
+    response_store: Arc<FusilladeResponseStore<P>>,
+    tool_executor: Arc<HttpToolExecutor>,
+    tool_resolved: Arc<crate::tool_executor::ResolvedToolSet>,
+    http_client: Arc<dyn HttpClient + Send + Sync>,
+    upstream: UpstreamTarget,
+    loop_config: LoopConfig,
+    request_id: String,
+    model_alias: String,
+) -> Result<Value, Value>
+where
+    P: fusillade::PoolProvider + Clone + Send + Sync + 'static,
+{
+    let tool_ctx = RequestContext::new()
+        .with_model(model_alias)
+        .with_extension(crate::tool_executor::ResolvedTools(tool_resolved));
+
+    let result = onwards::run_response_loop(
+        &*response_store,
+        &*tool_executor,
+        &tool_ctx,
+        &upstream,
+        http_client,
+        None,
+        &request_id,
+        None,
+        loop_config,
+        0,
+    )
+    .await;
+
+    match result {
+        Ok(_) => {
+            if let Err(e) = persist_terminal_completed(&response_store, &request_id).await {
+                tracing::warn!(error = %e, "Failed to persist warm-path-blocking terminal state");
+            }
+            response_store
+                .assemble_response(&request_id)
+                .await
+                .map_err(|e| serde_json::json!({"type": "assemble_failed", "message": e.to_string()}))
+        }
+        Err(LoopError::Failed(payload)) => {
+            if let Err(e) = persist_terminal_failed(&response_store, &request_id, &payload).await {
+                tracing::warn!(error = %e, "Failed to persist warm-path-blocking failure");
+            }
+            Err(payload)
+        }
+        Err(other) => {
+            let payload = serde_json::json!({
+                "type": "loop_error",
+                "message": other.to_string(),
+            });
+            if let Err(e) = persist_terminal_failed(&response_store, &request_id, &payload).await {
+                tracing::warn!(error = %e, "Failed to persist warm-path-blocking error");
+            }
+            Err(payload)
+        }
+    }
+}
+
 async fn persist_terminal_failed<P>(response_store: &FusilladeResponseStore<P>, request_id: &str, error: &Value) -> Result<(), String>
 where
     P: fusillade::PoolProvider + Clone + Send + Sync + 'static,
