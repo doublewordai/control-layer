@@ -145,4 +145,38 @@ describe("AsyncRequests", () => {
       within(container).getByText(/no async requests found/i),
     ).toBeInTheDocument();
   });
+
+  describe("Filter persistence", () => {
+    it("seeds filters from localStorage on mount", () => {
+      localStorage.setItem(
+        "filters:responses",
+        JSON.stringify({
+          status: "completed",
+          tier: ["flex"],
+          activeFirst: "false",
+        }),
+      );
+
+      render(<AsyncRequests />, { wrapper: createWrapper() });
+
+      expect(hooks.useAsyncRequests).toHaveBeenCalledWith(
+        expect.objectContaining({
+          status: "completed",
+          service_tiers: "flex",
+          active_first: false,
+        }),
+      );
+    });
+
+    it("does not persist date range across sessions", () => {
+      // No date range stored — the page should not pass any timestamps.
+      render(<AsyncRequests />, { wrapper: createWrapper() });
+
+      const lastCall = vi
+        .mocked(hooks.useAsyncRequests)
+        .mock.calls.at(-1)?.[0];
+      expect(lastCall?.created_after).toBeUndefined();
+      expect(lastCall?.created_before).toBeUndefined();
+    });
+  });
 });

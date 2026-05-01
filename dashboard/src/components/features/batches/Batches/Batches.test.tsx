@@ -709,4 +709,55 @@ describe("Batches", () => {
       ).toBeEnabled();
     });
   });
+
+  describe("Filter persistence", () => {
+    it("seeds the batch search input from localStorage on mount", () => {
+      localStorage.setItem(
+        "filters:batches",
+        JSON.stringify({ batchSearch: "saved-query" }),
+      );
+
+      const { container } = render(<Batches {...defaultProps} />, {
+        wrapper: createWrapper(),
+      });
+
+      const batchSearch =
+        within(container).getByPlaceholderText(/search batches/i);
+      expect(batchSearch).toHaveValue("saved-query");
+    });
+
+    it("writes the batch search query to localStorage when the user types", async () => {
+      const user = userEvent.setup();
+      const { container } = render(<Batches {...defaultProps} />, {
+        wrapper: createWrapper(),
+      });
+
+      const batchSearch =
+        within(container).getByPlaceholderText(/search batches/i);
+      await user.type(batchSearch, "abc");
+
+      const stored = JSON.parse(
+        localStorage.getItem("filters:batches") || "{}",
+      );
+      expect(stored.batchSearch).toBe("abc");
+    });
+
+    it("removes a key from localStorage once the value matches the default", async () => {
+      const user = userEvent.setup();
+      const { container } = render(<Batches {...defaultProps} />, {
+        wrapper: createWrapper(),
+      });
+
+      const batchSearch =
+        within(container).getByPlaceholderText(/search batches/i);
+      await user.type(batchSearch, "x");
+      expect(
+        JSON.parse(localStorage.getItem("filters:batches") || "{}")
+          .batchSearch,
+      ).toBe("x");
+
+      await user.clear(batchSearch);
+      expect(localStorage.getItem("filters:batches")).toBeNull();
+    });
+  });
 });
