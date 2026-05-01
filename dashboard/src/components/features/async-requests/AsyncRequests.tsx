@@ -365,12 +365,25 @@ export function AsyncRequests() {
 
   const columns = createColumns(showUserColumn, modelDisplayNames);
 
+  // In an org context the resolved memberList is authoritative — if the
+  // selected id isn't in it (because the org-change reset effect hasn't run
+  // yet, or the user was removed from the org), drop the filter rather than
+  // sending a stale id that the backend will reject. PM personal mode
+  // searches users on demand and can't make the same determination, so
+  // trust the id there.
+  const memberKnown =
+    !selectedMemberId || memberList.some((m) => m.id === selectedMemberId);
+  const memberIdFilter =
+    selectedMemberId && (!isOrgContext || memberKnown)
+      ? selectedMemberId
+      : undefined;
+
   const { data, isLoading } = useAsyncRequests({
     service_tiers: tierFilter.length > 0 ? tierFilter.join(",") : undefined,
     active_first: sortActiveFirst,
     status: statusFilter !== "all" ? statusFilter : undefined,
     model: modelFilter.length > 0 ? modelFilter.join(",") : undefined,
-    member_id: selectedMemberId,
+    member_id: memberIdFilter,
     created_after: dateRange?.from.toISOString(),
     created_before: dateRange?.to.toISOString(),
     ...pagination.queryParams,
