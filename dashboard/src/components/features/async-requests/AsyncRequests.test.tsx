@@ -168,8 +168,19 @@ describe("AsyncRequests", () => {
       );
     });
 
-    it("does not persist date range across sessions", () => {
-      // No date range stored — the page should not pass any timestamps.
+    it("does not persist date range across sessions even if junk is stored", () => {
+      // Pre-seed localStorage with date-range-shaped keys to make sure the
+      // page actively ignores them, rather than the test passing only because
+      // nothing was stored in the first place.
+      localStorage.setItem(
+        "filters:responses",
+        JSON.stringify({
+          created_after: "2025-01-01T00:00:00.000Z",
+          created_before: "2025-01-02T00:00:00.000Z",
+          dateRange: "2025-01-01_2025-01-02",
+        }),
+      );
+
       render(<AsyncRequests />, { wrapper: createWrapper() });
 
       const lastCall = vi

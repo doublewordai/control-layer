@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { Code, Play, X, Filter, Clock, DollarSign, Check, ChevronsUpDown, Zap, FastForward } from "lucide-react";
 import { type ColumnDef } from "@tanstack/react-table";
@@ -319,8 +319,15 @@ export function AsyncRequests() {
   );
   const [modelPopoverOpen, setModelPopoverOpen] = useState(false);
 
-  // Reset filters when org context changes
+  // Reset filters when org context changes. Skip the initial mount, otherwise
+  // freshly restored persisted filters would be wiped before they ever reach
+  // the API.
+  const isInitialOrgMount = useRef(true);
   useEffect(() => {
+    if (isInitialOrgMount.current) {
+      isInitialOrgMount.current = false;
+      return;
+    }
     setStatusFilter("all");
     setModelFilter(EMPTY_MODEL_FILTER);
     setTierFilter(DEFAULT_TIER_FILTER);

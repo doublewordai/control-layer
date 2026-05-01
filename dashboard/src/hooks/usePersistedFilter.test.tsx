@@ -143,6 +143,26 @@ describe("usePersistedFilter", () => {
     );
     expect(result.current[0]).toEqual(["a", "b", "c"]);
   });
+
+  it("supports updater-fn setters and survives back-to-back updates without losing the first one", () => {
+    const empty: string[] = [];
+    const { result } = renderHook(
+      () => usePersistedFilter("page-a", "models", empty),
+      { wrapper: wrapperWithRouter() },
+    );
+
+    act(() => {
+      // Two updates in the same tick — the second one's prev must reflect
+      // the first one's write, not the stale closure.
+      result.current[1]((prev) => [...prev, "a"]);
+      result.current[1]((prev) => [...prev, "b"]);
+    });
+
+    expect(result.current[0]).toEqual(["a", "b"]);
+    expect(
+      JSON.parse(localStorage.getItem("filters:page-a") || "{}").models,
+    ).toEqual(["a", "b"]);
+  });
 });
 
 describe("clearPersistedFilters", () => {
@@ -184,5 +204,35 @@ describe("clearPersistedFilters", () => {
     expect(result.current.params.get("status")).toBeNull();
     expect(result.current.params.get("model")).toBeNull();
     expect(result.current.params.get("keep")).toBe("yes");
+  });
+
+  it("only deletes the named keys within the scope, leaving other keys in the same bucket alone", () => {
+    localStorage.setItem(
+      "filters:page-a",
+      JSON.stringify({
+        status: "completed",
+        model: "gpt-4",
+        unrelated: "keep-me",
+      }),
+    );
+
+    const { result } = renderHook(
+      () => {
+        const [params, setParams] = useSearchParams();
+        return { params, setParams };
+      },
+      { wrapper: wrapperWithRouter() },
+    );
+
+    act(() => {
+      clearPersistedFilters("page-a", result.current.setParams, [
+        "status",
+        "model",
+      ]);
+    });
+
+    expect(JSON.parse(localStorage.getItem("filters:page-a") || "{}")).toEqual({
+      unrelated: "keep-me",
+    });
   });
 });

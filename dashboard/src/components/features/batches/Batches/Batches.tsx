@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import * as React from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
@@ -162,17 +162,13 @@ export function Batches({
     return [];
   }, [isOrgContext, useServerSideMemberSearch, orgMembers, searchedUsers]);
 
-  // Member filter: persisted as id+email pair so the chip shows the right
-  // address on reload even when the member isn't in the current search results.
-  // Empty string = no filter ("All members").
+  // Member filter — only the id is persisted. The email is PII and there's
+  // no need to keep coworker addresses in localStorage on a shared
+  // workstation; we re-resolve it from `memberList` on render and fall back
+  // to the id while the list loads. Empty string = no filter.
   const [selectedMemberId, setSelectedMemberId] = usePersistedFilter(
     PERSIST_SCOPE,
     "member",
-    "",
-  );
-  const [selectedMemberEmail, setSelectedMemberEmail] = usePersistedFilter(
-    PERSIST_SCOPE,
-    "memberEmail",
     "",
   );
   const [memberPopoverOpen, setMemberPopoverOpen] = useState(false);
@@ -210,9 +206,17 @@ export function Batches({
   // (member filter is org-scoped). Other persisted filters are intentionally left
   // alone — they describe how the user wants to view their data, not who they're
   // viewing it for.
+  //
+  // Skip the very first run: on mount activeOrganizationId is whatever it
+  // happens to be, and treating that as a "change" would wipe a freshly
+  // restored persisted member id before it ever reaches the API.
+  const isInitialOrgMount = useRef(true);
   useEffect(() => {
+    if (isInitialOrgMount.current) {
+      isInitialOrgMount.current = false;
+      return;
+    }
     setSelectedMemberId("");
-    setSelectedMemberEmail("");
     setMemberSearch("");
     setStatusFilter("all");
     setDateRange(undefined);
@@ -305,7 +309,20 @@ export function Batches({
         ? "batch_output"
         : "batch_error"; // error
 
-  const memberIdFilter = selectedMemberId || undefined;
+  // In an org context the resolved memberList is authoritative — if the
+  // persisted id isn't in it (e.g. user switched orgs in another tab or the
+  // member was removed), drop the filter rather than sending a stale id that
+  // returns nothing. PM personal mode searches users on demand, so we can't
+  // make that determination there without an extra round trip; trust the id.
+  const memberKnown =
+    !selectedMemberId || memberList.some((m) => m.id === selectedMemberId);
+  const memberIdFilter =
+    selectedMemberId && (!isOrgContext || memberKnown)
+      ? selectedMemberId
+      : undefined;
+  const resolvedMemberEmail = memberList.find(
+    (m) => m.id === selectedMemberId,
+  )?.email;
 
   const { data: filesResponse, isLoading: filesLoading } = useFiles({
     purpose: filePurpose,
@@ -602,9 +619,13 @@ export function Batches({
   });
 
   // Searchable member filter combobox - shared between batches and files tabs
-  const displayedMemberEmail =
-    selectedMemberEmail ||
-    memberList.find((m) => m.id === selectedMemberId)?.email;
+  // The email is resolved from the live memberList (we only persist the id),
+  // so we fall back to a generic placeholder while the list is loading.
+  const displayedMemberEmail = resolvedMemberEmail;
+  const memberLabel =
+    !selectedMemberId
+      ? "All members"
+      : displayedMemberEmail || "Selected member";
   // Show member filter: always for PM personal mode (server-side search),
   // only when org members exist for org context (client-side filtered)
   const showMemberCombobox =
@@ -621,9 +642,7 @@ export function Batches({
         >
           <div className="flex items-center gap-1.5 truncate">
             <Users className="w-3.5 h-3.5 shrink-0 text-gray-500" />
-            <span className="truncate">
-              {displayedMemberEmail || "All members"}
-            </span>
+            <span className="truncate">{memberLabel}</span>
           </div>
           <ChevronsUpDown className="ml-1 h-3.5 w-3.5 shrink-0 opacity-50" />
         </Button>
@@ -644,7 +663,6 @@ export function Batches({
                 value="all-members"
                 onSelect={() => {
                   setSelectedMemberId("");
-                  setSelectedMemberEmail("");
                   setMemberSearch("");
                   setMemberPopoverOpen(false);
                   batchesPagination.handleFirstPage();
@@ -665,7 +683,6 @@ export function Batches({
                   value={member.email}
                   onSelect={() => {
                     setSelectedMemberId(member.id);
-                    setSelectedMemberEmail(member.email);
                     setMemberSearch("");
                     setMemberPopoverOpen(false);
                     batchesPagination.handleFirstPage();

@@ -5,6 +5,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import { Batches } from "./Batches";
 import * as hooks from "../../../../api/control-layer/hooks";
+import { useOrganizationContext } from "../../../../contexts/organization/useOrganizationContext";
 
 // Mock the hooks
 vi.mock("../../../../api/control-layer/hooks", () => ({
@@ -758,6 +759,63 @@ describe("Batches", () => {
 
       await user.clear(batchSearch);
       expect(localStorage.getItem("filters:batches")).toBeNull();
+    });
+
+    it("seeds a persisted member id and forwards it as member_id when the member resolves in memberList", () => {
+      vi.mocked(useOrganizationContext).mockReturnValue({
+        activeOrganizationId: "org-1",
+        activeOrganization: { id: "org-1", name: "Acme" } as any,
+        isOrgContext: true,
+        setActiveOrganization: vi.fn(),
+      });
+      vi.mocked(hooks.useOrganizationMembers).mockReturnValue({
+        data: [
+          {
+            status: "active",
+            user: { id: "user-1", email: "alice@acme.test" },
+          },
+        ],
+        isLoading: false,
+      } as any);
+
+      localStorage.setItem(
+        "filters:batches",
+        JSON.stringify({ member: "user-1" }),
+      );
+
+      render(<Batches {...defaultProps} />, { wrapper: createWrapper() });
+
+      const lastCall = vi.mocked(hooks.useBatches).mock.calls.at(-1)?.[0];
+      expect(lastCall?.member_id).toBe("user-1");
+    });
+
+    it("drops a persisted member_id when the id is not in the org's memberList (e.g. after switching orgs)", () => {
+      vi.mocked(useOrganizationContext).mockReturnValue({
+        activeOrganizationId: "org-2",
+        activeOrganization: { id: "org-2", name: "Other" } as any,
+        isOrgContext: true,
+        setActiveOrganization: vi.fn(),
+      });
+      // Memberlist for org-2 doesn't contain "user-1" (member of org-1).
+      vi.mocked(hooks.useOrganizationMembers).mockReturnValue({
+        data: [
+          {
+            status: "active",
+            user: { id: "user-9", email: "carol@other.test" },
+          },
+        ],
+        isLoading: false,
+      } as any);
+
+      localStorage.setItem(
+        "filters:batches",
+        JSON.stringify({ member: "user-1" }),
+      );
+
+      render(<Batches {...defaultProps} />, { wrapper: createWrapper() });
+
+      const lastCall = vi.mocked(hooks.useBatches).mock.calls.at(-1)?.[0];
+      expect(lastCall?.member_id).toBeUndefined();
     });
   });
 });
