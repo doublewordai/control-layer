@@ -1,15 +1,26 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, within } from "@testing-library/react";
+import { render, within, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import { AsyncRequests } from "./AsyncRequests";
 import * as hooks from "../../../api/control-layer/hooks";
+import { useOrganizationContext } from "../../../contexts/organization/useOrganizationContext";
+import { useAuthorization } from "../../../utils/authorization";
 
 // Mock the hooks
 vi.mock("../../../api/control-layer/hooks", () => ({
   useConfig: vi.fn(),
   useAsyncRequests: vi.fn(),
   useModels: vi.fn(),
+  useOrganizationMembers: vi.fn(() => ({
+    data: [],
+    isLoading: false,
+  })),
+  useUsers: vi.fn(() => ({
+    data: { data: [], total_count: 0 },
+    isLoading: false,
+  })),
 }));
 
 // Mock authorization hook
@@ -144,5 +155,105 @@ describe("AsyncRequests", () => {
     expect(
       within(container).getByText(/no async requests found/i),
     ).toBeInTheDocument();
+  });
+
+  describe("Member filter", () => {
+    it("does not render the member filter for a standard user in personal context", () => {
+      vi.mocked(useOrganizationContext).mockReturnValue({
+        activeOrganizationId: null,
+        activeOrganization: null,
+        isOrgContext: false,
+        setActiveOrganization: vi.fn(),
+      });
+      // Standard user — no manage-models permission, not a PlatformManager.
+      vi.mocked(useAuthorization).mockReturnValue({
+        userRoles: ["StandardUser"],
+        isLoading: false,
+        hasPermission: () => false,
+        canAccessRoute: () => true,
+        getFirstAccessibleRoute: () => "/",
+      } as any);
+
+      const { container } = render(<AsyncRequests />, {
+        wrapper: createWrapper(),
+      });
+
+      expect(
+        within(container).queryByRole("combobox", {
+          name: /filter by member/i,
+        }),
+      ).not.toBeInTheDocument();
+    });
+
+    it("renders the member filter for an org member, populated from useOrganizationMembers", async () => {
+      vi.mocked(useOrganizationContext).mockReturnValue({
+        activeOrganizationId: "org-1",
+        activeOrganization: { id: "org-1", name: "Acme" } as any,
+        isOrgContext: true,
+        setActiveOrganization: vi.fn(),
+      });
+      vi.mocked(hooks.useOrganizationMembers).mockReturnValue({
+        data: [
+          {
+            status: "active",
+            user: { id: "user-1", email: "alice@acme.test" },
+          },
+          {
+            status: "active",
+            user: { id: "user-2", email: "bob@acme.test" },
+          },
+        ],
+        isLoading: false,
+      } as any);
+
+      const user = userEvent.setup();
+      const { container } = render(<AsyncRequests />, {
+        wrapper: createWrapper(),
+      });
+
+      const combobox = within(container).getByRole("combobox", {
+        name: /filter by member/i,
+      });
+      expect(combobox).toBeInTheDocument();
+      await user.click(combobox);
+      // Popover content renders in a portal, so use screen.
+      expect(await screen.findByText("alice@acme.test")).toBeInTheDocument();
+      expect(screen.getByText("bob@acme.test")).toBeInTheDocument();
+    });
+
+    it("passes member_id to useAsyncRequests when a member is selected", async () => {
+      vi.mocked(useOrganizationContext).mockReturnValue({
+        activeOrganizationId: "org-1",
+        activeOrganization: { id: "org-1", name: "Acme" } as any,
+        isOrgContext: true,
+        setActiveOrganization: vi.fn(),
+      });
+      vi.mocked(hooks.useOrganizationMembers).mockReturnValue({
+        data: [
+          {
+            status: "active",
+            user: { id: "user-1", email: "alice@acme.test" },
+          },
+        ],
+        isLoading: false,
+      } as any);
+
+      const user = userEvent.setup();
+      const { container } = render(<AsyncRequests />, {
+        wrapper: createWrapper(),
+      });
+
+      await user.click(
+        within(container).getByRole("combobox", {
+          name: /filter by member/i,
+        }),
+      );
+      await user.click(await screen.findByText("alice@acme.test"));
+
+      const lastCall = vi
+        .mocked(hooks.useAsyncRequests)
+        .mock.calls.at(-1)?.[0];
+      expect(lastCall?.member_id).toBe("user-1");
+    });
   });
 });
