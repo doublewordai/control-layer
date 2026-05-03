@@ -339,26 +339,48 @@ export function Onboarding() {
   // `batches.enabled` / `batches.async_requests.enabled`. If the resolved
   // route isn't accessible on this deployment we fall back to /models so
   // ProtectedRoute doesn't bounce the user mid-redirect.
+  //
+  // This is exposed for rendering the success-strip copy. The actual
+  // navigation reads from a ref captured at success-time (see below) so
+  // the redirect can't be lost when this value's identity churns
+  // (workloadType toggle, canAccessRoute refetch race, etc.) during the
+  // 2s redirect window.
   const browserSuccessRoute = useMemo(() => {
     const preferred = workloadType === "batch" ? "/batches" : "/async";
     return canAccessRoute(preferred) ? preferred : "/models";
   }, [workloadType, canAccessRoute]);
+
+  // Pinned destination for the auto-redirect timer. Updated on every
+  // render so the trigger effect can capture the latest value at the
+  // moment success fires, without having browserSuccessRoute as a dep
+  // (which would cause cleanup-then-skip races that lose the redirect).
+  const pendingRedirectRouteRef = useRef<string>("/models");
+  pendingRedirectRouteRef.current =
+    runState === "success" ? browserSuccessRoute : "/models";
 
   // Auto-redirect after success in both browser and CLI modes. The CLI
   // listener path doesn't run an actual workload (it's a "click to
   // continue" simulation), so we keep that path on /models — there's no
   // job for the user to view. The browser run-now path goes to the
   // job-specific route.
+  //
+  // Deps are deliberately limited to the success triggers and `navigate`
+  // (stable in practice). browserSuccessRoute is intentionally NOT a dep:
+  // including it caused a lost-redirect bug where toggling workloadType
+  // (or any churn in canAccessRoute) during the 2s window cleared the
+  // pending timer and the re-run of the effect short-circuited on the
+  // idempotency ref.
   useEffect(() => {
     const succeeded =
       runState === "success" || listenerState === "success";
     if (!succeeded || redirectScheduledRef.current) return;
     redirectScheduledRef.current = true;
-    const destination =
-      runState === "success" ? browserSuccessRoute : "/models";
-    const timer = setTimeout(() => navigate(destination), SUCCESS_REDIRECT_DELAY_MS);
+    const timer = setTimeout(
+      () => navigate(pendingRedirectRouteRef.current),
+      SUCCESS_REDIRECT_DELAY_MS,
+    );
     return () => clearTimeout(timer);
-  }, [runState, listenerState, browserSuccessRoute, navigate]);
+  }, [runState, listenerState, navigate]);
 
   // Visible code samples always render against the display alias so the UI
   // is never blank; outbound requests use runnableModelAlias and bail out
