@@ -29,6 +29,7 @@ import {
   useUser,
 } from "@/api/control-layer/hooks";
 import { copyToClipboard as copyToClipboardUtil } from "@/utils/clipboard";
+import { useAuthorization } from "@/utils/authorization";
 import { AppSidebar } from "../../../layout/Sidebar/AppSidebar";
 
 // Webhook used by the "invite a teammate" form. Configured per-environment
@@ -39,11 +40,13 @@ import { AppSidebar } from "../../../layout/Sidebar/AppSidebar";
 const INVITE_WEBHOOK_URL: string | undefined =
   import.meta.env.VITE_INVITE_WEBHOOK_URL;
 
-// Default catalog model used in the visible code samples. We swap this with the
-// first available chat model alias from the user's catalog when one is found,
-// but keep medgemma-4b as a fallback so the snippet always renders something
-// concrete even before /models loads.
-const FALLBACK_MODEL_ALIAS = "medgemma-4b";
+// Placeholder shown in the rendered code samples ONLY while the catalog
+// query is in flight or empty. Deliberately not a real model alias so it
+// can't be mistaken for one and so the visible payload never references a
+// model the user might or might not be entitled to. Outbound requests are
+// blocked entirely until a real catalog-resolved alias is available — see
+// `runnableModelAlias` and the disabled state on the Run Now button.
+const PLACEHOLDER_MODEL_ALIAS = "<your-model-alias>";
 
 const SUCCESS_REDIRECT_DELAY_MS = 2000;
 const RUN_NOW_SIMULATED_DELAY_MS = 2500;
@@ -182,6 +185,7 @@ export function Onboarding() {
   const navigate = useNavigate();
   const { isAuthenticated, isLoading: authLoading } = useAuth();
   const { data: currentUser } = useUser("current");
+  const { canAccessRoute } = useAuthorization();
 
   const [apiKey, setApiKey] = useState<string | null>(null);
   const [apiKeyError, setApiKeyError] = useState<string | null>(null);
@@ -208,17 +212,26 @@ export function Onboarding() {
   const createBatch = useCreateBatch();
   const uploadFile = useUploadFileWithProgress();
 
-  // Pull the first chat model alias from the catalog so the rendered code
-  // samples reference something that will actually work for the user. Falls
-  // back to a hard-coded alias when the catalog query is still loading or
-  // empty.
-  const { data: modelsData } = useModels({ accessible: true, limit: 50 });
-  const modelAlias = useMemo(() => {
+  // Pull the first accessible chat model alias from the catalog. Outbound
+  // requests are gated on this resolving to a concrete value; the rendered
+  // payload uses an obviously-non-runnable placeholder until then so the
+  // visible payload can never reference a model the backend isn't being
+  // asked to run.
+  const { data: modelsData, isLoading: modelsLoading } = useModels({
+    accessible: true,
+    limit: 50,
+  });
+  const runnableModelAlias = useMemo<string | undefined>(() => {
     const chat = modelsData?.data?.find(
       (m) => (m.model_type ?? "CHAT") === "CHAT",
     );
-    return chat?.alias ?? FALLBACK_MODEL_ALIAS;
+    return chat?.alias;
   }, [modelsData]);
+  // Single alias used for both rendering and outbound requests when
+  // available; otherwise an obviously-non-runnable placeholder for the UI
+  // (and the Run Now button is disabled, see below). This collapse ensures
+  // the visible payload and the outbound payload can never diverge.
+  const displayModelAlias = runnableModelAlias ?? PLACEHOLDER_MODEL_ALIAS;
 
   // Mint a live API key on mount so step 1 has something concrete to show.
   // We only do this once per visit and only when the user is authenticated.
@@ -250,14 +263,20 @@ export function Onboarding() {
       });
   }, [authLoading, isAuthenticated, currentUser, createApiKey]);
 
-  // Fire the "Hello World" sample batch in the background on mount. This is
-  // best-effort: if the catalog has no chat model or the upload fails, we
-  // swallow the error and just hide the toast. The toast is shown
-  // optimistically so the user sees activity even if the model catalog is
-  // slow to load.
+  // Fire the "Hello World" sample batch in the background once we know
+  // which model to send it to. We wait for the catalog query so the
+  // outbound payload uses the same alias the visible code samples render.
+  // If the catalog has no accessible chat model we skip the background
+  // batch and the toast entirely — there's no plausible model to demo
+  // with, and a doomed POST would just spam the console.
   useEffect(() => {
     if (sampleBatchRequestedRef.current) return;
     if (authLoading || !isAuthenticated) return;
+    if (modelsLoading) return;
+    if (!runnableModelAlias) {
+      sampleBatchRequestedRef.current = true;
+      return;
+    }
     sampleBatchRequestedRef.current = true;
 
     toast("Sample Batch Started", {
@@ -267,12 +286,19 @@ export function Onboarding() {
       icon: <Sparkles className="w-4 h-4 text-doubleword-primary" />,
     });
 
+    const aliasForRequest = runnableModelAlias;
     void (async () => {
       try {
-        // Wait one tick for the models query to resolve. If it hasn't, the
-        // fallback alias is fine — the batch creation will just fail silently
-        // server-side which is acceptable for this background "demo" job.
-        const helloPayload = `{"custom_id": "hello-1", "method": "POST", "url": "/v1/chat/completions", "body": {"model": "${modelAlias}", "messages": [{"role": "user", "content": "Say hello."}]}}\n`;
+        const helloRow = {
+          custom_id: "hello-1",
+          method: "POST",
+          url: "/v1/chat/completions",
+          body: {
+            model: aliasForRequest,
+            messages: [{ role: "user", content: "Say hello." }],
+          },
+        };
+        const helloPayload = `${JSON.stringify(helloRow)}\n`;
         const blob = new Blob([helloPayload], { type: "application/jsonl" });
         const file = new File([blob], `onboarding-hello-${Date.now()}.jsonl`, {
           type: "application/jsonl",
@@ -292,34 +318,82 @@ export function Onboarding() {
         console.warn("Background Hello World batch failed:", err);
       }
     })();
-    // We intentionally only run this once after auth is resolved; modelAlias
-    // is read inside the IIFE so we don't need it as a dep.
+    // The other deps are mutation handles that are stable across renders;
+    // re-running the effect when their identities churn would re-fire the
+    // batch on every render. The idempotency ref above is the single source
+    // of truth.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [authLoading, isAuthenticated]);
+  }, [authLoading, isAuthenticated, modelsLoading, runnableModelAlias]);
 
+  // "Skip to Dashboard" header button always lands on /models per the spec.
   const goToDashboard = useCallback(() => {
     navigate("/models");
   }, [navigate]);
 
-  // Auto-redirect after success in both browser and CLI modes.
+  // Where to land the user after they successfully run a workload from the
+  // browser tab. We send them to the route that will show the job they just
+  // queued (/async for async tier, /batches for batch tier) so they see
+  // their output instead of a generic models list.
+  //
+  // Both routes share the `batches` permission and are config-gated by
+  // `batches.enabled` / `batches.async_requests.enabled`. If the resolved
+  // route isn't accessible on this deployment we fall back to /models so
+  // ProtectedRoute doesn't bounce the user mid-redirect.
+  //
+  // This is exposed for rendering the success-strip copy. The actual
+  // navigation reads from a ref captured at success-time (see below) so
+  // the redirect can't be lost when this value's identity churns
+  // (workloadType toggle, canAccessRoute refetch race, etc.) during the
+  // 2s redirect window.
+  const browserSuccessRoute = useMemo(() => {
+    const preferred = workloadType === "batch" ? "/batches" : "/async";
+    return canAccessRoute(preferred) ? preferred : "/models";
+  }, [workloadType, canAccessRoute]);
+
+  // Pinned destination for the auto-redirect timer. Updated on every
+  // render so the trigger effect can capture the latest value at the
+  // moment success fires, without having browserSuccessRoute as a dep
+  // (which would cause cleanup-then-skip races that lose the redirect).
+  const pendingRedirectRouteRef = useRef<string>("/models");
+  pendingRedirectRouteRef.current =
+    runState === "success" ? browserSuccessRoute : "/models";
+
+  // Auto-redirect after success in both browser and CLI modes. The CLI
+  // listener path doesn't run an actual workload (it's a "click to
+  // continue" simulation), so we keep that path on /models — there's no
+  // job for the user to view. The browser run-now path goes to the
+  // job-specific route.
+  //
+  // Deps are deliberately limited to the success triggers and `navigate`
+  // (stable in practice). browserSuccessRoute is intentionally NOT a dep:
+  // including it caused a lost-redirect bug where toggling workloadType
+  // (or any churn in canAccessRoute) during the 2s window cleared the
+  // pending timer and the re-run of the effect short-circuited on the
+  // idempotency ref.
   useEffect(() => {
     const succeeded =
       runState === "success" || listenerState === "success";
     if (!succeeded || redirectScheduledRef.current) return;
     redirectScheduledRef.current = true;
-    const timer = setTimeout(goToDashboard, SUCCESS_REDIRECT_DELAY_MS);
+    const timer = setTimeout(
+      () => navigate(pendingRedirectRouteRef.current),
+      SUCCESS_REDIRECT_DELAY_MS,
+    );
     return () => clearTimeout(timer);
-  }, [runState, listenerState, goToDashboard]);
+  }, [runState, listenerState, navigate]);
 
+  // Visible code samples always render against the display alias so the UI
+  // is never blank; outbound requests use runnableModelAlias and bail out
+  // when undefined.
   const snippets = useMemo(
-    () => buildSnippets(apiKey ?? "<your-api-key>", modelAlias),
-    [apiKey, modelAlias],
+    () => buildSnippets(apiKey ?? "<your-api-key>", displayModelAlias),
+    [apiKey, displayModelAlias],
   );
 
   const browserPayload =
     workloadType === "batch"
-      ? buildJsonlPayload(modelAlias)
-      : buildAsyncPayload(modelAlias);
+      ? buildJsonlPayload(displayModelAlias)
+      : buildAsyncPayload(displayModelAlias);
   const cliSnippet = snippets[workloadType][language];
 
   const handleCopyKey = async () => {
@@ -342,6 +416,14 @@ export function Onboarding() {
 
   const handleRunNow = async () => {
     if (runState !== "idle") return;
+    // The button is disabled without a runnable alias; this guard is
+    // defensive in case the disabled prop is bypassed (e.g. via assistive
+    // tech or a stale render). We deliberately don't kick the simulated
+    // success state in that case — silently succeeding without a real
+    // request would re-introduce the visible-vs-actual divergence we just
+    // fixed.
+    const aliasForRequest = runnableModelAlias;
+    if (!aliasForRequest) return;
     setRunState("running");
 
     // Fire the real batch creation in the background. We don't surface its
@@ -358,12 +440,12 @@ export function Onboarding() {
         // still flipped the UI to "success".
         const payload =
           workloadType === "batch"
-            ? buildJsonlPayload(modelAlias)
+            ? buildJsonlPayload(aliasForRequest)
             : `${JSON.stringify({
                 custom_id: "row-1",
                 method: "POST",
                 url: "/v1/chat/completions",
-                body: buildAsyncPayloadObject(modelAlias),
+                body: buildAsyncPayloadObject(aliasForRequest),
               })}\n`;
         const blob = new Blob([payload], { type: "application/jsonl" });
         const file = new File(
@@ -656,7 +738,12 @@ export function Onboarding() {
                       </div>
                       <Button
                         onClick={handleRunNow}
-                        disabled={runState !== "idle"}
+                        disabled={runState !== "idle" || !runnableModelAlias}
+                        title={
+                          !runnableModelAlias
+                            ? "Loading available models…"
+                            : undefined
+                        }
                         className={`w-full whitespace-nowrap sm:w-auto ${
                           runState === "running"
                             ? "bg-amber-100 text-amber-700 hover:bg-amber-100"
@@ -700,8 +787,11 @@ export function Onboarding() {
                       <div className="flex items-center justify-between p-4">
                         <span className="flex items-center gap-2 text-sm font-medium text-emerald-800">
                           <Sparkles className="h-4 w-4" />
-                          Workload successfully received! Redirecting to
-                          dashboard…
+                          {browserSuccessRoute === "/batches"
+                            ? "Workload successfully received! Taking you to your batch…"
+                            : browserSuccessRoute === "/async"
+                              ? "Workload successfully received! Taking you to your async request…"
+                              : "Workload successfully received! Redirecting to dashboard…"}
                         </span>
                       </div>
                     </div>
