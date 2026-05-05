@@ -22,7 +22,7 @@ vi.mock("../../api/control-layer/hooks", () => ({
 vi.mock("../../api/control-layer/client", () => ({
   dwctlApi: {
     organizations: {
-      setActive: vi.fn().mockResolvedValue(undefined),
+      setActive: vi.fn().mockResolvedValue({ active_organization_id: null }),
     },
   },
 }));
@@ -49,9 +49,11 @@ describe("OrganizationProvider.setActiveOrganization", () => {
     const invalidateSpy = vi.spyOn(queryClient, "invalidateQueries");
 
     // Defer setActive so we can assert no invalidation has fired yet.
-    let resolveSetActive!: () => void;
+    let resolveSetActive!: (
+      value: import("../../api/control-layer/types").SetActiveOrganizationResponse,
+    ) => void;
     vi.mocked(dwctlApi.organizations.setActive).mockReturnValueOnce(
-      new Promise<void>((resolve) => {
+      new Promise((resolve) => {
         resolveSetActive = resolve;
       }),
     );
@@ -74,7 +76,7 @@ describe("OrganizationProvider.setActiveOrganization", () => {
     }
 
     await act(async () => {
-      resolveSetActive();
+      resolveSetActive({ active_organization_id: "org-1" });
       await switchPromise!;
     });
 
