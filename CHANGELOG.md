@@ -1,5 +1,17 @@
 # Changelog
 
+## [8.46.0](https://github.com/doublewordai/control-layer/compare/v8.45.0...v8.46.0) (2026-05-05)
+
+
+### Features
+
+* **webhooks:** allow org members read-only access to org webhooks ([#1043](https://github.com/doublewordai/control-layer/issues/1043)) ([4bf5b54](https://github.com/doublewordai/control-layer/commit/4bf5b54142b57d34bdf2456202f1db30d539461f))
+
+
+### Bug Fixes
+
+* **deps:** clear all 36 open Dependabot vulnerabilities ([#1045](https://github.com/doublewordai/control-layer/issues/1045)) ([fa79316](https://github.com/doublewordai/control-layer/commit/fa793161b73ae32432cd8a7d1e5f2ca0554469c2))
+
 ## [8.45.0](https://github.com/doublewordai/control-layer/compare/v8.44.3...v8.45.0) (2026-04-30)
 
 
