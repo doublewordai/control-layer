@@ -149,14 +149,25 @@ interface NotificationSettingsProps {
   showPlatformScope?: boolean;
   /** Whether the userId refers to an organization */
   isOrganization?: boolean;
+  /**
+   * Render webhook list as read-only — hides email & low-balance toggles
+   * and all webhook mutation controls. Used to let regular org members see
+   * the org's webhooks (and any delivery failures) without being able to
+   * change them.
+   */
+  readOnly?: boolean;
 }
 
 export const NotificationSettings: React.FC<NotificationSettingsProps> = ({
   userId,
   showPlatformScope = false,
   isOrganization = false,
+  readOnly = false,
 }) => {
-  const { data: user, refetch: refetchUser } = useUser(userId);
+  // Skip the user fetch in read-only mode — every consumer of `user` is in
+  // the email/low-balance section, which read-only callers don't render. Also
+  // avoids a needless 403 if a member lacks permission to read the org user.
+  const { data: user, refetch: refetchUser } = useUser(userId, { enabled: !readOnly });
   const updateUserMutation = useUpdateUser();
   const updateOrgMutation = useUpdateOrganization();
   const navigate = useNavigate();
@@ -355,9 +366,11 @@ export const NotificationSettings: React.FC<NotificationSettingsProps> = ({
     <>
       <div className="bg-white rounded-lg shadow-sm border border-gray-200 p-6">
         <h4 className="text-lg font-medium text-gray-900 mb-4">
-          Notifications
+          {readOnly ? "Webhooks" : "Notifications"}
         </h4>
 
+        {!readOnly && (
+          <>
         {/* Email Section */}
         <h5 className="text-sm font-medium text-gray-500 uppercase tracking-wide mb-3">
           Email
@@ -446,10 +459,15 @@ export const NotificationSettings: React.FC<NotificationSettingsProps> = ({
           </div>
         </div>
 
+          </>
+        )}
+
         {/* Webhooks Section */}
-        <h5 className="text-sm font-medium text-gray-500 uppercase tracking-wide mt-6 mb-3">
-          Webhooks
-        </h5>
+        {!readOnly && (
+          <h5 className="text-sm font-medium text-gray-500 uppercase tracking-wide mt-6 mb-3">
+            Webhooks
+          </h5>
+        )}
         <div>
           <div className="flex items-center justify-between mb-3">
             <div className="flex items-center gap-3">
@@ -458,19 +476,23 @@ export const NotificationSettings: React.FC<NotificationSettingsProps> = ({
               </div>
               <div>
                 <p className="text-xs text-gray-500">
-                  Receive HTTP callbacks when events occur
+                  {readOnly
+                    ? "HTTP callbacks sent when events occur. Contact an admin to make changes."
+                    : "Receive HTTP callbacks when events occur"}
                 </p>
               </div>
             </div>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={openCreateWebhookDialog}
-              aria-label="Add webhook"
-            >
-              <Plus className="w-3.5 h-3.5" />
-              Add Webhook
-            </Button>
+            {!readOnly && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={openCreateWebhookDialog}
+                aria-label="Add webhook"
+              >
+                <Plus className="w-3.5 h-3.5" />
+                Add Webhook
+              </Button>
+            )}
           </div>
 
           {/* Webhook List */}
@@ -541,53 +563,56 @@ export const NotificationSettings: React.FC<NotificationSettingsProps> = ({
                         )}
                       </div>
                     </div>
-                    <div className="flex items-center gap-1 shrink-0">
-                      <Switch
-                        checked={webhook.enabled}
-                        onCheckedChange={() =>
-                          handleWebhookToggle(webhook)
-                        }
-                        aria-label={`Toggle webhook ${webhook.url}`}
-                      />
-                      <Tooltip>
-                        <TooltipTrigger asChild>
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            className="h-7 w-7"
-                            onClick={() => openEditWebhookDialog(webhook)}
-                            aria-label={`Edit webhook ${webhook.url}`}
-                          >
-                            <Pencil className="w-3.5 h-3.5" />
-                          </Button>
-                        </TooltipTrigger>
-                        <TooltipContent>Edit webhook</TooltipContent>
-                      </Tooltip>
-                      <Tooltip>
-                        <TooltipTrigger asChild>
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            className="h-7 w-7 text-red-500 hover:text-red-700 hover:bg-red-50"
-                            onClick={() =>
-                              setDeletingWebhookId(webhook.id)
-                            }
-                            aria-label={`Delete webhook ${webhook.url}`}
-                          >
-                            <Trash2 className="w-3.5 h-3.5" />
-                          </Button>
-                        </TooltipTrigger>
-                        <TooltipContent>Delete webhook</TooltipContent>
-                      </Tooltip>
-                    </div>
+                    {!readOnly && (
+                      <div className="flex items-center gap-1 shrink-0">
+                        <Switch
+                          checked={webhook.enabled}
+                          onCheckedChange={() =>
+                            handleWebhookToggle(webhook)
+                          }
+                          aria-label={`Toggle webhook ${webhook.url}`}
+                        />
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              className="h-7 w-7"
+                              onClick={() => openEditWebhookDialog(webhook)}
+                              aria-label={`Edit webhook ${webhook.url}`}
+                            >
+                              <Pencil className="w-3.5 h-3.5" />
+                            </Button>
+                          </TooltipTrigger>
+                          <TooltipContent>Edit webhook</TooltipContent>
+                        </Tooltip>
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              className="h-7 w-7 text-red-500 hover:text-red-700 hover:bg-red-50"
+                              onClick={() =>
+                                setDeletingWebhookId(webhook.id)
+                              }
+                              aria-label={`Delete webhook ${webhook.url}`}
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </Button>
+                          </TooltipTrigger>
+                          <TooltipContent>Delete webhook</TooltipContent>
+                        </Tooltip>
+                      </div>
+                    )}
                   </div>
                 </div>
               ))}
             </div>
           ) : (
             <div className="text-sm text-gray-500 py-4 text-center border border-dashed border-gray-200 rounded-lg">
-              No webhooks configured. Add one to receive HTTP
-              notifications.
+              {readOnly
+                ? "No webhooks configured."
+                : "No webhooks configured. Add one to receive HTTP notifications."}
             </div>
           )}
         </div>
