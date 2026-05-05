@@ -164,7 +164,10 @@ export const NotificationSettings: React.FC<NotificationSettingsProps> = ({
   isOrganization = false,
   readOnly = false,
 }) => {
-  const { data: user, refetch: refetchUser } = useUser(userId);
+  // Skip the user fetch in read-only mode — every consumer of `user` is in
+  // the email/low-balance section, which read-only callers don't render. Also
+  // avoids a needless 403 if a member lacks permission to read the org user.
+  const { data: user, refetch: refetchUser } = useUser(userId, { enabled: !readOnly });
   const updateUserMutation = useUpdateUser();
   const updateOrgMutation = useUpdateOrganization();
   const navigate = useNavigate();

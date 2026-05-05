@@ -27,7 +27,7 @@ use crate::{
     path = "/users/{user_id}/webhooks",
     tag = "webhooks",
     summary = "List webhooks",
-    description = "List all webhooks for a user. Users can list their own webhooks; admins can list any user's webhooks.",
+    description = "List all webhooks for a user. Users can list their own webhooks; admins can list any user's webhooks; members of an organization can list webhooks owned by that organization (read-only).",
     params(
         ("user_id" = uuid::Uuid, Path, description = "User ID"),
     ),
@@ -54,7 +54,13 @@ pub async fn list_webhooks<P: PoolProvider>(
         UserIdOrCurrent::Id(id) => id,
     };
 
-    // Check permissions: can read all webhooks OR read own webhooks
+    // Allowed if any of:
+    //  - admin permission (ReadAll)
+    //  - reading own webhooks (ReadOwn)
+    //  - target is an organization the caller belongs to (any role) — read-only
+    //    access for org members, so they can spot delivery failures and notify
+    //    admins. Mutating handlers stay restricted to owner/admin via
+    //    can_manage_org_resource.
     let can_read_all = permissions::has_permission(&current_user, Resource::Webhooks, Operation::ReadAll);
     let can_read_own =
         target_user_id == current_user.id && permissions::has_permission(&current_user, Resource::Webhooks, Operation::ReadOwn);
@@ -222,7 +228,7 @@ pub async fn create_webhook<P: PoolProvider>(
     path = "/users/{user_id}/webhooks/{webhook_id}",
     tag = "webhooks",
     summary = "Get webhook",
-    description = "Get a specific webhook. Secret is not included in the response.",
+    description = "Get a specific webhook. Users can read their own webhooks; admins can read any user's webhooks; members of an organization can read webhooks owned by that organization (read-only). Secret is not included in the response.",
     params(
         ("user_id" = uuid::Uuid, Path, description = "User ID"),
         ("webhook_id" = uuid::Uuid, Path, description = "Webhook ID"),
@@ -251,7 +257,8 @@ pub async fn get_webhook<P: PoolProvider>(
         UserIdOrCurrent::Id(id) => id,
     };
 
-    // Check permissions
+    // Same authorization model as list_webhooks: admin (ReadAll), owner
+    // (ReadOwn), or member of the target organization (read-only).
     let can_read_all = permissions::has_permission(&current_user, Resource::Webhooks, Operation::ReadAll);
     let can_read_own =
         target_user_id == current_user.id && permissions::has_permission(&current_user, Resource::Webhooks, Operation::ReadOwn);
