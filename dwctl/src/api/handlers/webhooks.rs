@@ -61,10 +61,10 @@ pub async fn list_webhooks<P: PoolProvider>(
 
     if !can_read_all && !can_read_own {
         let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
-        let can_org = permissions::can_manage_org_resource(&current_user, target_user_id, &mut conn)
+        let is_member = permissions::is_org_member(&current_user, target_user_id, &mut conn)
             .await
             .map_err(Error::Database)?;
-        if !can_org {
+        if !is_member {
             return Err(Error::InsufficientPermissions {
                 required: Permission::Any(vec![
                     Permission::Allow(Resource::Webhooks, Operation::ReadAll),
@@ -258,10 +258,10 @@ pub async fn get_webhook<P: PoolProvider>(
 
     if !can_read_all && !can_read_own {
         let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
-        let can_org = permissions::can_manage_org_resource(&current_user, target_user_id, &mut conn)
+        let is_member = permissions::is_org_member(&current_user, target_user_id, &mut conn)
             .await
             .map_err(Error::Database)?;
-        if !can_org {
+        if !is_member {
             return Err(Error::InsufficientPermissions {
                 required: Permission::Any(vec![
                     Permission::Allow(Resource::Webhooks, Operation::ReadAll),
@@ -858,5 +858,204 @@ mod tests {
             .await;
 
         response.assert_status_ok();
+    }
+
+    // ── Read-only org member webhook access ────────────────────────────────
+    //
+    // Members of an org (any role, including plain "member") can list and read
+    // the org's webhooks so they can spot delivery failures and notify admins,
+    // but they cannot mutate them.
+
+    /// Helper: create a webhook for an org via the API as the owner, returning
+    /// the created webhook (with secret).
+    async fn create_org_webhook(
+        app: &axum_test::TestServer,
+        owner: &crate::api::models::users::UserResponse,
+        org_id: UserId,
+        url: &str,
+    ) -> WebhookWithSecretResponse {
+        let response = app
+            .post(&format!("/admin/api/v1/users/{}/webhooks", org_id))
+            .add_header(&add_auth_headers(owner)[0].0, &add_auth_headers(owner)[0].1)
+            .add_header(&add_auth_headers(owner)[1].0, &add_auth_headers(owner)[1].1)
+            .json(&json!({ "url": url }))
+            .await;
+        response.assert_status(StatusCode::CREATED);
+        response.json()
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_org_member_can_list_org_webhooks_without_secrets(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let alice = create_test_user(&pool, Role::StandardUser).await;
+        let bob = create_test_user(&pool, Role::StandardUser).await;
+        let org = create_test_org(&pool, alice.id).await;
+        add_org_member(&pool, org.id, bob.id, "member").await;
+
+        create_org_webhook(&app, &alice, org.id, "https://example.com/hook").await;
+
+        // Bob (plain member) lists the org's webhooks
+        let response = app
+            .get(&format!("/admin/api/v1/users/{}/webhooks", org.id))
+            .add_header(&add_auth_headers(&bob)[0].0, &add_auth_headers(&bob)[0].1)
+            .add_header(&add_auth_headers(&bob)[1].0, &add_auth_headers(&bob)[1].1)
+            .await;
+
+        response.assert_status_ok();
+        let webhooks: Vec<WebhookResponse> = response.json();
+        assert_eq!(webhooks.len(), 1);
+        assert_eq!(webhooks[0].url, "https://example.com/hook");
+
+        // Secrets must never appear in member-visible responses. WebhookResponse
+        // has no `secret` field, but check the raw JSON too as a belt-and-braces
+        // guard against future struct changes.
+        let raw: serde_json::Value = response.json();
+        let item = &raw.as_array().unwrap()[0];
+        assert!(item.get("secret").is_none(), "list response must not include secret");
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_org_member_can_get_single_org_webhook(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let alice = create_test_user(&pool, Role::StandardUser).await;
+        let bob = create_test_user(&pool, Role::StandardUser).await;
+        let org = create_test_org(&pool, alice.id).await;
+        add_org_member(&pool, org.id, bob.id, "member").await;
+
+        let created = create_org_webhook(&app, &alice, org.id, "https://example.com/hook").await;
+
+        let response = app
+            .get(&format!("/admin/api/v1/users/{}/webhooks/{}", org.id, created.id))
+            .add_header(&add_auth_headers(&bob)[0].0, &add_auth_headers(&bob)[0].1)
+            .add_header(&add_auth_headers(&bob)[1].0, &add_auth_headers(&bob)[1].1)
+            .await;
+
+        response.assert_status_ok();
+        let raw: serde_json::Value = response.json();
+        assert!(raw.get("secret").is_none(), "get response must not include secret");
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_non_member_cannot_list_org_webhooks(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let alice = create_test_user(&pool, Role::StandardUser).await;
+        let outsider = create_test_user(&pool, Role::StandardUser).await;
+        let org = create_test_org(&pool, alice.id).await;
+
+        create_org_webhook(&app, &alice, org.id, "https://example.com/hook").await;
+
+        let response = app
+            .get(&format!("/admin/api/v1/users/{}/webhooks", org.id))
+            .add_header(&add_auth_headers(&outsider)[0].0, &add_auth_headers(&outsider)[0].1)
+            .add_header(&add_auth_headers(&outsider)[1].0, &add_auth_headers(&outsider)[1].1)
+            .await;
+
+        response.assert_status_forbidden();
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_org_member_cannot_create_org_webhook(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let alice = create_test_user(&pool, Role::StandardUser).await;
+        let bob = create_test_user(&pool, Role::StandardUser).await;
+        let org = create_test_org(&pool, alice.id).await;
+        add_org_member(&pool, org.id, bob.id, "member").await;
+
+        let response = app
+            .post(&format!("/admin/api/v1/users/{}/webhooks", org.id))
+            .add_header(&add_auth_headers(&bob)[0].0, &add_auth_headers(&bob)[0].1)
+            .add_header(&add_auth_headers(&bob)[1].0, &add_auth_headers(&bob)[1].1)
+            .json(&json!({ "url": "https://example.com/hook" }))
+            .await;
+
+        response.assert_status_forbidden();
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_org_member_cannot_update_org_webhook(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let alice = create_test_user(&pool, Role::StandardUser).await;
+        let bob = create_test_user(&pool, Role::StandardUser).await;
+        let org = create_test_org(&pool, alice.id).await;
+        add_org_member(&pool, org.id, bob.id, "member").await;
+
+        let created = create_org_webhook(&app, &alice, org.id, "https://example.com/hook").await;
+
+        let response = app
+            .patch(&format!("/admin/api/v1/users/{}/webhooks/{}", org.id, created.id))
+            .add_header(&add_auth_headers(&bob)[0].0, &add_auth_headers(&bob)[0].1)
+            .add_header(&add_auth_headers(&bob)[1].0, &add_auth_headers(&bob)[1].1)
+            .json(&json!({ "enabled": false }))
+            .await;
+
+        response.assert_status_forbidden();
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_org_member_cannot_delete_org_webhook(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let alice = create_test_user(&pool, Role::StandardUser).await;
+        let bob = create_test_user(&pool, Role::StandardUser).await;
+        let org = create_test_org(&pool, alice.id).await;
+        add_org_member(&pool, org.id, bob.id, "member").await;
+
+        let created = create_org_webhook(&app, &alice, org.id, "https://example.com/hook").await;
+
+        let response = app
+            .delete(&format!("/admin/api/v1/users/{}/webhooks/{}", org.id, created.id))
+            .add_header(&add_auth_headers(&bob)[0].0, &add_auth_headers(&bob)[0].1)
+            .add_header(&add_auth_headers(&bob)[1].0, &add_auth_headers(&bob)[1].1)
+            .await;
+
+        response.assert_status_forbidden();
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_org_member_cannot_rotate_org_webhook_secret(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let alice = create_test_user(&pool, Role::StandardUser).await;
+        let bob = create_test_user(&pool, Role::StandardUser).await;
+        let org = create_test_org(&pool, alice.id).await;
+        add_org_member(&pool, org.id, bob.id, "member").await;
+
+        let created = create_org_webhook(&app, &alice, org.id, "https://example.com/hook").await;
+
+        let response = app
+            .post(&format!("/admin/api/v1/users/{}/webhooks/{}/rotate-secret", org.id, created.id))
+            .add_header(&add_auth_headers(&bob)[0].0, &add_auth_headers(&bob)[0].1)
+            .add_header(&add_auth_headers(&bob)[1].0, &add_auth_headers(&bob)[1].1)
+            .await;
+
+        response.assert_status_forbidden();
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_org_admin_can_still_manage_webhooks(pool: PgPool) {
+        // Regression guard: existing owner/admin write path must keep working
+        // after we relaxed the read-permission fallback from can_manage_org_resource
+        // (owner/admin only) to is_org_member (any role).
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let alice = create_test_user(&pool, Role::StandardUser).await;
+        let bob = create_test_user(&pool, Role::StandardUser).await;
+        let org = create_test_org(&pool, alice.id).await;
+        add_org_member(&pool, org.id, bob.id, "admin").await;
+
+        // Bob (org admin) creates a webhook for the org.
+        let response = app
+            .post(&format!("/admin/api/v1/users/{}/webhooks", org.id))
+            .add_header(&add_auth_headers(&bob)[0].0, &add_auth_headers(&bob)[0].1)
+            .add_header(&add_auth_headers(&bob)[1].0, &add_auth_headers(&bob)[1].1)
+            .json(&json!({ "url": "https://example.com/hook" }))
+            .await;
+
+        response.assert_status(StatusCode::CREATED);
     }
 }
