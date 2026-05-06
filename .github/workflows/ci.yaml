@@ -365,7 +365,14 @@ jobs:
         run: npx playwright install chromium --only-shell
 
       - name: Install hurl
+        # Pinned: hurl 8.0.0 (2026-04-27) ships an RFC 9535 JSONPath rewrite
+        # that breaks our existing `count` / `nth` patterns on filter results
+        # that yield 0 or 1 items (see tests/perms/{models,users,requests,
+        # transactions}.hurl and tests/authenticated/admin-crud-group.hurl).
+        # Hold at 7.x until the assertions are migrated to RFC 9535 semantics.
         uses: gacts/install-hurl@v1
+        with:
+          version: 7.1.0
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v4

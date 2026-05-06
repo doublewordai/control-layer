@@ -965,6 +965,7 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
           setApiExamplesModel(null);
         }}
         model={apiExamplesModel}
+        defaultTab="realtime"
       />
 
     </>

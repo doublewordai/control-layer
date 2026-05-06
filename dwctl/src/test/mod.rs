@@ -1,5 +1,7 @@
 pub mod databases;
+pub mod multi_step_executor;
 pub mod responses;
+pub mod sigterm_drain;
 pub mod sla;
 pub mod strict_mode;
 pub mod utils;
@@ -344,69 +346,18 @@ async fn test_e2e_ai_proxy_streaming_completions_with_fusillade_header(pool: PgP
     cleanup_fixture(fixture).await;
 }
 
-#[sqlx::test]
-#[test_log::test]
-async fn test_e2e_ai_proxy_streaming_responses_with_fusillade_header(pool: PgPool) {
-    let mock_server = wiremock::MockServer::start().await;
-    let response_json = serde_json::json!({
-        "id": "resp-123",
-        "object": "response",
-        "created_at": 1677652288,
-        "status": "completed",
-        "model": "gpt-4o",
-        "output": [],
-        "usage": {
-            "input_tokens": 15,
-            "output_tokens": 25,
-            "total_tokens": 40,
-            "input_tokens_details": { "cached_tokens": 0 },
-            "output_tokens_details": { "reasoning_tokens": 0 }
-        }
-    });
-    let sse_response = format!(
-        "data: {{\"type\":\"response.output_text.delta\",\"sequence_number\":1,\"item_id\":\"item_1\",\"output_index\":0,\"content_index\":0,\"delta\":\"Hello from responses\"}}\n\ndata: {{\"type\":\"response.completed\",\"sequence_number\":5,\"response\":{response_json}}}\n\n"
-    );
-
-    wiremock::Mock::given(method("POST"))
-        .and(path("/responses"))
-        .and(body_partial_json(serde_json::json!({
-            "stream": true
-        })))
-        .respond_with(
-            wiremock::ResponseTemplate::new(200)
-                .insert_header("content-type", "text/event-stream")
-                .insert_header("cache-control", "no-cache")
-                .set_body_raw(sse_response.clone(), "text/event-stream"),
-        )
-        .mount(&mock_server)
-        .await;
-
-    let fixture = setup_streaming_fixture(&pool, mock_server.uri(), "gpt-4o", "test-model", Some(false)).await;
-
-    let inference_response = fixture
-        .server
-        .post("/ai/v1/responses")
-        .add_header("authorization", format!("Bearer {}", fixture.api_key))
-        .add_header("x-fusillade-stream", "true")
-        .json(&serde_json::json!({
-            "model": "test-model",
-            "input": "Hello from E2E test"
-        }))
-        .await;
-
-    if inference_response.status_code().as_u16() != 200 {
-        let received = mock_server.received_requests().await.unwrap_or_default();
-        panic!(
-            "Responses streaming request failed with status {}. Mock received: {:?}",
-            inference_response.status_code().as_u16(),
-            received
-        );
-    }
-    assert_eq!(inference_response.status_code().as_u16(), 200);
-    assert_eq!(inference_response.text(), sse_response);
-    assert_usage_recorded(&fixture, "http://localhost/responses", 15, 25).await;
-    cleanup_fixture(fixture).await;
-}
+// Removed: `test_e2e_ai_proxy_streaming_responses_with_fusillade_header`.
+//
+// The original test proxied a streaming `/v1/responses` request to a
+// wiremock that returned an SSE response and asserted the proxied
+// stream made it through unchanged. Since commit `6a7c24d7`,
+// `/v1/responses` doesn't proxy — it engages the multi-step warm
+// path which builds chat-completions payloads itself and fires per-
+// step model_calls over an HTTP loopback (unreachable from the
+// axum_test in-memory transport). Streaming coverage of the warm
+// path's SSE event sink lives in `responses::streaming`'s unit tests
+// and the `multi_step_executor` integration test; an e2e proxy test
+// for `/v1/responses` would need a real loopback listener.
 
 /// End-to-end test: Traffic routing rules are enforced by onwards after sync.
 /// Covers three scenarios: baseline allow, deny by purpose, and redirect by purpose.

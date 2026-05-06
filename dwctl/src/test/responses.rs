@@ -277,71 +277,144 @@ async fn test_blocking_response_id_matches_fusillade_id(pool: PgPool) {
     assert!(found, "Response should be retrievable by the client-facing ID");
 }
 
-/// Test that POST /v1/responses with service_tier=priority (via adapter) creates a retrievable row.
+/// A multi-step `/v1/responses` chain — head model_call, server-side
+/// tool_call, summarizing model_call — assembles into the OpenAI
+/// Response shape and retrieves cleanly via GET /v1/responses/{id}.
+///
+/// The warm path runs the loop in-process and fires per-step model_calls
+/// over HTTP loopback, which the axum_test in-memory transport doesn't
+/// expose — so we drive the bridge primitives directly from the test.
+/// Same code path the loop drives in production (record_step →
+/// complete_step → finalize_head_request → get_response), just without
+/// the loop wrapper. End-to-end POST→GET coverage of the warm path
+/// itself lives under the loopback-listener integration suite (out of
+/// scope for unit tests).
 #[sqlx::test]
 #[test_log::test]
-async fn test_responses_api_creates_retrievable_response(pool: PgPool) {
-    let mock_server = wiremock::MockServer::start().await;
-    mount_chat_completions_mock(&mock_server).await;
+async fn test_multi_step_chain_assembles_and_is_retrievable_via_get(pool: PgPool) {
+    use crate::responses::store::{FusilladeResponseStore, PendingResponseInput};
+    use crate::test::utils::setup_fusillade_pool;
+    use fusillade::{PostgresRequestManager, PostgresResponseStepManager, ReqwestHttpClient, TestDbPools};
+    use onwards::{MultiStepStore, StepDescriptor, StepKind as OnwardsStepKind};
+    use serde_json::json;
+    use std::sync::Arc;
 
-    let (server, api_key, _bg) = setup_ai_test(pool.clone(), &mock_server, true).await;
+    let pool = setup_fusillade_pool(&pool).await;
+    let test_pools = TestDbPools::new(pool).await.unwrap();
+    let request_manager = Arc::new(PostgresRequestManager::<_, ReqwestHttpClient>::new(
+        test_pools.clone(),
+        Default::default(),
+    ));
+    let step_manager = Arc::new(PostgresResponseStepManager::new(test_pools));
+    let store = FusilladeResponseStore::new(request_manager).with_step_manager(step_manager);
 
-    // Make a responses API request with priority tier (adapter mode, realtime)
-    let response = server
-        .post("/ai/v1/responses")
-        .add_header("Authorization", &format!("Bearer {}", api_key))
-        .add_header("Content-Type", "application/json")
-        .json(&serde_json::json!({
+    // Stand in for warm_path_setup — register the user request body
+    // and reserve a head step uuid as the response identity.
+    let head_uuid = store.register_pending(PendingResponseInput {
+        body: json!({"model": "gpt-4o", "input": "weather in Paris?"}).to_string(),
+        api_key: None,
+        created_by: Some("test-user".to_string()),
+        base_url: "http://upstream-mock".to_string(),
+    });
+    let request_id = head_uuid.to_string();
+
+    // Step 1: head model_call returns a tool_call.
+    let head_descriptor = StepDescriptor {
+        kind: OnwardsStepKind::ModelCall,
+        request_payload: json!({
             "model": "gpt-4o",
-            "input": "Hello from responses API",
-            "service_tier": "priority"
-        }))
-        .await;
+            "messages": [{"role":"user","content":"weather in Paris?"}],
+        }),
+    };
+    let head = MultiStepStore::record_step(&store, &request_id, None, None, &head_descriptor)
+        .await
+        .unwrap();
+    MultiStepStore::mark_step_processing(&store, &head.id).await.unwrap();
+    MultiStepStore::complete_step(
+        &store,
+        &head.id,
+        &json!({
+            "choices": [{
+                "message": {
+                    "role":"assistant",
+                    "tool_calls":[{
+                        "id":"call_1",
+                        "type":"function",
+                        "function":{"name":"get_weather","arguments":"{\"city\":\"Paris\"}"}
+                    }]
+                },
+                "finish_reason":"tool_calls"
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+        }),
+    )
+    .await
+    .unwrap();
 
-    assert_eq!(response.status_code(), 200, "Responses API request should succeed");
-
-    // Poll until the outlet handler completes the row
-    let start = std::time::Instant::now();
-    let mut id = uuid::Uuid::nil();
-    let mut final_state = String::new();
-    while start.elapsed() < std::time::Duration::from_secs(5) {
-        // Note: in fusillade's request_templates table, the `endpoint` column
-        // stores the loopback base URL (e.g. http://localhost:.../ai) and the
-        // `path` column stores the API route (e.g. /v1/responses). Filter on
-        // `path`, not `endpoint`.
-        let row = sqlx::query(
-            "SELECT r.id, r.state, r.batch_id FROM fusillade.requests r \
-             JOIN fusillade.request_templates t ON r.template_id = t.id \
-             WHERE t.path LIKE '%responses%' \
-             ORDER BY r.created_at DESC LIMIT 1",
-        )
-        .fetch_optional(&pool)
+    // Step 2: tool_call (server-side dispatch).
+    let tool_descriptor = StepDescriptor {
+        kind: OnwardsStepKind::ToolCall,
+        request_payload: json!({"name":"get_weather","args":{"city":"Paris"},"call_id":"call_1"}),
+    };
+    let tool = MultiStepStore::record_step(&store, &request_id, None, Some(&head.id), &tool_descriptor)
+        .await
+        .unwrap();
+    MultiStepStore::mark_step_processing(&store, &tool.id).await.unwrap();
+    MultiStepStore::complete_step(&store, &tool.id, &json!({"temp_c": 18, "condition": "cloudy"}))
         .await
         .unwrap();
 
-        if let Some(row) = row {
-            id = sqlx::Row::get(&row, "id");
-            final_state = sqlx::Row::get::<String, _>(&row, "state");
-            let batch_id: Option<uuid::Uuid> = sqlx::Row::get(&row, "batch_id");
-            assert!(batch_id.is_some(), "Realtime request should be tracked via a single-request batch");
-            if final_state == "completed" {
-                break;
-            }
-        }
-        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-    }
-    assert_eq!(final_state, "completed");
+    // Step 3: summarizing model_call returns final assistant text.
+    let summary_descriptor = StepDescriptor {
+        kind: OnwardsStepKind::ModelCall,
+        request_payload: json!({
+            "model": "gpt-4o",
+            "messages": [
+                {"role":"user","content":"weather in Paris?"},
+                {"role":"tool","tool_call_id":"call_1","content":"{\"temp_c\":18}"},
+            ],
+        }),
+    };
+    let summary = MultiStepStore::record_step(&store, &request_id, None, Some(&tool.id), &summary_descriptor)
+        .await
+        .unwrap();
+    MultiStepStore::mark_step_processing(&store, &summary.id).await.unwrap();
+    MultiStepStore::complete_step(
+        &store,
+        &summary.id,
+        &json!({
+            "choices": [{
+                "message": {"role":"assistant","content":"It's 18°C and cloudy in Paris."},
+                "finish_reason":"stop"
+            }],
+            "usage": {"prompt_tokens": 12, "completion_tokens": 8},
+        }),
+    )
+    .await
+    .unwrap();
 
-    // Retrieve via GET
-    let response_id = format!("resp_{}", id);
-    let retrieve = server
-        .get(&format!("/ai/v1/responses/{}", response_id))
-        .add_header("Authorization", &format!("Bearer {}", api_key))
-        .await;
+    // Finalize like the warm path does on Ok exit: assemble the chain
+    // and stamp the result onto the head step's sub-request fusillade
+    // row so GET retrieval surfaces a completed response.
+    let assembled = MultiStepStore::assemble_response(&store, &request_id).await.unwrap();
+    store.finalize_head_request(&request_id, 200, assembled).await.unwrap();
 
-    assert_eq!(retrieve.status_code(), 200);
-    let body: serde_json::Value = retrieve.json();
-    assert_eq!(body["status"].as_str(), Some("completed"));
+    // GET retrieval: the response is completed, the id matches the head
+    // step (not any internal sub-request id), and the chain is listable.
+    let resp_id = format!("resp_{request_id}");
+    let response = store.get_response(&resp_id).await.unwrap().expect("response should be retrievable");
+    assert_eq!(response["id"].as_str(), Some(resp_id.as_str()));
+    assert_eq!(response["status"].as_str(), Some("completed"));
+
+    let chain = MultiStepStore::list_chain(&store, &request_id, None).await.unwrap();
+    assert_eq!(chain.len(), 3, "chain should have head + tool + summary");
+    assert_eq!(chain[0].id, head.id);
+    assert_eq!(chain[1].id, tool.id);
+    assert_eq!(chain[2].id, summary.id);
+    assert!(matches!(chain[0].kind, onwards::StepKind::ModelCall));
+    assert!(matches!(chain[1].kind, onwards::StepKind::ToolCall));
+    assert!(matches!(chain[2].kind, onwards::StepKind::ModelCall));
+    assert!(chain.iter().all(|s| matches!(s.state, onwards::StepState::Completed)));
 }
 
 /// Test that GET /v1/responses/{id} returns 404 for non-existent IDs.
@@ -402,189 +475,20 @@ async fn test_fusillade_header_skips_row_creation(pool: PgPool) {
     );
 }
 
-/// Test that a flex service_tier request with background=true returns 202
-/// and creates a batch of 1 in fusillade.
-#[sqlx::test]
-#[test_log::test]
-async fn test_flex_background_returns_202_with_queued_status(pool: PgPool) {
-    let mock_server = wiremock::MockServer::start().await;
-    mount_chat_completions_mock(&mock_server).await;
-
-    let (server, api_key, _bg) = setup_ai_test(pool.clone(), &mock_server, true).await;
-
-    // Make a responses API request with flex tier + background=true
-    let response = server
-        .post("/ai/v1/responses")
-        .add_header("Authorization", &format!("Bearer {}", api_key))
-        .add_header("Content-Type", "application/json")
-        .json(&serde_json::json!({
-            "model": "gpt-4o",
-            "input": "Process this asynchronously",
-            "service_tier": "flex",
-            "background": true
-        }))
-        .await;
-
-    assert_eq!(response.status_code(), 202, "Async background request should return 202");
-
-    let body: serde_json::Value = response.json();
-    assert_eq!(body["status"].as_str(), Some("queued"));
-    assert_eq!(body["object"].as_str(), Some("response"));
-    assert!(body["id"].as_str().unwrap().starts_with("resp_"));
-    assert_eq!(body["background"].as_bool(), Some(true));
-
-    // Verify the request was created in fusillade with a batch
-    let resp_id = body["id"].as_str().unwrap();
-    let uuid_str = resp_id.strip_prefix("resp_").unwrap();
-    let request_id: uuid::Uuid = uuid_str.parse().unwrap();
-
-    let row = sqlx::query("SELECT state, batch_id FROM fusillade.requests WHERE id = $1")
-        .bind(request_id)
-        .fetch_optional(&pool)
-        .await
-        .unwrap();
-
-    assert!(row.is_some(), "Request row should exist in fusillade");
-    let row = row.unwrap();
-    let state: &str = sqlx::Row::get(&row, "state");
-    let batch_id: Option<uuid::Uuid> = sqlx::Row::get(&row, "batch_id");
-
-    assert_eq!(state, "pending", "Async request should be in pending state");
-    assert!(batch_id.is_some(), "Async request should have a batch_id");
-
-    // Verify batch has user attribution (created_by should not be empty)
-    let batch_row = sqlx::query("SELECT created_by FROM fusillade.batches WHERE id = $1")
-        .bind(batch_id.unwrap())
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    let created_by: String = sqlx::Row::get(&batch_row, "created_by");
-    assert!(!created_by.is_empty(), "Flex batch should have created_by set for user attribution");
-}
-
-/// Test that flex + background=false holds the connection and returns the
-/// completed response once the daemon finishes processing.
-#[sqlx::test]
-#[test_log::test]
-async fn test_flex_blocking_waits_for_completion(pool: PgPool) {
-    let mock_server = wiremock::MockServer::start().await;
-    mount_chat_completions_mock(&mock_server).await;
-
-    let (server, api_key, _bg) = setup_ai_test(pool.clone(), &mock_server, true).await;
-
-    // Spawn a task that will simulate the daemon: after a short delay, find
-    // the pending request in fusillade and mark it as completed.
-    let pool_clone = pool.clone();
-    let daemon_task = tokio::spawn(async move {
-        // Wait for the request to appear
-        let start = std::time::Instant::now();
-        loop {
-            let row = sqlx::query(
-                "SELECT id FROM fusillade.requests WHERE state = 'pending' AND batch_id IS NOT NULL ORDER BY created_at DESC LIMIT 1",
-            )
-            .fetch_optional(&pool_clone)
-            .await
-            .unwrap();
-
-            if let Some(row) = row {
-                let id: uuid::Uuid = sqlx::Row::get(&row, "id");
-                // Simulate daemon completing the request
-                sqlx::query(
-                    "UPDATE fusillade.requests SET state = 'completed', response_status = 200,
-                     response_body = '{\"output\": [{\"type\": \"message\", \"content\": \"flex result\"}], \"usage\": {\"input_tokens\": 5, \"output_tokens\": 3}}',
-                     completed_at = NOW()
-                     WHERE id = $1",
-                )
-                .bind(id)
-                .execute(&pool_clone)
-                .await
-                .unwrap();
-                return;
-            }
-
-            if start.elapsed() > std::time::Duration::from_secs(5) {
-                panic!("Daemon simulator: no pending request appeared");
-            }
-            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-        }
-    });
-
-    // Make a blocking flex request — this should hold the connection
-    // until the simulated daemon completes it
-    let response = server
-        .post("/ai/v1/responses")
-        .add_header("Authorization", &format!("Bearer {}", api_key))
-        .add_header("Content-Type", "application/json")
-        .json(&serde_json::json!({
-            "model": "gpt-4o",
-            "input": "Process this synchronously at flex pricing",
-            "service_tier": "flex"
-        }))
-        .await;
-
-    // Wait for daemon simulator to finish
-    daemon_task.await.unwrap();
-
-    assert_eq!(
-        response.status_code(),
-        200,
-        "Blocking flex should return 200 after daemon completes"
-    );
-
-    let body: serde_json::Value = response.json();
-    assert_eq!(body["status"].as_str(), Some("completed"));
-    assert_eq!(body["object"].as_str(), Some("response"));
-}
-
-/// Test that priority + background=true returns 202, then the spawned task
-/// completes the request and it's retrievable via GET.
-#[sqlx::test]
-#[test_log::test]
-async fn test_priority_background_completes_and_is_retrievable(pool: PgPool) {
-    let mock_server = wiremock::MockServer::start().await;
-    mount_chat_completions_mock(&mock_server).await;
-
-    let (server, api_key, _bg) = setup_ai_test(pool.clone(), &mock_server, true).await;
-
-    let response = server
-        .post("/ai/v1/responses")
-        .add_header("Authorization", &format!("Bearer {}", api_key))
-        .add_header("Content-Type", "application/json")
-        .json(&serde_json::json!({
-            "model": "gpt-4o",
-            "input": "Process in background but at realtime priority",
-            "service_tier": "priority",
-            "background": true
-        }))
-        .await;
-
-    assert_eq!(response.status_code(), 202, "Priority background should return 202");
-
-    let body: serde_json::Value = response.json();
-    assert_eq!(body["status"].as_str(), Some("in_progress"));
-    assert_eq!(body["background"].as_bool(), Some(true));
-    let resp_id = body["id"].as_str().unwrap();
-    assert!(resp_id.starts_with("resp_"));
-
-    // Poll GET /v1/responses/{id} until it transitions to completed
-    // (the spawned task proxies through onwards, outlet handler writes the body)
-    let start = std::time::Instant::now();
-    let mut final_status = String::new();
-    while start.elapsed() < std::time::Duration::from_secs(5) {
-        let retrieve = server
-            .get(&format!("/ai/v1/responses/{}", resp_id))
-            .add_header("Authorization", &format!("Bearer {}", api_key))
-            .await;
-
-        if retrieve.status_code() == 200 {
-            let resp: serde_json::Value = retrieve.json();
-            final_status = resp["status"].as_str().unwrap_or("").to_string();
-            if final_status == "completed" {
-                break;
-            }
-        }
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-    }
-
-    assert_eq!(final_status, "completed", "Background priority request should eventually complete");
-}
+// Removed: `test_flex_background_returns_202_with_queued_status`,
+// `test_flex_blocking_waits_for_completion`,
+// `test_priority_background_completes_and_is_retrievable`.
+//
+// All three asserted on the pre-warm-path routing where flex went
+// through the fusillade daemon (returning `status=queued`) and
+// background invoked the realtime path with daemon polling. Since
+// commit `6a7c24d7` every `/v1/responses` engages the multi-step warm
+// path regardless of tier or background flag — the daemon-driven and
+// queued/in_progress assertions don't model current behavior. End-to-
+// end coverage of the warm path itself needs a real HTTP loopback
+// listener (the axum_test in-memory transport doesn't bind a port);
+// that integration suite is tracked under COR-349 (daemon-path
+// rewrite) and the loopback fixture follow-up. Bridge-primitive
+// coverage for the multi-step path lives in
+// `test_multi_step_chain_assembles_and_is_retrievable_via_get` above
+// and `test::multi_step_executor::loop_drives_real_tool_and_model_calls_through_production_executor`.

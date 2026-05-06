@@ -11,7 +11,7 @@
 
 use async_trait::async_trait;
 use chrono::Utc;
-use onwards::traits::{RequestContext, ToolError, ToolExecutor, ToolSchema};
+use onwards::traits::{RequestContext, ToolError, ToolExecutor, ToolKind, ToolSchema};
 use serde_json::Value;
 use sqlx::PgPool;
 use std::collections::HashMap;
@@ -35,6 +35,12 @@ pub struct ToolDefinition {
     pub timeout_secs: u64,
     /// Foreign key into `tool_sources` for analytics.
     pub tool_source_id: Uuid,
+    /// Tool dispatch kind from `tool_sources.kind`. `"http"` (default) =
+    /// fire HTTP request. `"agent"` = sub-agent dispatch (handled by the
+    /// multi-step loop's `StepExecutor::dispatch_tool_call` returning
+    /// `ToolDispatch::Recurse`). Single-step `HttpToolExecutor` ignores
+    /// this field.
+    pub kind: String,
 }
 
 /// Full set of tools resolved for a single request.
@@ -58,17 +64,52 @@ impl ResolvedToolSet {
     /// Convert resolved tools into `ToolSchema` values for onwards.
     pub fn to_tool_schemas(&self) -> Vec<ToolSchema> {
         self.tools
-            .keys()
-            .map(|name| {
+            .iter()
+            .map(|(name, def)| {
                 let (description, parameters) = self.metadata.get(name).cloned().unwrap_or((None, None));
                 ToolSchema {
                     name: name.clone(),
                     description: description.unwrap_or_default(),
                     parameters: parameters.unwrap_or(serde_json::json!({"type": "object"})),
                     strict: false,
+                    kind: tool_kind_from_str(&def.kind),
                 }
             })
             .collect()
+    }
+
+    /// Render the resolved tool set in OpenAI Chat Completions
+    /// `tools: [{ type: "function", function: {...} }]` format. This is
+    /// what the multi-step path's transition function picks up from
+    /// `body["tools"]` and forwards to the upstream model_call payload
+    /// — without it, registered tools never reach the model and the
+    /// loop runs no tool_call steps.
+    pub fn to_openai_tools_array(&self) -> Vec<serde_json::Value> {
+        self.tools
+            .keys()
+            .map(|name| {
+                let (description, parameters) = self.metadata.get(name).cloned().unwrap_or((None, None));
+                serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "description": description.unwrap_or_default(),
+                        "parameters": parameters.unwrap_or(serde_json::json!({"type": "object"})),
+                    }
+                })
+            })
+            .collect()
+    }
+}
+
+/// Translate the `tool_sources.kind` text column into onwards' typed
+/// [`ToolKind`]. Unknown values fall back to `Http` so an unrecognized
+/// kind in the database doesn't surface as a runtime panic — the loop's
+/// HTTP path is the safer default.
+fn tool_kind_from_str(kind: &str) -> ToolKind {
+    match kind {
+        "agent" => ToolKind::Agent,
+        _ => ToolKind::Http,
     }
 }
 
@@ -250,6 +291,7 @@ mod tests {
         tools.insert(
             tool_name.to_string(),
             ToolDefinition {
+                kind: "http".to_string(),
                 url: format!("{server_url}/tool"),
                 api_key,
                 timeout_secs: 5,
@@ -347,6 +389,7 @@ mod tests {
         tools.insert(
             "my_tool".to_string(),
             ToolDefinition {
+                kind: "http".to_string(),
                 url: "http://example.com".to_string(),
                 api_key: None,
                 timeout_secs: 5,
@@ -401,6 +444,7 @@ mod tests {
         tools.insert(
             "test_tool".to_string(),
             ToolDefinition {
+                kind: "http".to_string(),
                 url: format!("{}/tool", server.uri()),
                 api_key: None,
                 timeout_secs: 1,
@@ -427,6 +471,7 @@ mod tests {
         tools.insert(
             "weather".to_string(),
             ToolDefinition {
+                kind: "http".to_string(),
                 url: "http://example.com".to_string(),
                 api_key: None,
                 timeout_secs: 30,

@@ -43,6 +43,14 @@ pub struct ResponsesMiddlewareState<P: PoolProvider + Clone = sqlx_pool_router::
     /// Underway job used to create the realtime tracking batch asynchronously
     /// on the blocking (non-background) path.
     pub create_response_job: Arc<underway::Job<CreateResponseInput, crate::tasks::TaskState<P>>>,
+    /// Multi-step warm-path streaming pieces. When the user sends
+    /// `stream: true` (and not `background: true`) on `/v1/responses`,
+    /// the middleware routes the request through
+    /// [`super::streaming::run_inline_streaming`] using these.
+    pub response_store: Arc<super::store::FusilladeResponseStore<P>>,
+    pub multi_step_tool_executor: Arc<crate::tool_executor::HttpToolExecutor>,
+    pub multi_step_http_client: Arc<dyn onwards::client::HttpClient + Send + Sync>,
+    pub loop_config: onwards::LoopConfig,
 }
 
 /// Middleware that routes inference requests based on service_tier and background.
@@ -72,7 +80,7 @@ pub async fn responses_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
         }
     };
 
-    let request_value: serde_json::Value = match serde_json::from_slice(&body_bytes) {
+    let mut request_value: serde_json::Value = match serde_json::from_slice(&body_bytes) {
         Ok(v) => v,
         Err(e) => {
             tracing::error!(error = %e, "Failed to parse request body in responses middleware");
@@ -80,7 +88,8 @@ pub async fn responses_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
         }
     };
 
-    let model = request_value["model"].as_str().unwrap_or("unknown");
+    let model = request_value["model"].as_str().unwrap_or("unknown").to_string();
+    let model = model.as_str();
     let nested_path = parts.uri.path();
     let is_responses_api = nested_path.ends_with("/responses");
     // The router is nested at /ai/v1, so the path here is e.g. "/responses".
@@ -95,6 +104,34 @@ pub async fn responses_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
         .and_then(|s| s.strip_prefix("Bearer "))
         .map(|s| s.to_string());
 
+    // Inject server-side resolved tools into the request body so the
+    // multi-step path's transition function (which reads `body["tools"]`
+    // and forwards them to upstream model_call payloads) sees them.
+    // Without this, tools registered in the dwctl tool registry never
+    // reach the model — it can't issue real tool_calls and the loop
+    // runs as a single model_call.
+    //
+    // The single-step (onwards-routed) path injects tools via the
+    // strict-mode handlers; the multi-step path bypasses onwards for
+    // model_calls so we have to do it here. Skipped if the user
+    // already supplied tools (their list takes precedence).
+    //
+    // The cross-cutting `tool_injection_middleware` runs *inside* this
+    // layer (axum applies later-added layers as outer wrappers, so
+    // when responses_middleware fires, tool_injection hasn't yet
+    // populated request.extensions::<ResolvedTools>). We do the same
+    // DB resolve directly here.
+    if request_value.get("tools").is_none()
+        && is_responses_api
+        && let Some(key) = api_key.as_deref()
+        && let Ok(Some(resolved)) = crate::tool_injection::resolve_tools_for_request(&state.dwctl_pool, key, Some(model)).await
+    {
+        let openai_tools = resolved.to_openai_tools_array();
+        if !openai_tools.is_empty() {
+            request_value["tools"] = serde_json::Value::Array(openai_tools);
+        }
+    }
+
     // Only the Responses API supports service_tier and background.
     // Chat completions and embeddings always use realtime tier.
     let (service_tier, background) = if is_responses_api {
@@ -105,6 +142,34 @@ pub async fn responses_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
         (ServiceTier::Realtime, false)
     };
 
+    // Multi-step warm-path dispatch. Always engages for /v1/responses
+    // (regardless of stream/background flags) so tool calls actually
+    // dispatch — single-step onwards proxying would forward server-side
+    // tools to the upstream model but never run them. /v1/responses is
+    // the multi-step API; chat completions and embeddings keep their
+    // existing single-step proxy path.
+    //
+    //   stream=true,  background=false → SSE response, loop runs inline
+    //   stream=false, background=false → JSON response, loop runs inline
+    //   stream=*,     background=true  → 202 + spawned loop, GET /v1/responses/{id} polls
+    let stream_requested = is_responses_api && !background && request_value["stream"].as_bool().unwrap_or(false);
+    if stream_requested && let Some(resp) = try_warm_path_stream(&state, &request_value, api_key.as_deref(), model).await {
+        return resp;
+    }
+    if is_responses_api
+        && !background
+        && !stream_requested
+        && let Some(resp) = try_warm_path_blocking(&state, &request_value, api_key.as_deref(), model).await
+    {
+        return resp;
+    }
+    if is_responses_api
+        && background
+        && let Some(resp) = try_warm_path_background(&state, &request_value, api_key.as_deref(), model).await
+    {
+        return resp;
+    }
+
     tracing::debug!(
         model = %model,
         service_tier = %service_tier,
@@ -113,8 +178,13 @@ pub async fn responses_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
         "Routing inference request"
     );
 
-    // Generate the request ID upfront — known before any DB calls or proxying.
+    // Generate the request and batch IDs upfront — known before any DB calls
+    // or proxying. The batch_id is set as `x-fusillade-batch-id` on the
+    // proxied request so analytics_handler can associate the http_analytics
+    // row with this batch (otherwise total_cost / token aggregates in the
+    // Batches view come back empty for realtime tracking rows).
     let request_id = uuid::Uuid::new_v4();
+    let batch_id = uuid::Uuid::new_v4();
     let resp_id = format!("resp_{request_id}");
     let completion_window = match service_tier {
         ServiceTier::Flex => "1h",
@@ -165,6 +235,7 @@ pub async fn responses_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     };
 
     let batch_input = fusillade::CreateSingleRequestBatchInput {
+        batch_id: Some(batch_id),
         request_id,
         body: request_value.to_string(),
         model: model.to_string(),
@@ -177,7 +248,7 @@ pub async fn responses_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     };
 
     match service_tier {
-        ServiceTier::Realtime => handle_realtime(&state, batch_input, &resp_id, model, background, parts, body_bytes, next).await,
+        ServiceTier::Realtime => handle_realtime(&state, batch_input, batch_id, &resp_id, model, background, parts, body_bytes, next).await,
         ServiceTier::Flex => handle_flex(&state, batch_input, &resp_id, model, background).await,
     }
 }
@@ -219,6 +290,7 @@ fn resolve_service_tier(tier: Option<&str>) -> ServiceTier {
 async fn handle_realtime<P: PoolProvider + Clone + Send + Sync + 'static>(
     state: &ResponsesMiddlewareState<P>,
     batch_input: fusillade::CreateSingleRequestBatchInput,
+    batch_id: uuid::Uuid,
     resp_id: &str,
     model: &str,
     background: bool,
@@ -228,9 +300,10 @@ async fn handle_realtime<P: PoolProvider + Clone + Send + Sync + 'static>(
 ) -> Response {
     let rm = state.request_manager.clone();
 
-    // Capture endpoint before consuming batch_input — needed downstream as a
-    // header so the outlet handler can synthesize the row if create-response
-    // hasn't run yet.
+    // batch_id is passed in explicitly (rather than re-extracted from
+    // batch_input) so the type system enforces its presence — fusillade's
+    // `batch_id` field is `Option<Uuid>` to keep its API friendly for callers
+    // that don't need a pre-generated id, but here we always have one.
     let endpoint_for_header = batch_input.endpoint.clone();
 
     if background {
@@ -245,6 +318,7 @@ async fn handle_realtime<P: PoolProvider + Clone + Send + Sync + 'static>(
         // between proxying and the DB insert still leaves a retryable record.
         // The job resolves attribution and calls create_single_request_batch.
         let job_input = CreateResponseInput {
+            batch_id,
             request_id: batch_input.request_id,
             body: batch_input.body,
             model: batch_input.model,
@@ -270,6 +344,13 @@ async fn handle_realtime<P: PoolProvider + Clone + Send + Sync + 'static>(
     let mut req = Request::from_parts(parts, Body::from(body_bytes));
     req.headers_mut()
         .insert("x-fusillade-request-id", raw_id.parse().expect("response_id is valid header value"));
+    // x-fusillade-batch-id wires this realtime tracking row up to its
+    // http_analytics row so total_cost / token aggregates show up in the
+    // Batches view (analytics_handler reads this header).
+    req.headers_mut().insert(
+        "x-fusillade-batch-id",
+        batch_id.to_string().parse().expect("batch_id is valid header value"),
+    );
     req.headers_mut().insert(
         ONWARDS_RESPONSE_ID_HEADER,
         resp_id.parse().expect("response_id is valid header value"),
@@ -357,7 +438,13 @@ async fn handle_flex<P: PoolProvider + Clone + Send + Sync + 'static>(
                 let status_code = if response_obj["status"].as_str() == Some("completed") {
                     StatusCode::OK
                 } else {
-                    StatusCode::INTERNAL_SERVER_ERROR
+                    // Extract the real HTTP status from the error's code field,
+                    // which is populated by detail_to_response_object from the
+                    // upstream response status.
+                    response_obj["error"]["code"]
+                        .as_u64()
+                        .and_then(|c| StatusCode::from_u16(c as u16).ok())
+                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
                 };
                 (status_code, Json(response_obj)).into_response()
             }
@@ -379,6 +466,171 @@ async fn handle_flex<P: PoolProvider + Clone + Send + Sync + 'static>(
 pub(crate) fn should_intercept(method: &axum::http::Method, path: &str) -> bool {
     method == axum::http::Method::POST
         && (path.ends_with("/responses") || path.ends_with("/chat/completions") || path.ends_with("/embeddings"))
+}
+
+/// Attempt to dispatch a `/v1/responses` request through the warm-path
+/// streaming handler. Returns `Some(response)` if the dispatch
+/// succeeded; `None` if the request can't be served via the warm path
+/// (no API key, missing tool resolution, etc.) and should fall through
+/// to the standard single-step / daemon paths.
+async fn try_warm_path_stream<P: PoolProvider + Clone + Send + Sync + 'static>(
+    state: &ResponsesMiddlewareState<P>,
+    request_value: &serde_json::Value,
+    api_key: Option<&str>,
+    model: &str,
+) -> Option<Response> {
+    let api_key = api_key?;
+    let (head_step_uuid, resolved, upstream) = warm_path_setup(state, request_value, api_key, model).await?;
+
+    let sse = super::streaming::run_inline_streaming(
+        state.response_store.clone(),
+        state.multi_step_tool_executor.clone(),
+        resolved,
+        state.multi_step_http_client.clone(),
+        upstream,
+        state.loop_config,
+        head_step_uuid.to_string(),
+        model.to_string(),
+    );
+    Some(sse.into_response())
+}
+
+/// Warm-path blocking handler for `/v1/responses` with
+/// `stream:false, background:false`. Same multi-step machinery as
+/// `try_warm_path_stream`, but accumulates the loop's output and
+/// returns a single JSON response instead of an SSE stream — so tools
+/// dispatch correctly even when the user opted out of streaming.
+async fn try_warm_path_blocking<P: PoolProvider + Clone + Send + Sync + 'static>(
+    state: &ResponsesMiddlewareState<P>,
+    request_value: &serde_json::Value,
+    api_key: Option<&str>,
+    model: &str,
+) -> Option<Response> {
+    let api_key = api_key?;
+    let (request_id, resolved, upstream) = match warm_path_setup(state, request_value, api_key, model).await {
+        Some(s) => s,
+        None => return None,
+    };
+
+    let result = super::streaming::run_inline_blocking(
+        state.response_store.clone(),
+        state.multi_step_tool_executor.clone(),
+        resolved,
+        state.multi_step_http_client.clone(),
+        upstream,
+        state.loop_config,
+        request_id.to_string(),
+        model.to_string(),
+    )
+    .await;
+
+    let (status, body) = match result {
+        Ok(json) => (StatusCode::OK, json),
+        Err(err_payload) => (StatusCode::BAD_GATEWAY, serde_json::json!({"error": err_payload})),
+    };
+    Some((status, Json(body)).into_response())
+}
+
+/// Warm-path background handler for `/v1/responses` with
+/// `background:true`. Spawns the multi-step loop in a background
+/// task and returns a 202 with the in_progress response shape — the
+/// caller polls `GET /v1/responses/{id}` for the terminal state.
+async fn try_warm_path_background<P: PoolProvider + Clone + Send + Sync + 'static>(
+    state: &ResponsesMiddlewareState<P>,
+    request_value: &serde_json::Value,
+    api_key: Option<&str>,
+    model: &str,
+) -> Option<Response> {
+    let api_key = api_key?;
+    let (request_id, resolved, upstream) = match warm_path_setup(state, request_value, api_key, model).await {
+        Some(s) => s,
+        None => return None,
+    };
+
+    let resp_id = format!("resp_{request_id}");
+    let response_body = serde_json::json!({
+        "id": resp_id,
+        "object": "response",
+        "status": "in_progress",
+        "model": model,
+        "background": true,
+        "output": [],
+    });
+
+    let response_store = state.response_store.clone();
+    let tool_executor = state.multi_step_tool_executor.clone();
+    let http_client = state.multi_step_http_client.clone();
+    let loop_config = state.loop_config;
+    let model_str = model.to_string();
+    let request_id_str = request_id.to_string();
+    tokio::spawn(async move {
+        let _ = super::streaming::run_inline_blocking(
+            response_store,
+            tool_executor,
+            resolved,
+            http_client,
+            upstream,
+            loop_config,
+            request_id_str,
+            model_str,
+        )
+        .await;
+    });
+
+    Some((StatusCode::ACCEPTED, Json(response_body)).into_response())
+}
+
+/// Shared setup for the three warm paths: register the per-response
+/// context in the side-channel so the bridge's `next_action_for` /
+/// `record_step` can re-parse the original body and stamp api_key /
+/// created_by / base_url on per-step sub-request rows; resolve
+/// per-request tools; build the upstream target.
+///
+/// Returns the head-step UUID — the caller surfaces it to the user as
+/// `resp_<id>` and threads its string form into `run_response_loop` as
+/// the loop's `request_id` parameter. Crucially, **no parent
+/// `/v1/responses` fusillade row is created**: the response identity is
+/// purely the head step, and per-step sub-request rows are minted
+/// inside `record_step` for each model_call. This is the key shape
+/// change vs the pre-16.8 bridge — it's what lets the dashboard
+/// listing query show one row per response (the head's sub-request)
+/// with real analytics, instead of a parent row with zero usage.
+async fn warm_path_setup<P: PoolProvider + Clone + Send + Sync + 'static>(
+    state: &ResponsesMiddlewareState<P>,
+    request_value: &serde_json::Value,
+    api_key: &str,
+    model: &str,
+) -> Option<(uuid::Uuid, Arc<crate::tool_executor::ResolvedToolSet>, onwards::UpstreamTarget)> {
+    let created_by = response_store::lookup_created_by(&state.dwctl_pool, Some(api_key)).await;
+    let pending = response_store::PendingResponseInput {
+        body: request_value.to_string(),
+        api_key: Some(api_key.to_string()),
+        created_by,
+        base_url: state.loopback_base_url.clone(),
+    };
+    let head_step_uuid = state.response_store.register_pending(pending);
+
+    let resolved = match crate::tool_injection::resolve_tools_for_request(&state.dwctl_pool, api_key, Some(model)).await {
+        Ok(Some(set)) => Arc::new(set),
+        Ok(None) => Arc::new(crate::tool_executor::ResolvedToolSet::new(
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+        )),
+        Err(e) => {
+            tracing::warn!(error = %e, "warm-path: tool resolution failed; running with no tools");
+            Arc::new(crate::tool_executor::ResolvedToolSet::new(
+                std::collections::HashMap::new(),
+                std::collections::HashMap::new(),
+            ))
+        }
+    };
+
+    let upstream = onwards::UpstreamTarget {
+        url: format!("{}/v1/chat/completions", state.loopback_base_url),
+        api_key: Some(api_key.to_string()),
+    };
+
+    Some((head_step_uuid, resolved, upstream))
 }
 
 #[cfg(test)]

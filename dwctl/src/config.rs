@@ -185,6 +185,35 @@ pub struct Config {
     /// External data source connections configuration
     #[serde(default)]
     pub connections: ConnectionsConfig,
+    /// Multi-step Open Responses orchestration configuration. Only the
+    /// safety caps are exposed today; storage and dispatch are wired
+    /// implicitly when the multi-step processor is registered with
+    /// fusillade.
+    #[serde(default)]
+    pub responses: ResponsesConfig,
+}
+
+/// Configuration for `/v1/responses` multi-step orchestration.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ResponsesConfig {
+    /// Maximum sub-agent recursion depth (per plan §C11). A
+    /// `tool_call` step whose sub-agent dispatch would exceed this
+    /// depth is failed with `max_depth_exceeded`.
+    pub max_response_step_depth: u32,
+    /// Maximum model_call ↔ tool_call iterations within a single loop
+    /// level (per plan §C11). A loop level that hits this cap fails
+    /// with `max_iterations_exceeded`.
+    pub max_response_iterations: u32,
+}
+
+impl Default for ResponsesConfig {
+    fn default() -> Self {
+        Self {
+            max_response_step_depth: 8,
+            max_response_iterations: 10,
+        }
+    }
 }
 
 /// Individual pool configuration with all SQLx parameters.
@@ -1764,6 +1793,7 @@ impl Default for Config {
             onboarding_url: None,
             support_email: "support@doubleword.ai".to_string(),
             connections: ConnectionsConfig::default(),
+            responses: ResponsesConfig::default(),
         }
     }
 }

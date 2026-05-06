@@ -175,7 +175,9 @@ function createColumns(
               <Icon className="h-4 w-4" />
             </span>
           </TooltipTrigger>
-          <TooltipContent side="top">{tier}</TooltipContent>
+          <TooltipContent side="top">
+            {tier.charAt(0).toUpperCase() + tier.slice(1)}
+          </TooltipContent>
         </Tooltip>
       );
     },
@@ -452,7 +454,7 @@ export function AsyncRequests() {
                       }}
                       className="rounded border-gray-300"
                     />
-                    {tier === "flex" ? "Flex" : "Realtime"}
+                    {tier === "flex" ? "Flex" : "Priority"}
                   </label>
                 ))}
               </PopoverContent>

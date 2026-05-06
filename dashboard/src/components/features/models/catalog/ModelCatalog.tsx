@@ -990,6 +990,7 @@ const DesktopModelCatalog: React.FC<{ isMobile: boolean }> = ({ isMobile }) => {
         isOpen={apiExamplesModel !== null}
         onClose={() => setApiExamplesModel(null)}
         model={apiExamplesModel}
+        defaultTab="realtime"
       />
     </div>
   );

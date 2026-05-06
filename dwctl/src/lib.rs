@@ -295,6 +295,11 @@ where
     /// Response store for Open Responses API lifecycle tracking.
     /// Reads/writes to fusillade's requests table.
     pub response_store: Arc<crate::responses::store::FusilladeResponseStore<P>>,
+    /// Multi-step response_steps storage. Optional so deployments that
+    /// don't use the multi-step Open Responses path can omit the
+    /// wiring; the GET /v1/responses/{id} handler degrades to 404 in
+    /// that case rather than panicking.
+    pub response_step_manager: Option<Arc<fusillade::PostgresResponseStepManager<P>>>,
 }
 
 impl<P> AppState<P>
@@ -1666,6 +1671,20 @@ async fn inject_trace_id(request: axum::extract::Request, next: middleware::Next
 /// the shutdown token, signaling all tasks to stop.
 pub struct BackgroundServices {
     request_manager: Arc<fusillade::PostgresRequestManager<DbPools, fusillade::ReqwestHttpClient>>,
+    /// Step storage for multi-step responses, sharing the same fusillade
+    /// pool as the request manager. Constructed in
+    /// `setup_background_services` so the manager's processor (which
+    /// dwctl wires later in `Application::new_with_pool`) can use it.
+    step_manager: Arc<fusillade::PostgresResponseStepManager<DbPools>>,
+    /// The onwards-instance daemon id registered in the `daemons` table
+    /// for realtime / inline-loop attribution. The graceful-shutdown
+    /// drain (`shutdown()`) marks this row Dead and releases any
+    /// in-progress rows it owns back to `pending` so the next pod picks
+    /// them up immediately rather than waiting for stale-daemon
+    /// detection (~30s).
+    onwards_daemon_id: Option<Uuid>,
+    /// Fusillade write pool retained for the SIGTERM drain queries.
+    fusillade_write_pool: Option<sqlx::PgPool>,
     task_runner: Arc<tasks::TaskRunner>,
     is_leader: bool,
     onwards_targets: onwards::target::Targets,
@@ -1744,10 +1763,91 @@ impl BackgroundServices {
         self.shutdown_token.clone()
     }
 
-    /// Gracefully shutdown all background tasks
+    /// Gracefully shutdown all background tasks.
+    ///
+    /// Implements the SIGTERM drain protocol from
+    /// `fusillade/docs/plans/2026-04-28-multi-step-responses.md` (COR-353):
+    ///
+    /// 1. Signal all in-process tasks to stop accepting new work
+    ///    (`shutdown_token.cancel()`). The fusillade batch daemon stops
+    ///    claiming and waits for in-flight workers to finish their
+    ///    current loop iteration; it then marks its own daemon row Dead
+    ///    via the `Running -> Dead` typestate transition.
+    /// 2. Drain the **onwards-instance daemon** registration: this row
+    ///    is created manually for realtime/inline-loop attribution and
+    ///    is not managed by fusillade's daemon lifecycle, so we mark it
+    ///    Dead explicitly + release any rows it owns back to pending.
+    ///    Without this, the rows would wait for fusillade's stale-
+    ///    daemon detection (default ~30s) before the next pod picks
+    ///    them up.
+    ///
+    /// The drain is best-effort and logs errors rather than failing
+    /// shutdown — a slow/missing drain falls back to time-based
+    /// reclaim, which is correct just slower.
     pub async fn shutdown(mut self) {
         // Signal all background tasks to shutdown
         self.shutdown_token.cancel();
+
+        // Drain the onwards-instance daemon registration before joining
+        // tasks: this is the SIGTERM drain that gives the next pod
+        // immediate ownership of any rows we still hold. We do this
+        // BEFORE waiting for tasks because the unclaim is independent
+        // of in-flight task completion — it just touches DB state.
+        if let (Some(daemon_id), Some(pool)) = (self.onwards_daemon_id, self.fusillade_write_pool.as_ref()) {
+            // Mark our daemon row Dead. fusillade's reclaim query
+            // (`unclaim_stale_requests`) treats `daemons.status='dead'`
+            // as the immediate-reclaim signal, so as soon as this
+            // commits the next claim cycle on any other instance will
+            // see our rows.
+            //
+            // The `dead_timestamp_check` constraint on `daemons`
+            // requires `stopped_at IS NOT NULL` when status='dead', so
+            // we set it explicitly here.
+            let mark_dead = sqlx::query(
+                "UPDATE daemons SET status = 'dead', stopped_at = NOW() \
+                 WHERE id = $1",
+            )
+            .bind(daemon_id)
+            .execute(pool)
+            .await;
+            if let Err(e) = mark_dead {
+                tracing::warn!(error = %e, daemon_id = %daemon_id,
+                    "SIGTERM drain: failed to mark onwards daemon Dead — \
+                     rows will be reclaimed via stale-daemon detection");
+            } else {
+                tracing::info!(daemon_id = %daemon_id, "SIGTERM drain: marked onwards daemon Dead");
+            }
+
+            // Explicitly release any rows we own back to pending so the
+            // next pod's claim cycle picks them up immediately rather
+            // than waiting for the time-based fallback path. The
+            // typestate constraints on `requests` require we clear
+            // claimed_at/started_at when going back to pending.
+            let unclaim = sqlx::query(
+                "UPDATE requests \
+                 SET state = 'pending', daemon_id = NULL, claimed_at = NULL, started_at = NULL \
+                 WHERE daemon_id = $1 AND state IN ('claimed', 'processing')",
+            )
+            .bind(daemon_id)
+            .execute(pool)
+            .await;
+            match unclaim {
+                Ok(result) => {
+                    if result.rows_affected() > 0 {
+                        tracing::info!(
+                            daemon_id = %daemon_id,
+                            rows_released = result.rows_affected(),
+                            "SIGTERM drain: released claimed/processing rows back to pending"
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, daemon_id = %daemon_id,
+                        "SIGTERM drain: failed to unclaim rows — \
+                         rows will be reclaimed via stale-daemon detection");
+                }
+            }
+        }
 
         // Wait for all background tasks to complete and check for errors
         while let Some(result) = self.background_tasks.join_next_with_id().await {
@@ -1910,8 +2010,11 @@ async fn setup_background_services(
 
     let probe_scheduler = probes::ProbeScheduler::new(pool.clone(), config.clone());
 
-    // Clone fusillade pools for metrics before moving into request manager
+    // Clone fusillade pools for metrics + multi-step step manager before
+    // moving into request manager. Both later consumers need the
+    // PoolProvider to share state with the request manager's pool.
     let fusillade_pool_for_metrics = fusillade_pools.write().clone();
+    let fusillade_pools_for_steps = fusillade_pools.clone();
 
     // Initialize the fusillade request manager (for batch processing)
     let request_manager = Arc::new(
@@ -2274,8 +2377,11 @@ async fn setup_background_services(
 
     let (background_tasks, task_names) = background_tasks.into_parts();
 
+    let step_manager = Arc::new(fusillade::PostgresResponseStepManager::new(fusillade_pools_for_steps));
+
     Ok(BackgroundServices {
         request_manager,
+        step_manager,
         task_runner,
         is_leader,
         onwards_targets: initial_targets,
@@ -2287,6 +2393,11 @@ async fn setup_background_services(
         shutdown_token,
         drop_guard: Some(drop_guard),
         connections_encryption_key: encryption_key.clone(),
+        // Application::new_with_pool wires these once the onwards-
+        // instance daemon row is registered. Kept Optional here so
+        // tests that bypass that wiring still construct cleanly.
+        onwards_daemon_id: None,
+        fusillade_write_pool: None,
     })
 }
 
@@ -2404,11 +2515,18 @@ impl Application {
         // Embeddings don't support streaming.
         let body_transform: onwards::BodyTransformFn = Arc::new(request_logging::stream_usage::stream_usage_transform);
 
-        // Create the HTTP tool executor.
+        // Create the HTTP tool executor. The reqwest::Client and
+        // dwctl pool here are shared with the multi-step processor's
+        // executor below — cloning a reqwest::Client is cheap and
+        // shares its connection pool / TLS root cert cache, and the
+        // PgPool clone shares the underlying connection pool. Building
+        // separate clients/pools would double TLS init cost per test
+        // and add unnecessary parallelism pressure.
         let reqwest_client = reqwest::Client::new();
-        let tool_executor = crate::tool_executor::HttpToolExecutor::new(reqwest_client, Some(Arc::new(db_pools.write().clone())));
+        let tool_executor_pool = Arc::new(db_pools.write().clone());
+        let tool_executor = crate::tool_executor::HttpToolExecutor::new(reqwest_client.clone(), Some(tool_executor_pool.clone()));
 
-        // Register onwards as a fusillade daemon so realtime requests get a valid daemon_id
+        // Register onwards as a fusillade daemon so realtime requests get a valid daemon_id.
         let onwards_daemon_id = uuid::Uuid::new_v4();
         let fusillade_write_pool = bg_services.request_manager.pool().clone();
         let daemon_insert_result = sqlx::query(
@@ -2426,6 +2544,11 @@ impl Application {
         let daemon_registered = match &daemon_insert_result {
             Ok(_) => {
                 tracing::info!(daemon_id = %onwards_daemon_id, "Registered onwards as fusillade daemon");
+                // Stash on bg_services so the SIGTERM drain in
+                // BackgroundServices::shutdown can mark this row Dead
+                // and release its claimed rows.
+                bg_services.onwards_daemon_id = Some(onwards_daemon_id);
+                bg_services.fusillade_write_pool = Some(fusillade_write_pool.clone());
                 true
             }
             Err(e) => {
@@ -2476,9 +2599,74 @@ impl Application {
         } // daemon_registered
 
         // Create the response store (backed by request_manager for reads via Storage trait)
-        let response_store = Arc::new(crate::responses::store::FusilladeResponseStore::new(
-            bg_services.request_manager.clone(),
+        let response_store = Arc::new(
+            crate::responses::store::FusilladeResponseStore::new(bg_services.request_manager.clone())
+                .with_step_manager(bg_services.step_manager.clone()),
+        );
+
+        // Wire the multi-step orchestration dispatcher. The processor
+        // matches on `request.data.endpoint`: `/v1/responses` runs the
+        // multi-step loop (transition function + tool executor + model
+        // HTTP fire), everything else falls through to fusillade's
+        // DefaultRequestProcessor — the existing batch path is byte-
+        // for-byte unchanged.
+        //
+        // Late-wired via set_processor: the response_store needs the
+        // request_manager (for parent-body fetches), the processor
+        // needs the response_store, and the request_manager needs the
+        // processor. Constructing the manager first then attaching the
+        // processor breaks the would-be construction cycle. The
+        // resulting Arc graph is shaped manager → processor → store →
+        // manager, which is a memory cycle in principle, but these
+        // objects live for the entire app lifetime so it never matters
+        // in practice.
+        let multi_step_tool_executor = Arc::new(crate::tool_executor::HttpToolExecutor::new(
+            reqwest_client,
+            Some(tool_executor_pool),
         ));
+        let multi_step_http_client: Arc<dyn onwards::client::HttpClient + Send + Sync> =
+            Arc::new(onwards::client::create_hyper_client(10, 30));
+        let tool_resolver: Arc<dyn crate::responses::processor::DaemonToolResolver> =
+            Arc::new(crate::responses::processor::DbToolResolver {
+                pool: (*db_pools).write().clone(),
+            });
+        let multi_step_loop_config = onwards::LoopConfig {
+            max_response_step_depth: config.responses.max_response_step_depth,
+            max_response_iterations: config.responses.max_response_iterations,
+        };
+        // Clone the executor + client so the middleware state can use
+        // them for warm-path streaming. The daemon processor takes its
+        // own owned references — they all share the same underlying
+        // pool / connection state.
+        let multi_step_processor = Arc::new(
+            crate::responses::processor::DwctlRequestProcessor::new(
+                response_store.clone(),
+                multi_step_tool_executor.clone(),
+                multi_step_http_client.clone(),
+                multi_step_loop_config,
+            )
+            .with_tool_resolver(tool_resolver),
+        );
+        // Skipped in tests: this wiring forms an Arc cycle
+        // (request_manager → processor.OnceLock → response_store →
+        // request_manager) that's harmless in production where the app
+        // lives forever, but in `#[sqlx::test]` tests the cycle keeps
+        // each test's pool clones alive past test teardown, which
+        // blocks sqlx's `DROP DATABASE` cleanup with "database is being
+        // accessed by other users". That cleanup then holds the
+        // master pool slot for ~5s, exhausting the master pool's
+        // hardcoded max=20 across parallel tests and failing api_keys/
+        // auth tests with PoolTimedOut. The daemon path isn't exercised
+        // in unit tests anyway — multi-step integration coverage lives
+        // in the dedicated test/multi_step_*.rs modules with their own
+        // isolated setup.
+        if !cfg!(test) {
+            if let Err(e) = bg_services.request_manager.set_processor(multi_step_processor) {
+                tracing::warn!(error = e, "Multi-step processor was already set; skipping");
+            }
+        } else {
+            let _ = multi_step_processor;
+        }
 
         // Responses middleware state (enqueues create-response jobs via underway)
         let responses_middleware_state = crate::responses::middleware::ResponsesMiddlewareState {
@@ -2495,6 +2683,10 @@ impl Application {
             },
             dwctl_pool: (*db_pools).write().clone(),
             create_response_job: bg_services.task_runner.create_response_job.clone(),
+            response_store: response_store.clone(),
+            multi_step_tool_executor,
+            multi_step_http_client,
+            loop_config: multi_step_loop_config,
         };
 
         // Build onwards router from targets with body transform, response sanitization, and tool executor.
@@ -2525,6 +2717,7 @@ impl Application {
             .limiters(limiters)
             .maybe_connections_encryption_key(bg_services.connections_encryption_key.clone())
             .response_store(response_store)
+            .response_step_manager(bg_services.step_manager.clone())
             .build();
 
         if let Some(config_path) = config_path {

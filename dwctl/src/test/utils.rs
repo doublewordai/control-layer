@@ -76,9 +76,11 @@ pub async fn create_test_app_state_with_config(pool: PgPool, config: crate::conf
         .build()
 }
 
-/// Like `create_test_app_state_with_config` but also runs fusillade migrations.
-/// Use this in tests that call functions which use `state.request_manager` directly.
-pub async fn create_test_app_state_with_fusillade(pool: PgPool, config: crate::config::Config) -> crate::AppState<TestDbPools> {
+/// Set up the fusillade schema in a `#[sqlx::test]`-provided isolated
+/// test DB and return a small (max 4 conns) fusillade-schema pool. Use
+/// this from integration tests that drive fusillade directly without
+/// constructing the full Application.
+pub async fn setup_fusillade_pool(pool: &PgPool) -> PgPool {
     use sqlx::Executor;
     use sqlx::postgres::PgConnectOptions;
 
@@ -98,6 +100,14 @@ pub async fn create_test_app_state_with_fusillade(pool: PgPool, config: crate::c
         .run(&fusillade_pool)
         .await
         .expect("Failed to run fusillade migrations");
+
+    fusillade_pool
+}
+
+/// Like `create_test_app_state_with_config` but also runs fusillade migrations.
+/// Use this in tests that call functions which use `state.request_manager` directly.
+pub async fn create_test_app_state_with_fusillade(pool: PgPool, config: crate::config::Config) -> crate::AppState<TestDbPools> {
+    let fusillade_pool = setup_fusillade_pool(&pool).await;
 
     let test_pools = TestDbPools::new(pool.clone()).await.expect("Failed to create TestDbPools");
     let fusillade_test_pools = TestDbPools::new(fusillade_pool)
@@ -311,6 +321,7 @@ pub fn create_test_config() -> crate::config::Config {
         onboarding_url: None,
         support_email: "support@test.com".to_string(),
         connections: Default::default(),
+        responses: Default::default(),
     }
 }
 

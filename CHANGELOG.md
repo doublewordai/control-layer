@@ -1,5 +1,45 @@
 # Changelog
 
+## [8.46.0](https://github.com/doublewordai/control-layer/compare/v8.45.0...v8.46.0) (2026-05-05)
+
+
+### Features
+
+* **webhooks:** allow org members read-only access to org webhooks ([#1043](https://github.com/doublewordai/control-layer/issues/1043)) ([4bf5b54](https://github.com/doublewordai/control-layer/commit/4bf5b54142b57d34bdf2456202f1db30d539461f))
+
+
+### Bug Fixes
+
+* **deps:** clear all 36 open Dependabot vulnerabilities ([#1045](https://github.com/doublewordai/control-layer/issues/1045)) ([fa79316](https://github.com/doublewordai/control-layer/commit/fa793161b73ae32432cd8a7d1e5f2ca0554469c2))
+
+## [8.45.0](https://github.com/doublewordai/control-layer/compare/v8.44.3...v8.45.0) (2026-04-30)
+
+
+### Features
+
+* dwctl migration for multi-step response analytics linkage ([#1036](https://github.com/doublewordai/control-layer/issues/1036)) ([d9eb4bd](https://github.com/doublewordai/control-layer/commit/d9eb4bd562b507183cf8cb2dc6f64fab78b7bff9))
+
+## [8.44.3](https://github.com/doublewordai/control-layer/compare/v8.44.2...v8.44.3) (2026-04-28)
+
+
+### Bug Fixes
+
+* preserve upstream error codes instead of wrapping as 500 ([#1031](https://github.com/doublewordai/control-layer/issues/1031)) ([ddd7079](https://github.com/doublewordai/control-layer/commit/ddd7079c1af3e12e6b4e4d7e7f10a5dd7824731f))
+
+## [8.44.2](https://github.com/doublewordai/control-layer/compare/v8.44.1...v8.44.2) (2026-04-27)
+
+
+### Bug Fixes
+
+* filter priority from queue metrics ([#1029](https://github.com/doublewordai/control-layer/issues/1029)) ([89c92d5](https://github.com/doublewordai/control-layer/commit/89c92d57c6151e5e26818abd5b93c91a6e68db7d))
+
+## [8.44.1](https://github.com/doublewordai/control-layer/compare/v8.44.0...v8.44.1) (2026-04-27)
+
+
+### Bug Fixes
+
+* batch id attribution and completion window filtering ([#1025](https://github.com/doublewordai/control-layer/issues/1025)) ([2928686](https://github.com/doublewordai/control-layer/commit/29286866bbe40991c09b3a601899ca841d23d41b))
+
 ## [8.44.0](https://github.com/doublewordai/control-layer/compare/v8.43.0...v8.44.0) (2026-04-25)
 
 

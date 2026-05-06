@@ -27,6 +27,10 @@ use super::store::{self as response_store};
 /// `complete-response` job then transitions it to `"completed"`.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CreateResponseInput {
+    /// Pre-generated batch UUID; becomes the fusillade batch's primary key.
+    /// Must match the `x-fusillade-batch-id` header attached to the proxied
+    /// request so the http_analytics row links back to the same batch.
+    pub batch_id: Uuid,
     /// Pre-generated request UUID; becomes the fusillade request's primary key.
     pub request_id: Uuid,
     /// The full request body as JSON string.
@@ -105,6 +109,7 @@ pub async fn build_create_response_job<P: sqlx_pool_router::PoolProvider + Clone
             );
 
             let batch_input = fusillade::CreateSingleRequestBatchInput {
+                batch_id: Some(input.batch_id),
                 request_id: input.request_id,
                 body: input.body,
                 model: input.model.clone(),
@@ -175,6 +180,8 @@ pub struct CompleteResponseInput {
 
     // Fields below are used only when create-response hasn't run yet and
     // we need to synthesize the row ourselves.
+    /// Pre-generated batch UUID (extracted from `x-fusillade-batch-id`).
+    pub batch_id: Uuid,
     /// Pre-generated request UUID (matches `response_id` minus prefix).
     pub request_id: Uuid,
     /// Original request body (JSON string).
@@ -202,54 +209,51 @@ pub async fn build_complete_response_job<P: sqlx_pool_router::PoolProvider + Clo
     Job::<CompleteResponseInput, _>::builder()
         .state(state)
         .step(|cx, input: CompleteResponseInput| async move {
-            if (200..300).contains(&input.status_code) {
-                let create_ctx = response_store::CreateContext {
-                    request_id: input.request_id,
-                    request_body: &input.request_body,
-                    model: &input.model,
-                    endpoint: &input.endpoint,
-                    base_url: &input.base_url,
-                    api_key: input.api_key.as_deref(),
-                };
-                if let Err(e) = response_store::complete_response_idempotent(
-                    &cx.state.request_manager,
-                    &cx.state.dwctl_pool,
-                    &input.response_id,
-                    &input.response_body,
-                    input.status_code,
-                    create_ctx,
-                )
-                .await
-                {
-                    tracing::error!(
-                        response_id = %input.response_id,
-                        error = %e,
-                        "Failed to complete response in fusillade"
-                    );
-                    return Err(TaskError::Retryable(e.to_string()));
-                }
+            // Store all responses (success and error) via complete_response_idempotent.
+            // Previously, non-2xx responses used fail_request which hardcoded status 500,
+            // losing the real upstream status code (e.g. 403 became 500). By using
+            // complete_request for all statuses, the actual HTTP status and response
+            // body are preserved for callers to inspect.
+            let create_ctx = response_store::CreateContext {
+                batch_id: input.batch_id,
+                request_id: input.request_id,
+                request_body: &input.request_body,
+                model: &input.model,
+                endpoint: &input.endpoint,
+                base_url: &input.base_url,
+                api_key: input.api_key.as_deref(),
+            };
+            if let Err(e) = response_store::complete_response_idempotent(
+                &cx.state.request_manager,
+                &cx.state.dwctl_pool,
+                &input.response_id,
+                &input.response_body,
+                input.status_code,
+                create_ctx,
+            )
+            .await
+            {
+                tracing::error!(
+                    response_id = %input.response_id,
+                    error = %e,
+                    "Failed to complete response in fusillade"
+                );
+                return Err(TaskError::Retryable(e.to_string()));
+            }
 
+            if input.status_code >= 400 {
+                tracing::debug!(
+                    response_id = %input.response_id,
+                    status_code = input.status_code,
+                    body_size = input.response_body.len(),
+                    "Upstream error response stored in fusillade"
+                );
+            } else {
                 tracing::debug!(
                     response_id = %input.response_id,
                     status_code = input.status_code,
                     body_size = input.response_body.len(),
                     "Response completed in fusillade"
-                );
-            } else {
-                let error_msg = format!("Upstream returned {}: {}", input.status_code, input.response_body);
-                if let Err(e) = response_store::fail_response(&cx.state.request_manager, &input.response_id, &error_msg).await {
-                    tracing::error!(
-                        response_id = %input.response_id,
-                        error = %e,
-                        "Failed to mark response as failed in fusillade"
-                    );
-                    return Err(TaskError::Retryable(e.to_string()));
-                }
-
-                tracing::debug!(
-                    response_id = %input.response_id,
-                    status_code = input.status_code,
-                    "Response marked as failed in fusillade"
                 );
             }
 
