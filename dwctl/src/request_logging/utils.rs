@@ -455,6 +455,34 @@ mod tests {
     }
 
     #[test]
+    fn test_process_sse_chunks_error_frame() {
+        // Provider crashed mid-stream: 200 OK headers were sent, then an error frame
+        // arrived in place of the terminal usage chunk + [DONE]. We must capture the
+        // error chunk so analytics can reclassify the request as failed.
+        let chunks = vec![
+            r#"{"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"content":"hi"}}]}"#
+                .to_string(),
+            r#"{"error":{"message":"Engine was shut down during token generation","type":"internal_server_error","code":500}}"#.to_string(),
+        ];
+
+        let result = process_sse_chunks(chunks);
+
+        match result {
+            AiResponse::ChatCompletionsStream(parsed_chunks) => {
+                assert_eq!(parsed_chunks.len(), 2);
+                assert!(matches!(parsed_chunks[0], ChatCompletionChunk::Normal(_)));
+                match &parsed_chunks[1] {
+                    ChatCompletionChunk::Error(e) => {
+                        assert_eq!(e.error.get("code").and_then(|v| v.as_i64()), Some(500));
+                    }
+                    other => panic!("Expected Error chunk, got {:?}", other),
+                }
+            }
+            _ => panic!("Expected ChatCompletionsStream variant"),
+        }
+    }
+
+    #[test]
     fn test_process_sse_chunks_done_marker() {
         let chunks = vec!["[DONE]".to_string()];
 
