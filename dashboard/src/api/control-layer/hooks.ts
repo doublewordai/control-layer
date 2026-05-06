@@ -82,11 +82,13 @@ export function useUsers(options?: UsersQuery & { enabled?: boolean }) {
 }
 
 
-export function useUser(id: string, options?: { include?: string }) {
+export function useUser(id: string, options?: { include?: string; enabled?: boolean }) {
+  const { enabled = true, include } = options || {};
   return useQuery({
-    queryKey: queryKeys.users.byId(id, options?.include),
-    queryFn: () => dwctlApi.users.get(id, options),
+    queryKey: queryKeys.users.byId(id, include),
+    queryFn: () => dwctlApi.users.get(id, { include }),
     staleTime: 30 * 1000, // 30 seconds - matches useTransactions to keep balance in sync
+    enabled,
   });
 }
 

@@ -9,7 +9,7 @@ The Doubleword Control Layer (dwctl) is a high-performance AI model gateway prov
 
 ### Prerequisites
 - **Rust 1.88+** (SQLx compatibility requirement)
-- **Node.js 20+** with npm
+- **Node.js 20.19+** (or 22.12+) — required by Vite 7; declared in `dashboard/package.json` `engines`
 - **PostgreSQL** (running database required for Rust compilation due to SQLx)
 - **just** (command runner): `cargo install just`
 - **Docker** with Compose plugin

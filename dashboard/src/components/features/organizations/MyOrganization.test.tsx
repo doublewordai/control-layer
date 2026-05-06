@@ -101,7 +101,7 @@ describe("MyOrganization", () => {
     ).toBeInTheDocument();
   });
 
-  it("does not render notification settings for regular members", async () => {
+  it("renders read-only webhooks view for regular members", async () => {
     server.use(userWithOrg("member"));
     const { container } = render(<MyOrganization />, {
       wrapper: createWrapper(),
@@ -113,8 +113,18 @@ describe("MyOrganization", () => {
       ).toBeInTheDocument();
     });
 
+    // Read-only view: heading is "Webhooks", and admin-only controls are absent.
+    expect(
+      within(container).getByRole("heading", { name: "Webhooks" }),
+    ).toBeInTheDocument();
     expect(
       within(container).queryByRole("heading", { name: "Notifications" }),
+    ).not.toBeInTheDocument();
+    expect(
+      within(container).queryByRole("button", { name: "Add webhook" }),
+    ).not.toBeInTheDocument();
+    expect(
+      within(container).queryByRole("switch", { name: "Email notifications" }),
     ).not.toBeInTheDocument();
   });
 
