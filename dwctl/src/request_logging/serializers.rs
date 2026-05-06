@@ -359,15 +359,21 @@ impl UsageMetrics {
         let response_metrics = TokenMetrics::from(parsed_response);
 
         // Streams that started with HTTP 200 but ended with an embedded provider error frame
-        // get reclassified to 502 so success-rate / availability metrics, the credits-eligibility
+        // get reclassified to 500 so success-rate / availability metrics, the credits-eligibility
         // check, and dashboards keyed on `status_code BETWEEN 200 AND 299` exclude them.
+        // 500 matches what fusillade reclassifies these to in its HTTP layer, so the two views
+        // (analytics row, fusillade request state) agree on a number for the same logical event.
         let upstream_status = response_data.status.as_u16() as i32;
         let stream_errored = match parsed_response {
             AiResponse::ChatCompletionsStream(chunks) => chunks.iter().any(|c| matches!(c, ChatCompletionChunk::Error(_))),
             AiResponse::CompletionsStream(chunks) => chunks.iter().any(|c| matches!(c, CompletionChunk::Error(_))),
             _ => false,
         };
-        let status_code = if upstream_status < 400 && stream_errored { 502 } else { upstream_status };
+        let status_code = if upstream_status < 400 && stream_errored {
+            500
+        } else {
+            upstream_status
+        };
 
         Self {
             instance_id,
@@ -1008,7 +1014,7 @@ mod tests {
     }
 
     #[test]
-    fn test_fusillade_stream_with_embedded_error_frame_reclassifies_to_502() {
+    fn test_fusillade_stream_with_embedded_error_frame_reclassifies_to_500() {
         // Reproduces trace 91ea8848dc08735f183449277b8b8846: Dynamo started a 200 OK
         // SSE stream, generated some delta chunks, then crashed mid-generation and
         // emitted an error frame in place of the terminal usage chunk + [DONE].
@@ -1051,9 +1057,10 @@ mod tests {
         );
 
         assert_eq!(
-            metrics.status_code, 502,
-            "200 OK with embedded SSE error frame must be reclassified to 502 so success-rate \
-             metrics and credit-eligibility checks exclude this row"
+            metrics.status_code, 500,
+            "200 OK with embedded SSE error frame must be reclassified to 500 so success-rate \
+             metrics and credit-eligibility checks exclude this row, and so the analytics row \
+             agrees with fusillade's HTTP-layer reclassification"
         );
         assert_eq!(metrics.total_tokens, 0);
         assert_eq!(metrics.response_type, "chat_completion_stream");
@@ -1062,7 +1069,7 @@ mod tests {
     #[test]
     fn test_fusillade_stream_with_real_error_status_is_preserved() {
         // If upstream returns a real non-2xx status (no SSE body to scan), we must NOT
-        // override it to 502 — the real status code is more informative.
+        // override it to 500. The real status code is more informative.
         let request_json = r#"{"model": "gpt-4", "messages": [{"role": "user", "content": "hi"}], "stream": false}"#;
         let mut headers = HashMap::new();
         headers.insert("x-fusillade-stream".to_string(), vec![Bytes::from("true")]);
