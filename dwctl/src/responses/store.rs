@@ -4,7 +4,7 @@
 //! All fusillade operations go through the `Storage` trait via `request_manager`.
 //! The only raw SQL is the `api_keys` lookup which queries a dwctl-owned table.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
@@ -45,6 +45,18 @@ pub struct PendingResponseInput {
     /// `base_url` column points at the dwctl loopback so onwards can
     /// pick a target / honor strict mode at fire time.
     pub base_url: String,
+    /// Names of server-side tools registered for this request (resolved
+    /// from `tool_sources` joined with the user's groups + the deployment).
+    /// The transition function uses this to decide which tool_calls
+    /// returned by the model can be auto-dispatched server-side and which
+    /// must be passed through to the client as `function_call` output items.
+    ///
+    /// When a tool_call's name is missing from this set, it's treated as a
+    /// client-side tool: the loop completes with the model's response, and
+    /// `assemble_response` surfaces the call as a `function_call` item per
+    /// the OpenAI Responses contract — the client is expected to execute
+    /// it and submit the result via a follow-up request.
+    pub resolved_tool_names: HashSet<String>,
 }
 
 /// Header set by the responses middleware so the outlet handler knows which
@@ -741,7 +753,7 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> MultiStepStore for Fusilla
         let pending = self.pending_input(request_id)?;
         let parsed = super::transition::parse_parent_request(&pending.body).map_err(StoreError::StorageError)?;
         let chain = <Self as MultiStepStore>::list_chain(self, request_id, scope_parent).await?;
-        Ok(super::transition::decide_next_action(&parsed, &chain))
+        Ok(super::transition::decide_next_action(&parsed, &chain, &pending.resolved_tool_names))
     }
 
     async fn record_step(
