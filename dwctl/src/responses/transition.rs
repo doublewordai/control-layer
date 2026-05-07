@@ -168,12 +168,15 @@ fn translate_input_items(items: &[Value]) -> Result<Vec<Value>, String> {
                 out.push(Value::Object(translated));
             }
             "function_call" => {
-                let call_id = item
+                let obj = item
+                    .as_object()
+                    .ok_or_else(|| format!("input[{idx}]: 'function_call' item must be a JSON object"))?;
+                let call_id = obj
                     .get("call_id")
                     .and_then(|x| x.as_str())
                     .ok_or_else(|| format!("input[{idx}]: 'function_call' missing 'call_id'"))?
                     .to_string();
-                let name = item
+                let name = obj
                     .get("name")
                     .and_then(|x| x.as_str())
                     .ok_or_else(|| format!("input[{idx}]: 'function_call' missing 'name'"))?
@@ -197,7 +200,7 @@ fn translate_input_items(items: &[Value]) -> Result<Vec<Value>, String> {
                 // explicit; both produce the same bytes for `Value`,
                 // but the explicit call is what a reader expects to
                 // see when the goal is "a JSON-encoded string."
-                let arguments_str = match item.get("arguments") {
+                let arguments_str = match obj.get("arguments") {
                     Some(Value::String(s)) => s.clone(),
                     Some(Value::Null) | None => "{}".to_string(),
                     Some(other) => serde_json::to_string(other).unwrap_or_else(|_| "{}".to_string()),
@@ -225,7 +228,10 @@ fn translate_input_items(items: &[Value]) -> Result<Vec<Value>, String> {
                 }));
             }
             "function_call_output" => {
-                let call_id = item
+                let obj = item
+                    .as_object()
+                    .ok_or_else(|| format!("input[{idx}]: 'function_call_output' item must be a JSON object"))?;
+                let call_id = obj
                     .get("call_id")
                     .and_then(|x| x.as_str())
                     .ok_or_else(|| format!("input[{idx}]: 'function_call_output' missing 'call_id'"))?;
@@ -236,7 +242,7 @@ fn translate_input_items(items: &[Value]) -> Result<Vec<Value>, String> {
                 // like missing — `Value::Null` would otherwise become
                 // the string "null", surfaced back to the user; the
                 // spec intent is "no output".
-                let content_str = match item.get("output") {
+                let content_str = match obj.get("output") {
                     Some(Value::String(s)) => s.clone(),
                     Some(Value::Null) | None => String::new(),
                     Some(other) => serde_json::to_string(other).unwrap_or_default(),
@@ -730,6 +736,24 @@ mod tests {
         assert_eq!(p.initial_messages.len(), 2);
         assert_eq!(p.initial_messages[0]["role"], "user");
         assert_eq!(p.initial_messages[1]["role"], "assistant");
+    }
+
+    #[test]
+    fn non_object_input_items_return_clear_errors() {
+        // Bare strings/numbers/arrays in the input list aren't valid
+        // translatable items. Each translator branch surfaces a
+        // precise error rather than letting a missing-field check
+        // below produce a misleading message.
+        //
+        // A bare primitive defaults to `type: "message"` (the
+        // `unwrap_or("message")` fallback) and triggers the message
+        // branch's object validation.
+        let err = match parse_parent_request(r#"{"model":"m","input":["bare string"]}"#) {
+            Ok(_) => panic!("expected Err for bare string in input"),
+            Err(e) => e,
+        };
+        assert!(err.contains("must be a JSON object"), "got: {err}");
+        assert!(err.contains("'message'"), "got: {err}");
     }
 
     #[test]
