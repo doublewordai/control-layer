@@ -110,11 +110,23 @@ impl<P: PoolProvider + Clone> FusilladeResponseStore<P> {
     /// `request_id` parameter.
     pub fn register_pending(&self, input: PendingResponseInput) -> Uuid {
         let head_step_uuid = Uuid::new_v4();
+        self.register_pending_with_id(head_step_uuid, input);
+        head_step_uuid
+    }
+
+    /// Variant of [`register_pending`] for callers that already have a
+    /// stable response id and need the side-channel keyed by it. The
+    /// daemon path uses this: when a fusillade row is claimed for
+    /// `/v1/responses`, its `request_id` *is* the head step UUID
+    /// (`record_step` reuses `request_id` as the head step's id), so
+    /// the loop's `next_action_for(request_id)` lookup must match.
+    /// Without this, daemon-driven multi-step requests fail at the
+    /// first iteration with "no pending input registered".
+    pub fn register_pending_with_id(&self, head_step_uuid: Uuid, input: PendingResponseInput) {
         let key = head_step_uuid.to_string();
         if let Ok(mut guard) = self.pending_inputs.write() {
             guard.insert(key, input);
         }
-        head_step_uuid
     }
 
     /// Remove the side-channel entry for a completed (or failed)

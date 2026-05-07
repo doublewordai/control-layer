@@ -44,7 +44,7 @@ use onwards::client::HttpClient;
 use onwards::traits::{RequestContext, ToolExecutor};
 use onwards::{LoopConfig, LoopError, MultiStepStore, UpstreamTarget};
 
-use crate::responses::store::FusilladeResponseStore;
+use crate::responses::store::{FusilladeResponseStore, PendingResponseInput};
 use crate::tool_executor::ResolvedTools;
 
 /// Dispatches per-claim work to the multi-step loop for `/v1/responses`
@@ -200,9 +200,11 @@ where
         // tool set their original /v1/responses POST would have seen
         // — no daemon-vs-realtime tool-availability divergence.
         let mut tool_ctx = RequestContext::new().with_model(request.data.model.clone());
+        let mut resolved_tool_names = std::collections::HashSet::new();
         if let Some(resolver) = &self.tool_resolver {
             match resolver.resolve(&request.data.api_key, &request.data.model).await {
                 Ok(Some(resolved)) => {
+                    resolved_tool_names = resolved.tools.keys().cloned().collect();
                     tool_ctx = tool_ctx.with_extension(ResolvedTools(Arc::new(resolved)));
                 }
                 Ok(None) => {
@@ -222,6 +224,38 @@ where
             }
         }
 
+        // The transition function (`next_action_for`) re-parses the
+        // user's `/v1/responses` body on every iteration to build the
+        // chat-completions messages array; without a `pending_input`
+        // registered under this request_id it errors at the first
+        // iteration. The warm path stashes this synchronously before
+        // kicking off the loop; the daemon path has to do the same
+        // here, sourcing the body and per-request fields from the
+        // claimed fusillade row. Without this, daemon-driven
+        // multi-step requests fail with "no pending input registered"
+        // immediately — which is why `service_tier:"flex"` couldn't
+        // safely fall through to `handle_flex` until now.
+        //
+        // The fusillade row's `id` is the same UUID the loop uses as
+        // its `request_id` (and that `record_step` reuses as the head
+        // step's id), so we register under exactly that key.
+        let pending = PendingResponseInput {
+            body: request.data.body.clone(),
+            api_key: if request.data.api_key.is_empty() {
+                None
+            } else {
+                Some(request.data.api_key.clone())
+            },
+            created_by: if request.data.created_by.is_empty() {
+                None
+            } else {
+                Some(request.data.created_by.clone())
+            },
+            base_url: request.data.endpoint.clone(),
+            resolved_tool_names,
+        };
+        self.response_store.register_pending_with_id(request.data.id.0, pending);
+
         // Daemon path: no event sink — the user's HTTP connection is
         // long gone by the time we claim. Streaming requests use the
         // warm path (responses::streaming module) which runs the loop
@@ -239,6 +273,12 @@ where
             0,
         )
         .await;
+
+        // Drop the side-channel entry whether the loop succeeded or
+        // failed — same idempotent cleanup pattern the warm path
+        // uses. Without this the `pending_inputs` map grows
+        // unbounded across daemon-claimed requests.
+        self.response_store.unregister_pending(&request_id);
 
         match result {
             Ok(_final_payload) => {
