@@ -122,10 +122,26 @@ impl<P: PoolProvider + Clone> FusilladeResponseStore<P> {
     /// the loop's `next_action_for(request_id)` lookup must match.
     /// Without this, daemon-driven multi-step requests fail at the
     /// first iteration with "no pending input registered".
+    ///
+    /// A poisoned `pending_inputs` lock is logged at error level
+    /// rather than silently dropped — otherwise the failure would
+    /// surface downstream as a confusing "no pending input
+    /// registered" error from `next_action_for`, with no obvious
+    /// connection to the real cause.
     pub fn register_pending_with_id(&self, head_step_uuid: Uuid, input: PendingResponseInput) {
         let key = head_step_uuid.to_string();
-        if let Ok(mut guard) = self.pending_inputs.write() {
-            guard.insert(key, input);
+        match self.pending_inputs.write() {
+            Ok(mut guard) => {
+                guard.insert(key, input);
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    request_id = %head_step_uuid,
+                    "pending_inputs lock poisoned in register_pending_with_id; \
+                     multi-step loop will fail with 'no pending input registered'",
+                );
+            }
         }
     }
 

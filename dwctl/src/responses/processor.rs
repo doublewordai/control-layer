@@ -256,6 +256,19 @@ where
         };
         self.response_store.register_pending_with_id(request.data.id.0, pending);
 
+        // RAII cleanup: even if the loop panics or the daemon task
+        // is cancelled mid-await, the side-channel entry must be
+        // dropped — otherwise `pending_inputs` grows unbounded
+        // across daemon-claimed requests. An explicit
+        // `unregister_pending` call after the loop wouldn't run on
+        // task cancellation (the future is dropped at the await
+        // point); the guard's `Drop` runs in either path.
+        let cleanup_store = self.response_store.clone();
+        let cleanup_id = request_id.clone();
+        let _pending_guard = scopeguard::guard((), move |_| {
+            cleanup_store.unregister_pending(&cleanup_id);
+        });
+
         // Daemon path: no event sink — the user's HTTP connection is
         // long gone by the time we claim. Streaming requests use the
         // warm path (responses::streaming module) which runs the loop
@@ -273,12 +286,6 @@ where
             0,
         )
         .await;
-
-        // Drop the side-channel entry whether the loop succeeded or
-        // failed — same idempotent cleanup pattern the warm path
-        // uses. Without this the `pending_inputs` map grows
-        // unbounded across daemon-claimed requests.
-        self.response_store.unregister_pending(&request_id);
 
         match result {
             Ok(_final_payload) => {

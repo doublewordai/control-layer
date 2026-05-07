@@ -177,26 +177,23 @@ pub async fn responses_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     //   stream=*,     background=true,  !flex → 202 + spawned loop, GET /v1/responses/{id} polls
     //   any flex                                → falls through to handle_flex below
     let stream_requested = is_responses_api && !background && request_value["stream"].as_bool().unwrap_or(false);
-    if !is_flex
-        && stream_requested
-        && let Some(resp) = try_warm_path_stream(&state, &request_value, api_key.as_deref(), model).await
-    {
-        return resp;
-    }
-    if !is_flex
-        && is_responses_api
-        && !background
-        && !stream_requested
-        && let Some(resp) = try_warm_path_blocking(&state, &request_value, api_key.as_deref(), model).await
-    {
-        return resp;
-    }
-    if !is_flex
-        && is_responses_api
-        && background
-        && let Some(resp) = try_warm_path_background(&state, &request_value, api_key.as_deref(), model).await
-    {
-        return resp;
+    match warm_path_branch(is_responses_api, is_flex, background, stream_requested) {
+        WarmPathBranch::Stream => {
+            if let Some(resp) = try_warm_path_stream(&state, &request_value, api_key.as_deref(), model).await {
+                return resp;
+            }
+        }
+        WarmPathBranch::Blocking => {
+            if let Some(resp) = try_warm_path_blocking(&state, &request_value, api_key.as_deref(), model).await {
+                return resp;
+            }
+        }
+        WarmPathBranch::Background => {
+            if let Some(resp) = try_warm_path_background(&state, &request_value, api_key.as_deref(), model).await {
+                return resp;
+            }
+        }
+        WarmPathBranch::FallThrough => {}
     }
 
     tracing::debug!(
@@ -306,6 +303,44 @@ fn resolve_service_tier(tier: Option<&str>) -> ServiceTier {
         Some("flex") => ServiceTier::Flex,
         // "priority", "default", "auto", None → realtime
         _ => ServiceTier::Realtime,
+    }
+}
+
+/// Which warm-path branch (if any) should handle a request, given
+/// the orthogonal flags `(is_responses_api, is_flex, background,
+/// stream_requested)`. `FallThrough` means the request continues to
+/// the realtime / flex dispatch below — that's how flex
+/// `/v1/responses` reaches `handle_flex` and how chat completions /
+/// embeddings always reach `handle_realtime`.
+///
+/// Extracted as a pure function so the routing decision is testable
+/// without standing up the full middleware state.
+#[derive(Debug, PartialEq, Eq)]
+enum WarmPathBranch {
+    Stream,
+    Blocking,
+    Background,
+    FallThrough,
+}
+
+fn warm_path_branch(is_responses_api: bool, is_flex: bool, background: bool, stream_requested: bool) -> WarmPathBranch {
+    // Flex must reach `handle_flex` to land in fusillade-pending
+    // state for the daemon. Engaging warm-path for flex would defeat
+    // the tier (the loop runs inline, billed as realtime).
+    if is_flex {
+        return WarmPathBranch::FallThrough;
+    }
+    // Warm path is /v1/responses-only — chat completions and
+    // embeddings stay on the single-step proxy path.
+    if !is_responses_api {
+        return WarmPathBranch::FallThrough;
+    }
+    if stream_requested {
+        WarmPathBranch::Stream
+    } else if background {
+        WarmPathBranch::Background
+    } else {
+        WarmPathBranch::Blocking
     }
 }
 
@@ -738,5 +773,47 @@ mod tests {
     #[test]
     fn test_resolve_service_tier_flex() {
         assert!(matches!(resolve_service_tier(Some("flex")), ServiceTier::Flex));
+    }
+
+    // Routing-decision tests for `warm_path_branch`. The whole point
+    // of this PR is that flex `/v1/responses` must skip the warm
+    // path and fall through to `handle_flex`; these tests pin that
+    // contract so a future refactor that re-engages warm-path for
+    // flex can't silently regress the routing back to the bug.
+
+    #[test]
+    fn warm_path_branch_flex_responses_falls_through_to_handle_flex() {
+        // The bug being fixed: flex /v1/responses used to engage warm
+        // path regardless of tier and run the loop inline at realtime
+        // cost. After the fix, every flex case must fall through.
+        for &background in &[false, true] {
+            for &stream in &[false, true] {
+                assert_eq!(
+                    warm_path_branch(true, true, background, stream),
+                    WarmPathBranch::FallThrough,
+                    "flex /v1/responses must fall through (background={background}, stream={stream})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn warm_path_branch_realtime_responses_picks_correct_warm_branch() {
+        // Realtime /v1/responses keeps the existing warm-path
+        // behavior: stream → SSE, background → spawned task, neither
+        // → blocking JSON.
+        assert_eq!(warm_path_branch(true, false, false, true), WarmPathBranch::Stream);
+        assert_eq!(warm_path_branch(true, false, true, false), WarmPathBranch::Background);
+        assert_eq!(warm_path_branch(true, false, false, false), WarmPathBranch::Blocking);
+    }
+
+    #[test]
+    fn warm_path_branch_chat_completions_always_falls_through() {
+        // Warm path is /v1/responses-only. Chat completions and
+        // embeddings never engage it regardless of tier — they go
+        // through the single-step proxy.
+        assert_eq!(warm_path_branch(false, false, false, false), WarmPathBranch::FallThrough);
+        assert_eq!(warm_path_branch(false, true, false, false), WarmPathBranch::FallThrough);
+        assert_eq!(warm_path_branch(false, false, false, true), WarmPathBranch::FallThrough);
     }
 }
