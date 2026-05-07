@@ -159,17 +159,23 @@ fn translate_input_items(items: &[Value]) -> Result<Vec<Value>, String> {
                     .ok_or_else(|| format!("input[{idx}]: 'function_call' missing 'name'"))?
                     .to_string();
                 // `arguments` is a JSON-encoded string per the Responses
-                // spec, but tolerate raw objects from looser callers.
-                // Explicit-null is treated like missing — a client
-                // serializing an arguments-less call sometimes emits
-                // `"arguments": null`, and `Value::Null.to_string()`
-                // would produce the literal string "null", which the
-                // upstream model would then try to parse as JSON
-                // arguments and reject.
+                // spec, but tolerate raw objects from looser callers
+                // (we'll serialize them back into the JSON string form
+                // chat-completions expects). Explicit-null is treated
+                // like missing — a client serializing an arguments-less
+                // call sometimes emits `"arguments": null`, and the
+                // literal string "null" would then be parsed as JSON
+                // arguments and rejected by the upstream model.
+                //
+                // `serde_json::to_string` (rather than `.to_string()`)
+                // for the fallback makes the JSON-serialization intent
+                // explicit; both produce the same bytes for `Value`,
+                // but the explicit call is what a reader expects to
+                // see when the goal is "a JSON-encoded string."
                 let arguments_str = match item.get("arguments") {
                     Some(Value::String(s)) => s.clone(),
                     Some(Value::Null) | None => "{}".to_string(),
-                    Some(other) => other.to_string(),
+                    Some(other) => serde_json::to_string(other).unwrap_or_else(|_| "{}".to_string()),
                 };
                 let new_tool_call = json!({
                     "id": call_id,
@@ -199,15 +205,16 @@ fn translate_input_items(items: &[Value]) -> Result<Vec<Value>, String> {
                     .and_then(|x| x.as_str())
                     .ok_or_else(|| format!("input[{idx}]: 'function_call_output' missing 'call_id'"))?;
                 // Tool output is conventionally a JSON-encoded string.
-                // Stringify non-string values so chat-completions sees a
-                // string `content`. Treat explicit-null like missing —
-                // `Value::Null.to_string()` would produce the literal
-                // "null" which the model would surface back to the
-                // user, while the spec intent is "no output".
+                // Stringify non-string values via `serde_json::to_string`
+                // so chat-completions sees a string `content` (rather
+                // than the literal `Display` form). Treat explicit-null
+                // like missing — `Value::Null` would otherwise become
+                // the string "null", surfaced back to the user; the
+                // spec intent is "no output".
                 let content_str = match item.get("output") {
                     Some(Value::String(s)) => s.clone(),
                     Some(Value::Null) | None => String::new(),
-                    Some(other) => other.to_string(),
+                    Some(other) => serde_json::to_string(other).unwrap_or_default(),
                 };
                 out.push(json!({
                     "role": "tool",
@@ -815,6 +822,50 @@ mod tests {
         let body = r#"{"model":"m","input":[]}"#;
         let p = parse_parent_request(body).unwrap();
         assert!(p.initial_messages.is_empty());
+    }
+
+    #[test]
+    fn raw_object_arguments_are_json_serialized() {
+        // Looser clients sometimes send `arguments` as a raw JSON
+        // object instead of the spec-mandated JSON-encoded string.
+        // The translator should serialize it back into a string so
+        // the upstream model sees a valid `arguments` value.
+        let body = r#"{
+            "model": "m",
+            "input": [
+                {"type":"function_call","call_id":"c","name":"f","arguments":{"query":"x"}}
+            ]
+        }"#;
+        let p = parse_parent_request(body).unwrap();
+        let tool_calls = p.initial_messages[0]["tool_calls"].as_array().unwrap();
+        assert_eq!(tool_calls[0]["function"]["arguments"], "{\"query\":\"x\"}");
+    }
+
+    #[test]
+    fn normalizes_mixed_wrapped_and_spec_flat_tools_in_one_array() {
+        // Clients that hand-write requests sometimes mix shapes in
+        // the same `tools` array. Each entry should be normalized
+        // independently — wrapped items pass through, spec-flat
+        // items get wrapped.
+        let body = r#"{
+            "model": "m",
+            "input": "hi",
+            "tools": [
+                {"type":"function","function":{"name":"wrapped","description":"w"}},
+                {"type":"function","name":"flat","description":"f","parameters":{"type":"object"}}
+            ]
+        }"#;
+        let p = parse_parent_request(body).unwrap();
+        let arr = p.tools.unwrap();
+        let arr = arr.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        // Both end up wrapped after normalization.
+        assert_eq!(arr[0]["function"]["name"], "wrapped");
+        assert_eq!(arr[1]["function"]["name"], "flat");
+        // The second item's flat fields must not survive at the top
+        // level after wrapping.
+        assert!(arr[1].get("name").is_none());
+        assert!(arr[1].get("parameters").is_none());
     }
 
     fn names(items: &[&str]) -> HashSet<String> {
