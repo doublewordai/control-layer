@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.46.1](https://github.com/doublewordai/control-layer/compare/v8.46.0...v8.46.1) (2026-05-07)
+
+
+### Bug Fixes
+
+* pass through client-side tool_calls instead of dispatching them ([#1049](https://github.com/doublewordai/control-layer/issues/1049)) ([88ac176](https://github.com/doublewordai/control-layer/commit/88ac176d60b0a0b518d7b7b4ae3f5ff3d48ef129))
+
 ## [8.46.0](https://github.com/doublewordai/control-layer/compare/v8.45.0...v8.46.0) (2026-05-05)
 
 
