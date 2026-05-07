@@ -86,16 +86,17 @@ pub(crate) fn parse_parent_request(body: &str) -> Result<ParsedRequest, String> 
         // Open Responses 'input' may be a string or an array of items
         match input {
             Value::String(s) => vec![json!({"role": "user", "content": s})],
-            Value::Array(items) => items.clone(),
+            Value::Array(items) => translate_input_items(items)?,
             _ => return Err("'input' must be string or array".into()),
         }
     } else if let Some(messages) = v.get("messages").and_then(|m| m.as_array()) {
+        // Direct chat-completions shape — pass through verbatim.
         messages.clone()
     } else {
         return Err("parent body missing 'input' or 'messages'".into());
     };
 
-    let tools = v.get("tools").cloned();
+    let tools = v.get("tools").map(normalize_tools);
     let stream = v.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
 
     Ok(ParsedRequest {
@@ -104,6 +105,159 @@ pub(crate) fn parse_parent_request(body: &str) -> Result<ParsedRequest, String> 
         tools,
         stream,
     })
+}
+
+/// Translate Open Responses `input` items into chat-completions `messages`
+/// shape. The upstream model speaks chat-completions, so every message
+/// must carry a `role`, and tool_call items must live as `tool_calls`
+/// arrays on assistant messages — not as free-floating items.
+///
+/// Per-item rules:
+/// - `{type:"message", role, content}` → `{role, content}` (drop `type`)
+/// - `{type:"function_call", call_id, name, arguments}` → folded onto the
+///   preceding assistant message's `tool_calls` array if there is one;
+///   otherwise a new `{role:"assistant", content:null, tool_calls:[…]}`
+///   message. Consecutive function_calls collapse into a single assistant
+///   message with multiple `tool_calls`. An assistant text message
+///   immediately followed by function_calls absorbs them so the upstream
+///   sees one combined `{role:"assistant", content:"…", tool_calls:[…]}`.
+/// - `{type:"function_call_output", call_id, output}` →
+///   `{role:"tool", tool_call_id:call_id, content:output}`
+/// - `{type:"reasoning", …}` → dropped. Reasoning items are for client
+///   display; chat-completions has no equivalent shape and most upstream
+///   models reject the type. Dropping is the safe default.
+///
+/// Without this translation, `input.clone()` was passed verbatim to the
+/// model, and any non-`message` item produced a chat-completions message
+/// with no `role` field — the upstream then 422'd with
+/// `messages[N]: missing field 'role'`, breaking every multi-turn
+/// tool-calling conversation.
+fn translate_input_items(items: &[Value]) -> Result<Vec<Value>, String> {
+    let mut out: Vec<Value> = Vec::new();
+    for (idx, item) in items.iter().enumerate() {
+        // `type` defaults to "message" so historical clients that send
+        // bare `{role, content}` items still translate correctly.
+        let item_type = item.get("type").and_then(|t| t.as_str()).unwrap_or("message");
+        match item_type {
+            "message" => {
+                let role = item
+                    .get("role")
+                    .and_then(|r| r.as_str())
+                    .ok_or_else(|| format!("input[{idx}]: 'message' item missing 'role'"))?;
+                let content = item.get("content").cloned().unwrap_or(Value::Null);
+                out.push(json!({"role": role, "content": content}));
+            }
+            "function_call" => {
+                let call_id = item
+                    .get("call_id")
+                    .and_then(|x| x.as_str())
+                    .ok_or_else(|| format!("input[{idx}]: 'function_call' missing 'call_id'"))?
+                    .to_string();
+                let name = item
+                    .get("name")
+                    .and_then(|x| x.as_str())
+                    .ok_or_else(|| format!("input[{idx}]: 'function_call' missing 'name'"))?
+                    .to_string();
+                // `arguments` is a JSON-encoded string per the Responses
+                // spec, but tolerate raw objects from looser callers.
+                let arguments_str = match item.get("arguments") {
+                    Some(Value::String(s)) => s.clone(),
+                    Some(other) => other.to_string(),
+                    None => "{}".to_string(),
+                };
+                let new_tool_call = json!({
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": name, "arguments": arguments_str},
+                });
+
+                if let Some(last) = out.last_mut()
+                    && last.get("role").and_then(|r| r.as_str()) == Some("assistant")
+                    && let Some(obj) = last.as_object_mut()
+                {
+                    let tool_calls = obj.entry("tool_calls").or_insert_with(|| json!([]));
+                    if let Value::Array(arr) = tool_calls {
+                        arr.push(new_tool_call);
+                        continue;
+                    }
+                }
+                out.push(json!({
+                    "role": "assistant",
+                    "content": Value::Null,
+                    "tool_calls": [new_tool_call],
+                }));
+            }
+            "function_call_output" => {
+                let call_id = item
+                    .get("call_id")
+                    .and_then(|x| x.as_str())
+                    .ok_or_else(|| format!("input[{idx}]: 'function_call_output' missing 'call_id'"))?;
+                // Tool output is conventionally a JSON-encoded string.
+                // Stringify non-string values so chat-completions sees a
+                // string `content`.
+                let content_str = match item.get("output") {
+                    Some(Value::String(s)) => s.clone(),
+                    Some(other) => other.to_string(),
+                    None => String::new(),
+                };
+                out.push(json!({
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": content_str,
+                }));
+            }
+            "reasoning" => {
+                // Reasoning items are not valid chat-completions
+                // messages. Drop with a debug trace so unexpected
+                // disappearances are diagnosable.
+                tracing::debug!(idx, "dropping 'reasoning' input item during /v1/responses translation");
+            }
+            other => {
+                // Unknown types: warn rather than fail so a future spec
+                // addition doesn't take the whole request down. The
+                // model may still error if it needed the item, but at
+                // least the failure mode is observable.
+                tracing::warn!(idx, item_type = %other, "unknown Open Responses input item type; dropping");
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Normalize the `tools` array into chat-completions wrapped shape:
+/// `[{type:"function", function:{name, description, parameters, …}}]`.
+///
+/// Accepts:
+/// - already-wrapped (`{type:"function", function:{…}}`) → pass through
+/// - Open Responses spec-flat (`{type:"function", name, description, parameters, …}`)
+///   → wrap into `{type:"function", function:{…}}`
+///
+/// Without this, spec-flat tools were forwarded as-is and rejected by
+/// the upstream model with a deserialization error similar to the
+/// per-message role bug. See task 5 in the bug report.
+fn normalize_tools(tools: &Value) -> Value {
+    let Value::Array(items) = tools else {
+        return tools.clone();
+    };
+    let normalized: Vec<Value> = items
+        .iter()
+        .map(|item| {
+            // Already wrapped — leave it.
+            if item.get("function").is_some() {
+                return item.clone();
+            }
+            // Spec-flat: collect known fields under `function`.
+            let item_type = item.get("type").and_then(|t| t.as_str()).unwrap_or("function").to_string();
+            let mut function_obj = serde_json::Map::new();
+            for key in ["name", "description", "parameters", "strict"] {
+                if let Some(v) = item.get(key) {
+                    function_obj.insert(key.to_string(), v.clone());
+                }
+            }
+            json!({"type": item_type, "function": function_obj})
+        })
+        .collect();
+    Value::Array(normalized)
 }
 
 /// Build the messages list for the next model call by accumulating:
@@ -354,6 +508,227 @@ mod tests {
         let body = r#"{"model":"x","messages":[{"role":"user","content":"hello"}]}"#;
         let p = parse_parent_request(body).unwrap();
         assert_eq!(p.initial_messages.len(), 1);
+    }
+
+    #[test]
+    fn translates_message_input_items() {
+        // {type:"message", role, content} → {role, content}; the `type`
+        // field is dropped since chat-completions doesn't expect it.
+        let body = r#"{
+            "model": "m",
+            "input": [
+                {"type":"message","role":"system","content":"Be terse."},
+                {"type":"message","role":"user","content":"Find one fact."}
+            ]
+        }"#;
+        let p = parse_parent_request(body).unwrap();
+        assert_eq!(p.initial_messages.len(), 2);
+        assert_eq!(p.initial_messages[0], json!({"role":"system","content":"Be terse."}));
+        assert_eq!(p.initial_messages[1], json!({"role":"user","content":"Find one fact."}));
+        // No leftover `type` fields.
+        for msg in &p.initial_messages {
+            assert!(msg.get("type").is_none(), "translated message must drop 'type' field");
+        }
+    }
+
+    #[test]
+    fn translates_function_call_to_assistant_tool_calls_message() {
+        // The exact reproduction from the bug report: a `function_call`
+        // input item must produce a chat-completions assistant message
+        // with a non-empty `tool_calls` array — not a role-less item.
+        let body = r#"{
+            "model": "m",
+            "input": [
+                {"type":"message","role":"user","content":"go"},
+                {"type":"function_call","call_id":"call_a","name":"search","arguments":"{\"query\":\"x\"}"}
+            ]
+        }"#;
+        let p = parse_parent_request(body).unwrap();
+        assert_eq!(p.initial_messages.len(), 2);
+        let assistant = &p.initial_messages[1];
+        assert_eq!(assistant["role"], "assistant");
+        assert_eq!(assistant["content"], Value::Null);
+        let tool_calls = assistant["tool_calls"].as_array().unwrap();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0]["id"], "call_a");
+        assert_eq!(tool_calls[0]["type"], "function");
+        assert_eq!(tool_calls[0]["function"]["name"], "search");
+        // `arguments` stays a JSON-encoded string per chat-completions spec.
+        assert_eq!(tool_calls[0]["function"]["arguments"], "{\"query\":\"x\"}");
+    }
+
+    #[test]
+    fn translates_function_call_output_to_tool_message() {
+        let body = r#"{
+            "model": "m",
+            "input": [
+                {"type":"function_call","call_id":"call_a","name":"f","arguments":"{}"},
+                {"type":"function_call_output","call_id":"call_a","output":"{\"results\":[]}"}
+            ]
+        }"#;
+        let p = parse_parent_request(body).unwrap();
+        // assistant tool_call message + tool result message
+        assert_eq!(p.initial_messages.len(), 2);
+        let tool_msg = &p.initial_messages[1];
+        assert_eq!(tool_msg["role"], "tool");
+        assert_eq!(tool_msg["tool_call_id"], "call_a");
+        assert_eq!(tool_msg["content"], "{\"results\":[]}");
+    }
+
+    #[test]
+    fn collapses_consecutive_function_calls_into_one_assistant_message() {
+        // Two function_calls back-to-back belong to a single assistant
+        // turn and must collapse into one message with multiple
+        // tool_calls — chat-completions doesn't accept two assistant
+        // tool-call messages with no intervening tool result.
+        let body = r#"{
+            "model": "m",
+            "input": [
+                {"type":"function_call","call_id":"call_a","name":"a","arguments":"{}"},
+                {"type":"function_call","call_id":"call_b","name":"b","arguments":"{}"}
+            ]
+        }"#;
+        let p = parse_parent_request(body).unwrap();
+        assert_eq!(p.initial_messages.len(), 1);
+        let tool_calls = p.initial_messages[0]["tool_calls"].as_array().unwrap();
+        assert_eq!(tool_calls.len(), 2);
+        assert_eq!(tool_calls[0]["id"], "call_a");
+        assert_eq!(tool_calls[1]["id"], "call_b");
+    }
+
+    #[test]
+    fn folds_function_calls_into_preceding_assistant_message() {
+        // An assistant text turn that also issued a tool call arrives
+        // as two adjacent items: the message + the function_call. They
+        // must merge into one chat-completions message with both
+        // `content` and `tool_calls`.
+        let body = r#"{
+            "model": "m",
+            "input": [
+                {"type":"message","role":"user","content":"hi"},
+                {"type":"message","role":"assistant","content":"thinking..."},
+                {"type":"function_call","call_id":"call_a","name":"f","arguments":"{}"}
+            ]
+        }"#;
+        let p = parse_parent_request(body).unwrap();
+        assert_eq!(p.initial_messages.len(), 2);
+        let assistant = &p.initial_messages[1];
+        assert_eq!(assistant["role"], "assistant");
+        assert_eq!(assistant["content"], "thinking...");
+        let tool_calls = assistant["tool_calls"].as_array().unwrap();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0]["id"], "call_a");
+    }
+
+    #[test]
+    fn full_multi_turn_tool_conversation_translates_correctly() {
+        // The exact bug-report payload. After the fix, every translated
+        // message must have a `role` field — that's what the upstream
+        // 422 was complaining about. This test would have caught the
+        // original bug.
+        let body = r#"{
+            "model": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
+            "service_tier": "flex",
+            "max_output_tokens": 64,
+            "input": [
+                {"type":"message","role":"system","content":"Be terse."},
+                {"type":"message","role":"user","content":"Find one fact."},
+                {"type":"message","role":"system","content":"ctx"},
+                {"type":"function_call","call_id":"call_a","name":"search","arguments":"{\"query\":\"x\"}"},
+                {"type":"function_call_output","call_id":"call_a","output":"{\"results\":[]}"}
+            ],
+            "tools":[{"type":"function","function":{"name":"search","description":"s","parameters":{"type":"object"}}}]
+        }"#;
+        let p = parse_parent_request(body).unwrap();
+        // 3 message items + 1 collapsed assistant tool-call + 1 tool result = 5
+        assert_eq!(p.initial_messages.len(), 5);
+        for (idx, msg) in p.initial_messages.iter().enumerate() {
+            let role = msg.get("role").and_then(|r| r.as_str());
+            assert!(role.is_some(), "messages[{idx}] must have a role; got {msg}");
+        }
+        assert_eq!(p.initial_messages[0]["role"], "system");
+        assert_eq!(p.initial_messages[1]["role"], "user");
+        assert_eq!(p.initial_messages[2]["role"], "system");
+        assert_eq!(p.initial_messages[3]["role"], "assistant");
+        assert_eq!(p.initial_messages[3]["tool_calls"][0]["function"]["name"], "search");
+        assert_eq!(p.initial_messages[4]["role"], "tool");
+        assert_eq!(p.initial_messages[4]["tool_call_id"], "call_a");
+    }
+
+    #[test]
+    fn drops_reasoning_input_items() {
+        // Reasoning items have no chat-completions equivalent — chat
+        // completions has no `reasoning` role. Dropping them keeps the
+        // request valid; the reasoning is lost but most upstream models
+        // either reject it or ignore it.
+        let body = r#"{
+            "model": "m",
+            "input": [
+                {"type":"message","role":"user","content":"hi"},
+                {"type":"reasoning","summary":["thought"]},
+                {"type":"message","role":"assistant","content":"hello"}
+            ]
+        }"#;
+        let p = parse_parent_request(body).unwrap();
+        assert_eq!(p.initial_messages.len(), 2);
+        assert_eq!(p.initial_messages[0]["role"], "user");
+        assert_eq!(p.initial_messages[1]["role"], "assistant");
+    }
+
+    #[test]
+    fn missing_role_on_message_item_returns_error() {
+        // A message item without a role is malformed input — surface
+        // an error rather than silently producing an invalid upstream
+        // request that 422s deep in the loop.
+        let body = r#"{
+            "model": "m",
+            "input": [{"type":"message","content":"hi"}]
+        }"#;
+        let err = match parse_parent_request(body) {
+            Ok(_) => panic!("expected Err, got Ok"),
+            Err(e) => e,
+        };
+        assert!(err.contains("missing 'role'"), "got: {err}");
+    }
+
+    #[test]
+    fn normalizes_spec_flat_tools_into_wrapped_form() {
+        // Spec-flat: {type:"function", name, description, parameters}.
+        // Chat-completions wants wrapped: {type:"function", function:{…}}.
+        let body = r#"{
+            "model": "m",
+            "input": "hi",
+            "tools": [
+                {"type":"function","name":"search","description":"s","parameters":{"type":"object"}}
+            ]
+        }"#;
+        let p = parse_parent_request(body).unwrap();
+        let tools = p.tools.unwrap();
+        let arr = tools.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["type"], "function");
+        let function = &arr[0]["function"];
+        assert_eq!(function["name"], "search");
+        assert_eq!(function["description"], "s");
+        assert_eq!(function["parameters"], json!({"type": "object"}));
+        // The flat fields must not survive at the top level.
+        assert!(arr[0].get("name").is_none(), "wrapped tool must not have top-level 'name'");
+    }
+
+    #[test]
+    fn passes_already_wrapped_tools_through_unchanged() {
+        let body = r#"{
+            "model": "m",
+            "input": "hi",
+            "tools": [
+                {"type":"function","function":{"name":"search","description":"s","parameters":{"type":"object"}}}
+            ]
+        }"#;
+        let p = parse_parent_request(body).unwrap();
+        let tools = p.tools.unwrap();
+        let arr = tools.as_array().unwrap();
+        assert_eq!(arr[0]["function"]["name"], "search");
+        assert!(arr[0].get("name").is_none());
     }
 
     fn names(items: &[&str]) -> HashSet<String> {
