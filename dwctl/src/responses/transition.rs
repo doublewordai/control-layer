@@ -140,12 +140,27 @@ fn translate_input_items(items: &[Value]) -> Result<Vec<Value>, String> {
         let item_type = item.get("type").and_then(|t| t.as_str()).unwrap_or("message");
         match item_type {
             "message" => {
-                let role = item
-                    .get("role")
-                    .and_then(|r| r.as_str())
-                    .ok_or_else(|| format!("input[{idx}]: 'message' item missing 'role'"))?;
-                let content = item.get("content").cloned().unwrap_or(Value::Null);
-                out.push(json!({"role": role, "content": content}));
+                // Validate `role` is present; the upstream model will
+                // 422 with `messages[N]: missing field 'role'`
+                // otherwise.
+                if item.get("role").and_then(|r| r.as_str()).is_none() {
+                    return Err(format!("input[{idx}]: 'message' item missing 'role'"));
+                }
+                // Preserve every field except the Open Responses `type`
+                // discriminator. Clients sometimes send chat-completions-
+                // shaped messages directly (`{role, content, tool_calls,
+                // tool_call_id, name, …}`) and the previous `items.clone()`
+                // forwarded those verbatim — dropping anything outside
+                // `role`/`content` would be a regression.
+                let mut translated = serde_json::Map::new();
+                if let Some(obj) = item.as_object() {
+                    for (k, v) in obj {
+                        if k != "type" {
+                            translated.insert(k.clone(), v.clone());
+                        }
+                    }
+                }
+                out.push(Value::Object(translated));
             }
             "function_call" => {
                 let call_id = item
@@ -262,13 +277,22 @@ fn normalize_tools(tools: &Value) -> Value {
             if item.get("function").is_some() {
                 return item.clone();
             }
-            // Spec-flat: lift everything except the top-level `type`
-            // discriminator into a `function` object. Copying the
-            // whole object (rather than a fixed whitelist) avoids
-            // silently dropping spec additions or vendor extensions
-            // — anything the client cared to send gets forwarded to
-            // the upstream tool schema.
-            let item_type = item.get("type").and_then(|t| t.as_str()).unwrap_or("function").to_string();
+            // Only wrap function tools. Hosted Open Responses tool
+            // types like `web_search` / `file_search` have their own
+            // schemas (no `function` sub-object) and forwarding them
+            // verbatim is the only correct call — wrapping their
+            // fields under a `function` key would produce an invalid
+            // tool object.
+            let item_type = item.get("type").and_then(|t| t.as_str()).unwrap_or("function");
+            if item_type != "function" {
+                return item.clone();
+            }
+            // Spec-flat function tool: lift everything except the
+            // top-level `type` discriminator into a `function` object.
+            // Copying the whole object (rather than a fixed whitelist)
+            // avoids silently dropping spec additions or vendor
+            // extensions — anything the client cared to send gets
+            // forwarded to the upstream tool schema.
             let mut function_obj = serde_json::Map::new();
             if let Some(obj) = item.as_object() {
                 for (k, v) in obj {
@@ -277,7 +301,7 @@ fn normalize_tools(tools: &Value) -> Value {
                     }
                 }
             }
-            json!({"type": item_type, "function": function_obj})
+            json!({"type": "function", "function": function_obj})
         })
         .collect();
     Value::Array(normalized)
@@ -839,6 +863,68 @@ mod tests {
         let p = parse_parent_request(body).unwrap();
         let tool_calls = p.initial_messages[0]["tool_calls"].as_array().unwrap();
         assert_eq!(tool_calls[0]["function"]["arguments"], "{\"query\":\"x\"}");
+    }
+
+    #[test]
+    fn message_translation_preserves_chat_completions_fields() {
+        // Clients sometimes send chat-completions-shaped message
+        // objects directly through `input` (the legacy `name` field,
+        // assistant `tool_calls`, tool-message `tool_call_id`, etc.).
+        // The previous `items.clone()` forwarded those verbatim —
+        // dropping anything outside `role`/`content` would be a
+        // regression. Only the Open Responses `type` discriminator
+        // is stripped.
+        let body = r#"{
+            "model": "m",
+            "input": [
+                {"type":"message","role":"user","content":"hi","name":"alice"},
+                {"role":"tool","tool_call_id":"call_a","content":"{\"ok\":1}"},
+                {"role":"assistant","content":null,"tool_calls":[{"id":"call_a","type":"function","function":{"name":"f","arguments":"{}"}}]}
+            ]
+        }"#;
+        let p = parse_parent_request(body).unwrap();
+        assert_eq!(p.initial_messages.len(), 3);
+        // `name` survives on the user message.
+        assert_eq!(p.initial_messages[0]["role"], "user");
+        assert_eq!(p.initial_messages[0]["name"], "alice");
+        assert!(p.initial_messages[0].get("type").is_none());
+        // `tool_call_id` survives on the tool message.
+        assert_eq!(p.initial_messages[1]["role"], "tool");
+        assert_eq!(p.initial_messages[1]["tool_call_id"], "call_a");
+        // `tool_calls` survives on the assistant message.
+        assert_eq!(p.initial_messages[2]["role"], "assistant");
+        let tool_calls = p.initial_messages[2]["tool_calls"].as_array().unwrap();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0]["id"], "call_a");
+    }
+
+    #[test]
+    fn normalize_tools_passes_through_non_function_tool_types() {
+        // Hosted tool types (web_search, file_search, …) have their
+        // own schema and don't carry a `function` sub-object. Wrapping
+        // them with the function-tool transformation would produce an
+        // invalid tool object that upstream would reject. They must
+        // pass through as-is.
+        let body = r#"{
+            "model": "m",
+            "input": "hi",
+            "tools": [
+                {"type":"web_search"},
+                {"type":"file_search","vector_store_ids":["vs_1"]},
+                {"type":"function","name":"f","parameters":{"type":"object"}}
+            ]
+        }"#;
+        let p = parse_parent_request(body).unwrap();
+        let arr = p.tools.unwrap();
+        let arr = arr.as_array().unwrap();
+        assert_eq!(arr.len(), 3);
+        // Non-function tools pass through verbatim.
+        assert_eq!(arr[0], json!({"type": "web_search"}));
+        assert_eq!(arr[1], json!({"type": "file_search", "vector_store_ids": ["vs_1"]}));
+        // Function tool gets wrapped as before.
+        assert_eq!(arr[2]["type"], "function");
+        assert_eq!(arr[2]["function"]["name"], "f");
+        assert!(arr[2].get("name").is_none());
     }
 
     #[test]
