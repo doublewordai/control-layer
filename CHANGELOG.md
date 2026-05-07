@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.46.2](https://github.com/doublewordai/control-layer/compare/v8.46.1...v8.46.2) (2026-05-07)
+
+
+### Bug Fixes
+
+* Do not record requests as successful in outlet/http-analytics if they actually had errors mid-sse-stream ([#1048](https://github.com/doublewordai/control-layer/issues/1048)) ([2b6e252](https://github.com/doublewordai/control-layer/commit/2b6e252e353445c97d5c09c713f276b162a0ee61))
+
 ## [8.46.1](https://github.com/doublewordai/control-layer/compare/v8.46.0...v8.46.1) (2026-05-07)
 
 

@@ -3,7 +3,6 @@ import { useLocation } from "react-router-dom";
 import { Server, Plus, Trash2 } from "lucide-react";
 import {
   useEndpoints,
-  useSynchronizeEndpoint,
   useUpdateEndpoint,
   useDeleteEndpoint,
 } from "../../../../api/control-layer";
@@ -45,7 +44,6 @@ export function Endpoints() {
   } = useEndpoints({
     ...endpointsPagination.queryParams,
   });
-  const synchronizeEndpointMutation = useSynchronizeEndpoint();
   const updateEndpointMutation = useUpdateEndpoint();
   const deleteEndpointMutation = useDeleteEndpoint();
 
@@ -90,16 +88,6 @@ export function Endpoints() {
     setEndpointToDelete(endpoint);
   };
 
-  const handleSynchronize = async (endpoint: Endpoint) => {
-    try {
-      await synchronizeEndpointMutation.mutateAsync(endpoint.id.toString());
-      toast.success("Endpoint synchronized successfully");
-    } catch (error) {
-      console.error("Failed to synchronize endpoint:", error);
-      toast.error("Failed to synchronize endpoint. Please try again.");
-    }
-  };
-
   const handleBulkDelete = async () => {
     try {
       // Delete endpoints one by one
@@ -122,8 +110,6 @@ export function Endpoints() {
     onEdit: handleInlineEdit,
     onEditModal: handleEdit,
     onDelete: handleDelete,
-    onSynchronize: handleSynchronize,
-    isSynchronizing: synchronizeEndpointMutation.isPending,
   });
 
   if (isLoading) {
