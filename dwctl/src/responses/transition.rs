@@ -160,10 +160,16 @@ fn translate_input_items(items: &[Value]) -> Result<Vec<Value>, String> {
                     .to_string();
                 // `arguments` is a JSON-encoded string per the Responses
                 // spec, but tolerate raw objects from looser callers.
+                // Explicit-null is treated like missing — a client
+                // serializing an arguments-less call sometimes emits
+                // `"arguments": null`, and `Value::Null.to_string()`
+                // would produce the literal string "null", which the
+                // upstream model would then try to parse as JSON
+                // arguments and reject.
                 let arguments_str = match item.get("arguments") {
                     Some(Value::String(s)) => s.clone(),
+                    Some(Value::Null) | None => "{}".to_string(),
                     Some(other) => other.to_string(),
-                    None => "{}".to_string(),
                 };
                 let new_tool_call = json!({
                     "id": call_id,
@@ -194,11 +200,14 @@ fn translate_input_items(items: &[Value]) -> Result<Vec<Value>, String> {
                     .ok_or_else(|| format!("input[{idx}]: 'function_call_output' missing 'call_id'"))?;
                 // Tool output is conventionally a JSON-encoded string.
                 // Stringify non-string values so chat-completions sees a
-                // string `content`.
+                // string `content`. Treat explicit-null like missing —
+                // `Value::Null.to_string()` would produce the literal
+                // "null" which the model would surface back to the
+                // user, while the spec intent is "no output".
                 let content_str = match item.get("output") {
                     Some(Value::String(s)) => s.clone(),
+                    Some(Value::Null) | None => String::new(),
                     Some(other) => other.to_string(),
-                    None => String::new(),
                 };
                 out.push(json!({
                     "role": "tool",
@@ -246,12 +255,19 @@ fn normalize_tools(tools: &Value) -> Value {
             if item.get("function").is_some() {
                 return item.clone();
             }
-            // Spec-flat: collect known fields under `function`.
+            // Spec-flat: lift everything except the top-level `type`
+            // discriminator into a `function` object. Copying the
+            // whole object (rather than a fixed whitelist) avoids
+            // silently dropping spec additions or vendor extensions
+            // — anything the client cared to send gets forwarded to
+            // the upstream tool schema.
             let item_type = item.get("type").and_then(|t| t.as_str()).unwrap_or("function").to_string();
             let mut function_obj = serde_json::Map::new();
-            for key in ["name", "description", "parameters", "strict"] {
-                if let Some(v) = item.get(key) {
-                    function_obj.insert(key.to_string(), v.clone());
+            if let Some(obj) = item.as_object() {
+                for (k, v) in obj {
+                    if k != "type" {
+                        function_obj.insert(k.clone(), v.clone());
+                    }
                 }
             }
             json!({"type": item_type, "function": function_obj})
@@ -729,6 +745,76 @@ mod tests {
         let arr = tools.as_array().unwrap();
         assert_eq!(arr[0]["function"]["name"], "search");
         assert!(arr[0].get("name").is_none());
+    }
+
+    #[test]
+    fn null_arguments_on_function_call_become_empty_object() {
+        // Some clients serialize an arguments-less call as
+        // `"arguments": null`. Without explicit handling, that becomes
+        // the literal string "null" — which the upstream model would
+        // try to parse as the JSON arguments string and reject.
+        let body = r#"{
+            "model": "m",
+            "input": [
+                {"type":"function_call","call_id":"c","name":"f","arguments":null}
+            ]
+        }"#;
+        let p = parse_parent_request(body).unwrap();
+        let tool_calls = p.initial_messages[0]["tool_calls"].as_array().unwrap();
+        assert_eq!(tool_calls[0]["function"]["arguments"], "{}");
+    }
+
+    #[test]
+    fn null_output_on_function_call_output_becomes_empty_string() {
+        let body = r#"{
+            "model": "m",
+            "input": [
+                {"type":"function_call","call_id":"c","name":"f","arguments":"{}"},
+                {"type":"function_call_output","call_id":"c","output":null}
+            ]
+        }"#;
+        let p = parse_parent_request(body).unwrap();
+        let tool_msg = &p.initial_messages[1];
+        assert_eq!(tool_msg["role"], "tool");
+        assert_eq!(tool_msg["content"], "");
+    }
+
+    #[test]
+    fn normalize_tools_preserves_unknown_fields() {
+        // Spec additions and vendor extensions should be forwarded to
+        // the wrapped `function` object rather than silently dropped.
+        // A whitelist would lock the translator to a frozen view of
+        // the spec; copying everything except the top-level `type`
+        // discriminator stays compatible with future fields.
+        let body = r#"{
+            "model": "m",
+            "input": "hi",
+            "tools": [
+                {"type":"function","name":"f","description":"d","parameters":{"type":"object"},"strict":true,"x_vendor":{"hint":"v"}}
+            ]
+        }"#;
+        let p = parse_parent_request(body).unwrap();
+        let arr = p.tools.unwrap();
+        let function = &arr[0]["function"];
+        assert_eq!(function["name"], "f");
+        assert_eq!(function["description"], "d");
+        assert_eq!(function["strict"], true);
+        assert_eq!(function["x_vendor"]["hint"], "v");
+        // Top-level `type` discriminator stays at the wrapper level,
+        // not lifted into `function`.
+        assert!(function.get("type").is_none());
+        assert_eq!(arr[0]["type"], "function");
+    }
+
+    #[test]
+    fn empty_input_array_translates_to_empty_messages() {
+        // Edge case: a client sending an empty input array shouldn't
+        // crash the translator. The downstream model will reject the
+        // empty messages list, but that's a model-level concern, not
+        // a translator-level one.
+        let body = r#"{"model":"m","input":[]}"#;
+        let p = parse_parent_request(body).unwrap();
+        assert!(p.initial_messages.is_empty());
     }
 
     fn names(items: &[&str]) -> HashSet<String> {
