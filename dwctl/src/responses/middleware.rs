@@ -92,6 +92,7 @@ pub async fn responses_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     let model = model.as_str();
     let nested_path = parts.uri.path();
     let is_responses_api = nested_path.ends_with("/responses");
+    let is_chat_completions_api = nested_path.ends_with("/chat/completions");
     // The router is nested at /ai/v1, so the path here is e.g. "/responses".
     // Prepend /v1 for the full API path used by the loopback and fusillade templates.
     let endpoint = format!("/v1{nested_path}");
@@ -132,12 +133,15 @@ pub async fn responses_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
         }
     }
 
-    // Only the Responses API supports service_tier and background.
-    // Chat completions and embeddings always use realtime tier.
+    // Only the Responses API supports `background`. Chat completions can opt
+    // into the flex tier via `service_tier:"flex"` but always blocks (no async
+    // mode in the OpenAI chat-completions surface). Embeddings always realtime.
     let (service_tier, background) = if is_responses_api {
         let tier = resolve_service_tier(request_value["service_tier"].as_str());
         let bg = request_value["background"].as_bool().unwrap_or(false);
         (tier, bg)
+    } else if is_chat_completions_api {
+        (resolve_service_tier(request_value["service_tier"].as_str()), false)
     } else {
         (ServiceTier::Realtime, false)
     };
@@ -249,6 +253,7 @@ pub async fn responses_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
 
     match service_tier {
         ServiceTier::Realtime => handle_realtime(&state, batch_input, batch_id, &resp_id, model, background, parts, body_bytes, next).await,
+        ServiceTier::Flex if is_chat_completions_api => handle_chat_completion_flex(&state, batch_input, request_id).await,
         ServiceTier::Flex => handle_flex(&state, batch_input, &resp_id, model, background).await,
     }
 }
@@ -458,6 +463,60 @@ async fn handle_flex<P: PoolProvider + Clone + Send + Sync + 'static>(
                 });
                 (StatusCode::GATEWAY_TIMEOUT, Json(response_body)).into_response()
             }
+        }
+    }
+}
+
+/// Handle a flex `/v1/chat/completions` request.
+///
+/// Always blocks: chat completions has no `background` field in the OpenAI surface,
+/// so we hold the connection until the daemon finishes (or we hit the 1h timeout).
+/// On success the upstream `chat.completion` body is returned verbatim. On failure
+/// the OpenAI chat-completions error envelope is returned with the upstream HTTP
+/// status surfaced.
+async fn handle_chat_completion_flex<P: PoolProvider + Clone + Send + Sync + 'static>(
+    state: &ResponsesMiddlewareState<P>,
+    batch_input: fusillade::CreateSingleRequestBatchInput,
+    request_id: uuid::Uuid,
+) -> Response {
+    if let Err(e) = fusillade::Storage::create_single_request_batch(&*state.request_manager, batch_input).await {
+        tracing::error!(error = %e, "Failed to create flex chat-completions batch in fusillade");
+        return Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "error": {
+                        "message": "Failed to enqueue request",
+                        "type": "server_error",
+                    }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+    }
+
+    let poll_interval = std::time::Duration::from_millis(500);
+    let timeout = std::time::Duration::from_secs(3600);
+
+    match response_store::poll_until_terminal(&state.request_manager, request_id, poll_interval, timeout).await {
+        Ok(detail) => {
+            let (status, body) = response_store::detail_to_chat_completion_object(&detail);
+            let status_code = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            (status_code, Json(body)).into_response()
+        }
+        Err(e) => {
+            tracing::error!(error = %e, request_id = %request_id, "Blocking flex chat-completions poll failed");
+            (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(serde_json::json!({
+                    "error": {
+                        "message": format!("Request timed out: {e}"),
+                        "type": "server_error",
+                    }
+                })),
+            )
+                .into_response()
         }
     }
 }
