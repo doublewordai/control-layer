@@ -602,13 +602,6 @@ async fn warm_path_setup<P: PoolProvider + Clone + Send + Sync + 'static>(
     model: &str,
 ) -> Option<(uuid::Uuid, Arc<crate::tool_executor::ResolvedToolSet>, onwards::UpstreamTarget)> {
     let created_by = response_store::lookup_created_by(&state.dwctl_pool, Some(api_key)).await;
-    let pending = response_store::PendingResponseInput {
-        body: request_value.to_string(),
-        api_key: Some(api_key.to_string()),
-        created_by,
-        base_url: state.loopback_base_url.clone(),
-    };
-    let head_step_uuid = state.response_store.register_pending(pending);
 
     let resolved = match crate::tool_injection::resolve_tools_for_request(&state.dwctl_pool, api_key, Some(model)).await {
         Ok(Some(set)) => Arc::new(set),
@@ -624,6 +617,25 @@ async fn warm_path_setup<P: PoolProvider + Clone + Send + Sync + 'static>(
             ))
         }
     };
+
+    // The transition function uses these names to decide which
+    // tool_calls returned by the model can be auto-dispatched and
+    // which must be passed through to the client as `function_call`
+    // output items. Any tool the user supplies in their request body
+    // that isn't registered in `tool_sources` ends up outside this set
+    // and gets the client-side passthrough treatment — without this,
+    // HttpToolExecutor would try to dispatch the unknown name and the
+    // step would fail with `Tool not found`.
+    let resolved_tool_names = resolved.tools.keys().cloned().collect();
+
+    let pending = response_store::PendingResponseInput {
+        body: request_value.to_string(),
+        api_key: Some(api_key.to_string()),
+        created_by,
+        base_url: state.loopback_base_url.clone(),
+        resolved_tool_names,
+    };
+    let head_step_uuid = state.response_store.register_pending(pending);
 
     let upstream = onwards::UpstreamTarget {
         url: format!("{}/v1/chat/completions", state.loopback_base_url),

@@ -56,6 +56,8 @@
 //! tests) stay decoupled from the strict-mode adapter — wiring those in
 //! is a future cleanup once the multi-step path is live.
 
+use std::collections::HashSet;
+
 use onwards::{ChainStep, NextAction, StepDescriptor, StepKind, StepState};
 use serde_json::{Value, json};
 
@@ -239,10 +241,16 @@ pub(crate) fn prepare_followup_model_call(parsed: &ParsedRequest, chain: &[Chain
 /// Decide the next action given:
 /// - `parsed`: the parent fusillade request body
 /// - `chain`: completed/failed steps in the current scope, in sequence order
+/// - `resolved_tool_names`: names of server-side tools registered for this
+///   request. Tool_calls whose name is in this set get auto-dispatched as
+///   server-side `ToolCall` steps; tool_calls outside the set are
+///   passed through to the client as `function_call` output items by
+///   completing the response with the model's payload (the assembly step
+///   surfaces them per the OpenAI Responses contract).
 ///
 /// Returns the action the loop should take. Pure function over its inputs;
 /// no I/O.
-pub(crate) fn decide_next_action(parsed: &ParsedRequest, chain: &[ChainStep]) -> NextAction {
+pub(crate) fn decide_next_action(parsed: &ParsedRequest, chain: &[ChainStep], resolved_tool_names: &HashSet<String>) -> NextAction {
     if chain.is_empty() {
         return NextAction::AppendSteps(vec![prepare_initial_model_call(parsed)]);
     }
@@ -275,9 +283,31 @@ pub(crate) fn decide_next_action(parsed: &ParsedRequest, chain: &[ChainStep]) ->
             let tool_calls = extract_tool_calls(&response);
             if tool_calls.is_empty() {
                 // No tool calls — the model returned final output.
-                NextAction::Complete(response)
-            } else {
+                return NextAction::Complete(response);
+            }
+
+            // Server-side dispatch is only safe when every tool_call
+            // names a server-registered tool (i.e., one with a row in
+            // `tool_sources` for this request's user/deployment). If
+            // any name is unregistered, it's a client-side function
+            // tool — the model must have seen it because the user put
+            // it in the request body — and we cannot dispatch it. The
+            // OpenAI Responses contract for that case is to surface
+            // every tool_call as a `function_call` output item and let
+            // the client run them and submit results in a follow-up.
+            //
+            // We bail out for the *whole* fan-out (rather than partial
+            // dispatch) because the model expects results for every
+            // call it emitted before producing its next message; a
+            // mixed dispatch would leave the conversation in a state
+            // the upstream model can't reason about.
+            let all_registered = tool_calls
+                .iter()
+                .all(|step| tool_call_name(&step.request_payload).is_some_and(|name| resolved_tool_names.contains(name)));
+            if all_registered {
                 NextAction::AppendSteps(tool_calls)
+            } else {
+                NextAction::Complete(response)
             }
         }
         StepKind::ToolCall => {
@@ -288,6 +318,10 @@ pub(crate) fn decide_next_action(parsed: &ParsedRequest, chain: &[ChainStep]) ->
             NextAction::AppendSteps(vec![prepare_followup_model_call(parsed, chain)])
         }
     }
+}
+
+fn tool_call_name(payload: &Value) -> Option<&str> {
+    payload.get("name").and_then(|n| n.as_str())
 }
 
 #[cfg(test)]
@@ -322,6 +356,10 @@ mod tests {
         assert_eq!(p.initial_messages.len(), 1);
     }
 
+    fn names(items: &[&str]) -> HashSet<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
     #[test]
     fn empty_chain_emits_initial_model_call() {
         let parsed = ParsedRequest {
@@ -330,7 +368,7 @@ mod tests {
             tools: None,
             stream: false,
         };
-        match decide_next_action(&parsed, &[]) {
+        match decide_next_action(&parsed, &[], &HashSet::new()) {
             NextAction::AppendSteps(steps) => {
                 assert_eq!(steps.len(), 1);
                 assert!(matches!(steps[0].kind, StepKind::ModelCall));
@@ -341,7 +379,7 @@ mod tests {
     }
 
     #[test]
-    fn model_call_with_tool_calls_emits_fan_out() {
+    fn model_call_with_registered_tool_calls_emits_fan_out() {
         let parsed = ParsedRequest {
             model: "m".into(),
             initial_messages: vec![],
@@ -360,7 +398,7 @@ mod tests {
             }]
         });
         let chain = vec![step("s1", 1, StepKind::ModelCall, StepState::Completed, Some(response))];
-        match decide_next_action(&parsed, &chain) {
+        match decide_next_action(&parsed, &chain, &names(&["a", "b"])) {
             NextAction::AppendSteps(steps) => {
                 assert_eq!(steps.len(), 2);
                 assert_eq!(steps[0].request_payload["name"], "a");
@@ -369,6 +407,67 @@ mod tests {
                 assert_eq!(steps[1].request_payload["name"], "b");
             }
             _ => panic!("expected AppendSteps"),
+        }
+    }
+
+    #[test]
+    fn model_call_with_unregistered_tool_completes_for_client_dispatch() {
+        // The user supplied a client-side function tool in the request
+        // body; the model emits a tool_call for it. With no row in
+        // `tool_sources` for this name, the loop must NOT try to
+        // dispatch it (HttpToolExecutor would fail with NotFound) —
+        // instead it completes with the model's response so assembly
+        // can surface a `function_call` output item to the client.
+        let parsed = ParsedRequest {
+            model: "m".into(),
+            initial_messages: vec![],
+            tools: None,
+            stream: false,
+        };
+        let response = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {"id": "call_1", "type": "function", "function": {"name": "read_pages", "arguments": "{\"id\":1}"}},
+                    ]
+                }
+            }]
+        });
+        let chain = vec![step("s1", 1, StepKind::ModelCall, StepState::Completed, Some(response.clone()))];
+        match decide_next_action(&parsed, &chain, &HashSet::new()) {
+            NextAction::Complete(v) => assert_eq!(v, response),
+            other => panic!("expected Complete for unregistered tool, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn model_call_with_mixed_registered_and_unregistered_completes() {
+        // If even one tool_call in a fan-out is unregistered, the whole
+        // batch passes through to the client. Partial dispatch would
+        // leave the model expecting results for tool_calls the loop
+        // never ran.
+        let parsed = ParsedRequest {
+            model: "m".into(),
+            initial_messages: vec![],
+            tools: None,
+            stream: false,
+        };
+        let response = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {"id": "call_1", "type": "function", "function": {"name": "weather", "arguments": "{}"}},
+                        {"id": "call_2", "type": "function", "function": {"name": "client_only", "arguments": "{}"}},
+                    ]
+                }
+            }]
+        });
+        let chain = vec![step("s1", 1, StepKind::ModelCall, StepState::Completed, Some(response.clone()))];
+        match decide_next_action(&parsed, &chain, &names(&["weather"])) {
+            NextAction::Complete(v) => assert_eq!(v, response),
+            other => panic!("expected Complete for mixed tool_calls, got {other:?}"),
         }
     }
 
@@ -386,7 +485,7 @@ mod tests {
             }]
         });
         let chain = vec![step("s1", 1, StepKind::ModelCall, StepState::Completed, Some(response.clone()))];
-        match decide_next_action(&parsed, &chain) {
+        match decide_next_action(&parsed, &chain, &HashSet::new()) {
             NextAction::Complete(v) => assert_eq!(v, response),
             _ => panic!("expected Complete"),
         }
@@ -412,7 +511,7 @@ mod tests {
             step("s1", 1, StepKind::ModelCall, StepState::Completed, Some(model_response)),
             step("s2", 2, StepKind::ToolCall, StepState::Completed, Some(json!({"result": 1}))),
         ];
-        match decide_next_action(&parsed, &chain) {
+        match decide_next_action(&parsed, &chain, &names(&["a"])) {
             NextAction::AppendSteps(steps) => {
                 assert_eq!(steps.len(), 1);
                 assert!(matches!(steps[0].kind, StepKind::ModelCall));
@@ -437,7 +536,7 @@ mod tests {
         };
         let mut s = step("s1", 1, StepKind::ModelCall, StepState::Failed, None);
         s.error = Some(json!({"type": "upstream_500"}));
-        match decide_next_action(&parsed, &[s]) {
+        match decide_next_action(&parsed, &[s], &HashSet::new()) {
             NextAction::Fail(v) => assert_eq!(v, json!({"type": "upstream_500"})),
             _ => panic!("expected Fail"),
         }
