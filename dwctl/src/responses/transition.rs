@@ -140,10 +140,17 @@ fn translate_input_items(items: &[Value]) -> Result<Vec<Value>, String> {
         let item_type = item.get("type").and_then(|t| t.as_str()).unwrap_or("message");
         match item_type {
             "message" => {
+                // A non-object item (string/number/array) can't carry
+                // `role`, so produce an explicit error here rather
+                // than letting the missing-`role` check below report
+                // a misleading message.
+                let obj = item
+                    .as_object()
+                    .ok_or_else(|| format!("input[{idx}]: 'message' item must be a JSON object"))?;
                 // Validate `role` is present; the upstream model will
                 // 422 with `messages[N]: missing field 'role'`
                 // otherwise.
-                if item.get("role").and_then(|r| r.as_str()).is_none() {
+                if obj.get("role").and_then(|r| r.as_str()).is_none() {
                     return Err(format!("input[{idx}]: 'message' item missing 'role'"));
                 }
                 // Preserve every field except the Open Responses `type`
@@ -153,11 +160,9 @@ fn translate_input_items(items: &[Value]) -> Result<Vec<Value>, String> {
                 // forwarded those verbatim — dropping anything outside
                 // `role`/`content` would be a regression.
                 let mut translated = serde_json::Map::new();
-                if let Some(obj) = item.as_object() {
-                    for (k, v) in obj {
-                        if k != "type" {
-                            translated.insert(k.clone(), v.clone());
-                        }
+                for (k, v) in obj {
+                    if k != "type" {
+                        translated.insert(k.clone(), v.clone());
                     }
                 }
                 out.push(Value::Object(translated));
@@ -181,6 +186,11 @@ fn translate_input_items(items: &[Value]) -> Result<Vec<Value>, String> {
                 // call sometimes emits `"arguments": null`, and the
                 // literal string "null" would then be parsed as JSON
                 // arguments and rejected by the upstream model.
+                //
+                // Empty-string `arguments` are forwarded as-is. The
+                // upstream model will reject malformed JSON; faithfully
+                // round-tripping the client's input is the right
+                // contract for a translator at this layer.
                 //
                 // `serde_json::to_string` (rather than `.to_string()`)
                 // for the fallback makes the JSON-serialization intent
@@ -278,11 +288,11 @@ fn normalize_tools(tools: &Value) -> Value {
                 return item.clone();
             }
             // Only wrap function tools. Hosted Open Responses tool
-            // types like `web_search` / `file_search` have their own
-            // schemas (no `function` sub-object) and forwarding them
-            // verbatim is the only correct call — wrapping their
-            // fields under a `function` key would produce an invalid
-            // tool object.
+            // types like `web_search`, `file_search`,
+            // `computer_use_preview`, etc. have their own schemas
+            // (no `function` sub-object) and forwarding them verbatim
+            // is the only correct call — wrapping their fields under
+            // a `function` key would produce an invalid tool object.
             let item_type = item.get("type").and_then(|t| t.as_str()).unwrap_or("function");
             if item_type != "function" {
                 return item.clone();
