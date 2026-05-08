@@ -39,8 +39,9 @@ export const RemoveModelDialog: React.FC<RemoveModelDialogProps> = ({
             Remove {modelName}?
           </DialogTitle>
           <DialogDescription>
-            This deployment is used elsewhere. Removing it from the endpoint
-            will affect:
+            This deployment is referenced elsewhere. Removing it from the
+            endpoint will break the resources below — API requests targeting
+            them will fail until you update each one's configuration.
           </DialogDescription>
         </DialogHeader>
 

@@ -379,6 +379,68 @@ describe("EditEndpointModal", () => {
     });
   });
 
+  it("flags case-only and whitespace-only alias collisions before save (matches backend LOWER(alias))", async () => {
+    render(
+      <EditEndpointModal
+        isOpen={true}
+        onClose={mockOnClose}
+        onSuccess={mockOnSuccess}
+        endpoint={mockEndpoint}
+      />,
+      { wrapper: createWrapper() },
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /Discover Models/i }));
+    await waitFor(() =>
+      expect(screen.getByText(/Imported models/i)).toBeInTheDocument(),
+    );
+
+    // Add two models manually so we have two rows whose aliases we control.
+    const addRow = async (name: string) => {
+      fireEvent.click(screen.getByRole("button", { name: /Add model/i }));
+      const input = await waitFor(() =>
+        screen.getByPlaceholderText(/type a (model )?name/i),
+      );
+      fireEvent.change(input, { target: { value: name } });
+      fireEvent.click(await waitFor(() => screen.getByText(/Add manually:/i)));
+      await waitFor(() => expect(screen.getByText(name)).toBeInTheDocument());
+    };
+
+    await addRow("model-one");
+    await addRow("model-two");
+
+    const aliasOne = screen.getByLabelText("Alias for model-one");
+    const aliasTwo = screen.getByLabelText("Alias for model-two");
+
+    // Case-only collision: "Test" and "test" share LOWER(alias) on the backend.
+    fireEvent.change(aliasOne, { target: { value: "Test" } });
+    fireEvent.change(aliasTwo, { target: { value: "test" } });
+
+    await waitFor(() => {
+      expect(
+        screen.getByText(/Duplicate aliases detected/i),
+      ).toBeInTheDocument();
+    });
+
+    // Whitespace-only collision: "  test  " trims to "test", same as the other row.
+    fireEvent.change(aliasOne, { target: { value: "  test  " } });
+
+    await waitFor(() => {
+      expect(
+        screen.getByText(/Duplicate aliases detected/i),
+      ).toBeInTheDocument();
+    });
+
+    // Disambiguating clears the warning.
+    fireEvent.change(aliasOne, { target: { value: "unique-alias" } });
+
+    await waitFor(() => {
+      expect(
+        screen.queryByText(/Duplicate aliases detected/i),
+      ).not.toBeInTheDocument();
+    });
+  });
+
   it("requires name field for update", async () => {
     render(
       <EditEndpointModal

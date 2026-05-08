@@ -1,6 +1,9 @@
 import { describe, it, expect } from "vitest";
 import {
+  buildReferenceIndex,
   computeReferencesForDeployment,
+  hasUserConfiguredReferences,
+  lookupReferences,
   totalReferenceCount,
 } from "./references";
 import type { Model } from "../../../api/control-layer/types";
@@ -169,5 +172,146 @@ describe("computeReferencesForDeployment", () => {
     };
 
     expect(totalReferenceCount(refs)).toBe(4);
+  });
+});
+
+describe("hasUserConfiguredReferences", () => {
+  it("ignores the implicit single Standard Model wrapper", () => {
+    expect(
+      hasUserConfiguredReferences({
+        directHosted: [{ modelId: "wrapper", modelAlias: "alias" }],
+        virtualModels: [],
+        trafficRules: [],
+      }),
+    ).toBe(false);
+  });
+
+  it("flags additional wrappers beyond the implicit one", () => {
+    expect(
+      hasUserConfiguredReferences({
+        directHosted: [
+          { modelId: "wrapper-1", modelAlias: "alias-1" },
+          { modelId: "wrapper-2", modelAlias: "alias-2" },
+        ],
+        virtualModels: [],
+        trafficRules: [],
+      }),
+    ).toBe(true);
+  });
+
+  it("flags virtual model dependencies", () => {
+    expect(
+      hasUserConfiguredReferences({
+        directHosted: [{ modelId: "wrapper", modelAlias: "alias" }],
+        virtualModels: [{ modelId: "v", modelAlias: "v" }],
+        trafficRules: [],
+      }),
+    ).toBe(true);
+  });
+
+  it("flags traffic rule dependencies", () => {
+    expect(
+      hasUserConfiguredReferences({
+        directHosted: [{ modelId: "wrapper", modelAlias: "alias" }],
+        virtualModels: [],
+        trafficRules: [
+          {
+            modelId: "owner",
+            modelAlias: "owner",
+            rule: { api_key_purpose: "batch", action: { type: "deny" } },
+          },
+        ],
+      }),
+    ).toBe(true);
+  });
+});
+
+describe("buildReferenceIndex + lookupReferences", () => {
+  it("returns the same data as computeReferencesForDeployment for a typical case", () => {
+    const wrapper = standardModel({
+      id: "wrapper-1",
+      alias: "fast-llama",
+      model_name: "llama-70b",
+    });
+    const virtual = virtualModel({
+      id: "virt-1",
+      alias: "smart-virtual",
+      components: [
+        {
+          weight: 1,
+          enabled: true,
+          sort_order: 0,
+          created_at: "2024-01-01",
+          model: { id: "wrapper-1", alias: "fast-llama", model_name: "llama-70b" },
+        },
+      ],
+    });
+    const ruleOwner: Model = {
+      ...virtualModel({ id: "owner", alias: "owner-alias" }),
+      traffic_routing_rules: [
+        { api_key_purpose: "batch", action: { type: "redirect", target: "fast-llama" } },
+      ],
+    };
+
+    const all = [wrapper, virtual, ruleOwner];
+    const direct = computeReferencesForDeployment(ENDPOINT_ID, "llama-70b", all);
+    const indexed = lookupReferences(
+      buildReferenceIndex(all),
+      ENDPOINT_ID,
+      "llama-70b",
+    );
+
+    expect(indexed).toEqual(direct);
+  });
+
+  it("returns empty results for a deployment with no references in the index", () => {
+    const index = buildReferenceIndex([]);
+    const refs = lookupReferences(index, ENDPOINT_ID, "ghost-model");
+
+    expect(refs.directHosted).toEqual([]);
+    expect(refs.virtualModels).toEqual([]);
+    expect(refs.trafficRules).toEqual([]);
+  });
+
+  it("does not double-count a virtual model that includes two wrappers of the same deployment", () => {
+    const wrapperA = standardModel({
+      id: "wrapper-a",
+      alias: "alias-a",
+      model_name: "shared-model",
+    });
+    const wrapperB = standardModel({
+      id: "wrapper-b",
+      alias: "alias-b",
+      model_name: "shared-model",
+    });
+    const virtual = virtualModel({
+      id: "virt-1",
+      alias: "v",
+      components: [
+        {
+          weight: 1,
+          enabled: true,
+          sort_order: 0,
+          created_at: "2024-01-01",
+          model: { id: "wrapper-a", alias: "alias-a", model_name: "shared-model" },
+        },
+        {
+          weight: 1,
+          enabled: true,
+          sort_order: 1,
+          created_at: "2024-01-01",
+          model: { id: "wrapper-b", alias: "alias-b", model_name: "shared-model" },
+        },
+      ],
+    });
+
+    const refs = lookupReferences(
+      buildReferenceIndex([wrapperA, wrapperB, virtual]),
+      ENDPOINT_ID,
+      "shared-model",
+    );
+
+    expect(refs.virtualModels).toHaveLength(1);
+    expect(refs.virtualModels[0].modelId).toBe("virt-1");
   });
 });

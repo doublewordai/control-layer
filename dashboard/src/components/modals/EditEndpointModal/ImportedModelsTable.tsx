@@ -73,10 +73,17 @@ const ImportedModelRow: React.FC<ImportedModelRowProps> = ({
   onAliasChange,
   onRemove,
 }) => {
-  const hostedCount = references
-    ? references.directHosted.length + references.virtualModels.length
-    : 0;
+  // The deployment's own implicit Standard Model wrapper is part of the
+  // import — counting it as a "reference" is misleading. We only show a
+  // badge when the user has configured *additional* dependencies: extra
+  // wrappers, virtual model components, or traffic rules.
+  const extraWrapperCount = Math.max(
+    0,
+    (references?.directHosted.length ?? 0) - 1,
+  );
+  const virtualCount = references?.virtualModels.length ?? 0;
   const ruleCount = references?.trafficRules.length ?? 0;
+  const hasAnyBadge = extraWrapperCount + virtualCount + ruleCount > 0;
 
   return (
     <li
@@ -108,20 +115,41 @@ const ImportedModelRow: React.FC<ImportedModelRowProps> = ({
       </div>
 
       <div className="col-span-2 text-xs flex items-center gap-1.5 flex-wrap" role="cell">
-        {hostedCount === 0 && ruleCount === 0 ? (
+        {!hasAnyBadge ? (
           <span className="text-gray-400">—</span>
         ) : (
           <>
-            {hostedCount > 0 && (
+            {virtualCount > 0 && (
               <ReferenceBadge
-                label={`${hostedCount} model${hostedCount === 1 ? "" : "s"}`}
+                label={`${virtualCount} virtual`}
                 tone="warn"
+                title={
+                  virtualCount === 1
+                    ? "1 virtual model includes this as a component"
+                    : `${virtualCount} virtual models include this as a component`
+                }
               />
             )}
             {ruleCount > 0 && (
               <ReferenceBadge
                 label={`${ruleCount} rule${ruleCount === 1 ? "" : "s"}`}
                 tone="warn"
+                title={
+                  ruleCount === 1
+                    ? "1 traffic rule redirects to this deployment"
+                    : `${ruleCount} traffic rules redirect to this deployment`
+                }
+              />
+            )}
+            {extraWrapperCount > 0 && (
+              <ReferenceBadge
+                label={`${extraWrapperCount} extra hosted`}
+                tone="warn"
+                title={
+                  extraWrapperCount === 1
+                    ? "1 additional standard model wraps this deployment"
+                    : `${extraWrapperCount} additional standard models wrap this deployment`
+                }
               />
             )}
           </>
@@ -144,11 +172,13 @@ const ImportedModelRow: React.FC<ImportedModelRowProps> = ({
   );
 };
 
-const ReferenceBadge: React.FC<{ label: string; tone: "warn" | "neutral" }> = ({
-  label,
-  tone,
-}) => (
+const ReferenceBadge: React.FC<{
+  label: string;
+  tone: "warn" | "neutral";
+  title?: string;
+}> = ({ label, tone, title }) => (
   <span
+    title={title}
     className={
       tone === "warn"
         ? "px-1.5 py-0.5 rounded bg-amber-50 text-amber-700 border border-amber-200 text-[10px] font-medium"

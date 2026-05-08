@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
 import {
   Server,
   Check,
@@ -53,9 +53,10 @@ import {
   type ImportedDeployment,
 } from "./useEndpointModelsState";
 import {
-  computeReferencesForDeployment,
+  buildReferenceIndex,
   emptyReferences,
-  totalReferenceCount,
+  hasUserConfiguredReferences,
+  lookupReferences,
   type DeploymentReferences,
 } from "./references";
 
@@ -175,34 +176,42 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
 
   const modelsState = useEndpointModelsState(initialDeployments);
 
-  // Compute references once per render — the work is bounded by the number of
-  // deployments times the number of models in the org.
+  // Build the reference index once per `allModels` change. Per-deployment
+  // lookups against this index are O(1), so the references map below is cheap
+  // to recompute on every render even during alias-input keystrokes.
+  const referenceIndex = useMemo(
+    () => buildReferenceIndex(allModels),
+    [allModels],
+  );
+
   const referencesByModelName = useMemo(() => {
     const map = new Map<string, DeploymentReferences>();
     for (const d of modelsState.deployments) {
-      // Only compute for server-side deployments — newly-added models can't have
-      // references yet because they haven't been saved.
-      if (d.isNew) {
-        map.set(d.modelName, emptyReferences());
-      } else {
-        map.set(
-          d.modelName,
-          computeReferencesForDeployment(endpoint.id, d.modelName, allModels),
-        );
-      }
+      map.set(
+        d.modelName,
+        lookupReferences(referenceIndex, endpoint.id, d.modelName),
+      );
     }
     return map;
-  }, [modelsState.deployments, allModels, endpoint.id]);
+  }, [modelsState.deployments, referenceIndex, endpoint.id]);
 
-  // Local conflict detection (same alias used by 2+ deployments in the staged set)
+  // Local conflict detection. Mirrors the backend's `LOWER(alias)` uniqueness
+  // constraint and the `.trim()` we apply on submit, so that "Foo"/"foo" and
+  // "foo"/" foo" are caught before save instead of producing 409s.
   const conflictingAliases = useMemo(() => {
-    const counts = new Map<string, number>();
+    const groups = new Map<string, string[]>();
     for (const d of modelsState.deployments) {
-      counts.set(d.alias, (counts.get(d.alias) ?? 0) + 1);
+      const normalized = d.alias.trim().toLowerCase();
+      if (!normalized) continue;
+      const list = groups.get(normalized) ?? [];
+      list.push(d.alias);
+      groups.set(normalized, list);
     }
     const dupes = new Set<string>();
-    for (const [alias, count] of counts) {
-      if (count > 1) dupes.add(alias);
+    for (const [, originals] of groups) {
+      if (originals.length > 1) {
+        for (const a of originals) dupes.add(a);
+      }
     }
     return dupes;
   }, [modelsState.deployments]);
@@ -279,28 +288,38 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
     setBackendConflicts(new Set());
   };
 
+  // backendConflicts holds *aliases* (not modelNames) returned by the server's
+  // 409 response. Any user edit that could change the alias set invalidates
+  // them, so we clear the whole set on add/remove/alias-edit and let the next
+  // save round-trip surface fresh ones.
+  const invalidateBackendConflicts = useCallback(() => {
+    setBackendConflicts((prev) => (prev.size === 0 ? prev : new Set()));
+  }, []);
+
   const handleAddModel = (modelName: string) => {
     modelsState.addModel(modelName);
-    // Clear any backend conflict that may have referenced this name on a prior save
-    setBackendConflicts((prev) => {
-      if (!prev.has(modelName)) return prev;
-      const next = new Set(prev);
-      next.delete(modelName);
-      return next;
-    });
+    invalidateBackendConflicts();
+  };
+
+  const handleAliasChange = (modelName: string, alias: string) => {
+    modelsState.setAlias(modelName, alias);
+    invalidateBackendConflicts();
   };
 
   const handleRemoveModel = (modelName: string) => {
     const refs =
       referencesByModelName.get(modelName) ?? emptyReferences();
 
-    if (totalReferenceCount(refs) === 0) {
-      // Silent removal with undo
-      modelsState.removeModel(modelName);
+    // The deployment's own implicit Standard Model wrapper is always present
+    // and isn't a "user-configured" dependency — only warn when there are
+    // additional wrappers, virtual model components, or traffic rules.
+    if (!hasUserConfiguredReferences(refs)) {
+      const undo = modelsState.removeModel(modelName);
+      invalidateBackendConflicts();
       toast(`Removed ${modelName}`, {
         action: {
           label: "Undo",
-          onClick: () => modelsState.undoRemove(modelName),
+          onClick: undo,
         },
       });
       return;
@@ -312,6 +331,7 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
   const confirmRemoval = () => {
     if (!pendingRemoval) return;
     modelsState.removeModel(pendingRemoval.modelName);
+    invalidateBackendConflicts();
     setPendingRemoval(null);
   };
 
@@ -336,7 +356,11 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
     const visibleModelNames = modelsState.deployments.map((d) => d.modelName);
     const aliasMapping: Record<string, string> = {};
     for (const d of modelsState.deployments) {
-      aliasMapping[d.modelName] = (d.alias || d.modelName).trim();
+      // Trim first, fall back to modelName if the trimmed alias is empty.
+      // Without ordering it this way, an alias of pure whitespace would slip
+      // through (`"  ".trim()` -> `""`) and be sent to the API as empty.
+      const trimmed = (d.alias ?? "").trim();
+      aliasMapping[d.modelName] = trimmed.length > 0 ? trimmed : d.modelName;
     }
 
     const updateData: EndpointUpdateRequest = {
@@ -443,6 +467,7 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
                 catalog={catalog}
                 importedModelNames={importedModelNames}
                 onAddModel={handleAddModel}
+                onAliasChange={handleAliasChange}
                 onRemoveModel={handleRemoveModel}
                 submitError={submitError}
               />
@@ -726,6 +751,7 @@ interface ModelsStepProps {
   catalog: AvailableModel[];
   importedModelNames: Set<string>;
   onAddModel: (modelName: string) => void;
+  onAliasChange: (modelName: string, alias: string) => void;
   onRemoveModel: (modelName: string) => void;
   submitError: string | null;
 }
@@ -739,6 +765,7 @@ const ModelsStep: React.FC<ModelsStepProps> = ({
   catalog,
   importedModelNames,
   onAddModel,
+  onAliasChange,
   onRemoveModel,
   submitError,
 }) => (
@@ -814,7 +841,7 @@ const ModelsStep: React.FC<ModelsStepProps> = ({
         conflictingAliases={
           new Set([...conflictingAliases, ...backendConflicts])
         }
-        onAliasChange={modelsState.setAlias}
+        onAliasChange={onAliasChange}
         onRemove={onRemoveModel}
       />
     </div>
