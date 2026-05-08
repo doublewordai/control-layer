@@ -1,6 +1,6 @@
 [package]
 name = "dwctl"
-version = "8.45.0"
+version = "8.46.4"
 edition = "2024"
 description = "The Doubleword Control Layer - A self-hostable observability and analytics platform for LLM applications"
 license = "MIT OR Apache-2.0"
@@ -19,7 +19,7 @@ embedded-db = ["dep:postgresql_embedded"]
 
 [dependencies]
 axum = { version = "0.8", features = ["multipart"] }
-fusillade = { version = "16.8.0" }
+fusillade = { version = "16.8.2" }
 tokio = { version = "1.0", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = "0.7"
@@ -75,7 +75,7 @@ utoipa-scalar = { version = "0.3", features = ["axum"] }
 figment = { version = "0.10", features = ["yaml", "env", "test"] }
 rand = "0.10"
 # Authentication
-jsonwebtoken = "9.0"
+jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 argon2 = "0.5"
 base64 = "0.22"
 bytes = "1.5"
@@ -148,8 +148,12 @@ ctor = "0.9"
 hmac = "0.13.0"
 sha2 = "0.11.0"
 hex = "0.4.3"
-# AWS SDK for S3 source connections
-aws-sdk-s3 = "1.21"
+# AWS SDK for S3 source connections.
+# default-features disabled to drop the legacy `rustls` feature, which pulls
+# in the unmaintained rustls 0.21 / hyper-rustls 0.24 stack (and with it the
+# vulnerable rustls-webpki 0.101.x). `default-https-client` gives us the
+# modern rustls 0.23 / aws-lc-rs path instead.
+aws-sdk-s3 = { version = "1.21", default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
 aws-credential-types = "1.1"
 
 [dev-dependencies]

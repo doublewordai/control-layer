@@ -63,9 +63,11 @@ export function MyOrganization() {
         readOnly={!canManage}
       />
 
-      {canManage && (
-        <NotificationSettings userId={activeOrganizationId} isOrganization />
-      )}
+      <NotificationSettings
+        userId={activeOrganizationId}
+        isOrganization
+        readOnly={!canManage}
+      />
     </div>
   );
 }

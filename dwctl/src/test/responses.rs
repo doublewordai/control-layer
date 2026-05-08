@@ -315,6 +315,7 @@ async fn test_multi_step_chain_assembles_and_is_retrievable_via_get(pool: PgPool
         api_key: None,
         created_by: Some("test-user".to_string()),
         base_url: "http://upstream-mock".to_string(),
+        resolved_tool_names: std::collections::HashSet::new(),
     });
     let request_id = head_uuid.to_string();
 

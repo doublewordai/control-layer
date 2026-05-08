@@ -172,7 +172,10 @@ impl RequestHandler for AnalyticsHandler {
             // Extract basic metrics - captures status_code, duration, model from request, etc.
             let metrics = UsageMetrics::extract(self.instance_id, &request_data, &response_data, &metrics_response, &self.config);
 
-            if response_data.status.is_success()
+            // Gate on the (possibly reclassified) status from metrics, not the raw upstream
+            // status — streams that opened 200 but ended with an embedded error frame have
+            // already been rewritten to 502 by UsageMetrics::extract and shouldn't trip this.
+            if (200..300).contains(&metrics.status_code)
                 && metrics.total_tokens == 0
                 && let Some(endpoint) = usage_required_endpoint
             {

@@ -7,7 +7,6 @@ import {
   ArrowUpDown,
   MoreHorizontal,
   ExternalLink,
-  RefreshCw,
   Edit2,
   Trash2,
   Check,
@@ -35,8 +34,6 @@ interface ColumnActions {
   ) => void;
   onEditModal: (endpoint: Endpoint) => void;
   onDelete: (endpoint: Endpoint) => void;
-  onSynchronize: (endpoint: Endpoint) => void;
-  isSynchronizing?: boolean;
 }
 
 // Editable cell component
@@ -297,13 +294,6 @@ export const createColumns = (
             <DropdownMenuItem onClick={() => actions.onEditModal(endpoint)}>
               <Edit2 className="mr-2 h-4 w-4" />
               Edit
-            </DropdownMenuItem>
-            <DropdownMenuItem
-              onClick={() => actions.onSynchronize(endpoint)}
-              disabled={actions.isSynchronizing}
-            >
-              <RefreshCw className="mr-2 h-4 w-4" />
-              Synchronize
             </DropdownMenuItem>
             <DropdownMenuSeparator />
             <DropdownMenuItem

@@ -61,6 +61,7 @@ pub fn verify_session_token(token: &str, config: &Config) -> Result<UserId, Erro
         | jsonwebtoken::errors::ErrorKind::InvalidSignature
         | jsonwebtoken::errors::ErrorKind::ExpiredSignature
         | jsonwebtoken::errors::ErrorKind::MissingRequiredClaim(_)
+        | jsonwebtoken::errors::ErrorKind::InvalidClaimFormat(_)
         | jsonwebtoken::errors::ErrorKind::InvalidIssuer
         | jsonwebtoken::errors::ErrorKind::InvalidAudience
         | jsonwebtoken::errors::ErrorKind::InvalidSubject
@@ -70,14 +71,16 @@ pub fn verify_session_token(token: &str, config: &Config) -> Result<UserId, Erro
 
         // Server errors (500) - key issues, internal failures
         jsonwebtoken::errors::ErrorKind::InvalidEcdsaKey
+        | jsonwebtoken::errors::ErrorKind::InvalidEddsaKey
         | jsonwebtoken::errors::ErrorKind::InvalidRsaKey(_)
         | jsonwebtoken::errors::ErrorKind::RsaFailedSigning
+        | jsonwebtoken::errors::ErrorKind::Signing(_)
+        | jsonwebtoken::errors::ErrorKind::Provider(_)
         | jsonwebtoken::errors::ErrorKind::InvalidAlgorithmName
         | jsonwebtoken::errors::ErrorKind::InvalidKeyFormat
         | jsonwebtoken::errors::ErrorKind::MissingAlgorithm
         | jsonwebtoken::errors::ErrorKind::Json(_)
-        | jsonwebtoken::errors::ErrorKind::Utf8(_)
-        | jsonwebtoken::errors::ErrorKind::Crypto(_) => Error::Internal {
+        | jsonwebtoken::errors::ErrorKind::Utf8(_) => Error::Internal {
             operation: format!("JWT verification: {e}"),
         },
 

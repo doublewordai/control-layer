@@ -44,7 +44,7 @@ use onwards::client::HttpClient;
 use onwards::traits::{RequestContext, ToolExecutor};
 use onwards::{LoopConfig, LoopError, MultiStepStore, UpstreamTarget};
 
-use crate::responses::store::FusilladeResponseStore;
+use crate::responses::store::{FusilladeResponseStore, PendingResponseInput};
 use crate::tool_executor::ResolvedTools;
 
 /// Dispatches per-claim work to the multi-step loop for `/v1/responses`
@@ -200,9 +200,11 @@ where
         // tool set their original /v1/responses POST would have seen
         // — no daemon-vs-realtime tool-availability divergence.
         let mut tool_ctx = RequestContext::new().with_model(request.data.model.clone());
+        let mut resolved_tool_names = std::collections::HashSet::new();
         if let Some(resolver) = &self.tool_resolver {
             match resolver.resolve(&request.data.api_key, &request.data.model).await {
                 Ok(Some(resolved)) => {
+                    resolved_tool_names = resolved.tools.keys().cloned().collect();
                     tool_ctx = tool_ctx.with_extension(ResolvedTools(Arc::new(resolved)));
                 }
                 Ok(None) => {
@@ -221,6 +223,62 @@ where
                 }
             }
         }
+
+        // The transition function (`next_action_for`) re-parses the
+        // user's `/v1/responses` body on every iteration to build the
+        // chat-completions messages array; without a `pending_input`
+        // registered under this request_id it errors at the first
+        // iteration. The warm path stashes this synchronously before
+        // kicking off the loop; the daemon path has to do the same
+        // here, sourcing the body and per-request fields from the
+        // claimed fusillade row. Without this, daemon-driven
+        // multi-step requests fail with "no pending input registered"
+        // immediately — which is why `service_tier:"flex"` couldn't
+        // safely fall through to `handle_flex` until now.
+        //
+        // The fusillade row's `id` is the same UUID the loop uses as
+        // its `request_id` (and that `record_step` reuses as the head
+        // step's id), so we register under exactly that key.
+        let pending = PendingResponseInput {
+            body: request.data.body.clone(),
+            api_key: if request.data.api_key.is_empty() {
+                None
+            } else {
+                Some(request.data.api_key.clone())
+            },
+            created_by: if request.data.created_by.is_empty() {
+                None
+            } else {
+                Some(request.data.created_by.clone())
+            },
+            base_url: request.data.endpoint.clone(),
+            resolved_tool_names,
+        };
+        if let Err(e) = self.response_store.register_pending_with_id(request.data.id.0, pending) {
+            // Fail the request immediately with the real cause rather
+            // than letting the loop surface a confusing
+            // "no pending input registered" error that doesn't
+            // mention the lock at all. Lock poisoning is rare in
+            // practice (would require a panic while holding the
+            // mutex), but when it does happen we want the failure
+            // mode to be diagnosable from the audit log alone.
+            return Err(fusillade::FusilladeError::Other(anyhow::anyhow!(
+                "register pending input for daemon-driven /v1/responses: {e}"
+            )));
+        }
+
+        // RAII cleanup: even if the loop panics or the daemon task
+        // is cancelled mid-await, the side-channel entry must be
+        // dropped — otherwise `pending_inputs` grows unbounded
+        // across daemon-claimed requests. An explicit
+        // `unregister_pending` call after the loop wouldn't run on
+        // task cancellation (the future is dropped at the await
+        // point); the guard's `Drop` runs in either path.
+        let cleanup_store = self.response_store.clone();
+        let cleanup_id = request_id.clone();
+        let _pending_guard = scopeguard::guard((), move |_| {
+            cleanup_store.unregister_pending(&cleanup_id);
+        });
 
         // Daemon path: no event sink — the user's HTTP connection is
         // long gone by the time we claim. Streaming requests use the

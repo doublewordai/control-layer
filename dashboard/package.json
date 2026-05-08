@@ -88,8 +88,11 @@
     "tailwindcss": "^4.1.12",
     "typescript": "~5.9.2",
     "typescript-eslint": "^8.46.2",
-    "vite": "^7.1.3",
+    "vite": "^7.3.2",
     "vitest": "^3.2.4"
+  },
+  "engines": {
+    "node": "^20.19.0 || >=22.12.0"
   },
   "msw": {
     "workerDirectory": [
@@ -98,7 +101,9 @@
   },
   "pnpm": {
     "overrides": {
-      "rollup": "npm:@rollup/wasm-node"
+      "rollup": "npm:@rollup/wasm-node",
+      "lodash": "^4.18.0",
+      "mdast-util-to-hast": "^13.2.1"
     },
     "onlyBuiltDependencies": [
       "esbuild",
