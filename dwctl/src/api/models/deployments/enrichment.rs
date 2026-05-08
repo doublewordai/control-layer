@@ -223,6 +223,10 @@ impl<'a> DeployedModelEnricher<'a> {
             // Add tariffs if pricing is requested and available
             if self.include_pricing {
                 model_response = Self::apply_tariffs(model_response, &pricing_tariffs_map);
+                // Hide pricing for purposes that the model denies via a
+                // traffic-routing rule. Run after `apply_tariffs` so it
+                // operates on the freshly-attached set; no-op if no tariffs.
+                model_response = model_response.filter_denied_purpose_tariffs();
             }
 
             // Add components if requested (for composite models)
@@ -857,5 +861,96 @@ mod tests {
 
         // Non-batch tariffs always pass through
         assert_eq!(result.tariffs.unwrap().len(), 2);
+    }
+
+    fn deny_rule(purpose: ApiKeyPurpose) -> crate::api::models::deployments::TrafficRoutingRule {
+        crate::api::models::deployments::TrafficRoutingRule {
+            api_key_purpose: purpose,
+            action: crate::api::models::deployments::TrafficRoutingAction::Deny,
+        }
+    }
+
+    fn redirect_rule(purpose: ApiKeyPurpose, target: &str) -> crate::api::models::deployments::TrafficRoutingRule {
+        crate::api::models::deployments::TrafficRoutingRule {
+            api_key_purpose: purpose,
+            action: crate::api::models::deployments::TrafficRoutingAction::Redirect {
+                target: target.to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn test_filter_denied_purpose_tariffs_drops_matching_purpose() {
+        let mut model = create_test_model();
+        model.traffic_routing_rules = Some(vec![deny_rule(ApiKeyPurpose::Batch)]);
+        model.tariffs = Some(vec![
+            create_test_tariff(Some(ApiKeyPurpose::Batch), Some("24h")),
+            create_test_tariff(Some(ApiKeyPurpose::Batch), Some("1h")),
+            create_test_tariff(Some(ApiKeyPurpose::Realtime), None),
+        ]);
+
+        let result = model.filter_denied_purpose_tariffs();
+
+        let tariffs = result.tariffs.unwrap();
+        assert_eq!(tariffs.len(), 1);
+        assert_eq!(tariffs[0].api_key_purpose, Some(ApiKeyPurpose::Realtime));
+    }
+
+    #[test]
+    fn test_filter_denied_purpose_tariffs_keeps_null_purpose_fallback() {
+        let mut model = create_test_model();
+        model.traffic_routing_rules = Some(vec![deny_rule(ApiKeyPurpose::Realtime), deny_rule(ApiKeyPurpose::Batch)]);
+        model.tariffs = Some(vec![
+            create_test_tariff(Some(ApiKeyPurpose::Realtime), None),
+            create_test_tariff(Some(ApiKeyPurpose::Batch), Some("24h")),
+            create_test_tariff(None, None), // implicit fallback
+        ]);
+
+        let result = model.filter_denied_purpose_tariffs();
+
+        // Both denied purposes drop; null-purpose fallback survives.
+        let tariffs = result.tariffs.unwrap();
+        assert_eq!(tariffs.len(), 1);
+        assert_eq!(tariffs[0].api_key_purpose, None);
+    }
+
+    #[test]
+    fn test_filter_denied_purpose_tariffs_ignores_redirect_rules() {
+        let mut model = create_test_model();
+        model.traffic_routing_rules = Some(vec![redirect_rule(ApiKeyPurpose::Batch, "another-model")]);
+        model.tariffs = Some(vec![
+            create_test_tariff(Some(ApiKeyPurpose::Batch), Some("24h")),
+            create_test_tariff(Some(ApiKeyPurpose::Realtime), None),
+        ]);
+
+        let result = model.filter_denied_purpose_tariffs();
+
+        // Redirect doesn't deny access, so batch tariff stays.
+        assert_eq!(result.tariffs.unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_filter_denied_purpose_tariffs_no_rules_is_noop() {
+        let mut model = create_test_model();
+        model.traffic_routing_rules = Some(vec![]);
+        model.tariffs = Some(vec![
+            create_test_tariff(Some(ApiKeyPurpose::Realtime), None),
+            create_test_tariff(Some(ApiKeyPurpose::Batch), Some("24h")),
+        ]);
+
+        let result = model.filter_denied_purpose_tariffs();
+
+        assert_eq!(result.tariffs.unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_filter_denied_purpose_tariffs_no_tariffs_is_noop() {
+        let mut model = create_test_model();
+        model.traffic_routing_rules = Some(vec![deny_rule(ApiKeyPurpose::Batch)]);
+        model.tariffs = None;
+
+        let result = model.filter_denied_purpose_tariffs();
+
+        assert!(result.tariffs.is_none());
     }
 }

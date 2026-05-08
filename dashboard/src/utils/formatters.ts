@@ -230,7 +230,10 @@ function deniedPurposes<
     traffic_routing_rules?:
       | Array<{
           api_key_purpose?: string | null;
-          action: { type: string };
+          // Extra index signature lets us accept the full
+          // TrafficRoutingAction shape (which carries `target` for
+          // redirect actions) without coupling formatters to that type.
+          action: { type: string; [key: string]: unknown };
         }>
       | null;
   },
@@ -253,6 +256,10 @@ function deniedPurposes<
  * Tariffs with a null/undefined `api_key_purpose` are kept regardless of
  * deny rules: they're the implicit fallback price, not tied to a specific
  * purpose.
+ *
+ * Generic over the tariff element type so callers retain access to the
+ * concrete fields (`input_price_per_token`, `id`, etc.) — without this,
+ * TypeScript would narrow the result to the bare constraint shape.
  */
 export function getVisibleTariffsForModel<
   T extends {
@@ -260,16 +267,15 @@ export function getVisibleTariffsForModel<
     api_key_purpose?: string | null;
     completion_window?: string | null;
   },
-  M extends {
-    tariffs?: T[] | null;
-    traffic_routing_rules?:
-      | Array<{
-          api_key_purpose?: string | null;
-          action: { type: string };
-        }>
-      | null;
-  },
->(model: M): T[] {
+>(model: {
+  tariffs?: T[] | null;
+  traffic_routing_rules?:
+    | Array<{
+        api_key_purpose?: string | null;
+        action: { type: string; [key: string]: unknown };
+      }>
+    | null;
+}): T[] {
   const denied = deniedPurposes(model);
   return getUserFacingTariffs(model.tariffs ?? []).filter(
     (t) => t.api_key_purpose == null || !denied.has(t.api_key_purpose),
