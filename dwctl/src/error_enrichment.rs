@@ -89,7 +89,17 @@ pub async fn error_enrichment_middleware(State(pool): State<PgPool>, request: Re
     {
         debug!("Intercepted 403 response on AI proxy path, attempting enrichment");
 
-        // First check if it's a model access issue
+        // Order matters: the more fundamental the failure, the earlier it runs, so
+        // when several conditions could explain the 403 we surface the one that's
+        // most useful to act on.
+        //   1. Model access (group membership) — without this the user can't reach
+        //      the model at all, so report it first.
+        //   2. Modality (traffic routing rule) — user has the model but their key
+        //      kind (batch/realtime/playground) is denied.
+        //   3. Insufficient balance — onwards excludes keys with balance ≤ 0; this
+        //      is the catch-all if neither of the above explains the 403.
+
+        // 1. Model access via group membership
         if let Some(model) = &model_name
             && let Ok(user_id) = get_user_id_of_api_key(pool.clone(), &key).await
             && let Ok(has_access) = check_user_has_model_access(pool.clone(), user_id, model).await
@@ -105,8 +115,7 @@ pub async fn error_enrichment_middleware(State(pool): State<PgPool>, request: Re
             .into_response();
         }
 
-        // Then check whether a traffic routing rule denies the API key's purpose (modality)
-        // for this model. This catches deny rules configured on the deployed model.
+        // 2. Modality blocked by a traffic routing rule on this model.
         if let Some(model) = &model_name
             && let Ok(Some(purpose)) = check_modality_blocked(pool.clone(), &key, model).await
         {
@@ -118,7 +127,7 @@ pub async fn error_enrichment_middleware(State(pool): State<PgPool>, request: Re
             .into_response();
         }
 
-        // If access is OK but we have a 403, check balance - onwards excludes keys with balance <= 0
+        // 3. Insufficient balance.
         if let Ok(balance) = get_balance_of_api_key(pool.clone(), &key).await
             && balance <= Decimal::ZERO
         {
@@ -295,6 +304,24 @@ mod tests {
     };
     use crate::{api::models::users::Role, test::utils::create_test_user};
     use rust_decimal::Decimal;
+
+    /// Pure unit test: `modality_label` produces user-friendly labels for known
+    /// purposes and capitalises unknown values rather than emitting a placeholder.
+    #[test]
+    fn test_modality_label_known_and_unknown_purposes() {
+        assert_eq!(modality_label("batch"), "Batch");
+        assert_eq!(modality_label("realtime"), "Real-time");
+        assert_eq!(modality_label("playground"), "Playground");
+        assert_eq!(modality_label("platform"), "Platform");
+
+        // Unknown purposes capitalise the raw value so messages stay accurate
+        // if a new purpose ships before this match is updated.
+        assert_eq!(modality_label("evaluation"), "Evaluation");
+
+        // Empty string falls back to a generic label rather than producing
+        // a sentence starting with " access to ...".
+        assert_eq!(modality_label(""), "This");
+    }
 
     /// Integration test: Error enrichment middleware enriches 403 with balance info
     #[sqlx::test]
