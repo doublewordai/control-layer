@@ -108,9 +108,23 @@ impl<P: PoolProvider + Clone> FusilladeResponseStore<P> {
     /// generated head step UUID — the warm path uses its string form
     /// as both the user-visible `resp_<id>` value and the loop's
     /// `request_id` parameter.
+    ///
+    /// On lock-poison, logs at error level and still returns a UUID;
+    /// the warm path can't easily fail-fast on this without
+    /// restructuring its `Option`-returning helpers, and the
+    /// downstream `next_action_for` will surface a "no pending input
+    /// registered" error with the same UUID, making the two log
+    /// lines correlatable. Daemon callers that *can* propagate
+    /// errors should use [`register_pending_with_id`] directly.
     pub fn register_pending(&self, input: PendingResponseInput) -> Uuid {
         let head_step_uuid = Uuid::new_v4();
-        self.register_pending_with_id(head_step_uuid, input);
+        if let Err(e) = self.register_pending_with_id(head_step_uuid, input) {
+            tracing::error!(
+                error = %e,
+                request_id = %head_step_uuid,
+                "warm-path register_pending continuing after lock-poison; loop will fail downstream",
+            );
+        }
         head_step_uuid
     }
 
@@ -123,26 +137,18 @@ impl<P: PoolProvider + Clone> FusilladeResponseStore<P> {
     /// Without this, daemon-driven multi-step requests fail at the
     /// first iteration with "no pending input registered".
     ///
-    /// A poisoned `pending_inputs` lock is logged at error level
-    /// rather than silently dropped — otherwise the failure would
-    /// surface downstream as a confusing "no pending input
-    /// registered" error from `next_action_for`, with no obvious
-    /// connection to the real cause.
-    pub fn register_pending_with_id(&self, head_step_uuid: Uuid, input: PendingResponseInput) {
+    /// Returns `Err` on lock poisoning so the daemon can fail the
+    /// request immediately with the real cause rather than letting
+    /// the loop surface a downstream "no pending input registered"
+    /// error that doesn't mention the lock at all.
+    pub fn register_pending_with_id(&self, head_step_uuid: Uuid, input: PendingResponseInput) -> Result<(), StoreError> {
         let key = head_step_uuid.to_string();
-        match self.pending_inputs.write() {
-            Ok(mut guard) => {
-                guard.insert(key, input);
-            }
-            Err(e) => {
-                tracing::error!(
-                    error = %e,
-                    request_id = %head_step_uuid,
-                    "pending_inputs lock poisoned in register_pending_with_id; \
-                     multi-step loop will fail with 'no pending input registered'",
-                );
-            }
-        }
+        let mut guard = self
+            .pending_inputs
+            .write()
+            .map_err(|e| StoreError::StorageError(format!("pending_inputs lock poisoned: {e}")))?;
+        guard.insert(key, input);
+        Ok(())
     }
 
     /// Remove the side-channel entry for a completed (or failed)

@@ -315,6 +315,14 @@ fn resolve_service_tier(tier: Option<&str>) -> ServiceTier {
 ///
 /// Extracted as a pure function so the routing decision is testable
 /// without standing up the full middleware state.
+///
+/// Check order matters for readability rather than correctness — both
+/// short-circuits return `FallThrough`, so reordering them produces
+/// the same answer — but reading flex-first makes the bug-this-PR-
+/// fixes connection explicit: flex must never reach the warm path.
+/// `is_responses_api` second documents that warm path is exclusive
+/// to `/v1/responses`. Stream/background tail dispatch is the only
+/// real branching.
 #[derive(Debug, PartialEq, Eq)]
 enum WarmPathBranch {
     Stream,

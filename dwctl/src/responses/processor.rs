@@ -254,7 +254,18 @@ where
             base_url: request.data.endpoint.clone(),
             resolved_tool_names,
         };
-        self.response_store.register_pending_with_id(request.data.id.0, pending);
+        if let Err(e) = self.response_store.register_pending_with_id(request.data.id.0, pending) {
+            // Fail the request immediately with the real cause rather
+            // than letting the loop surface a confusing
+            // "no pending input registered" error that doesn't
+            // mention the lock at all. Lock poisoning is rare in
+            // practice (would require a panic while holding the
+            // mutex), but when it does happen we want the failure
+            // mode to be diagnosable from the audit log alone.
+            return Err(fusillade::FusilladeError::Other(anyhow::anyhow!(
+                "register pending input for daemon-driven /v1/responses: {e}"
+            )));
+        }
 
         // RAII cleanup: even if the loop panics or the daemon task
         // is cancelled mid-await, the side-channel entry must be
