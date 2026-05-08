@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { Code, Play, X, Filter, Clock, DollarSign, Check, ChevronsUpDown, Zap, FastForward } from "lucide-react";
 import { type ColumnDef } from "@tanstack/react-table";
@@ -39,7 +39,12 @@ import { ApiExamples } from "../../modals";
 import { useBootstrapContent } from "../../../hooks/use-bootstrap-content";
 import { useOrganizationContext } from "../../../contexts/organization/useOrganizationContext";
 import { useServerPagination } from "../../../hooks/useServerPagination";
+import { usePersistedFilter } from "../../../hooks/usePersistedFilter";
 import { formatTimestamp, formatLongDuration, copyToClipboard } from "../../../utils";
+
+const PERSIST_SCOPE = "responses";
+const DEFAULT_TIER_FILTER: string[] = ["flex", "priority"];
+const EMPTY_MODEL_FILTER: string[] = [];
 
 const getStatusColor = (status: string): string => {
   switch (status) {
@@ -275,13 +280,33 @@ export function AsyncRequests() {
   const isPlatformManager = hasPermission("manage-models");
   const { isOrgContext, activeOrganizationId } = useOrganizationContext();
   const showUserColumn = isPlatformManager || isOrgContext;
-  // Filters
-  const [statusFilter, setStatusFilter] = useState<
-    AsyncRequestStatus | "all"
-  >("all");
-  const [modelFilter, setModelFilter] = useState<string[]>([]);
-  const [tierFilter, setTierFilter] = useState<string[]>(["flex", "priority"]);
-  const [sortActiveFirst, setSortActiveFirst] = useState(true);
+  // Filters — persisted to URL params + localStorage so they survive
+  // navigation to detail pages and across reloads. Date range is intentionally
+  // excluded — restoring stale absolute timestamps on a later visit would be
+  // confusing.
+  const [statusFilter, setStatusFilter] = usePersistedFilter(
+    PERSIST_SCOPE,
+    "status",
+    "all",
+  );
+  const [modelFilter, setModelFilter] = usePersistedFilter(
+    PERSIST_SCOPE,
+    "model",
+    EMPTY_MODEL_FILTER,
+  );
+  const [tierFilter, setTierFilter] = usePersistedFilter(
+    PERSIST_SCOPE,
+    "tier",
+    DEFAULT_TIER_FILTER,
+  );
+  const [sortActiveFirstStr, setSortActiveFirstStr] = usePersistedFilter(
+    PERSIST_SCOPE,
+    "activeFirst",
+    "true",
+  );
+  const sortActiveFirst = sortActiveFirstStr !== "false";
+  const setSortActiveFirst = (next: boolean) =>
+    setSortActiveFirstStr(next ? "true" : "false");
   const [dateRange, setDateRange] = useState<
     { from: Date; to: Date } | undefined
   >(undefined);
@@ -294,12 +319,20 @@ export function AsyncRequests() {
   );
   const [modelPopoverOpen, setModelPopoverOpen] = useState(false);
 
-  // Reset filters when org context changes
+  // Reset filters when org context changes. Skip the initial mount, otherwise
+  // freshly restored persisted filters would be wiped before they ever reach
+  // the API.
+  const isInitialOrgMount = useRef(true);
   useEffect(() => {
+    if (isInitialOrgMount.current) {
+      isInitialOrgMount.current = false;
+      return;
+    }
     setStatusFilter("all");
-    setModelFilter([]);
-    setTierFilter(["flex", "priority"]);
+    setModelFilter(EMPTY_MODEL_FILTER);
+    setTierFilter(DEFAULT_TIER_FILTER);
     setDateRange(undefined);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeOrganizationId]);
 
   // Server-side offset pagination
@@ -310,7 +343,10 @@ export function AsyncRequests() {
   const { data, isLoading } = useAsyncRequests({
     service_tiers: tierFilter.length > 0 ? tierFilter.join(",") : undefined,
     active_first: sortActiveFirst,
-    status: statusFilter !== "all" ? statusFilter : undefined,
+    status:
+      statusFilter !== "all"
+        ? (statusFilter as AsyncRequestStatus)
+        : undefined,
     model: modelFilter.length > 0 ? modelFilter.join(",") : undefined,
     created_after: dateRange?.from.toISOString(),
     created_before: dateRange?.to.toISOString(),
@@ -397,7 +433,7 @@ export function AsyncRequests() {
             <Select
               value={statusFilter}
               onValueChange={(v) => {
-                setStatusFilter(v as AsyncRequestStatus | "all");
+                setStatusFilter(v);
                 pagination.handleReset();
               }}
             >
@@ -445,10 +481,10 @@ export function AsyncRequests() {
                       type="checkbox"
                       checked={tierFilter.includes(tier)}
                       onChange={() => {
-                        setTierFilter((prev) =>
-                          prev.includes(tier)
-                            ? prev.filter((t) => t !== tier)
-                            : [...prev, tier],
+                        setTierFilter(
+                          tierFilter.includes(tier)
+                            ? tierFilter.filter((t) => t !== tier)
+                            : [...tierFilter, tier],
                         );
                         pagination.handleReset();
                       }}
@@ -487,7 +523,7 @@ export function AsyncRequests() {
                       <CommandItem
                         value="all-models"
                         onSelect={() => {
-                          setModelFilter([]);
+                          setModelFilter(EMPTY_MODEL_FILTER);
                           pagination.handleReset();
                         }}
                       >
@@ -504,10 +540,10 @@ export function AsyncRequests() {
                           key={m.id}
                           value={m.display_name || m.alias}
                           onSelect={() => {
-                            setModelFilter((prev) =>
-                              prev.includes(m.alias)
-                                ? prev.filter((v) => v !== m.alias)
-                                : [...prev, m.alias],
+                            setModelFilter(
+                              modelFilter.includes(m.alias)
+                                ? modelFilter.filter((v) => v !== m.alias)
+                                : [...modelFilter, m.alias],
                             );
                             pagination.handleReset();
                           }}
