@@ -110,14 +110,10 @@ pub async fn error_enrichment_middleware(State(pool): State<PgPool>, request: Re
         if let Some(model) = &model_name
             && let Ok(Some(purpose)) = check_modality_blocked(pool.clone(), &key, model).await
         {
-            let purpose_label = modality_label(&purpose);
             return Error::ModalityAccessDenied {
                 model_name: model.clone(),
                 purpose: purpose.clone(),
-                message: format!(
-                    "{} access to '{}' is blocked by a routing rule. Please contact your administrator to request access.",
-                    purpose_label, model
-                ),
+                message: modality_blocked_message(&purpose, model),
             }
             .into_response();
         }
@@ -138,12 +134,23 @@ pub async fn error_enrichment_middleware(State(pool): State<PgPool>, request: Re
 }
 
 /// Render an `api_keys.purpose` value as a user-facing modality label.
-fn modality_label(purpose: &str) -> &'static str {
+///
+/// Returns owned `String` so unknown purposes can fall back to a capitalised
+/// form of the raw value (rather than a generic placeholder), keeping the
+/// message accurate if new purposes are added without updating this match.
+fn modality_label(purpose: &str) -> String {
     match purpose {
-        "batch" => "Batch",
-        "realtime" => "Real-time",
-        "playground" => "Playground",
-        _ => "This",
+        "batch" => "Batch".to_string(),
+        "realtime" => "Real-time".to_string(),
+        "playground" => "Playground".to_string(),
+        "platform" => "Platform".to_string(),
+        other => {
+            let mut chars = other.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().chain(chars).collect(),
+                None => "This".to_string(),
+            }
+        }
     }
 }
 
@@ -230,17 +237,21 @@ pub async fn check_user_has_model_access(pool: PgPool, user_id: UserId, model_al
     Ok(result)
 }
 
-/// Validate that the bearer token's user has access to the specified model.
+/// Validate that the bearer token's user is allowed to call the specified model.
 ///
-/// Returns `Ok(())` if access is granted, or an error message if not.
-/// Used by the responses middleware to fail fast on invalid model access
-/// before creating fusillade rows.
+/// Checks both group-based access and modality (traffic routing rule) restrictions.
+/// Returns `Ok(())` if the request should be allowed, or a user-facing error message
+/// if not.
+///
+/// Used by the responses middleware to fail fast on Flex requests that bypass
+/// `onwards` entirely — without the modality check here, a Batch-purpose key
+/// could send a Flex request and skip a deny rule onwards would have enforced.
 pub async fn validate_api_key_model_access(pool: PgPool, api_key: &str, model: &str) -> Result<(), String> {
     let user_id = get_user_id_of_api_key(pool.clone(), api_key)
         .await
         .map_err(|_| "Invalid API key".to_string())?;
 
-    let has_access = check_user_has_model_access(pool, user_id, model)
+    let has_access = check_user_has_model_access(pool.clone(), user_id, model)
         .await
         .map_err(|e| format!("Failed to check model access: {e}"))?;
 
@@ -251,7 +262,25 @@ pub async fn validate_api_key_model_access(pool: PgPool, api_key: &str, model: &
         ));
     }
 
+    if let Some(purpose) = check_modality_blocked(pool, api_key, model)
+        .await
+        .map_err(|e| format!("Failed to check modality routing rules: {e}"))?
+    {
+        return Err(modality_blocked_message(&purpose, model));
+    }
+
     Ok(())
+}
+
+/// Build the user-facing message returned when a routing rule denies the API
+/// key's purpose for the requested model. Shared by the proxy enrichment
+/// middleware and the Flex validation path so both surface identical wording.
+fn modality_blocked_message(purpose: &str, model: &str) -> String {
+    format!(
+        "{} access to '{}' is blocked by a routing rule. Please contact your administrator to request access.",
+        modality_label(purpose),
+        model
+    )
 }
 
 #[cfg(test)]
@@ -624,6 +653,61 @@ mod tests {
             body.contains("Batch") && body.contains("blocked-model") && body.contains("administrator"),
             "expected modality-blocked message, got: {body}"
         );
+    }
+
+    /// Direct unit test: `validate_api_key_model_access` rejects requests when a routing
+    /// rule denies the API key's purpose. Flex requests on `/v1/responses` bypass onwards
+    /// and use this function to enforce auth, so it must reject modality-blocked keys
+    /// — otherwise a Batch key could reach a model where Batch is denied.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_validate_api_key_model_access_rejects_modality_blocked(pool: PgPool) {
+        use crate::test::utils::{add_deployment_to_group, add_user_to_group, create_test_group};
+
+        let user = create_test_user(&pool, Role::StandardUser).await;
+
+        let mut api_key_conn = pool.acquire().await.unwrap();
+        let mut api_keys_repo = ApiKeys::new(&mut api_key_conn);
+        let api_key = api_keys_repo
+            .create(&ApiKeyCreateDBRequest {
+                user_id: user.id,
+                name: "Batch Key".to_string(),
+                description: None,
+                purpose: ApiKeyPurpose::Batch,
+                requests_per_second: None,
+                burst_size: None,
+                created_by: user.id,
+            })
+            .await
+            .unwrap();
+
+        let endpoint_id = crate::test::utils::create_test_endpoint(&pool, "test-endpoint", user.id).await;
+        let deployment_id = crate::test::utils::create_test_model(&pool, "blocked-model-name", "blocked-model", endpoint_id, user.id).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+        add_deployment_to_group(&pool, deployment_id, group.id, user.id).await;
+
+        sqlx::query!(
+            "INSERT INTO model_traffic_rules (deployed_model_id, api_key_purpose, action) VALUES ($1, 'batch', 'deny')",
+            deployment_id
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let result = validate_api_key_model_access(pool.clone(), &api_key.secret, "blocked-model").await;
+        let err = result.expect_err("expected modality-blocked rejection");
+        assert!(
+            err.contains("Batch") && err.contains("blocked-model") && err.contains("administrator"),
+            "expected modality-blocked message, got: {err}"
+        );
+
+        // Sanity: a model without the deny rule still passes.
+        let other_deployment_id = crate::test::utils::create_test_model(&pool, "open-model-name", "open-model", endpoint_id, user.id).await;
+        add_deployment_to_group(&pool, other_deployment_id, group.id, user.id).await;
+        validate_api_key_model_access(pool.clone(), &api_key.secret, "open-model")
+            .await
+            .expect("expected access to be granted on a model without a deny rule");
     }
 
     /// Integration test: Error enrichment middleware passes through when no auth header
