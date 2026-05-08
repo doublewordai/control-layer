@@ -204,18 +204,11 @@ pub async fn responses_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
         "Routing inference request"
     );
 
-    // Generate the request and batch IDs upfront — known before any DB calls
-    // or proxying. The batch_id is set as `x-fusillade-batch-id` on the
-    // proxied request so analytics_handler can associate the http_analytics
-    // row with this batch (otherwise total_cost / token aggregates in the
-    // Batches view come back empty for realtime tracking rows).
+    // Generate the request ID upfront — known before any DB calls or
+    // proxying. Used as `x-fusillade-request-id` on the proxied request so
+    // the outlet handler can locate the row to update.
     let request_id = uuid::Uuid::new_v4();
-    let batch_id = uuid::Uuid::new_v4();
     let resp_id = format!("resp_{request_id}");
-    let completion_window = match service_tier {
-        ServiceTier::Flex => "1h",
-        ServiceTier::Realtime => "0s",
-    };
 
     // Validate API key for flex requests (realtime is validated by onwards).
     // Flex requests bypass onwards entirely — the daemon processes them later —
@@ -254,28 +247,33 @@ pub async fn responses_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
         None
     };
 
-    // Build the batch input (shared by both tiers).
-    let initial_state = match service_tier {
-        ServiceTier::Realtime => "processing", // Daemon won't claim; outlet handler completes
-        ServiceTier::Flex => "pending",        // Daemon claims and processes
-    };
-
-    let batch_input = fusillade::CreateSingleRequestBatchInput {
-        batch_id: Some(batch_id),
-        request_id,
-        body: request_value.to_string(),
-        model: model.to_string(),
-        base_url: state.loopback_base_url.clone(),
-        endpoint: endpoint.clone(),
-        completion_window: completion_window.to_string(),
-        initial_state: initial_state.to_string(),
-        api_key: api_key.clone(),
-        created_by,
-    };
-
     match service_tier {
-        ServiceTier::Realtime => handle_realtime(&state, batch_input, batch_id, &resp_id, model, background, parts, body_bytes, next).await,
-        ServiceTier::Flex => handle_flex(&state, batch_input, &resp_id, model, background).await,
+        ServiceTier::Realtime => {
+            let realtime_input = fusillade::CreateRealtimeInput {
+                request_id,
+                body: request_value.to_string(),
+                model: model.to_string(),
+                endpoint: state.loopback_base_url.clone(),
+                method: "POST".to_string(),
+                path: endpoint.clone(),
+                api_key: api_key.clone().unwrap_or_default(),
+                created_by: created_by.unwrap_or_default(),
+            };
+            handle_realtime(&state, realtime_input, &resp_id, model, background, parts, body_bytes, next).await
+        }
+        ServiceTier::Flex => {
+            let flex_input = fusillade::CreateFlexInput {
+                request_id,
+                body: request_value.to_string(),
+                model: model.to_string(),
+                endpoint: state.loopback_base_url.clone(),
+                method: "POST".to_string(),
+                path: endpoint.clone(),
+                api_key: api_key.clone().unwrap_or_default(),
+                created_by: created_by.unwrap_or_default(),
+            };
+            handle_flex(&state, flex_input, &resp_id, model, background).await
+        }
     }
 }
 
@@ -354,15 +352,14 @@ fn warm_path_branch(is_responses_api: bool, is_flex: bool, background: bool, str
 
 /// Handle a realtime request (priority/default/auto).
 ///
-/// For `background=true`: creates the batch row synchronously (so the client
+/// For `background=true`: creates the request row synchronously (so the client
 /// can immediately poll by ID), then spawns the proxy in the background.
-/// For `background=false`: fires off batch creation in the background and
+/// For `background=false`: fires off row creation in the background and
 /// proxies immediately — the outlet handler completes the row.
 #[allow(clippy::too_many_arguments)]
 async fn handle_realtime<P: PoolProvider + Clone + Send + Sync + 'static>(
     state: &ResponsesMiddlewareState<P>,
-    batch_input: fusillade::CreateSingleRequestBatchInput,
-    batch_id: uuid::Uuid,
+    realtime_input: fusillade::CreateRealtimeInput,
     resp_id: &str,
     model: &str,
     background: bool,
@@ -372,31 +369,25 @@ async fn handle_realtime<P: PoolProvider + Clone + Send + Sync + 'static>(
 ) -> Response {
     let rm = state.request_manager.clone();
 
-    // batch_id is passed in explicitly (rather than re-extracted from
-    // batch_input) so the type system enforces its presence — fusillade's
-    // `batch_id` field is `Option<Uuid>` to keep its API friendly for callers
-    // that don't need a pre-generated id, but here we always have one.
-    let endpoint_for_header = batch_input.endpoint.clone();
+    let endpoint_for_header = realtime_input.path.clone();
 
     if background {
-        // Background mode: create batch synchronously so the row exists
-        // before we return the 202 (client will poll immediately).
-        // created_by was resolved upfront by the caller.
-        if let Err(e) = fusillade::Storage::create_single_request_batch(&*rm, batch_input).await {
-            tracing::warn!(error = %e, "Failed to create realtime tracking batch");
+        // Background mode: create row synchronously so it exists before
+        // we return the 202 (client will poll immediately).
+        if let Err(e) = fusillade::Storage::create_realtime(&*rm, realtime_input).await {
+            tracing::warn!(error = %e, "Failed to create realtime tracking row");
         }
     } else {
         // Blocking mode: enqueue the create-response underway job so a crash
         // between proxying and the DB insert still leaves a retryable record.
-        // The job resolves attribution and calls create_single_request_batch.
+        // The job resolves attribution and calls create_realtime.
         let job_input = CreateResponseInput {
-            batch_id,
-            request_id: batch_input.request_id,
-            body: batch_input.body,
-            model: batch_input.model,
-            base_url: batch_input.base_url,
-            endpoint: batch_input.endpoint,
-            api_key: batch_input.api_key,
+            request_id: realtime_input.request_id,
+            body: realtime_input.body,
+            model: realtime_input.model,
+            base_url: realtime_input.endpoint,
+            endpoint: realtime_input.path,
+            api_key: Some(realtime_input.api_key).filter(|s| !s.is_empty()),
         };
         tracing::debug!(
             request_id = %job_input.request_id,
@@ -416,13 +407,6 @@ async fn handle_realtime<P: PoolProvider + Clone + Send + Sync + 'static>(
     let mut req = Request::from_parts(parts, Body::from(body_bytes));
     req.headers_mut()
         .insert("x-fusillade-request-id", raw_id.parse().expect("response_id is valid header value"));
-    // x-fusillade-batch-id wires this realtime tracking row up to its
-    // http_analytics row so total_cost / token aggregates show up in the
-    // Batches view (analytics_handler reads this header).
-    req.headers_mut().insert(
-        "x-fusillade-batch-id",
-        batch_id.to_string().parse().expect("batch_id is valid header value"),
-    );
     req.headers_mut().insert(
         ONWARDS_RESPONSE_ID_HEADER,
         resp_id.parse().expect("response_id is valid header value"),
@@ -458,21 +442,21 @@ async fn handle_realtime<P: PoolProvider + Clone + Send + Sync + 'static>(
     }
 }
 
-/// Handle a flex request by creating a batch in fusillade.
+/// Handle a flex request by creating a pending request row in fusillade.
 ///
 /// The fusillade daemon picks up the pending request and processes it.
 /// With `background=false`, holds the connection and polls until complete.
 /// With `background=true`, returns 202 immediately.
 async fn handle_flex<P: PoolProvider + Clone + Send + Sync + 'static>(
     state: &ResponsesMiddlewareState<P>,
-    batch_input: fusillade::CreateSingleRequestBatchInput,
+    flex_input: fusillade::CreateFlexInput,
     resp_id: &str,
     model: &str,
     background: bool,
 ) -> Response {
-    // Flex needs the batch created synchronously (daemon must find the row).
-    if let Err(e) = fusillade::Storage::create_single_request_batch(&*state.request_manager, batch_input).await {
-        tracing::error!(error = %e, "Failed to create flex batch in fusillade");
+    // Flex needs the row created synchronously (daemon must find it).
+    if let Err(e) = fusillade::Storage::create_flex(&*state.request_manager, flex_input).await {
+        tracing::error!(error = %e, "Failed to create flex row in fusillade");
         return Response::builder()
             .status(StatusCode::INTERNAL_SERVER_ERROR)
             .body(Body::from(

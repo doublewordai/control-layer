@@ -12,9 +12,6 @@ pub struct ListBatchRequestsQuery {
     #[param(inline)]
     pub pagination: Pagination,
 
-    /// Filter by batch completion window (e.g., "1h", "24h")
-    pub completion_window: Option<String>,
-
     /// Filter by request state (pending, processing, completed, failed, canceled)
     pub status: Option<String>,
 
@@ -81,7 +78,6 @@ pub struct BatchRequestDetail {
     pub body: String,
     pub response_body: Option<String>,
     pub error: Option<String>,
-    pub completion_window: Option<String>,
-    pub batch_created_by: Option<String>,
+    pub created_by: Option<String>,
     pub created_by_email: Option<String>,
 }

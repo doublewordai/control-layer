@@ -186,9 +186,8 @@ async fn test_chat_completion_creates_retrievable_response(pool: PgPool) {
             id = sqlx::Row::get(&row, "id");
             final_state = sqlx::Row::get::<String, _>(&row, "state");
             let batch_id: Option<uuid::Uuid> = sqlx::Row::get(&row, "batch_id");
-            // Realtime requests are now tracked via a single-request batch created
-            // by the create-response underway job — the row must have a batch_id.
-            assert!(batch_id.is_some(), "Realtime request should be tracked via a single-request batch");
+            // Realtime responses are batchless: the row has no parent batch.
+            assert!(batch_id.is_none(), "Realtime response should not have a batch_id");
             if final_state == "completed" {
                 break;
             }

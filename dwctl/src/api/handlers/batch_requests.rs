@@ -94,7 +94,6 @@ pub async fn list_batch_requests<P: PoolProvider>(
         .request_manager
         .list_requests(fusillade::ListRequestsFilter {
             created_by: created_by_filter,
-            completion_window: query.completion_window.clone(),
             status: query.status.clone(),
             models,
             created_after: query.created_after,
@@ -144,7 +143,7 @@ pub async fn list_batch_requests<P: PoolProvider>(
     let unique_creator_ids: Vec<String> = result
         .data
         .iter()
-        .filter_map(|r| r.batch_created_by.as_ref().cloned())
+        .filter_map(|r| r.created_by.as_ref().cloned())
         .collect::<std::collections::HashSet<_>>()
         .into_iter()
         .collect();
@@ -170,7 +169,7 @@ pub async fn list_batch_requests<P: PoolProvider>(
         .into_iter()
         .map(|r| {
             let a = analytics_map.get(&r.id);
-            let email: Option<String> = r.batch_created_by.as_ref().and_then(|id| email_map.get(id)).cloned();
+            let email: Option<String> = r.created_by.as_ref().and_then(|id| email_map.get(id)).cloned();
             BatchRequestSummary {
                 id: r.id,
                 batch_id: r.batch_id,
@@ -242,7 +241,7 @@ pub async fn get_batch_request<P: PoolProvider>(
     let can_read_all = can_read_all_resources(&current_user, Resource::Batches);
     if !can_read_all
         && !detail
-            .batch_created_by
+            .created_by
             .as_deref()
             .is_some_and(|cb| is_batch_owner(&current_user, cb))
     {
@@ -275,8 +274,8 @@ pub async fn get_batch_request<P: PoolProvider>(
     // Look up the creator's email via UUID primary-key lookup (org IDs and unparseable
     // values return None without a query). Uses the primary pool to avoid replica lag
     // right after batch creation.
-    let created_by_email = if let Some(ref batch_created_by) = detail.batch_created_by
-        && let Ok(created_by_uuid) = Uuid::parse_str(batch_created_by)
+    let created_by_email = if let Some(ref created_by) = detail.created_by
+        && let Ok(created_by_uuid) = Uuid::parse_str(created_by)
     {
         sqlx::query_as::<_, EmailRow>("SELECT id::text as user_id, email FROM users WHERE id = $1")
             .bind(created_by_uuid)
@@ -310,8 +309,7 @@ pub async fn get_batch_request<P: PoolProvider>(
         body: detail.body.unwrap_or_default(),
         response_body: detail.response_body,
         error: detail.error,
-        completion_window: detail.completion_window,
-        batch_created_by: detail.batch_created_by,
+        created_by: detail.created_by,
         created_by_email,
     }))
 }
@@ -442,11 +440,12 @@ mod tests {
         .expect("insert template");
 
         sqlx::query(
-            "INSERT INTO fusillade.requests (id, batch_id, template_id, model, state, created_at) VALUES ($1, $2, $3, 'test-model', 'pending', NOW())",
+            "INSERT INTO fusillade.requests (id, batch_id, template_id, model, state, created_at, created_by) VALUES ($1, $2, $3, 'test-model', 'pending', NOW(), $4)",
         )
         .bind(request_id)
         .bind(batch_id)
         .bind(template_id)
+        .bind(user.id.to_string())
         .execute(&pool)
         .await
         .expect("insert request");

@@ -22,15 +22,11 @@ use super::store::{self as response_store};
 /// Input for the create-response background job.
 ///
 /// Used by the realtime non-background path so the middleware can return a
-/// response without blocking on the fusillade batch insert. The job creates
-/// a single-request batch in `"processing"` state — the outlet handler's
+/// response without blocking on the fusillade row insert. The job creates
+/// a request row in `"processing"` state — the outlet handler's
 /// `complete-response` job then transitions it to `"completed"`.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CreateResponseInput {
-    /// Pre-generated batch UUID; becomes the fusillade batch's primary key.
-    /// Must match the `x-fusillade-batch-id` header attached to the proxied
-    /// request so the http_analytics row links back to the same batch.
-    pub batch_id: Uuid,
     /// Pre-generated request UUID; becomes the fusillade request's primary key.
     pub request_id: Uuid,
     /// The full request body as JSON string.
@@ -108,23 +104,18 @@ pub async fn build_create_response_job<P: sqlx_pool_router::PoolProvider + Clone
                 "create-response inserting fusillade row"
             );
 
-            let batch_input = fusillade::CreateSingleRequestBatchInput {
-                batch_id: Some(input.batch_id),
+            let realtime_input = fusillade::CreateRealtimeInput {
                 request_id: input.request_id,
                 body: input.body,
                 model: input.model.clone(),
-                base_url: input.base_url,
-                endpoint: input.endpoint,
-                // Realtime tracking batch: completion window 0s, row pre-marked
-                // "processing" so the fusillade daemon won't claim it — onwards
-                // is already proxying it.
-                completion_window: "0s".to_string(),
-                initial_state: "processing".to_string(),
-                api_key: input.api_key,
-                created_by,
+                endpoint: input.base_url,
+                method: "POST".to_string(),
+                path: input.endpoint,
+                api_key: input.api_key.unwrap_or_default(),
+                created_by: created_by.unwrap_or_default(),
             };
 
-            if let Err(e) = fusillade::Storage::create_single_request_batch(&*cx.state.request_manager, batch_input).await {
+            if let Err(e) = fusillade::Storage::create_realtime(&*cx.state.request_manager, realtime_input).await {
                 // The pre-check is best-effort — complete-response can insert
                 // the row in the TOCTOU window between request_exists and this
                 // INSERT. Re-check; if it now exists we lost the race, our
@@ -139,7 +130,7 @@ pub async fn build_create_response_job<P: sqlx_pool_router::PoolProvider + Clone
                 tracing::error!(
                     request_id = %input.request_id,
                     error = %e,
-                    "Failed to create realtime tracking batch"
+                    "Failed to create realtime tracking row"
                 );
                 return Err(TaskError::Retryable(e.to_string()));
             }
@@ -147,7 +138,7 @@ pub async fn build_create_response_job<P: sqlx_pool_router::PoolProvider + Clone
             tracing::debug!(
                 request_id = %input.request_id,
                 model = %input.model,
-                "Created realtime tracking batch in fusillade"
+                "Created realtime tracking row in fusillade"
             );
 
             To::done()
@@ -180,8 +171,6 @@ pub struct CompleteResponseInput {
 
     // Fields below are used only when create-response hasn't run yet and
     // we need to synthesize the row ourselves.
-    /// Pre-generated batch UUID (extracted from `x-fusillade-batch-id`).
-    pub batch_id: Uuid,
     /// Pre-generated request UUID (matches `response_id` minus prefix).
     pub request_id: Uuid,
     /// Original request body (JSON string).
@@ -215,7 +204,6 @@ pub async fn build_complete_response_job<P: sqlx_pool_router::PoolProvider + Clo
             // complete_request for all statuses, the actual HTTP status and response
             // body are preserved for callers to inspect.
             let create_ctx = response_store::CreateContext {
-                batch_id: input.batch_id,
                 request_id: input.request_id,
                 request_body: &input.request_body,
                 model: &input.model,
