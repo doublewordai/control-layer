@@ -108,6 +108,11 @@ const ModelInfo: React.FC = () => {
   const [searchParams] = useSearchParams();
   const { hasPermission } = useAuthorization();
   const canManageGroups = hasPermission("manage-groups");
+  // Both `manage-groups` and `manage-models` are granted exclusively to
+  // PlatformManager (see ROLE_PERMISSIONS in utils/authorization.ts), so
+  // either permission is a PM-only gate. We keep them named explicitly so
+  // the intent is clear at the call site.
+  const canManageModels = hasPermission("manage-models");
   const canViewAnalytics = hasPermission("analytics");
   const canViewEndpoints = hasPermission("endpoints");
 
@@ -659,13 +664,13 @@ const ModelInfo: React.FC = () => {
                         </TabsTrigger>
                       )}
                     </TabsList>
-                    {model.is_composite && (
+                    {model.is_composite && canManageModels && (
                       <Button
                         type="button"
                         variant="outline"
                         size="sm"
                         onClick={() => setShowDeleteVirtualModal(true)}
-                        className="text-red-600 border-red-200 hover:bg-red-50 hover:text-red-700 hover:border-red-300"
+                        className="h-8 w-8 p-0"
                         aria-label="Delete virtual model"
                         title="Delete virtual model"
                       >
