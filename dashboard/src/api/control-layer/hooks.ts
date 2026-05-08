@@ -1870,7 +1870,7 @@ export function useAsyncRequests(
   const { enabled, ...queryOptions } = options || {};
 
   return useQuery({
-    queryKey: ["asyncRequests", queryOptions],
+    queryKey: queryKeys.asyncRequests.list(queryOptions),
     queryFn: () => dwctlApi.asyncRequests.list(queryOptions),
     enabled,
     refetchOnMount: "always" as const,
@@ -1896,7 +1896,7 @@ export function useAsyncRequests(
 
 export function useAsyncRequest(id: string | undefined) {
   return useQuery({
-    queryKey: ["asyncRequests", "detail", id],
+    queryKey: queryKeys.asyncRequests.detail(id ?? ""),
     queryFn: () => dwctlApi.asyncRequests.get(id!),
     enabled: !!id,
     refetchOnMount: "always" as const,

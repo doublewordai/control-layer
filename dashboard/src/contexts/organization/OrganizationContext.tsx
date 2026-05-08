@@ -31,6 +31,7 @@ export function OrganizationProvider({ children }: { children: ReactNode }) {
       queryClient.invalidateQueries({ queryKey: queryKeys.models.all });
       queryClient.invalidateQueries({ queryKey: queryKeys.apiKeys.all });
       queryClient.invalidateQueries({ queryKey: queryKeys.batches.all });
+      queryClient.invalidateQueries({ queryKey: queryKeys.asyncRequests.all });
       queryClient.invalidateQueries({ queryKey: queryKeys.files.all });
       queryClient.invalidateQueries({ queryKey: queryKeys.usage.all });
       queryClient.invalidateQueries({ queryKey: queryKeys.webhooks.all });

@@ -129,6 +129,18 @@ export const queryKeys = {
       [...queryKeys.batches.results(id), filters] as const,
   },
 
+  // Async requests (Open Responses API). Same shape as `files` and
+  // `batches` so prefix-matching is consistent — invalidating `all` clears
+  // both lists and details, which is what we want when org context changes.
+  asyncRequests: {
+    all: ["asyncRequests"] as const,
+    lists: () => [...queryKeys.asyncRequests.all, "list"] as const,
+    list: (filters: any) =>
+      [...queryKeys.asyncRequests.lists(), filters] as const,
+    details: () => [...queryKeys.asyncRequests.all, "detail"] as const,
+    detail: (id: string) => [...queryKeys.asyncRequests.details(), id] as const,
+  },
+
   // Payments
   payments: {
     all: ["payments"] as const,

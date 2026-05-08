@@ -1,6 +1,6 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useMemo } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
-import { Code, Play, X, Filter, Clock, DollarSign, Check, ChevronsUpDown, Zap, FastForward } from "lucide-react";
+import { Code, Play, X, Filter, Clock, DollarSign, Check, ChevronsUpDown, Users, Zap, FastForward } from "lucide-react";
 import { type ColumnDef } from "@tanstack/react-table";
 import { Button } from "../../ui/button";
 import { DataTable } from "../../ui/data-table";
@@ -28,7 +28,13 @@ import {
   CommandList,
 } from "../../ui/command";
 import { cn } from "../../../lib/utils";
-import { useAsyncRequests, useModels } from "../../../api/control-layer/hooks";
+import {
+  useAsyncRequests,
+  useModels,
+  useOrganizationMembers,
+  useUsers,
+} from "../../../api/control-layer/hooks";
+import { useDebounce } from "../../../hooks/useDebounce";
 import { useAuthorization } from "../../../utils/authorization";
 import type {
   AsyncRequest,
@@ -275,6 +281,55 @@ export function AsyncRequests() {
   const isPlatformManager = hasPermission("manage-models");
   const { isOrgContext, activeOrganizationId } = useOrganizationContext();
   const showUserColumn = isPlatformManager || isOrgContext;
+
+  // Member filter — mirrors the Batches page so users in an org context can
+  // narrow Responses to a specific member, and PMs in personal context can
+  // search any user platform-wide. The backend gates the underlying
+  // `member_id` query param on the same can_read_all permission, but for
+  // org members it's narrowed automatically via the active_organization on
+  // the session.
+  const showMemberFilter = isOrgContext || (isPlatformManager && !isOrgContext);
+  const useServerSideMemberSearch = isPlatformManager && !isOrgContext;
+  const { data: orgMembers } = useOrganizationMembers(
+    activeOrganizationId || "",
+  );
+
+  const [memberSearch, setMemberSearch] = useState("");
+  const debouncedMemberSearch = useDebounce(memberSearch, 300);
+  const { data: searchedUsers } = useUsers({
+    search: debouncedMemberSearch,
+    limit: 50,
+    enabled: useServerSideMemberSearch,
+  });
+
+  const memberList = useMemo(() => {
+    if (isOrgContext && orgMembers) {
+      return orgMembers
+        .filter((m) => m.status === "active" && m.user)
+        .map((m) => ({ id: m.user!.id, email: m.user!.email }));
+    }
+    if (useServerSideMemberSearch && searchedUsers?.data) {
+      const seen = new Set<string>();
+      return searchedUsers.data
+        .filter((u) => u.user_type !== "organization")
+        .filter((u) => {
+          if (seen.has(u.email)) return false;
+          seen.add(u.email);
+          return true;
+        })
+        .map((u) => ({ id: u.id, email: u.email }));
+    }
+    return [];
+  }, [isOrgContext, useServerSideMemberSearch, orgMembers, searchedUsers]);
+
+  const [selectedMemberId, setSelectedMemberId] = useState<string | undefined>(
+    undefined,
+  );
+  const [selectedMemberEmail, setSelectedMemberEmail] = useState<
+    string | undefined
+  >(undefined);
+  const [memberPopoverOpen, setMemberPopoverOpen] = useState(false);
+
   // Filters
   const [statusFilter, setStatusFilter] = useState<
     AsyncRequestStatus | "all"
@@ -294,8 +349,11 @@ export function AsyncRequests() {
   );
   const [modelPopoverOpen, setModelPopoverOpen] = useState(false);
 
-  // Reset filters when org context changes
+  // Reset filters (member is org-scoped) when org context changes
   useEffect(() => {
+    setSelectedMemberId(undefined);
+    setSelectedMemberEmail(undefined);
+    setMemberSearch("");
     setStatusFilter("all");
     setModelFilter([]);
     setTierFilter(["flex", "priority"]);
@@ -307,11 +365,25 @@ export function AsyncRequests() {
 
   const columns = createColumns(showUserColumn, modelDisplayNames);
 
+  // In an org context the resolved memberList is authoritative — if the
+  // selected id isn't in it (because the org-change reset effect hasn't run
+  // yet, or the user was removed from the org), drop the filter rather than
+  // sending a stale id that the backend will reject. PM personal mode
+  // searches users on demand and can't make the same determination, so
+  // trust the id there.
+  const memberKnown =
+    !selectedMemberId || memberList.some((m) => m.id === selectedMemberId);
+  const memberIdFilter =
+    selectedMemberId && (!isOrgContext || memberKnown)
+      ? selectedMemberId
+      : undefined;
+
   const { data, isLoading } = useAsyncRequests({
     service_tiers: tierFilter.length > 0 ? tierFilter.join(",") : undefined,
     active_first: sortActiveFirst,
     status: statusFilter !== "all" ? statusFilter : undefined,
     model: modelFilter.length > 0 ? modelFilter.join(",") : undefined,
+    member_id: memberIdFilter,
     created_after: dateRange?.from.toISOString(),
     created_before: dateRange?.to.toISOString(),
     ...pagination.queryParams,
@@ -394,6 +466,93 @@ export function AsyncRequests() {
                 Active first
               </label>
             </div>
+            {showMemberFilter &&
+              (useServerSideMemberSearch || memberList.length > 0) && (
+                <Popover
+                  open={memberPopoverOpen}
+                  onOpenChange={setMemberPopoverOpen}
+                >
+                  <PopoverTrigger asChild>
+                    <Button
+                      variant="outline"
+                      role="combobox"
+                      aria-expanded={memberPopoverOpen}
+                      aria-label="Filter by member"
+                      className="w-[220px] h-9 justify-between font-normal"
+                    >
+                      <div className="flex items-center gap-1.5 truncate">
+                        <Users className="w-3.5 h-3.5 shrink-0 text-gray-500" />
+                        <span className="truncate">
+                          {selectedMemberEmail ||
+                            memberList.find((m) => m.id === selectedMemberId)
+                              ?.email ||
+                            "All members"}
+                        </span>
+                      </div>
+                      <ChevronsUpDown className="ml-1 h-3.5 w-3.5 shrink-0 opacity-50" />
+                    </Button>
+                  </PopoverTrigger>
+                  <PopoverContent className="w-[280px] p-0" align="start">
+                    <Command shouldFilter={!useServerSideMemberSearch}>
+                      <CommandInput
+                        placeholder="Search by email..."
+                        value={
+                          useServerSideMemberSearch ? memberSearch : undefined
+                        }
+                        onValueChange={
+                          useServerSideMemberSearch ? setMemberSearch : undefined
+                        }
+                      />
+                      <CommandList>
+                        <CommandEmpty>No members found.</CommandEmpty>
+                        <CommandGroup>
+                          <CommandItem
+                            value="all-members"
+                            onSelect={() => {
+                              setSelectedMemberId(undefined);
+                              setSelectedMemberEmail(undefined);
+                              setMemberSearch("");
+                              setMemberPopoverOpen(false);
+                              pagination.handleReset();
+                            }}
+                          >
+                            <Check
+                              className={cn(
+                                "mr-2 h-4 w-4",
+                                !selectedMemberId ? "opacity-100" : "opacity-0",
+                              )}
+                            />
+                            All members
+                          </CommandItem>
+                          {memberList.map((member) => (
+                            <CommandItem
+                              key={member.id}
+                              value={member.email}
+                              onSelect={() => {
+                                setSelectedMemberId(member.id);
+                                setSelectedMemberEmail(member.email);
+                                setMemberSearch("");
+                                setMemberPopoverOpen(false);
+                                pagination.handleReset();
+                              }}
+                            >
+                              <Check
+                                className={cn(
+                                  "mr-2 h-4 w-4",
+                                  selectedMemberId === member.id
+                                    ? "opacity-100"
+                                    : "opacity-0",
+                                )}
+                              />
+                              <span className="truncate">{member.email}</span>
+                            </CommandItem>
+                          ))}
+                        </CommandGroup>
+                      </CommandList>
+                    </Command>
+                  </PopoverContent>
+                </Popover>
+              )}
             <Select
               value={statusFilter}
               onValueChange={(v) => {
