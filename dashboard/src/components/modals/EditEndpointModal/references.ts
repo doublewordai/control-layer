@@ -84,7 +84,9 @@ export function buildReferenceIndex(allModels: Model[]): ReferenceIndex {
   >();
 
   for (const m of allModels) {
-    if (!m.is_composite && m.hosted_on) {
+    // Standard models always have model_name + hosted_on per the type, but
+    // we guard defensively in case mock or partially-hydrated data arrives.
+    if (!m.is_composite && m.hosted_on && m.model_name) {
       const key = `${m.hosted_on}|${m.model_name}`;
       const list = hostedByDeployment.get(key);
       if (list) list.push(m);
@@ -93,6 +95,7 @@ export function buildReferenceIndex(allModels: Model[]): ReferenceIndex {
 
     if (m.is_composite && m.components) {
       for (const c of m.components) {
+        if (!c.model?.id) continue;
         const list = virtualByComponentId.get(c.model.id);
         if (list) list.push(m);
         else virtualByComponentId.set(c.model.id, [m]);

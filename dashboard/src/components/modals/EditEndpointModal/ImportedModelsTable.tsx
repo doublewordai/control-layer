@@ -182,6 +182,7 @@ const ReferenceBadge: React.FC<{
 }> = ({ label, tone, title }) => (
   <span
     title={title}
+    aria-label={title ?? label}
     className={
       tone === "warn"
         ? "px-1.5 py-0.5 rounded bg-amber-50 text-amber-700 border border-amber-200 text-[10px] font-medium"

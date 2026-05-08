@@ -115,8 +115,9 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
 
   // Pull every model in the org so we can compute references for each deployment.
   // include=components is essential — virtual models reference us via their
-  // component list. The query is cached, so reopening the modal is cheap.
-  const allModelsQuery = useModels({ include: "components" });
+  // component list. Gated on `isOpen` so we don't fetch while the modal is
+  // mounted-but-hidden; the result is cached, so reopening the modal is cheap.
+  const allModelsQuery = useModels({ include: "components", enabled: isOpen });
 
   const form = useForm<FormData>({
     resolver: zodResolver(formSchema),

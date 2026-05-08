@@ -150,13 +150,15 @@ export function useDeleteUser() {
 }
 
 // Models hooks
-export function useModels(options?: ModelsQuery) {
+export function useModels(options?: ModelsQuery & { enabled?: boolean }) {
   const queryClient = useQueryClient();
+  const { enabled = true, ...queryOptions } = options || {};
 
   return useQuery({
-    queryKey: queryKeys.models.query(options),
-    queryFn: () => dwctlApi.models.list(options),
+    queryKey: queryKeys.models.query(queryOptions),
+    queryFn: () => dwctlApi.models.list(queryOptions),
     placeholderData: keepPreviousData,
+    enabled,
     // Populate individual model caches when list is fetched
     select: (data) => {
       // Seed the cache with individual models
