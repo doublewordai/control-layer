@@ -38,7 +38,10 @@ export const ImportedModelsTable: React.FC<ImportedModelsTableProps> = ({
         role="row"
       >
         <div className="col-span-5" role="columnheader">Model</div>
-        <div className="col-span-4" role="columnheader">Alias</div>
+        {/* Alias and References cells contain inputs/badges that have their own
+            px-3 padding (or live in a flex with badges). Mirror that here so
+            the header text aligns with the value text in each row. */}
+        <div className="col-span-4 px-3" role="columnheader">Alias</div>
         <div className="col-span-2" role="columnheader">References</div>
         <div className="col-span-1" role="columnheader" aria-label="Actions" />
       </div>
@@ -91,7 +94,7 @@ const ImportedModelRow: React.FC<ImportedModelRowProps> = ({
       role="row"
     >
       <div className="col-span-5 min-w-0 flex items-center gap-2" role="cell">
-        <span className="font-mono text-sm truncate" title={deployment.modelName}>
+        <span className="text-sm truncate" title={deployment.modelName}>
           {deployment.modelName}
         </span>
         {deployment.isNew && (
@@ -106,7 +109,7 @@ const ImportedModelRow: React.FC<ImportedModelRowProps> = ({
           value={deployment.alias}
           onChange={(e) => onAliasChange(deployment.modelName, e.target.value)}
           className={
-            "h-8 text-sm font-mono bg-transparent border-transparent hover:border-input focus:border-input focus:bg-white" +
+            "h-8 text-sm bg-transparent border-transparent hover:border-input focus:border-input focus:bg-white" +
             (isAliasConflict ? " border-red-400 hover:border-red-400" : "")
           }
           placeholder={deployment.modelName}

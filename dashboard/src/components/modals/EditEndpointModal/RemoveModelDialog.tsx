@@ -128,7 +128,7 @@ const ReferenceSection: React.FC<ReferenceSectionProps> = ({ label, note, entrie
           key={entry.key}
           className="flex items-center justify-between px-3 py-2 text-sm"
         >
-          <span className="font-mono text-gray-800 truncate">{entry.title}</span>
+          <span className="text-gray-800 truncate">{entry.title}</span>
           <span className="text-xs text-gray-500 shrink-0 ml-2">{entry.meta}</span>
         </li>
       ))}
