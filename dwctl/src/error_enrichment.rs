@@ -18,6 +18,9 @@
 //!    - Shows current balance
 //! 2. **403 Forbidden - Model Access Denied**: User is not a member of a group with access to the requested model
 //!    - Shows which model was requested
+//! 3. **403 Forbidden - Modality Blocked**: A traffic routing rule denies the API key's
+//!    purpose (realtime/batch/playground) for the requested model
+//!    - Shows which modality and model are blocked
 
 use crate::{
     db::errors::DbError,
@@ -48,6 +51,7 @@ struct ChatRequest {
 /// Currently handles:
 /// - 403 Forbidden errors (likely insufficient credits) → enriched with balance
 /// - 403 Forbidden errors (likely model access denied) → enriched with model name
+/// - 403 Forbidden errors (likely modality blocked by routing rule) → enriched with modality + model
 #[instrument(name = "dwctl.error_enrichment", skip_all, fields(http.request.method = %request.method(), url.path = %request.uri().path(), url.query = request.uri().query().unwrap_or("")))]
 pub async fn error_enrichment_middleware(State(pool): State<PgPool>, request: Request<Body>, next: Next) -> Response<Body> {
     // Extract API key from request headers before passing to onwards
@@ -86,9 +90,9 @@ pub async fn error_enrichment_middleware(State(pool): State<PgPool>, request: Re
         debug!("Intercepted 403 response on AI proxy path, attempting enrichment");
 
         // First check if it's a model access issue
-        if let Some(model) = model_name
+        if let Some(model) = &model_name
             && let Ok(user_id) = get_user_id_of_api_key(pool.clone(), &key).await
-            && let Ok(has_access) = check_user_has_model_access(pool.clone(), user_id, &model).await
+            && let Ok(has_access) = check_user_has_model_access(pool.clone(), user_id, model).await
             && !has_access
         {
             return Error::ModelAccessDenied {
@@ -96,6 +100,23 @@ pub async fn error_enrichment_middleware(State(pool): State<PgPool>, request: Re
                 message: format!(
                     "You do not have access to '{}'. Please contact your administrator to request access.",
                     model
+                ),
+            }
+            .into_response();
+        }
+
+        // Then check whether a traffic routing rule denies the API key's purpose (modality)
+        // for this model. This catches deny rules configured on the deployed model.
+        if let Some(model) = &model_name
+            && let Ok(Some(purpose)) = check_modality_blocked(pool.clone(), &key, model).await
+        {
+            let purpose_label = modality_label(&purpose);
+            return Error::ModalityAccessDenied {
+                model_name: model.clone(),
+                purpose: purpose.clone(),
+                message: format!(
+                    "{} access to '{}' is blocked by a routing rule. Please contact your administrator to request access.",
+                    purpose_label, model
                 ),
             }
             .into_response();
@@ -114,6 +135,46 @@ pub async fn error_enrichment_middleware(State(pool): State<PgPool>, request: Re
     }
 
     response
+}
+
+/// Render an `api_keys.purpose` value as a user-facing modality label.
+fn modality_label(purpose: &str) -> &'static str {
+    match purpose {
+        "batch" => "Batch",
+        "realtime" => "Real-time",
+        "playground" => "Playground",
+        _ => "This",
+    }
+}
+
+/// Check whether a traffic routing rule denies this API key's purpose for the given model.
+///
+/// Returns `Ok(Some(purpose))` if a matching `deny` rule exists, where `purpose` is the
+/// `api_key_purpose` string stored on the rule (e.g. "batch"). Returns `Ok(None)` otherwise.
+#[instrument(skip(pool, api_key), name = "dwctl.check_modality_blocked")]
+pub async fn check_modality_blocked(pool: PgPool, api_key: &str, model_alias: &str) -> Result<Option<String>, DbError> {
+    let mut conn = pool.acquire().await?;
+
+    let purpose = sqlx::query_scalar!(
+        r#"
+        SELECT mtr.api_key_purpose
+        FROM model_traffic_rules mtr
+        JOIN deployed_models dm ON dm.id = mtr.deployed_model_id
+        JOIN api_keys ak ON ak.purpose = mtr.api_key_purpose
+        WHERE dm.alias = $1
+          AND dm.deleted = false
+          AND ak.secret = $2
+          AND ak.is_deleted = false
+          AND mtr.action = 'deny'
+        LIMIT 1
+        "#,
+        model_alias,
+        api_key,
+    )
+    .fetch_optional(&mut *conn)
+    .await?;
+
+    Ok(purpose)
 }
 
 #[instrument(skip_all, name = "dwctl.get_user_id_of_api_key")]
@@ -472,6 +533,97 @@ mod tests {
         // Should remain 404, not enriched
         assert_eq!(response.status_code().as_u16(), 404);
         assert_eq!(response.text(), "Not Found");
+    }
+
+    /// Integration test: Error enrichment middleware enriches 403 when a routing
+    /// rule denies the API key's purpose (e.g. batch/realtime/playground) for the model.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_error_enrichment_middleware_enriches_403_with_modality_block(pool: PgPool) {
+        use crate::test::utils::{add_deployment_to_group, add_user_to_group, create_test_group};
+
+        // User with positive balance, model access, and a Batch-purpose API key.
+        let user = create_test_user(&pool, Role::StandardUser).await;
+
+        let mut api_key_conn = pool.acquire().await.unwrap();
+        let mut api_keys_repo = ApiKeys::new(&mut api_key_conn);
+        let api_key = api_keys_repo
+            .create(&ApiKeyCreateDBRequest {
+                user_id: user.id,
+                name: "Batch Key".to_string(),
+                description: None,
+                purpose: ApiKeyPurpose::Batch,
+                requests_per_second: None,
+                burst_size: None,
+                created_by: user.id,
+            })
+            .await
+            .unwrap();
+
+        let mut credits_conn = pool.acquire().await.unwrap();
+        let mut credits_repo = Credits::new(&mut credits_conn);
+        credits_repo
+            .create_transaction(&CreditTransactionCreateDBRequest {
+                user_id: user.id,
+                transaction_type: CreditTransactionType::AdminGrant,
+                amount: Decimal::new(5000, 2),
+                source_id: uuid::Uuid::new_v4().to_string(),
+                description: Some("Initial credits".to_string()),
+                fusillade_batch_id: None,
+                api_key_id: None,
+            })
+            .await
+            .unwrap();
+
+        // Deploy a model the user can access via group membership.
+        let endpoint_id = crate::test::utils::create_test_endpoint(&pool, "test-endpoint", user.id).await;
+        let deployment_id = crate::test::utils::create_test_model(&pool, "blocked-model-name", "blocked-model", endpoint_id, user.id).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+        add_deployment_to_group(&pool, deployment_id, group.id, user.id).await;
+
+        // Add a deny rule for batch-purpose keys on this model.
+        sqlx::query!(
+            "INSERT INTO model_traffic_rules (deployed_model_id, api_key_purpose, action) VALUES ($1, 'batch', 'deny')",
+            deployment_id
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let router = axum::Router::new()
+            .route(
+                "/ai/v1/chat/completions",
+                axum::routing::post(|| async {
+                    // Simulate onwards returning 403 because a deny rule matched.
+                    axum::response::Response::builder()
+                        .status(StatusCode::FORBIDDEN)
+                        .body(axum::body::Body::from("Forbidden"))
+                        .unwrap()
+                }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                pool.clone(),
+                crate::error_enrichment::error_enrichment_middleware,
+            ));
+
+        let server = axum_test::TestServer::new(router).expect("Failed to create test server");
+
+        let response = server
+            .post("/ai/v1/chat/completions")
+            .add_header("authorization", &format!("Bearer {}", api_key.secret))
+            .json(&serde_json::json!({
+                "model": "blocked-model",
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .await;
+
+        assert_eq!(response.status_code().as_u16(), 403);
+        let body = response.text();
+        assert!(
+            body.contains("Batch") && body.contains("blocked-model") && body.contains("administrator"),
+            "expected modality-blocked message, got: {body}"
+        );
     }
 
     /// Integration test: Error enrichment middleware passes through when no auth header

@@ -128,6 +128,14 @@ pub enum Error {
     #[error("Model access denied: {message}")]
     ModelAccessDenied { model_name: String, message: String },
 
+    /// API key's purpose (modality) is denied for the requested model by a routing rule
+    #[error("Modality access denied: {message}")]
+    ModalityAccessDenied {
+        model_name: String,
+        purpose: String,
+        message: String,
+    },
+
     /// Too many concurrent requests - rate limiting
     #[error("Too many requests: {message}")]
     TooManyRequests { message: String },
@@ -162,6 +170,7 @@ impl Error {
             Error::PayloadTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
             Error::InsufficientCredits { .. } => StatusCode::PAYMENT_REQUIRED,
             Error::ModelAccessDenied { .. } => StatusCode::FORBIDDEN,
+            Error::ModalityAccessDenied { .. } => StatusCode::FORBIDDEN,
             Error::TooManyRequests { .. } => StatusCode::TOO_MANY_REQUESTS,
         }
     }
@@ -220,6 +229,7 @@ impl Error {
             }
             Error::InsufficientCredits { message, .. } => message.clone(),
             Error::ModelAccessDenied { message, .. } => message.clone(),
+            Error::ModalityAccessDenied { message, .. } => message.clone(),
             Error::TooManyRequests { message } => message.clone(),
         }
     }
@@ -252,6 +262,9 @@ impl IntoResponse for Error {
             }
             Error::ModelAccessDenied { .. } => {
                 tracing::info!("Model access denied error: {}", self);
+            }
+            Error::ModalityAccessDenied { .. } => {
+                tracing::info!("Modality access denied error: {}", self);
             }
             Error::TooManyRequests { .. } => {
                 tracing::info!("Rate limit exceeded: {}", self);
