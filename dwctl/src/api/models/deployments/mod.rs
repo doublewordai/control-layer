@@ -651,7 +651,7 @@ impl DeployedModelResponse {
     /// purpose. Redirect rules are also ignored: those re-route access, not
     /// block it.
     pub fn filter_denied_purpose_tariffs(mut self) -> Self {
-        if let (Some(ref rules), Some(ref mut tariffs)) = (self.traffic_routing_rules.as_ref(), self.tariffs.as_mut()) {
+        if let (Some(rules), Some(tariffs)) = (self.traffic_routing_rules.as_ref(), self.tariffs.as_mut()) {
             // Denied purpose set is small (at most one per ApiKeyPurpose
             // variant), so a Vec scan beats hashing.
             let denied: Vec<&ApiKeyPurpose> = rules
@@ -661,7 +661,7 @@ impl DeployedModelResponse {
                 .collect();
             if !denied.is_empty() {
                 tariffs.retain(|t| match &t.api_key_purpose {
-                    Some(purpose) => !denied.iter().any(|d| *d == purpose),
+                    Some(purpose) => !denied.contains(&purpose),
                     None => true, // implicit fallback — keep
                 });
             }
