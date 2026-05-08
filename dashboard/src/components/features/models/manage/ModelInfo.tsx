@@ -13,6 +13,7 @@ import {
   Check,
   Copy,
   GitMerge,
+  Trash2,
 } from "lucide-react";
 import {
   useModel,
@@ -39,6 +40,7 @@ import {
   ApiExamples,
   AccessManagementModal,
   UpdateModelPricingModal,
+  DeleteVirtualModelModal,
 } from "../../../modals";
 import UserUsageTable from "./UserUsageTable";
 import ModelProbes from "./ModelProbes";
@@ -172,6 +174,7 @@ const ModelInfo: React.FC = () => {
   const [showAccessModal, setShowAccessModal] = useState(false);
   const [isEditingModelDetails, setIsEditingModelDetails] = useState(false);
   const [showPricingModal, setShowPricingModal] = useState(false);
+  const [showDeleteVirtualModal, setShowDeleteVirtualModal] = useState(false);
   const [aliasCopied, setAliasCopied] = useState(false);
 
   // Alias form
@@ -656,6 +659,19 @@ const ModelInfo: React.FC = () => {
                         </TabsTrigger>
                       )}
                     </TabsList>
+                    {model.is_composite && (
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        onClick={() => setShowDeleteVirtualModal(true)}
+                        className="text-red-600 border-red-200 hover:bg-red-50 hover:text-red-700 hover:border-red-300"
+                        aria-label="Delete virtual model"
+                        title="Delete virtual model"
+                      >
+                        <Trash2 className="h-4 w-4" />
+                      </Button>
+                    )}
                   </div>
                 )}
               </div>
@@ -2614,6 +2630,19 @@ const ModelInfo: React.FC = () => {
         modelName={model.alias}
         onClose={() => setShowPricingModal(false)}
       />
+
+      {/* Delete Virtual Model Modal */}
+      {model.is_composite && (
+        <DeleteVirtualModelModal
+          isOpen={showDeleteVirtualModal}
+          onClose={() => setShowDeleteVirtualModal(false)}
+          onSuccess={() => navigate(fromUrl || "/models/manage")}
+          modelId={model.id}
+          modelAlias={model.alias}
+          modelName={model.model_name}
+          componentCount={components?.length ?? 0}
+        />
+      )}
     </div>
   );
 };

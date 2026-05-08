@@ -178,7 +178,7 @@ describe("ModelCombobox", () => {
     await waitFor(() => {
       expect(
         // assert screen since popover renders outside of container
-        screen.getByPlaceholderText("Search models..."),
+        screen.getByPlaceholderText(/Search/i),
       ).toBeInTheDocument();
     });
   });
@@ -220,7 +220,7 @@ describe("ModelCombobox", () => {
     });
 
     // Type search query
-    const searchInput = screen.getByPlaceholderText("Search models...");
+    const searchInput = screen.getByPlaceholderText(/Search/i);
     await user.type(searchInput, "claude");
 
     // Should show filtered results (debounced)
@@ -361,7 +361,7 @@ describe("ModelCombobox", () => {
     });
 
     // Type search query that matches no models
-    const searchInput = screen.getByPlaceholderText("Search models...");
+    const searchInput = screen.getByPlaceholderText(/Search/i);
     await user.type(searchInput, "nonexistent-model-xyz");
 
     // Should show custom empty message (debounced)
@@ -389,7 +389,7 @@ describe("ModelCombobox", () => {
     expect(combobox).toHaveClass("custom-width");
   });
 
-  it("debounces search input", async () => {
+  it("debounces server search while filtering visible items immediately", async () => {
     const user = userEvent.setup();
     const { container } = render(<ModelCombobox value={null} />, {
       wrapper: createWrapper(),
@@ -403,23 +403,19 @@ describe("ModelCombobox", () => {
     // Wait for initial models to load
     await waitFor(() => {
       expect(screen.getByText("gpt-4o")).toBeInTheDocument();
+      expect(screen.getByText("claude-3-opus")).toBeInTheDocument();
     });
 
-    const searchInput = screen.getByPlaceholderText("Search models...");
+    const searchInput = screen.getByPlaceholderText(/Search/i);
 
-    // Type quickly (should debounce)
+    // Type a query that doesn't match any catalog entries except "gpt-4o*".
+    // cmdk filters the visible list client-side (so claude-3-opus drops out
+    // immediately) while the server-side `search` parameter is still
+    // debounced.
     await user.type(searchInput, "gp");
 
-    // Should still show all models immediately (debounced)
-    expect(screen.getByText("claude-3-opus")).toBeInTheDocument();
-
-    // After debounce delay, should filter
-    await waitFor(
-      () => {
-        expect(screen.queryByText("claude-3-opus")).not.toBeInTheDocument();
-      },
-      { timeout: 500 },
-    );
+    expect(screen.queryByText("claude-3-opus")).not.toBeInTheDocument();
+    expect(screen.getByText("gpt-4o")).toBeInTheDocument();
   });
 
   it("passes additional query options to useModels", async () => {

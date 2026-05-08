@@ -257,6 +257,18 @@ export function useCreateModel() {
   });
 }
 
+export function useDeleteModel() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (id: string) => dwctlApi.models.delete(id),
+    onSuccess: (_, id) => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.models.all });
+      queryClient.removeQueries({ queryKey: queryKeys.models.byId(id) });
+    },
+  });
+}
+
 export function useProviderDisplayConfigs(options?: { enabled?: boolean }) {
   const { enabled = true } = options || {};
   return useQuery({

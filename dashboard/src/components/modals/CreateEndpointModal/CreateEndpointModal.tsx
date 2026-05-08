@@ -53,6 +53,7 @@ import type {
 import { AddModelPalette } from "../EditEndpointModal/AddModelPalette";
 import { ImportedModelsTable } from "../EditEndpointModal/ImportedModelsTable";
 import { useEndpointModelsState } from "../EditEndpointModal/useEndpointModelsState";
+import type { DeploymentReferences } from "../EditEndpointModal/references";
 
 interface CreateEndpointModalProps {
   isOpen: boolean;
@@ -336,7 +337,10 @@ export const CreateEndpointModal: React.FC<CreateEndpointModalProps> = ({
 
   // No deployments exist yet for a new endpoint, so references can't exist.
   // Pass an empty map; the silent-removal path always fires.
-  const referencesByModelName = useMemo(() => new Map(), []);
+  const referencesByModelName = useMemo<Map<string, DeploymentReferences>>(
+    () => new Map(),
+    [],
+  );
 
   const conflictingAliases = useMemo(() => {
     const groups = new Map<string, string[]>();
@@ -1040,7 +1044,7 @@ const ConnectionStep: React.FC<ConnectionStepProps> = ({
 interface ModelsStepProps {
   form: ReturnType<typeof useForm<FormData>>;
   modelsState: ReturnType<typeof useEndpointModelsState>;
-  referencesByModelName: Map<string, never>;
+  referencesByModelName: Map<string, DeploymentReferences>;
   conflictingAliases: Set<string>;
   backendConflicts: Set<string>;
   catalog: AvailableModel[];
