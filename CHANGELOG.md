@@ -1,5 +1,47 @@
 # Changelog
 
+## [8.46.4](https://github.com/doublewordai/control-layer/compare/v8.46.3...v8.46.4) (2026-05-08)
+
+
+### Bug Fixes
+
+* **responses:** make complete-response idempotent against terminal-state rows ([#1050](https://github.com/doublewordai/control-layer/issues/1050)) ([1bbec2d](https://github.com/doublewordai/control-layer/commit/1bbec2df3178152cce05db642ff01caae744555d))
+* **responses:** translate Open Responses input items to chat-completions shape ([#1058](https://github.com/doublewordai/control-layer/issues/1058)) ([7f700c4](https://github.com/doublewordai/control-layer/commit/7f700c43537259e7a589e4d62cfaae7dba795728))
+* **responses:** wire service_tier:flex to the daemon for /v1/responses ([#1059](https://github.com/doublewordai/control-layer/issues/1059)) ([35ff4f1](https://github.com/doublewordai/control-layer/commit/35ff4f1fc5e045081664df89bdcb6d0302657bf8))
+
+## [8.46.3](https://github.com/doublewordai/control-layer/compare/v8.46.2...v8.46.3) (2026-05-07)
+
+
+### Bug Fixes
+
+* bump fusillade + minor deps ([#1054](https://github.com/doublewordai/control-layer/issues/1054)) ([306ef31](https://github.com/doublewordai/control-layer/commit/306ef315b30786b4194240edea824de1b6560724))
+
+## [8.46.2](https://github.com/doublewordai/control-layer/compare/v8.46.1...v8.46.2) (2026-05-07)
+
+
+### Bug Fixes
+
+* Do not record requests as successful in outlet/http-analytics if they actually had errors mid-sse-stream ([#1048](https://github.com/doublewordai/control-layer/issues/1048)) ([2b6e252](https://github.com/doublewordai/control-layer/commit/2b6e252e353445c97d5c09c713f276b162a0ee61))
+
+## [8.46.1](https://github.com/doublewordai/control-layer/compare/v8.46.0...v8.46.1) (2026-05-07)
+
+
+### Bug Fixes
+
+* pass through client-side tool_calls instead of dispatching them ([#1049](https://github.com/doublewordai/control-layer/issues/1049)) ([88ac176](https://github.com/doublewordai/control-layer/commit/88ac176d60b0a0b518d7b7b4ae3f5ff3d48ef129))
+
+## [8.46.0](https://github.com/doublewordai/control-layer/compare/v8.45.0...v8.46.0) (2026-05-05)
+
+
+### Features
+
+* **webhooks:** allow org members read-only access to org webhooks ([#1043](https://github.com/doublewordai/control-layer/issues/1043)) ([4bf5b54](https://github.com/doublewordai/control-layer/commit/4bf5b54142b57d34bdf2456202f1db30d539461f))
+
+
+### Bug Fixes
+
+* **deps:** clear all 36 open Dependabot vulnerabilities ([#1045](https://github.com/doublewordai/control-layer/issues/1045)) ([fa79316](https://github.com/doublewordai/control-layer/commit/fa793161b73ae32432cd8a7d1e5f2ca0554469c2))
+
 ## [8.45.0](https://github.com/doublewordai/control-layer/compare/v8.44.3...v8.45.0) (2026-04-30)
 
 

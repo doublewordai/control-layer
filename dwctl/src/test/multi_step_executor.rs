@@ -62,6 +62,7 @@ where
             api_key: None,
             created_by: None,
             base_url: base_url.to_string(),
+            resolved_tool_names: std::collections::HashSet::new(),
         })
         .to_string()
 }

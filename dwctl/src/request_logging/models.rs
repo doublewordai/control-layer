@@ -46,10 +46,23 @@ pub struct ParsedAIRequest {
     pub responses_request: Option<ResponsesRequest>,
 }
 
+/// SSE chunk emitted by an upstream provider when it fails mid-stream.
+///
+/// OpenAI-compatible inference engines (Dynamo, vLLM, etc.) signal errors that occur
+/// after the 200 OK headers have been sent by emitting a `data:` frame whose payload is
+/// `{"error": {...}}` instead of the usual `chat.completion.chunk` shape. Capturing this
+/// variant lets the analytics layer reclassify the request as failed, even though the
+/// HTTP status was 200.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamErrorChunk {
+    pub error: Value,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ChatCompletionChunk {
     Normal(CreateChatCompletionStreamResponse),
+    Error(StreamErrorChunk),
     #[serde(rename = "[DONE]")]
     Done,
 }
@@ -58,6 +71,7 @@ pub enum ChatCompletionChunk {
 #[serde(untagged)]
 pub enum CompletionChunk {
     Normal(CreateCompletionResponse), //async-openai reuses this type for streaming
+    Error(StreamErrorChunk),
     #[serde(rename = "[DONE]")]
     Done,
 }

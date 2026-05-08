@@ -358,6 +358,23 @@ impl UsageMetrics {
         // Extract token metrics and response model from response
         let response_metrics = TokenMetrics::from(parsed_response);
 
+        // Streams that started with HTTP 200 but ended with an embedded provider error frame
+        // get reclassified to 500 so success-rate / availability metrics, the credits-eligibility
+        // check, and dashboards keyed on `status_code BETWEEN 200 AND 299` exclude them.
+        // 500 matches what fusillade reclassifies these to in its HTTP layer, so the two views
+        // (analytics row, fusillade request state) agree on a number for the same logical event.
+        let upstream_status = response_data.status.as_u16() as i32;
+        let stream_errored = match parsed_response {
+            AiResponse::ChatCompletionsStream(chunks) => chunks.iter().any(|c| matches!(c, ChatCompletionChunk::Error(_))),
+            AiResponse::CompletionsStream(chunks) => chunks.iter().any(|c| matches!(c, CompletionChunk::Error(_))),
+            _ => false,
+        };
+        let status_code = if upstream_status < 400 && stream_errored {
+            500
+        } else {
+            upstream_status
+        };
+
         Self {
             instance_id,
             correlation_id: request_data.correlation_id as i64,
@@ -366,7 +383,7 @@ impl UsageMetrics {
             uri: request_data.uri.to_string(),
             request_model,
             response_model: response_metrics.response_model,
-            status_code: response_data.status.as_u16() as i32,
+            status_code,
             duration_ms: response_data.duration.as_millis() as i64,
             duration_to_first_byte_ms: Some(response_data.duration_to_first_byte.as_millis() as i64),
             prompt_tokens: response_metrics.prompt_tokens,
@@ -994,6 +1011,98 @@ mod tests {
             }
             other => panic!("Expected ChatCompletionsStream, got {:?}", std::mem::discriminant(other)),
         }
+    }
+
+    #[test]
+    fn test_fusillade_stream_with_embedded_error_frame_reclassifies_to_500() {
+        // Reproduces trace 91ea8848dc08735f183449277b8b8846: Dynamo started a 200 OK
+        // SSE stream, generated some delta chunks, then crashed mid-generation and
+        // emitted an error frame in place of the terminal usage chunk + [DONE].
+        let request_json = r#"{"model": "moonshotai/Kimi-K2.6", "messages": [{"role": "user", "content": "hi"}], "stream": false}"#;
+        let mut headers = HashMap::new();
+        headers.insert("x-fusillade-stream".to_string(), vec![Bytes::from("true")]);
+        let request_data = RequestData {
+            correlation_id: 999,
+            timestamp: SystemTime::now(),
+            method: Method::POST,
+            uri: "/v1/chat/completions".parse::<Uri>().unwrap(),
+            headers,
+            body: Some(Bytes::from(request_json)),
+            trace_id: None,
+            span_id: None,
+        };
+
+        let sse_response = concat!(
+            "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"moonshotai/Kimi-K2.6\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"}}]}\n\n",
+            "data: {\"error\":{\"message\":\"Engine was shut down during token generation\",\"type\":\"internal_server_error\",\"code\":500}}\n\n",
+        );
+
+        let response_data = ResponseData {
+            correlation_id: 999,
+            timestamp: SystemTime::now(),
+            status: StatusCode::OK,
+            headers: HashMap::new(),
+            body: Some(Bytes::from(sse_response)),
+            duration: Duration::from_millis(335_000),
+            duration_to_first_byte: Duration::from_millis(2_300),
+        };
+
+        let parsed = parse_ai_response(&request_data, &response_data).unwrap();
+        let metrics = UsageMetrics::extract(
+            uuid::Uuid::nil(),
+            &request_data,
+            &response_data,
+            &parsed,
+            &crate::config::Config::default(),
+        );
+
+        assert_eq!(
+            metrics.status_code, 500,
+            "200 OK with embedded SSE error frame must be reclassified to 500 so success-rate \
+             metrics and credit-eligibility checks exclude this row, and so the analytics row \
+             agrees with fusillade's HTTP-layer reclassification"
+        );
+        assert_eq!(metrics.total_tokens, 0);
+        assert_eq!(metrics.response_type, "chat_completion_stream");
+    }
+
+    #[test]
+    fn test_fusillade_stream_with_real_error_status_is_preserved() {
+        // If upstream returns a real non-2xx status (no SSE body to scan), we must NOT
+        // override it to 500. The real status code is more informative.
+        let request_json = r#"{"model": "gpt-4", "messages": [{"role": "user", "content": "hi"}], "stream": false}"#;
+        let mut headers = HashMap::new();
+        headers.insert("x-fusillade-stream".to_string(), vec![Bytes::from("true")]);
+        let request_data = RequestData {
+            correlation_id: 7,
+            timestamp: SystemTime::now(),
+            method: Method::POST,
+            uri: "/v1/chat/completions".parse::<Uri>().unwrap(),
+            headers,
+            body: Some(Bytes::from(request_json)),
+            trace_id: None,
+            span_id: None,
+        };
+        let response_data = ResponseData {
+            correlation_id: 7,
+            timestamp: SystemTime::now(),
+            status: StatusCode::TOO_MANY_REQUESTS,
+            headers: HashMap::new(),
+            body: Some(Bytes::from(r#"{"error":{"message":"rate limit","type":"rate_limit"}}"#)),
+            duration: Duration::from_millis(50),
+            duration_to_first_byte: Duration::from_millis(50),
+        };
+
+        let parsed = parse_ai_response(&request_data, &response_data).unwrap();
+        let metrics = UsageMetrics::extract(
+            uuid::Uuid::nil(),
+            &request_data,
+            &response_data,
+            &parsed,
+            &crate::config::Config::default(),
+        );
+
+        assert_eq!(metrics.status_code, 429);
     }
 
     #[test]
