@@ -177,7 +177,7 @@ describe("EditEndpointModal", () => {
     expect(mockOnClose).toHaveBeenCalledOnce();
   });
 
-  it("shows Discover Models button when auto-discover is enabled", () => {
+  it("shows Discover Models button on Step 1", () => {
     render(
       <EditEndpointModal
         isOpen={true}
@@ -188,13 +188,6 @@ describe("EditEndpointModal", () => {
       { wrapper: createWrapper() },
     );
 
-    // Auto-discover checkbox should be checked by default
-    const autoDiscoverCheckbox = screen.getByRole("checkbox", {
-      name: /Auto-discover models/i,
-    });
-    expect(autoDiscoverCheckbox).toBeChecked();
-
-    // Button should say "Discover Models"
     expect(
       screen.getByRole("button", { name: /Discover Models/i }),
     ).toBeInTheDocument();
@@ -265,7 +258,7 @@ describe("EditEndpointModal", () => {
     });
   });
 
-  it("shows validation success state after successful model fetch", async () => {
+  it("navigates to Step 2 after successful discovery", async () => {
     render(
       <EditEndpointModal
         isOpen={true}
@@ -282,8 +275,11 @@ describe("EditEndpointModal", () => {
     fireEvent.click(discoverButton);
 
     await waitFor(() => {
-      // Should navigate to Step 2 and show success message
-      expect(screen.getByText(/Models refreshed/i)).toBeInTheDocument();
+      // Step 2 surfaces the imported models heading and the Update button
+      expect(screen.getByText(/Imported models/i)).toBeInTheDocument();
+      expect(
+        screen.getByRole("button", { name: /Update Endpoint/i }),
+      ).toBeInTheDocument();
     });
   });
 
@@ -321,7 +317,7 @@ describe("EditEndpointModal", () => {
     });
   });
 
-  it("shows model selection after successful validation", async () => {
+  it("shows the Add model trigger and imported models on Step 2", async () => {
     render(
       <EditEndpointModal
         isOpen={true}
@@ -338,24 +334,14 @@ describe("EditEndpointModal", () => {
     fireEvent.click(discoverButton);
 
     await waitFor(() => {
-      // Should be in Step 2 with model selection UI
+      expect(screen.getByText(/Imported models/i)).toBeInTheDocument();
       expect(
-        screen.getByText(/Select Models & Configure Aliases/i),
-      ).toBeInTheDocument();
-      expect(
-        screen.getByText(
-          /Aliases default to model names but can be customized/i,
-        ),
-      ).toBeInTheDocument();
-      expect(
-        screen.getByRole("button", {
-          name: /Select All|Deselect All/i,
-        }),
+        screen.getByRole("button", { name: /Add model/i }),
       ).toBeInTheDocument();
     });
   });
 
-  it("handles model selection/deselection", async () => {
+  it("opens the add palette and adds a manually-typed model name", async () => {
     render(
       <EditEndpointModal
         isOpen={true}
@@ -366,57 +352,31 @@ describe("EditEndpointModal", () => {
       { wrapper: createWrapper() },
     );
 
-    const discoverButton = screen.getByRole("button", {
-      name: /Discover Models/i,
-    });
-    fireEvent.click(discoverButton);
-
-    await waitFor(() => {
-      expect(
-        screen.getByText(/Select Models & Configure Aliases/i),
-      ).toBeInTheDocument();
-    });
-
-    // Find model checkboxes (excluding the auto-discover checkbox)
-    const checkboxes = screen.getAllByRole("checkbox");
-    // Should have auto-discover checkbox plus model checkboxes
-    expect(checkboxes.length).toBeGreaterThan(1);
-
-    // Click a model checkbox (not the first which might be auto-discover)
-    fireEvent.click(checkboxes[1]);
-
-    // The checkbox state should have changed
-    // This is a basic test - in a real scenario we'd verify the selection count changes
-  });
-
-  it("handles select all/deselect all functionality", async () => {
-    render(
-      <EditEndpointModal
-        isOpen={true}
-        onClose={mockOnClose}
-        onSuccess={mockOnSuccess}
-        endpoint={mockEndpoint}
-      />,
-      { wrapper: createWrapper() },
+    fireEvent.click(
+      screen.getByRole("button", { name: /Discover Models/i }),
+    );
+    await waitFor(() =>
+      expect(screen.getByText(/Imported models/i)).toBeInTheDocument(),
     );
 
-    const discoverButton = screen.getByRole("button", {
-      name: /Discover Models/i,
-    });
-    fireEvent.click(discoverButton);
+    fireEvent.click(screen.getByRole("button", { name: /Add model/i }));
+
+    // Palette renders inside a portal — use screen
+    const input = await waitFor(() =>
+      screen.getByPlaceholderText(/type a (model )?name/i),
+    );
+    fireEvent.change(input, { target: { value: "my-custom-model" } });
+
+    const manualOption = await waitFor(() =>
+      screen.getByText(/Add manually:/i),
+    );
+    fireEvent.click(manualOption);
 
     await waitFor(() => {
-      expect(
-        screen.getByText(/Select Models & Configure Aliases/i),
-      ).toBeInTheDocument();
+      // Newly-added row appears with a "new" badge
+      expect(screen.getByText("my-custom-model")).toBeInTheDocument();
+      expect(screen.getByText(/^new$/i)).toBeInTheDocument();
     });
-
-    const selectAllButton = screen.getByRole("button", {
-      name: /Select All|Deselect All/i,
-    });
-    fireEvent.click(selectAllButton);
-
-    // This would change the selection state
   });
 
   it("requires name field for update", async () => {
