@@ -347,9 +347,17 @@ pub struct CreateContext<'a> {
 ///
 /// The two-job lifecycle (create-response, complete-response) can race —
 /// they're enqueued within ~50ms of each other and run on independent
-/// underway queues. This helper tolerates either ordering: if the UPDATE
-/// finds nothing, we synthesize the row with the supplied context and
-/// retry the UPDATE.
+/// underway queues. Worse, underway's heartbeat-based reclamation can
+/// produce zombie attempts: the original worker keeps running after
+/// underway has marked the attempt failed and started a fresh one, so
+/// two attempts may modify the same row concurrently.
+///
+/// This helper tolerates all of those orderings:
+///  - missing row → synthesize, then complete
+///  - row already in `completed`/`failed`/`canceled` → idempotent success
+///    (some other writer — typically a zombie attempt or a duplicate
+///    enqueue — has already done our work)
+///  - row in `processing` → straight UPDATE
 pub async fn complete_response_idempotent<P: PoolProvider + Clone>(
     request_manager: &PostgresRequestManager<P, ReqwestHttpClient>,
     dwctl_pool: &sqlx::PgPool,
@@ -360,74 +368,97 @@ pub async fn complete_response_idempotent<P: PoolProvider + Clone>(
 ) -> Result<(), StoreError> {
     let id = parse_response_id(response_id)?;
 
+    // Fast path: row exists in `processing` — UPDATE matches and we're done.
     match request_manager.complete_request(RequestId(id), response_body, status_code).await {
-        Ok(()) => Ok(()),
-        Err(fusillade::FusilladeError::RequestNotFound(_)) => {
-            // create-response hasn't run yet (or failed). Synthesize the row.
-            // create-response may also be racing us — if it wins between our
-            // failed UPDATE and our INSERT, the INSERT will hit a PK conflict.
-            // Treat that as "create-response got there first" and just retry
-            // the UPDATE.
+        Ok(()) => return Ok(()),
+        Err(fusillade::FusilladeError::RequestStateConflict { current_state, .. }) if is_terminal(&current_state) => {
             tracing::info!(
                 response_id = %response_id,
-                model = %create_ctx.model,
-                endpoint = %create_ctx.endpoint,
-                "complete-response synthesizing row (create-response hasn't run yet)"
+                final_state = %current_state,
+                "complete-response: row already in terminal state — idempotent success"
             );
-            if create_ctx.endpoint.is_empty() {
-                // We'd create a row with an empty endpoint — that's broken
-                // upstream (responses middleware should always set the
-                // x-onwards-endpoint header). Better to fail loudly than
-                // silently insert a row that's hard to find later.
-                return Err(StoreError::StorageError(
-                    "Cannot synthesize request row: empty endpoint in CreateContext (x-onwards-endpoint header missing upstream)".into(),
-                ));
-            }
-            let created_by = lookup_created_by(dwctl_pool, create_ctx.api_key).await;
-            let batch_input = fusillade::CreateSingleRequestBatchInput {
-                batch_id: Some(create_ctx.batch_id),
-                request_id: create_ctx.request_id,
-                body: create_ctx.request_body.to_string(),
-                model: create_ctx.model.to_string(),
-                base_url: create_ctx.base_url.to_string(),
-                endpoint: create_ctx.endpoint.to_string(),
-                completion_window: "0s".to_string(),
-                initial_state: "processing".to_string(),
-                api_key: create_ctx.api_key.map(String::from),
-                created_by,
-            };
-            match request_manager.create_single_request_batch(batch_input).await {
-                Ok(_) => {
-                    tracing::info!(
-                        response_id = %response_id,
-                        "Synthetic create from complete-response succeeded — row now exists in 'processing'"
-                    );
-                }
-                Err(e) => {
-                    // Don't fail loudly here — the next UPDATE attempt is the
-                    // ground truth. If the row exists (we lost the race to
-                    // create), UPDATE will succeed.
-                    tracing::info!(
-                        response_id = %response_id,
-                        error = %e,
-                        "Synthetic create from complete-response failed (likely create-response won the race) — proceeding to UPDATE"
-                    );
-                }
-            }
-
-            match request_manager.complete_request(RequestId(id), response_body, status_code).await {
-                Ok(()) => {
-                    tracing::info!(response_id = %response_id, "Second-attempt UPDATE succeeded — row now 'completed'");
-                    Ok(())
-                }
-                Err(e) => {
-                    tracing::warn!(response_id = %response_id, error = %e, "Second-attempt UPDATE failed");
-                    Err(StoreError::StorageError(format!("Failed to complete after create: {e}")))
-                }
-            }
+            return Ok(());
         }
-        Err(e) => Err(StoreError::StorageError(format!("Failed to complete request: {e}"))),
+        Err(fusillade::FusilladeError::RequestStateConflict { current_state, .. }) => {
+            // Row exists in some non-terminal, non-processing state (e.g.
+            // 'pending' or 'claimed'). This shouldn't happen for the realtime
+            // path, but it's not our place to force-complete. Bubble up.
+            return Err(StoreError::StorageError(format!(
+                "Row exists for response {response_id} in unexpected state '{current_state}'"
+            )));
+        }
+        Err(fusillade::FusilladeError::RequestNotFound(_)) => {} // synthesize below
+        Err(e) => return Err(StoreError::StorageError(format!("Failed to complete request: {e}"))),
     }
+
+    // Row doesn't exist — synthesize it. create-response may race us; if it
+    // wins between our failed UPDATE and our INSERT, the INSERT hits a PK
+    // conflict and the retry UPDATE below sorts it out.
+    tracing::info!(
+        response_id = %response_id,
+        model = %create_ctx.model,
+        endpoint = %create_ctx.endpoint,
+        "complete-response synthesizing row (create-response hasn't run yet)"
+    );
+    if create_ctx.endpoint.is_empty() {
+        // Empty endpoint means an upstream header is missing; better to fail
+        // loudly than silently insert a row the /responses lookup can't find.
+        return Err(StoreError::StorageError(
+            "Cannot synthesize request row: empty endpoint in CreateContext (x-onwards-endpoint header missing upstream)".into(),
+        ));
+    }
+    let created_by = lookup_created_by(dwctl_pool, create_ctx.api_key).await;
+    let batch_input = fusillade::CreateSingleRequestBatchInput {
+        batch_id: Some(create_ctx.batch_id),
+        request_id: create_ctx.request_id,
+        body: create_ctx.request_body.to_string(),
+        model: create_ctx.model.to_string(),
+        base_url: create_ctx.base_url.to_string(),
+        endpoint: create_ctx.endpoint.to_string(),
+        completion_window: "0s".to_string(),
+        initial_state: "processing".to_string(),
+        api_key: create_ctx.api_key.map(String::from),
+        created_by,
+    };
+    match request_manager.create_single_request_batch(batch_input).await {
+        Ok(_) => tracing::info!(
+            response_id = %response_id,
+            "Synthetic create from complete-response succeeded — row now exists in 'processing'"
+        ),
+        Err(e) => tracing::info!(
+            response_id = %response_id,
+            error = %e,
+            "Synthetic create from complete-response failed (likely create-response won the race) — proceeding to UPDATE"
+        ),
+    }
+
+    // Retry the UPDATE. Same idempotency rules as the fast path: another
+    // writer may have raced ahead to a terminal state in the window between
+    // our first UPDATE and this retry.
+    match request_manager.complete_request(RequestId(id), response_body, status_code).await {
+        Ok(()) => {
+            tracing::info!(response_id = %response_id, "Second-attempt UPDATE succeeded — row now 'completed'");
+            Ok(())
+        }
+        Err(fusillade::FusilladeError::RequestStateConflict { current_state, .. }) if is_terminal(&current_state) => {
+            tracing::info!(
+                response_id = %response_id,
+                final_state = %current_state,
+                "complete-response: row already terminal after synthesis — idempotent success"
+            );
+            Ok(())
+        }
+        Err(e) => {
+            tracing::warn!(response_id = %response_id, error = %e, "Second-attempt UPDATE failed");
+            Err(StoreError::StorageError(format!("Failed to complete after create: {e}")))
+        }
+    }
+}
+
+/// True when the row has reached a state where re-completing it would be a
+/// no-op — there's nothing left for us to do.
+fn is_terminal(state: &str) -> bool {
+    matches!(state, "completed" | "failed" | "canceled")
 }
 
 /// Poll a fusillade request until it reaches a terminal state (completed/failed/canceled).

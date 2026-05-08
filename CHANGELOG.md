@@ -1,5 +1,14 @@
 # Changelog
 
+## [8.46.4](https://github.com/doublewordai/control-layer/compare/v8.46.3...v8.46.4) (2026-05-08)
+
+
+### Bug Fixes
+
+* **responses:** make complete-response idempotent against terminal-state rows ([#1050](https://github.com/doublewordai/control-layer/issues/1050)) ([1bbec2d](https://github.com/doublewordai/control-layer/commit/1bbec2df3178152cce05db642ff01caae744555d))
+* **responses:** translate Open Responses input items to chat-completions shape ([#1058](https://github.com/doublewordai/control-layer/issues/1058)) ([7f700c4](https://github.com/doublewordai/control-layer/commit/7f700c43537259e7a589e4d62cfaae7dba795728))
+* **responses:** wire service_tier:flex to the daemon for /v1/responses ([#1059](https://github.com/doublewordai/control-layer/issues/1059)) ([35ff4f1](https://github.com/doublewordai/control-layer/commit/35ff4f1fc5e045081664df89bdcb6d0302657bf8))
+
 ## [8.46.3](https://github.com/doublewordai/control-layer/compare/v8.46.2...v8.46.3) (2026-05-07)
 
 
