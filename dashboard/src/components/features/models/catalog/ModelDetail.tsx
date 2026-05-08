@@ -15,7 +15,7 @@ import { copyToClipboard } from "../../../../utils/clipboard";
 import {
   formatTariffPrice,
   getTariffDisplayName,
-  getUserFacingTariffs,
+  getVisibleTariffsForModel,
 } from "../../../../utils/formatters";
 import { IntelligenceBars } from "../IntelligenceIndicator";
 
@@ -26,8 +26,7 @@ const MODEL_TYPE_LABELS: Record<string, string> = {
 };
 
 function ModelPricing({ model }: { model: Model }) {
-  if (!model.tariffs) return null;
-  const tiers = getUserFacingTariffs(model.tariffs);
+  const tiers = getVisibleTariffsForModel(model);
   if (tiers.length === 0) return null;
 
   return (

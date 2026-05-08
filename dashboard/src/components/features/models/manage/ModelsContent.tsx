@@ -52,7 +52,7 @@ import {
   formatLatency,
   formatRelativeTime,
   formatTariffPrice,
-  getUserFacingTariffs,
+  getVisibleTariffsForModel,
 } from "../../../../utils/formatters";
 import { Skeleton } from "../../../ui/skeleton";
 import {
@@ -696,15 +696,13 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                                 const realtimeDenied = isRealtimeDenied(model);
                                 const batchDenied = isBatchDenied(model);
                                 // Use the same filter as the catalog: drop
-                                // playground tariffs and `is_active === false`.
-                                // This keeps the two views consistent and
-                                // tolerates serializer quirks (e.g. an
-                                // omitted `api_key_purpose` arriving as
-                                // `undefined` instead of `null`, which the
-                                // previous `=== null` check rejected).
-                                const visibleTariffs = getUserFacingTariffs(
-                                  model.tariffs ?? [],
-                                );
+                                // playground, inactive, and any tariff whose
+                                // api_key_purpose is denied by a traffic
+                                // rule on the model. Keeps the two views
+                                // consistent and prevents advertising prices
+                                // for purposes the user can't actually reach.
+                                const visibleTariffs =
+                                  getVisibleTariffsForModel(model);
                                 // The "realtime" slot consumes any tariff
                                 // whose purpose is "realtime" OR null/
                                 // undefined (the implicit fallback purpose).
