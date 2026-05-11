@@ -827,7 +827,12 @@ pub fn detail_to_chat_completion_object(detail: &fusillade::RequestDetail) -> (u
                     .as_deref()
                     .and_then(|b| serde_json::from_str::<serde_json::Value>(b).ok())
                 {
-                    Some(parsed) => (200, parsed),
+                    // Pass-through: surface the upstream's actual 2xx status
+                    // rather than hardcoding 200. Chat completions almost
+                    // always returns 200 in practice but the helper is
+                    // pass-through by design — a 201/204/3xx from upstream
+                    // should propagate, not get rewritten to 200.
+                    Some(parsed) => (response_status, parsed),
                     None => (
                         500,
                         serde_json::json!({
@@ -1280,6 +1285,19 @@ mod tests {
         assert_eq!(status, 200);
         assert_eq!(value["id"], "chatcmpl-abc");
         assert_eq!(value["object"], "chat.completion");
+        assert!(value.get("error").is_none());
+    }
+
+    #[test]
+    fn test_detail_to_chat_completion_completed_2xx_upstream_status_passes_through() {
+        // Pass-through: an upstream 201/204/etc. should surface as-is, not get
+        // rewritten to 200. Chat-completions virtually always returns 200 in
+        // practice, but the helper's contract is pass-through.
+        let body = r#"{"id":"chatcmpl-y","object":"chat.completion","choices":[]}"#;
+        let detail = make_detail("completed", Some(201), Some(body), None);
+        let (status, value) = detail_to_chat_completion_object(&detail);
+        assert_eq!(status, 201);
+        assert_eq!(value["id"], "chatcmpl-y");
         assert!(value.get("error").is_none());
     }
 

@@ -479,11 +479,13 @@ async fn handle_flex<P: PoolProvider + Clone + Send + Sync + 'static>(
         tracing::error!(error = %e, "Failed to create flex batch in fusillade");
         return Response::builder()
             .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .header("content-type", "application/json")
             .body(Body::from(
                 serde_json::json!({
                     "error": {
                         "message": "Failed to enqueue request",
                         "type": "server_error",
+                        "code": 500,
                     }
                 })
                 .to_string(),
@@ -560,6 +562,7 @@ async fn handle_chat_completion_flex<P: PoolProvider + Clone + Send + Sync + 'st
                     "error": {
                         "message": "Failed to enqueue request",
                         "type": "server_error",
+                        "code": 500,
                     }
                 })
                 .to_string(),
@@ -574,9 +577,18 @@ async fn handle_chat_completion_flex<P: PoolProvider + Clone + Send + Sync + 'st
         Ok(detail) => {
             let (status, body) = response_store::detail_to_chat_completion_object(&detail);
             let status_code = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            tracing::debug!(request_id = %request_id, %status_code, "Flex chat-completions terminal");
             (status_code, Json(body)).into_response()
         }
         Err(e) => {
+            // poll_until_terminal can fail for two reasons: the 1h timeout
+            // fires (504-shaped), or the polling query itself errors out
+            // (500-shaped — DB/connection issues). The current poller
+            // returns a single error type without distinguishing, so we
+            // log the underlying error and use 504 as the surfaced status
+            // since the timeout path is the dominant case in practice. If
+            // the poller grows a typed error variant for timeout vs.
+            // storage errors, this map can be tightened.
             tracing::error!(error = %e, request_id = %request_id, "Blocking flex chat-completions poll failed");
             (
                 StatusCode::GATEWAY_TIMEOUT,
@@ -584,6 +596,7 @@ async fn handle_chat_completion_flex<P: PoolProvider + Clone + Send + Sync + 'st
                     "error": {
                         "message": format!("Request timed out: {e}"),
                         "type": "server_error",
+                        "code": 504,
                     }
                 })),
             )
