@@ -7,6 +7,7 @@ export * from "./CreateUserModal";
 export * from "./DeleteEndpointModal";
 export * from "./DeleteGroupModal";
 export * from "./DeleteUserModal";
+export * from "./DeleteVirtualModelModal";
 export * from "./EditEndpointModal";
 export * from "./EditGroupModal";
 export * from "./EditUserModal";

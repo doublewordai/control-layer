@@ -1,5 +1,13 @@
 # Changelog
 
+## [8.47.0](https://github.com/doublewordai/control-layer/compare/v8.46.4...v8.47.0) (2026-05-08)
+
+
+### Features
+
+* **api:** explain modality-blocked 403s in AI proxy errors ([#1062](https://github.com/doublewordai/control-layer/issues/1062)) ([4e32c41](https://github.com/doublewordai/control-layer/commit/4e32c41353f8748f1185a29e6e9fa8f4ff08132a))
+* redesign endpoint model editing UX ([#1060](https://github.com/doublewordai/control-layer/issues/1060)) ([c26ed46](https://github.com/doublewordai/control-layer/commit/c26ed46af8b8b686ce35f0c569bc4853c3a26825))
+
 ## [8.46.4](https://github.com/doublewordai/control-layer/compare/v8.46.3...v8.46.4) (2026-05-08)
 
 

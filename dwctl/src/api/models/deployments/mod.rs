@@ -642,6 +642,33 @@ impl DeployedModelResponse {
         self
     }
 
+    /// Filter out tariffs whose `api_key_purpose` matches a `Deny` traffic
+    /// routing rule on this model. A user can't reach the model through a
+    /// denied purpose, so advertising a price for it is misleading.
+    ///
+    /// Tariffs with `api_key_purpose = None` (the implicit fallback price)
+    /// are kept regardless of deny rules — they aren't bound to a specific
+    /// purpose. Redirect rules are also ignored: those re-route access, not
+    /// block it.
+    pub fn filter_denied_purpose_tariffs(mut self) -> Self {
+        if let (Some(rules), Some(tariffs)) = (self.traffic_routing_rules.as_ref(), self.tariffs.as_mut()) {
+            // Denied purpose set is small (at most one per ApiKeyPurpose
+            // variant), so a Vec scan beats hashing.
+            let denied: Vec<&ApiKeyPurpose> = rules
+                .iter()
+                .filter(|r| matches!(r.action, TrafficRoutingAction::Deny))
+                .map(|r| &r.api_key_purpose)
+                .collect();
+            if !denied.is_empty() {
+                tariffs.retain(|t| match &t.api_key_purpose {
+                    Some(purpose) => !denied.contains(&purpose),
+                    None => true, // implicit fallback — keep
+                });
+            }
+        }
+        self
+    }
+
     /// Create a response with endpoint information included
     pub fn with_endpoint(mut self, endpoint: super::inference_endpoints::InferenceEndpointResponse) -> Self {
         self.endpoint = Some(endpoint);
