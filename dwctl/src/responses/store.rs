@@ -9,9 +9,8 @@ use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use fusillade::{
-    BatchInput, CreateRealtimeInput, CreateStepInput, PostgresRequestManager, PostgresResponseStepManager, RequestId,
-    RequestTemplateInput, ReqwestHttpClient, ResponseStep, ResponseStepStore, StepId, StepKind as FusilladeStepKind,
-    StepState as FusilladeStepState, Storage,
+    BatchInput, CreateRealtimeInput, CreateStepInput, PostgresRequestManager, PostgresResponseStepManager, RequestId, RequestTemplateInput,
+    ReqwestHttpClient, ResponseStep, ResponseStepStore, StepId, StepKind as FusilladeStepKind, StepState as FusilladeStepState, Storage,
 };
 use onwards::{
     ChainStep, MultiStepStore, RecordedStep, ResponseStore, StepDescriptor, StepKind as OnwardsStepKind, StepState as OnwardsStepState,

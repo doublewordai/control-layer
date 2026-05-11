@@ -264,9 +264,6 @@ pub async fn responses_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
             };
             handle_realtime(&state, realtime_input, &resp_id, model, background, parts, body_bytes, next).await
         }
-        ServiceTier::Flex if is_chat_completions_api => {
-            handle_chat_completion_flex(&state, batch_input, request_id).await;
-        }
         ServiceTier::Flex => {
             let flex_input = fusillade::CreateFlexInput {
                 request_id,
@@ -278,7 +275,12 @@ pub async fn responses_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                 api_key: api_key.clone().unwrap_or_default(),
                 created_by: created_by.unwrap_or_default(),
             };
-            handle_flex(&state, flex_input, &resp_id, model, background).await
+
+            if is_chat_completions_api {
+                handle_chat_completion_flex(&state, flex_input, request_id).await
+            } else {
+                handle_flex(&state, flex_input, &resp_id, model, background).await
+            }
         }
     }
 }
@@ -535,10 +537,10 @@ async fn handle_flex<P: PoolProvider + Clone + Send + Sync + 'static>(
 /// status surfaced.
 async fn handle_chat_completion_flex<P: PoolProvider + Clone + Send + Sync + 'static>(
     state: &ResponsesMiddlewareState<P>,
-    batch_input: fusillade::CreateSingleRequestBatchInput,
+    flex_input: fusillade::CreateFlexInput,
     request_id: uuid::Uuid,
 ) -> Response {
-    if let Err(e) = fusillade::Storage::create_single_request_batch(&*state.request_manager, batch_input).await {
+    if let Err(e) = fusillade::Storage::create_flex(&*state.request_manager, flex_input).await {
         tracing::error!(error = %e, "Failed to create flex chat-completions batch in fusillade");
         return Response::builder()
             .status(StatusCode::INTERNAL_SERVER_ERROR)
