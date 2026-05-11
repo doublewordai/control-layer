@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import * as React from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
@@ -57,6 +57,7 @@ import type {
 } from "../../../../api/control-layer/types";
 import { useServerCursorPagination } from "../../../../hooks/useServerCursorPagination";
 import { useDebounce } from "../../../../hooks/useDebounce";
+import { usePersistedFilter } from "../../../../hooks/usePersistedFilter";
 import { useAuthorization } from "../../../../utils/authorization";
 import { useOrganizationContext } from "../../../../contexts/organization/useOrganizationContext";
 import { useBootstrapContent } from "@/hooks/use-bootstrap-content";
@@ -69,6 +70,9 @@ import { cn } from "@/lib/utils";
 // the UI selector — they're queryable via the API but live on the Responses
 // page in the dashboard.
 const BATCH_COMPLETION_WINDOW = "24h";
+const DEFAULT_COMPLETION_WINDOWS: string[] = [BATCH_COMPLETION_WINDOW];
+
+const PERSIST_SCOPE = "batches";
 
 /**
  * Props for the Batches component.
@@ -158,33 +162,61 @@ export function Batches({
     return [];
   }, [isOrgContext, useServerSideMemberSearch, orgMembers, searchedUsers]);
 
-  const [selectedMemberId, setSelectedMemberId] = useState<string | undefined>(
-    undefined,
+  // Member filter — only the id is persisted. The email is PII and there's
+  // no need to keep coworker addresses in localStorage on a shared
+  // workstation; we re-resolve it from `memberList` on render and fall back
+  // to the id while the list loads. Empty string = no filter.
+  const [selectedMemberId, setSelectedMemberId] = usePersistedFilter(
+    PERSIST_SCOPE,
+    "member",
+    "",
   );
-  // Track the selected member's email so it persists when search results change
-  const [selectedMemberEmail, setSelectedMemberEmail] = useState<
-    string | undefined
-  >(undefined);
   const [memberPopoverOpen, setMemberPopoverOpen] = useState(false);
 
   // Batch-specific filters
-  const [statusFilter, setStatusFilter] = useState<BatchStatus | "all">("all");
+  const [statusFilter, setStatusFilter] = usePersistedFilter(
+    PERSIST_SCOPE,
+    "status",
+    "all",
+  );
   // Completion-window multi-select. Maps directly to the backend
   // `completion_window` query param (comma-separated). Default hides the
   // realtime tracking rows ("0s") and async/flex requests ("1h") that the
   // Open Responses API creates — those have their own page in Async Requests.
-  const [completionWindowFilter, setCompletionWindowFilter] = useState<
-    string[]
-  >([BATCH_COMPLETION_WINDOW]);
-  const [sortActiveFirst, setSortActiveFirst] = useState(true);
+  const [completionWindowFilter, setCompletionWindowFilter] = usePersistedFilter(
+    PERSIST_SCOPE,
+    "window",
+    DEFAULT_COMPLETION_WINDOWS,
+  );
+  const [sortActiveFirstStr, setSortActiveFirstStr] = usePersistedFilter(
+    PERSIST_SCOPE,
+    "activeFirst",
+    "true",
+  );
+  const sortActiveFirst = sortActiveFirstStr !== "false";
+  const setSortActiveFirst = (next: boolean) =>
+    setSortActiveFirstStr(next ? "true" : "false");
+  // Date range is intentionally not persisted — bringing back stale absolute
+  // timestamps on a later visit would be confusing.
   const [dateRange, setDateRange] = useState<
     { from: Date; to: Date } | undefined
   >(undefined);
 
-  // Clear all filters and reset pagination when org context changes
+  // Clear member + status filters and reset pagination when org context changes
+  // (member filter is org-scoped). Other persisted filters are intentionally left
+  // alone — they describe how the user wants to view their data, not who they're
+  // viewing it for.
+  //
+  // Skip the very first run: on mount activeOrganizationId is whatever it
+  // happens to be, and treating that as a "change" would wipe a freshly
+  // restored persisted member id before it ever reaches the API.
+  const isInitialOrgMount = useRef(true);
   useEffect(() => {
-    setSelectedMemberId(undefined);
-    setSelectedMemberEmail(undefined);
+    if (isInitialOrgMount.current) {
+      isInitialOrgMount.current = false;
+      return;
+    }
+    setSelectedMemberId("");
     setMemberSearch("");
     setStatusFilter("all");
     setDateRange(undefined);
@@ -203,8 +235,16 @@ export function Batches({
   const [dragActive, setDragActive] = useState(false);
 
   // Search state for files and batches (server-side)
-  const [fileSearchQuery, setFileSearchQuery] = useState("");
-  const [batchSearchQuery, setBatchSearchQuery] = useState("");
+  const [fileSearchQuery, setFileSearchQuery] = usePersistedFilter(
+    PERSIST_SCOPE,
+    "fileSearch",
+    "",
+  );
+  const [batchSearchQuery, setBatchSearchQuery] = usePersistedFilter(
+    PERSIST_SCOPE,
+    "batchSearch",
+    "",
+  );
   const debouncedFileSearch = useDebounce(fileSearchQuery, 300);
   const debouncedBatchSearch = useDebounce(batchSearchQuery, 300);
 
@@ -269,10 +309,25 @@ export function Batches({
         ? "batch_output"
         : "batch_error"; // error
 
+  // In an org context the resolved memberList is authoritative — if the
+  // persisted id isn't in it (e.g. user switched orgs in another tab or the
+  // member was removed), drop the filter rather than sending a stale id that
+  // returns nothing. PM personal mode searches users on demand, so we can't
+  // make that determination there without an extra round trip; trust the id.
+  const memberKnown =
+    !selectedMemberId || memberList.some((m) => m.id === selectedMemberId);
+  const memberIdFilter =
+    selectedMemberId && (!isOrgContext || memberKnown)
+      ? selectedMemberId
+      : undefined;
+  const resolvedMemberEmail = memberList.find(
+    (m) => m.id === selectedMemberId,
+  )?.email;
+
   const { data: filesResponse, isLoading: filesLoading } = useFiles({
     purpose: filePurpose,
     search: debouncedFileSearch.trim() || undefined,
-    member_id: selectedMemberId,
+    member_id: memberIdFilter,
     ...filesPagination.queryParams,
     enabled: activeTab === "files" || !!batchFileFilter,
   });
@@ -288,8 +343,9 @@ export function Batches({
   const { data: batchesResponse, isLoading: batchesLoading } = useBatches({
     search: debouncedBatchSearch.trim() || undefined,
     include: "analytics",
-    member_id: selectedMemberId,
-    status: statusFilter !== "all" ? statusFilter : undefined,
+    member_id: memberIdFilter,
+    status:
+      statusFilter !== "all" ? (statusFilter as BatchStatus) : undefined,
     created_after: dateRange?.from.toISOString(),
     created_before: dateRange?.to.toISOString(),
     active_first: sortActiveFirst || undefined,
@@ -335,7 +391,7 @@ export function Batches({
       const prefetchOptions = {
         purpose: filePurpose,
         search: debouncedFileSearch.trim() || undefined,
-        member_id: selectedMemberId,
+        member_id: memberIdFilter,
         limit: filesPagination.pageSize + 1,
         after: nextCursor,
       };
@@ -352,7 +408,7 @@ export function Batches({
     filesPagination.pageSize,
     filePurpose,
     debouncedFileSearch,
-    selectedMemberId,
+    memberIdFilter,
     queryClient,
   ]);
 
@@ -365,9 +421,9 @@ export function Batches({
       const prefetchOptions = {
         search: debouncedBatchSearch.trim() || undefined,
         include: "analytics" as const,
-        member_id: selectedMemberId,
+        member_id: memberIdFilter,
         status:
-          statusFilter !== "all" ? statusFilter : undefined,
+          statusFilter !== "all" ? (statusFilter as BatchStatus) : undefined,
         created_after: dateRange?.from.toISOString(),
         created_before: dateRange?.to.toISOString(),
         active_first: sortActiveFirst || undefined,
@@ -388,7 +444,7 @@ export function Batches({
     batchesPagination.pageSize,
     completionWindowParam,
     debouncedBatchSearch,
-    selectedMemberId,
+    memberIdFilter,
     statusFilter,
     dateRange,
     sortActiveFirst,
@@ -563,9 +619,13 @@ export function Batches({
   });
 
   // Searchable member filter combobox - shared between batches and files tabs
-  const displayedMemberEmail =
-    selectedMemberEmail ||
-    memberList.find((m) => m.id === selectedMemberId)?.email;
+  // The email is resolved from the live memberList (we only persist the id),
+  // so we fall back to a generic placeholder while the list is loading.
+  const displayedMemberEmail = resolvedMemberEmail;
+  const memberLabel =
+    !selectedMemberId
+      ? "All members"
+      : displayedMemberEmail || "Selected member";
   // Show member filter: always for PM personal mode (server-side search),
   // only when org members exist for org context (client-side filtered)
   const showMemberCombobox =
@@ -582,9 +642,7 @@ export function Batches({
         >
           <div className="flex items-center gap-1.5 truncate">
             <Users className="w-3.5 h-3.5 shrink-0 text-gray-500" />
-            <span className="truncate">
-              {displayedMemberEmail || "All members"}
-            </span>
+            <span className="truncate">{memberLabel}</span>
           </div>
           <ChevronsUpDown className="ml-1 h-3.5 w-3.5 shrink-0 opacity-50" />
         </Button>
@@ -604,8 +662,7 @@ export function Batches({
               <CommandItem
                 value="all-members"
                 onSelect={() => {
-                  setSelectedMemberId(undefined);
-                  setSelectedMemberEmail(undefined);
+                  setSelectedMemberId("");
                   setMemberSearch("");
                   setMemberPopoverOpen(false);
                   batchesPagination.handleFirstPage();
@@ -626,7 +683,6 @@ export function Batches({
                   value={member.email}
                   onSelect={() => {
                     setSelectedMemberId(member.id);
-                    setSelectedMemberEmail(member.email);
                     setMemberSearch("");
                     setMemberPopoverOpen(false);
                     batchesPagination.handleFirstPage();
@@ -874,10 +930,12 @@ export function Batches({
                           type="checkbox"
                           checked={completionWindowFilter.includes(window)}
                           onChange={() => {
-                            setCompletionWindowFilter((prev) =>
-                              prev.includes(window)
-                                ? prev.filter((w) => w !== window)
-                                : [...prev, window],
+                            setCompletionWindowFilter(
+                              completionWindowFilter.includes(window)
+                                ? completionWindowFilter.filter(
+                                    (w) => w !== window,
+                                  )
+                                : [...completionWindowFilter, window],
                             );
                             batchesPagination.handleFirstPage();
                           }}
@@ -892,7 +950,7 @@ export function Batches({
                 <Select
                   value={statusFilter}
                   onValueChange={(v) => {
-                    setStatusFilter(v as BatchStatus | "all");
+                    setStatusFilter(v);
                     batchesPagination.handleFirstPage();
                   }}
                 >

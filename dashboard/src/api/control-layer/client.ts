@@ -420,6 +420,19 @@ const modelApi = {
     return response.json();
   },
 
+  async delete(id: string): Promise<void> {
+    const response = await fetch(`/admin/api/v1/models/${id}`, {
+      method: "DELETE",
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(
+        errorText || `Failed to delete model: ${response.status}`,
+      );
+    }
+  },
+
   // Composite model component operations
   components: {
     async list(modelId: string): Promise<ModelComponent[]> {

@@ -14,6 +14,7 @@ import {
   formatContextLength,
   getTariffDisplayName,
   getUserFacingTariffs,
+  getVisibleTariffsForModel,
 } from "./formatters";
 
 describe("formatters", () => {
@@ -371,6 +372,77 @@ describe("formatters", () => {
 
     it("should handle empty array", () => {
       expect(getUserFacingTariffs([])).toEqual([]);
+    });
+  });
+
+  describe("getVisibleTariffsForModel", () => {
+    const baseTariffs = [
+      { id: "rt", api_key_purpose: "realtime", completion_window: null, is_active: true },
+      { id: "b24", api_key_purpose: "batch", completion_window: "24h", is_active: true },
+      { id: "b1", api_key_purpose: "batch", completion_window: "1h", is_active: true },
+      { id: "pg", api_key_purpose: "playground", completion_window: null, is_active: true },
+      { id: "fb", api_key_purpose: null, completion_window: null, is_active: true },
+    ];
+
+    it("returns all non-playground active tariffs when nothing is denied", () => {
+      const result = getVisibleTariffsForModel({
+        tariffs: baseTariffs,
+        traffic_routing_rules: [],
+      });
+      // Playground always filtered. fb (null purpose) kept. realtime + 2 batch kept.
+      expect(result.map((t) => t.id).sort()).toEqual(["b1", "b24", "fb", "rt"].sort());
+    });
+
+    it("drops tariffs whose api_key_purpose is denied by a traffic rule", () => {
+      const result = getVisibleTariffsForModel({
+        tariffs: baseTariffs,
+        traffic_routing_rules: [
+          { api_key_purpose: "batch", action: { type: "deny" } },
+        ],
+      });
+      // Both batch tariffs (24h + 1h) drop out; realtime + null-purpose stay.
+      expect(result.map((t) => t.id).sort()).toEqual(["fb", "rt"]);
+    });
+
+    it("keeps null-purpose (fallback) tariffs even when other purposes are denied", () => {
+      const result = getVisibleTariffsForModel({
+        tariffs: baseTariffs,
+        traffic_routing_rules: [
+          { api_key_purpose: "realtime", action: { type: "deny" } },
+          { api_key_purpose: "batch", action: { type: "deny" } },
+        ],
+      });
+      expect(result.map((t) => t.id)).toEqual(["fb"]);
+    });
+
+    it("ignores redirect rules — only `deny` rules suppress pricing", () => {
+      const result = getVisibleTariffsForModel({
+        tariffs: baseTariffs,
+        traffic_routing_rules: [
+          {
+            api_key_purpose: "batch",
+            action: { type: "redirect", target: "another-model" },
+          },
+        ],
+      });
+      // batch tariffs survive — redirect doesn't deny access, just reroutes.
+      expect(result.map((t) => t.id)).toContain("b24");
+      expect(result.map((t) => t.id)).toContain("b1");
+    });
+
+    it("returns empty when the model has no tariffs", () => {
+      expect(
+        getVisibleTariffsForModel({
+          tariffs: null,
+          traffic_routing_rules: [],
+        }),
+      ).toEqual([]);
+      expect(
+        getVisibleTariffsForModel({
+          tariffs: undefined,
+          traffic_routing_rules: undefined,
+        }),
+      ).toEqual([]);
     });
   });
 });

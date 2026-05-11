@@ -1,5 +1,25 @@
 # Changelog
 
+## [8.48.0](https://github.com/doublewordai/control-layer/compare/v8.47.0...v8.48.0) (2026-05-11)
+
+
+### Features
+
+* **chat-completions:** support service_tier:"flex" via fusillade ([#1056](https://github.com/doublewordai/control-layer/issues/1056)) ([20b77ef](https://github.com/doublewordai/control-layer/commit/20b77ef1b6fe9699d3af1ed2e0f4fd4b35906ed8))
+
+
+### Bug Fixes
+
+* **responses:** wire DwctlRequestProcessor end-to-end on the flex daemon path ([#1064](https://github.com/doublewordai/control-layer/issues/1064)) ([66e7564](https://github.com/doublewordai/control-layer/commit/66e756425271f0c12171cab249d1d127659fd1af))
+
+## [8.47.0](https://github.com/doublewordai/control-layer/compare/v8.46.4...v8.47.0) (2026-05-08)
+
+
+### Features
+
+* **api:** explain modality-blocked 403s in AI proxy errors ([#1062](https://github.com/doublewordai/control-layer/issues/1062)) ([4e32c41](https://github.com/doublewordai/control-layer/commit/4e32c41353f8748f1185a29e6e9fa8f4ff08132a))
+* redesign endpoint model editing UX ([#1060](https://github.com/doublewordai/control-layer/issues/1060)) ([c26ed46](https://github.com/doublewordai/control-layer/commit/c26ed46af8b8b686ce35f0c569bc4853c3a26825))
+
 ## [8.46.4](https://github.com/doublewordai/control-layer/compare/v8.46.3...v8.46.4) (2026-05-08)
 
 

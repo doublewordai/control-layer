@@ -27,7 +27,7 @@ import {
   formatContextLength,
   formatTariffPrice,
   getTariffDisplayName,
-  getUserFacingTariffs,
+  getVisibleTariffsForModel,
 } from "../../../../utils/formatters";
 import { isPlaygroundDenied } from "../../../../utils/modelAccess";
 import { IntelligenceBars, EmbeddingScore } from "../IntelligenceIndicator";
@@ -93,9 +93,8 @@ function formatReleaseDate(dateStr: string): string {
   return date.toLocaleDateString("en-US", { month: "short", year: "numeric" });
 }
 
-function getCheapestInputPrice(tariffs: Model["tariffs"]): string | null {
-  if (!tariffs) return null;
-  const visible = getUserFacingTariffs(tariffs);
+function getCheapestInputPrice(model: Model): string | null {
+  const visible = getVisibleTariffsForModel(model);
   if (visible.length === 0) return null;
   let cheapest = Infinity;
   for (const t of visible) {
@@ -106,9 +105,8 @@ function getCheapestInputPrice(tariffs: Model["tariffs"]): string | null {
   return formatTariffPrice(String(cheapest));
 }
 
-function getCheapestInputPriceValue(tariffs: Model["tariffs"]): number | null {
-  if (!tariffs) return null;
-  const visible = getUserFacingTariffs(tariffs);
+function getCheapestInputPriceValue(model: Model): number | null {
+  const visible = getVisibleTariffsForModel(model);
   if (visible.length === 0) return null;
   let cheapest = Infinity;
   for (const t of visible) {
@@ -204,9 +202,8 @@ function SortButton({
   );
 }
 
-function PricingTiers({ tariffs }: { tariffs: Model["tariffs"] }) {
-  if (!tariffs) return null;
-  const tiers = getUserFacingTariffs(tariffs);
+function PricingTiers({ model }: { model: Model }) {
+  const tiers = getVisibleTariffsForModel(model);
   if (tiers.length === 0) return null;
 
   return (
@@ -238,7 +235,7 @@ function ExpandedContent({ model }: { model: Model }) {
       )}
 
       {model.tariffs && model.tariffs.length > 0 && (
-        <PricingTiers tariffs={model.tariffs} />
+        <PricingTiers model={model} />
       )}
 
       {useCases.length > 0 && (
@@ -282,9 +279,9 @@ function ModelRow({
 }) {
   const navigate = useNavigate();
   const [copied, setCopied] = useState(false);
-  const visibleTariffs = model.tariffs ? getUserFacingTariffs(model.tariffs) : [];
+  const visibleTariffs = getVisibleTariffsForModel(model);
   const cheapestPrice =
-    visibleTariffs.length > 0 ? getCheapestInputPrice(model.tariffs) : null;
+    visibleTariffs.length > 0 ? getCheapestInputPrice(model) : null;
 
   const playgroundAvailable = !isPlaygroundDenied(model);
   const isChat = getCatalogTabForModel(model) !== "embedding";
@@ -591,8 +588,8 @@ function SectionTable({
           break;
         case "price_from": {
           comparison = compareNumbers(
-            getCheapestInputPriceValue(a.tariffs),
-            getCheapestInputPriceValue(b.tariffs),
+            getCheapestInputPriceValue(a),
+            getCheapestInputPriceValue(b),
           );
           break;
         }
