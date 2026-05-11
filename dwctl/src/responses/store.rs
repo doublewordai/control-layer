@@ -461,22 +461,23 @@ fn is_terminal(state: &str) -> bool {
     matches!(state, "completed" | "failed" | "canceled")
 }
 
-/// Poll a fusillade request until it reaches a terminal state (completed/failed/canceled).
-pub async fn poll_until_complete<P: PoolProvider + Clone>(
+/// Poll a fusillade request until it reaches a terminal state, returning the raw `RequestDetail`.
+///
+/// Callers pass the result through their own response-shape converter — e.g.
+/// `detail_to_response_object` for the Responses API, `detail_to_chat_completion_object`
+/// for chat completions.
+pub async fn poll_until_terminal<P: PoolProvider + Clone>(
     request_manager: &PostgresRequestManager<P, ReqwestHttpClient>,
-    response_id: &str,
+    request_id: Uuid,
     poll_interval: std::time::Duration,
     timeout: std::time::Duration,
-) -> Result<serde_json::Value, StoreError> {
-    let id = parse_response_id(response_id)?;
+) -> Result<fusillade::RequestDetail, StoreError> {
     let start = std::time::Instant::now();
 
     loop {
-        match request_manager.get_request_detail(RequestId(id)).await {
+        match request_manager.get_request_detail(RequestId(request_id)).await {
             Ok(detail) => match detail.status.as_str() {
-                "completed" | "failed" | "canceled" => {
-                    return Ok(detail_to_response_object(&detail));
-                }
+                "completed" | "failed" | "canceled" => return Ok(detail),
                 _ => {}
             },
             Err(fusillade::FusilladeError::RequestNotFound(_)) => {}
@@ -487,13 +488,24 @@ pub async fn poll_until_complete<P: PoolProvider + Clone>(
 
         if start.elapsed() >= timeout {
             return Err(StoreError::StorageError(format!(
-                "Timeout waiting for request {response_id} to complete after {:?}",
-                timeout
+                "Timeout waiting for request {request_id} to complete after {timeout:?}"
             )));
         }
 
         tokio::time::sleep(poll_interval).await;
     }
+}
+
+/// Poll a fusillade request until it reaches a terminal state and return a Responses-API-shaped object.
+pub async fn poll_until_complete<P: PoolProvider + Clone>(
+    request_manager: &PostgresRequestManager<P, ReqwestHttpClient>,
+    response_id: &str,
+    poll_interval: std::time::Duration,
+    timeout: std::time::Duration,
+) -> Result<serde_json::Value, StoreError> {
+    let id = parse_response_id(response_id)?;
+    let detail = poll_until_terminal(request_manager, id, poll_interval, timeout).await?;
+    Ok(detail_to_response_object(&detail))
 }
 
 /// Look up the user ID from an API key for batch/response attribution.
@@ -779,6 +791,102 @@ fn detail_to_response_object(detail: &fusillade::RequestDetail) -> serde_json::V
     }
 
     resp
+}
+
+/// Convert a terminal `RequestDetail` into an HTTP status + chat-completions body.
+///
+/// On success the upstream `chat.completion` body is returned verbatim — flex requests
+/// are drop-in compatible with non-flex chat completions. On failure the OpenAI error
+/// envelope is returned with the upstream HTTP status surfaced in both the response
+/// status and the `error.code` field.
+pub fn detail_to_chat_completion_object(detail: &fusillade::RequestDetail) -> (u16, serde_json::Value) {
+    match detail.status.as_str() {
+        "completed" => {
+            let response_status = detail.response_status.and_then(|s| u16::try_from(s).ok()).unwrap_or(200);
+            if response_status >= 400 {
+                let (error_type, message) = match detail.response_body.as_deref() {
+                    Some(body) => extract_upstream_error(response_status, body),
+                    None => (
+                        status_to_error_type(response_status),
+                        format!("Upstream returned {response_status}"),
+                    ),
+                };
+                (
+                    response_status,
+                    serde_json::json!({
+                        "error": {
+                            "message": message,
+                            "type": error_type,
+                            "code": response_status,
+                        }
+                    }),
+                )
+            } else {
+                match detail
+                    .response_body
+                    .as_deref()
+                    .and_then(|b| serde_json::from_str::<serde_json::Value>(b).ok())
+                {
+                    // Pass-through: surface the upstream's actual 2xx status
+                    // rather than hardcoding 200. Chat completions almost
+                    // always returns 200 in practice but the helper is
+                    // pass-through by design — a 201/204/3xx from upstream
+                    // should propagate, not get rewritten to 200.
+                    Some(parsed) => (response_status, parsed),
+                    None => (
+                        500,
+                        serde_json::json!({
+                            "error": {
+                                "message": "Empty or invalid response from upstream",
+                                "type": "server_error",
+                                "code": 500,
+                            }
+                        }),
+                    ),
+                }
+            }
+        }
+        "failed" => {
+            let (error_type, message, status_code) = match detail.error.as_deref() {
+                Some(err) => parse_failure_error(err),
+                None => ("server_error", "Request failed".to_string(), None),
+            };
+            let code = status_code.unwrap_or(500);
+            (
+                code,
+                serde_json::json!({
+                    "error": {
+                        "message": message,
+                        "type": error_type,
+                        "code": code,
+                    }
+                }),
+            )
+        }
+        "canceled" => (
+            499,
+            serde_json::json!({
+                "error": {
+                    "message": "Request was canceled",
+                    "type": "request_canceled",
+                    "code": 499,
+                }
+            }),
+        ),
+        other => {
+            tracing::warn!(state = %other, request_id = %detail.id, "detail_to_chat_completion_object called on non-terminal state");
+            (
+                500,
+                serde_json::json!({
+                    "error": {
+                        "message": format!("Unexpected request state: {other}"),
+                        "type": "server_error",
+                        "code": 500,
+                    }
+                }),
+            )
+        }
+    }
 }
 
 #[async_trait]
@@ -1142,5 +1250,148 @@ mod tests {
         assert_eq!(status_to_error_type(429), "rate_limit_error");
         assert_eq!(status_to_error_type(500), "server_error");
         assert_eq!(status_to_error_type(503), "server_error");
+    }
+
+    fn make_detail(
+        status: &str,
+        response_status: Option<i16>,
+        response_body: Option<&str>,
+        error: Option<&str>,
+    ) -> fusillade::RequestDetail {
+        fusillade::RequestDetail {
+            id: Uuid::new_v4(),
+            batch_id: None,
+            model: "test-model".to_string(),
+            status: status.to_string(),
+            created_at: chrono::Utc::now(),
+            completed_at: None,
+            failed_at: None,
+            duration_ms: None,
+            response_status,
+            body: None,
+            response_body: response_body.map(|s| s.to_string()),
+            error: error.map(|s| s.to_string()),
+            completion_window: None,
+            service_tier: None,
+            batch_created_by: None,
+        }
+    }
+
+    #[test]
+    fn test_detail_to_chat_completion_completed_success_passes_through() {
+        let body = r#"{"id":"chatcmpl-abc","object":"chat.completion","choices":[{"message":{"role":"assistant","content":"hi"}}]}"#;
+        let detail = make_detail("completed", Some(200), Some(body), None);
+        let (status, value) = detail_to_chat_completion_object(&detail);
+        assert_eq!(status, 200);
+        assert_eq!(value["id"], "chatcmpl-abc");
+        assert_eq!(value["object"], "chat.completion");
+        assert!(value.get("error").is_none());
+    }
+
+    #[test]
+    fn test_detail_to_chat_completion_completed_2xx_upstream_status_passes_through() {
+        // Pass-through: an upstream 201/204/etc. should surface as-is, not get
+        // rewritten to 200. Chat-completions virtually always returns 200 in
+        // practice, but the helper's contract is pass-through.
+        let body = r#"{"id":"chatcmpl-y","object":"chat.completion","choices":[]}"#;
+        let detail = make_detail("completed", Some(201), Some(body), None);
+        let (status, value) = detail_to_chat_completion_object(&detail);
+        assert_eq!(status, 201);
+        assert_eq!(value["id"], "chatcmpl-y");
+        assert!(value.get("error").is_none());
+    }
+
+    #[test]
+    fn test_detail_to_chat_completion_completed_no_response_status_assumes_200() {
+        let body = r#"{"id":"chatcmpl-x","object":"chat.completion","choices":[]}"#;
+        let detail = make_detail("completed", None, Some(body), None);
+        let (status, value) = detail_to_chat_completion_object(&detail);
+        assert_eq!(status, 200);
+        assert_eq!(value["id"], "chatcmpl-x");
+    }
+
+    #[test]
+    fn test_detail_to_chat_completion_completed_with_upstream_429_surfaces_status() {
+        let body = r#"{"error":{"message":"Rate limit exceeded","type":"rate_limit_error"}}"#;
+        let detail = make_detail("completed", Some(429), Some(body), None);
+        let (status, value) = detail_to_chat_completion_object(&detail);
+        assert_eq!(status, 429);
+        assert_eq!(value["error"]["message"], "Rate limit exceeded");
+        assert_eq!(value["error"]["type"], "rate_limit_error");
+        assert_eq!(value["error"]["code"], 429);
+    }
+
+    #[test]
+    fn test_detail_to_chat_completion_completed_with_upstream_403_extracts_message() {
+        let body = r#"{"error":{"message":"Forbidden","type":"invalid_request_error"}}"#;
+        let detail = make_detail("completed", Some(403), Some(body), None);
+        let (status, value) = detail_to_chat_completion_object(&detail);
+        assert_eq!(status, 403);
+        assert_eq!(value["error"]["message"], "Forbidden");
+        assert_eq!(value["error"]["type"], "permission_error");
+        assert_eq!(value["error"]["code"], 403);
+    }
+
+    #[test]
+    fn test_detail_to_chat_completion_completed_missing_body_returns_500() {
+        let detail = make_detail("completed", Some(200), None, None);
+        let (status, value) = detail_to_chat_completion_object(&detail);
+        assert_eq!(status, 500);
+        assert_eq!(value["error"]["type"], "server_error");
+    }
+
+    #[test]
+    fn test_detail_to_chat_completion_completed_invalid_json_body_returns_500() {
+        let detail = make_detail("completed", Some(200), Some("not json"), None);
+        let (status, value) = detail_to_chat_completion_object(&detail);
+        assert_eq!(status, 500);
+        assert_eq!(value["error"]["type"], "server_error");
+    }
+
+    #[test]
+    fn test_detail_to_chat_completion_failed_with_failure_reason_envelope() {
+        let err = r#"{"type":"NonRetriableHttpStatus","details":{"status":403,"body":"{\"error\":{\"message\":\"Forbidden\",\"type\":\"invalid_request_error\"}}"}}"#;
+        let detail = make_detail("failed", None, None, Some(err));
+        let (status, value) = detail_to_chat_completion_object(&detail);
+        assert_eq!(status, 403);
+        assert_eq!(value["error"]["message"], "Forbidden");
+        assert_eq!(value["error"]["type"], "permission_error");
+        assert_eq!(value["error"]["code"], 403);
+    }
+
+    #[test]
+    fn test_detail_to_chat_completion_failed_with_legacy_upstream_returned_format() {
+        let err = r#"Upstream returned 500: {"error":{"message":"Internal error"}}"#;
+        let detail = make_detail("failed", None, None, Some(err));
+        let (status, value) = detail_to_chat_completion_object(&detail);
+        assert_eq!(status, 500);
+        assert_eq!(value["error"]["message"], "Internal error");
+        assert_eq!(value["error"]["code"], 500);
+    }
+
+    #[test]
+    fn test_detail_to_chat_completion_failed_with_no_error_field() {
+        let detail = make_detail("failed", None, None, None);
+        let (status, value) = detail_to_chat_completion_object(&detail);
+        assert_eq!(status, 500);
+        assert_eq!(value["error"]["type"], "server_error");
+        assert_eq!(value["error"]["message"], "Request failed");
+    }
+
+    #[test]
+    fn test_detail_to_chat_completion_canceled_returns_499() {
+        let detail = make_detail("canceled", None, None, None);
+        let (status, value) = detail_to_chat_completion_object(&detail);
+        assert_eq!(status, 499);
+        assert_eq!(value["error"]["type"], "request_canceled");
+        assert_eq!(value["error"]["code"], 499);
+    }
+
+    #[test]
+    fn test_detail_to_chat_completion_non_terminal_state_returns_500() {
+        let detail = make_detail("processing", None, None, None);
+        let (status, value) = detail_to_chat_completion_object(&detail);
+        assert_eq!(status, 500);
+        assert_eq!(value["error"]["type"], "server_error");
     }
 }

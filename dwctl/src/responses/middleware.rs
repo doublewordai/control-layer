@@ -92,6 +92,7 @@ pub async fn responses_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     let model = model.as_str();
     let nested_path = parts.uri.path();
     let is_responses_api = nested_path.ends_with("/responses");
+    let is_chat_completions_api = nested_path.ends_with("/chat/completions");
     // The router is nested at /ai/v1, so the path here is e.g. "/responses".
     // Prepend /v1 for the full API path used by the loopback and fusillade templates.
     let endpoint = format!("/v1{nested_path}");
@@ -132,30 +133,32 @@ pub async fn responses_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
         }
     }
 
-    // Parse `service_tier` and `background` from the body. Only the
-    // Responses API supports either today.
+    // Parse `service_tier` and `background` from the body.
     //
-    // For chat completions and embeddings, `service_tier:"flex"` is
-    // currently silently downgraded to realtime: routing flex through
-    // `handle_flex` would work for the routing layer but the polling
-    // path returns `detail_to_response_object`, which only produces
-    // Responses-API-shape output. Returning that shape to a chat
-    // completions or embeddings client breaks them. Wiring up flex
-    // for those endpoints requires a separate response-shape change
-    // that's tracked as a follow-up; for now we forward those
-    // requests to `handle_realtime` and emit a warning so the silent
-    // downgrade is at least observable.
+    // Both `/v1/responses` and `/v1/chat/completions` support
+    // `service_tier:"flex"` — they route to different handlers because
+    // their response shapes differ:
+    //   - `/v1/responses` → `handle_flex` (Responses-API output shape,
+    //     supports `background=true` for fire-and-poll)
+    //   - `/v1/chat/completions` → `handle_chat_completion_flex` (always
+    //     blocks; OpenAI chat-completions surface has no `background`
+    //     field)
+    //
+    // `/v1/embeddings` doesn't have a flex handler yet — its response
+    // shape isn't a chat completion either, and the
+    // `detail_to_response_object` path is wrong for it. Flex on
+    // embeddings is silently downgraded to realtime with a warning so
+    // the fallback is at least observable.
     let requested_tier = resolve_service_tier(request_value["service_tier"].as_str());
     let background = if is_responses_api {
         request_value["background"].as_bool().unwrap_or(false)
     } else {
         false
     };
-    let service_tier = if matches!(requested_tier, ServiceTier::Flex) && !is_responses_api {
+    let service_tier = if matches!(requested_tier, ServiceTier::Flex) && !is_responses_api && !is_chat_completions_api {
         tracing::warn!(
             endpoint = %nested_path,
-            "service_tier:'flex' is not yet supported on chat completions / embeddings; falling back to realtime. \
-             Routing through handle_flex would return a Responses-API-shape body to a chat-completions client."
+            "service_tier:'flex' is not yet supported on this endpoint; falling back to realtime."
         );
         ServiceTier::Realtime
     } else {
@@ -275,6 +278,7 @@ pub async fn responses_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
 
     match service_tier {
         ServiceTier::Realtime => handle_realtime(&state, batch_input, batch_id, &resp_id, model, background, parts, body_bytes, next).await,
+        ServiceTier::Flex if is_chat_completions_api => handle_chat_completion_flex(&state, batch_input, request_id).await,
         ServiceTier::Flex => handle_flex(&state, batch_input, &resp_id, model, background).await,
     }
 }
@@ -475,11 +479,13 @@ async fn handle_flex<P: PoolProvider + Clone + Send + Sync + 'static>(
         tracing::error!(error = %e, "Failed to create flex batch in fusillade");
         return Response::builder()
             .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .header("content-type", "application/json")
             .body(Body::from(
                 serde_json::json!({
                     "error": {
                         "message": "Failed to enqueue request",
                         "type": "server_error",
+                        "code": 500,
                     }
                 })
                 .to_string(),
@@ -530,6 +536,71 @@ async fn handle_flex<P: PoolProvider + Clone + Send + Sync + 'static>(
                 });
                 (StatusCode::GATEWAY_TIMEOUT, Json(response_body)).into_response()
             }
+        }
+    }
+}
+
+/// Handle a flex `/v1/chat/completions` request.
+///
+/// Always blocks: chat completions has no `background` field in the OpenAI surface,
+/// so we hold the connection until the daemon finishes (or we hit the 1h timeout).
+/// On success the upstream `chat.completion` body is returned verbatim. On failure
+/// the OpenAI chat-completions error envelope is returned with the upstream HTTP
+/// status surfaced.
+async fn handle_chat_completion_flex<P: PoolProvider + Clone + Send + Sync + 'static>(
+    state: &ResponsesMiddlewareState<P>,
+    batch_input: fusillade::CreateSingleRequestBatchInput,
+    request_id: uuid::Uuid,
+) -> Response {
+    if let Err(e) = fusillade::Storage::create_single_request_batch(&*state.request_manager, batch_input).await {
+        tracing::error!(error = %e, "Failed to create flex chat-completions batch in fusillade");
+        return Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "error": {
+                        "message": "Failed to enqueue request",
+                        "type": "server_error",
+                        "code": 500,
+                    }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+    }
+
+    let poll_interval = std::time::Duration::from_millis(500);
+    let timeout = std::time::Duration::from_secs(3600);
+
+    match response_store::poll_until_terminal(&state.request_manager, request_id, poll_interval, timeout).await {
+        Ok(detail) => {
+            let (status, body) = response_store::detail_to_chat_completion_object(&detail);
+            let status_code = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            tracing::debug!(request_id = %request_id, %status_code, "Flex chat-completions terminal");
+            (status_code, Json(body)).into_response()
+        }
+        Err(e) => {
+            // poll_until_terminal can fail for two reasons: the 1h timeout
+            // fires (504-shaped), or the polling query itself errors out
+            // (500-shaped — DB/connection issues). The current poller
+            // returns a single error type without distinguishing, so we
+            // log the underlying error and use 504 as the surfaced status
+            // since the timeout path is the dominant case in practice. If
+            // the poller grows a typed error variant for timeout vs.
+            // storage errors, this map can be tightened.
+            tracing::error!(error = %e, request_id = %request_id, "Blocking flex chat-completions poll failed");
+            (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(serde_json::json!({
+                    "error": {
+                        "message": format!("Request timed out: {e}"),
+                        "type": "server_error",
+                        "code": 504,
+                    }
+                })),
+            )
+                .into_response()
         }
     }
 }
