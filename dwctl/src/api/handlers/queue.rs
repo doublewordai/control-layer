@@ -144,8 +144,10 @@ mod tests {
         // partitions by service_tier; we expect:
         //   "24h" → service_tier IS NULL (batch tier — counted)
         //   "1h"  → service_tier = 'flex'   (counted)
-        // "priority" (0s) is exercised separately via create_realtime, which
-        // marks the row 'processing' so it's excluded from pending counts.
+        // "priority" (0s) is exercised separately via create_realtime; the
+        // handler's ServiceTierFilter::Exclude(["priority"]) is what drops
+        // those rows from the count — not their state (processing is included
+        // in the queried states alongside pending and claimed).
         let model = "test-model";
         let mut batch_ids = Vec::new();
         for completion_window in ["24h", "1h"] {
