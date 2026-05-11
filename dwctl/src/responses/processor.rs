@@ -311,6 +311,25 @@ where
                     .assemble_response(&request_id)
                     .await
                     .map_err(|e| fusillade::FusilladeError::Other(anyhow::anyhow!("assemble_response after loop: {e}")))?;
+                // Finalize the head step's sub-request row before the
+                // parent. Sub-request rows are created in `processing`
+                // state by `create_sub_request_row` and rely on the
+                // loop's caller to UPDATE them on terminal — see the
+                // comment block in `responses/store.rs` next to the
+                // `initial_state: "processing"` literal. Without this,
+                // the row that `GET /v1/responses/{id}` reads from
+                // (head_step.request_id → fusillade.requests row) stays
+                // stuck in `processing` forever, and a polling client
+                // sees `"status":"in_progress"` indefinitely even after
+                // the parent below transitions to Completed. The warm
+                // path does the same call via
+                // `streaming::persist_terminal_completed`; the daemon
+                // path is the only multi-step caller that was missing
+                // it.
+                self.response_store
+                    .finalize_head_request(&request_id, 200, assembled.clone())
+                    .await
+                    .map_err(|e| fusillade::FusilladeError::Other(anyhow::anyhow!("finalize head sub-request: {e}")))?;
                 let body = serde_json::to_string(&assembled)
                     .map_err(|e| fusillade::FusilladeError::Other(anyhow::anyhow!("serialize assembled response: {e}")))?;
                 let completed = Request {
@@ -328,6 +347,14 @@ where
                 Ok(RequestCompletionResult::Completed(completed))
             }
             Err(LoopError::Failed(payload)) => {
+                // Mirror the success path: finalize the head sub-request
+                // row before transitioning the parent. Without this,
+                // GET /v1/responses/{id} would keep returning
+                // `"status":"in_progress"` after the loop has already
+                // failed.
+                if let Err(e) = self.response_store.finalize_head_request(&request_id, 500, payload.clone()).await {
+                    tracing::warn!(error = %e, request_id = %request_id, "Failed to finalize head sub-request after loop failure");
+                }
                 let body = serde_json::to_string(&payload).unwrap_or_default();
                 let failed = Request {
                     data: request.data.clone(),
@@ -348,6 +375,21 @@ where
                 // multi-step loop already persisted whatever step rows
                 // got partway through; surfacing the parent's terminal
                 // state lets the caller see what happened.
+                //
+                // Same head-sub-request finalization concern as the
+                // success / `LoopError::Failed` arms above — without
+                // this, polling clients see stale `in_progress`. We
+                // do best-effort here: the head step / sub-request
+                // row may not exist at all if the loop crashed before
+                // the first record_step, which is exactly the no-op
+                // path inside `finalize_head_request`.
+                let payload = serde_json::json!({
+                    "type": "loop_error",
+                    "message": other.to_string(),
+                });
+                if let Err(e) = self.response_store.finalize_head_request(&request_id, 500, payload).await {
+                    tracing::warn!(error = %e, request_id = %request_id, "Failed to finalize head sub-request after unexpected loop error");
+                }
                 let failed = Request {
                     data: request.data.clone(),
                     state: Failed {
