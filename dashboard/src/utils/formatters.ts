@@ -220,6 +220,69 @@ export function getUserFacingTariffs<
 }
 
 /**
+ * Build the set of API-key-purposes that a model's traffic-routing rules
+ * explicitly deny. Pricing for a denied purpose is misleading — the user
+ * can't reach the model through that purpose, so showing them a price
+ * implies access they don't have.
+ */
+function deniedPurposes<
+  M extends {
+    traffic_routing_rules?:
+      | Array<{
+          api_key_purpose?: string | null;
+          // Extra index signature lets us accept the full
+          // TrafficRoutingAction shape (which carries `target` for
+          // redirect actions) without coupling formatters to that type.
+          action: { type: string; [key: string]: unknown };
+        }>
+      | null;
+  },
+>(model: M): Set<string> {
+  const denied = new Set<string>();
+  for (const rule of model.traffic_routing_rules ?? []) {
+    if (rule.action.type === "deny" && rule.api_key_purpose != null) {
+      denied.add(rule.api_key_purpose);
+    }
+  }
+  return denied;
+}
+
+/**
+ * Like `getUserFacingTariffs`, but additionally drops tariffs whose
+ * api_key_purpose is denied by a traffic-routing rule on the model. Use
+ * this anywhere pricing is rendered or surfaced — the filter respects the
+ * "if a purpose is denied, don't advertise its price" invariant.
+ *
+ * Tariffs with a null/undefined `api_key_purpose` are kept regardless of
+ * deny rules: they're the implicit fallback price, not tied to a specific
+ * purpose.
+ *
+ * Generic over the tariff element type so callers retain access to the
+ * concrete fields (`input_price_per_token`, `id`, etc.) — without this,
+ * TypeScript would narrow the result to the bare constraint shape.
+ */
+export function getVisibleTariffsForModel<
+  T extends {
+    is_active?: boolean;
+    api_key_purpose?: string | null;
+    completion_window?: string | null;
+  },
+>(model: {
+  tariffs?: T[] | null;
+  traffic_routing_rules?:
+    | Array<{
+        api_key_purpose?: string | null;
+        action: { type: string; [key: string]: unknown };
+      }>
+    | null;
+}): T[] {
+  const denied = deniedPurposes(model);
+  return getUserFacingTariffs(model.tariffs ?? []).filter(
+    (t) => t.api_key_purpose == null || !denied.has(t.api_key_purpose),
+  );
+}
+
+/**
  * Format a single tariff price (stored as price per token) for display as price per million tokens
  * @param pricePerToken - Price per token as a decimal string (e.g., "0.000001")
  * @returns Formatted price per million tokens (e.g., "$1.00")

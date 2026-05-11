@@ -13,6 +13,7 @@ import {
   Check,
   Copy,
   GitMerge,
+  Trash2,
 } from "lucide-react";
 import {
   useModel,
@@ -39,6 +40,7 @@ import {
   ApiExamples,
   AccessManagementModal,
   UpdateModelPricingModal,
+  DeleteVirtualModelModal,
 } from "../../../modals";
 import UserUsageTable from "./UserUsageTable";
 import ModelProbes from "./ModelProbes";
@@ -106,6 +108,11 @@ const ModelInfo: React.FC = () => {
   const [searchParams] = useSearchParams();
   const { hasPermission } = useAuthorization();
   const canManageGroups = hasPermission("manage-groups");
+  // Both `manage-groups` and `manage-models` are granted exclusively to
+  // PlatformManager (see ROLE_PERMISSIONS in utils/authorization.ts), so
+  // either permission is a PM-only gate. We keep them named explicitly so
+  // the intent is clear at the call site.
+  const canManageModels = hasPermission("manage-models");
   const canViewAnalytics = hasPermission("analytics");
   const canViewEndpoints = hasPermission("endpoints");
 
@@ -172,6 +179,7 @@ const ModelInfo: React.FC = () => {
   const [showAccessModal, setShowAccessModal] = useState(false);
   const [isEditingModelDetails, setIsEditingModelDetails] = useState(false);
   const [showPricingModal, setShowPricingModal] = useState(false);
+  const [showDeleteVirtualModal, setShowDeleteVirtualModal] = useState(false);
   const [aliasCopied, setAliasCopied] = useState(false);
 
   // Alias form
@@ -656,6 +664,19 @@ const ModelInfo: React.FC = () => {
                         </TabsTrigger>
                       )}
                     </TabsList>
+                    {model.is_composite && canManageModels && (
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        onClick={() => setShowDeleteVirtualModal(true)}
+                        className="h-8 w-8 p-0"
+                        aria-label="Delete virtual model"
+                        title="Delete virtual model"
+                      >
+                        <Trash2 className="h-4 w-4" />
+                      </Button>
+                    )}
                   </div>
                 )}
               </div>
@@ -2614,6 +2635,19 @@ const ModelInfo: React.FC = () => {
         modelName={model.alias}
         onClose={() => setShowPricingModal(false)}
       />
+
+      {/* Delete Virtual Model Modal */}
+      {model.is_composite && (
+        <DeleteVirtualModelModal
+          isOpen={showDeleteVirtualModal}
+          onClose={() => setShowDeleteVirtualModal(false)}
+          onSuccess={() => navigate(fromUrl || "/models/manage")}
+          modelId={model.id}
+          modelAlias={model.alias}
+          modelName={model.model_name}
+          componentCount={components?.length ?? 0}
+        />
+      )}
     </div>
   );
 };

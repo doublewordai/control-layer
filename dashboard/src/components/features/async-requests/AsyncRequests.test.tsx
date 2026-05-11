@@ -145,4 +145,49 @@ describe("AsyncRequests", () => {
       within(container).getByText(/no async requests found/i),
     ).toBeInTheDocument();
   });
+
+  describe("Filter persistence", () => {
+    it("seeds filters from localStorage on mount", () => {
+      localStorage.setItem(
+        "filters:responses",
+        JSON.stringify({
+          status: "completed",
+          tier: ["flex"],
+          activeFirst: "false",
+        }),
+      );
+
+      render(<AsyncRequests />, { wrapper: createWrapper() });
+
+      expect(hooks.useAsyncRequests).toHaveBeenCalledWith(
+        expect.objectContaining({
+          status: "completed",
+          service_tiers: "flex",
+          active_first: false,
+        }),
+      );
+    });
+
+    it("does not persist date range across sessions even if junk is stored", () => {
+      // Pre-seed localStorage with date-range-shaped keys to make sure the
+      // page actively ignores them, rather than the test passing only because
+      // nothing was stored in the first place.
+      localStorage.setItem(
+        "filters:responses",
+        JSON.stringify({
+          created_after: "2025-01-01T00:00:00.000Z",
+          created_before: "2025-01-02T00:00:00.000Z",
+          dateRange: "2025-01-01_2025-01-02",
+        }),
+      );
+
+      render(<AsyncRequests />, { wrapper: createWrapper() });
+
+      const lastCall = vi
+        .mocked(hooks.useAsyncRequests)
+        .mock.calls.at(-1)?.[0];
+      expect(lastCall?.created_after).toBeUndefined();
+      expect(lastCall?.created_before).toBeUndefined();
+    });
+  });
 });

@@ -41,12 +41,12 @@ import {
   useUpdateModelComponent,
   useRemoveModelComponent,
   useUpdateModel,
-  useModels,
   useConfig,
   type Model,
   type ModelComponent,
   type LoadBalancingStrategy,
 } from "../../../../api/control-layer";
+import { ModelCombobox } from "../../../ui/model-combobox";
 import { queryKeys } from "../../../../api/control-layer/keys";
 import {
   Card,
@@ -403,23 +403,20 @@ const AddProviderModal: React.FC<{
   isPriorityMode,
   strictModeEnabled,
 }) => {
-  const [selectedModel, setSelectedModel] = useState<string>("");
+  const [selectedModel, setSelectedModel] = useState<Model | null>(null);
   const [weight, setWeight] = useState<string>("50");
   const [trusted, setTrusted] = useState<string>("untrusted");
-
-  const { data: modelsData, isLoading: modelsLoading } = useModels({
-    limit: 100,
-    accessible: false,
-  });
 
   const addMutation = useAddModelComponent();
   const updateModelMutation = useUpdateModel();
 
-  // Filter out composite models and already added models
-  const availableModels =
-    modelsData?.data?.filter(
-      (m) => !m.is_composite && !existingComponentIds.includes(m.id),
-    ) || [];
+  // Excludes composite models (a virtual model can't include another virtual
+  // as a component) and any models already added to this composite. The
+  // combobox handles searching/filtering across the full model list.
+  const filterAvailableModels = React.useCallback(
+    (m: Model) => !m.is_composite && !existingComponentIds.includes(m.id),
+    [existingComponentIds],
+  );
 
   const handleSubmit = async () => {
     if (!selectedModel) return;
@@ -428,7 +425,7 @@ const AddProviderModal: React.FC<{
       await addMutation.mutateAsync({
         modelId,
         data: {
-          deployed_model_id: selectedModel,
+          deployed_model_id: selectedModel.id,
           // New components are added at the end of the priority order
           sort_order: existingComponentIds.length,
           // Only include weight for weighted_random mode
@@ -438,12 +435,12 @@ const AddProviderModal: React.FC<{
       // Set trusted flag if strict mode is enabled
       if (strictModeEnabled) {
         await updateModelMutation.mutateAsync({
-          id: selectedModel,
+          id: selectedModel.id,
           data: { trusted: trusted === "trusted" },
         });
       }
       onClose();
-      setSelectedModel("");
+      setSelectedModel(null);
       setWeight("50");
       setTrusted("untrusted");
     } catch {
@@ -453,7 +450,7 @@ const AddProviderModal: React.FC<{
 
   const handleClose = () => {
     onClose();
-    setSelectedModel("");
+    setSelectedModel(null);
     setWeight("50");
     setTrusted("untrusted");
   };
@@ -473,36 +470,16 @@ const AddProviderModal: React.FC<{
             <label className="text-sm font-medium text-gray-700">
               Select Model
             </label>
-            {modelsLoading ? (
-              <div className="flex items-center justify-center p-4">
-                <div className="animate-spin rounded-full h-6 w-6 border-b-2 border-gray-600" />
-              </div>
-            ) : availableModels.length === 0 ? (
-              <div className="p-4 text-center text-sm text-gray-500 bg-gray-50 rounded-lg">
-                No available models. All hosted models are either virtual or
-                already added.
-              </div>
-            ) : (
-              <Select value={selectedModel} onValueChange={setSelectedModel}>
-                <SelectTrigger>
-                  <SelectValue placeholder="Choose a model..." />
-                </SelectTrigger>
-                <SelectContent>
-                  {availableModels.map((model) => (
-                    <SelectItem key={model.id} value={model.id}>
-                      <div className="flex flex-col">
-                        <span>{model.alias}</span>
-                        {model.model_name !== model.alias && (
-                          <span className="text-xs text-gray-500">
-                            {model.model_name}
-                          </span>
-                        )}
-                      </div>
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            )}
+            <ModelCombobox
+              value={selectedModel}
+              onValueChange={setSelectedModel}
+              placeholder="Choose a hosted model…"
+              searchPlaceholder="Search by alias, model name, or endpoint…"
+              emptyMessage="No matching hosted models. (Already-added or virtual models are hidden.)"
+              filterFn={filterAvailableModels}
+              queryOptions={{ accessible: false, is_composite: false }}
+              className="w-full"
+            />
           </div>
 
           {/* Weight field - only for weighted distribution mode */}

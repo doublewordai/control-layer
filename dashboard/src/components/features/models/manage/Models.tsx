@@ -57,13 +57,13 @@ const Models: React.FC = () => {
   const showPricing = true;
   const canManageModels = hasPermission("manage-models");
 
-  const [filterProvider, setFilterProvider] = usePersistedFilter("endpoint", "all");
-  const [filterGroups, setFilterGroups] = usePersistedFilter("groups", EMPTY_GROUPS);
-  const [rawModelType, setFilterModelType] = usePersistedFilter("type", "all");
+  const [filterProvider, setFilterProvider] = usePersistedFilter("models", "endpoint", "all");
+  const [filterGroups, setFilterGroups] = usePersistedFilter("models", "groups", EMPTY_GROUPS);
+  const [rawModelType, setFilterModelType] = usePersistedFilter("models", "type", "all");
   const filterModelType: ModelType = (MODEL_TYPES as readonly string[]).includes(rawModelType)
     ? (rawModelType as ModelType)
     : "all";
-  const [accessibleOnly, setAccessibleOnly] = usePersistedFilter("accessible", "false");
+  const [accessibleOnly, setAccessibleOnly] = usePersistedFilter("models", "accessible", "false");
   const showAccessibleOnly = accessibleOnly === "true";
 
   const [searchQuery, setSearchQuery] = useState(
@@ -130,7 +130,7 @@ const Models: React.FC = () => {
 
   const handleClearFilters = () => {
     setSearchQuery("");
-    clearPersistedFilters(setSearchParams, FILTER_PARAM_NAMES);
+    clearPersistedFilters("models", setSearchParams, FILTER_PARAM_NAMES);
   };
 
   return (
