@@ -1954,15 +1954,20 @@ impl BackgroundTaskBuilder {
 /// → request_manager` Arc cycle that blocks `sqlx::test`'s `DROP DATABASE`
 /// cleanup (the cycle's only effect in production — where the app lives
 /// forever — is benign).
-///
-/// Many parameters by design: each is a discrete piece of state with
-/// different ownership semantics. Wrapping them in a config struct
-/// would just add an indirection without changing the shape.
-#[allow(clippy::too_many_arguments)]
-async fn setup_background_services(
-    request_manager: Arc<fusillade::PostgresRequestManager<DbPools, fusillade::ReqwestHttpClient>>,
-    step_manager: Arc<fusillade::PostgresResponseStepManager<DbPools>>,
-    multi_step_processor: Option<
+pub(crate) struct BackgroundServicesInput {
+    /// Fusillade's HTTP request manager. The caller builds this so the
+    /// multi-step processor (which depends on it transitively via
+    /// `FusilladeResponseStore`) can be constructed and injected via
+    /// `set_processor` before any daemon spawn inside this function.
+    pub request_manager: Arc<fusillade::PostgresRequestManager<DbPools, fusillade::ReqwestHttpClient>>,
+    /// Fusillade's response-step manager. Shares the same fusillade
+    /// pool as the request manager.
+    pub step_manager: Arc<fusillade::PostgresResponseStepManager<DbPools>>,
+    /// Multi-step processor to inject onto the request manager. `None`
+    /// in tests to avoid forming the `request_manager → processor →
+    /// response_store → request_manager` Arc cycle that blocks
+    /// `sqlx::test`'s `DROP DATABASE` cleanup.
+    pub multi_step_processor: Option<
         Arc<
             dyn fusillade::RequestProcessor<
                     fusillade::PostgresRequestManager<DbPools, fusillade::ReqwestHttpClient>,
@@ -1971,15 +1976,41 @@ async fn setup_background_services(
                 + Sync,
         >,
     >,
-    model_capacity_limits: Arc<dashmap::DashMap<String, usize>>,
-    pool: PgPool,
-    fusillade_pools: DbPools,
-    outlet_pool: Option<PgPool>,
-    config: Config,
-    shared_config: SharedConfig,
-    shutdown_token: tokio_util::sync::CancellationToken,
-    metrics_recorder: Option<GenAiMetrics>,
-) -> anyhow::Result<BackgroundServices> {
+    /// Shared map between the fusillade daemon's concurrency control
+    /// and the onwards config-sync writer. Built once by the caller and
+    /// passed in by-clone here.
+    pub model_capacity_limits: Arc<dashmap::DashMap<String, usize>>,
+    /// dwctl primary pool (used for probe scheduler, notification
+    /// poller, and the responses middleware setup).
+    pub pool: PgPool,
+    /// Fusillade pool wrapper; kept around inside this function only
+    /// to clone the write pool for the metrics sampler — fusillade's
+    /// daemon already owns its own clone via `request_manager`.
+    pub fusillade_pools: DbPools,
+    /// Outlet (request-logging) pool. Optional because outlet is
+    /// optional.
+    pub outlet_pool: Option<PgPool>,
+    pub config: Config,
+    pub shared_config: SharedConfig,
+    pub shutdown_token: tokio_util::sync::CancellationToken,
+    pub metrics_recorder: Option<GenAiMetrics>,
+}
+
+async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Result<BackgroundServices> {
+    let BackgroundServicesInput {
+        request_manager,
+        step_manager,
+        multi_step_processor,
+        model_capacity_limits,
+        pool,
+        fusillade_pools,
+        outlet_pool,
+        config,
+        shared_config,
+        shutdown_token,
+        metrics_recorder,
+    } = input;
+
     // Wire the multi-step processor onto the request manager *before*
     // any daemon spawn below — this is the whole reason `setup_background_services`
     // accepts these as parameters rather than constructing them itself.
@@ -2621,19 +2652,19 @@ impl Application {
             )
         };
 
-        let mut bg_services = setup_background_services(
-            request_manager.clone(),
-            step_manager.clone(),
-            multi_step_processor_for_setup,
+        let mut bg_services = setup_background_services(BackgroundServicesInput {
+            request_manager: request_manager.clone(),
+            step_manager: step_manager.clone(),
+            multi_step_processor: multi_step_processor_for_setup,
             model_capacity_limits,
-            (*db_pools).clone(),
-            fusillade_pools.clone(),
-            outlet_pools.as_ref().map(|p| (**p).clone()),
-            config.clone(),
-            shared_config.clone(),
-            shutdown_token.clone(),
-            metrics_recorder.clone(),
-        )
+            pool: (*db_pools).clone(),
+            fusillade_pools: fusillade_pools.clone(),
+            outlet_pool: outlet_pools.as_ref().map(|p| (**p).clone()),
+            config: config.clone(),
+            shared_config: shared_config.clone(),
+            shutdown_token: shutdown_token.clone(),
+            metrics_recorder: metrics_recorder.clone(),
+        })
         .await?;
 
         // Enforce `stream_options.include_usage` for streaming chat completions.
