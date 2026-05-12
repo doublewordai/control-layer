@@ -1,3 +1,8 @@
 [workspace]
 members = ["dwctl"]
 resolver = "2"
+
+# Local override so dwctl rebuilds against the in-tree fusillade. REMOVE
+# before committing — release flow expects fusillade pulled from crates.io.
+[patch.crates-io]
+fusillade = { path = "../fusillade" }

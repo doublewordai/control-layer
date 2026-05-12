@@ -60,7 +60,7 @@ const createWrapper = () => {
     defaultOptions: { queries: { retry: false } },
   });
   return ({ children }: { children: React.ReactNode }) => (
-    <MemoryRouter initialEntries={["/async"]}>
+    <MemoryRouter initialEntries={["/responses"]}>
       <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
     </MemoryRouter>
   );
@@ -100,12 +100,12 @@ describe("AsyncRequests", () => {
     ).toBeInTheDocument();
   });
 
-  it("renders Create Async and API buttons", () => {
+  it("renders Create Response and API buttons", () => {
     const { container } = render(<AsyncRequests />, {
       wrapper: createWrapper(),
     });
     expect(
-      within(container).getByRole("button", { name: /create async/i }),
+      within(container).getByRole("button", { name: /create response/i }),
     ).toBeInTheDocument();
     expect(
       within(container).getByRole("button", { name: /api/i }),

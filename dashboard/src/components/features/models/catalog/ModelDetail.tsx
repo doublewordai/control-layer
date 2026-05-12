@@ -193,7 +193,7 @@ export const ModelDetail: React.FC = () => {
                     size="sm"
                     onClick={() =>
                       navigate(
-                        `/async?create=true&model=${encodeURIComponent(model.alias)}`,
+                        `/responses?create=true&model=${encodeURIComponent(model.alias)}`,
                       )
                     }
                   >

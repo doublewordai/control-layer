@@ -91,7 +91,7 @@ export const ROUTE_PERMISSIONS: Record<string, PagePermission> = {
   "/system": "settings",
   "/profile": "profile",
   "/batches": "batches",
-  "/async": "batches",
+  "/responses": "batches",
   "/usage": "usage",
   "/connections": "connections",
 };
@@ -114,7 +114,7 @@ function isRouteEnabledByConfig(
     return true;
   }
 
-  if (path === "/async") {
+  if (path === "/responses") {
     return Boolean(
       config.batches?.enabled && config.batches.async_requests?.enabled,
     );
@@ -155,7 +155,7 @@ export function getFirstAccessibleRoute(
   // Priority order for fallback routes mirrors the primary nav layout.
   const fallbackOrder: string[] = [
     "/models",
-    "/async",
+    "/responses",
     "/batches",
     "/playground",
     "/api-keys",
