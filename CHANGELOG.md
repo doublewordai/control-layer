@@ -1,5 +1,18 @@
 # Changelog
 
+## [8.49.0](https://github.com/doublewordai/control-layer/compare/v8.48.0...v8.49.0) (2026-05-13)
+
+
+### Features
+
+* create response UI ([#1067](https://github.com/doublewordai/control-layer/issues/1067)) ([c6e69e3](https://github.com/doublewordai/control-layer/commit/c6e69e37c6688acf26139e07daee99f931642d41))
+
+
+### Bug Fixes
+
+* **responses:** mark parent row processing during multi-step loop ([#1069](https://github.com/doublewordai/control-layer/issues/1069)) ([1b86515](https://github.com/doublewordai/control-layer/commit/1b865152c24197cf3bcf4bd8c764935397a9f510))
+* **responses:** terminate fusillade row on client cancel ([#1070](https://github.com/doublewordai/control-layer/issues/1070)) ([602df7f](https://github.com/doublewordai/control-layer/commit/602df7fa568d7f6096efdee7f1672af3da9b167c))
+
 ## [8.48.0](https://github.com/doublewordai/control-layer/compare/v8.47.0...v8.48.0) (2026-05-11)
 
 
