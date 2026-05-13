@@ -683,6 +683,12 @@ fn status_to_error_type(status: u16) -> &'static str {
         403 => "permission_error",
         404 => "not_found_error",
         429 => "rate_limit_error",
+        // 499 is the nginx-popularized "Client Closed Request" status —
+        // emitted by `FusilladeOutletHandler::handle_abandoned` when the
+        // client cancels before the upstream responds. Without this case
+        // the listing UI would derive the type from the catch-all
+        // `server_error` arm while the stored body said `client_disconnected`.
+        499 => "client_disconnected",
         _ => "server_error",
     }
 }
