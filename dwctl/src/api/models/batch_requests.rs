@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 use super::pagination::Pagination;
 
-/// Query parameters for listing batch requests
+/// Query parameters for listing responses (batchless fusillade requests).
 #[derive(Debug, Default, Deserialize, IntoParams, ToSchema)]
 pub struct ListBatchRequestsQuery {
     #[serde(flatten)]
@@ -34,10 +34,10 @@ pub struct ListBatchRequestsQuery {
     pub active_first: Option<bool>,
 }
 
-/// Individual batch request summary for list endpoint.
+/// Summary of a response (batchless fusillade request) for list views.
 /// Combines fusillade request data with http_analytics enrichment.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct BatchRequestSummary {
+pub struct ResponseSummary {
     pub id: Uuid,
     pub batch_id: Option<Uuid>,
     pub model: String,
@@ -56,10 +56,10 @@ pub struct BatchRequestSummary {
     pub created_by_email: Option<String>,
 }
 
-/// Full batch request detail including input/output.
+/// Full response detail (batchless fusillade request) including input/output.
 /// Combines fusillade request detail with http_analytics enrichment.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct BatchRequestDetail {
+pub struct ResponseDetail {
     pub id: Uuid,
     pub batch_id: Option<Uuid>,
     pub model: String,
@@ -78,6 +78,6 @@ pub struct BatchRequestDetail {
     pub body: String,
     pub response_body: Option<String>,
     pub error: Option<String>,
-    pub created_by: Option<String>,
+    pub created_by: String,
     pub created_by_email: Option<String>,
 }

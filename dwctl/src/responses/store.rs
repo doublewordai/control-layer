@@ -1264,9 +1264,8 @@ mod tests {
             body: None,
             response_body: response_body.map(|s| s.to_string()),
             error: error.map(|s| s.to_string()),
-            completion_window: None,
             service_tier: None,
-            batch_created_by: None,
+            created_by: "test-user".to_string(),
         }
     }
 

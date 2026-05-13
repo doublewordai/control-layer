@@ -85,7 +85,7 @@ pub async fn get_response<P: PoolProvider>(
 
     // Verify ownership: the row's created_by must match the API key's user_id.
     // Return 404 (not 403) to avoid leaking existence of other users' responses.
-    let owner = detail.created_by.as_deref().unwrap_or("");
+    let owner = detail.created_by.as_str();
     if owner != owner_id {
         return Err(Error::NotFound {
             resource: "response".to_string(),
