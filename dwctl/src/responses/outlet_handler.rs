@@ -150,6 +150,84 @@ impl RequestHandler for FusilladeOutletHandler {
             }
         }
     }
+
+    fn handle_abandoned(&self, request_data: RequestData) -> impl std::future::Future<Output = ()> + Send {
+        let job = self.job.clone();
+
+        async move {
+            // Same header-presence gating as handle_response — without
+            // `x-onwards-response-id` this wasn't a responses-middleware
+            // request, so nothing for us to do.
+            let response_id = match Self::extract_response_id(&request_data) {
+                Some(id) => id,
+                None => return,
+            };
+            let request_id = match Self::extract_request_id(&request_data) {
+                Some(id) => id,
+                None => {
+                    tracing::warn!(response_id = %response_id, "Missing x-fusillade-request-id header on abandoned request — skipping enqueue");
+                    return;
+                }
+            };
+            let batch_id = match Self::extract_batch_id(&request_data) {
+                Some(id) => id,
+                None => {
+                    tracing::warn!(response_id = %response_id, "Missing x-fusillade-batch-id header on abandoned request — skipping enqueue");
+                    return;
+                }
+            };
+
+            // We don't have a body captured here — RequestData::body is None
+            // because outlet's AbandonGuard builds a minimal record before
+            // body capture completes. That's fine for create-if-missing:
+            // the row's body column ends up empty, which is correct since
+            // no upstream call ever happened. The endpoint/model headers
+            // still need to be present so the synthesized row is queryable.
+            let model = Self::header_str(&request_data, "x-onwards-model").unwrap_or("unknown").to_string();
+            let endpoint = Self::header_str(&request_data, "x-onwards-endpoint").unwrap_or("").to_string();
+            let api_key = Self::extract_api_key(&request_data);
+
+            if endpoint.is_empty() {
+                tracing::warn!(
+                    response_id = %response_id,
+                    uri = %request_data.uri,
+                    "Missing x-onwards-endpoint header on abandoned request — complete-response synthesize will fail"
+                );
+            }
+
+            // 499 Client Closed Request — nginx-popularized status for
+            // exactly this scenario. The structured body marks the row
+            // distinguishable from a real upstream 5xx in the responses
+            // listing without inventing a new schema.
+            const STATUS_CLIENT_CLOSED: u16 = 499;
+            let abandoned_body = serde_json::json!({
+                "error": {
+                    "type": "client_disconnected",
+                    "message": "client cancelled request before upstream response",
+                    "code": STATUS_CLIENT_CLOSED,
+                }
+            })
+            .to_string();
+
+            if let Err(e) = job
+                .enqueue(&CompleteResponseInput {
+                    response_id: response_id.clone(),
+                    status_code: STATUS_CLIENT_CLOSED,
+                    response_body: abandoned_body,
+                    batch_id,
+                    request_id,
+                    request_body: String::new(),
+                    model,
+                    endpoint,
+                    base_url: String::new(),
+                    api_key,
+                })
+                .await
+            {
+                tracing::warn!(error = %e, response_id = %response_id, "Failed to enqueue complete-response job for abandoned request");
+            }
+        }
+    }
 }
 
 #[cfg(test)]
