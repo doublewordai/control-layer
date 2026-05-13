@@ -261,3 +261,4 @@ Migrations are stored in the `migrations/` directory, and run automatically on s
 ## API Endpoints
 
 - See OpenAPI docs at `/admin/docs` when running
+- AI proxy requests are served under `/ai/v1/*` (e.g. `/ai/v1/chat/completions`, `/ai/v1/responses`) and routed by the embedded `onwards` layer
