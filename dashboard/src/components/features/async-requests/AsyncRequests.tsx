@@ -370,7 +370,7 @@ export function AsyncRequests() {
         <div className="flex items-center gap-2">
           <Button variant="outline" onClick={() => setCreateModalOpen(true)}>
             <Play className="w-4 h-4 mr-2" />
-            Create Async
+            Create Response
           </Button>
           <Button variant="outline" onClick={() => setShowApiExamples(true)}>
             <Code className="h-4 w-4" />
@@ -399,7 +399,7 @@ export function AsyncRequests() {
         columns={columns}
         data={requests}
         isLoading={isLoading}
-        onRowClick={(row) => navigate(`/async/${row.id}`)}
+        onRowClick={(row) => navigate(`/responses/${row.id}`)}
         showColumnToggle={true}
         pageSize={pagination.pageSize}
         minRows={pagination.pageSize}

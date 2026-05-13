@@ -122,9 +122,9 @@ export function AsyncRequestDetail() {
       <div className="mb-4 flex flex-col sm:flex-row sm:items-end sm:justify-between gap-4">
         <div className="flex items-center gap-4">
           <button
-            onClick={() => navigate("/async")}
+            onClick={() => navigate("/responses")}
             className="p-2 text-doubleword-neutral-600 hover:bg-doubleword-neutral-100 rounded-lg transition-colors shrink-0"
-            aria-label="Back to Async"
+            aria-label="Back to Responses"
           >
             <ArrowLeft className="w-5 h-5" />
           </button>

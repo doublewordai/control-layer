@@ -120,7 +120,7 @@ describe("canAccessRoute", () => {
 
   it("denies async and batches routes when disabled in config", () => {
     expect(
-      canAccessRoute(["ConnectionsUser"], "/async", configWithAsyncDisabled),
+      canAccessRoute(["ConnectionsUser"], "/responses", configWithAsyncDisabled),
     ).toBe(false);
     expect(
       canAccessRoute(["ConnectionsUser"], "/batches", configWithBatchesDisabled),
@@ -157,13 +157,13 @@ describe("getFirstAccessibleRoute", () => {
     expect(getFirstAccessibleRoute(["RequestViewer"])).toBe("/models");
   });
 
-  it("returns /async before /batches when models are unavailable", () => {
+  it("returns /responses before /batches when models are unavailable", () => {
     expect(
       getFirstAccessibleRoute(["ConnectionsUser"], configWithAsyncEnabled),
-    ).toBe("/async");
+    ).toBe("/responses");
   });
 
-  it("skips /async when async requests are disabled", () => {
+  it("skips /responses when async requests are disabled", () => {
     expect(
       getFirstAccessibleRoute(["ConnectionsUser"], configWithAsyncDisabled),
     ).toBe("/batches");

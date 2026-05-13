@@ -395,12 +395,12 @@ function AppRoutes() {
             </AppLayout>
           }
         />
-        {/* Async routes */}
+        {/* Responses routes */}
         <Route
-          path="/async"
+          path="/responses"
           element={
             <AppLayout>
-              <ProtectedRoute path="/async">
+              <ProtectedRoute path="/responses">
                 <Suspense fallback={<RouteLoader />}>
                   <AsyncRequests />
                 </Suspense>
@@ -409,10 +409,10 @@ function AppRoutes() {
           }
         />
         <Route
-          path="/async/:requestId"
+          path="/responses/:requestId"
           element={
             <AppLayout>
-              <ProtectedRoute path="/async">
+              <ProtectedRoute path="/responses">
                 <Suspense fallback={<RouteLoader />}>
                   <AsyncRequestDetail />
                 </Suspense>

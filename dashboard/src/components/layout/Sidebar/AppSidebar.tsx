@@ -99,7 +99,7 @@ export function AppSidebar() {
   const allNavItems: NavItem[] = [
     { path: "/models", icon: Layers, label: "Models" },
     {
-      path: "/async",
+      path: "/responses",
       icon: Zap,
       label: "Responses",
       demoOnly: false,
