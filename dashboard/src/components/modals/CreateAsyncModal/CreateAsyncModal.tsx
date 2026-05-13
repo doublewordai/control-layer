@@ -192,13 +192,11 @@ export function CreateAsyncModal({
         return lines.join("\n");
       }
 
-      // curl
-      const indented = JSON.stringify(body, null, 2)
-        .split("\n")
-        .map((line) => `    ${line}`)
-        .join("\n")
-        .trimStart();
-      const submit = `# Submit a response${isBackground ? " (returns 202 + response id)" : ""}\ncurl ${baseUrl}/responses \\\n  -H "Authorization: Bearer ${keyValue}" \\\n  -H "Content-Type: application/json" \\\n  -d '${indented}'`;
+      // curl — use a heredoc with a single-quoted delimiter so prompts
+      // containing apostrophes (or any other shell metacharacter) don't
+      // break the command when copy-pasted into a terminal.
+      const bodyJson = JSON.stringify(body, null, 2);
+      const submit = `# Submit a response${isBackground ? " (returns 202 + response id)" : ""}\ncurl ${baseUrl}/responses \\\n  -H "Authorization: Bearer ${keyValue}" \\\n  -H "Content-Type: application/json" \\\n  --data-binary @- <<'EOF'\n${bodyJson}\nEOF`;
       if (!isBackground) return submit;
       return `${submit}\n\n# Poll until terminal (replace YOUR_RESP_ID with the id returned above)\ncurl ${baseUrl}/responses/YOUR_RESP_ID \\\n  -H "Authorization: Bearer ${keyValue}"`;
     },
