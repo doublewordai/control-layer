@@ -2383,9 +2383,9 @@ checksum = "e6d5a32815ae3f33302d95fdcb2ce17862f8c65363dcfd29360480ba1001fc9c"
 
 [[package]]
 name = "fusillade"
-version = "16.8.2"
+version = "16.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ddba5f712613dae8a1c92f88e18ab45de448d2a69215be9c12cf50de3f7dfe81"
+checksum = "de712031542971f0b94e8fcadcb288975566577b32f63a50c0e9c62461bfe909"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4099,9 +4099,9 @@ dependencies = [
 
 [[package]]
 name = "outlet"
-version = "0.8.0"
+version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bc2267a2dcdc06dc06dc701bd768ee9b6ca9f12567094477898c1d8108e9b407"
+checksum = "058ce12aaf808056347c45d87d8943514895b6ca9ec01bf597ec56078e54f3d5"
 dependencies = [
  "anyhow",
  "axum",
