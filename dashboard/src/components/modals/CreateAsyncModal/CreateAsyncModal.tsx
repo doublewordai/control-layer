@@ -242,7 +242,7 @@ export function CreateAsyncModal({
     setError(null);
 
     if (!apiKey) {
-      setError("Fill an API key before submitting");
+      setError("Enter an API key before submitting");
       return;
     }
     if (!model) {
@@ -271,6 +271,11 @@ export function CreateAsyncModal({
 
       if (!res.ok) {
         const text = await res.text().catch(() => "");
+        if (res.status === 401 || res.status === 403) {
+          throw new Error(
+            "API key was rejected — try minting a new one with the button above",
+          );
+        }
         throw new Error(
           `Request failed (${res.status}): ${text.slice(0, 500) || res.statusText}`,
         );
@@ -529,7 +534,8 @@ export function CreateAsyncModal({
                 <button
                   type="button"
                   onClick={() => handleCopy(snippet, "code")}
-                  className="flex items-center gap-1 px-2 py-1 text-xs text-gray-500 hover:text-gray-700 hover:bg-gray-100 rounded transition-colors"
+                  disabled={!model || !userPrompt.trim()}
+                  className="flex items-center gap-1 px-2 py-1 text-xs text-gray-500 hover:text-gray-700 hover:bg-gray-100 rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:bg-transparent disabled:hover:text-gray-500"
                 >
                   <Copy className="w-3 h-3" />
                   {copiedCode === "code" ? "Copied!" : "Copy"}
