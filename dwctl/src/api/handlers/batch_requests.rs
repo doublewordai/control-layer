@@ -70,7 +70,13 @@ pub async fn list_batch_requests<P: PoolProvider>(
     let limit = query.pagination.limit();
     let can_read_all = can_read_all_resources(&current_user, Resource::Batches);
 
-    // Build ownership filter — member_id only allowed for users with ReadAll permission
+    // Build ownership filter — member_id only allowed for users with ReadAll permission.
+    //
+    // Branch order matters: when an org is active, scope to that org even for
+    // platform managers. Falling through to `can_read_all = None` for a PM in
+    // org context would leak personal/cross-org rows into the Responses view
+    // and is what the legacy implementation accidentally did. Mirrors the
+    // logic in `batches.rs::list_batches` so both views stay consistent.
     let created_by_filter: Option<String> = if let Some(member_id) = query.member_id {
         if !can_read_all {
             return Err(Error::BadRequest {
@@ -78,15 +84,12 @@ pub async fn list_batch_requests<P: PoolProvider>(
             });
         }
         Some(member_id.to_string())
+    } else if let Some(org_id) = current_user.active_organization {
+        Some(org_id.to_string())
     } else if can_read_all {
         None
     } else {
-        Some(
-            current_user
-                .active_organization
-                .map(|org_id| org_id.to_string())
-                .unwrap_or_else(|| current_user.id.to_string()),
-        )
+        Some(current_user.id.to_string())
     };
 
     // Parse comma-separated model filter
