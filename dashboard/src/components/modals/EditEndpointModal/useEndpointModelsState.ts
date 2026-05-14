@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 
 export interface ImportedDeployment {
   /** Provider model name — unique identifier within an endpoint */
@@ -10,12 +10,16 @@ export interface ImportedDeployment {
 }
 
 export interface EndpointModelsState {
-  /** Deployments visible in the table (server state minus removals plus additions) */
+  /** Deployments visible in the table for the currently-loaded server window plus session adds. */
   deployments: ImportedDeployment[];
-  /** Provider model names that were present at modal open but are staged for removal */
+  /** Provider model names staged for removal in this session (may include rows not on the current page). */
   removedModelNames: string[];
   /** Provider model names that were added during this session */
   addedModelNames: string[];
+  /** Full session-added deployments (modelName + alias). Use at submit time to rebuild model_filter. */
+  addedDeployments: ImportedDeployment[];
+  /** Alias edits keyed by server modelName (only entries that differ from the server's alias). */
+  aliasEdits: Record<string, string>;
   /** Number of staged changes (additions + removals + alias edits) */
   changeCount: number;
   /** Has anything changed since modal open */
@@ -62,56 +66,25 @@ const EMPTY_STAGED: StagedState = {
  * Tracks the staged state of model deployments on an endpoint while a user
  * edits in the modal.
  *
- * `initial` is the server state. It is consumed live (not snapshotted) so
- * that asynchronously-loaded server data is reflected in the hook's output
- * without needing a remount or reset. Staged user edits are merged on top
- * via {@link EndpointModelsState.deployments}.
+ * `initial` is the currently-loaded server window (a single page when the
+ * caller paginates). Staged removals/adds/alias edits are tracked as deltas
+ * keyed by modelName so they survive page navigation. Submit-time callers
+ * combine the deltas with a full server fetch to produce the authoritative
+ * model_filter.
  */
 export function useEndpointModelsState(
   initial: InitialDeployment[],
 ): EndpointModelsState {
   const [staged, setStaged] = useState<StagedState>(EMPTY_STAGED);
 
-  // Index server deployments by modelName for O(1) lookup.
+  // Index the current server window by modelName for O(1) lookup. Only
+  // reflects rows the caller has loaded (e.g. the current page), not all
+  // deployments on the endpoint.
   const serverByName = useMemo(() => {
     const m = new Map<string, InitialDeployment>();
     for (const d of initial) m.set(d.modelName, d);
     return m;
   }, [initial]);
-
-  // If `initial` brings in a name the user had optimistically added (e.g.
-  // they added a model before the server fetch completed), drop it from
-  // `staged.added` — the server snapshot is now authoritative for that name.
-  // We also drop any `staged.removed` entries that no longer correspond to a
-  // server deployment, so a stale removal can't shadow a name that's been
-  // re-imported externally.
-  useEffect(() => {
-    if (initial.length === 0) return;
-    setStaged((prev) => {
-      let changed = false;
-      let added = prev.added;
-      let removed = prev.removed;
-
-      const overlapping = prev.added.filter((d) => serverByName.has(d.modelName));
-      if (overlapping.length > 0) {
-        added = prev.added.filter((d) => !serverByName.has(d.modelName));
-        changed = true;
-      }
-
-      let removedChanged = false;
-      const nextRemoved = new Set<string>();
-      for (const name of prev.removed) {
-        if (serverByName.has(name)) nextRemoved.add(name);
-        else removedChanged = true;
-      }
-      if (removedChanged) {
-        removed = nextRemoved;
-        changed = true;
-      }
-
-      return changed ? { ...prev, added, removed } : prev;
-    });
-  }, [initial, serverByName]);
 
   const addModel = useCallback(
     (modelName: string, defaultAlias?: string) => {
@@ -226,39 +199,38 @@ export function useEndpointModelsState(
         isNew: false,
       });
     }
-    // Defensive: drop any staged adds that overlap a server name (the effect
-    // above prunes these, but during the same render we might still see them).
+    // Drop any staged adds that overlap a server name in the current window
+    // so the user never sees the same row twice. Cross-window dups (if the
+    // user added a name that lives on a different page) are resolved at
+    // submit time.
     const safeAdded = staged.added.filter((d) => !serverByName.has(d.modelName));
     return [...surviving, ...safeAdded];
   }, [initial, staged, serverByName]);
 
-  const removedModelNames = useMemo(() => {
-    const list: string[] = [];
-    for (const name of staged.removed) {
-      if (serverByName.has(name)) list.push(name);
-    }
-    return list;
-  }, [staged.removed, serverByName]);
-
-  const addedModelNames = useMemo(
-    () =>
-      staged.added
-        .filter((d) => !serverByName.has(d.modelName))
-        .map((d) => d.modelName),
-    [staged.added, serverByName],
+  // Removals are tracked as deltas keyed by modelName; with a paginated
+  // server window we can't pin them to the rows currently in view, so we
+  // surface every staged removal.
+  const removedModelNames = useMemo(
+    () => Array.from(staged.removed),
+    [staged.removed],
   );
 
-  // Alias edits = staged.aliases entries that target an existing, non-removed
-  // server deployment AND differ from the server value.
+  const addedModelNames = useMemo(
+    () => staged.added.map((d) => d.modelName),
+    [staged.added],
+  );
+
+  // setAlias clears entries that match the server's current value, so any
+  // entry left in staged.aliases is by definition an edit. Subtract any that
+  // overlap with removed rows to avoid double-counting.
   const aliasEditsCount = useMemo(() => {
     let n = 0;
-    for (const [name, alias] of Object.entries(staged.aliases)) {
+    for (const name of Object.keys(staged.aliases)) {
       if (staged.removed.has(name)) continue;
-      const original = serverByName.get(name)?.alias;
-      if (original !== undefined && alias !== original) n++;
+      n++;
     }
     return n;
-  }, [staged.aliases, staged.removed, serverByName]);
+  }, [staged.aliases, staged.removed]);
 
   const changeCount =
     addedModelNames.length + removedModelNames.length + aliasEditsCount;
@@ -268,6 +240,8 @@ export function useEndpointModelsState(
     deployments,
     removedModelNames,
     addedModelNames,
+    addedDeployments: staged.added,
+    aliasEdits: staged.aliases,
     changeCount,
     hasChanges,
     addModel,

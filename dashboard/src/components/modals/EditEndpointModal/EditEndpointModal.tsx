@@ -38,6 +38,7 @@ import {
   useModels,
   dwctlApi,
 } from "../../../api/control-layer";
+import { useServerPagination } from "../../../hooks/useServerPagination";
 import type {
   EndpointValidateRequest,
   AvailableModel,
@@ -97,9 +98,6 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
 
   // ----- Step 2 (Models) state -----
   const [catalog, setCatalog] = useState<AvailableModel[]>([]);
-  const [initialDeployments, setInitialDeployments] = useState<
-    { modelName: string; alias: string }[]
-  >([]);
   const [allModels, setAllModels] = useState<Model[]>([]);
   const [pendingRemoval, setPendingRemoval] = useState<{
     modelName: string;
@@ -109,15 +107,53 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
     new Set(),
   );
   const [submitError, setSubmitError] = useState<string | null>(null);
+  // True while we loop all deployment pages at submit time to rebuild the
+  // authoritative model_filter. Distinct from the per-page query loading flag.
+  const [isBuildingFilter, setIsBuildingFilter] = useState(false);
 
   const validateEndpointMutation = useValidateEndpoint();
   const updateEndpointMutation = useUpdateEndpoint();
+
+  // Server-driven pagination for the current endpoint's deployments. URL
+  // params are prefixed so they don't collide with the underlying Endpoints
+  // page state, and cleared on close.
+  const pagination = useServerPagination({
+    paramPrefix: "endpointModels",
+    defaultPageSize: 10,
+  });
+
+  // Per-page fetch of this endpoint's deployments. Driven by the pagination
+  // hook above; only enabled once we reach step 2 so we don't waste a request
+  // while the user is still on the connection step.
+  const deploymentsQuery = useModels({
+    endpoint: endpoint.id.toString(),
+    skip: pagination.queryParams.skip,
+    limit: pagination.queryParams.limit,
+    enabled: isOpen && currentStep === 2,
+  });
+
+  const currentPageInitial = useMemo(
+    () =>
+      (deploymentsQuery.data?.data ?? []).map((m) => ({
+        modelName: m.model_name,
+        alias: m.alias,
+      })),
+    [deploymentsQuery.data],
+  );
+
+  const totalDeployments = deploymentsQuery.data?.total_count ?? 0;
 
   // Pull every model in the org so we can compute references for each deployment.
   // include=components is essential — virtual models reference us via their
   // component list. Gated on `isOpen` so we don't fetch while the modal is
   // mounted-but-hidden; the result is cached, so reopening the modal is cheap.
-  const allModelsQuery = useModels({ include: "components", enabled: isOpen });
+  // limit=100 (backend max) covers most orgs; orgs with >100 models will see
+  // incomplete reference warnings — a paginating fetch would resolve this.
+  const allModelsQuery = useModels({
+    include: "components",
+    limit: 100,
+    enabled: isOpen,
+  });
 
   const form = useForm<FormData>({
     resolver: zodResolver(formSchema),
@@ -131,7 +167,8 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
     },
   });
 
-  // Initialize on open
+  // Initialize on open. Deployments themselves are fetched lazily by
+  // `deploymentsQuery` once we reach step 2.
   useEffect(() => {
     if (!isOpen || !endpoint) return;
 
@@ -151,22 +188,16 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
     setBackendConflicts(new Set());
     setSubmitError(null);
     setPendingRemoval(null);
-
-    // Pull the current deployments so the staged-state hook gets a faithful
-    // server snapshot. Aliases come from the Standard Models hosted on this
-    // endpoint, keyed by provider model_name.
-    (async () => {
-      try {
-        const current = await dwctlApi.models.list({ endpoint: endpoint.id });
-        setInitialDeployments(
-          current.data.map((m) => ({ modelName: m.model_name, alias: m.alias })),
-        );
-      } catch (err) {
-        console.error("Failed to fetch current deployments:", err);
-        setInitialDeployments([]);
-      }
-    })();
+    setIsBuildingFilter(false);
   }, [isOpen, endpoint, form]);
+
+  // Strip the pagination URL params when the modal closes. Cancel/X/ESC
+  // all flow through `isOpen` toggling false, so a single effect catches
+  // every close path. handleClear is memoized so it's a stable dep.
+  const clearPagination = pagination.handleClear;
+  useEffect(() => {
+    if (!isOpen) clearPagination();
+  }, [isOpen, clearPagination]);
 
   // Track all models for reference computation (separate query, may load after open)
   useEffect(() => {
@@ -175,7 +206,7 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
     }
   }, [allModelsQuery.data]);
 
-  const modelsState = useEndpointModelsState(initialDeployments);
+  const modelsState = useEndpointModelsState(currentPageInitial);
 
   // Build the reference index once per `allModels` change. Per-deployment
   // lookups against this index are O(1), so the references map below is cheap
@@ -354,14 +385,70 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
       return;
     }
 
-    const visibleModelNames = modelsState.deployments.map((d) => d.modelName);
+    // Server pagination means we only hold one page of deployments in memory.
+    // To build the authoritative model_filter we have to read every page now.
+    // This is a small cost paid once on save; typical endpoints have tens of
+    // deployments, not thousands.
+    setIsBuildingFilter(true);
+    const allServerDeployments: { modelName: string; alias: string }[] = [];
+    try {
+      const PAGE_LIMIT = 100;
+      let skip = 0;
+      while (true) {
+        const page = await dwctlApi.models.list({
+          endpoint: endpoint.id.toString(),
+          skip,
+          limit: PAGE_LIMIT,
+        });
+        for (const m of page.data) {
+          allServerDeployments.push({
+            modelName: m.model_name,
+            alias: m.alias,
+          });
+        }
+        skip += PAGE_LIMIT;
+        if (skip >= page.total_count || page.data.length === 0) break;
+      }
+    } catch (err: any) {
+      setIsBuildingFilter(false);
+      setSubmitError(
+        err?.message || "Failed to load endpoint deployments before saving",
+      );
+      return;
+    }
+    setIsBuildingFilter(false);
+
+    // Reconcile staged deltas against the full server state:
+    //  - keep every server deployment that wasn't staged for removal
+    //  - apply alias edits (from staged.aliases) where present
+    //  - append session adds that don't already exist server-side
+    const removedSet = new Set(modelsState.removedModelNames);
+    const aliasEdits = modelsState.aliasEdits;
+    const serverNameSet = new Set(
+      allServerDeployments.map((d) => d.modelName),
+    );
+
+    const finalModelFilter: string[] = [];
     const aliasMapping: Record<string, string> = {};
-    for (const d of modelsState.deployments) {
-      // Trim first, fall back to modelName if the trimmed alias is empty.
-      // Without ordering it this way, an alias of pure whitespace would slip
-      // through (`"  ".trim()` -> `""`) and be sent to the API as empty.
-      const trimmed = (d.alias ?? "").trim();
-      aliasMapping[d.modelName] = trimmed.length > 0 ? trimmed : d.modelName;
+
+    const finalizeAlias = (raw: string | undefined, fallback: string) => {
+      const trimmed = (raw ?? "").trim();
+      return trimmed.length > 0 ? trimmed : fallback;
+    };
+
+    for (const { modelName, alias: serverAlias } of allServerDeployments) {
+      if (removedSet.has(modelName)) continue;
+      finalModelFilter.push(modelName);
+      aliasMapping[modelName] = finalizeAlias(
+        aliasEdits[modelName] ?? serverAlias,
+        modelName,
+      );
+    }
+
+    for (const added of modelsState.addedDeployments) {
+      if (serverNameSet.has(added.modelName)) continue;
+      finalModelFilter.push(added.modelName);
+      aliasMapping[added.modelName] = finalizeAlias(added.alias, added.modelName);
     }
 
     const updateData: EndpointUpdateRequest = {
@@ -372,7 +459,7 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
       // Always send model_filter — passing an empty array means "no models"
       // which matches the user's edits. If the user removed everything, that's
       // intentional.
-      model_filter: visibleModelNames,
+      model_filter: finalModelFilter,
       alias_mapping: aliasMapping,
       ...(data.authHeaderName?.trim() && {
         auth_header_name: data.authHeaderName.trim(),
@@ -387,6 +474,7 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
         id: endpoint.id.toString(),
         data: updateData,
       });
+      pagination.handleClear();
       onSuccess();
       onClose();
     } catch (err: any) {
@@ -422,9 +510,14 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
     }
   };
 
+  // Note: we deliberately don't gate on `deploymentsQuery.isLoading` here.
+  // The submit handler does its own all-pages fetch to build model_filter,
+  // so even if the user clicks before the first page lands, the reconcile
+  // still uses authoritative server state.
   const canSave =
     !!form.watch("name")?.trim() &&
     !updateEndpointMutation.isPending &&
+    !isBuildingFilter &&
     validationState !== "testing" &&
     (!urlChanged || validationState === "success") &&
     backendConflicts.size === 0 &&
@@ -471,6 +564,13 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
                 onAliasChange={handleAliasChange}
                 onRemoveModel={handleRemoveModel}
                 submitError={submitError}
+                pagination={{
+                  page: pagination.page,
+                  pageSize: pagination.pageSize,
+                  totalItems: totalDeployments,
+                  onPageChange: pagination.handlePageChange,
+                }}
+                isLoading={deploymentsQuery.isLoading || deploymentsQuery.isFetching}
               />
             )}
           </form>
@@ -534,7 +634,12 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
                 onClick={() => form.handleSubmit(onSubmit)()}
                 disabled={!canSave}
               >
-                {updateEndpointMutation.isPending ? (
+                {isBuildingFilter ? (
+                  <>
+                    <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                    Loading deployments...
+                  </>
+                ) : updateEndpointMutation.isPending ? (
                   <>
                     <Loader2 className="w-4 h-4 mr-2 animate-spin" />
                     Updating...
@@ -755,6 +860,13 @@ interface ModelsStepProps {
   onAliasChange: (modelName: string, alias: string) => void;
   onRemoveModel: (modelName: string) => void;
   submitError: string | null;
+  pagination: {
+    page: number;
+    pageSize: number;
+    totalItems: number;
+    onPageChange: (page: number) => void;
+  };
+  isLoading: boolean;
 }
 
 const ModelsStep: React.FC<ModelsStepProps> = ({
@@ -769,6 +881,8 @@ const ModelsStep: React.FC<ModelsStepProps> = ({
   onAliasChange,
   onRemoveModel,
   submitError,
+  pagination,
+  isLoading,
 }) => (
   <div className="space-y-6">
     <FormField
@@ -824,9 +938,16 @@ const ModelsStep: React.FC<ModelsStepProps> = ({
         <div>
           <p className="text-sm font-medium">Imported models</p>
           <p className="text-xs text-gray-500">
-            {modelsState.deployments.length === 0
-              ? "No models imported yet"
-              : `${modelsState.deployments.length} imported · click an alias to rename`}
+            {(() => {
+              // Pending count = (server total - removals) + session adds.
+              // Approximate; the authoritative number is computed at submit.
+              const pending =
+                Math.max(0, pagination.totalItems - modelsState.removedModelNames.length) +
+                modelsState.addedDeployments.length;
+              return pending === 0
+                ? "No models imported yet"
+                : `${pending} imported · click an alias to rename`;
+            })()}
           </p>
         </div>
         <AddModelPalette
@@ -844,6 +965,8 @@ const ModelsStep: React.FC<ModelsStepProps> = ({
         }
         onAliasChange={onAliasChange}
         onRemove={onRemoveModel}
+        pagination={pagination}
+        isLoading={isLoading}
       />
     </div>
 

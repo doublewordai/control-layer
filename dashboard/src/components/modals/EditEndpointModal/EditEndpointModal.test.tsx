@@ -13,6 +13,7 @@ import {
   beforeEach,
 } from "vitest";
 import React from "react";
+import { MemoryRouter } from "react-router-dom";
 import { handlers } from "../../../api/control-layer/mocks/handlers";
 import { EditEndpointModal } from "./EditEndpointModal";
 import type { Endpoint } from "../../../api/control-layer/types";
@@ -33,8 +34,12 @@ function createWrapper() {
     },
   });
 
+  // The modal uses useServerPagination, which depends on react-router's
+  // useSearchParams. Wrap tests in MemoryRouter to provide that context.
   return ({ children }: { children: React.ReactNode }) => (
-    <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+    <QueryClientProvider client={queryClient}>
+      <MemoryRouter>{children}</MemoryRouter>
+    </QueryClientProvider>
   );
 }
 

@@ -37,7 +37,12 @@ describe("useEndpointModelsState", () => {
     ]);
   });
 
-  it("drops a staged add when the server fetch later includes the same name", () => {
+  it("does not double-render a staged add when the server window includes it", () => {
+    // With paginated server data, `initial` is a moving window of the current
+    // page — not a complete snapshot. The hook keeps the staged add as a
+    // delta (so it survives navigating away and back) but the deployments
+    // view filters dups against the current window so the user never sees
+    // the same row twice. Cross-window dedup happens at submit time.
     const { result, rerender } = renderHook(
       ({ data }: { data: typeof initial }) => useEndpointModelsState(data),
       { initialProps: { data: [] as typeof initial } },
@@ -48,8 +53,9 @@ describe("useEndpointModelsState", () => {
 
     rerender({ data: initial });
 
-    // The optimistic add is collapsed into the server deployment; not double-counted.
-    expect(result.current.addedModelNames).toEqual([]);
+    // Delta persists — caller dedups at submit
+    expect(result.current.addedModelNames).toEqual(["llama-70b"]);
+    // …but the table doesn't double-render the row
     expect(result.current.deployments.map((d) => d.modelName).sort()).toEqual([
       "llama-70b",
       "qwen-32b",
