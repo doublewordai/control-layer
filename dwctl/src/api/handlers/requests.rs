@@ -204,6 +204,14 @@ pub async fn get_usage<P: PoolProvider>(
     let has_dates = query.start_date.is_some() || query.end_date.is_some();
     let refresh = query.refresh.unwrap_or(false);
 
+    // Scope usage stats to the active org when one is set, otherwise to the
+    // caller. Mirrors `batches.rs::list_batches` so the Usage page reflects
+    // the same context the rest of the app does after a switch — without
+    // this, switching to an org silently keeps showing the human user's
+    // personal stats. The cache key is keyed on this id too, so org-context
+    // and personal-context numbers can't collide in the shared cache.
+    let target_user_id = current_user.active_organization.unwrap_or(current_user.id);
+
     // Build cache key: truncate dates to midnight UTC so preset windows always hit cache.
     // Skip cache for ranges under 30 days — the data moves too fast to cache usefully.
     let (cache_key, use_cache) = if has_dates {
@@ -212,11 +220,11 @@ pub async fn get_usage<P: PoolProvider>(
         let span = end_date - start_date;
         let truncate = |dt: DateTime<Utc>| dt.date_naive().and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp();
         (
-            (current_user.id, Some(truncate(start_date)), Some(truncate(end_date))),
+            (target_user_id, Some(truncate(start_date)), Some(truncate(end_date))),
             span.num_days() >= 30,
         )
     } else {
-        ((current_user.id, None, None), true)
+        ((target_user_id, None, None), true)
     };
 
     if refresh {
@@ -234,8 +242,8 @@ pub async fn get_usage<P: PoolProvider>(
         let start_date = if start < max_start { max_start } else { start };
 
         tokio::try_join!(
-            get_user_batch_count_for_range(state.db.read(), current_user.id, start_date, end_date),
-            get_user_model_breakdown_for_range(state.db.read(), current_user.id, start_date, end_date),
+            get_user_batch_count_for_range(state.db.read(), target_user_id, start_date, end_date),
+            get_user_model_breakdown_for_range(state.db.read(), target_user_id, start_date, end_date),
             get_realtime_tariffs(state.db.read()),
         )?
     } else {
@@ -259,11 +267,11 @@ pub async fn get_usage<P: PoolProvider>(
         refresh_user_model_usage(state.db.write()).await?;
         if refresh {
             let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
-            Credits::new(&mut conn).aggregate_user_batches(current_user.id).await?;
+            Credits::new(&mut conn).aggregate_user_batches(target_user_id).await?;
         }
         let (batch_stats, by_model, tariffs) = tokio::try_join!(
-            get_user_batch_counts(state.db.read(), current_user.id),
-            get_user_model_breakdown(state.db.read(), current_user.id),
+            get_user_batch_counts(state.db.read(), target_user_id),
+            get_user_model_breakdown(state.db.read(), target_user_id),
             get_realtime_tariffs(state.db.read()),
         )?;
         (batch_stats.0, by_model, tariffs)
