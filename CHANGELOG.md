@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.49.1](https://github.com/doublewordai/control-layer/compare/v8.49.0...v8.49.1) (2026-05-14)
+
+
+### Bug Fixes
+
+* **endpoints:** paginate edit modal and stop dropping models on save ([#1071](https://github.com/doublewordai/control-layer/issues/1071)) ([73c2073](https://github.com/doublewordai/control-layer/commit/73c207353f4e57e0bccf2c5e072e1e2ac2fdf6aa))
+
 ## [8.49.0](https://github.com/doublewordai/control-layer/compare/v8.48.0...v8.49.0) (2026-05-13)
 
 
