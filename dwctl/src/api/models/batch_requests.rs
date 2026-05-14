@@ -78,6 +78,11 @@ pub struct ResponseDetail {
     pub body: String,
     pub response_body: Option<String>,
     pub error: Option<String>,
+    /// Creator ID (user or org). Always non-empty: fusillade's
+    /// `create_realtime` / `create_flex` coerce empty-string inputs to NULL,
+    /// and the schema's `requests_attribution_xor` CHECK rejects NULL
+    /// `created_by` for batchless rows. So a row reaching this struct came
+    /// from a real attributed input.
     pub created_by: String,
     pub created_by_email: Option<String>,
 }

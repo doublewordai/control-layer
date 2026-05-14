@@ -480,12 +480,18 @@ pub(crate) fn decide_next_action(parsed: &ParsedRequest, chain: &[ChainStep], re
     {
         Some(s) => s,
         None => {
-            // Chain has steps but none reached a terminal state. The
-            // loop should not have called us in this state — surface
-            // as a transition failure rather than spinning.
+            // Chain has steps but none reached a terminal state. In
+            // steady-state operation a single worker owns the loop and
+            // every iteration either appends new steps or terminates,
+            // so this branch should only fire on a genuine resume —
+            // another worker has re-claimed the row after the original
+            // worker died mid-step. Re-firing the abandoned step risks
+            // duplicate model/tool side effects and we don't carry
+            // enough metadata to know whether the upstream call
+            // completed before the worker died, so we fail the chain.
             return NextAction::Fail(json!({
-                "type": "transition_invariant_violation",
-                "message": "next_action_for called with no terminal step in chain",
+                "type": "step_abandoned",
+                "message": "a step was in flight when this worker took over; the previous worker exited before completing it",
             }));
         }
     };

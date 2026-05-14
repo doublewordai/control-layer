@@ -244,8 +244,12 @@ pub async fn get_batch_request<P: PoolProvider>(
 
     // Check ownership — fetch-then-check pattern matches get_batch handler.
     // 404 (not 403) avoids leaking existence of other users' responses.
-    // `detail.created_by` is guaranteed set: fusillade's `get_request_detail`
-    // is batchless-only and returns `RequestNotFound` for batched IDs.
+    // `detail.created_by` is guaranteed non-empty:
+    //   1. `get_request_detail` filters `WHERE r.created_by IS NOT NULL`, so
+    //      batched rows return `RequestNotFound`.
+    //   2. `create_realtime` / `create_flex` coerce empty-string inputs to
+    //      NULL, which the XOR CHECK constraint rejects at insert time.
+    // So if the row is returned, its `created_by` came from a non-empty input.
     let can_read_all = can_read_all_resources(&current_user, Resource::Batches);
     if !can_read_all && !is_batch_owner(&current_user, &detail.created_by) {
         return Err(Error::NotFound {

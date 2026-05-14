@@ -12,6 +12,7 @@
 pub mod assembly;
 pub mod handler;
 pub mod jobs;
+pub mod loop_http_client;
 pub mod middleware;
 pub mod outlet_handler;
 pub mod processor;

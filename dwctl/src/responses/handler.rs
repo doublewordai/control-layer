@@ -85,6 +85,9 @@ pub async fn get_response<P: PoolProvider>(
 
     // Verify ownership: the row's created_by must match the API key's user_id.
     // Return 404 (not 403) to avoid leaking existence of other users' responses.
+    // `detail.created_by` is non-empty by fusillade's schema invariants —
+    // `get_request_detail` filters out batched rows, and `create_realtime` /
+    // `create_flex` coerce empty inputs to NULL which the XOR CHECK rejects.
     let owner = detail.created_by.as_str();
     if owner != owner_id {
         return Err(Error::NotFound {
