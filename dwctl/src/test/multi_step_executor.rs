@@ -44,27 +44,55 @@ use crate::tool_executor::{HttpToolExecutor, ResolvedToolSet, ResolvedTools, Too
 
 use crate::test::utils::setup_fusillade_pool;
 
-/// Stash a pending input in the bridge's side-channel and return the
-/// generated head step UUID as a String — the value to thread into
-/// `run_response_loop` as `request_id`.
+/// Create the up-front /v1/responses fusillade row (the row
+/// `record_step`'s head branch reuses), then stash the per-response
+/// context in the side-channel keyed by the same UUID. Returns the
+/// UUID as a String — the value to thread into `run_response_loop` as
+/// `request_id`.
 ///
 /// In production this is what `warm_path_setup` does before kicking
-/// off the loop. The integration tests need the same setup for
-/// `record_step` to find the per-response context (api_key, base_url)
-/// it stamps onto each per-step sub-request fusillade row.
-fn register_test_response<P>(store: &FusilladeResponseStore<P>, base_url: &str) -> String
+/// off the loop. The integration tests need the same two-step setup
+/// (row + side-channel) for `record_step`'s head branch to find an
+/// existing row at `head_step_uuid` and for the bridge to read
+/// per-response context (api_key, base_url).
+async fn register_test_response<P>(store: &FusilladeResponseStore<P>, base_url: &str) -> String
 where
     P: FusilladePoolProvider + Clone + Send + Sync + 'static,
 {
+    let head_uuid = Uuid::new_v4();
+    let body = r#"{"model":"test-model","input":"hi"}"#.to_string();
+    fusillade::Storage::create_realtime(
+        store.request_manager(),
+        fusillade::CreateRealtimeInput {
+            request_id: head_uuid,
+            body: body.clone(),
+            model: "test-model".to_string(),
+            endpoint: base_url.to_string(),
+            method: "POST".to_string(),
+            path: "/v1/responses".to_string(),
+            api_key: String::new(),
+            // Must be non-empty: create_realtime coerces empty to NULL,
+            // and `requests_attribution_xor` requires exactly one of
+            // batch_created_by / created_by to be non-null. Batchless
+            // rows have batch_created_by NULL, so created_by must be set.
+            created_by: "test-user".to_string(),
+        },
+    )
+    .await
+    .expect("create_realtime for test head row");
     store
-        .register_pending(PendingResponseInput {
-            body: r#"{"model":"test-model","input":"hi"}"#.to_string(),
-            api_key: None,
-            created_by: None,
-            base_url: base_url.to_string(),
-            resolved_tool_names: std::collections::HashSet::new(),
-        })
-        .to_string()
+        .register_pending_with_id(
+            head_uuid,
+            PendingResponseInput {
+                body,
+                api_key: None,
+                created_by: Some("test-user".to_string()),
+                base_url: base_url.to_string(),
+                resolved_tool_names: std::collections::HashSet::new(),
+            },
+        )
+        .expect("register pending for test response");
+    head_uuid.to_string()
 }
 
 /// Production-shaped transition function over [`FusilladeResponseStore`].
@@ -236,7 +264,7 @@ async fn loop_drives_real_tool_and_model_calls_through_production_executor(pool:
     // it for analytics surface, not for routing — the loop fires to
     // `upstream.url` directly), but it must be present so
     // record_step can stamp it onto sub-request rows.
-    let request_id = register_test_response(&inner_store, &model_server.uri());
+    let request_id = register_test_response(&inner_store, &model_server.uri()).await;
     let store = TransitionStore { inner: inner_store };
 
     // Drive it.

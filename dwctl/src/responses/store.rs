@@ -964,12 +964,22 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> MultiStepStore for Fusilla
         let sequence = chain.iter().map(|s| s.step_sequence).max().unwrap_or(0) + 1;
 
         // model_call steps require a sub-request fusillade row (CHECK
-        // constraint: model_call ⇒ request_id IS NOT NULL). Create it
-        // synchronously so the FK is satisfied at the response_steps
-        // insert. tool_call steps have request_id = NULL — analytics
-        // for them live in tool_call_analytics (keyed on
-        // response_step_id).
+        // constraint: model_call ⇒ request_id IS NOT NULL). tool_call
+        // steps have request_id = NULL — analytics for them live in
+        // tool_call_analytics (keyed on response_step_id).
+        //
+        // The head model_call reuses the up-front /v1/responses row
+        // (created by `handle_flex` for flex, `warm_path_setup` for the
+        // realtime warm path) — its id is `head_step_uuid` by
+        // construction. That collapses what used to be "parent row +
+        // head sub-request row" into a single tracking row per
+        // response: 1 row for a single-step tool-using chain,
+        // N rows for an N-model_call chain.
+        //
+        // Descendant model_calls (followups after tool dispatch) still
+        // mint their own sub-request rows via `create_sub_request_row`.
         let req_id = match descriptor.kind {
+            OnwardsStepKind::ModelCall if is_head => Some(RequestId(head_step_uuid)),
             OnwardsStepKind::ModelCall => Some(RequestId(self.create_sub_request_row(request_id, descriptor).await?)),
             OnwardsStepKind::ToolCall => None,
         };
