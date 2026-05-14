@@ -812,4 +812,114 @@ mod tests {
             let _: ListAnalyticsResponse = response.json();
         }
     }
+
+    /// Insert an `http_analytics` row with an explicit `user_id`. The
+    /// general `insert_test_analytics` helper above intentionally leaves
+    /// `user_id` NULL because most tests don't care about ownership; the
+    /// usage handler does care, so we need a variant that sets it.
+    async fn insert_test_analytics_for_user(
+        pool: &PgPool,
+        user_id: uuid::Uuid,
+        timestamp: chrono::DateTime<chrono::Utc>,
+        model: &str,
+        prompt_tokens: i64,
+        completion_tokens: i64,
+    ) {
+        let correlation_id = CORRELATION_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
+        sqlx::query!(
+            r#"
+            INSERT INTO http_analytics (
+                instance_id, correlation_id, timestamp, uri, method, status_code, duration_ms,
+                model, prompt_tokens, completion_tokens, total_tokens, user_id
+            ) VALUES ($1, $2, $3, '/ai/chat/completions', 'POST', 200, 100, $4, $5, $6, $7, $8)
+            "#,
+            uuid::Uuid::new_v4(),
+            correlation_id,
+            timestamp,
+            model,
+            prompt_tokens,
+            completion_tokens,
+            prompt_tokens + completion_tokens,
+            user_id,
+        )
+        .execute(pool)
+        .await
+        .expect("Failed to insert test analytics data with user_id");
+    }
+
+    /// Regression test for org-context scoping in the `/admin/api/v1/usage`
+    /// handler. The handler previously read `current_user.id` directly for
+    /// every query and cache key, so usage figures never changed when the
+    /// user switched into an org — they always saw their personal numbers.
+    ///
+    /// We exercise the date-filtered path because it reads `http_analytics`
+    /// directly (with `WHERE user_id = $1`), avoiding the need to run the
+    /// background `refresh_user_model_usage` / `aggregate_user_batches`
+    /// jobs against the test pool. Two analytics rows are seeded — one for
+    /// the PM, one for the org — and the test asserts the response only
+    /// contains the model attributed to the active context.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_get_usage_pm_in_org_context_scopes_to_org(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+
+        let pm_user = create_test_user_with_roles(
+            &pool,
+            vec![Role::PlatformManager, Role::StandardUser, Role::BatchAPIUser],
+        )
+        .await;
+        let org = create_test_org(&pool, pm_user.id).await;
+        let auth = add_auth_headers(&pm_user);
+
+        // Seed two analytics rows with distinct (user_id, model) pairs so
+        // we can tell which context is "winning" just by reading off the
+        // single model alias in by_model.
+        let one_hour_ago = Utc::now() - Duration::hours(1);
+        insert_test_analytics_for_user(&pool, pm_user.id, one_hour_ago, "personal-model", 50, 25).await;
+        insert_test_analytics_for_user(&pool, org.id, one_hour_ago, "org-model", 100, 50).await;
+
+        // Date-filtered request — bypasses the all-time pre-aggregated path
+        // so we don't depend on the cursor-driven refresh job running.
+        // Use the `Z`-suffix RFC3339 form so the querystring needs no
+        // percent-encoding ("+" in numeric-offset RFC3339 timestamps would
+        // be misread as a space by the form parser).
+        use chrono::SecondsFormat;
+        let start = (one_hour_ago - Duration::minutes(1)).to_rfc3339_opts(SecondsFormat::Secs, true);
+        let end = (Utc::now() + Duration::minutes(1)).to_rfc3339_opts(SecondsFormat::Secs, true);
+        let url = format!("/admin/api/v1/usage?start_date={}&end_date={}", start, end);
+
+        // PM in personal context → personal-model only.
+        let personal_resp = app
+            .get(&url)
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+        personal_resp.assert_status_ok();
+        let personal_body: serde_json::Value = personal_resp.json();
+        let personal_models = personal_body["by_model"].as_array().expect("by_model array");
+        assert_eq!(
+            personal_models.len(), 1,
+            "personal context should see only the human user's analytics",
+        );
+        assert_eq!(personal_models[0]["model"], "personal-model");
+
+        // PM in org context → org-model only. This is the contract that
+        // regressed before the fix; if `get_usage` ever stops threading
+        // `active_organization` through `target_user_id` this fails.
+        let org_cookie = format!("dw_active_org={}", org.id);
+        let org_resp = app
+            .get(&url)
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .add_header("cookie", &org_cookie)
+            .await;
+        org_resp.assert_status_ok();
+        let org_body: serde_json::Value = org_resp.json();
+        let org_models = org_body["by_model"].as_array().expect("by_model array");
+        assert_eq!(
+            org_models.len(), 1,
+            "org context should see only the org's analytics, not the human user's",
+        );
+        assert_eq!(org_models[0]["model"], "org-model");
+    }
 }

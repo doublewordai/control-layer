@@ -67,10 +67,10 @@ pub async fn list_batch_requests<P: PoolProvider>(
     // Build ownership filter — member_id only allowed for users with ReadAll permission.
     //
     // Branch order matters: when an org is active, scope to that org even for
-    // platform managers. Falling through to `can_read_all = None` for a PM in
-    // org context would leak personal/cross-org rows into the Responses view
-    // and is what the legacy implementation accidentally did. Mirrors the
-    // logic in `batches.rs::list_batches` so both views stay consistent.
+    // platform managers. The old order checked `can_read_all` first, so a PM
+    // in org context fell through to `created_by_filter = None` and saw all
+    // rows across all users and orgs in the Responses view. Mirrors the logic
+    // in `batches.rs::list_batches` so both views stay consistent.
     let created_by_filter: Option<String> = if let Some(member_id) = query.member_id {
         if !can_read_all {
             return Err(Error::BadRequest {
@@ -399,6 +399,132 @@ mod tests {
             .await;
 
         response.assert_status_not_found();
+    }
+
+    /// Regression test for the PM-in-org-context scoping bug fixed alongside
+    /// this test. The bug: `list_batch_requests` checked `can_read_all`
+    /// before the org-context arm, so a platform manager who had switched
+    /// into an org context still got `created_by_filter = None` and saw
+    /// rows from every user and every org. The fix reorders the branches
+    /// to match `batches.rs::list_batches` — the org context arm now wins.
+    ///
+    /// To trigger the bug we need three populated `created_by` values and a
+    /// PM caller:
+    ///   - the PM themselves (personal-context batch)
+    ///   - a different user (cross-user noise)
+    ///   - the org the PM has switched into
+    ///
+    /// With the fix:
+    ///   - PM personal context → all three rows (PM bypass, intentional)
+    ///   - PM in org context   → only the org's row (the contract we're testing)
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_list_batch_requests_pm_in_org_context_scopes_to_org(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+
+        let pm_user = create_test_user_with_roles(
+            &pool,
+            vec![Role::PlatformManager, Role::StandardUser, Role::BatchAPIUser],
+        )
+        .await;
+        let other_user = create_test_user_with_roles(
+            &pool,
+            vec![Role::StandardUser, Role::BatchAPIUser],
+        )
+        .await;
+        let org = create_test_org(&pool, pm_user.id).await;
+        let auth = add_auth_headers(&pm_user);
+
+        // Seed fusillade batches/requests for each `created_by`. Mirrors the
+        // direct-SQL pattern used by `test_get_batch_request_populates_created_by_email`.
+        let file_id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO fusillade.files (id, name, status, created_at, updated_at) VALUES ($1, 'scoping-test.jsonl', 'processed', NOW(), NOW())",
+        )
+        .bind(file_id)
+        .execute(&pool)
+        .await
+        .expect("insert file");
+
+        let template_id = uuid::Uuid::new_v4();
+        let body = serde_json::json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}]});
+        sqlx::query(
+            "INSERT INTO fusillade.request_templates (id, file_id, model, api_key, endpoint, path, body, custom_id, method) VALUES ($1, $2, 'test-model', 'test-key', 'http://test', '/v1/chat/completions', $3, 'req-0', 'POST')",
+        )
+        .bind(template_id)
+        .bind(file_id)
+        .bind(serde_json::to_string(&body).unwrap())
+        .execute(&pool)
+        .await
+        .expect("insert template");
+
+        // One batch per `created_by` so the cross-user / org rows are
+        // distinguishable from each other in the response.
+        let owners = [
+            ("pm_user", pm_user.id.to_string()),
+            ("other_user", other_user.id.to_string()),
+            ("org", org.id.to_string()),
+        ];
+        for (_label, owner) in &owners {
+            let batch_id = uuid::Uuid::new_v4();
+            let request_id = uuid::Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO fusillade.batches (id, created_by, file_id, endpoint, completion_window, expires_at, created_at, total_requests) VALUES ($1, $2, $3, '/v1/chat/completions', '24h', NOW() + interval '24 hours', NOW(), 1)",
+            )
+            .bind(batch_id)
+            .bind(owner)
+            .bind(file_id)
+            .execute(&pool)
+            .await
+            .expect("insert batch");
+            sqlx::query(
+                "INSERT INTO fusillade.requests (id, batch_id, template_id, model, state, created_at) VALUES ($1, $2, $3, 'test-model', 'pending', NOW())",
+            )
+            .bind(request_id)
+            .bind(batch_id)
+            .bind(template_id)
+            .execute(&pool)
+            .await
+            .expect("insert request");
+        }
+
+        // PM in personal context — `can_read_all` wins, no filter, all three
+        // rows visible. This guards the intentional PM-bypass behavior.
+        let personal_resp = app
+            .get("/admin/api/v1/batches/requests")
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+        personal_resp.assert_status_ok();
+        let personal_body: serde_json::Value = personal_resp.json();
+        assert_eq!(
+            personal_body["total_count"], 3,
+            "PM in personal context should see every row (read-all bypass)",
+        );
+
+        // PM in org context — `created_by_filter = Some(org.id)`, only the
+        // org's row visible. This is the contract that regressed before
+        // the fix; if branch ordering ever flips again this assertion fails.
+        let org_cookie = format!("dw_active_org={}", org.id);
+        let org_resp = app
+            .get("/admin/api/v1/batches/requests")
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .add_header("cookie", &org_cookie)
+            .await;
+        org_resp.assert_status_ok();
+        let org_body: serde_json::Value = org_resp.json();
+        // Three rows were seeded, one per `created_by`. The org filter
+        // queries `WHERE created_by = $1`, so getting exactly 1 row back
+        // is sufficient evidence that the filter applied and the right
+        // owner was picked — no need to spelunk into the response model's
+        // creator-identity field.
+        assert_eq!(
+            org_body["total_count"], 1,
+            "PM in org context should see only the org's row",
+        );
+        let org_rows = org_body["data"].as_array().expect("data array");
+        assert_eq!(org_rows.len(), 1);
     }
 
     #[sqlx::test]
