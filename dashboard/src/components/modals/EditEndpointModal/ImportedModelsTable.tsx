@@ -1,7 +1,8 @@
 import React from "react";
-import { X } from "lucide-react";
+import { Loader2, X } from "lucide-react";
 import { Input } from "../../ui/input";
 import { Button } from "../../ui/button";
+import { TablePagination } from "../../ui/table-pagination";
 import type { ImportedDeployment } from "./useEndpointModelsState";
 import type { DeploymentReferences } from "./references";
 
@@ -13,6 +14,14 @@ export interface ImportedModelsTableProps {
   conflictingAliases: Set<string>;
   onAliasChange: (modelName: string, alias: string) => void;
   onRemove: (modelName: string) => void;
+  /** Server-driven pagination state. Omit for fully-loaded lists. */
+  pagination?: {
+    page: number;
+    pageSize: number;
+    totalItems: number;
+    onPageChange: (page: number) => void;
+  };
+  isLoading?: boolean;
 }
 
 export const ImportedModelsTable: React.FC<ImportedModelsTableProps> = ({
@@ -21,8 +30,10 @@ export const ImportedModelsTable: React.FC<ImportedModelsTableProps> = ({
   conflictingAliases,
   onAliasChange,
   onRemove,
+  pagination,
+  isLoading,
 }) => {
-  if (deployments.length === 0) {
+  if (deployments.length === 0 && !isLoading) {
     return (
       <div className="border border-dashed rounded-lg py-10 text-center text-sm text-gray-500">
         No models imported yet. Click <span className="font-medium">Add model</span> to
@@ -32,32 +43,49 @@ export const ImportedModelsTable: React.FC<ImportedModelsTableProps> = ({
   }
 
   return (
-    <div className="border rounded-lg overflow-hidden" role="table" aria-label="Imported models">
-      <div
-        className="grid grid-cols-12 gap-2 px-3 py-2 bg-gray-50 border-b text-xs font-medium text-gray-600 uppercase tracking-wide"
-        role="row"
-      >
-        <div className="col-span-5" role="columnheader">Model</div>
-        {/* Alias and References cells contain inputs/badges that have their own
-            px-3 padding (or live in a flex with badges). Mirror that here so
-            the header text aligns with the value text in each row. */}
-        <div className="col-span-4 px-3" role="columnheader">Alias</div>
-        <div className="col-span-2" role="columnheader">References</div>
-        <div className="col-span-1" role="columnheader" aria-label="Actions" />
+    <>
+      <div className="border rounded-lg overflow-hidden relative" role="table" aria-label="Imported models">
+        <div
+          className="grid grid-cols-12 gap-2 px-3 py-2 bg-gray-50 border-b text-xs font-medium text-gray-600 uppercase tracking-wide"
+          role="row"
+        >
+          <div className="col-span-5" role="columnheader">Model</div>
+          {/* Alias and References cells contain inputs/badges that have their own
+              px-3 padding (or live in a flex with badges). Mirror that here so
+              the header text aligns with the value text in each row. */}
+          <div className="col-span-4 px-3" role="columnheader">Alias</div>
+          <div className="col-span-2" role="columnheader">References</div>
+          <div className="col-span-1" role="columnheader" aria-label="Actions" />
+        </div>
+        <ul className="divide-y" role="rowgroup">
+          {deployments.map((d) => (
+            <ImportedModelRow
+              key={d.modelName}
+              deployment={d}
+              references={referencesByModelName.get(d.modelName)}
+              isAliasConflict={conflictingAliases.has(d.alias)}
+              onAliasChange={onAliasChange}
+              onRemove={onRemove}
+            />
+          ))}
+        </ul>
+        {isLoading && (
+          <div className="absolute inset-0 bg-white/60 flex items-center justify-center">
+            <Loader2 className="w-4 h-4 animate-spin text-gray-500" />
+          </div>
+        )}
       </div>
-      <ul className="divide-y" role="rowgroup">
-        {deployments.map((d) => (
-          <ImportedModelRow
-            key={d.modelName}
-            deployment={d}
-            references={referencesByModelName.get(d.modelName)}
-            isAliasConflict={conflictingAliases.has(d.alias)}
-            onAliasChange={onAliasChange}
-            onRemove={onRemove}
-          />
-        ))}
-      </ul>
-    </div>
+      {pagination && (
+        <TablePagination
+          currentPage={pagination.page}
+          itemsPerPage={pagination.pageSize}
+          totalItems={pagination.totalItems}
+          onPageChange={pagination.onPageChange}
+          itemName="models"
+          className="mt-4"
+        />
+      )}
+    </>
   );
 };
 
