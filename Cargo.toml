@@ -1,3 +1,23 @@
 [workspace]
 members = ["dwctl"]
 resolver = "2"
+
+# Local path overrides for the in-flight onwards multi-step rollout.
+# `fusillade` main has the streaming-event-callback work merged but
+# unreleased; `onwards` is still on `feat/multi-step-feature-flag`
+# (which pulls fusillade from the same git URL until both publish).
+# Once both publish, drop these and bump the version specifiers in
+# `dwctl/Cargo.toml` instead.
+[patch.crates-io]
+fusillade = { path = "../fusillade" }
+onwards = { path = "../onwards" }
+
+# Collapse onwards's git-based fusillade dep onto the same local
+# fusillade source. Without this, cargo treats the crates.io-versioned
+# fusillade (used by dwctl) and the git-versioned fusillade (used by
+# onwards' multi-step feature) as two separate crates, even though
+# both resolve to the same path — and the `fusillade::HttpClient`
+# trait from one then doesn't satisfy bounds expressed against the
+# other.
+[patch."https://github.com/doublewordai/fusillade"]
+fusillade = { path = "../fusillade" }
