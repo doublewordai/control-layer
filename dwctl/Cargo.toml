@@ -157,7 +157,7 @@ aws-sdk-s3 = { version = "1.21", default-features = false, features = ["sigv4a",
 aws-credential-types = "1.1"
 
 [dev-dependencies]
-axum-test = { version = "18.4.1" }
+axum-test = { version = "20.0.0" }
 sqlx = { version = "0.8", features = [
   "postgres",
   "runtime-tokio-rustls",
