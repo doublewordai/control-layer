@@ -145,7 +145,10 @@ export function CreateAsyncModal({
         typeof body.instructions === "string" ? body.instructions : "";
 
       if (lang === "python") {
-        const createArgs = [`    model="${modelValue}",`];
+        // JSON.stringify produces a double-quoted string with all special
+        // characters escaped — that's also a valid Python string literal,
+        // so it survives model aliases like `acme's-llm-v2` or `path\foo`.
+        const createArgs = [`    model=${JSON.stringify(modelValue)},`];
         if (instructions) {
           createArgs.push(`    instructions=${JSON.stringify(instructions)},`);
         }
@@ -180,7 +183,10 @@ ${tail}`;
       }
 
       if (lang === "javascript") {
-        const createArgs = [`    model: '${modelValue}',`];
+        // Same reasoning as the Python branch — JSON-quoted strings are
+        // valid JS strings, so apostrophes/backslashes in the alias don't
+        // break the snippet. Yields `model: "alias"` rather than `'alias'`.
+        const createArgs = [`    model: ${JSON.stringify(modelValue)},`];
         if (instructions) {
           createArgs.push(
             `    instructions: ${JSON.stringify(instructions)},`,
@@ -214,7 +220,7 @@ ${tail}`;
       }
 
       // curl
-      const bodyLines = [`    "model": "${modelValue}"`];
+      const bodyLines = [`    "model": ${JSON.stringify(modelValue)}`];
       if (instructions) {
         bodyLines.push(`    "instructions": ${JSON.stringify(instructions)}`);
       }
@@ -222,13 +228,18 @@ ${tail}`;
       bodyLines.push(`    "service_tier": "${tierValue}"`);
       if (isBackground) bodyLines.push(`    "background": true`);
 
+      // The body sits inside a single-quoted shell argument, so any `'` in
+      // the JSON (from a prompt like "don't" or an alias containing one)
+      // would terminate the argument early. Escape with the standard POSIX
+      // close-quote / escaped-quote / reopen-quote dance.
+      const bodyContent = `{\n${bodyLines.join(",\n")}\n  }`;
+      const shellSafeBody = bodyContent.replace(/'/g, "'\\''");
+
       const submit = `# Submit a response${isBackground ? " — capture the id from the response body" : ""}
 curl ${baseUrl}/responses \\
   -H "Authorization: Bearer ${keyValue}" \\
   -H "Content-Type: application/json" \\
-  -d '{
-${bodyLines.join(",\n")}
-  }'`;
+  -d '${shellSafeBody}'`;
 
       if (!isBackground) return submit;
       return `${submit}
