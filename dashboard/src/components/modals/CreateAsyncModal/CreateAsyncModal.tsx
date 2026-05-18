@@ -608,8 +608,11 @@ curl ${baseUrl}/responses/YOUR_RESP_ID \\
               <div className="flex items-start gap-2 text-xs text-muted-foreground">
                 <Info className="h-3.5 w-3.5 mt-0.5 flex-shrink-0" />
                 <span>
-                  Fill in the model and user prompt on the Compose tab to see
-                  them rendered in the snippet.
+                  {!model && !userPrompt.trim()
+                    ? "Pick a model above and add a user prompt on the Compose tab to render the snippet."
+                    : !model
+                      ? "Pick a model above to render the snippet."
+                      : "Add a user prompt on the Compose tab to render the snippet."}
                 </span>
               </div>
             )}
