@@ -37,3 +37,14 @@ pub struct OrganizationMemberDBResponse {
     pub invited_by: Option<UserId>,
     pub expires_at: Option<DateTime<Utc>>,
 }
+
+/// Database response for a pending organization email change.
+#[derive(Debug, Clone)]
+pub struct PendingOrgEmailChangeDBResponse {
+    pub id: uuid::Uuid,
+    pub organization_id: UserId,
+    pub new_email: String,
+    pub requested_by: UserId,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+}
