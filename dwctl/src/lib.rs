@@ -2618,9 +2618,9 @@ impl Application {
         let batch_daemon_fusillade_cfg = batch_daemon_cfg.to_fusillade_config();
         let multi_step_http_client: Arc<fusillade::ReqwestHttpClient> = Arc::new(
             fusillade::ReqwestHttpClient::new(
-                batch_daemon_fusillade_cfg.first_chunk_timeout,
-                batch_daemon_fusillade_cfg.chunk_timeout,
-                batch_daemon_fusillade_cfg.body_timeout,
+                std::time::Duration::from_millis(batch_daemon_fusillade_cfg.first_chunk_timeout_ms),
+                std::time::Duration::from_millis(batch_daemon_fusillade_cfg.chunk_timeout_ms),
+                std::time::Duration::from_millis(batch_daemon_fusillade_cfg.body_timeout_ms),
                 batch_daemon_fusillade_cfg.streamable_endpoints.clone(),
             ),
         );
