@@ -14,7 +14,11 @@
 
 CREATE TABLE pending_org_email_changes (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    organization_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    -- At most one pending change per organization. A new PATCH atomically
+    -- supersedes the previous one via INSERT ... ON CONFLICT, which
+    -- guarantees older verification links stop working the moment a new
+    -- request is accepted (no read-then-write race window).
+    organization_id UUID NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
     new_email VARCHAR NOT NULL,
     requested_by UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     token_hash VARCHAR NOT NULL UNIQUE,
@@ -22,9 +26,5 @@ CREATE TABLE pending_org_email_changes (
     expires_at TIMESTAMPTZ NOT NULL
 );
 
--- Look up pending changes by org (used when superseding a prior request).
-CREATE INDEX idx_pending_org_email_changes_org
-    ON pending_org_email_changes(organization_id);
-
--- The unique constraint on token_hash already provides the lookup index for
--- the confirm endpoint.
+-- Both `UNIQUE` constraints above (organization_id and token_hash) provide
+-- the lookup indexes needed by the confirm and supersede paths.

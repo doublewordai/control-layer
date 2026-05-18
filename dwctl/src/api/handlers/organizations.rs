@@ -408,36 +408,46 @@ pub async fn update_organization<P: PoolProvider>(
             let token_hash = hash_invite_token(&token);
             let expires_at = chrono::Utc::now() + Duration::hours(EMAIL_CHANGE_TOKEN_TTL_HOURS);
 
+            // Single UPSERT atomically supersedes any prior pending change for this org,
+            // invalidating the older verification token in the same statement.
             let mut org_repo = Organizations::new(&mut pool_conn);
-            // Supersede any prior pending change so older verification links stop working.
-            org_repo.delete_pending_email_changes(id).await?;
             let pending = org_repo
-                .create_pending_email_change(id, &normalized, current_user.id, &token_hash, expires_at)
+                .upsert_pending_email_change(id, &normalized, current_user.id, &token_hash, expires_at)
                 .await?;
 
-            // Best-effort: send verification email to the new address and a notice to
-            // the old one. Mail failures should not roll back the API call — the
-            // verification row already gates the actual email change.
+            // Best-effort: send a verification link to the new address and a notice to
+            // the current address. The verification row already gates the actual email
+            // change, so we never let mail failures (transport down, template error,
+            // service misconfiguration) roll back the API call or hide the pending
+            // state from the client.
             let config = state.current_config();
-            let email_service = EmailService::new(&config)?;
             let org_name = current_org.display_name.clone().unwrap_or_else(|| current_org.username.clone());
+            // The verification link must be a plain GET URL that works from any
+            // email client, so it points at the backend confirm endpoint directly.
             let confirm_link = format!(
-                "{}/organizations/email-change?token={}",
+                "{}/admin/api/v1/organizations/email-change/{}/confirm",
                 config.dashboard_url.trim_end_matches('/'),
                 token,
             );
 
-            if let Err(e) = email_service
-                .send_org_email_change_verify(&normalized, &org_name, &confirm_link)
-                .await
-            {
-                tracing::warn!("Failed to send org email-change verify to {normalized}: {e}");
-            }
-            if let Err(e) = email_service
-                .send_org_email_change_notice(&current_org.email, &org_name, &normalized, Some(&config.support_email))
-                .await
-            {
-                tracing::warn!("Failed to send org email-change notice to current address: {e}");
+            match EmailService::new(&config) {
+                Ok(email_service) => {
+                    if let Err(e) = email_service
+                        .send_org_email_change_verify(&normalized, &org_name, &confirm_link)
+                        .await
+                    {
+                        tracing::warn!("Failed to send org email-change verify to {normalized}: {e}");
+                    }
+                    if let Err(e) = email_service
+                        .send_org_email_change_notice(&current_org.email, &org_name, &normalized, Some(&config.support_email))
+                        .await
+                    {
+                        tracing::warn!("Failed to send org email-change notice to current address: {e}");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Email service unavailable for org email-change verification: {e}");
+                }
             }
 
             pending_email_info = Some(PendingEmailChangeInfo {
@@ -1446,48 +1456,56 @@ pub async fn cancel_invite<P: PoolProvider>(
 /// Confirm a pending organization email change by consuming a verification token.
 ///
 /// The token is sent (via `update_organization`) to the requested new contact
-/// address. Clicking the link routes here, the change is applied, and the
-/// pending row is consumed. No authentication is required because the secret
-/// token itself proves possession of the new mailbox.
+/// address. Mail clients render the link as a plain anchor, so this is a `GET`
+/// endpoint that returns a small HTML page describing the result — no
+/// dashboard route is required to make the link work, and no separate API
+/// call is needed. No authentication is required because the secret token
+/// itself proves possession of the new mailbox.
 #[utoipa::path(
-    post,
+    get,
     path = "/organizations/email-change/{token}/confirm",
     tag = "organizations",
     summary = "Confirm an organization email change",
-    description = "Apply a pending organization contact email change using the verification token from the email sent to the new address.",
+    description = "Apply a pending organization contact email change using the verification token from the email sent to the new address. Returns an HTML confirmation page.",
     params(
         ("token" = String, Path, description = "Email change verification token"),
     ),
     responses(
-        (status = 200, description = "Email change applied", body = OrganizationResponse),
-        (status = 400, description = "Bad request - token has expired"),
-        (status = 404, description = "Not found - invalid or already-consumed token"),
+        (status = 200, description = "Email change applied (HTML page)"),
+        (status = 400, description = "Token has expired (HTML page)"),
+        (status = 404, description = "Invalid or already-consumed token (HTML page)"),
     ),
 )]
 #[tracing::instrument(skip_all)]
 pub async fn confirm_email_change<P: PoolProvider>(
     State(state): State<AppState<P>>,
     Path(token): Path<String>,
-) -> Result<Json<OrganizationResponse>> {
+) -> Result<axum::response::Response> {
     let token_hash = hash_invite_token(&token);
 
     let mut pool_conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut org_repo = Organizations::new(&mut pool_conn);
 
-    let pending = org_repo
-        .find_pending_email_change_by_token_hash(&token_hash)
-        .await?
-        .ok_or_else(|| Error::NotFound {
-            resource: "Email change request".to_string(),
-            id: "invalid or already-consumed token".to_string(),
-        })?;
+    // Atomic claim: `DELETE ... RETURNING` ensures two concurrent confirmations
+    // cannot both succeed, and a PATCH that supersedes this row cannot race
+    // with the lookup. If the row was already consumed/replaced, we return 404.
+    let pending = match org_repo.consume_pending_email_change(&token_hash).await? {
+        Some(p) => p,
+        None => {
+            return Ok(email_change_html(
+                StatusCode::NOT_FOUND,
+                "This confirmation link is invalid or has already been used.",
+            ));
+        }
+    };
 
     if pending.expires_at < chrono::Utc::now() {
-        // Consume the row so an expired token can't be probed repeatedly.
-        org_repo.delete_pending_email_change(pending.id).await?;
-        return Err(Error::BadRequest {
-            message: "This email-change link has expired. Please request a new change.".to_string(),
-        });
+        // Row is already deleted by consume_pending_email_change above, so an
+        // expired token can't be probed repeatedly.
+        return Ok(email_change_html(
+            StatusCode::BAD_REQUEST,
+            "This confirmation link has expired. Please request the email change again from the dashboard.",
+        ));
     }
 
     let update = OrganizationUpdateDBRequest {
@@ -1497,11 +1515,34 @@ pub async fn confirm_email_change<P: PoolProvider>(
         batch_notifications_enabled: None,
         low_balance_threshold: None,
     };
-    let updated = org_repo.update(pending.organization_id, &update).await?;
+    org_repo.update(pending.organization_id, &update).await?;
 
-    org_repo.delete_pending_email_change(pending.id).await?;
+    Ok(email_change_html(
+        StatusCode::OK,
+        "Your organization's contact email has been updated. You can close this tab.",
+    ))
+}
 
-    Ok(Json(OrganizationResponse::from_user(UserResponse::from(updated))))
+/// Render a minimal HTML confirmation page for the email-change flow.
+fn email_change_html(status: StatusCode, message: &str) -> axum::response::Response {
+    let body = format!(
+        r#"<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Email change</title></head>
+<body style="font-family: system-ui, sans-serif; max-width: 540px; margin: 60px auto; padding: 20px; color: #333;">
+<h2>Organization contact email</h2>
+<p>{}</p>
+</body></html>"#,
+        html_escape(message),
+    );
+    axum::response::Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .body(body.into())
+        .expect("static HTML response builds")
+}
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
 
 #[cfg(test)]
@@ -2294,13 +2335,17 @@ mod tests {
         .await
         .unwrap();
 
-        // No auth required — the token IS the proof.
+        // No auth required — the token IS the proof. The link must be clickable
+        // straight from an email client, so the endpoint is GET and returns HTML.
         let resp = server
-            .post(&format!("/admin/api/v1/organizations/email-change/{token}/confirm"))
+            .get(&format!("/admin/api/v1/organizations/email-change/{token}/confirm"))
             .await;
         resp.assert_status(axum::http::StatusCode::OK);
-        let body = resp.json::<serde_json::Value>();
-        assert_eq!(body["email"].as_str().unwrap(), "new@example.com");
+        let body = resp.text();
+        assert!(
+            body.contains("contact email has been updated"),
+            "unexpected confirmation body: {body}"
+        );
 
         // Underlying state: email written, pending row consumed.
         let resp = server
@@ -2325,9 +2370,10 @@ mod tests {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
 
         let resp = server
-            .post("/admin/api/v1/organizations/email-change/not-a-real-token/confirm")
+            .get("/admin/api/v1/organizations/email-change/not-a-real-token/confirm")
             .await;
         resp.assert_status(axum::http::StatusCode::NOT_FOUND);
+        assert!(resp.text().contains("invalid"));
     }
 
     #[sqlx::test]
@@ -2356,9 +2402,10 @@ mod tests {
         .unwrap();
 
         let resp = server
-            .post(&format!("/admin/api/v1/organizations/email-change/{token}/confirm"))
+            .get(&format!("/admin/api/v1/organizations/email-change/{token}/confirm"))
             .await;
         resp.assert_status(axum::http::StatusCode::BAD_REQUEST);
+        assert!(resp.text().contains("expired"));
 
         // The email must NOT have been updated, and the expired row must be cleaned up.
         let resp = server
@@ -2405,6 +2452,98 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rows, vec!["two@example.com".to_string()]);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_superseded_token_cannot_confirm(pool: PgPool) {
+        // After a second PATCH, the *first* token must be inert — clicking the
+        // old verification link must not roll back the new pending change or
+        // resurrect the old one.
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let pm = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let pm_headers = add_auth_headers(&pm);
+        let owner = create_test_user(&pool, Role::StandardUser).await;
+        let owner_headers = add_auth_headers(&owner);
+
+        let org_id = create_org_for(&server, &pm_headers, "stale-token-org", "billing@example.com", owner.id).await;
+
+        // Plant the first token directly so we know its plaintext.
+        let token_one = crate::auth::password::generate_reset_token();
+        let token_one_hash = super::hash_invite_token(&token_one);
+        sqlx::query(
+            "INSERT INTO pending_org_email_changes (organization_id, new_email, requested_by, token_hash, expires_at)
+             VALUES ($1, $2, $3, $4, NOW() + INTERVAL '1 hour')",
+        )
+        .bind(uuid::Uuid::parse_str(&org_id).unwrap())
+        .bind("first@example.com")
+        .bind(owner.id)
+        .bind(&token_one_hash)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // A second PATCH supersedes via UPSERT.
+        let resp = server
+            .patch(&format!("/admin/api/v1/organizations/{org_id}"))
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .json(&json!({ "email": "second@example.com" }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::OK);
+
+        // The first token should now be invalid.
+        let resp = server
+            .get(&format!("/admin/api/v1/organizations/email-change/{token_one}/confirm"))
+            .await;
+        resp.assert_status(axum::http::StatusCode::NOT_FOUND);
+
+        // The org's email is still the original — only the second token (which the
+        // test cannot read here) could change it.
+        let resp = server
+            .get(&format!("/admin/api/v1/organizations/{org_id}"))
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .await;
+        let body = resp.json::<serde_json::Value>();
+        assert_eq!(body["email"].as_str().unwrap(), "billing@example.com");
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_confirm_token_consumed_after_first_use(pool: PgPool) {
+        // The DELETE RETURNING in consume_pending_email_change must make the
+        // token single-use — replaying the same URL returns 404 the second time.
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let pm = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let pm_headers = add_auth_headers(&pm);
+        let owner = create_test_user(&pool, Role::StandardUser).await;
+
+        let org_id = create_org_for(&server, &pm_headers, "replay-org", "billing@example.com", owner.id).await;
+
+        let token = crate::auth::password::generate_reset_token();
+        let token_hash = super::hash_invite_token(&token);
+        sqlx::query(
+            "INSERT INTO pending_org_email_changes (organization_id, new_email, requested_by, token_hash, expires_at)
+             VALUES ($1, $2, $3, $4, NOW() + INTERVAL '1 hour')",
+        )
+        .bind(uuid::Uuid::parse_str(&org_id).unwrap())
+        .bind("new@example.com")
+        .bind(owner.id)
+        .bind(&token_hash)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let first = server
+            .get(&format!("/admin/api/v1/organizations/email-change/{token}/confirm"))
+            .await;
+        first.assert_status(axum::http::StatusCode::OK);
+
+        let second = server
+            .get(&format!("/admin/api/v1/organizations/email-change/{token}/confirm"))
+            .await;
+        second.assert_status(axum::http::StatusCode::NOT_FOUND);
     }
 
     #[sqlx::test]

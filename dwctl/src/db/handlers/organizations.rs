@@ -583,21 +583,15 @@ impl<'c> Organizations<'c> {
         Ok(count.unwrap_or(0))
     }
 
-    /// Delete every pending email change row for an organization.
+    /// Atomically insert or replace the pending email-change row for an org.
     ///
-    /// Called before inserting a new pending change so that only the most
-    /// recent verification token is valid (older tokens become useless).
-    #[instrument(skip(self), fields(org_id = %abbrev_uuid(&org_id)), err)]
-    pub async fn delete_pending_email_changes(&mut self, org_id: UserId) -> Result<u64> {
-        let result = sqlx::query!("DELETE FROM pending_org_email_changes WHERE organization_id = $1", org_id)
-            .execute(&mut *self.db)
-            .await?;
-        Ok(result.rows_affected())
-    }
-
-    /// Insert a pending email change row.
+    /// The `pending_org_email_changes.organization_id` column has a UNIQUE
+    /// constraint, so `ON CONFLICT` ensures that at most one pending change
+    /// exists per org and that older verification tokens are invalidated the
+    /// instant a new one is accepted — without a read-then-write race
+    /// window.
     #[instrument(skip(self, token_hash), fields(org_id = %abbrev_uuid(&org_id)), err)]
-    pub async fn create_pending_email_change(
+    pub async fn upsert_pending_email_change(
         &mut self,
         org_id: UserId,
         new_email: &str,
@@ -610,6 +604,12 @@ impl<'c> Organizations<'c> {
             INSERT INTO pending_org_email_changes
                 (organization_id, new_email, requested_by, token_hash, expires_at)
             VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (organization_id) DO UPDATE SET
+                new_email = EXCLUDED.new_email,
+                requested_by = EXCLUDED.requested_by,
+                token_hash = EXCLUDED.token_hash,
+                expires_at = EXCLUDED.expires_at,
+                created_at = NOW()
             RETURNING id, organization_id, new_email, requested_by, created_at, expires_at
             "#,
             org_id,
@@ -631,14 +631,17 @@ impl<'c> Organizations<'c> {
         })
     }
 
-    /// Look up a pending email change by token hash.
+    /// Atomically consume a pending email change by token hash. The row is
+    /// deleted as part of the lookup so two concurrent confirmations can't
+    /// both succeed; the caller still needs to verify `expires_at` against
+    /// the current time before applying the change.
     #[instrument(skip(self, token_hash), err)]
-    pub async fn find_pending_email_change_by_token_hash(&mut self, token_hash: &str) -> Result<Option<PendingOrgEmailChangeDBResponse>> {
+    pub async fn consume_pending_email_change(&mut self, token_hash: &str) -> Result<Option<PendingOrgEmailChangeDBResponse>> {
         let row = sqlx::query!(
             r#"
-            SELECT id, organization_id, new_email, requested_by, created_at, expires_at
-            FROM pending_org_email_changes
+            DELETE FROM pending_org_email_changes
             WHERE token_hash = $1
+            RETURNING id, organization_id, new_email, requested_by, created_at, expires_at
             "#,
             token_hash,
         )
@@ -653,15 +656,6 @@ impl<'c> Organizations<'c> {
             created_at: r.created_at,
             expires_at: r.expires_at,
         }))
-    }
-
-    /// Delete a pending email change row by ID. Returns whether a row was removed.
-    #[instrument(skip(self), err)]
-    pub async fn delete_pending_email_change(&mut self, id: Uuid) -> Result<bool> {
-        let result = sqlx::query!("DELETE FROM pending_org_email_changes WHERE id = $1", id)
-            .execute(&mut *self.db)
-            .await?;
-        Ok(result.rows_affected() > 0)
     }
 }
 

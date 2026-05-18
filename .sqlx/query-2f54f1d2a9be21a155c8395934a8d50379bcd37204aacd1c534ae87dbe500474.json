@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            INSERT INTO pending_org_email_changes\n                (organization_id, new_email, requested_by, token_hash, expires_at)\n            VALUES ($1, $2, $3, $4, $5)\n            RETURNING id, organization_id, new_email, requested_by, created_at, expires_at\n            ",
+  "query": "\n            INSERT INTO pending_org_email_changes\n                (organization_id, new_email, requested_by, token_hash, expires_at)\n            VALUES ($1, $2, $3, $4, $5)\n            ON CONFLICT (organization_id) DO UPDATE SET\n                new_email = EXCLUDED.new_email,\n                requested_by = EXCLUDED.requested_by,\n                token_hash = EXCLUDED.token_hash,\n                expires_at = EXCLUDED.expires_at,\n                created_at = NOW()\n            RETURNING id, organization_id, new_email, requested_by, created_at, expires_at\n            ",
   "describe": {
     "columns": [
       {
@@ -52,5 +52,5 @@
       false
     ]
   },
-  "hash": "b7322c55bbf9dee35cf87a2dbc6a64439205980d4ab692620426b00f22b97e1b"
+  "hash": "2f54f1d2a9be21a155c8395934a8d50379bcd37204aacd1c534ae87dbe500474"
 }

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id, organization_id, new_email, requested_by, created_at, expires_at\n            FROM pending_org_email_changes\n            WHERE token_hash = $1\n            ",
+  "query": "\n            DELETE FROM pending_org_email_changes\n            WHERE token_hash = $1\n            RETURNING id, organization_id, new_email, requested_by, created_at, expires_at\n            ",
   "describe": {
     "columns": [
       {
@@ -48,5 +48,5 @@
       false
     ]
   },
-  "hash": "330a3b99dbccd6e99fdf5c5c108fb88d2dc1e39dd65ecd7ca66242c0fd690795"
+  "hash": "16fbd8c82aeec13da8de0a30aba74bb582bfee03ad136ce766678d127cd16621"
 }
