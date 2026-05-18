@@ -63,7 +63,10 @@ export function CreateAsyncModal({
   const [systemPrompt, setSystemPrompt] = useState<string>("");
   const [userPrompt, setUserPrompt] = useState<string>("");
 
-  // API key — required for the direct /v1/responses call, also baked into snippet.
+  // API key — only used to fill in the Code Snippet tab so users can paste a
+  // working call into their own apps. Submissions from this modal go through
+  // the dashboard's session-proxied /admin/api/v1/ai path, so no key is needed
+  // to create a response here.
   const [apiKey, setApiKey] = useState<string | null>(null);
   const [showCreateForm, setShowCreateForm] = useState(false);
   const [newKeyName, setNewKeyName] = useState("");
@@ -105,20 +108,22 @@ export function CreateAsyncModal({
     return base.endsWith("/v1") ? base : `${base}/v1`;
   }, [config?.ai_api_base_url]);
 
-  // Submit URL — routed through the dashboard's own origin to avoid CORS.
-  // In dev the Vite proxy forwards /ai → dwctl on :3001; in prod app.doubleword.ai
-  // serves /ai/v1 from the same host as the dashboard.
-  const submitUrl = "/ai/v1/responses";
+  // Submit URL — the admin/ai proxy rewrites this to /ai/v1/responses and
+  // injects a per-user hidden API key derived from the session, so the
+  // browser submits with cookies and never needs to handle a user-facing key.
+  const submitUrl = "/admin/api/v1/ai/v1/responses";
 
   const buildResponseBody = useCallback(() => {
+    // Key order matters for the rendered snippet — keep `instructions`
+    // adjacent to `model` so the JSON/Python/JS examples read naturally.
     const body: Record<string, unknown> = {
       model: model || "model-name",
-      input: userPrompt.trim() || "Hello!",
-      service_tier: serviceTier,
     };
     if (systemPrompt.trim()) {
       body.instructions = systemPrompt.trim();
     }
+    body.input = userPrompt.trim() || "Hello!";
+    body.service_tier = serviceTier;
     if (serviceTier === "flex") {
       // Background mode is the recommended flex pattern — submit returns 202,
       // poll for terminal status. Realtime/priority requests stay synchronous.
@@ -133,72 +138,104 @@ export function CreateAsyncModal({
       const baseUrl = getBaseUrl();
       const body = buildResponseBody();
       const isBackground = body.background === true;
-      const instructions = typeof body.instructions === "string" ? body.instructions : "";
-      const input = typeof body.input === "string" ? body.input : "";
+      const modelValue = String(body.model);
+      const tierValue = String(body.service_tier);
+      const inputValue = typeof body.input === "string" ? body.input : "";
+      const instructions =
+        typeof body.instructions === "string" ? body.instructions : "";
 
       if (lang === "python") {
-        const lines: string[] = ["from openai import OpenAI"];
-        if (isBackground) lines.push("from time import sleep");
-        lines.push("");
-        lines.push(`client = OpenAI(api_key="${keyValue}", base_url="${baseUrl}")`);
-        lines.push("");
-        lines.push("resp = client.responses.create(");
-        lines.push(`    model="${body.model}",`);
-        if (instructions) lines.push(`    instructions=${JSON.stringify(instructions)},`);
-        lines.push(`    input=${JSON.stringify(input)},`);
-        lines.push(`    service_tier="${body.service_tier}",`);
-        if (isBackground) lines.push("    background=True,");
-        lines.push(")");
-        if (isBackground) {
-          lines.push("");
-          lines.push('while resp.status in {"queued", "in_progress"}:');
-          lines.push("    sleep(2)");
-          lines.push("    resp = client.responses.retrieve(resp.id)");
-          lines.push("");
-          lines.push('print(f"Final status: {resp.status}\\nOutput:\\n{resp.output_text}")');
-        } else {
-          lines.push("");
-          lines.push("print(resp.output_text)");
+        const createArgs = [`    model="${modelValue}",`];
+        if (instructions) {
+          createArgs.push(`    instructions=${JSON.stringify(instructions)},`);
         }
-        return lines.join("\n");
+        createArgs.push(`    input=${JSON.stringify(inputValue)},`);
+        createArgs.push(`    service_tier="${tierValue}",`);
+        if (isBackground) createArgs.push("    background=True,");
+
+        const header = isBackground
+          ? "from openai import OpenAI\nfrom time import sleep"
+          : "from openai import OpenAI";
+
+        const tail = isBackground
+          ? `while resp.status in {"queued", "in_progress"}:
+    sleep(2)
+    resp = client.responses.retrieve(resp.id)
+
+print(f"Final status: {resp.status}\\nOutput:\\n{resp.output_text}")`
+          : "print(resp.output_text)";
+
+        return `${header}
+
+client = OpenAI(
+    api_key="${keyValue}",
+    base_url="${baseUrl}",
+)
+
+resp = client.responses.create(
+${createArgs.join("\n")}
+)
+
+${tail}`;
       }
 
       if (lang === "javascript") {
-        const lines: string[] = [
-          "import OpenAI from 'openai';",
-          "",
-          `const client = new OpenAI({ apiKey: '${keyValue}', baseURL: '${baseUrl}' });`,
-          "",
-          "let resp = await client.responses.create({",
-          `  model: '${body.model}',`,
-        ];
-        if (instructions) lines.push(`  instructions: ${JSON.stringify(instructions)},`);
-        lines.push(`  input: ${JSON.stringify(input)},`);
-        lines.push(`  service_tier: '${body.service_tier}',`);
-        if (isBackground) lines.push("  background: true,");
-        lines.push("});");
-        if (isBackground) {
-          lines.push("");
-          lines.push("while (['queued', 'in_progress'].includes(resp.status)) {");
-          lines.push("  await new Promise((r) => setTimeout(r, 2000));");
-          lines.push("  resp = await client.responses.retrieve(resp.id);");
-          lines.push("}");
-          lines.push("");
-          lines.push("console.log(`Final status: ${resp.status}\\nOutput:\\n${resp.output_text}`);");
-        } else {
-          lines.push("");
-          lines.push("console.log(resp.output_text);");
+        const createArgs = [`    model: '${modelValue}',`];
+        if (instructions) {
+          createArgs.push(
+            `    instructions: ${JSON.stringify(instructions)},`,
+          );
         }
-        return lines.join("\n");
+        createArgs.push(`    input: ${JSON.stringify(inputValue)},`);
+        createArgs.push(`    service_tier: '${tierValue}',`);
+        if (isBackground) createArgs.push("    background: true,");
+
+        const tail = isBackground
+          ? `while (['queued', 'in_progress'].includes(resp.status)) {
+    await new Promise((r) => setTimeout(r, 2000));
+    resp = await client.responses.retrieve(resp.id);
+}
+
+console.log(\`Final status: \${resp.status}\\nOutput:\\n\${resp.output_text}\`);`
+          : "console.log(resp.output_text);";
+
+        return `import OpenAI from 'openai';
+
+const client = new OpenAI({
+    apiKey: '${keyValue}',
+    baseURL: '${baseUrl}',
+});
+
+let resp = await client.responses.create({
+${createArgs.join("\n")}
+});
+
+${tail}`;
       }
 
-      // curl — use a heredoc with a single-quoted delimiter so prompts
-      // containing apostrophes (or any other shell metacharacter) don't
-      // break the command when copy-pasted into a terminal.
-      const bodyJson = JSON.stringify(body, null, 2);
-      const submit = `# Submit a response${isBackground ? " (returns 202 + response id)" : ""}\ncurl ${baseUrl}/responses \\\n  -H "Authorization: Bearer ${keyValue}" \\\n  -H "Content-Type: application/json" \\\n  --data-binary @- <<'EOF'\n${bodyJson}\nEOF`;
+      // curl
+      const bodyLines = [`    "model": "${modelValue}"`];
+      if (instructions) {
+        bodyLines.push(`    "instructions": ${JSON.stringify(instructions)}`);
+      }
+      bodyLines.push(`    "input": ${JSON.stringify(inputValue)}`);
+      bodyLines.push(`    "service_tier": "${tierValue}"`);
+      if (isBackground) bodyLines.push(`    "background": true`);
+
+      const submit = `# Submit a response${isBackground ? " — capture the id from the response body" : ""}
+curl ${baseUrl}/responses \\
+  -H "Authorization: Bearer ${keyValue}" \\
+  -H "Content-Type: application/json" \\
+  -d '{
+${bodyLines.join(",\n")}
+  }'`;
+
       if (!isBackground) return submit;
-      return `${submit}\n\n# Poll until terminal (replace YOUR_RESP_ID with the id returned above)\ncurl ${baseUrl}/responses/YOUR_RESP_ID \\\n  -H "Authorization: Bearer ${keyValue}"`;
+      return `${submit}
+
+# Poll until terminal (replace YOUR_RESP_ID with the id returned above)
+curl ${baseUrl}/responses/YOUR_RESP_ID \\
+  -H "Authorization: Bearer ${keyValue}"`;
     },
     [apiKey, getBaseUrl, buildResponseBody],
   );
@@ -241,10 +278,6 @@ export function CreateAsyncModal({
   const handleSubmit = async () => {
     setError(null);
 
-    if (!apiKey) {
-      setError("Enter an API key before submitting");
-      return;
-    }
     if (!model) {
       setError("Please select a model");
       return;
@@ -256,16 +289,14 @@ export function CreateAsyncModal({
 
     setIsSubmitting(true);
     try {
-      // Call the Open Responses API the same way the snippet shows, but via
-      // the dashboard's same-origin /ai/v1 path so the browser doesn't block
-      // it on CORS. The backend responses middleware turns this into a
-      // tracked async/realtime request that surfaces on the Responses page.
+      // Submit through the admin/ai proxy. The backend middleware reads the
+      // session cookie, looks up (or mints) a hidden playground API key for
+      // the user, and rewrites the path to /ai/v1/responses before passing
+      // through onwards and the responses middleware. The browser never
+      // needs to know about the API key.
       const res = await fetch(submitUrl, {
         method: "POST",
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          "Content-Type": "application/json",
-        },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify(buildResponseBody()),
       });
 
@@ -273,7 +304,7 @@ export function CreateAsyncModal({
         const text = await res.text().catch(() => "");
         if (res.status === 401 || res.status === 403) {
           throw new Error(
-            "API key was rejected — try minting a new one with the button above",
+            "Your session was rejected — try signing in again and retrying",
           );
         }
         throw new Error(
@@ -306,8 +337,8 @@ export function CreateAsyncModal({
     setUserPrompt("");
     setError(null);
     setActiveTab("compose");
-    // apiKey intentionally persists across resets so users don't have to
-    // re-mint a key for every response they submit in the same session.
+    // apiKey intentionally persists across resets so users who minted a key
+    // for the snippet don't lose it after creating a response.
   };
 
   const handleClose = () => {
@@ -316,10 +347,7 @@ export function CreateAsyncModal({
   };
 
   const canSubmit =
-    Boolean(apiKey) &&
-    Boolean(model) &&
-    userPrompt.trim().length > 0 &&
-    !isSubmitting;
+    Boolean(model) && userPrompt.trim().length > 0 && !isSubmitting;
 
   const renderApiKeyPopover = (trigger: React.ReactNode) => (
     <Popover open={showCreateForm} onOpenChange={setShowCreateForm}>
@@ -329,7 +357,8 @@ export function CreateAsyncModal({
           <div className="space-y-1">
             <h4 className="font-medium leading-none">Create API Key</h4>
             <p className="text-sm text-muted-foreground">
-              Used to authenticate this and future response submissions
+              Filled into the code snippet so you can paste a working call
+              into your own apps. Not required to submit from here.
             </p>
           </div>
           <div className="space-y-2">
@@ -392,44 +421,6 @@ export function CreateAsyncModal({
             Submit a single request to the Open Responses API
           </DialogDescription>
         </DialogHeader>
-
-        {/* Shared API key bar — both the Compose submit and the Snippet tab
-            use the same key, so a single source of truth at the top is
-            clearer than duplicating the affordance. */}
-        <div className="flex items-center justify-between gap-3 rounded-md border bg-muted/30 px-3 py-2">
-          <div className="flex items-center gap-2 min-w-0">
-            <KeyRound className="h-4 w-4 text-muted-foreground flex-shrink-0" />
-            <span className="text-sm font-medium text-doubleword-neutral-700">
-              API key
-            </span>
-            <span className="text-sm font-mono text-muted-foreground truncate">
-              {apiKey
-                ? `${apiKey.slice(0, 6)}…${apiKey.slice(-4)}`
-                : "not set"}
-            </span>
-          </div>
-          <div className="flex items-center gap-1">
-            {apiKey && (
-              <button
-                type="button"
-                onClick={() => handleCopy(apiKey, "api-key")}
-                className="flex items-center gap-1 px-2 py-1 text-xs text-green-600 hover:text-green-700 hover:bg-green-50 rounded transition-colors"
-              >
-                <Copy className="w-3 h-3" />
-                {copiedCode === "api-key" ? "Copied!" : "Copy"}
-              </button>
-            )}
-            {renderApiKeyPopover(
-              <button
-                type="button"
-                className="flex items-center gap-1 px-2 py-1 text-xs text-gray-500 hover:text-gray-700 hover:bg-gray-100 rounded transition-colors"
-              >
-                <Plus className="w-3 h-3" />
-                {apiKey ? "Replace" : "Fill API key"}
-              </button>,
-            )}
-          </div>
-        </div>
 
         <Tabs
           value={activeTab}
@@ -502,6 +493,60 @@ export function CreateAsyncModal({
           </TabsContent>
 
           <TabsContent value="snippet" className="space-y-3 mt-4">
+            {/* Model picker mirrored from Compose — without it the snippet
+                shows whatever model was last selected with no way to swap
+                without flipping tabs. */}
+            <div className="space-y-2">
+              <Label>Model</Label>
+              <Combobox
+                options={modelOptions}
+                value={model}
+                onValueChange={setModel}
+                placeholder="Select a model..."
+                searchPlaceholder="Search models..."
+                emptyMessage="No models found."
+                className="w-full"
+              />
+            </div>
+
+            {/* API key bar lives in the snippet tab because that's its only
+                purpose — submissions from this modal use the dashboard
+                session, so no key is needed to hit Create. */}
+            <div className="flex items-center justify-between gap-3 rounded-md border bg-muted/30 px-3 py-2">
+              <div className="flex items-center gap-2 min-w-0">
+                <KeyRound className="h-4 w-4 text-muted-foreground flex-shrink-0" />
+                <span className="text-sm font-medium text-doubleword-neutral-700">
+                  API key
+                </span>
+                <span className="text-sm font-mono text-muted-foreground truncate">
+                  {apiKey
+                    ? `${apiKey.slice(0, 6)}…${apiKey.slice(-4)}`
+                    : "not set"}
+                </span>
+              </div>
+              <div className="flex items-center gap-1">
+                {apiKey && (
+                  <button
+                    type="button"
+                    onClick={() => handleCopy(apiKey, "api-key")}
+                    className="flex items-center gap-1 px-2 py-1 text-xs text-green-600 hover:text-green-700 hover:bg-green-50 rounded transition-colors"
+                  >
+                    <Copy className="w-3 h-3" />
+                    {copiedCode === "api-key" ? "Copied!" : "Copy"}
+                  </button>
+                )}
+                {renderApiKeyPopover(
+                  <button
+                    type="button"
+                    className="flex items-center gap-1 px-2 py-1 text-xs text-gray-500 hover:text-gray-700 hover:bg-gray-100 rounded transition-colors"
+                  >
+                    <Plus className="w-3 h-3" />
+                    {apiKey ? "Replace" : "Fill API key"}
+                  </button>,
+                )}
+              </div>
+            </div>
+
             <div className="bg-white border border-gray-200 rounded-lg overflow-hidden">
               <div className="bg-gray-50 px-4 py-2 border-b border-gray-200 flex items-center justify-between">
                 <div className="flex items-center gap-2">
