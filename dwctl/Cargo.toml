@@ -79,10 +79,7 @@ jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 argon2 = "0.5"
 base64 = "0.22"
 bytes = "1.5"
-# Tracking the in-flight `feat/multi-step-feature-flag` branch until
-# onwards publishes a release with the `multi-step` feature. Once
-# published, switch to `{ version = "0.28", features = ["multi-step"] }`.
-onwards = { git = "https://github.com/doublewordai/onwards", branch = "feat/multi-step-feature-flag", features = ["multi-step"] }
+onwards = { version = "0.28", features = ["multi-step"] }
 thiserror = "2.0.14"
 axum-prometheus = "0.10"
 # Metrics facade and exporter (same versions as axum-prometheus uses)
