@@ -1,5 +1,17 @@
 # Changelog
 
+## [8.50.0](https://github.com/doublewordai/control-layer/compare/v8.49.1...v8.50.0) (2026-05-15)
+
+
+### Features
+
+* Remove virtual batches ([#1065](https://github.com/doublewordai/control-layer/issues/1065)) ([3a30d90](https://github.com/doublewordai/control-layer/commit/3a30d90daa0b9363770a45691a96e80fd8141afc))
+
+
+### Bug Fixes
+
+* Bump fusillade to speedup batch page query ([#1077](https://github.com/doublewordai/control-layer/issues/1077)) ([970f7c2](https://github.com/doublewordai/control-layer/commit/970f7c28fb13ed8de41594128af53a4859f6221d))
+
 ## [8.49.1](https://github.com/doublewordai/control-layer/compare/v8.49.0...v8.49.1) (2026-05-14)
 
 

@@ -157,6 +157,29 @@ where
             return self.default.process(request, http, storage, should_retry, cancellation).await;
         }
 
+        // Tool-free /v1/responses doesn't need the multi-step loop —
+        // there are no tool_calls to dispatch. Delegate to the default
+        // processor: it fires a single HTTP call to the row's
+        // {endpoint}/v1/responses (the dwctl loopback) and onwards
+        // handles the /v1/responses → /v1/chat/completions rewrite
+        // natively. Result: one tracking row, no record_step,
+        // no response_steps, no finalize_head_request.
+        //
+        // `has_tools` is parsed from the row's body — which the
+        // middleware already populated with any server-side-resolved
+        // tools before persisting. A failed parse falls through to
+        // the loop path defensively (a malformed body will fail
+        // there too, but with the existing error surfaces).
+        let has_tools = serde_json::from_str::<serde_json::Value>(&request.data.body)
+            .ok()
+            .as_ref()
+            .and_then(|v| v.get("tools"))
+            .and_then(|v| v.as_array())
+            .is_some_and(|a| !a.is_empty());
+        if !has_tools {
+            return self.default.process(request, http, storage, should_retry, cancellation).await;
+        }
+
         // Plug the multi-step loop into fusillade's HttpClient seam. The
         // rest of the flow (state transition, abort, retry, persistence)
         // is identical to DefaultRequestProcessor — see this module's

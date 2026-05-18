@@ -2130,8 +2130,6 @@ const asyncRequestsApi = {
     const params = new URLSearchParams();
     if (options?.skip) params.set("skip", options.skip.toString());
     if (options?.limit) params.set("limit", options.limit.toString());
-    if (options?.completion_window)
-      params.set("completion_window", options.completion_window);
     if (options?.service_tiers)
       params.set("service_tiers", options.service_tiers);
     if (options?.status) params.set("status", options.status);

@@ -1,8 +1,12 @@
-//! Batch request handlers
+//! Response (batchless fusillade request) handlers.
 //!
-//! Endpoints for listing individual requests across fusillade batches.
-//! Uses fusillade's Storage trait for request queries, enriches with
-//! http_analytics data (tokens, cost) from the dwctl database.
+//! Lists and fetches individual responses — fusillade rows with
+//! `batch_id IS NULL` and `created_by IS NOT NULL`. Despite the legacy
+//! `/admin/api/v1/batches/requests` route, these endpoints are
+//! batchless-only: `list_requests` filters batched rows out at the SQL
+//! layer, and `get_batch_request` rejects batched IDs with 404. Combines
+//! fusillade data with `http_analytics` enrichment (tokens, cost) and
+//! creator emails from the users table.
 
 use axum::{
     extract::{Path, Query, State},
@@ -15,7 +19,7 @@ use uuid::Uuid;
 use crate::{
     AppState,
     api::models::{
-        batch_requests::{BatchRequestDetail, BatchRequestSummary, ListBatchRequestsQuery},
+        batch_requests::{ListBatchRequestsQuery, ResponseDetail, ResponseSummary},
         pagination::PaginatedResponse,
         users::CurrentUser,
     },
@@ -38,16 +42,17 @@ fn is_batch_owner(current_user: &CurrentUser, created_by: &str) -> bool {
     false
 }
 
-/// List individual batch requests across all batches
+/// List responses (batchless fusillade requests).
 ///
-/// Uses fusillade for core request listing, then enriches with token/cost
-/// metrics from http_analytics and user emails from the users table.
+/// Returns only rows with `batch_id IS NULL` — fusillade's `list_requests`
+/// filters batched rows at the SQL layer. Enriched with token/cost metrics
+/// from `http_analytics` and creator emails from the users table.
 #[utoipa::path(
     get,
     path = "/admin/api/v1/batches/requests",
     params(ListBatchRequestsQuery),
     responses(
-        (status = 200, description = "Paginated list of batch requests", body = PaginatedResponse<BatchRequestSummary>),
+        (status = 200, description = "Paginated list of responses", body = PaginatedResponse<ResponseSummary>),
         (status = 403, description = "Insufficient permissions"),
         (status = 500, description = "Internal server error"),
     ),
@@ -59,7 +64,7 @@ pub async fn list_batch_requests<P: PoolProvider>(
     Query(query): Query<ListBatchRequestsQuery>,
     current_user: CurrentUser,
     _: RequiresPermission<resource::Batches, operation::ReadOwn>,
-) -> Result<Json<PaginatedResponse<BatchRequestSummary>>> {
+) -> Result<Json<PaginatedResponse<ResponseSummary>>> {
     let skip = query.pagination.skip();
     let limit = query.pagination.limit();
     let can_read_all = can_read_all_resources(&current_user, Resource::Batches);
@@ -97,7 +102,6 @@ pub async fn list_batch_requests<P: PoolProvider>(
         .request_manager
         .list_requests(fusillade::ListRequestsFilter {
             created_by: created_by_filter,
-            completion_window: query.completion_window.clone(),
             status: query.status.clone(),
             models,
             created_after: query.created_after,
@@ -112,7 +116,7 @@ pub async fn list_batch_requests<P: PoolProvider>(
         })
         .await
         .map_err(|e| Error::Internal {
-            operation: format!("list batch requests: {}", e),
+            operation: format!("list responses: {}", e),
         })?;
 
     // Enrich with http_analytics data (tokens, cost) and user emails
@@ -147,7 +151,7 @@ pub async fn list_batch_requests<P: PoolProvider>(
     let unique_creator_ids: Vec<String> = result
         .data
         .iter()
-        .filter_map(|r| r.batch_created_by.as_ref().cloned())
+        .map(|r| r.created_by.clone())
         .collect::<std::collections::HashSet<_>>()
         .into_iter()
         .collect();
@@ -158,7 +162,7 @@ pub async fn list_batch_requests<P: PoolProvider>(
             .fetch_all(state.db.write())
             .await
             .unwrap_or_else(|e| {
-                tracing::warn!(error = %e, "failed to fetch creator emails for batch requests");
+                tracing::warn!(error = %e, "failed to fetch creator emails for responses");
                 vec![]
             })
     } else {
@@ -168,13 +172,13 @@ pub async fn list_batch_requests<P: PoolProvider>(
     let email_map: std::collections::HashMap<String, String> = emails.into_iter().map(|e| (e.user_id, e.email)).collect();
 
     // Combine fusillade data with analytics enrichment
-    let data: Vec<BatchRequestSummary> = result
+    let data: Vec<ResponseSummary> = result
         .data
         .into_iter()
         .map(|r| {
             let a = analytics_map.get(&r.id);
-            let email: Option<String> = r.batch_created_by.as_ref().and_then(|id| email_map.get(id)).cloned();
-            BatchRequestSummary {
+            let email: Option<String> = email_map.get(&r.created_by).cloned();
+            ResponseSummary {
                 id: r.id,
                 batch_id: r.batch_id,
                 model: r.model,
@@ -198,9 +202,10 @@ pub async fn list_batch_requests<P: PoolProvider>(
     Ok(Json(PaginatedResponse::new(data, result.total_count, skip, limit)))
 }
 
-/// Get individual batch request detail
+/// Get a response (batchless fusillade request) by ID.
 ///
-/// Uses fusillade for core request detail, enriches with analytics.
+/// Batched-row IDs return 404 — this endpoint is the detail view for
+/// `list_batch_requests`, which is batchless-only.
 #[utoipa::path(
     get,
     path = "/admin/api/v1/batches/requests/{request_id}",
@@ -208,8 +213,8 @@ pub async fn list_batch_requests<P: PoolProvider>(
         ("request_id" = Uuid, Path, description = "The request ID"),
     ),
     responses(
-        (status = 200, description = "Batch request detail", body = BatchRequestDetail),
-        (status = 404, description = "Request not found"),
+        (status = 200, description = "Response detail", body = ResponseDetail),
+        (status = 404, description = "Response not found"),
         (status = 403, description = "Insufficient permissions"),
         (status = 500, description = "Internal server error"),
     ),
@@ -221,7 +226,7 @@ pub async fn get_batch_request<P: PoolProvider>(
     Path(request_id): Path<Uuid>,
     current_user: CurrentUser,
     _: RequiresPermission<resource::Batches, operation::ReadOwn>,
-) -> Result<Json<BatchRequestDetail>> {
+) -> Result<Json<ResponseDetail>> {
     // Get core request detail from fusillade
     let detail = state
         .request_manager
@@ -229,28 +234,29 @@ pub async fn get_batch_request<P: PoolProvider>(
         .await
         .map_err(|e| match e {
             fusillade::FusilladeError::RequestNotFound(_) => Error::NotFound {
-                resource: "BatchRequest".to_string(),
+                resource: "Response".to_string(),
                 id: request_id.to_string(),
             },
             other => {
-                tracing::error!(request_id = %request_id, error = %other, "failed to fetch batch request detail");
+                tracing::error!(request_id = %request_id, error = %other, "failed to fetch response detail");
                 Error::Internal {
-                    operation: format!("get batch request detail: {}", other),
+                    operation: format!("get response detail: {}", other),
                 }
             }
         })?;
 
     // Check ownership — fetch-then-check pattern matches get_batch handler.
-    // The response is discarded on failure (returns 404, no data leakage).
+    // 404 (not 403) avoids leaking existence of other users' responses.
+    // `detail.created_by` is guaranteed non-empty:
+    //   1. `get_request_detail` filters `WHERE r.created_by IS NOT NULL`, so
+    //      batched rows return `RequestNotFound`.
+    //   2. `create_realtime` / `create_flex` coerce empty-string inputs to
+    //      NULL, which the XOR CHECK constraint rejects at insert time.
+    // So if the row is returned, its `created_by` came from a non-empty input.
     let can_read_all = can_read_all_resources(&current_user, Resource::Batches);
-    if !can_read_all
-        && !detail
-            .batch_created_by
-            .as_deref()
-            .is_some_and(|cb| is_batch_owner(&current_user, cb))
-    {
+    if !can_read_all && !is_batch_owner(&current_user, &detail.created_by) {
         return Err(Error::NotFound {
-            resource: "BatchRequest".to_string(),
+            resource: "Response".to_string(),
             id: request_id.to_string(),
         });
     }
@@ -277,16 +283,14 @@ pub async fn get_batch_request<P: PoolProvider>(
 
     // Look up the creator's email via UUID primary-key lookup (org IDs and unparseable
     // values return None without a query). Uses the primary pool to avoid replica lag
-    // right after batch creation.
-    let created_by_email = if let Some(ref batch_created_by) = detail.batch_created_by
-        && let Ok(created_by_uuid) = Uuid::parse_str(batch_created_by)
-    {
+    // right after response creation.
+    let created_by_email = if let Ok(created_by_uuid) = Uuid::parse_str(&detail.created_by) {
         sqlx::query_as::<_, EmailRow>("SELECT id::text as user_id, email FROM users WHERE id = $1")
             .bind(created_by_uuid)
             .fetch_optional(state.db.write())
             .await
             .unwrap_or_else(|e| {
-                tracing::warn!(error = %e, "failed to fetch creator email for batch request detail");
+                tracing::warn!(error = %e, "failed to fetch creator email for response detail");
                 None
             })
             .map(|row| row.email)
@@ -294,7 +298,7 @@ pub async fn get_batch_request<P: PoolProvider>(
         None
     };
 
-    Ok(Json(BatchRequestDetail {
+    Ok(Json(ResponseDetail {
         id: detail.id,
         batch_id: detail.batch_id,
         model: detail.model,
@@ -313,8 +317,7 @@ pub async fn get_batch_request<P: PoolProvider>(
         body: detail.body.unwrap_or_default(),
         response_body: detail.response_body,
         error: detail.error,
-        completion_window: detail.completion_window,
-        batch_created_by: detail.batch_created_by,
+        created_by: detail.created_by,
         created_by_email,
     }))
 }
@@ -534,48 +537,28 @@ mod tests {
         let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
         let auth = add_auth_headers(&user);
 
-        // Insert a fusillade batch + request owned by the test user directly, mirroring
-        // the approach used in batches.rs tests.
-        let file_id = uuid::Uuid::new_v4();
-        let batch_id = uuid::Uuid::new_v4();
+        // Insert a batchless fusillade response (template with file_id IS NULL,
+        // request with batch_id IS NULL + created_by set), matching how realtime/
+        // flex responses are stored after the responses-from-batches separation.
         let template_id = uuid::Uuid::new_v4();
         let request_id = uuid::Uuid::new_v4();
         let body = serde_json::json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}]});
 
         sqlx::query(
-            "INSERT INTO fusillade.files (id, name, status, created_at, updated_at) VALUES ($1, 'test.jsonl', 'processed', NOW(), NOW())",
-        )
-        .bind(file_id)
-        .execute(&pool)
-        .await
-        .expect("insert file");
-
-        sqlx::query(
-            "INSERT INTO fusillade.batches (id, created_by, file_id, endpoint, completion_window, expires_at, created_at, total_requests) VALUES ($1, $2, $3, '/v1/chat/completions', '24h', NOW() + interval '24 hours', NOW(), 1)",
-        )
-        .bind(batch_id)
-        .bind(user.id.to_string())
-        .bind(file_id)
-        .execute(&pool)
-        .await
-        .expect("insert batch");
-
-        sqlx::query(
-            "INSERT INTO fusillade.request_templates (id, file_id, model, api_key, endpoint, path, body, custom_id, method) VALUES ($1, $2, 'test-model', 'test-key', 'http://test', '/v1/chat/completions', $3, 'req-0', 'POST')",
+            "INSERT INTO fusillade.request_templates (id, file_id, model, api_key, endpoint, path, body, custom_id, method) VALUES ($1, NULL, 'test-model', 'test-key', 'http://test', '/v1/chat/completions', $2, NULL, 'POST')",
         )
         .bind(template_id)
-        .bind(file_id)
         .bind(serde_json::to_string(&body).unwrap())
         .execute(&pool)
         .await
         .expect("insert template");
 
         sqlx::query(
-            "INSERT INTO fusillade.requests (id, batch_id, template_id, model, state, created_at) VALUES ($1, $2, $3, 'test-model', 'pending', NOW())",
+            "INSERT INTO fusillade.requests (id, batch_id, template_id, model, state, created_at, created_by) VALUES ($1, NULL, $2, 'test-model', 'pending', NOW(), $3)",
         )
         .bind(request_id)
-        .bind(batch_id)
         .bind(template_id)
+        .bind(user.id.to_string())
         .execute(&pool)
         .await
         .expect("insert request");

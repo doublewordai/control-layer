@@ -166,21 +166,34 @@ pub async fn responses_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     };
     let is_flex = matches!(service_tier, ServiceTier::Flex);
 
-    // Multi-step warm-path dispatch. Engages for `/v1/responses`
-    // realtime requests (priority / default / auto) so tool calls
-    // actually dispatch — single-step onwards proxying would forward
-    // server-side tools to the upstream model but never run them.
+    // The warm path / multi-step loop only earns its keep when the
+    // request actually has tools to dispatch. Tool-free `/v1/responses`
+    // can be served by onwards' native single-step proxying (which
+    // rewrites /v1/responses → /v1/chat/completions on the wire and
+    // back), producing one tracking row via the standard outlet path
+    // instead of going through `record_step` / `response_steps` /
+    // `finalize_head_request`. We compute `has_tools` after tool
+    // injection so server-side-resolved tools also count.
+    let has_tools = request_value.get("tools").and_then(|v| v.as_array()).is_some_and(|a| !a.is_empty());
+
+    // Multi-step warm-path dispatch. Engages for tool-using
+    // `/v1/responses` realtime requests (priority / default / auto) so
+    // tool calls actually dispatch — single-step onwards proxying
+    // would forward server-side tools to the upstream model but never
+    // run them. Tool-free requests don't need this and fall through to
+    // `handle_realtime` like chat-completions.
     // Flex requests skip the warm path entirely so they can reach
     // `handle_flex` and be queued for the daemon (1h SLA, batch
     // pricing). The daemon's `DwctlRequestProcessor` runs the same
-    // multi-step loop async.
+    // multi-step loop async when tools are present.
     //
-    //   stream=true,  background=false, !flex → SSE response, loop runs inline
-    //   stream=false, background=false, !flex → JSON response, loop runs inline
-    //   stream=*,     background=true,  !flex → 202 + spawned loop, GET /v1/responses/{id} polls
-    //   any flex                                → falls through to handle_flex below
+    //   stream=true,  background=false, !flex, tools → SSE response, loop runs inline
+    //   stream=false, background=false, !flex, tools → JSON response, loop runs inline
+    //   stream=*,     background=true,  !flex, tools → 202 + spawned loop, GET /v1/responses/{id} polls
+    //   no tools, !flex                              → falls through to handle_realtime below
+    //   any flex                                     → falls through to handle_flex below
     let stream_requested = is_responses_api && !background && request_value["stream"].as_bool().unwrap_or(false);
-    match warm_path_branch(is_responses_api, is_flex, background, stream_requested) {
+    match warm_path_branch(is_responses_api, is_flex, background, stream_requested, has_tools) {
         WarmPathBranch::Stream => {
             if let Some(resp) = try_warm_path_stream(&state, &request_value, api_key.as_deref(), model).await {
                 return resp;
@@ -207,18 +220,11 @@ pub async fn responses_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
         "Routing inference request"
     );
 
-    // Generate the request and batch IDs upfront — known before any DB calls
-    // or proxying. The batch_id is set as `x-fusillade-batch-id` on the
-    // proxied request so analytics_handler can associate the http_analytics
-    // row with this batch (otherwise total_cost / token aggregates in the
-    // Batches view come back empty for realtime tracking rows).
+    // Generate the request ID upfront — known before any DB calls or
+    // proxying. Used as `x-fusillade-request-id` on the proxied request so
+    // the outlet handler can locate the row to update.
     let request_id = uuid::Uuid::new_v4();
-    let batch_id = uuid::Uuid::new_v4();
     let resp_id = format!("resp_{request_id}");
-    let completion_window = match service_tier {
-        ServiceTier::Flex => "1h",
-        ServiceTier::Realtime => "0s",
-    };
 
     // Validate API key for flex requests (realtime is validated by onwards).
     // Flex requests bypass onwards entirely — the daemon processes them later —
@@ -257,29 +263,38 @@ pub async fn responses_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
         None
     };
 
-    // Build the batch input (shared by both tiers).
-    let initial_state = match service_tier {
-        ServiceTier::Realtime => "processing", // Daemon won't claim; outlet handler completes
-        ServiceTier::Flex => "pending",        // Daemon claims and processes
-    };
-
-    let batch_input = fusillade::CreateSingleRequestBatchInput {
-        batch_id: Some(batch_id),
-        request_id,
-        body: request_value.to_string(),
-        model: model.to_string(),
-        base_url: state.loopback_base_url.clone(),
-        endpoint: endpoint.clone(),
-        completion_window: completion_window.to_string(),
-        initial_state: initial_state.to_string(),
-        api_key: api_key.clone(),
-        created_by,
-    };
-
     match service_tier {
-        ServiceTier::Realtime => handle_realtime(&state, batch_input, batch_id, &resp_id, model, background, parts, body_bytes, next).await,
-        ServiceTier::Flex if is_chat_completions_api => handle_chat_completion_flex(&state, batch_input, request_id).await,
-        ServiceTier::Flex => handle_flex(&state, batch_input, &resp_id, model, background).await,
+        ServiceTier::Realtime => {
+            let realtime_input = fusillade::CreateRealtimeInput {
+                request_id,
+                body: request_value.to_string(),
+                model: model.to_string(),
+                endpoint: state.loopback_base_url.clone(),
+                method: "POST".to_string(),
+                path: endpoint.clone(),
+                api_key: api_key.clone().unwrap_or_default(),
+                created_by: created_by.unwrap_or_default(),
+            };
+            handle_realtime(&state, realtime_input, &resp_id, model, background, parts, body_bytes, next).await
+        }
+        ServiceTier::Flex => {
+            let flex_input = fusillade::CreateFlexInput {
+                request_id,
+                body: request_value.to_string(),
+                model: model.to_string(),
+                endpoint: state.loopback_base_url.clone(),
+                method: "POST".to_string(),
+                path: endpoint.clone(),
+                api_key: api_key.clone().unwrap_or_default(),
+                created_by: created_by.unwrap_or_default(),
+            };
+
+            if is_chat_completions_api {
+                handle_chat_completion_flex(&state, flex_input, request_id).await
+            } else {
+                handle_flex(&state, flex_input, &resp_id, model, background).await
+            }
+        }
     }
 }
 
@@ -335,7 +350,7 @@ enum WarmPathBranch {
     FallThrough,
 }
 
-fn warm_path_branch(is_responses_api: bool, is_flex: bool, background: bool, stream_requested: bool) -> WarmPathBranch {
+fn warm_path_branch(is_responses_api: bool, is_flex: bool, background: bool, stream_requested: bool, has_tools: bool) -> WarmPathBranch {
     // Flex must reach `handle_flex` to land in fusillade-pending
     // state for the daemon. Engaging warm-path for flex would defeat
     // the tier (the loop runs inline, billed as realtime).
@@ -345,6 +360,13 @@ fn warm_path_branch(is_responses_api: bool, is_flex: bool, background: bool, str
     // Warm path is /v1/responses-only — chat completions and
     // embeddings stay on the single-step proxy path.
     if !is_responses_api {
+        return WarmPathBranch::FallThrough;
+    }
+    // Tool-free /v1/responses doesn't need the multi-step loop —
+    // there are no tool_calls to dispatch. Fall through so onwards'
+    // single-step /v1/responses → /v1/chat/completions proxy handles
+    // it, producing one tracking row via the standard outlet path.
+    if !has_tools {
         return WarmPathBranch::FallThrough;
     }
     if stream_requested {
@@ -358,15 +380,14 @@ fn warm_path_branch(is_responses_api: bool, is_flex: bool, background: bool, str
 
 /// Handle a realtime request (priority/default/auto).
 ///
-/// For `background=true`: creates the batch row synchronously (so the client
+/// For `background=true`: creates the request row synchronously (so the client
 /// can immediately poll by ID), then spawns the proxy in the background.
-/// For `background=false`: fires off batch creation in the background and
+/// For `background=false`: fires off row creation in the background and
 /// proxies immediately — the outlet handler completes the row.
 #[allow(clippy::too_many_arguments)]
 async fn handle_realtime<P: PoolProvider + Clone + Send + Sync + 'static>(
     state: &ResponsesMiddlewareState<P>,
-    batch_input: fusillade::CreateSingleRequestBatchInput,
-    batch_id: uuid::Uuid,
+    realtime_input: fusillade::CreateRealtimeInput,
     resp_id: &str,
     model: &str,
     background: bool,
@@ -376,31 +397,25 @@ async fn handle_realtime<P: PoolProvider + Clone + Send + Sync + 'static>(
 ) -> Response {
     let rm = state.request_manager.clone();
 
-    // batch_id is passed in explicitly (rather than re-extracted from
-    // batch_input) so the type system enforces its presence — fusillade's
-    // `batch_id` field is `Option<Uuid>` to keep its API friendly for callers
-    // that don't need a pre-generated id, but here we always have one.
-    let endpoint_for_header = batch_input.endpoint.clone();
+    let endpoint_for_header = realtime_input.path.clone();
 
     if background {
-        // Background mode: create batch synchronously so the row exists
-        // before we return the 202 (client will poll immediately).
-        // created_by was resolved upfront by the caller.
-        if let Err(e) = fusillade::Storage::create_single_request_batch(&*rm, batch_input).await {
-            tracing::warn!(error = %e, "Failed to create realtime tracking batch");
+        // Background mode: create row synchronously so it exists before
+        // we return the 202 (client will poll immediately).
+        if let Err(e) = fusillade::Storage::create_realtime(&*rm, realtime_input).await {
+            tracing::warn!(error = %e, "Failed to create realtime tracking row");
         }
     } else {
         // Blocking mode: enqueue the create-response underway job so a crash
         // between proxying and the DB insert still leaves a retryable record.
-        // The job resolves attribution and calls create_single_request_batch.
+        // The job resolves attribution and calls create_realtime.
         let job_input = CreateResponseInput {
-            batch_id,
-            request_id: batch_input.request_id,
-            body: batch_input.body,
-            model: batch_input.model,
-            base_url: batch_input.base_url,
-            endpoint: batch_input.endpoint,
-            api_key: batch_input.api_key,
+            request_id: realtime_input.request_id,
+            body: realtime_input.body,
+            model: realtime_input.model,
+            base_url: realtime_input.endpoint,
+            endpoint: realtime_input.path,
+            api_key: Some(realtime_input.api_key).filter(|s| !s.is_empty()),
         };
         tracing::debug!(
             request_id = %job_input.request_id,
@@ -420,13 +435,6 @@ async fn handle_realtime<P: PoolProvider + Clone + Send + Sync + 'static>(
     let mut req = Request::from_parts(parts, Body::from(body_bytes));
     req.headers_mut()
         .insert("x-fusillade-request-id", raw_id.parse().expect("response_id is valid header value"));
-    // x-fusillade-batch-id wires this realtime tracking row up to its
-    // http_analytics row so total_cost / token aggregates show up in the
-    // Batches view (analytics_handler reads this header).
-    req.headers_mut().insert(
-        "x-fusillade-batch-id",
-        batch_id.to_string().parse().expect("batch_id is valid header value"),
-    );
     req.headers_mut().insert(
         ONWARDS_RESPONSE_ID_HEADER,
         resp_id.parse().expect("response_id is valid header value"),
@@ -462,21 +470,21 @@ async fn handle_realtime<P: PoolProvider + Clone + Send + Sync + 'static>(
     }
 }
 
-/// Handle a flex request by creating a batch in fusillade.
+/// Handle a flex request by creating a pending request row in fusillade.
 ///
 /// The fusillade daemon picks up the pending request and processes it.
 /// With `background=false`, holds the connection and polls until complete.
 /// With `background=true`, returns 202 immediately.
 async fn handle_flex<P: PoolProvider + Clone + Send + Sync + 'static>(
     state: &ResponsesMiddlewareState<P>,
-    batch_input: fusillade::CreateSingleRequestBatchInput,
+    flex_input: fusillade::CreateFlexInput,
     resp_id: &str,
     model: &str,
     background: bool,
 ) -> Response {
-    // Flex needs the batch created synchronously (daemon must find the row).
-    if let Err(e) = fusillade::Storage::create_single_request_batch(&*state.request_manager, batch_input).await {
-        tracing::error!(error = %e, "Failed to create flex batch in fusillade");
+    // Flex needs the row created synchronously (daemon must find it).
+    if let Err(e) = fusillade::Storage::create_flex(&*state.request_manager, flex_input).await {
+        tracing::error!(error = %e, "Failed to create flex row in fusillade");
         return Response::builder()
             .status(StatusCode::INTERNAL_SERVER_ERROR)
             .header("content-type", "application/json")
@@ -549,10 +557,10 @@ async fn handle_flex<P: PoolProvider + Clone + Send + Sync + 'static>(
 /// status surfaced.
 async fn handle_chat_completion_flex<P: PoolProvider + Clone + Send + Sync + 'static>(
     state: &ResponsesMiddlewareState<P>,
-    batch_input: fusillade::CreateSingleRequestBatchInput,
+    flex_input: fusillade::CreateFlexInput,
     request_id: uuid::Uuid,
 ) -> Response {
-    if let Err(e) = fusillade::Storage::create_single_request_batch(&*state.request_manager, batch_input).await {
+    if let Err(e) = fusillade::Storage::create_flex(&*state.request_manager, flex_input).await {
         tracing::error!(error = %e, "Failed to create flex chat-completions batch in fusillade");
         return Response::builder()
             .status(StatusCode::INTERNAL_SERVER_ERROR)
@@ -731,13 +739,17 @@ async fn try_warm_path_background<P: PoolProvider + Clone + Send + Sync + 'stati
 ///
 /// Returns the head-step UUID — the caller surfaces it to the user as
 /// `resp_<id>` and threads its string form into `run_response_loop` as
-/// the loop's `request_id` parameter. Crucially, **no parent
-/// `/v1/responses` fusillade row is created**: the response identity is
-/// purely the head step, and per-step sub-request rows are minted
-/// inside `record_step` for each model_call. This is the key shape
-/// change vs the pre-16.8 bridge — it's what lets the dashboard
-/// listing query show one row per response (the head's sub-request)
-/// with real analytics, instead of a parent row with zero usage.
+/// the loop's `request_id` parameter.
+///
+/// A single `/v1/responses` fusillade row is created up front via
+/// `create_realtime` (state=`processing`, id=`head_step_uuid`). That
+/// row is the response: `record_step`'s head branch reuses it instead
+/// of inserting another, and `finalize_head_request` completes it when
+/// the loop terminates. Descendant model_call steps still mint their
+/// own sub-request rows. The asymmetry with the daemon-driven flex
+/// path (which uses `handle_flex` to create the same shape of row in
+/// `pending` state) is just state at insert: warm path doesn't go
+/// through the daemon's claim cycle.
 async fn warm_path_setup<P: PoolProvider + Clone + Send + Sync + 'static>(
     state: &ResponsesMiddlewareState<P>,
     request_value: &serde_json::Value,
@@ -771,14 +783,49 @@ async fn warm_path_setup<P: PoolProvider + Clone + Send + Sync + 'static>(
     // step would fail with `Tool not found`.
     let resolved_tool_names = resolved.tools.keys().cloned().collect();
 
+    // Allocate the head step UUID up front so the side-channel entry
+    // and the fusillade row share the same id — `record_step`'s head
+    // branch reuses this row instead of creating a separate sub-request.
+    let head_step_uuid = uuid::Uuid::new_v4();
+
     let pending = response_store::PendingResponseInput {
         body: request_value.to_string(),
         api_key: Some(api_key.to_string()),
-        created_by,
+        created_by: created_by.clone(),
         base_url: state.loopback_base_url.clone(),
         resolved_tool_names,
     };
-    let head_step_uuid = state.response_store.register_pending(pending);
+    if let Err(e) = state.response_store.register_pending_with_id(head_step_uuid, pending) {
+        tracing::error!(
+            error = %e,
+            request_id = %head_step_uuid,
+            "warm-path: failed to register pending input — aborting warm path",
+        );
+        return None;
+    }
+
+    // Create the /v1/responses row up front in `processing` state so
+    // it's not claimable by the daemon (warm path owns its lifecycle)
+    // and so `record_step`'s head branch can attach to it via id.
+    let realtime_input = fusillade::CreateRealtimeInput {
+        request_id: head_step_uuid,
+        body: request_value.to_string(),
+        model: model.to_string(),
+        endpoint: state.loopback_base_url.clone(),
+        method: "POST".to_string(),
+        path: "/v1/responses".to_string(),
+        api_key: api_key.to_string(),
+        created_by: created_by.unwrap_or_default(),
+    };
+    if let Err(e) = fusillade::Storage::create_realtime(&*state.request_manager, realtime_input).await {
+        tracing::error!(
+            error = %e,
+            request_id = %head_step_uuid,
+            "warm-path: failed to create /v1/responses tracking row — aborting warm path",
+        );
+        state.response_store.unregister_pending(&head_step_uuid.to_string());
+        return None;
+    }
 
     let upstream = onwards::UpstreamTarget {
         url: format!("{}/v1/chat/completions", state.loopback_base_url),
@@ -867,23 +914,42 @@ mod tests {
         // cost. After the fix, every flex case must fall through.
         for &background in &[false, true] {
             for &stream in &[false, true] {
-                assert_eq!(
-                    warm_path_branch(true, true, background, stream),
-                    WarmPathBranch::FallThrough,
-                    "flex /v1/responses must fall through (background={background}, stream={stream})"
-                );
+                for &has_tools in &[false, true] {
+                    assert_eq!(
+                        warm_path_branch(true, true, background, stream, has_tools),
+                        WarmPathBranch::FallThrough,
+                        "flex /v1/responses must fall through (background={background}, stream={stream}, has_tools={has_tools})"
+                    );
+                }
             }
         }
     }
 
     #[test]
-    fn warm_path_branch_realtime_responses_picks_correct_warm_branch() {
-        // Realtime /v1/responses keeps the existing warm-path
-        // behavior: stream → SSE, background → spawned task, neither
-        // → blocking JSON.
-        assert_eq!(warm_path_branch(true, false, false, true), WarmPathBranch::Stream);
-        assert_eq!(warm_path_branch(true, false, true, false), WarmPathBranch::Background);
-        assert_eq!(warm_path_branch(true, false, false, false), WarmPathBranch::Blocking);
+    fn warm_path_branch_realtime_responses_with_tools_picks_correct_warm_branch() {
+        // Realtime /v1/responses with tools keeps the existing
+        // warm-path behavior: stream → SSE, background → spawned
+        // task, neither → blocking JSON.
+        assert_eq!(warm_path_branch(true, false, false, true, true), WarmPathBranch::Stream);
+        assert_eq!(warm_path_branch(true, false, true, false, true), WarmPathBranch::Background);
+        assert_eq!(warm_path_branch(true, false, false, false, true), WarmPathBranch::Blocking);
+    }
+
+    #[test]
+    fn warm_path_branch_realtime_responses_without_tools_falls_through() {
+        // Without tools the multi-step loop has nothing to dispatch.
+        // Fall through so onwards' single-step /v1/responses proxy
+        // handles it — produces one tracking row via the standard
+        // outlet path instead of record_step / response_steps.
+        for &background in &[false, true] {
+            for &stream in &[false, true] {
+                assert_eq!(
+                    warm_path_branch(true, false, background, stream, false),
+                    WarmPathBranch::FallThrough,
+                    "tool-free realtime /v1/responses must fall through (background={background}, stream={stream})"
+                );
+            }
+        }
     }
 
     #[test]
@@ -891,8 +957,10 @@ mod tests {
         // Warm path is /v1/responses-only. Chat completions and
         // embeddings never engage it regardless of tier — they go
         // through the single-step proxy.
-        assert_eq!(warm_path_branch(false, false, false, false), WarmPathBranch::FallThrough);
-        assert_eq!(warm_path_branch(false, true, false, false), WarmPathBranch::FallThrough);
-        assert_eq!(warm_path_branch(false, false, false, true), WarmPathBranch::FallThrough);
+        for &has_tools in &[false, true] {
+            assert_eq!(warm_path_branch(false, false, false, false, has_tools), WarmPathBranch::FallThrough);
+            assert_eq!(warm_path_branch(false, true, false, false, has_tools), WarmPathBranch::FallThrough);
+            assert_eq!(warm_path_branch(false, false, false, true, has_tools), WarmPathBranch::FallThrough);
+        }
     }
 }

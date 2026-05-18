@@ -5,15 +5,12 @@ use uuid::Uuid;
 
 use super::pagination::Pagination;
 
-/// Query parameters for listing batch requests
+/// Query parameters for listing responses (batchless fusillade requests).
 #[derive(Debug, Default, Deserialize, IntoParams, ToSchema)]
 pub struct ListBatchRequestsQuery {
     #[serde(flatten)]
     #[param(inline)]
     pub pagination: Pagination,
-
-    /// Filter by batch completion window (e.g., "1h", "24h")
-    pub completion_window: Option<String>,
 
     /// Filter by request state (pending, processing, completed, failed, canceled)
     pub status: Option<String>,
@@ -37,10 +34,10 @@ pub struct ListBatchRequestsQuery {
     pub active_first: Option<bool>,
 }
 
-/// Individual batch request summary for list endpoint.
+/// Summary of a response (batchless fusillade request) for list views.
 /// Combines fusillade request data with http_analytics enrichment.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct BatchRequestSummary {
+pub struct ResponseSummary {
     pub id: Uuid,
     pub batch_id: Option<Uuid>,
     pub model: String,
@@ -59,10 +56,10 @@ pub struct BatchRequestSummary {
     pub created_by_email: Option<String>,
 }
 
-/// Full batch request detail including input/output.
+/// Full response detail (batchless fusillade request) including input/output.
 /// Combines fusillade request detail with http_analytics enrichment.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct BatchRequestDetail {
+pub struct ResponseDetail {
     pub id: Uuid,
     pub batch_id: Option<Uuid>,
     pub model: String,
@@ -81,7 +78,11 @@ pub struct BatchRequestDetail {
     pub body: String,
     pub response_body: Option<String>,
     pub error: Option<String>,
-    pub completion_window: Option<String>,
-    pub batch_created_by: Option<String>,
+    /// Creator ID (user or org). Always non-empty: fusillade's
+    /// `create_realtime` / `create_flex` coerce empty-string inputs to NULL,
+    /// and the schema's `requests_attribution_xor` CHECK rejects NULL
+    /// `created_by` for batchless rows. So a row reaching this struct came
+    /// from a real attributed input.
+    pub created_by: String,
     pub created_by_email: Option<String>,
 }

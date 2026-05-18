@@ -37,11 +37,6 @@ impl FusilladeOutletHandler {
         Self::header_str(request, "x-fusillade-request-id").and_then(|s| Uuid::parse_str(s).ok())
     }
 
-    /// Extract the raw fusillade batch UUID from `x-fusillade-batch-id`.
-    fn extract_batch_id(request: &RequestData) -> Option<Uuid> {
-        Self::header_str(request, "x-fusillade-batch-id").and_then(|s| Uuid::parse_str(s).ok())
-    }
-
     /// Extract the bearer token from the Authorization header.
     fn extract_api_key(request: &RequestData) -> Option<String> {
         Self::header_str(request, "authorization")
@@ -77,13 +72,6 @@ impl FusilladeOutletHandler {
                 return None;
             }
         };
-        let batch_id = match Self::extract_batch_id(request) {
-            Some(id) => id,
-            None => {
-                tracing::warn!(response_id = %response_id, "Missing x-fusillade-batch-id header — skipping enqueue");
-                return None;
-            }
-        };
 
         let model = Self::header_str(request, "x-onwards-model").unwrap_or("unknown").to_string();
         let endpoint = Self::header_str(request, "x-onwards-endpoint").unwrap_or("").to_string();
@@ -104,7 +92,6 @@ impl FusilladeOutletHandler {
         Some(CompleteResponseCtx {
             response_id,
             request_id,
-            batch_id,
             model,
             endpoint,
             api_key,
@@ -119,7 +106,6 @@ impl FusilladeOutletHandler {
 struct CompleteResponseCtx {
     response_id: String,
     request_id: Uuid,
-    batch_id: Uuid,
     model: String,
     endpoint: String,
     api_key: Option<String>,
@@ -155,7 +141,6 @@ impl RequestHandler for FusilladeOutletHandler {
                     response_id: ctx.response_id.clone(),
                     status_code,
                     response_body,
-                    batch_id: ctx.batch_id,
                     request_id: ctx.request_id,
                     request_body,
                     model: ctx.model,
@@ -204,7 +189,6 @@ impl RequestHandler for FusilladeOutletHandler {
                     response_id: ctx.response_id.clone(),
                     status_code: STATUS_CLIENT_CLOSED,
                     response_body: abandoned_body,
-                    batch_id: ctx.batch_id,
                     request_id: ctx.request_id,
                     request_body: String::new(),
                     model: ctx.model,
@@ -260,9 +244,10 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_response_id_not_skipped_for_realtime_with_fusillade_header() {
-        // Realtime requests have x-fusillade-request-id (for ID override) but
-        // NOT x-fusillade-batch-id — they should still be processed.
+    fn test_extract_response_id_present_with_fusillade_request_header() {
+        // Responses middleware sets `x-fusillade-request-id` for the ID
+        // override and `x-onwards-response-id` for outlet routing. Both
+        // headers together must produce a valid response id.
         let mut headers = HashMap::new();
         headers.insert("x-fusillade-request-id".to_string(), vec![Bytes::from("some-id")]);
         headers.insert(
@@ -330,10 +315,6 @@ mod tests {
             "x-fusillade-request-id".to_string(),
             vec![Bytes::from("12345678-1234-1234-1234-123456789abc")],
         );
-        headers.insert(
-            "x-fusillade-batch-id".to_string(),
-            vec![Bytes::from("abcdef00-0000-0000-0000-000000000001")],
-        );
         headers.insert("x-onwards-model".to_string(), vec![Bytes::from("Qwen/Qwen3.5-9B")]);
         headers.insert("x-onwards-endpoint".to_string(), vec![Bytes::from("http://127.0.0.1:3001/ai")]);
         headers.insert("authorization".to_string(), vec![Bytes::from("Bearer sk-test")]);
@@ -346,7 +327,6 @@ mod tests {
         let ctx = FusilladeOutletHandler::extract_complete_response_ctx(&request).expect("should extract");
         assert_eq!(ctx.response_id, "resp_12345678-1234-1234-1234-123456789abc");
         assert_eq!(ctx.request_id, Uuid::parse_str("12345678-1234-1234-1234-123456789abc").unwrap());
-        assert_eq!(ctx.batch_id, Uuid::parse_str("abcdef00-0000-0000-0000-000000000001").unwrap());
         assert_eq!(ctx.model, "Qwen/Qwen3.5-9B");
         assert_eq!(ctx.endpoint, "http://127.0.0.1:3001/ai");
         assert_eq!(ctx.api_key, Some("sk-test".to_string()));
@@ -367,14 +347,6 @@ mod tests {
     fn test_extract_complete_response_ctx_missing_request_id_returns_none() {
         let mut headers = full_headers();
         headers.remove("x-fusillade-request-id");
-        let request = make_request_data(headers);
-        assert!(FusilladeOutletHandler::extract_complete_response_ctx(&request).is_none());
-    }
-
-    #[test]
-    fn test_extract_complete_response_ctx_missing_batch_id_returns_none() {
-        let mut headers = full_headers();
-        headers.remove("x-fusillade-batch-id");
         let request = make_request_data(headers);
         assert!(FusilladeOutletHandler::extract_complete_response_ctx(&request).is_none());
     }

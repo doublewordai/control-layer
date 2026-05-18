@@ -23,7 +23,7 @@ use crate::errors::{Error, Result};
 ///
 /// Authenticates via Bearer API key. The response_id is the head step's
 /// uuid (with optional `resp_` prefix); the head step's sub-request
-/// fusillade row carries `batch_created_by` for ownership.
+/// fusillade row carries `created_by` for ownership.
 #[tracing::instrument(skip_all)]
 pub async fn get_response<P: PoolProvider>(
     State(state): State<AppState<P>>,
@@ -54,7 +54,7 @@ pub async fn get_response<P: PoolProvider>(
         id: response_id.clone(),
     })?;
 
-    // Resolve the row that carries `batch_created_by` for ownership.
+    // Resolve the row that carries `created_by` for ownership.
     // Two paths, mirroring `FusilladeResponseStore::get_response`:
     //   * Multi-step — head step → its sub-request fusillade row.
     //   * Single-step — the id is itself a fusillade.requests row
@@ -83,10 +83,13 @@ pub async fn get_response<P: PoolProvider>(
             _ => Error::Database(crate::db::errors::DbError::Other(anyhow::anyhow!("{e}"))),
         })?;
 
-    // Verify ownership: the batch's created_by must match the API key's user_id.
+    // Verify ownership: the row's created_by must match the API key's user_id.
     // Return 404 (not 403) to avoid leaking existence of other users' responses.
-    let batch_owner = detail.batch_created_by.as_deref().unwrap_or("");
-    if batch_owner != owner_id {
+    // `detail.created_by` is non-empty by fusillade's schema invariants —
+    // `get_request_detail` filters out batched rows, and `create_realtime` /
+    // `create_flex` coerce empty inputs to NULL which the XOR CHECK rejects.
+    let owner = detail.created_by.as_str();
+    if owner != owner_id {
         return Err(Error::NotFound {
             resource: "response".to_string(),
             id: response_id,

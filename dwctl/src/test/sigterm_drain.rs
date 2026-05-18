@@ -51,8 +51,8 @@ async fn shutdown_marks_onwards_daemon_dead_and_releases_rows(pool: PgPool) {
     .expect("insert template");
     sqlx::query(
         "INSERT INTO requests \
-         (id, batch_id, template_id, model, custom_id, state, daemon_id, claimed_at, started_at) \
-         VALUES ($1, NULL, $2, 'm', NULL, 'processing', $3, $4, $4)",
+         (id, batch_id, template_id, model, custom_id, state, daemon_id, claimed_at, started_at, created_by) \
+         VALUES ($1, NULL, $2, 'm', NULL, 'processing', $3, $4, $4, 'test-user')",
     )
     .bind(request_id)
     .bind(template_id)
@@ -138,8 +138,8 @@ async fn drain_does_not_touch_other_daemons_rows(pool: PgPool) {
     .unwrap();
     sqlx::query(
         "INSERT INTO requests \
-         (id, batch_id, template_id, model, custom_id, state, daemon_id, claimed_at, started_at) \
-         VALUES ($1, NULL, $2, 'm', NULL, 'processing', $3, NOW(), NOW())",
+         (id, batch_id, template_id, model, custom_id, state, daemon_id, claimed_at, started_at, created_by) \
+         VALUES ($1, NULL, $2, 'm', NULL, 'processing', $3, NOW(), NOW(), 'test-user')",
     )
     .bind(other_request)
     .bind(template_id)

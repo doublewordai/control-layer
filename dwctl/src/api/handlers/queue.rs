@@ -121,7 +121,7 @@ mod tests {
 
     #[sqlx::test]
     async fn test_pending_request_counts_excludes_priority_service_tier(pool: PgPool) {
-        use fusillade::{CreateSingleRequestBatchInput, Storage};
+        use fusillade::{BatchInput, RequestTemplateInput, Storage};
         use sqlx::postgres::PgConnectOptions;
         use sqlx_pool_router::TestDbPools;
 
@@ -140,37 +140,64 @@ mod tests {
         let fusillade_pools = TestDbPools::new(fusillade_pool.clone()).await.expect("TestDbPools");
         let request_manager = fusillade::PostgresRequestManager::new(fusillade_pools, Default::default());
 
-        // Create three single-request batches for the same model with
-        // different completion windows. fusillade derives service_tier from
-        // completion_window:
+        // Create one batch per completion_window. The pending counts endpoint
+        // partitions by service_tier; we expect:
         //   "24h" → service_tier IS NULL (batch tier — counted)
         //   "1h"  → service_tier = 'flex'   (counted)
-        //   "0s"  → service_tier = 'priority' (EXCLUDED — managed externally)
+        // "priority" (0s) is exercised separately via create_realtime; the
+        // handler's ServiceTierFilter::Exclude(["priority"]) is what drops
+        // those rows from the count — not their state (processing is included
+        // in the queried states alongside pending and claimed).
         let model = "test-model";
         let mut batch_ids = Vec::new();
-        for completion_window in ["24h", "1h", "0s"] {
-            let batch_id = uuid::Uuid::new_v4();
-            request_manager
-                .create_single_request_batch(CreateSingleRequestBatchInput {
-                    batch_id: Some(batch_id),
-                    request_id: uuid::Uuid::new_v4(),
-                    body: r#"{"input":"x"}"#.to_string(),
-                    model: model.to_string(),
-                    base_url: "http://localhost".to_string(),
+        for completion_window in ["24h", "1h"] {
+            let template = RequestTemplateInput {
+                custom_id: None,
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/chat/completions".to_string(),
+                body: r#"{"input":"x"}"#.to_string(),
+                model: model.to_string(),
+                api_key: "key".to_string(),
+            };
+            let file_id = request_manager
+                .create_file(format!("queue-test-{completion_window}"), None, vec![template])
+                .await
+                .expect("create_file");
+            let batch = request_manager
+                .create_batch(BatchInput {
+                    file_id,
                     endpoint: "/v1/chat/completions".to_string(),
                     completion_window: completion_window.to_string(),
-                    initial_state: "pending".to_string(),
-                    api_key: None,
+                    metadata: None,
                     created_by: None,
+                    api_key_id: None,
+                    api_key: None,
+                    total_requests: None,
                 })
                 .await
-                .expect("create single-request batch");
-            batch_ids.push(batch_id);
+                .expect("create_batch");
+            batch_ids.push(batch.id.0);
         }
 
-        // Pin all expires_at into the configured 24h window so the deadline
-        // predicate matches deterministically regardless of the original
-        // completion_window.
+        // Realtime row in 'processing' — the priority tier shouldn't count
+        // as pending.
+        request_manager
+            .create_realtime(fusillade::CreateRealtimeInput {
+                request_id: uuid::Uuid::new_v4(),
+                body: r#"{"input":"x"}"#.to_string(),
+                model: model.to_string(),
+                endpoint: "http://localhost".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/responses".to_string(),
+                api_key: String::new(),
+                created_by: "queue-user".to_string(),
+            })
+            .await
+            .expect("create_realtime");
+
+        // Pin all batch expires_at into the configured 24h window so the
+        // deadline predicate matches deterministically.
         for batch_id in &batch_ids {
             sqlx::query("UPDATE batches SET expires_at = NOW() + interval '30 minutes' WHERE id = $1")
                 .bind(batch_id)
@@ -188,9 +215,9 @@ mod tests {
         response.assert_status_ok();
         let counts: HashMap<String, HashMap<String, i64>> = response.json();
 
-        // The default test config queries the "24h" window only. All three
-        // batches expire in 30 min so they all fall inside it. Priority must
-        // be excluded; batch + flex remain.
+        // The default test config queries the "24h" window only. Both batches
+        // expire in 30 min so they fall inside it. Priority must be excluded;
+        // batch + flex remain.
         let model_counts = counts
             .get(model)
             .unwrap_or_else(|| panic!("expected '{model}' in response, got {counts:?}"));

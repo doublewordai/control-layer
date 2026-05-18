@@ -186,9 +186,8 @@ async fn test_chat_completion_creates_retrievable_response(pool: PgPool) {
             id = sqlx::Row::get(&row, "id");
             final_state = sqlx::Row::get::<String, _>(&row, "state");
             let batch_id: Option<uuid::Uuid> = sqlx::Row::get(&row, "batch_id");
-            // Realtime requests are now tracked via a single-request batch created
-            // by the create-response underway job — the row must have a batch_id.
-            assert!(batch_id.is_some(), "Realtime request should be tracked via a single-request batch");
+            // Realtime responses are batchless: the row has no parent batch.
+            assert!(batch_id.is_none(), "Realtime response should not have a batch_id");
             if final_state == "completed" {
                 break;
             }
@@ -306,17 +305,41 @@ async fn test_multi_step_chain_assembles_and_is_retrievable_via_get(pool: PgPool
         Default::default(),
     ));
     let step_manager = Arc::new(PostgresResponseStepManager::new(test_pools));
-    let store = FusilladeResponseStore::new(request_manager).with_step_manager(step_manager);
+    let store = FusilladeResponseStore::new(request_manager.clone()).with_step_manager(step_manager);
 
-    // Stand in for warm_path_setup — register the user request body
-    // and reserve a head step uuid as the response identity.
-    let head_uuid = store.register_pending(PendingResponseInput {
-        body: json!({"model": "gpt-4o", "input": "weather in Paris?"}).to_string(),
-        api_key: None,
-        created_by: Some("test-user".to_string()),
-        base_url: "http://upstream-mock".to_string(),
-        resolved_tool_names: std::collections::HashSet::new(),
-    });
+    // Stand in for warm_path_setup — create the up-front /v1/responses
+    // fusillade row that `record_step`'s head branch reuses, then
+    // register the per-response context in the side-channel keyed by
+    // the same UUID.
+    let head_uuid = uuid::Uuid::new_v4();
+    let body = json!({"model": "gpt-4o", "input": "weather in Paris?"}).to_string();
+    fusillade::Storage::create_realtime(
+        &*request_manager,
+        fusillade::CreateRealtimeInput {
+            request_id: head_uuid,
+            body: body.clone(),
+            model: "gpt-4o".to_string(),
+            endpoint: "http://upstream-mock".to_string(),
+            method: "POST".to_string(),
+            path: "/v1/responses".to_string(),
+            api_key: String::new(),
+            created_by: "test-user".to_string(),
+        },
+    )
+    .await
+    .unwrap();
+    store
+        .register_pending_with_id(
+            head_uuid,
+            PendingResponseInput {
+                body,
+                api_key: None,
+                created_by: Some("test-user".to_string()),
+                base_url: "http://upstream-mock".to_string(),
+                resolved_tool_names: std::collections::HashSet::new(),
+            },
+        )
+        .unwrap();
     let request_id = head_uuid.to_string();
 
     // Step 1: head model_call returns a tool_call.

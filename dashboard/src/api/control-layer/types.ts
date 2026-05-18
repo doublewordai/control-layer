@@ -1635,14 +1635,12 @@ export interface AsyncRequestDetail extends AsyncRequest {
   body: string;
   response_body: string | null;
   error: string | null;
-  completion_window: string | null;
-  batch_created_by: string | null;
+  created_by: string | null;
 }
 
 export interface AsyncRequestsListQuery {
   skip?: number;
   limit?: number;
-  completion_window?: string;
   service_tiers?: string;
   status?: string;
   model?: string;

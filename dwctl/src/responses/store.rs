@@ -9,9 +9,8 @@ use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use fusillade::{
-    BatchInput, CreateSingleRequestBatchInput, CreateStepInput, PostgresRequestManager, PostgresResponseStepManager, RequestId,
-    RequestTemplateInput, ReqwestHttpClient, ResponseStep, ResponseStepStore, StepId, StepKind as FusilladeStepKind,
-    StepState as FusilladeStepState, Storage,
+    BatchInput, CreateRealtimeInput, CreateStepInput, PostgresRequestManager, PostgresResponseStepManager, RequestId, RequestTemplateInput,
+    ReqwestHttpClient, ResponseStep, ResponseStepStore, StepId, StepKind as FusilladeStepKind, StepState as FusilladeStepState, Storage,
 };
 use onwards::{
     ChainStep, MultiStepStore, RecordedStep, ResponseStore, StepDescriptor, StepKind as OnwardsStepKind, StepState as OnwardsStepState,
@@ -329,12 +328,11 @@ pub async fn request_exists<P: PoolProvider + Clone>(
     }
 }
 
-/// Context required to create a fusillade single-request batch.
+/// Context required to synthesize a fusillade request row.
 ///
 /// Carried by `complete-response` so it can create-then-complete when it
 /// races ahead of `create-response`.
 pub struct CreateContext<'a> {
-    pub batch_id: Uuid,
     pub request_id: Uuid,
     pub request_body: &'a str,
     pub model: &'a str,
@@ -408,19 +406,17 @@ pub async fn complete_response_idempotent<P: PoolProvider + Clone>(
         ));
     }
     let created_by = lookup_created_by(dwctl_pool, create_ctx.api_key).await;
-    let batch_input = fusillade::CreateSingleRequestBatchInput {
-        batch_id: Some(create_ctx.batch_id),
+    let realtime_input = fusillade::CreateRealtimeInput {
         request_id: create_ctx.request_id,
         body: create_ctx.request_body.to_string(),
         model: create_ctx.model.to_string(),
-        base_url: create_ctx.base_url.to_string(),
-        endpoint: create_ctx.endpoint.to_string(),
-        completion_window: "0s".to_string(),
-        initial_state: "processing".to_string(),
-        api_key: create_ctx.api_key.map(String::from),
-        created_by,
+        endpoint: create_ctx.base_url.to_string(),
+        method: "POST".to_string(),
+        path: create_ctx.endpoint.to_string(),
+        api_key: create_ctx.api_key.unwrap_or("").to_string(),
+        created_by: created_by.unwrap_or_default(),
     };
-    match request_manager.create_single_request_batch(batch_input).await {
+    match request_manager.create_realtime(realtime_input).await {
         Ok(_) => tracing::info!(
             response_id = %response_id,
             "Synthetic create from complete-response succeeded — row now exists in 'processing'"
@@ -968,12 +964,22 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> MultiStepStore for Fusilla
         let sequence = chain.iter().map(|s| s.step_sequence).max().unwrap_or(0) + 1;
 
         // model_call steps require a sub-request fusillade row (CHECK
-        // constraint: model_call ⇒ request_id IS NOT NULL). Create it
-        // synchronously so the FK is satisfied at the response_steps
-        // insert. tool_call steps have request_id = NULL — analytics
-        // for them live in tool_call_analytics (keyed on
-        // response_step_id).
+        // constraint: model_call ⇒ request_id IS NOT NULL). tool_call
+        // steps have request_id = NULL — analytics for them live in
+        // tool_call_analytics (keyed on response_step_id).
+        //
+        // The head model_call reuses the up-front /v1/responses row
+        // (created by `handle_flex` for flex, `warm_path_setup` for the
+        // realtime warm path) — its id is `head_step_uuid` by
+        // construction. That collapses what used to be "parent row +
+        // head sub-request row" into a single tracking row per
+        // response: 1 row for a single-step tool-using chain,
+        // N rows for an N-model_call chain.
+        //
+        // Descendant model_calls (followups after tool dispatch) still
+        // mint their own sub-request rows via `create_sub_request_row`.
         let req_id = match descriptor.kind {
+            OnwardsStepKind::ModelCall if is_head => Some(RequestId(head_step_uuid)),
             OnwardsStepKind::ModelCall => Some(RequestId(self.create_sub_request_row(request_id, descriptor).await?)),
             OnwardsStepKind::ToolCall => None,
         };
@@ -1088,10 +1094,9 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> FusilladeResponseStore<P> 
     /// Returns the new row's id, which the caller writes into the
     /// `response_steps.request_id` column to wire the 1:1 link.
     ///
-    /// Uses `create_single_request_batch` to satisfy the file/template/
-    /// batch FK chain in one round-trip. The batch is single-use (one
-    /// request per batch); the listing-query anti-join hides every
-    /// non-head sub-request row.
+    /// Uses `create_realtime` to insert the request row directly with no
+    /// parent batch. The listing query is scoped to head-step rows so
+    /// non-head sub-request rows don't surface in the dashboard view.
     async fn create_sub_request_row(&self, request_id: &str, descriptor: &StepDescriptor) -> Result<Uuid, StoreError> {
         let pending = self.pending_input(request_id)?;
         let model = descriptor
@@ -1104,28 +1109,26 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> FusilladeResponseStore<P> 
             .map_err(|e| StoreError::StorageError(format!("serialize step request_payload: {e}")))?;
 
         let sub_request_id = Uuid::new_v4();
-        let input = CreateSingleRequestBatchInput {
-            batch_id: None,
+        // Sub-request rows are owned by the warm-path loop running in this
+        // onwards instance — created in `processing` state so the daemon
+        // doesn't claim them. The loop UPDATEs via complete_request /
+        // fail_request when each step terminates.
+        let input = CreateRealtimeInput {
             request_id: sub_request_id,
             body,
             model,
-            base_url: pending.base_url,
+            endpoint: pending.base_url,
+            method: "POST".to_string(),
             // The actual upstream HTTP fire happens via onwards' loopback
-            // to /v1/chat/completions. Storing that as the row's endpoint
+            // to /v1/chat/completions. Storing that as the row's path
             // makes analytics + the responses-listing dashboard show the
             // right URL for each step.
-            endpoint: "/v1/chat/completions".to_string(),
-            completion_window: "0s".to_string(),
-            // Initial state is `processing` because this row is "owned"
-            // by the warm-path loop running in this onwards instance —
-            // the daemon shouldn't claim it. The loop will UPDATE it via
-            // complete_request / fail_request when the step terminates.
-            initial_state: "processing".to_string(),
-            api_key: pending.api_key,
-            created_by: pending.created_by,
+            path: "/v1/chat/completions".to_string(),
+            api_key: pending.api_key.unwrap_or_default(),
+            created_by: pending.created_by.unwrap_or_default(),
         };
         self.request_manager
-            .create_single_request_batch(input)
+            .create_realtime(input)
             .await
             .map_err(|e| StoreError::StorageError(format!("create sub-request row: {e}")))?;
         Ok(sub_request_id)
@@ -1277,9 +1280,8 @@ mod tests {
             body: None,
             response_body: response_body.map(|s| s.to_string()),
             error: error.map(|s| s.to_string()),
-            completion_window: None,
             service_tier: None,
-            batch_created_by: None,
+            created_by: "test-user".to_string(),
         }
     }
 
