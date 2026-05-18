@@ -2608,8 +2608,22 @@ impl Application {
             multi_step_reqwest_client.clone(),
             Some(multi_step_tool_executor_pool.clone()),
         ));
-        let multi_step_http_client: Arc<dyn onwards::client::HttpClient + Send + Sync> =
-            Arc::new(onwards::client::create_hyper_client(10, 30));
+        // Same `ReqwestHttpClient` shape the batch daemon uses internally,
+        // so per-step model fires inherit fusillade's header stamping
+        // (`X-Fusillade-Request-Id` for analytics correlation) and
+        // streamable-endpoint dispatch. Timeouts and the streamable list
+        // come from the same config knobs the daemon respects, so warm
+        // path and daemon path use identical streaming semantics.
+        let batch_daemon_cfg = &config.background_services.batch_daemon;
+        let batch_daemon_fusillade_cfg = batch_daemon_cfg.to_fusillade_config();
+        let multi_step_http_client: Arc<fusillade::ReqwestHttpClient> = Arc::new(
+            fusillade::ReqwestHttpClient::new(
+                std::time::Duration::from_millis(batch_daemon_fusillade_cfg.first_chunk_timeout_ms),
+                std::time::Duration::from_millis(batch_daemon_fusillade_cfg.chunk_timeout_ms),
+                std::time::Duration::from_millis(batch_daemon_fusillade_cfg.body_timeout_ms),
+                batch_daemon_fusillade_cfg.streamable_endpoints.clone(),
+            ),
+        );
         let multi_step_loop_config = onwards::LoopConfig {
             max_response_step_depth: config.responses.max_response_step_depth,
             max_response_iterations: config.responses.max_response_iterations,
