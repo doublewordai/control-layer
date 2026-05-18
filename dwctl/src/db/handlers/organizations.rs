@@ -10,7 +10,9 @@ use crate::db::{
     errors::{DbError, Result},
     handlers::users::{UserFilter, Users},
     models::{
-        organizations::{OrganizationCreateDBRequest, OrganizationMemberDBResponse, OrganizationUpdateDBRequest},
+        organizations::{
+            OrganizationCreateDBRequest, OrganizationMemberDBResponse, OrganizationUpdateDBRequest, PendingOrgEmailChangeDBResponse,
+        },
         users::UserDBResponse,
     },
 };
@@ -579,6 +581,87 @@ impl<'c> Organizations<'c> {
         .await?;
 
         Ok(count.unwrap_or(0))
+    }
+
+    /// Delete every pending email change row for an organization.
+    ///
+    /// Called before inserting a new pending change so that only the most
+    /// recent verification token is valid (older tokens become useless).
+    #[instrument(skip(self), fields(org_id = %abbrev_uuid(&org_id)), err)]
+    pub async fn delete_pending_email_changes(&mut self, org_id: UserId) -> Result<u64> {
+        let result = sqlx::query!("DELETE FROM pending_org_email_changes WHERE organization_id = $1", org_id)
+            .execute(&mut *self.db)
+            .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Insert a pending email change row.
+    #[instrument(skip(self, token_hash), fields(org_id = %abbrev_uuid(&org_id)), err)]
+    pub async fn create_pending_email_change(
+        &mut self,
+        org_id: UserId,
+        new_email: &str,
+        requested_by: UserId,
+        token_hash: &str,
+        expires_at: DateTime<Utc>,
+    ) -> Result<PendingOrgEmailChangeDBResponse> {
+        let row = sqlx::query!(
+            r#"
+            INSERT INTO pending_org_email_changes
+                (organization_id, new_email, requested_by, token_hash, expires_at)
+            VALUES ($1, $2, $3, $4, $5)
+            RETURNING id, organization_id, new_email, requested_by, created_at, expires_at
+            "#,
+            org_id,
+            new_email,
+            requested_by,
+            token_hash,
+            expires_at,
+        )
+        .fetch_one(&mut *self.db)
+        .await?;
+
+        Ok(PendingOrgEmailChangeDBResponse {
+            id: row.id,
+            organization_id: row.organization_id,
+            new_email: row.new_email,
+            requested_by: row.requested_by,
+            created_at: row.created_at,
+            expires_at: row.expires_at,
+        })
+    }
+
+    /// Look up a pending email change by token hash.
+    #[instrument(skip(self, token_hash), err)]
+    pub async fn find_pending_email_change_by_token_hash(&mut self, token_hash: &str) -> Result<Option<PendingOrgEmailChangeDBResponse>> {
+        let row = sqlx::query!(
+            r#"
+            SELECT id, organization_id, new_email, requested_by, created_at, expires_at
+            FROM pending_org_email_changes
+            WHERE token_hash = $1
+            "#,
+            token_hash,
+        )
+        .fetch_optional(&mut *self.db)
+        .await?;
+
+        Ok(row.map(|r| PendingOrgEmailChangeDBResponse {
+            id: r.id,
+            organization_id: r.organization_id,
+            new_email: r.new_email,
+            requested_by: r.requested_by,
+            created_at: r.created_at,
+            expires_at: r.expires_at,
+        }))
+    }
+
+    /// Delete a pending email change row by ID. Returns whether a row was removed.
+    #[instrument(skip(self), err)]
+    pub async fn delete_pending_email_change(&mut self, id: Uuid) -> Result<bool> {
+        let result = sqlx::query!("DELETE FROM pending_org_email_changes WHERE id = $1", id)
+            .execute(&mut *self.db)
+            .await?;
+        Ok(result.rows_affected() > 0)
     }
 }
 
