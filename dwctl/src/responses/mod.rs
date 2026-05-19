@@ -11,6 +11,7 @@
 
 pub mod assembly;
 pub mod handler;
+pub mod image_normalizer_middleware;
 pub mod jobs;
 pub mod loop_http_client;
 pub mod middleware;

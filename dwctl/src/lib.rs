@@ -1397,6 +1397,26 @@ pub async fn build_router(
         crate::tool_injection::tool_injection_middleware,
     ));
 
+    // Apply the image-input normaliser middleware. This runs BEFORE
+    // tool_injection in request flow (i.e. as an outer Tower layer added
+    // after the inner one). For each `/chat/completions` and `/responses`
+    // request, it walks the body for HTTP(S) `image_url` values, fetches +
+    // stores them via `image_normalizer`, and substitutes signed URLs into
+    // the body before the request reaches onwards.
+    let onwards_router = {
+        let cfg = state.current_config();
+        let normalizer = crate::image_normalizer::from_config(&cfg.image_normalizer);
+        let realtime_ttl = cfg.image_normalizer.signing.realtime_ttl();
+        let image_normalizer_state = crate::responses::image_normalizer_middleware::ImageNormalizerMiddlewareState {
+            normalizer,
+            realtime_ttl,
+        };
+        onwards_router.layer(middleware::from_fn_with_state(
+            image_normalizer_state,
+            crate::responses::image_normalizer_middleware::image_normalizer_middleware,
+        ))
+    };
+
     // Apply error enrichment middleware to onwards router (before outlet logging)
     let onwards_router = onwards_router.layer(middleware::from_fn_with_state(
         state.db.write().clone(),
