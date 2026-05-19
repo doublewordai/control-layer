@@ -2652,15 +2652,24 @@ impl Application {
                 Arc::new(crate::responses::processor::DbToolResolver {
                     pool: (*db_pools).write().clone(),
                 });
-            let processor = Arc::new(
-                crate::responses::processor::DwctlRequestProcessor::new(
-                    response_store.clone(),
-                    multi_step_tool_executor.clone(),
-                    multi_step_http_client.clone(),
-                    multi_step_loop_config,
-                )
-                .with_tool_resolver(tool_resolver),
-            );
+            // Build a single normaliser instance shared across processor
+            // attempts and middleware. Disabled mode returns the no-op
+            // normaliser; `with_image_normalizer` still wires it in so
+            // the JIT walker no-ops cleanly on missing tokens rather
+            // than branching at the per-request site.
+            let image_normalizer = crate::image_normalizer::from_config(&config.image_normalizer);
+            let dispatch_ttl = config.image_normalizer.signing.dispatch_ttl();
+            let mut processor_builder = crate::responses::processor::DwctlRequestProcessor::new(
+                response_store.clone(),
+                multi_step_tool_executor.clone(),
+                multi_step_http_client.clone(),
+                multi_step_loop_config,
+            )
+            .with_tool_resolver(tool_resolver);
+            if config.image_normalizer.enabled {
+                processor_builder = processor_builder.with_image_normalizer(image_normalizer, dispatch_ttl);
+            }
+            let processor = Arc::new(processor_builder);
             Some(
                 processor
                     as Arc<

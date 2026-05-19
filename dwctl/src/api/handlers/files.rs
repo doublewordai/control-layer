@@ -15,6 +15,7 @@ use crate::api::models::users::CurrentUser;
 use crate::auth::permissions::{RequiresPermission, can_read_all_resources, operation, resource};
 
 use crate::AppState;
+use crate::image_normalizer::{ImageInput, ImageNormalizer, Mode as ImageNormalizerMode, walker as image_walker};
 use crate::db::{
     handlers::api_keys::ApiKeys,
     handlers::connections::Connections,
@@ -254,7 +255,9 @@ impl OpenAIBatchRequest {
 }
 
 /// Configuration for file stream processing.
-#[derive(Debug)]
+//
+// Debug is implemented manually below because the `normalizer` field
+// holds an `Arc<dyn ImageNormalizer>` which does not implement Debug.
 struct FileStreamConfig {
     /// Maximum file size in bytes (0 = unlimited)
     max_file_size: u64,
@@ -264,6 +267,58 @@ struct FileStreamConfig {
     max_request_body_size: u64,
     /// Channel buffer size for streaming
     buffer_size: usize,
+    /// Optional image normaliser. When `Some`, each parsed template's body is
+    /// walked for `image_url` fields containing HTTP(S) URLs (per the user's
+    /// mode); each is ingested into the content store and replaced with an
+    /// opaque `dw-img://` token. The dispatcher swaps tokens for short-lived
+    /// signed URLs at send time. When `None`, bodies pass through unchanged.
+    normalizer: Option<Arc<dyn ImageNormalizer>>,
+    /// Walker mode for the calling user. Pinned to [`ImageNormalizerMode::HttpOnly`]
+    /// until the per-user opt-in flag is wired in.
+    normalizer_mode: ImageNormalizerMode,
+}
+
+impl std::fmt::Debug for FileStreamConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FileStreamConfig")
+            .field("max_file_size", &self.max_file_size)
+            .field("max_requests_per_file", &self.max_requests_per_file)
+            .field("max_request_body_size", &self.max_request_body_size)
+            .field("buffer_size", &self.buffer_size)
+            .field("normalizer_enabled", &self.normalizer.is_some())
+            .field("normalizer_mode", &self.normalizer_mode)
+            .finish()
+    }
+}
+
+/// Walk a single batch template's body and replace HTTP(S) `image_url` fields
+/// with opaque `dw-img://{sha256}` tokens via the normaliser. No-op when
+/// the normaliser is unset or the body is not valid JSON (the existing line
+/// parser would already have rejected non-JSON).
+async fn normalize_template_body_in_place(
+    normalizer: Option<&Arc<dyn ImageNormalizer>>,
+    mode: ImageNormalizerMode,
+    template: &mut fusillade::RequestTemplateInput,
+) -> std::result::Result<(), String> {
+    let Some(normalizer) = normalizer else {
+        return Ok(());
+    };
+    let mut body_value: serde_json::Value = match serde_json::from_str(&template.body) {
+        Ok(v) => v,
+        Err(_) => return Ok(()), // non-JSON body — let existing handling deal with it
+    };
+    let count = image_walker::substitute_with(&mut body_value, mode, |url| {
+        let normalizer = Arc::clone(normalizer);
+        async move {
+            let token = normalizer.ingest(ImageInput::HttpUrl(url)).await.map_err(|e| e.to_string())?;
+            Ok::<String, String>(token.to_dw_img_uri())
+        }
+    })
+    .await?;
+    if count > 0 {
+        template.body = serde_json::to_string(&body_value).map_err(|e| format!("re-serialise after image normalisation: {e}"))?;
+    }
+    Ok(())
 }
 
 /// Errors that can occur during file upload processing.
@@ -442,6 +497,8 @@ fn create_file_stream(
         accessible_models,
         allowed_url_paths,
     } = req_ctx;
+    let normalizer = config.normalizer.clone();
+    let normalizer_mode = config.normalizer_mode;
     let (tx, rx) = mpsc::channel(config.buffer_size);
     // std::sync::Mutex is appropriate here because:
     // 1. Lock is held only briefly (no await points while locked)
@@ -629,7 +686,18 @@ fn create_file_stream(
                                             // Transform to internal format (includes model access validation)
                                             match openai_req.to_internal(&endpoint, api_key.clone(), &accessible_models, &allowed_url_paths)
                                             {
-                                                Ok(template) => {
+                                                Ok(mut template) => {
+                                                    // Normalise image URLs in the per-template body
+                                                    // before the size cap check, since substitution
+                                                    // replaces (potentially large) HTTP URLs with
+                                                    // short opaque tokens — bodies usually shrink.
+                                                    if let Err(e) = normalize_template_body_in_place(normalizer.as_ref(), normalizer_mode, &mut template).await {
+                                                        abort!(FileUploadError::ValidationError {
+                                                            line: line_count + 1,
+                                                            message: format!("image input normalisation failed: {e}"),
+                                                        });
+                                                    }
+
                                                     // Check per-request body size limit (0 = unlimited)
                                                     if config.max_request_body_size > 0
                                                         && template.body.len() as u64 > config.max_request_body_size
@@ -713,7 +781,15 @@ fn create_file_stream(
                             match serde_json::from_str::<OpenAIBatchRequest>(trimmed) {
                                 Ok(openai_req) => {
                                     match openai_req.to_internal(&endpoint, api_key.clone(), &accessible_models, &allowed_url_paths) {
-                                        Ok(template) => {
+                                        Ok(mut template) => {
+                                            // Normalise image URLs in the trailing line as well.
+                                            if let Err(e) = normalize_template_body_in_place(normalizer.as_ref(), normalizer_mode, &mut template).await {
+                                                abort!(FileUploadError::ValidationError {
+                                                    line: line_count + 1,
+                                                    message: format!("image input normalisation failed: {e}"),
+                                                });
+                                            }
+
                                             // Check per-request body size limit (0 = unlimited)
                                             if config.max_request_body_size > 0 && template.body.len() as u64 > config.max_request_body_size
                                             {
@@ -851,11 +927,25 @@ pub async fn upload_file<P: PoolProvider>(
         message: format!("Invalid multipart request: {}", e),
     })?;
 
+    // Build the image normaliser handle for the batch ingest path. The
+    // dispatcher will JIT-resign any `dw-img://` tokens produced here with
+    // a fresh short-lived signed URL before sending to the provider.
+    let normalizer = if config.image_normalizer.enabled {
+        Some(crate::image_normalizer::from_config(&config.image_normalizer))
+    } else {
+        None
+    };
     let stream_config = FileStreamConfig {
         max_file_size: config.limits.files.max_file_size,
         max_requests_per_file: config.limits.files.max_requests_per_file,
         max_request_body_size: config.limits.requests.max_body_size,
         buffer_size: config.batches.files.upload_buffer_size,
+        normalizer,
+        // Per-user opt-in (mode All) is wired in a follow-up commit that
+        // surfaces the `users.image_normalization_enabled` flag through the
+        // auth context. Until then, batch ingest runs HttpOnly (the floor
+        // security control).
+        normalizer_mode: ImageNormalizerMode::HttpOnly,
     };
     // When in org context, attribute file ownership to the org (not the individual user).
     // Also used for the hidden API key lookup below.
