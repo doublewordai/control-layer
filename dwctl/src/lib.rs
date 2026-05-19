@@ -151,6 +151,7 @@ mod email;
 pub mod encryption;
 mod error_enrichment;
 pub mod errors;
+pub mod image_normalizer;
 mod leader_election;
 pub mod limits;
 mod metrics;
