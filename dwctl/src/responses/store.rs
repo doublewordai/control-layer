@@ -1000,6 +1000,15 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> MultiStepStore for Fusilla
         Ok(RecordedStep {
             id: id.0.to_string(),
             sequence,
+            // Hand the sub-request fusillade row id back to onwards so
+            // its loop can stamp it as `X-Fusillade-Request-Id` on the
+            // outgoing HTTP fire — that's how the resulting
+            // `http_analytics` row gets attributed to the right row in
+            // `fusillade.requests`. `tool_call` steps don't get a
+            // sub-request row (analytics live in `tool_call_analytics`
+            // keyed on response_step_id), so this stays `None` for
+            // them per the DB CHECK constraint.
+            sub_request_id: req_id,
         })
     }
 
