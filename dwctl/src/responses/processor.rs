@@ -36,9 +36,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use fusillade::request::{Canceled, Claimed, Request, RequestCompletionResult};
-use fusillade::{CancellationFuture, DefaultRequestProcessor, PoolProvider as FusilladePool, RequestProcessor, ShouldRetry, Storage};
+use fusillade::{
+    CancellationFuture, DefaultRequestProcessor, PoolProvider as FusilladePool, RequestProcessor, ReqwestHttpClient, ShouldRetry, Storage,
+};
 use onwards::LoopConfig;
-use onwards::client::HttpClient;
 use onwards::traits::ToolExecutor;
 
 use crate::responses::loop_http_client::ResponseLoopHttpClient;
@@ -61,7 +62,7 @@ where
 {
     pub response_store: Arc<FusilladeResponseStore<P>>,
     pub tool_executor: Arc<T>,
-    pub http_client: Arc<dyn HttpClient + Send + Sync>,
+    pub http_client: Arc<ReqwestHttpClient>,
     pub loop_config: LoopConfig,
     /// Tool resolver for the daemon path. Tools today are scoped per
     /// (api_key, model alias) — same as the realtime middleware path —
@@ -109,7 +110,7 @@ where
     pub fn new(
         response_store: Arc<FusilladeResponseStore<P>>,
         tool_executor: Arc<T>,
-        http_client: Arc<dyn HttpClient + Send + Sync>,
+        http_client: Arc<ReqwestHttpClient>,
         loop_config: LoopConfig,
     ) -> Self {
         Self {

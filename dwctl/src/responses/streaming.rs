@@ -32,8 +32,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use axum::response::sse::{Event, KeepAlive, Sse};
+use fusillade::ReqwestHttpClient;
 use futures::stream::Stream;
-use onwards::client::HttpClient;
 use onwards::traits::RequestContext;
 use onwards::{EventSink, EventSinkError, LoopConfig, LoopError, LoopEvent, MultiStepStore, UpstreamTarget};
 use serde_json::Value;
@@ -92,7 +92,7 @@ pub fn run_inline_streaming<P>(
     response_store: Arc<FusilladeResponseStore<P>>,
     tool_executor: Arc<HttpToolExecutor>,
     tool_resolved: Arc<crate::tool_executor::ResolvedToolSet>,
-    http_client: Arc<dyn HttpClient + Send + Sync>,
+    http_client: Arc<ReqwestHttpClient>,
     upstream: UpstreamTarget,
     loop_config: LoopConfig,
     request_id: String,
@@ -208,7 +208,7 @@ pub async fn run_inline_blocking<P>(
     response_store: Arc<FusilladeResponseStore<P>>,
     tool_executor: Arc<HttpToolExecutor>,
     tool_resolved: Arc<crate::tool_executor::ResolvedToolSet>,
-    http_client: Arc<dyn HttpClient + Send + Sync>,
+    http_client: Arc<ReqwestHttpClient>,
     upstream: UpstreamTarget,
     loop_config: LoopConfig,
     request_id: String,
