@@ -2616,14 +2616,12 @@ impl Application {
         // path and daemon path use identical streaming semantics.
         let batch_daemon_cfg = &config.background_services.batch_daemon;
         let batch_daemon_fusillade_cfg = batch_daemon_cfg.to_fusillade_config();
-        let multi_step_http_client: Arc<fusillade::ReqwestHttpClient> = Arc::new(
-            fusillade::ReqwestHttpClient::new(
-                std::time::Duration::from_millis(batch_daemon_fusillade_cfg.first_chunk_timeout_ms),
-                std::time::Duration::from_millis(batch_daemon_fusillade_cfg.chunk_timeout_ms),
-                std::time::Duration::from_millis(batch_daemon_fusillade_cfg.body_timeout_ms),
-                batch_daemon_fusillade_cfg.streamable_endpoints.clone(),
-            ),
-        );
+        let multi_step_http_client: Arc<fusillade::ReqwestHttpClient> = Arc::new(fusillade::ReqwestHttpClient::new(
+            std::time::Duration::from_millis(batch_daemon_fusillade_cfg.first_chunk_timeout_ms),
+            std::time::Duration::from_millis(batch_daemon_fusillade_cfg.chunk_timeout_ms),
+            std::time::Duration::from_millis(batch_daemon_fusillade_cfg.body_timeout_ms),
+            batch_daemon_fusillade_cfg.streamable_endpoints.clone(),
+        ));
         let multi_step_loop_config = onwards::LoopConfig {
             max_response_step_depth: config.responses.max_response_step_depth,
             max_response_iterations: config.responses.max_response_iterations,
