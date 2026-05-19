@@ -49,7 +49,7 @@ pub struct ResponsesMiddlewareState<P: PoolProvider + Clone = sqlx_pool_router::
     /// [`super::streaming::run_inline_streaming`] using these.
     pub response_store: Arc<super::store::FusilladeResponseStore<P>>,
     pub multi_step_tool_executor: Arc<crate::tool_executor::HttpToolExecutor>,
-    pub multi_step_http_client: Arc<dyn onwards::client::HttpClient + Send + Sync>,
+    pub multi_step_http_client: Arc<fusillade::ReqwestHttpClient>,
     pub loop_config: onwards::LoopConfig,
 }
 
@@ -827,8 +827,12 @@ async fn warm_path_setup<P: PoolProvider + Clone + Send + Sync + 'static>(
         return None;
     }
 
+    // Endpoint + path are split (not pre-concatenated) so fusillade
+    // can match `/v1/chat/completions` against its streamable_endpoints
+    // list and pick the streaming branch when the user requested SSE.
     let upstream = onwards::UpstreamTarget {
-        url: format!("{}/v1/chat/completions", state.loopback_base_url),
+        endpoint: state.loopback_base_url.clone(),
+        path: "/v1/chat/completions".to_string(),
         api_key: Some(api_key.to_string()),
     };
 
