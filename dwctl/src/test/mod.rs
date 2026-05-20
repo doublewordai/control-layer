@@ -997,16 +997,27 @@ async fn test_dedicated_databases_for_components(pool: PgPool) {
     // Make a test request
     let _ = server.get("/ai/v1/models").await;
 
-    // Wait for logging to complete
-    tokio::task::yield_now().await;
-
-    let result = repository
-        .query(RequestFilter {
-            method: Some("GET".into()),
-            ..Default::default()
-        })
-        .await
-        .expect("Should be able to query requests from dedicated outlet db");
+    // Poll for the outlet write to land — the middleware logs in a
+    // detached task so a single `yield_now()` is racy under CI load (per
+    // CLAUDE.md's "poll until the condition becomes true" guidance for
+    // background-job assertions).
+    let result = {
+        let mut attempt = 0u32;
+        loop {
+            let rows = repository
+                .query(RequestFilter {
+                    method: Some("GET".into()),
+                    ..Default::default()
+                })
+                .await
+                .expect("Should be able to query requests from dedicated outlet db");
+            if !rows.is_empty() || attempt >= 50 {
+                break rows;
+            }
+            attempt += 1;
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    };
     assert_eq!(result.len(), 1, "Request should be logged to dedicated outlet database");
 
     // Create a batch user and verify batch is stored in dedicated fusillade database
