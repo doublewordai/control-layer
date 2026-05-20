@@ -15,7 +15,6 @@ use crate::api::models::users::CurrentUser;
 use crate::auth::permissions::{RequiresPermission, can_read_all_resources, operation, resource};
 
 use crate::AppState;
-use crate::image_normalizer::{ImageInput, ImageNormalizer, Mode as ImageNormalizerMode, walker as image_walker};
 use crate::db::{
     handlers::api_keys::ApiKeys,
     handlers::connections::Connections,
@@ -28,6 +27,7 @@ use crate::db::{
     models::users::UserDBResponse,
 };
 use crate::errors::{Error, Result};
+use crate::image_normalizer::{ImageInput, ImageNormalizer, Mode as ImageNormalizerMode, walker as image_walker};
 use crate::types::Resource;
 use axum::{
     Json,
@@ -350,7 +350,11 @@ async fn normalize_template_body_in_place(
         let err_cell = &err_cell;
         let is_data_uri = url.starts_with("data:");
         async move {
-            let input = if is_data_uri { ImageInput::DataUri(url) } else { ImageInput::HttpUrl(url) };
+            let input = if is_data_uri {
+                ImageInput::DataUri(url)
+            } else {
+                ImageInput::HttpUrl(url)
+            };
             match normalizer.ingest(input).await {
                 Ok(token) => {
                     if let (Some(pool), Some(uid)) = (access_pool, access_user_id) {
@@ -367,7 +371,9 @@ async fn normalize_template_body_in_place(
                         crate::image_normalizer::NormalizeError::FetchFailed(m) => BatchNormalizeError::FetchFailed(m),
                         crate::image_normalizer::NormalizeError::Transient(m) => BatchNormalizeError::Transient(m),
                         crate::image_normalizer::NormalizeError::StoreFailed(m) => BatchNormalizeError::StoreFailed(m),
-                        crate::image_normalizer::NormalizeError::NotFound => BatchNormalizeError::StoreFailed("image token not found in store".to_string()),
+                        crate::image_normalizer::NormalizeError::NotFound => {
+                            BatchNormalizeError::StoreFailed("image token not found in store".to_string())
+                        }
                     };
                     if let Ok(mut g) = err_cell.lock()
                         && g.is_none()
@@ -393,7 +399,8 @@ async fn normalize_template_body_in_place(
     }
     let count = walker_result.expect("walker_result is Ok by control flow above");
     if count > 0 {
-        template.body = serde_json::to_string(&body_value).map_err(|e| BatchNormalizeError::StoreFailed(format!("re-serialise after image normalisation: {e}")))?;
+        template.body = serde_json::to_string(&body_value)
+            .map_err(|e| BatchNormalizeError::StoreFailed(format!("re-serialise after image normalisation: {e}")))?;
     }
     Ok(())
 }
@@ -796,7 +803,15 @@ fn create_file_stream(
                                                     // before the size cap check, since substitution
                                                     // replaces (potentially large) HTTP URLs with
                                                     // short opaque tokens — bodies usually shrink.
-                                                    if let Err(e) = normalize_template_body_in_place(normalizer.as_ref(), normalizer_mode, &mut template, access_pool.as_ref(), access_user_id).await {
+                                                    if let Err(e) = normalize_template_body_in_place(
+                                                        normalizer.as_ref(),
+                                                        normalizer_mode,
+                                                        &mut template,
+                                                        access_pool.as_ref(),
+                                                        access_user_id,
+                                                    )
+                                                    .await
+                                                    {
                                                         abort!(map_batch_normalize_error(e, line_count + 1));
                                                     }
 
@@ -885,7 +900,15 @@ fn create_file_stream(
                                     match openai_req.to_internal(&endpoint, api_key.clone(), &accessible_models, &allowed_url_paths) {
                                         Ok(mut template) => {
                                             // Normalise image URLs in the trailing line as well.
-                                            if let Err(e) = normalize_template_body_in_place(normalizer.as_ref(), normalizer_mode, &mut template, access_pool.as_ref(), access_user_id).await {
+                                            if let Err(e) = normalize_template_body_in_place(
+                                                normalizer.as_ref(),
+                                                normalizer_mode,
+                                                &mut template,
+                                                access_pool.as_ref(),
+                                                access_user_id,
+                                            )
+                                            .await
+                                            {
                                                 abort!(map_batch_normalize_error(e, line_count + 1));
                                             }
 

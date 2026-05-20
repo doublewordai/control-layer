@@ -112,13 +112,7 @@ pub async fn get_image<P: PoolProvider + Clone + Send + Sync>(
 /// Best-effort: errors are logged and swallowed. We never block the request
 /// path on this bookkeeping write — the security control (substituting the
 /// URL before forwarding to the upstream) does not depend on it.
-pub async fn record_image_access(
-    pool: &sqlx::PgPool,
-    user_id: uuid::Uuid,
-    token: ImageToken,
-    mime: &str,
-    bytes_len: u64,
-) {
+pub async fn record_image_access(pool: &sqlx::PgPool, user_id: uuid::Uuid, token: ImageToken, mime: &str, bytes_len: u64) {
     let sha_bytes: Vec<u8> = token.0.to_vec();
     let bytes_len_i64 = bytes_len as i64;
     if let Err(e) = sqlx::query!(

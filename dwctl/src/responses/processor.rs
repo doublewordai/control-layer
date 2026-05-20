@@ -144,7 +144,11 @@ where
     /// Wire in the image normaliser for JIT signing. Without this, the
     /// processor passes bodies through unchanged. The TTL controls how
     /// long the signed URL handed to the upstream is valid.
-    pub fn with_image_normalizer(mut self, normalizer: Arc<dyn crate::image_normalizer::ImageNormalizer>, ttl: std::time::Duration) -> Self {
+    pub fn with_image_normalizer(
+        mut self,
+        normalizer: Arc<dyn crate::image_normalizer::ImageNormalizer>,
+        ttl: std::time::Duration,
+    ) -> Self {
         self.image_normalizer = Some(normalizer);
         self.dispatch_ttl = ttl;
         self
@@ -191,12 +195,11 @@ where
             // silently dispatching the literal token to an upstream
             // (which can't fetch a `dw-img://` URL) would manifest as a
             // confusing upstream error far from the root cause.
-            let mut body_value: serde_json::Value =
-                serde_json::from_str(&request.data.body).map_err(|e| {
-                    fusillade::FusilladeError::Other(anyhow::anyhow!(
-                        "JIT image signing: request body is not valid JSON ({e}); refusing to dispatch with unresolved tokens"
-                    ))
-                })?;
+            let mut body_value: serde_json::Value = serde_json::from_str(&request.data.body).map_err(|e| {
+                fusillade::FusilladeError::Other(anyhow::anyhow!(
+                    "JIT image signing: request body is not valid JSON ({e}); refusing to dispatch with unresolved tokens"
+                ))
+            })?;
             let result = crate::image_normalizer::walker::substitute_with(
                 &mut body_value,
                 crate::image_normalizer::Mode::TokensOnly,
@@ -216,12 +219,16 @@ where
                 Ok(count) if count > 0 => match serde_json::to_string(&body_value) {
                     Ok(new_body) => request.data.body = new_body,
                     Err(e) => {
-                        return Err(fusillade::FusilladeError::Other(anyhow::anyhow!("re-serialise body after JIT signing: {e}")));
+                        return Err(fusillade::FusilladeError::Other(anyhow::anyhow!(
+                            "re-serialise body after JIT signing: {e}"
+                        )));
                     }
                 },
                 Ok(_) => {} // no tokens found, leave body alone
                 Err(e) => {
-                    return Err(fusillade::FusilladeError::Other(anyhow::anyhow!("JIT image-URL signing failed: {e}")));
+                    return Err(fusillade::FusilladeError::Other(anyhow::anyhow!(
+                        "JIT image-URL signing failed: {e}"
+                    )));
                 }
             }
         }

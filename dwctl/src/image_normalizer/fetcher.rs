@@ -107,7 +107,9 @@ impl ImageFetcher {
                 return Err(FetchError::BadInput(format!("unsupported scheme: {}", url.scheme())));
             }
             let host = url.host_str().ok_or_else(|| FetchError::BadInput("missing host".into()))?;
-            let port = url.port_or_known_default().ok_or_else(|| FetchError::BadInput("unknown port".into()))?;
+            let port = url
+                .port_or_known_default()
+                .ok_or_else(|| FetchError::BadInput("unknown port".into()))?;
             let resolved = resolve_first_allowed(host, port).await?;
 
             // Build a per-attempt reqwest client that:
@@ -136,9 +138,14 @@ impl ImageFetcher {
                 let Some(location) = resp.headers().get(reqwest::header::LOCATION).and_then(|h| h.to_str().ok()) else {
                     return Err(FetchError::FetchFailed(format!("{status} without Location header")));
                 };
-                let next = url.join(location).map_err(|e| FetchError::BadInput(format!("bad redirect target: {e}")))?;
+                let next = url
+                    .join(location)
+                    .map_err(|e| FetchError::BadInput(format!("bad redirect target: {e}")))?;
                 if hop == self.config.max_redirects {
-                    return Err(FetchError::BadInput(format!("too many redirects (cap {})", self.config.max_redirects)));
+                    return Err(FetchError::BadInput(format!(
+                        "too many redirects (cap {})",
+                        self.config.max_redirects
+                    )));
                 }
                 debug!(?next, "image fetcher following redirect");
                 url = next;
@@ -170,7 +177,10 @@ impl ImageFetcher {
             if let Some(len) = resp.content_length()
                 && len > self.config.max_bytes
             {
-                return Err(FetchError::BadInput(format!("content-length {} exceeds cap {}", len, self.config.max_bytes)));
+                return Err(FetchError::BadInput(format!(
+                    "content-length {} exceeds cap {}",
+                    len, self.config.max_bytes
+                )));
             }
 
             // Read with bounded reader so an upstream lying about length
@@ -189,14 +199,18 @@ impl ImageFetcher {
 /// Returns `BadInput` if every resolved IP is denied; `Transient` if DNS
 /// itself fails.
 async fn resolve_first_allowed(host: &str, port: u16) -> Result<SocketAddr, FetchError> {
-    let lookup = tokio::net::lookup_host((host, port)).await.map_err(|e| FetchError::Transient(format!("dns resolve {host}: {e}")))?;
+    let lookup = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|e| FetchError::Transient(format!("dns resolve {host}: {e}")))?;
     for addr in lookup {
         let ip: IpAddr = addr.ip();
         if !ip_filter::is_denied(ip) {
             return Ok(addr);
         }
     }
-    Err(FetchError::BadInput(format!("all resolved addresses for {host} are in the deny-list")))
+    Err(FetchError::BadInput(format!(
+        "all resolved addresses for {host} are in the deny-list"
+    )))
 }
 
 /// Read up to `max` bytes from `resp` and refuse if more remain.

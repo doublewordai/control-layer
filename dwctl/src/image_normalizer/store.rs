@@ -117,7 +117,12 @@ impl ImageStore for MemoryStore {
             return Err(StoreError::NotFound);
         }
         let expires_at = Utc::now() + ChronoDuration::from_std(ttl).unwrap_or(ChronoDuration::seconds(900));
-        let url = format!("{}/{}?expires={}", self.base_url.trim_end_matches('/'), token.to_hex(), expires_at.timestamp());
+        let url = format!(
+            "{}/{}?expires={}",
+            self.base_url.trim_end_matches('/'),
+            token.to_hex(),
+            expires_at.timestamp()
+        );
         Ok(SignedImageUrl { url, expires_at })
     }
 

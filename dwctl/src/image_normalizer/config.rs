@@ -147,10 +147,10 @@ pub struct SigningConfig {
 impl Default for SigningConfig {
     fn default() -> Self {
         Self {
-            realtime_ttl_secs: 900,             // 15 min
-            dispatch_ttl_secs: None,            // derive from processing_timeout_ms
-            dispatch_ttl_headroom_secs: 300,    // +5 min headroom on derived dispatch TTL
-            dashboard_ttl_secs: 300,            // 5 min
+            realtime_ttl_secs: 900,          // 15 min
+            dispatch_ttl_secs: None,         // derive from processing_timeout_ms
+            dispatch_ttl_headroom_secs: 300, // +5 min headroom on derived dispatch TTL
+            dashboard_ttl_secs: 300,         // 5 min
         }
     }
 }

@@ -160,7 +160,11 @@ pub async fn image_normalizer_middleware(
         let pool_for_access = pool_for_access.clone();
         let is_data_uri = url.starts_with("data:");
         async move {
-            let input = if is_data_uri { ImageInput::DataUri(url) } else { ImageInput::HttpUrl(url) };
+            let input = if is_data_uri {
+                ImageInput::DataUri(url)
+            } else {
+                ImageInput::HttpUrl(url)
+            };
             let token = normalizer.ingest(input).await?;
             let signed = normalizer.sign(token, realtime_ttl).await?;
             // Best-effort image_access bookkeeping: fire-and-forget so
@@ -335,7 +339,10 @@ mod tests {
         let substituted = echoed["messages"][0]["content"][0]["image_url"]["url"]
             .as_str()
             .expect("image_url.url should still be a string");
-        assert_ne!(substituted, TINY_PNG_DATA_URI, "data: URI should be substituted, not passed through");
+        assert_ne!(
+            substituted, TINY_PNG_DATA_URI,
+            "data: URI should be substituted, not passed through"
+        );
         assert!(
             substituted.starts_with("http://test.local/dw-img/"),
             "expected MemoryStore-backed signed URL, got: {substituted}",
