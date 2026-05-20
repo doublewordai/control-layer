@@ -454,7 +454,13 @@ pub async fn update_organization<P: PoolProvider>(
                     {
                         // Promote to a structured warn because failure here is
                         // security-relevant: an attacker benefits from the legitimate
-                        // owner not being notified of the change request.
+                        // owner not being notified of the change request. Ops should
+                        // alert on `kind = "org_email_change_notice_failed"`.
+                        //
+                        // Follow-up: a durable retry (via the task runner / batched
+                        // email queue) would harden this further against transient
+                        // SMTP failures. Out of scope for this PR — the structured
+                        // warn is the alertable hook in the meantime.
                         tracing::warn!(
                             org_id = %id,
                             old_email = %current_org.email,
@@ -1488,6 +1494,13 @@ pub async fn cancel_invite<P: PoolProvider>(
 /// opt-in via the `CurrentUser` extractor on each handler, not via a router
 /// layer around `/admin/api/v1`, so the absence of `CurrentUser` here is what
 /// makes the endpoint public.)
+///
+/// **Pool routing:** this endpoint MUST always run against the primary
+/// database pool. The transaction below uses `state.db.write().begin()`,
+/// which routes to the primary via the `DbPools.write()` API. Do not add
+/// a replica fast-path here or split the consume + update across pools —
+/// the security guarantee (single-use, atomic supersede, no replay) only
+/// holds if both statements run inside the same primary-pool transaction.
 #[utoipa::path(
     get,
     path = "/organizations/email-change/{token}/confirm",

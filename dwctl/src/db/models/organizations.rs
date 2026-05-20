@@ -13,11 +13,20 @@ pub struct OrganizationCreateDBRequest {
     pub created_by: UserId,
 }
 
-/// Database request for updating an organization
+/// Database request for updating an organization.
 #[derive(Debug, Clone)]
 pub struct OrganizationUpdateDBRequest {
     pub display_name: Option<String>,
     pub avatar_url: Option<String>,
+    /// Direct write to the organization's contact email.
+    ///
+    /// **Security invariant:** user-facing PATCH (`update_organization`) must
+    /// always pass `None` here. The contact email is rendered into Stripe
+    /// receipts, invitation emails and audit notifications, so a silent
+    /// change could redirect security-sensitive mail to an attacker. The
+    /// only caller permitted to set `Some(_)` is the email-verification
+    /// flow (`confirm_email_change`), which proves possession of the new
+    /// mailbox via a hashed token before applying the change.
     pub email: Option<String>,
     pub batch_notifications_enabled: Option<bool>,
     /// `None` = don't change, `Some(None)` = disable, `Some(Some(val))` = set threshold.

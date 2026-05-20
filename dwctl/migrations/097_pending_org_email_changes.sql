@@ -18,6 +18,14 @@ CREATE TABLE pending_org_email_changes (
     -- supersedes the previous one via INSERT ... ON CONFLICT, which
     -- guarantees older verification links stop working the moment a new
     -- request is accepted (no read-then-write race window).
+    --
+    -- NOTE: ON DELETE CASCADE only fires when the org row is physically
+    -- removed from `users`. This codebase soft-deletes orgs by setting
+    -- `is_deleted = true`, which does NOT trigger CASCADE — so a pending
+    -- row can outlive a soft-deleted org. Application code must check
+    -- `is_deleted = false` when consuming tokens, and indeed
+    -- `consume_pending_email_change` joins `users` and filters on
+    -- `is_deleted = false` for exactly that reason.
     organization_id UUID NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
     new_email VARCHAR NOT NULL,
     requested_by UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
