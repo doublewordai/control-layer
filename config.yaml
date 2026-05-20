@@ -469,6 +469,40 @@ image_normalizer:
       - image/webp
       - image/gif
   signing:
-    realtime_ttl_secs: 900     # 15 min — covers a chat completion
-    dispatch_ttl_secs: 1800    # 30 min — refreshed per batch dispatch attempt
-    dashboard_ttl_secs: 300    # 5 min — for dashboard image-view path
+    realtime_ttl_secs: 900            # 15 min — covers a chat completion
+    # dispatch_ttl_secs: 1800         # Optional override. When omitted,
+                                      # derived as
+                                      #   processing_timeout_ms (from
+                                      #   background_services.batch_daemon)
+                                      #   + dispatch_ttl_headroom_secs
+                                      # so the URL is always valid for at
+                                      # least one full dispatch attempt.
+                                      # Each retry gets a brand-new URL.
+    dispatch_ttl_headroom_secs: 300   # +5 min on top of processing_timeout
+    dashboard_ttl_secs: 300           # 5 min — dashboard image-view path
+
+# NOTE on bucket data lifetime:
+#
+# This dwctl process never garbage-collects objects from the image
+# normaliser bucket — that's a GCS-side concern, configured out-of-band
+# via the bucket's Object Lifecycle Management policy
+# (Terraform / gcloud).
+#
+# Recommended lifecycle rule for production:
+#
+#   age (days)  = max_batch_completion_window + investigation_buffer
+#   action      = Delete
+#
+# Example (covers 24h batches + 6 days of headroom for support / replay):
+#
+#   gcloud storage buckets update gs://<bucket> --lifecycle-file=- <<EOF
+#   {"lifecycle":{"rule":[{"action":{"type":"Delete"},
+#                          "condition":{"age":7}}]}}
+#   EOF
+#
+# Tighter retention is fine — the worst-case batch dispatch attempt is
+# bounded by background_services.batch_daemon.processing_timeout_ms,
+# and dispatch URLs are signed per-attempt. The only constraint is the
+# bucket retention MUST exceed the maximum time a batch can sit
+# between ingest and final dispatch attempt (typically the batch
+# completion window, 24h for OpenAI-style "24h" batches).

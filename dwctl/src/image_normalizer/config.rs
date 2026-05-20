@@ -116,10 +116,23 @@ pub struct SigningConfig {
     /// TTL applied to signed URLs handed to upstream providers from the
     /// realtime path. Covers a single chat completion.
     pub realtime_ttl_secs: u64,
-    /// TTL applied to signed URLs handed to upstream providers from the
-    /// batch dispatcher. Covers a single dispatch attempt; retries get
-    /// fresh URLs.
-    pub dispatch_ttl_secs: u64,
+    /// Optional override for the TTL applied to signed URLs handed to
+    /// upstream providers from the batch dispatcher.
+    ///
+    /// When `None` (default), the TTL is **derived from the batch daemon's
+    /// `processing_timeout_ms`** at startup: `processing_timeout +
+    /// dispatch_ttl_headroom_secs` (default headroom: 5 min). This ensures
+    /// the URL is always valid for at least one full dispatch attempt, plus
+    /// a margin for clock skew / processing pauses — the URL itself can
+    /// never be the cause of a dispatch failure.
+    ///
+    /// Set explicitly to a `Some(secs)` only if you have a specific
+    /// reason to deviate from the derived value (e.g., very long-running
+    /// upstream calls with a much shorter URL leak window requirement).
+    pub dispatch_ttl_secs: Option<u64>,
+    /// Headroom added on top of `processing_timeout_ms` when deriving the
+    /// dispatch TTL. Ignored if `dispatch_ttl_secs` is set.
+    pub dispatch_ttl_headroom_secs: u64,
     /// TTL applied to signed URLs served via the dashboard image-view
     /// endpoint. Short, since the dashboard re-signs on each page load.
     pub dashboard_ttl_secs: u64,
@@ -128,9 +141,10 @@ pub struct SigningConfig {
 impl Default for SigningConfig {
     fn default() -> Self {
         Self {
-            realtime_ttl_secs: 900,    // 15 min
-            dispatch_ttl_secs: 1800,   // 30 min — refreshed per dispatch
-            dashboard_ttl_secs: 300,   // 5 min
+            realtime_ttl_secs: 900,             // 15 min
+            dispatch_ttl_secs: None,            // derive from processing_timeout_ms
+            dispatch_ttl_headroom_secs: 300,    // +5 min headroom on derived dispatch TTL
+            dashboard_ttl_secs: 300,            // 5 min
         }
     }
 }
@@ -139,9 +153,17 @@ impl SigningConfig {
     pub fn realtime_ttl(&self) -> Duration {
         Duration::from_secs(self.realtime_ttl_secs)
     }
-    pub fn dispatch_ttl(&self) -> Duration {
-        Duration::from_secs(self.dispatch_ttl_secs)
+
+    /// Resolve the dispatch TTL. If `dispatch_ttl_secs` is set, that
+    /// value is used verbatim; otherwise it is derived from
+    /// `processing_timeout` + `dispatch_ttl_headroom_secs`.
+    pub fn dispatch_ttl(&self, processing_timeout: Duration) -> Duration {
+        match self.dispatch_ttl_secs {
+            Some(s) => Duration::from_secs(s),
+            None => processing_timeout + Duration::from_secs(self.dispatch_ttl_headroom_secs),
+        }
     }
+
     pub fn dashboard_ttl(&self) -> Duration {
         Duration::from_secs(self.dashboard_ttl_secs)
     }
@@ -188,7 +210,8 @@ mod tests {
             },
             signing: SigningConfig {
                 realtime_ttl_secs: 60,
-                dispatch_ttl_secs: 120,
+                dispatch_ttl_secs: Some(120),
+                dispatch_ttl_headroom_secs: 300,
                 dashboard_ttl_secs: 30,
             },
         };
@@ -203,5 +226,37 @@ mod tests {
         assert!(back.fetcher.mime_allowed("image/png"));
         assert!(!back.fetcher.mime_allowed("image/jpeg"));
         assert_eq!(back.signing.realtime_ttl().as_secs(), 60);
+    }
+
+    #[test]
+    fn dispatch_ttl_explicit_override_used_verbatim() {
+        let signing = SigningConfig {
+            realtime_ttl_secs: 900,
+            dispatch_ttl_secs: Some(3600),
+            dispatch_ttl_headroom_secs: 300,
+            dashboard_ttl_secs: 300,
+        };
+        // Caller's processing_timeout is irrelevant when an explicit
+        // override is set.
+        assert_eq!(signing.dispatch_ttl(Duration::from_secs(60)).as_secs(), 3600);
+        assert_eq!(signing.dispatch_ttl(Duration::from_secs(99999)).as_secs(), 3600);
+    }
+
+    #[test]
+    fn dispatch_ttl_derived_from_processing_timeout_plus_headroom() {
+        let signing = SigningConfig::default(); // headroom 300s
+        assert_eq!(signing.dispatch_ttl(Duration::from_secs(600)).as_secs(), 900);
+        assert_eq!(signing.dispatch_ttl(Duration::from_secs(1800)).as_secs(), 2100);
+    }
+
+    #[test]
+    fn dispatch_ttl_headroom_is_configurable() {
+        let signing = SigningConfig {
+            realtime_ttl_secs: 900,
+            dispatch_ttl_secs: None,
+            dispatch_ttl_headroom_secs: 60,
+            dashboard_ttl_secs: 300,
+        };
+        assert_eq!(signing.dispatch_ttl(Duration::from_secs(600)).as_secs(), 660);
     }
 }

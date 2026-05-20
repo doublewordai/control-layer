@@ -2663,7 +2663,11 @@ impl Application {
             // the JIT walker no-ops cleanly on missing tokens rather
             // than branching at the per-request site.
             let image_normalizer = crate::image_normalizer::from_config(&config.image_normalizer);
-            let dispatch_ttl = config.image_normalizer.signing.dispatch_ttl();
+            // Derive dispatch TTL from the batch daemon's processing timeout so
+            // the signed URL is always valid for at least one full dispatch
+            // attempt — never the cause of a batch failure on its own.
+            let processing_timeout = std::time::Duration::from_millis(config.background_services.batch_daemon.processing_timeout_ms);
+            let dispatch_ttl = config.image_normalizer.signing.dispatch_ttl(processing_timeout);
             let mut processor_builder = crate::responses::processor::DwctlRequestProcessor::new(
                 response_store.clone(),
                 multi_step_tool_executor.clone(),
