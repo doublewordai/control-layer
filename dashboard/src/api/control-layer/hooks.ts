@@ -1894,6 +1894,21 @@ export function useAsyncRequests(
   });
 }
 
+export function useDeleteAsyncRequest() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (id: string) => dwctlApi.asyncRequests.delete(id),
+    onSuccess: (_, id) => {
+      // Drop any cached detail for this row so re-navigating doesn't hit a
+      // stale row, and refresh all list views (they're keyed by full query
+      // options, so we invalidate at the top of the namespace).
+      queryClient.removeQueries({ queryKey: ["asyncRequests", "detail", id] });
+      queryClient.invalidateQueries({ queryKey: ["asyncRequests"] });
+    },
+  });
+}
+
 export function useAsyncRequest(id: string | undefined) {
   return useQuery({
     queryKey: ["asyncRequests", "detail", id],
