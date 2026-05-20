@@ -136,19 +136,22 @@ impl ImageStore for MemoryStore {
 
 /// Google Cloud Storage backend.
 ///
-/// **Not yet wired up.** Requires:
-/// - A GCS crate for uploads (e.g. `google-cloud-storage` or `cloud-storage`)
-/// - V4 URL signing via the IAM `signBlob` API (Workload Identity has no
-///   on-disk private key, so the `gcp_auth` + IAM signing approach is the
-///   right one).
+/// Uses Application Default Credentials (Workload Identity in production)
+/// for both the object IO operations (write_object / read_object) and for
+/// V4 signed URL generation. Signing piggybacks on the IAM `signBlob` API,
+/// so no on-disk private key is required — the GCP SA bound by WI just
+/// needs `roles/iam.serviceAccountTokenCreator` on itself and
+/// `roles/storage.objectAdmin` on the bucket.
 ///
-/// The struct + trait impl are scaffolded so that:
-/// - The config layer can refer to it and rule selection works at startup.
-/// - The trait seam is final: when the GCS wiring lands, no caller needs
-///   to change.
+/// The client + signer are constructed lazily on first use via `tokio::sync::OnceCell`
+/// so that the dwctl binary can boot even when GCS auth isn't yet available
+/// (useful in CI / local dev where the `image_normalizer.enabled` flag is
+/// off).
 pub struct GcsStore {
     pub bucket: String,
     pub region: String,
+    client_cell: tokio::sync::OnceCell<google_cloud_storage::client::Storage>,
+    signer_cell: tokio::sync::OnceCell<google_cloud_auth::signer::Signer>,
 }
 
 impl GcsStore {
@@ -156,36 +159,110 @@ impl GcsStore {
         Self {
             bucket: bucket.into(),
             region: region.into(),
+            client_cell: tokio::sync::OnceCell::new(),
+            signer_cell: tokio::sync::OnceCell::new(),
         }
     }
 
-    /// Object key shape for a given token. The two-level prefix keeps
-    /// listing fan-out small on dense buckets. Used once the put/sign
-    /// methods are wired up.
-    #[allow(dead_code)]
+    /// Object key shape for a given token. Two-level prefix keeps listing
+    /// fan-out small on dense buckets.
     pub(crate) fn key(token: ImageToken) -> String {
         let hex = token.to_hex();
-        // Two-level prefix for object-listing fan-out, common dedup pattern.
         format!("images/{}/{}/{}", &hex[..2], &hex[2..4], hex)
+    }
+
+    /// `projects/_/buckets/<bucket>` — the resource form `SignedUrlBuilder` wants.
+    fn bucket_resource(&self) -> String {
+        format!("projects/_/buckets/{}", self.bucket)
+    }
+
+    async fn client(&self) -> Result<&google_cloud_storage::client::Storage, StoreError> {
+        self.client_cell
+            .get_or_try_init(|| async {
+                google_cloud_storage::client::Storage::builder()
+                    .build()
+                    .await
+                    .map_err(|e| StoreError::Backend(format!("GCS client init: {e}")))
+            })
+            .await
+    }
+
+    async fn signer(&self) -> Result<&google_cloud_auth::signer::Signer, StoreError> {
+        self.signer_cell
+            .get_or_try_init(|| async {
+                google_cloud_auth::credentials::Builder::default()
+                    .build_signer()
+                    .map_err(|e| StoreError::Backend(format!("ADC signer init: {e}")))
+            })
+            .await
     }
 }
 
 #[async_trait]
 impl ImageStore for GcsStore {
-    async fn put(&self, _token: ImageToken, _mime: &str, _bytes: Bytes) -> Result<bool, StoreError> {
-        Err(StoreError::Unimplemented)
+    async fn put(&self, token: ImageToken, mime: &str, bytes: Bytes) -> Result<bool, StoreError> {
+        // Idempotency: short-circuit if the object already exists.
+        if self.exists(token).await? {
+            return Ok(false);
+        }
+        let client = self.client().await?;
+        let key = Self::key(token);
+        client
+            .write_object(self.bucket_resource(), &key, bytes)
+            .set_content_type(mime)
+            .send_buffered()
+            .await
+            .map_err(|e| StoreError::Backend(format!("GCS put {key}: {e}")))?;
+        Ok(true)
     }
 
-    async fn sign(&self, _token: ImageToken, _ttl: Duration) -> Result<SignedImageUrl, StoreError> {
-        Err(StoreError::Unimplemented)
+    async fn sign(&self, token: ImageToken, ttl: Duration) -> Result<SignedImageUrl, StoreError> {
+        let signer = self.signer().await?;
+        let key = Self::key(token);
+        let url = google_cloud_storage::builder::storage::SignedUrlBuilder::for_object(self.bucket_resource(), &key)
+            .with_method(google_cloud_storage::http::Method::GET)
+            .with_expiration(ttl)
+            .sign_with(signer)
+            .await
+            .map_err(|e| StoreError::Backend(format!("GCS sign {key}: {e}")))?;
+        let expires_at = Utc::now() + ChronoDuration::from_std(ttl).unwrap_or(ChronoDuration::seconds(900));
+        Ok(SignedImageUrl { url, expires_at })
     }
 
-    async fn read(&self, _token: ImageToken) -> Result<(String, Bytes), StoreError> {
-        Err(StoreError::Unimplemented)
+    async fn read(&self, token: ImageToken) -> Result<(String, Bytes), StoreError> {
+        let client = self.client().await?;
+        let key = Self::key(token);
+        let mut resp = client
+            .read_object(self.bucket_resource(), &key)
+            .send()
+            .await
+            .map_err(|e| StoreError::Backend(format!("GCS read {key}: {e}")))?;
+        let mime = resp.object().content_type.clone();
+        let mut bytes_vec: Vec<u8> = Vec::new();
+        while let Some(chunk) = resp.next().await {
+            let chunk = chunk.map_err(|e| StoreError::Backend(format!("GCS read body: {e}")))?;
+            bytes_vec.extend_from_slice(&chunk);
+        }
+        Ok((mime, Bytes::from(bytes_vec)))
     }
 
-    async fn exists(&self, _token: ImageToken) -> Result<bool, StoreError> {
-        Err(StoreError::Unimplemented)
+    async fn exists(&self, token: ImageToken) -> Result<bool, StoreError> {
+        let client = self.client().await?;
+        let key = Self::key(token);
+        // The smallest GET we can do — start a read; if it succeeds, the
+        // object exists. We immediately drop the response without reading
+        // the body. 404 → false; other errors → bubble up.
+        match client.read_object(self.bucket_resource(), &key).send().await {
+            Ok(_) => Ok(true),
+            Err(e) => {
+                let s = format!("{e}");
+                if s.contains("404") || s.to_ascii_lowercase().contains("not found") {
+                    Ok(false)
+                } else {
+                    Err(StoreError::Backend(format!("GCS exists {key}: {e}")))
+                }
+            }
+        }
     }
 }
 
@@ -247,14 +324,9 @@ mod tests {
         assert!(key.starts_with("images/ab/ab/abab"));
     }
 
-    #[tokio::test]
-    async fn gcs_store_methods_return_unimplemented() {
-        // Scaffolded only — exercised here so the test suite flags any
-        // accidental wiring before the proper implementation lands.
-        let s = GcsStore::new("test-bucket", "europe-west4");
-        assert!(matches!(s.put(tok(1), "image/png", Bytes::new()).await, Err(StoreError::Unimplemented)));
-        assert!(matches!(s.sign(tok(1), Duration::from_secs(60)).await, Err(StoreError::Unimplemented)));
-        assert!(matches!(s.read(tok(1)).await, Err(StoreError::Unimplemented)));
-        assert!(matches!(s.exists(tok(1)).await, Err(StoreError::Unimplemented)));
+    #[test]
+    fn gcs_bucket_resource_format() {
+        let s = GcsStore::new("my-bucket", "europe-west4");
+        assert_eq!(s.bucket_resource(), "projects/_/buckets/my-bucket");
     }
 }

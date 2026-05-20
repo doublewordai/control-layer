@@ -155,6 +155,11 @@ hex = "0.4.3"
 # modern rustls 0.23 / aws-lc-rs path instead.
 aws-sdk-s3 = { version = "1.21", default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
 aws-credential-types = "1.1"
+# GCS for the image normaliser's content-addressed object store.
+# `auth` feature pulls google-cloud-auth so we can use ADC (Workload
+# Identity in production); `rustls-tls` avoids OpenSSL on Alpine images.
+google-cloud-storage = "1.12"
+google-cloud-auth = "1.10"
 
 [dev-dependencies]
 axum-test = { version = "18.4.1" }
