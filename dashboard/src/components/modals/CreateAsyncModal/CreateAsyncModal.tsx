@@ -105,10 +105,13 @@ export function CreateAsyncModal({
     return base.endsWith("/v1") ? base : `${base}/v1`;
   }, [config?.ai_api_base_url]);
 
-  // Submit URL — routed through the dashboard's own origin to avoid CORS.
-  // In dev the Vite proxy forwards /ai → dwctl on :3001; in prod app.doubleword.ai
-  // serves /ai/v1 from the same host as the dashboard.
-  const submitUrl = "/ai/v1/responses";
+  // Submit URL — routed through `/admin/api/v1/ai/v1` so dwctl's
+  // `admin_ai_proxy_middleware` can resolve the current user from the
+  // session cookie, mint a hidden playground API key, and forward to
+  // onwards as `POST /ai/v1/responses`. Posting directly to `/ai/v1/...`
+  // would hit onwards, which only accepts Bearer-key auth and 401s on a
+  // bare cookie. Same pattern the Playground uses for chat completions.
+  const submitUrl = "/admin/api/v1/ai/v1/responses";
 
   const buildResponseBody = useCallback(() => {
     const body: Record<string, unknown> = {
@@ -241,10 +244,6 @@ export function CreateAsyncModal({
   const handleSubmit = async () => {
     setError(null);
 
-    if (!apiKey) {
-      setError("Enter an API key before submitting");
-      return;
-    }
     if (!model) {
       setError("Please select a model");
       return;
@@ -256,14 +255,15 @@ export function CreateAsyncModal({
 
     setIsSubmitting(true);
     try {
-      // Call the Open Responses API the same way the snippet shows, but via
-      // the dashboard's same-origin /ai/v1 path so the browser doesn't block
-      // it on CORS. The backend responses middleware turns this into a
-      // tracked async/realtime request that surfaces on the Responses page.
+      // Same-origin POST — dwctl accepts the session cookie on /ai/v1 the
+      // same way the Playground does, so the user doesn't need to mint a
+      // Bearer key just to submit from inside the dashboard. (The Snippet
+      // tab still surfaces a Bearer key because that snippet is meant to be
+      // copy-pasted into the user's own app.)
       const res = await fetch(submitUrl, {
         method: "POST",
+        credentials: "include",
         headers: {
-          Authorization: `Bearer ${apiKey}`,
           "Content-Type": "application/json",
         },
         body: JSON.stringify(buildResponseBody()),
@@ -273,7 +273,7 @@ export function CreateAsyncModal({
         const text = await res.text().catch(() => "");
         if (res.status === 401 || res.status === 403) {
           throw new Error(
-            "API key was rejected — try minting a new one with the button above",
+            "Your session has expired — please reload and sign in again",
           );
         }
         throw new Error(
@@ -316,10 +316,7 @@ export function CreateAsyncModal({
   };
 
   const canSubmit =
-    Boolean(apiKey) &&
-    Boolean(model) &&
-    userPrompt.trim().length > 0 &&
-    !isSubmitting;
+    Boolean(model) && userPrompt.trim().length > 0 && !isSubmitting;
 
   const renderApiKeyPopover = (trigger: React.ReactNode) => (
     <Popover open={showCreateForm} onOpenChange={setShowCreateForm}>
@@ -393,44 +390,6 @@ export function CreateAsyncModal({
           </DialogDescription>
         </DialogHeader>
 
-        {/* Shared API key bar — both the Compose submit and the Snippet tab
-            use the same key, so a single source of truth at the top is
-            clearer than duplicating the affordance. */}
-        <div className="flex items-center justify-between gap-3 rounded-md border bg-muted/30 px-3 py-2">
-          <div className="flex items-center gap-2 min-w-0">
-            <KeyRound className="h-4 w-4 text-muted-foreground flex-shrink-0" />
-            <span className="text-sm font-medium text-doubleword-neutral-700">
-              API key
-            </span>
-            <span className="text-sm font-mono text-muted-foreground truncate">
-              {apiKey
-                ? `${apiKey.slice(0, 6)}…${apiKey.slice(-4)}`
-                : "not set"}
-            </span>
-          </div>
-          <div className="flex items-center gap-1">
-            {apiKey && (
-              <button
-                type="button"
-                onClick={() => handleCopy(apiKey, "api-key")}
-                className="flex items-center gap-1 px-2 py-1 text-xs text-green-600 hover:text-green-700 hover:bg-green-50 rounded transition-colors"
-              >
-                <Copy className="w-3 h-3" />
-                {copiedCode === "api-key" ? "Copied!" : "Copy"}
-              </button>
-            )}
-            {renderApiKeyPopover(
-              <button
-                type="button"
-                className="flex items-center gap-1 px-2 py-1 text-xs text-gray-500 hover:text-gray-700 hover:bg-gray-100 rounded transition-colors"
-              >
-                <Plus className="w-3 h-3" />
-                {apiKey ? "Replace" : "Fill API key"}
-              </button>,
-            )}
-          </div>
-        </div>
-
         <Tabs
           value={activeTab}
           onValueChange={(v) => setActiveTab(v as "compose" | "snippet")}
@@ -502,6 +461,45 @@ export function CreateAsyncModal({
           </TabsContent>
 
           <TabsContent value="snippet" className="space-y-3 mt-4">
+            {/* API key bar — only relevant to the snippet, since the Compose
+                tab submits same-origin and authenticates via session cookie.
+                Users mint a key here so the copy-pasteable snippet they take
+                to their own app has a real Bearer token baked in. */}
+            <div className="flex items-center justify-between gap-3 rounded-md border bg-muted/30 px-3 py-2">
+              <div className="flex items-center gap-2 min-w-0">
+                <KeyRound className="h-4 w-4 text-muted-foreground flex-shrink-0" />
+                <span className="text-sm font-medium text-doubleword-neutral-700">
+                  API key
+                </span>
+                <span className="text-sm font-mono text-muted-foreground truncate">
+                  {apiKey
+                    ? `${apiKey.slice(0, 6)}…${apiKey.slice(-4)}`
+                    : "not set"}
+                </span>
+              </div>
+              <div className="flex items-center gap-1">
+                {apiKey && (
+                  <button
+                    type="button"
+                    onClick={() => handleCopy(apiKey, "api-key")}
+                    className="flex items-center gap-1 px-2 py-1 text-xs text-green-600 hover:text-green-700 hover:bg-green-50 rounded transition-colors"
+                  >
+                    <Copy className="w-3 h-3" />
+                    {copiedCode === "api-key" ? "Copied!" : "Copy"}
+                  </button>
+                )}
+                {renderApiKeyPopover(
+                  <button
+                    type="button"
+                    className="flex items-center gap-1 px-2 py-1 text-xs text-gray-500 hover:text-gray-700 hover:bg-gray-100 rounded transition-colors"
+                  >
+                    <Plus className="w-3 h-3" />
+                    {apiKey ? "Replace" : "Fill API key"}
+                  </button>,
+                )}
+              </div>
+            </div>
+
             <div className="bg-white border border-gray-200 rounded-lg overflow-hidden">
               <div className="bg-gray-50 px-4 py-2 border-b border-gray-200 flex items-center justify-between">
                 <div className="flex items-center gap-2">

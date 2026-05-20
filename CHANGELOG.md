@@ -1,5 +1,18 @@
 # Changelog
 
+## [8.51.0](https://github.com/doublewordai/control-layer/compare/v8.50.0...v8.51.0) (2026-05-20)
+
+
+### Features
+
+* single request deletion ([#1082](https://github.com/doublewordai/control-layer/issues/1082)) ([379e705](https://github.com/doublewordai/control-layer/commit/379e70597935e095cc7131d7137678dfc1b6585c))
+* unified http client ([#1078](https://github.com/doublewordai/control-layer/issues/1078)) ([106b78e](https://github.com/doublewordai/control-layer/commit/106b78e4ab775e425d29fa3fe6ffdc1f7eb80004))
+
+
+### Bug Fixes
+
+* open responses compliant deletion ([#1084](https://github.com/doublewordai/control-layer/issues/1084)) ([2de7390](https://github.com/doublewordai/control-layer/commit/2de7390227ce2376741902e54104ee4d731a9c63))
+
 ## [8.50.0](https://github.com/doublewordai/control-layer/compare/v8.49.1...v8.50.0) (2026-05-15)
 
 
