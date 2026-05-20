@@ -80,6 +80,12 @@ pub struct UserUpdate {
     /// auto top-up charges, set to null to remove the limit. Omit entirely to leave unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
     pub auto_topup_monthly_limit: Option<Option<f32>>,
+    /// Opt into full image input normalisation. When true, the realtime
+    /// middleware and batch ingest path replace both `data:` URIs and
+    /// HTTP(S) URLs with opaque image tokens — no raw image bytes leave
+    /// our control plane on the upstream-bound request. When false (the
+    /// default), only HTTP(S) URLs are normalised. Omit to keep unchanged.
+    pub image_normalization_enabled: Option<bool>,
 }
 
 /// Full user details returned by the API.
@@ -140,6 +146,8 @@ pub struct UserResponse {
     pub auto_topup_monthly_limit: Option<f32>,
     /// User type: 'individual' or 'organization'
     pub user_type: String,
+    /// Whether the user has opted into full image input normalisation.
+    pub image_normalization_enabled: bool,
     /// Organizations this user belongs to (only included if `include=organizations` is specified)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub organizations: Option<Vec<super::organizations::OrganizationSummary>>,
@@ -194,6 +202,8 @@ pub struct CurrentUser {
     /// Active organization ID (from X-Organization-Id header)
     #[schema(value_type = Option<String>, format = "uuid")]
     pub active_organization: Option<UserId>,
+    /// Whether this user has opted into full image input normalisation.
+    pub image_normalization_enabled: bool,
 }
 
 /// Context about a user's organization membership
@@ -237,6 +247,7 @@ impl From<UserDBResponse> for UserResponse {
             has_auto_topup_payment_method: db.payment_provider_id.as_ref().is_some_and(|s| !s.is_empty()),
             auto_topup_monthly_limit: db.auto_topup_monthly_limit,
             user_type: db.user_type,
+            image_normalization_enabled: db.image_normalization_enabled,
             organizations: None,
             active_organization_id: None,
             onboarding_redirect_url: None,
@@ -289,6 +300,7 @@ impl From<UserDBResponse> for CurrentUser {
             payment_provider_id: db.payment_provider_id,
             organizations: vec![],
             active_organization: None,
+            image_normalization_enabled: db.image_normalization_enabled,
         }
     }
 }

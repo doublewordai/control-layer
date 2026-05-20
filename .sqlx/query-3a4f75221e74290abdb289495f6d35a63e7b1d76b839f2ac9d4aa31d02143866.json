@@ -122,6 +122,11 @@
         "ordinal": 23,
         "name": "auto_topup_limit_notification_sent",
         "type_info": "Bool"
+      },
+      {
+        "ordinal": 24,
+        "name": "image_normalization_enabled",
+        "type_info": "Bool"
       }
     ],
     "parameters": {
@@ -153,6 +158,7 @@
       true,
       true,
       true,
+      false,
       false
     ]
   },

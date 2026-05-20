@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO deployed_models (id, model_name, alias, hosted_on, created_by) VALUES ($1, 'test-model', 'test-alias', $2, $3)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "7fd26a3153a47e16b86de4a9e1e8e2e013cf2a60c7e7b6156debbd8044439809"
+}

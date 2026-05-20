@@ -1172,6 +1172,10 @@ pub async fn build_router(
             "/models/{id}/components/{component_id}",
             delete(api::handlers::deployments::remove_model_component),
         )
+        // Image content store — short-lived signed URL for normalised
+        // image bytes the user has previously submitted. Authorisation
+        // is per-user via the image_access table.
+        .route("/images/{sha256}", get(api::handlers::images::get_image))
         // Groups management
         .route("/groups", get(api::handlers::groups::list_groups))
         .route("/groups", post(api::handlers::groups::create_group))

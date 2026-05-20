@@ -322,6 +322,7 @@ pub fn create_test_config() -> crate::config::Config {
         support_email: "support@test.com".to_string(),
         connections: Default::default(),
         responses: Default::default(),
+        image_normalizer: Default::default(),
     }
 }
 
@@ -469,6 +470,7 @@ pub async fn get_system_user(pool: &mut PgConnection) -> UserResponse {
         has_auto_topup_payment_method: false,
         auto_topup_monthly_limit: None,
         user_type: "individual".to_string(),
+        image_normalization_enabled: false,
         organizations: None,
         active_organization_id: None,
         onboarding_redirect_url: None,
@@ -655,6 +657,7 @@ pub async fn create_test_org(pool: &PgPool, created_by: UserId) -> UserResponse 
         has_auto_topup_payment_method: false,
         auto_topup_monthly_limit: None,
         user_type: org.user_type,
+        image_normalization_enabled: false,
         organizations: None,
         active_organization_id: None,
         onboarding_redirect_url: None,

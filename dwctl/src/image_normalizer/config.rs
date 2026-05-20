@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 /// Top-level image-normaliser configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ImageNormalizerConfig {
     /// Master switch. When false, the normaliser is replaced by a no-op
     /// at startup and the middleware passes all traffic through unchanged.
@@ -27,24 +27,14 @@ pub struct ImageNormalizerConfig {
     pub signing: SigningConfig,
 }
 
-impl Default for ImageNormalizerConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            backend: BackendConfig::default(),
-            fetcher: FetcherConfig::default(),
-            signing: SigningConfig::default(),
-        }
-    }
-}
-
 /// Object-store backend selection.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum BackendConfig {
     /// In-process bytes only. For tests and local development. Bytes are
     /// lost on restart; signed URLs are served by the dwctl process itself
     /// via the dashboard image endpoint.
+    #[default]
     Memory,
     /// Google Cloud Storage. Requires Workload Identity binding so the
     /// service account can write to the bucket and call `signBlob` for V4
@@ -54,12 +44,6 @@ pub enum BackendConfig {
         #[serde(default = "default_gcs_region")]
         region: String,
     },
-}
-
-impl Default for BackendConfig {
-    fn default() -> Self {
-        BackendConfig::Memory
-    }
 }
 
 fn default_gcs_region() -> String {

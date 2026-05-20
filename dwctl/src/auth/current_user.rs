@@ -84,6 +84,7 @@ async fn try_jwt_session_auth(
                     payment_provider_id: user.payment_provider_id,
                     organizations: vec![],
                     active_organization: None,
+                    image_normalization_enabled: false,
                 },
                 last_login,
             )));
@@ -236,6 +237,7 @@ async fn try_proxy_header_auth<P: sqlx_pool_router::PoolProvider + Clone + Send 
                         payment_provider_id: user.payment_provider_id,
                         organizations: vec![],
                         active_organization: None,
+                        image_normalization_enabled: false,
                     },
                     last_login,
                 ))
@@ -261,6 +263,7 @@ async fn try_proxy_header_auth<P: sqlx_pool_router::PoolProvider + Clone + Send 
                         payment_provider_id: user.payment_provider_id,
                         organizations: vec![],
                         active_organization: None,
+                        image_normalization_enabled: false,
                     },
                     last_login,
                 ))
@@ -428,6 +431,10 @@ async fn try_api_key_auth(parts: &axum::http::request::Parts, db: &PgPool) -> Op
             payment_provider_id: api_key_data.payment_provider_id,
             organizations: vec![],
             active_organization,
+            // API-key-derived current users don't expose the opt-in
+            // flag — it's surfaced by the dashboard session path that
+            // hits Users::get_by_id (which carries the real value).
+            image_normalization_enabled: false,
         },
         api_key_data.last_login,
     )))
@@ -1206,6 +1213,7 @@ mod tests {
             payment_provider_id: None,
             organizations: vec![],
             active_organization: None,
+            image_normalization_enabled: false,
         };
 
         let result = require_admin(admin_user);
@@ -1223,6 +1231,7 @@ mod tests {
             payment_provider_id: None,
             organizations: vec![],
             active_organization: None,
+            image_normalization_enabled: false,
         };
 
         let result = require_admin(regular_user);
@@ -1253,6 +1262,7 @@ mod tests {
             payment_provider_id: None,
             organizations: vec![],
             active_organization: None,
+            image_normalization_enabled: false,
         };
         let jwt_token = session::create_session_token(&current_user, &config).unwrap();
 
@@ -1285,6 +1295,7 @@ mod tests {
             auto_topup_amount: None,
             auto_topup_threshold: None,
             auto_topup_monthly_limit: None,
+        image_normalization_enabled: None,
         };
         users_repo.update(user.id, &update).await.unwrap();
 
@@ -1324,6 +1335,7 @@ mod tests {
             payment_provider_id: None,
             organizations: vec![],
             active_organization: None,
+            image_normalization_enabled: false,
         };
         let jwt_token = session::create_session_token(&current_user, &config).unwrap();
 

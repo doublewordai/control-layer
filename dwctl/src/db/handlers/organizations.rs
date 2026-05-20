@@ -111,7 +111,8 @@ impl<'c> Organizations<'c> {
                    is_admin, password_hash, external_user_id, payment_provider_id,
                    is_deleted, is_internal, batch_notifications_enabled, first_batch_email_sent,
                    low_balance_notification_sent, low_balance_threshold,
-                   auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, user_type
+                   auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, user_type,
+                   image_normalization_enabled
             FROM users
             WHERE username = $1 AND user_type = 'organization' AND is_deleted = false
             "#,
@@ -149,6 +150,7 @@ impl<'c> Organizations<'c> {
                     auto_topup_threshold: r.auto_topup_threshold,
                     auto_topup_monthly_limit: r.auto_topup_monthly_limit,
                     user_type: r.user_type,
+                    image_normalization_enabled: r.image_normalization_enabled,
                 }))
             }
             None => Ok(None),
@@ -174,7 +176,8 @@ impl<'c> Organizations<'c> {
                       is_admin, password_hash, external_user_id, payment_provider_id,
                       is_deleted, is_internal, batch_notifications_enabled, first_batch_email_sent,
                       low_balance_notification_sent, low_balance_threshold,
-                      auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, user_type
+                      auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, user_type,
+                      image_normalization_enabled
             "#,
             org_id,
             request.name,
@@ -232,6 +235,7 @@ impl<'c> Organizations<'c> {
             auto_topup_threshold: row.auto_topup_threshold,
             auto_topup_monthly_limit: row.auto_topup_monthly_limit,
             user_type: row.user_type,
+            image_normalization_enabled: row.image_normalization_enabled,
         })
     }
 
@@ -274,7 +278,8 @@ impl<'c> Organizations<'c> {
                       is_admin, password_hash, external_user_id, payment_provider_id,
                       batch_notifications_enabled, first_batch_email_sent,
                       low_balance_notification_sent, low_balance_threshold,
-                      auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, user_type
+                      auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, user_type,
+                      image_normalization_enabled
             "#,
             id,
             request.display_name,
@@ -315,6 +320,7 @@ impl<'c> Organizations<'c> {
             auto_topup_threshold: row.auto_topup_threshold,
             auto_topup_monthly_limit: row.auto_topup_monthly_limit,
             user_type: row.user_type,
+            image_normalization_enabled: row.image_normalization_enabled,
         })
     }
 
