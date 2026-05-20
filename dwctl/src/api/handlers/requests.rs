@@ -170,15 +170,26 @@ pub async fn aggregate_by_user<P: PoolProvider>(
     Ok(Json(usage_data))
 }
 
-/// Get the current user's batch usage metrics
+/// Get batch usage metrics for the current caller or a related user/org
 ///
 /// Returns batch usage including total tokens, costs, request/batch counts,
-/// and per-model breakdown. Only includes batched requests. Any authenticated user
-/// can access their own usage data.
+/// and per-model breakdown. The default target is:
+///
+/// - the caller's `active_organization` when set (so a member who has switched
+///   into an org context sees the org's aggregate rather than their personal
+///   usage), or
+/// - the caller's own user id otherwise.
+///
+/// Callers can pass `user_id` to drill into a specific subject:
+/// - their own id (always allowed),
+/// - their active org's id (always allowed for org members),
+/// - another member of their active org (only allowed for owners/admins of
+///   the org).
 ///
 /// When `start_date` and/or `end_date` are provided, queries http_analytics directly
 /// for the given range (capped at 180 days). Without date params, returns all-time
-/// stats from pre-aggregated tables. Both paths use a shared 60-minute cache.
+/// stats from pre-aggregated tables. Both paths use a shared 60-minute cache,
+/// scoped per target user.
 #[utoipa::path(
     get,
     path = "/admin/api/v1/usage",
@@ -186,6 +197,7 @@ pub async fn aggregate_by_user<P: PoolProvider>(
     responses(
         (status = 200, description = "User batch usage metrics", body = UserBatchUsageResponse),
         (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Caller is not allowed to view this user's usage"),
         (status = 500, description = "Internal server error"),
     ),
     tag = "usage",
@@ -204,6 +216,10 @@ pub async fn get_usage<P: PoolProvider>(
     let has_dates = query.start_date.is_some() || query.end_date.is_some();
     let refresh = query.refresh.unwrap_or(false);
 
+    // Resolve the target user *before* building the cache key — different
+    // targets must never share a cache entry.
+    let target_user_id = resolve_usage_target(&state, &current_user, query.user_id).await?;
+
     // Build cache key: truncate dates to midnight UTC so preset windows always hit cache.
     // Skip cache for ranges under 30 days — the data moves too fast to cache usefully.
     let (cache_key, use_cache) = if has_dates {
@@ -212,11 +228,11 @@ pub async fn get_usage<P: PoolProvider>(
         let span = end_date - start_date;
         let truncate = |dt: DateTime<Utc>| dt.date_naive().and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp();
         (
-            (current_user.id, Some(truncate(start_date)), Some(truncate(end_date))),
+            (target_user_id, Some(truncate(start_date)), Some(truncate(end_date))),
             span.num_days() >= 30,
         )
     } else {
-        ((current_user.id, None, None), true)
+        ((target_user_id, None, None), true)
     };
 
     if refresh {
@@ -234,8 +250,8 @@ pub async fn get_usage<P: PoolProvider>(
         let start_date = if start < max_start { max_start } else { start };
 
         tokio::try_join!(
-            get_user_batch_count_for_range(state.db.read(), current_user.id, start_date, end_date),
-            get_user_model_breakdown_for_range(state.db.read(), current_user.id, start_date, end_date),
+            get_user_batch_count_for_range(state.db.read(), target_user_id, start_date, end_date),
+            get_user_model_breakdown_for_range(state.db.read(), target_user_id, start_date, end_date),
             get_realtime_tariffs(state.db.read()),
         )?
     } else {
@@ -259,11 +275,11 @@ pub async fn get_usage<P: PoolProvider>(
         refresh_user_model_usage(state.db.write()).await?;
         if refresh {
             let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
-            Credits::new(&mut conn).aggregate_user_batches(current_user.id).await?;
+            Credits::new(&mut conn).aggregate_user_batches(target_user_id).await?;
         }
         let (batch_stats, by_model, tariffs) = tokio::try_join!(
-            get_user_batch_counts(state.db.read(), current_user.id),
-            get_user_model_breakdown(state.db.read(), current_user.id),
+            get_user_batch_counts(state.db.read(), target_user_id),
+            get_user_model_breakdown(state.db.read(), target_user_id),
             get_realtime_tariffs(state.db.read()),
         )?;
         (batch_stats.0, by_model, tariffs)
@@ -309,6 +325,61 @@ pub async fn get_usage<P: PoolProvider>(
     }
 
     Ok(Json(usage))
+}
+
+/// Resolve the `user_id` the `/usage` endpoint should aggregate against, with
+/// authorization. Mirrors the rules described on the route handler:
+///
+/// - When `requested` is `None`, fall back to the caller's active organization
+///   (so org-context callers see org-wide usage by default) and then to the
+///   caller's own id.
+/// - When `requested == current_user.id` or `requested == active_organization`
+///   (any role inside that org), pass it through.
+/// - Otherwise the request is only honored when the caller is an owner or
+///   admin of their active organization *and* the requested id is a member
+///   of that organization — that's the per-member drill-down case.
+async fn resolve_usage_target<P: PoolProvider>(
+    state: &AppState<P>,
+    current_user: &CurrentUser,
+    requested: Option<crate::types::UserId>,
+) -> Result<crate::types::UserId, Error> {
+    let default_target = current_user.active_organization.unwrap_or(current_user.id);
+    let Some(requested) = requested else {
+        return Ok(default_target);
+    };
+
+    if requested == current_user.id {
+        return Ok(requested);
+    }
+
+    let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+
+    // The active org itself is always queryable by any of its members.
+    if let Some(active_org) = current_user.active_organization
+        && requested == active_org
+    {
+        let mut repo = crate::db::handlers::Organizations::new(&mut conn);
+        if repo.get_user_org_role(current_user.id, active_org).await?.is_some() {
+            return Ok(requested);
+        }
+    }
+
+    // Drilling into another member's id requires owner/admin role on the
+    // active org *and* the requested id to be a member of it.
+    if let Some(active_org) = current_user.active_organization {
+        let mut repo = crate::db::handlers::Organizations::new(&mut conn);
+        let actor_role = repo.get_user_org_role(current_user.id, active_org).await?;
+        let target_role = repo.get_user_org_role(requested, active_org).await?;
+        if matches!(actor_role.as_deref(), Some("owner" | "admin")) && target_role.is_some() {
+            return Ok(requested);
+        }
+    }
+
+    Err(Error::InsufficientPermissions {
+        required: crate::types::Permission::Allow(crate::types::Resource::Requests, crate::types::Operation::ReadOwn),
+        action: crate::types::Operation::ReadOwn,
+        resource: format!("Usage for user {requested}"),
+    })
 }
 
 #[cfg(test)]
@@ -774,6 +845,168 @@ mod tests {
             .await;
 
         response.assert_status_ok();
+    }
+
+    /// Helper: insert an http_analytics row attributed to a specific user_id.
+    /// Used by usage-scope tests to seed distinct totals for an org vs a member.
+    async fn insert_analytics_for_user(pool: &PgPool, user_id: uuid::Uuid, prompt_tokens: i64, completion_tokens: i64) {
+        let correlation_id = CORRELATION_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
+        sqlx::query!(
+            r#"
+            INSERT INTO http_analytics (
+                instance_id, correlation_id, timestamp, uri, method, status_code, duration_ms,
+                model, prompt_tokens, completion_tokens, total_tokens, user_id
+            ) VALUES ($1, $2, $3, '/ai/chat/completions', 'POST', 200, 100, 'gpt-4', $4, $5, $6, $7)
+            "#,
+            uuid::Uuid::new_v4(),
+            correlation_id,
+            chrono::Utc::now() - chrono::Duration::minutes(5),
+            prompt_tokens,
+            completion_tokens,
+            prompt_tokens + completion_tokens,
+            user_id,
+        )
+        .execute(pool)
+        .await
+        .expect("Failed to insert test analytics row");
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_usage_defaults_to_active_organization(pool: PgPool) {
+        // Org-context callers should see the org's aggregate by default,
+        // not their personal usage.
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let org = crate::test::utils::create_test_org(&pool, user.id).await;
+
+        // Distinct seed amounts so we can verify which subject the handler hit.
+        insert_analytics_for_user(&pool, user.id, 100, 50).await;
+        insert_analytics_for_user(&pool, org.id, 1000, 500).await;
+
+        // `to_rfc3339()` would emit `+00:00`, and `+` in a query string is
+        // interpreted as a space by the standard parser — use the explicit
+        // `Z` suffix to keep the timestamp unambiguous.
+        let start = (Utc::now() - Duration::hours(1)).format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        let end = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        let url = format!("/admin/api/v1/usage?start_date={start}&end_date={end}");
+        let org_cookie = format!("dw_active_org={}", org.id);
+        let auth = add_auth_headers(&user);
+
+        let response = app
+            .get(&url)
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .add_header("cookie", &org_cookie)
+            .await;
+
+        response.assert_status_ok();
+        let body: UserBatchUsageResponse = response.json();
+        assert_eq!(
+            body.total_input_tokens, 1000,
+            "should return the org's tokens, not the human user's"
+        );
+        assert_eq!(body.total_output_tokens, 500);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_usage_user_id_filter_to_self(pool: PgPool) {
+        // Callers can always pass their own id to override the org-default
+        // and see their personal usage instead.
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let org = crate::test::utils::create_test_org(&pool, user.id).await;
+
+        insert_analytics_for_user(&pool, user.id, 100, 50).await;
+        insert_analytics_for_user(&pool, org.id, 1000, 500).await;
+
+        // `to_rfc3339()` would emit `+00:00`, and `+` in a query string is
+        // interpreted as a space by the standard parser — use the explicit
+        // `Z` suffix to keep the timestamp unambiguous.
+        let start = (Utc::now() - Duration::hours(1)).format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        let end = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        let url = format!("/admin/api/v1/usage?start_date={start}&end_date={end}&user_id={}", user.id);
+        let org_cookie = format!("dw_active_org={}", org.id);
+        let auth = add_auth_headers(&user);
+
+        let response = app
+            .get(&url)
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .add_header("cookie", &org_cookie)
+            .await;
+
+        response.assert_status_ok();
+        let body: UserBatchUsageResponse = response.json();
+        assert_eq!(body.total_input_tokens, 100);
+        assert_eq!(body.total_output_tokens, 50);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_usage_admin_can_filter_to_member(pool: PgPool) {
+        // Org admins / owners can drill into a specific member's id.
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let owner = create_test_user(&pool, Role::StandardUser).await;
+        let member = create_test_user(&pool, Role::StandardUser).await;
+        let org = crate::test::utils::create_test_org(&pool, owner.id).await;
+        crate::test::utils::add_org_member(&pool, org.id, member.id, "member").await;
+
+        insert_analytics_for_user(&pool, member.id, 25, 25).await;
+
+        // `to_rfc3339()` would emit `+00:00`, and `+` in a query string is
+        // interpreted as a space by the standard parser — use the explicit
+        // `Z` suffix to keep the timestamp unambiguous.
+        let start = (Utc::now() - Duration::hours(1)).format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        let end = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        let url = format!("/admin/api/v1/usage?start_date={start}&end_date={end}&user_id={}", member.id);
+        let org_cookie = format!("dw_active_org={}", org.id);
+        let auth = add_auth_headers(&owner);
+
+        let response = app
+            .get(&url)
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .add_header("cookie", &org_cookie)
+            .await;
+
+        response.assert_status_ok();
+        let body: UserBatchUsageResponse = response.json();
+        assert_eq!(body.total_input_tokens, 25);
+        assert_eq!(body.total_output_tokens, 25);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_usage_non_admin_cannot_filter_to_other_member(pool: PgPool) {
+        // Regular members can't see another member's usage even within the
+        // same org — the handler must 403.
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let owner = create_test_user(&pool, Role::StandardUser).await;
+        let member_a = create_test_user(&pool, Role::StandardUser).await;
+        let member_b = create_test_user(&pool, Role::StandardUser).await;
+        let org = crate::test::utils::create_test_org(&pool, owner.id).await;
+        crate::test::utils::add_org_member(&pool, org.id, member_a.id, "member").await;
+        crate::test::utils::add_org_member(&pool, org.id, member_b.id, "member").await;
+
+        // `to_rfc3339()` would emit `+00:00`, and `+` in a query string is
+        // interpreted as a space by the standard parser — use the explicit
+        // `Z` suffix to keep the timestamp unambiguous.
+        let start = (Utc::now() - Duration::hours(1)).format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        let end = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        let url = format!("/admin/api/v1/usage?start_date={start}&end_date={end}&user_id={}", member_b.id);
+        let org_cookie = format!("dw_active_org={}", org.id);
+        let auth = add_auth_headers(&member_a);
+
+        let response = app
+            .get(&url)
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .add_header("cookie", &org_cookie)
+            .await;
+
+        response.assert_status(axum::http::StatusCode::FORBIDDEN);
     }
 
     #[sqlx::test]
