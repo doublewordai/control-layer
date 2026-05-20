@@ -276,7 +276,7 @@ function createColumns(
   },
   {
     id: "actions",
-    header: () => <span className="sr-only">Actions</span>,
+    header: "Actions",
     enableHiding: false,
     cell: ({ row }) => (
       <div className="flex items-center justify-end gap-1">
