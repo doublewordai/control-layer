@@ -2060,6 +2060,70 @@ export const handlers = [
     }
   }),
 
+  // Open Responses API — the CreateAsyncModal posts here when "Create" is
+  // clicked. The real backend either returns 200 (priority/realtime) or 202
+  // (flex/background) with a Responses-shaped body; demo mode just needs the
+  // call to succeed so the toast fires and the requests list refreshes.
+  http.post("/admin/api/v1/ai/v1/responses", async ({ request }) => {
+    const body = await request.json();
+    const model = (body as any).model || "mock-model";
+    const input = (body as any).input || "";
+    const instructions = (body as any).instructions;
+    const serviceTier = (body as any).service_tier || "priority";
+    const isBackground = (body as any).background === true;
+
+    // Mirror the chat-completions mock so the rendered text is consistent
+    // with what the Playground would show for the same prompt.
+    const storedSettings = localStorage.getItem("app-settings");
+    let responseTemplate =
+      'This is a demo response in demo mode. You asked: "{userMessage}"';
+    if (storedSettings) {
+      try {
+        const settings = JSON.parse(storedSettings);
+        if (settings.demoConfig?.customResponse) {
+          responseTemplate = settings.demoConfig.customResponse;
+        }
+      } catch (e) {
+        console.error("Failed to parse settings:", e);
+      }
+    }
+    const outputText = responseTemplate.replace(/{userMessage}/g, input);
+
+    const responseBody = {
+      id: `resp_${Date.now()}`,
+      object: "response",
+      created_at: Math.floor(Date.now() / 1000),
+      model,
+      // Flex/background submissions return 202 with a queued status; priority
+      // submissions return 200 with a terminal status.
+      status: isBackground ? "queued" : "completed",
+      service_tier: serviceTier,
+      instructions: instructions ?? null,
+      input,
+      output_text: isBackground ? "" : outputText,
+      output: isBackground
+        ? []
+        : [
+            {
+              type: "message",
+              role: "assistant",
+              content: [{ type: "output_text", text: outputText }],
+            },
+          ],
+      usage: isBackground
+        ? null
+        : {
+            input_tokens: 10,
+            output_tokens: 15,
+            total_tokens: 25,
+          },
+    };
+
+    return HttpResponse.json(responseBody, {
+      status: isBackground ? 202 : 200,
+    });
+  }),
+
   // Embeddings
   http.post("/admin/api/v1/ai/v1/embeddings", async ({ request }) => {
     const body = await request.json();

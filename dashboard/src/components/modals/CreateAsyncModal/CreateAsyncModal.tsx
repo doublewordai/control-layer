@@ -114,8 +114,11 @@ export function CreateAsyncModal({
   const submitUrl = "/admin/api/v1/ai/v1/responses";
 
   const buildResponseBody = useCallback(() => {
-    // Key order matters for the rendered snippet — keep `instructions`
-    // adjacent to `model` so the JSON/Python/JS examples read naturally.
+    // Insertion order here only affects how the submitted JSON serialises on
+    // the wire (visible in the network panel / server logs) — `generateSnippet`
+    // builds each language's output line-by-line and doesn't iterate `body`,
+    // so the snippet's key order is independent of this. We still place
+    // `instructions` next to `model` so the on-wire body reads naturally.
     const body: Record<string, unknown> = {
       model: model || "model-name",
     };
@@ -313,9 +316,19 @@ curl ${baseUrl}/responses/YOUR_RESP_ID \\
 
       if (!res.ok) {
         const text = await res.text().catch(() => "");
-        if (res.status === 401 || res.status === 403) {
+        if (res.status === 401) {
+          // No / expired session — the user actually does need to sign in.
           throw new Error(
             "Your session was rejected — try signing in again and retrying",
+          );
+        }
+        if (res.status === 403) {
+          // Session is valid but the request was forbidden — could be lack of
+          // access to the chosen model, insufficient credits, etc. Surface the
+          // server's message so the real reason isn't hidden behind a generic
+          // "sign in again" prompt.
+          throw new Error(
+            `Forbidden: ${text.slice(0, 500) || res.statusText}`,
           );
         }
         throw new Error(
