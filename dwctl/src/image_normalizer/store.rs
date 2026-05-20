@@ -251,17 +251,15 @@ impl ImageStore for GcsStore {
         let key = Self::key(token);
         // The smallest GET we can do — start a read; if it succeeds, the
         // object exists. We immediately drop the response without reading
-        // the body. 404 → false; other errors → bubble up.
+        // the body. Typed 404 → false; any other error (auth failure,
+        // network, server error) → bubble up so misconfiguration can't be
+        // misread as a missing object (which would trigger a re-upload).
         match client.read_object(self.bucket_resource(), &key).send().await {
             Ok(_) => Ok(true),
-            Err(e) => {
-                let s = format!("{e}");
-                if s.contains("404") || s.to_ascii_lowercase().contains("not found") {
-                    Ok(false)
-                } else {
-                    Err(StoreError::Backend(format!("GCS exists {key}: {e}")))
-                }
-            }
+            Err(e) => match e.http_status_code() {
+                Some(404) => Ok(false),
+                _ => Err(StoreError::Backend(format!("GCS exists {key}: {e}"))),
+            },
         }
     }
 }

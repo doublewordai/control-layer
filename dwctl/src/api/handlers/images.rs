@@ -53,9 +53,11 @@ pub async fn get_image<P: PoolProvider + Clone + Send + Sync>(
     }
 
     // Authorise: this user must have a row in image_access for this hash.
-    // We pre-hash the sha256 hex to bytes for the BYTEA column.
+    // Use the PRIMARY pool — the access row is written by the realtime
+    // middleware / batch ingest path which also uses the primary, so any
+    // immediate "view what I just submitted" lookup avoids replica lag.
     let sha_bytes: Vec<u8> = token.0.to_vec();
-    let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+    let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let row = sqlx::query!(
         r#"
         SELECT 1 AS "exists!"
@@ -78,10 +80,11 @@ pub async fn get_image<P: PoolProvider + Clone + Send + Sync>(
         });
     }
 
-    // Build a fresh normaliser handle and sign for the dashboard TTL.
-    let normalizer = crate::image_normalizer::from_config(&config.image_normalizer);
+    // Use the AppState-bound normaliser singleton (built once at startup).
+    // Re-creating it per request would re-init the GCS client + ADC signer
+    // on every dashboard image load.
     let ttl = Duration::from_secs(config.image_normalizer.signing.dashboard_ttl_secs);
-    let signed = normalizer.sign(token, ttl).await.map_err(|e| {
+    let signed = state.image_normalizer.sign(token, ttl).await.map_err(|e| {
         warn!(error = %e, "image_normalizer.sign failed for dashboard view");
         Error::Internal {
             operation: format!("image signing failed: {e}"),

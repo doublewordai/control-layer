@@ -185,37 +185,45 @@ where
         // remain bounded. No-op when the normaliser is unset.
         if let Some(normalizer) = self.image_normalizer.clone() {
             let ttl = self.dispatch_ttl;
-            if let Ok(mut body_value) = serde_json::from_str::<serde_json::Value>(&request.data.body) {
-                let result = crate::image_normalizer::walker::substitute_with(
-                    &mut body_value,
-                    crate::image_normalizer::Mode::TokensOnly,
-                    |maybe_token| {
-                        let normalizer = Arc::clone(&normalizer);
-                        async move {
-                            let token: crate::image_normalizer::ImageToken = maybe_token
-                                .parse()
-                                .map_err(|e: crate::image_normalizer::TokenParseError| format!("invalid dw-img token: {e}"))?;
-                            let signed = normalizer.sign(token, ttl).await.map_err(|e| format!("sign failed: {e}"))?;
-                            Ok::<String, String>(signed.url)
-                        }
-                    },
-                )
-                .await;
-                match result {
-                    Ok(count) if count > 0 => match serde_json::to_string(&body_value) {
-                        Ok(new_body) => request.data.body = new_body,
-                        Err(e) => {
-                            return Err(fusillade::FusilladeError::Other(anyhow::anyhow!("re-serialise body after JIT signing: {e}")));
-                        }
-                    },
-                    Ok(_) => {} // no tokens found, leave body alone
-                    Err(e) => {
-                        return Err(fusillade::FusilladeError::Other(anyhow::anyhow!("JIT image-URL signing failed: {e}")));
+            // Fail loud if the body isn't parseable JSON. A row that
+            // contains `dw-img://` tokens by construction always has a
+            // JSON body; an unparseable body here means corruption, and
+            // silently dispatching the literal token to an upstream
+            // (which can't fetch a `dw-img://` URL) would manifest as a
+            // confusing upstream error far from the root cause.
+            let mut body_value: serde_json::Value =
+                serde_json::from_str(&request.data.body).map_err(|e| {
+                    fusillade::FusilladeError::Other(anyhow::anyhow!(
+                        "JIT image signing: request body is not valid JSON ({e}); refusing to dispatch with unresolved tokens"
+                    ))
+                })?;
+            let result = crate::image_normalizer::walker::substitute_with(
+                &mut body_value,
+                crate::image_normalizer::Mode::TokensOnly,
+                |maybe_token| {
+                    let normalizer = Arc::clone(&normalizer);
+                    async move {
+                        let token: crate::image_normalizer::ImageToken = maybe_token
+                            .parse()
+                            .map_err(|e: crate::image_normalizer::TokenParseError| format!("invalid dw-img token: {e}"))?;
+                        let signed = normalizer.sign(token, ttl).await.map_err(|e| format!("sign failed: {e}"))?;
+                        Ok::<String, String>(signed.url)
                     }
+                },
+            )
+            .await;
+            match result {
+                Ok(count) if count > 0 => match serde_json::to_string(&body_value) {
+                    Ok(new_body) => request.data.body = new_body,
+                    Err(e) => {
+                        return Err(fusillade::FusilladeError::Other(anyhow::anyhow!("re-serialise body after JIT signing: {e}")));
+                    }
+                },
+                Ok(_) => {} // no tokens found, leave body alone
+                Err(e) => {
+                    return Err(fusillade::FusilladeError::Other(anyhow::anyhow!("JIT image-URL signing failed: {e}")));
                 }
             }
-            // Non-JSON body: the existing parser at line 173 already
-            // tolerates non-JSON. Skip JIT signing the same way.
         }
 
         // Multi-step path is gated on the request's API path. fusillade's

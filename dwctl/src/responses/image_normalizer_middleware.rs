@@ -115,7 +115,16 @@ pub async fn image_normalizer_middleware(
         Ok(b) => b,
         Err(e) => {
             warn!(error = %e, "Failed to read request body in image_normalizer middleware");
-            return (StatusCode::BAD_REQUEST, "Failed to read request body").into_response();
+            // Match the structured error shape used elsewhere so
+            // OpenAI-compatible clients can parse it.
+            let body = serde_json::json!({
+                "error": {
+                    "message": format!("failed to read request body: {e}"),
+                    "type": "invalid_request_error",
+                    "code": "body_read_failed",
+                }
+            });
+            return (StatusCode::BAD_REQUEST, axum::Json(body)).into_response();
         }
     };
 
@@ -185,7 +194,14 @@ pub async fn image_normalizer_middleware(
             Ok(b) => b,
             Err(e) => {
                 warn!(error = %e, "Failed to re-serialise body after image normalisation");
-                return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to re-serialise request body").into_response();
+                let body = serde_json::json!({
+                    "error": {
+                        "message": format!("failed to re-serialise request body: {e}"),
+                        "type": "internal_error",
+                        "code": "body_reserialize_failed",
+                    }
+                });
+                return (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(body)).into_response();
             }
         };
         // Keep Content-Length consistent with the new body so any
@@ -297,9 +313,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn passes_through_when_only_data_uri_in_http_only_mode() {
-        // HttpOnly mode is the default for the realtime middleware; data:
-        // URIs must pass through untouched.
+    async fn substitutes_data_uri_with_signed_url_in_all_mode() {
+        // The realtime middleware runs `Mode::All` in production. Data
+        // URIs should be substituted with a signed URL pointing at the
+        // store (a local `http://test.local/dw-img/<hex>` URL when the
+        // backing store is `MemoryStore`).
         let router = build_router(state_for_tests());
         let (status, echoed) = post_json(
             router,
@@ -314,10 +332,13 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(
-            echoed["messages"][0]["content"][0]["image_url"]["url"],
-            TINY_PNG_DATA_URI,
-            "data: URI should pass through HttpOnly mode",
+        let substituted = echoed["messages"][0]["content"][0]["image_url"]["url"]
+            .as_str()
+            .expect("image_url.url should still be a string");
+        assert_ne!(substituted, TINY_PNG_DATA_URI, "data: URI should be substituted, not passed through");
+        assert!(
+            substituted.starts_with("http://test.local/dw-img/"),
+            "expected MemoryStore-backed signed URL, got: {substituted}",
         );
     }
 

@@ -301,6 +301,11 @@ where
     /// wiring; the GET /v1/responses/{id} handler degrades to 404 in
     /// that case rather than panicking.
     pub response_step_manager: Option<Arc<fusillade::PostgresResponseStepManager<P>>>,
+    /// Singleton image normaliser used by the realtime middleware, the
+    /// batch ingest path, the dispatcher's JIT-signing step, and the
+    /// dashboard `/images/:sha256` endpoint. Built once at startup so
+    /// the GCS client + ADC signer are not re-initialised per request.
+    pub image_normalizer: Arc<dyn crate::image_normalizer::ImageNormalizer>,
 }
 
 impl<P> AppState<P>
@@ -1409,7 +1414,8 @@ pub async fn build_router(
     // the body before the request reaches onwards.
     let onwards_router = {
         let cfg = state.current_config();
-        let normalizer = crate::image_normalizer::from_config(&cfg.image_normalizer);
+        // Re-use the AppState-bound singleton built once at startup.
+        let normalizer = state.image_normalizer.clone();
         let realtime_ttl = cfg.image_normalizer.signing.realtime_ttl();
         let image_normalizer_state = crate::responses::image_normalizer_middleware::ImageNormalizerMiddlewareState {
             normalizer,
@@ -2624,6 +2630,15 @@ impl Application {
         let response_store =
             Arc::new(crate::responses::store::FusilladeResponseStore::new(request_manager.clone()).with_step_manager(step_manager.clone()));
 
+        // Build the image normaliser ONCE — fail loud at startup if
+        // `image_normalizer.enabled = true` but no backend is configured.
+        // This single instance is threaded through the processor builder,
+        // the realtime middleware, the batch ingest handler, and the
+        // dashboard image-view handler via AppState — never reconstructed
+        // per request.
+        let image_normalizer =
+            crate::image_normalizer::from_config(&config.image_normalizer).map_err(|e| anyhow::anyhow!("image normaliser config: {e}"))?;
+
         // Build the multi-step processor's dependencies. These also end
         // up wired into the responses middleware state below; cloning
         // them is cheap (Arc + reqwest::Client share their internal
@@ -2657,12 +2672,6 @@ impl Application {
                 Arc::new(crate::responses::processor::DbToolResolver {
                     pool: (*db_pools).write().clone(),
                 });
-            // Build a single normaliser instance shared across processor
-            // attempts and middleware. Disabled mode returns the no-op
-            // normaliser; `with_image_normalizer` still wires it in so
-            // the JIT walker no-ops cleanly on missing tokens rather
-            // than branching at the per-request site.
-            let image_normalizer = crate::image_normalizer::from_config(&config.image_normalizer);
             // Derive dispatch TTL from the batch daemon's processing timeout so
             // the signed URL is always valid for at least one full dispatch
             // attempt — never the cause of a batch failure on its own.
@@ -2676,7 +2685,9 @@ impl Application {
             )
             .with_tool_resolver(tool_resolver);
             if config.image_normalizer.enabled {
-                processor_builder = processor_builder.with_image_normalizer(image_normalizer, dispatch_ttl);
+                // Re-use the AppState-bound singleton built above; no second
+                // GCS client / ADC signer init.
+                processor_builder = processor_builder.with_image_normalizer(image_normalizer.clone(), dispatch_ttl);
             }
             let processor = Arc::new(processor_builder);
             Some(
@@ -2862,6 +2873,7 @@ impl Application {
             .maybe_connections_encryption_key(bg_services.connections_encryption_key.clone())
             .response_store(response_store)
             .response_step_manager(bg_services.step_manager.clone())
+            .image_normalizer(image_normalizer)
             .build();
 
         if let Some(config_path) = config_path {

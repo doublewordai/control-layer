@@ -6,6 +6,10 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 /// Top-level image-normaliser configuration.
+///
+/// Default = disabled with no backend; safe for builds and tests where
+/// the feature is off. When `enabled` is set to true, `backend` MUST be
+/// configured — see `from_config` for the explicit error.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ImageNormalizerConfig {
     /// Master switch. When false, the normaliser is replaced by a no-op
@@ -15,8 +19,10 @@ pub struct ImageNormalizerConfig {
 
     /// Object store backend. Choose `memory` for local development and
     /// integration tests (bytes held in-process only); `gcs` for production.
-    #[serde(default)]
-    pub backend: BackendConfig,
+    /// Required when `enabled` is true; there is intentionally no default
+    /// so a misconfigured prod deployment can't silently fall back to
+    /// in-process memory (which loses bytes on restart and across replicas).
+    pub backend: Option<BackendConfig>,
 
     /// Hardened-fetcher policy.
     #[serde(default)]
@@ -28,13 +34,13 @@ pub struct ImageNormalizerConfig {
 }
 
 /// Object-store backend selection.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum BackendConfig {
     /// In-process bytes only. For tests and local development. Bytes are
     /// lost on restart; signed URLs are served by the dwctl process itself
-    /// via the dashboard image endpoint.
-    #[default]
+    /// via the dashboard image endpoint. Intentionally NOT the default —
+    /// operators must opt in explicitly (and never use this in production).
     Memory,
     /// Google Cloud Storage. Requires Workload Identity binding so the
     /// service account can write to the bucket and call `signBlob` for V4
@@ -174,10 +180,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_disabled_with_memory_backend() {
+    fn defaults_disabled_with_no_backend() {
         let c = ImageNormalizerConfig::default();
         assert!(!c.enabled);
-        assert!(matches!(c.backend, BackendConfig::Memory));
+        assert!(c.backend.is_none(), "no default backend — must be set explicitly when enabled");
     }
 
     #[test]
@@ -196,10 +202,10 @@ mod tests {
         // dwctl's broader Figment-based config tests.
         let cfg = ImageNormalizerConfig {
             enabled: true,
-            backend: BackendConfig::Gcs {
+            backend: Some(BackendConfig::Gcs {
                 bucket: "my-bucket".to_string(),
                 region: "europe-west4".to_string(),
-            },
+            }),
             fetcher: FetcherConfig {
                 max_bytes: 1_048_576,
                 timeout_secs: 10,
@@ -219,7 +225,7 @@ mod tests {
         let back: ImageNormalizerConfig = serde_json::from_str(&json).expect("deserialize");
         assert!(back.enabled);
         match back.backend {
-            BackendConfig::Gcs { ref bucket, .. } => assert_eq!(bucket, "my-bucket"),
+            Some(BackendConfig::Gcs { ref bucket, .. }) => assert_eq!(bucket, "my-bucket"),
             _ => panic!("expected gcs backend"),
         }
         assert_eq!(back.fetcher.max_bytes, 1_048_576);

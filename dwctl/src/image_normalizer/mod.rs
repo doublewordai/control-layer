@@ -197,13 +197,24 @@ impl<S: ImageStore + 'static> ImageNormalizer for DefaultImageNormalizer<S> {
 /// Build a normaliser from config. Returns a boxed trait object so callers
 /// can hold it as `Arc<dyn ImageNormalizer>` regardless of backend choice.
 ///
-/// When the GCS backend lands properly, this is the single switch point
-/// — no other code needs to change.
-pub fn from_config(cfg: &ImageNormalizerConfig) -> Arc<dyn ImageNormalizer> {
+/// The returned `Arc` is **the single shared instance** for the process —
+/// callers must hold and clone it (e.g. from `AppState`), not re-build it
+/// per request. Rebuilding per request would re-init the GCS client + ADC
+/// signer on every dashboard image load, which hammers the GCP metadata
+/// server and creates a new mTLS connection each time.
+///
+/// Returns an error if `enabled = true` but no backend is configured —
+/// silently falling back to `MemoryStore` in production would lose bytes
+/// on restart and across replicas.
+pub fn from_config(cfg: &ImageNormalizerConfig) -> Result<Arc<dyn ImageNormalizer>, anyhow::Error> {
     if !cfg.enabled {
-        return Arc::new(DisabledNormalizer);
+        return Ok(Arc::new(DisabledNormalizer));
     }
-    match &cfg.backend {
+    let backend = cfg
+        .backend
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("image_normalizer.enabled = true but image_normalizer.backend is not set"))?;
+    Ok(match backend {
         BackendConfig::Memory => {
             let store = Arc::new(MemoryStore::new());
             Arc::new(DefaultImageNormalizer::new(cfg.fetcher.clone(), store))
@@ -212,7 +223,7 @@ pub fn from_config(cfg: &ImageNormalizerConfig) -> Arc<dyn ImageNormalizer> {
             let store = Arc::new(store::GcsStore::new(bucket.clone(), region.clone()));
             Arc::new(DefaultImageNormalizer::new(cfg.fetcher.clone(), store))
         }
-    }
+    })
 }
 
 #[cfg(test)]
@@ -263,20 +274,38 @@ mod tests {
     #[test]
     fn from_config_disabled_returns_disabled_normalizer() {
         let cfg = ImageNormalizerConfig::default();
-        let n = from_config(&cfg);
         // Smoke check: ensure we got *something*; the disabled-error
         // behaviour is exercised in `disabled_normalizer_errors_predictably`.
-        let _: Arc<dyn ImageNormalizer> = n;
+        let _: Arc<dyn ImageNormalizer> = from_config(&cfg).expect("disabled config must build cleanly");
     }
 
     #[test]
     fn from_config_memory_backend_when_enabled() {
         let cfg = ImageNormalizerConfig {
             enabled: true,
-            backend: BackendConfig::Memory,
+            backend: Some(BackendConfig::Memory),
             fetcher: FetcherConfig::default(),
             signing: SigningConfig::default(),
         };
-        let _: Arc<dyn ImageNormalizer> = from_config(&cfg);
+        let _: Arc<dyn ImageNormalizer> = from_config(&cfg).expect("memory backend must build");
+    }
+
+    #[test]
+    fn from_config_enabled_without_backend_errors() {
+        let cfg = ImageNormalizerConfig {
+            enabled: true,
+            backend: None,
+            fetcher: FetcherConfig::default(),
+            signing: SigningConfig::default(),
+        };
+        // Manual match because the Ok arm holds `Arc<dyn ImageNormalizer>`
+        // which doesn't implement Debug (required by `expect_err`).
+        match from_config(&cfg) {
+            Ok(_) => panic!("enabled + no backend must error"),
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(msg.contains("backend"), "error should mention 'backend': {msg}");
+            }
+        }
     }
 }

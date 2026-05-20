@@ -305,13 +305,34 @@ impl std::fmt::Debug for FileStreamConfig {
 /// via the dashboard endpoint. No-op when the normaliser is unset or the
 /// body is not valid JSON (the existing line parser would already have
 /// rejected non-JSON).
+/// Returned by `normalize_template_body_in_place` so the caller can map
+/// transient/store errors to a different `FileUploadError` than a real
+/// "bad input" — important for user-facing messaging (transient outages
+/// should not surface as "fix your file").
+#[derive(Debug)]
+enum BatchNormalizeError {
+    /// User-supplied URL/data was unacceptable (bad scheme, denied IP,
+    /// MIME mismatch, oversized, malformed). Surface as a validation
+    /// error.
+    BadInput(String),
+    /// Upstream fetch failed in a way that isn't worth a retry from the
+    /// client (e.g. origin 4xx). Surface as a fetch failure.
+    FetchFailed(String),
+    /// Transient: timed out or origin 5xx after the configured retries.
+    /// Surface as a "try again" so users aren't told to fix their file.
+    Transient(String),
+    /// The content store itself failed (GCS unreachable, IAM error).
+    /// Surface as "service unavailable".
+    StoreFailed(String),
+}
+
 async fn normalize_template_body_in_place(
     normalizer: Option<&Arc<dyn ImageNormalizer>>,
     mode: ImageNormalizerMode,
     template: &mut fusillade::RequestTemplateInput,
     access_pool: Option<&sqlx::PgPool>,
     access_user_id: Option<uuid::Uuid>,
-) -> std::result::Result<(), String> {
+) -> std::result::Result<(), BatchNormalizeError> {
     let Some(normalizer) = normalizer else {
         return Ok(());
     };
@@ -319,25 +340,60 @@ async fn normalize_template_body_in_place(
         Ok(v) => v,
         Err(_) => return Ok(()), // non-JSON body — let existing handling deal with it
     };
-    let count = image_walker::substitute_with(&mut body_value, mode, |url| {
+    // Async closures can't propagate enum errors cleanly through the
+    // walker's `Result<String, E>` shape, so we route the variant via a
+    // shared cell — set once on first failure, returned to the caller.
+    let err_cell: std::sync::Mutex<Option<BatchNormalizeError>> = std::sync::Mutex::new(None);
+    let walker_result = image_walker::substitute_with(&mut body_value, mode, |url| {
         let normalizer = Arc::clone(normalizer);
         let access_pool = access_pool.cloned();
+        let err_cell = &err_cell;
         let is_data_uri = url.starts_with("data:");
         async move {
             let input = if is_data_uri { ImageInput::DataUri(url) } else { ImageInput::HttpUrl(url) };
-            let token = normalizer.ingest(input).await.map_err(|e| e.to_string())?;
-            if let (Some(pool), Some(uid)) = (access_pool, access_user_id) {
-                // Fire-and-forget bookkeeping; non-fatal.
-                tokio::spawn(async move {
-                    crate::api::handlers::images::record_image_access(&pool, uid, token, "", 0).await;
-                });
+            match normalizer.ingest(input).await {
+                Ok(token) => {
+                    if let (Some(pool), Some(uid)) = (access_pool, access_user_id) {
+                        // Batch ingest is already async (file upload latency dominates),
+                        // so we AWAIT the bookkeeping write rather than fire-and-forget —
+                        // the user's later "view what I submitted" lookup depends on it.
+                        crate::api::handlers::images::record_image_access(&pool, uid, token, "", 0).await;
+                    }
+                    Ok::<String, ()>(token.to_dw_img_uri())
+                }
+                Err(e) => {
+                    let mapped = match e {
+                        crate::image_normalizer::NormalizeError::BadInput(m) => BatchNormalizeError::BadInput(m),
+                        crate::image_normalizer::NormalizeError::FetchFailed(m) => BatchNormalizeError::FetchFailed(m),
+                        crate::image_normalizer::NormalizeError::Transient(m) => BatchNormalizeError::Transient(m),
+                        crate::image_normalizer::NormalizeError::StoreFailed(m) => BatchNormalizeError::StoreFailed(m),
+                        crate::image_normalizer::NormalizeError::NotFound => BatchNormalizeError::StoreFailed("image token not found in store".to_string()),
+                    };
+                    if let Ok(mut g) = err_cell.lock()
+                        && g.is_none()
+                    {
+                        *g = Some(mapped);
+                    }
+                    // Bubble up a sentinel so the walker stops; the real
+                    // error lives in `err_cell`.
+                    Err(())
+                }
             }
-            Ok::<String, String>(token.to_dw_img_uri())
         }
     })
-    .await?;
+    .await;
+    if walker_result.is_err() {
+        // Unwrap the variant set by the closure above.
+        let e = err_cell
+            .into_inner()
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| BatchNormalizeError::StoreFailed("unknown normalisation error".into()));
+        return Err(e);
+    }
+    let count = walker_result.expect("walker_result is Ok by control flow above");
     if count > 0 {
-        template.body = serde_json::to_string(&body_value).map_err(|e| format!("re-serialise after image normalisation: {e}"))?;
+        template.body = serde_json::to_string(&body_value).map_err(|e| BatchNormalizeError::StoreFailed(format!("re-serialise after image normalisation: {e}")))?;
     }
     Ok(())
 }
@@ -364,6 +420,26 @@ enum FileUploadError {
     ModelAccessDenied { model: String, line: u64 },
     /// Per-line validation error (custom_id, method, url, etc.)
     ValidationError { line: u64, message: String },
+    /// Image normalisation transient failure (origin timeout / 5xx after
+    /// retries, GCS network blip). Surface as 503 so the client retries
+    /// rather than thinking the file is malformed.
+    ImageTransient { line: u64, message: String },
+    /// Image normaliser content-store backend failed (GCS unreachable,
+    /// IAM error). 502/503 territory; not the user's fault.
+    ImageStoreFailed { line: u64, message: String },
+}
+
+/// Map a `BatchNormalizeError` variant to the `FileUploadError` that
+/// gives the user the right action: "fix your file" vs. "try again" vs.
+/// "service issue".
+fn map_batch_normalize_error(e: BatchNormalizeError, line: u64) -> FileUploadError {
+    match e {
+        BatchNormalizeError::BadInput(message) | BatchNormalizeError::FetchFailed(message) => {
+            FileUploadError::ValidationError { line, message }
+        }
+        BatchNormalizeError::Transient(message) => FileUploadError::ImageTransient { line, message },
+        BatchNormalizeError::StoreFailed(message) => FileUploadError::ImageStoreFailed { line, message },
+    }
 }
 
 impl FileUploadError {
@@ -416,6 +492,12 @@ impl FileUploadError {
             },
             FileUploadError::ValidationError { line, message } => Error::BadRequest {
                 message: format!("Line {}: {}", line, message),
+            },
+            FileUploadError::ImageTransient { line, message } => Error::Internal {
+                operation: format!("Line {}: image fetch failed after retries (try again): {}", line, message),
+            },
+            FileUploadError::ImageStoreFailed { line, message } => Error::Internal {
+                operation: format!("Line {}: image content store unavailable: {}", line, message),
             },
         }
     }
@@ -715,10 +797,7 @@ fn create_file_stream(
                                                     // replaces (potentially large) HTTP URLs with
                                                     // short opaque tokens — bodies usually shrink.
                                                     if let Err(e) = normalize_template_body_in_place(normalizer.as_ref(), normalizer_mode, &mut template, access_pool.as_ref(), access_user_id).await {
-                                                        abort!(FileUploadError::ValidationError {
-                                                            line: line_count + 1,
-                                                            message: format!("image input normalisation failed: {e}"),
-                                                        });
+                                                        abort!(map_batch_normalize_error(e, line_count + 1));
                                                     }
 
                                                     // Check per-request body size limit (0 = unlimited)
@@ -807,10 +886,7 @@ fn create_file_stream(
                                         Ok(mut template) => {
                                             // Normalise image URLs in the trailing line as well.
                                             if let Err(e) = normalize_template_body_in_place(normalizer.as_ref(), normalizer_mode, &mut template, access_pool.as_ref(), access_user_id).await {
-                                                abort!(FileUploadError::ValidationError {
-                                                    line: line_count + 1,
-                                                    message: format!("image input normalisation failed: {e}"),
-                                                });
+                                                abort!(map_batch_normalize_error(e, line_count + 1));
                                             }
 
                                             // Check per-request body size limit (0 = unlimited)
@@ -955,11 +1031,12 @@ pub async fn upload_file<P: PoolProvider>(
     let target_user_id = current_user.active_organization.unwrap_or(current_user.id);
     let uploaded_by = Some(target_user_id.to_string());
 
-    // Build the image normaliser handle for the batch ingest path. The
-    // dispatcher will JIT-resign any `dw-img://` tokens produced here with
-    // a fresh short-lived signed URL before sending to the provider.
+    // Re-use the AppState-bound normaliser singleton (built once at
+    // startup). The dispatcher will JIT-resign any `dw-img://` tokens
+    // produced here with a fresh short-lived signed URL before sending
+    // to the provider.
     let normalizer = if config.image_normalizer.enabled {
-        Some(crate::image_normalizer::from_config(&config.image_normalizer))
+        Some(state.image_normalizer.clone())
     } else {
         None
     };
