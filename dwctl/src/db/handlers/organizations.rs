@@ -589,33 +589,47 @@ impl<'c> Organizations<'c> {
     /// constraint, so `ON CONFLICT` ensures that at most one pending change
     /// exists per org and that older verification tokens are invalidated the
     /// instant a new one is accepted — without a read-then-write race
-    /// window.
-    #[instrument(skip(self, token_hash), fields(org_id = %abbrev_uuid(&org_id)), err)]
+    /// window. The `created_at` reset and the cleared `*_confirmed_at`
+    /// columns guarantee that a superseded change never finalizes using a
+    /// confirmation that was recorded against the previous (now-replaced)
+    /// row.
+    #[instrument(
+        skip(self, new_email_token_hash, old_email_token_hash),
+        fields(org_id = %abbrev_uuid(&org_id)),
+        err,
+    )]
     pub async fn upsert_pending_email_change(
         &mut self,
         org_id: UserId,
         new_email: &str,
         requested_by: UserId,
-        token_hash: &str,
+        new_email_token_hash: &str,
+        old_email_token_hash: &str,
         expires_at: DateTime<Utc>,
     ) -> Result<PendingOrgEmailChangeDBResponse> {
         let row = sqlx::query!(
             r#"
             INSERT INTO pending_org_email_changes
-                (organization_id, new_email, requested_by, token_hash, expires_at)
-            VALUES ($1, $2, $3, $4, $5)
+                (organization_id, new_email, requested_by, new_email_token_hash, old_email_token_hash, expires_at)
+            VALUES ($1, $2, $3, $4, $5, $6)
             ON CONFLICT (organization_id) DO UPDATE SET
                 new_email = EXCLUDED.new_email,
                 requested_by = EXCLUDED.requested_by,
-                token_hash = EXCLUDED.token_hash,
+                new_email_token_hash = EXCLUDED.new_email_token_hash,
+                old_email_token_hash = EXCLUDED.old_email_token_hash,
+                new_email_confirmed_at = NULL,
+                old_email_confirmed_at = NULL,
                 expires_at = EXCLUDED.expires_at,
                 created_at = NOW()
-            RETURNING id, organization_id, new_email, requested_by, created_at, expires_at
+            RETURNING id, organization_id, new_email, requested_by,
+                      new_email_confirmed_at, old_email_confirmed_at,
+                      created_at, expires_at
             "#,
             org_id,
             new_email,
             requested_by,
-            token_hash,
+            new_email_token_hash,
+            old_email_token_hash,
             expires_at,
         )
         .fetch_one(&mut *self.db)
@@ -626,32 +640,35 @@ impl<'c> Organizations<'c> {
             organization_id: row.organization_id,
             new_email: row.new_email,
             requested_by: row.requested_by,
+            new_email_confirmed_at: row.new_email_confirmed_at,
+            old_email_confirmed_at: row.old_email_confirmed_at,
             created_at: row.created_at,
             expires_at: row.expires_at,
         })
     }
 
-    /// Atomically consume a pending email change by token hash.
+    /// Mark the new-email side of the pending change as confirmed.
     ///
-    /// The row is deleted as part of the lookup so two concurrent confirmations
-    /// can't both succeed. We additionally join against `users` and require
-    /// `is_deleted = false`, which prevents a pending row from being used to
-    /// change the contact email of a soft-deleted organization (the `ON DELETE
-    /// CASCADE` foreign key only fires on hard deletes, and orgs are soft-
-    /// deleted in this codebase).
-    ///
-    /// The caller still needs to verify `expires_at` against the current time
-    /// before applying the change.
+    /// Atomic update with the same hardening as the confirm-side lookups:
+    /// joins `users` and requires `is_deleted = false`, blocks
+    /// already-confirmed and expired tokens. Returns the freshly-updated row
+    /// (including both `*_confirmed_at` timestamps so the caller can check
+    /// if the change is now ready to apply), or `None` if no row matched.
     #[instrument(skip(self, token_hash), err)]
-    pub async fn consume_pending_email_change(&mut self, token_hash: &str) -> Result<Option<PendingOrgEmailChangeDBResponse>> {
+    pub async fn confirm_new_email_side(&mut self, token_hash: &str) -> Result<Option<PendingOrgEmailChangeDBResponse>> {
         let row = sqlx::query!(
             r#"
-            DELETE FROM pending_org_email_changes p
-            USING users u
-            WHERE p.token_hash = $1
+            UPDATE pending_org_email_changes p
+            SET new_email_confirmed_at = NOW()
+            FROM users u
+            WHERE p.new_email_token_hash = $1
+              AND p.new_email_confirmed_at IS NULL
+              AND p.expires_at > NOW()
               AND p.organization_id = u.id
               AND u.is_deleted = false
-            RETURNING p.id, p.organization_id, p.new_email, p.requested_by, p.created_at, p.expires_at
+            RETURNING p.id, p.organization_id, p.new_email, p.requested_by,
+                      p.new_email_confirmed_at, p.old_email_confirmed_at,
+                      p.created_at, p.expires_at
             "#,
             token_hash,
         )
@@ -663,9 +680,58 @@ impl<'c> Organizations<'c> {
             organization_id: r.organization_id,
             new_email: r.new_email,
             requested_by: r.requested_by,
+            new_email_confirmed_at: r.new_email_confirmed_at,
+            old_email_confirmed_at: r.old_email_confirmed_at,
             created_at: r.created_at,
             expires_at: r.expires_at,
         }))
+    }
+
+    /// Mark the old-email side of the pending change as confirmed.
+    /// Symmetric to [`Self::confirm_new_email_side`].
+    #[instrument(skip(self, token_hash), err)]
+    pub async fn confirm_old_email_side(&mut self, token_hash: &str) -> Result<Option<PendingOrgEmailChangeDBResponse>> {
+        let row = sqlx::query!(
+            r#"
+            UPDATE pending_org_email_changes p
+            SET old_email_confirmed_at = NOW()
+            FROM users u
+            WHERE p.old_email_token_hash = $1
+              AND p.old_email_confirmed_at IS NULL
+              AND p.expires_at > NOW()
+              AND p.organization_id = u.id
+              AND u.is_deleted = false
+            RETURNING p.id, p.organization_id, p.new_email, p.requested_by,
+                      p.new_email_confirmed_at, p.old_email_confirmed_at,
+                      p.created_at, p.expires_at
+            "#,
+            token_hash,
+        )
+        .fetch_optional(&mut *self.db)
+        .await?;
+
+        Ok(row.map(|r| PendingOrgEmailChangeDBResponse {
+            id: r.id,
+            organization_id: r.organization_id,
+            new_email: r.new_email,
+            requested_by: r.requested_by,
+            new_email_confirmed_at: r.new_email_confirmed_at,
+            old_email_confirmed_at: r.old_email_confirmed_at,
+            created_at: r.created_at,
+            expires_at: r.expires_at,
+        }))
+    }
+
+    /// Delete a pending email change row by id. Used by the confirm
+    /// handler once both sides are confirmed and the change has been
+    /// applied to `users.email` — both operations must run inside the
+    /// same transaction so a failure in either rolls back the other.
+    #[instrument(skip(self), err)]
+    pub async fn delete_pending_email_change(&mut self, id: Uuid) -> Result<bool> {
+        let result = sqlx::query!("DELETE FROM pending_org_email_changes WHERE id = $1", id)
+            .execute(&mut *self.db)
+            .await?;
+        Ok(result.rows_affected() > 0)
     }
 }
 
@@ -917,16 +983,13 @@ mod tests {
             .unwrap();
 
         let updated = orgs
-            .update(
-                org.id,
-                &OrganizationUpdateDBRequest {
-                    display_name: Some("New Acme Name".to_string()),
-                    avatar_url: None,
-                    email: Some("new@acme.example.com".to_string()),
-                    batch_notifications_enabled: None,
-                    low_balance_threshold: None,
-                },
-            )
+            .update(org.id, &OrganizationUpdateDBRequest {
+                display_name: Some("New Acme Name".to_string()),
+                avatar_url: None,
+                email: Some("new@acme.example.com".to_string()),
+                batch_notifications_enabled: None,
+                low_balance_threshold: None,
+            })
             .await
             .unwrap();
 
@@ -959,16 +1022,13 @@ mod tests {
 
         // Update only email, leave display_name unchanged
         let updated = orgs
-            .update(
-                org.id,
-                &OrganizationUpdateDBRequest {
-                    display_name: None,
-                    avatar_url: None,
-                    email: Some("new@acme.example.com".to_string()),
-                    batch_notifications_enabled: None,
-                    low_balance_threshold: None,
-                },
-            )
+            .update(org.id, &OrganizationUpdateDBRequest {
+                display_name: None,
+                avatar_url: None,
+                email: Some("new@acme.example.com".to_string()),
+                batch_notifications_enabled: None,
+                low_balance_threshold: None,
+            })
             .await
             .unwrap();
 
@@ -1004,16 +1064,13 @@ mod tests {
 
         // Enable notifications and set threshold
         let updated = orgs
-            .update(
-                org.id,
-                &OrganizationUpdateDBRequest {
-                    display_name: None,
-                    avatar_url: None,
-                    email: None,
-                    batch_notifications_enabled: Some(true),
-                    low_balance_threshold: Some(Some(10.0)),
-                },
-            )
+            .update(org.id, &OrganizationUpdateDBRequest {
+                display_name: None,
+                avatar_url: None,
+                email: None,
+                batch_notifications_enabled: Some(true),
+                low_balance_threshold: Some(Some(10.0)),
+            })
             .await
             .unwrap();
 
@@ -1023,16 +1080,13 @@ mod tests {
 
         // Partial update: change threshold only, notifications stay enabled
         let updated = orgs
-            .update(
-                org.id,
-                &OrganizationUpdateDBRequest {
-                    display_name: None,
-                    avatar_url: None,
-                    email: None,
-                    batch_notifications_enabled: None,
-                    low_balance_threshold: Some(Some(25.0)),
-                },
-            )
+            .update(org.id, &OrganizationUpdateDBRequest {
+                display_name: None,
+                avatar_url: None,
+                email: None,
+                batch_notifications_enabled: None,
+                low_balance_threshold: Some(Some(25.0)),
+            })
             .await
             .unwrap();
 
@@ -1043,16 +1097,13 @@ mod tests {
 
         // Clear threshold to disable alerts
         let updated = orgs
-            .update(
-                org.id,
-                &OrganizationUpdateDBRequest {
-                    display_name: None,
-                    avatar_url: None,
-                    email: None,
-                    batch_notifications_enabled: None,
-                    low_balance_threshold: Some(None),
-                },
-            )
+            .update(org.id, &OrganizationUpdateDBRequest {
+                display_name: None,
+                avatar_url: None,
+                email: None,
+                batch_notifications_enabled: None,
+                low_balance_threshold: Some(None),
+            })
             .await
             .unwrap();
 
@@ -1061,16 +1112,13 @@ mod tests {
 
         // Omitting threshold entirely leaves it unchanged
         let updated = orgs
-            .update(
-                org.id,
-                &OrganizationUpdateDBRequest {
-                    display_name: None,
-                    avatar_url: None,
-                    email: None,
-                    batch_notifications_enabled: None,
-                    low_balance_threshold: None,
-                },
-            )
+            .update(org.id, &OrganizationUpdateDBRequest {
+                display_name: None,
+                avatar_url: None,
+                email: None,
+                batch_notifications_enabled: None,
+                low_balance_threshold: None,
+            })
             .await
             .unwrap();
 

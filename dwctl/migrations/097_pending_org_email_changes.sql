@@ -7,10 +7,17 @@
 -- verification, which allowed a session with org-update privileges to
 -- silently redirect every notification to an attacker-chosen address.
 --
--- Email changes now go through a verification flow: a pending change row
--- is created with a hashed token, a verification link is sent to the new
--- address, and a notice is sent to the old address. The change is only
--- applied when the token is consumed via the confirm endpoint.
+-- Email changes now go through a *double-opt-in* verification flow:
+-- both the current contact address AND the new address must click a
+-- verification link within 24 hours. The change is only applied to
+-- `users.email` once both `*_confirmed_at` columns are set, at which
+-- point the pending row is deleted in the same transaction.
+--
+-- This matches the standard SaaS account-takeover mitigation (Stripe,
+-- GitHub, Google Cloud): requiring possession proof from both mailboxes
+-- prevents (a) a session-hijack attacker — who controls the session but
+-- not the old mailbox — from redirecting notifications, and (b) typos /
+-- attacker-controlled new addresses from receiving notifications.
 
 CREATE TABLE pending_org_email_changes (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -24,15 +31,24 @@ CREATE TABLE pending_org_email_changes (
     -- `is_deleted = true`, which does NOT trigger CASCADE — so a pending
     -- row can outlive a soft-deleted org. Application code must check
     -- `is_deleted = false` when consuming tokens, and indeed
-    -- `consume_pending_email_change` joins `users` and filters on
+    -- `confirm_*_email_side` joins `users` and filters on
     -- `is_deleted = false` for exactly that reason.
     organization_id UUID NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
     new_email VARCHAR NOT NULL,
     requested_by UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    token_hash VARCHAR NOT NULL UNIQUE,
+    -- Separate tokens for each mailbox. UNIQUE so a single token can only
+    -- bind to one row, and so the confirm endpoint can dispatch on which
+    -- column it matched.
+    new_email_token_hash VARCHAR NOT NULL UNIQUE,
+    old_email_token_hash VARCHAR NOT NULL UNIQUE,
+    -- Per-side confirmation timestamps. The change is applied (and the
+    -- row deleted) when BOTH are non-null.
+    new_email_confirmed_at TIMESTAMPTZ,
+    old_email_confirmed_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     expires_at TIMESTAMPTZ NOT NULL
 );
 
--- Both `UNIQUE` constraints above (organization_id and token_hash) provide
--- the lookup indexes needed by the confirm and supersede paths.
+-- The UNIQUE constraints above (organization_id, new_email_token_hash,
+-- old_email_token_hash) provide the lookup indexes needed by the confirm
+-- and supersede paths.

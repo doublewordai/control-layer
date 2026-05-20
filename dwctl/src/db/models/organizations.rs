@@ -48,12 +48,27 @@ pub struct OrganizationMemberDBResponse {
 }
 
 /// Database response for a pending organization email change.
+///
+/// Carries both token-side confirmation timestamps. The change is applied
+/// to `users.email` only when both `old_email_confirmed_at` and
+/// `new_email_confirmed_at` are non-null; until then the row sits as a
+/// pending request that supersedes future PATCHes via the UNIQUE
+/// `organization_id` constraint.
 #[derive(Debug, Clone)]
 pub struct PendingOrgEmailChangeDBResponse {
     pub id: uuid::Uuid,
     pub organization_id: UserId,
     pub new_email: String,
     pub requested_by: UserId,
+    pub new_email_confirmed_at: Option<DateTime<Utc>>,
+    pub old_email_confirmed_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
+}
+
+impl PendingOrgEmailChangeDBResponse {
+    /// Returns true when both mailboxes have clicked their verification link.
+    pub fn is_fully_confirmed(&self) -> bool {
+        self.new_email_confirmed_at.is_some() && self.old_email_confirmed_at.is_some()
+    }
 }
