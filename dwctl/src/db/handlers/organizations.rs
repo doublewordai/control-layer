@@ -631,17 +631,27 @@ impl<'c> Organizations<'c> {
         })
     }
 
-    /// Atomically consume a pending email change by token hash. The row is
-    /// deleted as part of the lookup so two concurrent confirmations can't
-    /// both succeed; the caller still needs to verify `expires_at` against
-    /// the current time before applying the change.
+    /// Atomically consume a pending email change by token hash.
+    ///
+    /// The row is deleted as part of the lookup so two concurrent confirmations
+    /// can't both succeed. We additionally join against `users` and require
+    /// `is_deleted = false`, which prevents a pending row from being used to
+    /// change the contact email of a soft-deleted organization (the `ON DELETE
+    /// CASCADE` foreign key only fires on hard deletes, and orgs are soft-
+    /// deleted in this codebase).
+    ///
+    /// The caller still needs to verify `expires_at` against the current time
+    /// before applying the change.
     #[instrument(skip(self, token_hash), err)]
     pub async fn consume_pending_email_change(&mut self, token_hash: &str) -> Result<Option<PendingOrgEmailChangeDBResponse>> {
         let row = sqlx::query!(
             r#"
-            DELETE FROM pending_org_email_changes
-            WHERE token_hash = $1
-            RETURNING id, organization_id, new_email, requested_by, created_at, expires_at
+            DELETE FROM pending_org_email_changes p
+            USING users u
+            WHERE p.token_hash = $1
+              AND p.organization_id = u.id
+              AND u.is_deleted = false
+            RETURNING p.id, p.organization_id, p.new_email, p.requested_by, p.created_at, p.expires_at
             "#,
             token_hash,
         )
