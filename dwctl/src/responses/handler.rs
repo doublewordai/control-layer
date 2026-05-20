@@ -10,15 +10,45 @@
 use axum::{
     Json,
     extract::{Path, State},
-    http::{HeaderMap, StatusCode},
+    http::HeaderMap,
 };
 use fusillade::{ResponseStepStore, Storage};
 use onwards::StoreError;
+use serde::{Deserialize, Serialize};
 use sqlx_pool_router::PoolProvider;
 use std::collections::HashSet;
+use utoipa::ToSchema;
 
 use crate::AppState;
 use crate::errors::{Error, Result};
+
+/// Response body for `DELETE /v1/responses/{response_id}`.
+///
+/// Matches the OpenAI Responses API delete shape — clients (including the
+/// OpenAI SDK) parse this into a typed `ResponseDeleted`, so the field names
+/// and the literal `"object": "response"` discriminator are load-bearing.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[schema(example = json!({
+    "id": "resp_abc123",
+    "object": "response",
+    "deleted": true
+}))]
+pub struct ResponseDeleted {
+    #[schema(example = "resp_abc123")]
+    pub id: String,
+    #[serde(rename = "object")]
+    #[schema(example = "response")]
+    pub object_type: ResponseDeletedObjectType,
+    #[schema(example = true)]
+    pub deleted: bool,
+}
+
+/// Always `"response"` for the deletion envelope.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ResponseDeletedObjectType {
+    Response,
+}
 
 /// Retrieve a response by ID.
 ///
@@ -155,7 +185,7 @@ schema and survive the erasure.",
         ("response_id" = String, Path, description = "The response ID returned when the response was created (with or without the `resp_` prefix).")
     ),
     responses(
-        (status = 204, description = "Response deleted."),
+        (status = 200, description = "Response deleted.", body = ResponseDeleted),
         (status = 401, description = "Invalid or missing API key. Ensure your `Authorization` header is set to `Bearer YOUR_API_KEY`."),
         (status = 404, description = "Response not found or you don't have access to it."),
         (status = 500, description = "An unexpected error occurred. Retry the request or contact support if the issue persists.")
@@ -167,7 +197,7 @@ pub async fn delete_response<P: PoolProvider>(
     State(state): State<AppState<P>>,
     headers: HeaderMap,
     Path(response_id): Path<String>,
-) -> Result<StatusCode> {
+) -> Result<Json<ResponseDeleted>> {
     let api_key = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
@@ -303,5 +333,13 @@ pub async fn delete_response<P: PoolProvider>(
         ))));
     }
 
-    Ok(StatusCode::NO_CONTENT)
+    // Echo the id back in the canonical OpenAI form (with `resp_` prefix if
+    // the caller used it). Matches the OpenAI Responses API delete shape so
+    // clients (including the OpenAI SDK's `ResponseDeleted` parser) accept
+    // the body.
+    Ok(Json(ResponseDeleted {
+        id: response_id,
+        object_type: ResponseDeletedObjectType::Response,
+        deleted: true,
+    }))
 }

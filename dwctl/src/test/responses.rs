@@ -538,13 +538,18 @@ async fn test_delete_response_removes_fusillade_row(pool: PgPool) {
     }
     assert_ne!(id, uuid::Uuid::nil(), "row should reach completed state");
 
-    // DELETE the response.
+    // DELETE the response — spec returns 200 with {id, object: "response",
+    // deleted: true}.
     let response_id = format!("resp_{}", id);
     let resp = server
         .delete(&format!("/ai/v1/responses/{}", response_id))
         .add_header("Authorization", &format!("Bearer {}", api_key))
         .await;
-    assert_eq!(resp.status_code(), 204);
+    assert_eq!(resp.status_code(), 200);
+    let body: serde_json::Value = resp.json();
+    assert_eq!(body["id"].as_str(), Some(response_id.as_str()));
+    assert_eq!(body["object"].as_str(), Some("response"));
+    assert_eq!(body["deleted"].as_bool(), Some(true));
 
     // Row is gone from fusillade.requests.
     let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM fusillade.requests WHERE id = $1")

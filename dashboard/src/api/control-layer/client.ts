@@ -2162,6 +2162,15 @@ const asyncRequestsApi = {
     }
     return response.json();
   },
+
+  async delete(id: string): Promise<void> {
+    const response = await fetch(`/admin/api/v1/batches/requests/${id}`, {
+      method: "DELETE",
+    });
+    if (!response.ok) {
+      throw new Error(`Failed to delete response: ${response.status}`);
+    }
+  },
 };
 
 // Main nested API object
