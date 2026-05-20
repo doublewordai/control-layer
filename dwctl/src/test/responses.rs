@@ -499,6 +499,86 @@ async fn test_fusillade_header_skips_row_creation(pool: PgPool) {
     );
 }
 
+/// DELETE /ai/v1/responses/{id} hard-deletes the underlying fusillade row,
+/// and a subsequent GET returns 404.
+#[sqlx::test]
+#[test_log::test]
+async fn test_delete_response_removes_fusillade_row(pool: PgPool) {
+    let mock_server = wiremock::MockServer::start().await;
+    mount_chat_completions_mock(&mock_server).await;
+
+    let (server, api_key, _bg) = setup_ai_test(pool.clone(), &mock_server, true).await;
+
+    // Create a chat completion (priority/realtime tier → batchless fusillade row).
+    server
+        .post("/ai/v1/chat/completions")
+        .add_header("Authorization", &format!("Bearer {}", api_key))
+        .add_header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "service_tier": "priority"
+        }))
+        .await;
+
+    // Poll for the row to reach completed (outlet writes asynchronously).
+    let start = std::time::Instant::now();
+    let mut id = uuid::Uuid::nil();
+    while start.elapsed() < std::time::Duration::from_secs(5) {
+        if let Some(row) = sqlx::query("SELECT id, state FROM fusillade.requests WHERE model = 'gpt-4o' ORDER BY created_at DESC LIMIT 1")
+            .fetch_optional(&pool)
+            .await
+            .unwrap()
+            && sqlx::Row::get::<String, _>(&row, "state") == "completed"
+        {
+            id = sqlx::Row::get(&row, "id");
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    }
+    assert_ne!(id, uuid::Uuid::nil(), "row should reach completed state");
+
+    // DELETE the response.
+    let response_id = format!("resp_{}", id);
+    let resp = server
+        .delete(&format!("/ai/v1/responses/{}", response_id))
+        .add_header("Authorization", &format!("Bearer {}", api_key))
+        .await;
+    assert_eq!(resp.status_code(), 204);
+
+    // Row is gone from fusillade.requests.
+    let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM fusillade.requests WHERE id = $1")
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count.0, 0, "fusillade row should be hard-deleted");
+
+    // GET now returns 404.
+    let get = server
+        .get(&format!("/ai/v1/responses/{}", response_id))
+        .add_header("Authorization", &format!("Bearer {}", api_key))
+        .await;
+    assert_eq!(get.status_code(), 404);
+}
+
+/// DELETE /ai/v1/responses/{id} returns 404 for a non-existent id.
+#[sqlx::test]
+#[test_log::test]
+async fn test_delete_response_404_for_unknown_id(pool: PgPool) {
+    let mock_server = wiremock::MockServer::start().await;
+    mount_chat_completions_mock(&mock_server).await;
+
+    let (server, api_key, _bg) = setup_ai_test(pool.clone(), &mock_server, true).await;
+
+    let fake_id = format!("resp_{}", uuid::Uuid::new_v4());
+    let resp = server
+        .delete(&format!("/ai/v1/responses/{}", fake_id))
+        .add_header("Authorization", &format!("Bearer {}", api_key))
+        .await;
+    assert_eq!(resp.status_code(), 404);
+}
+
 // Removed: `test_flex_background_returns_202_with_queued_status`,
 // `test_flex_blocking_waits_for_completion`,
 // `test_priority_background_completes_and_is_retrievable`.

@@ -185,6 +185,8 @@ fn create_response() {}
         list_models,
         get_model,
         create_response,
+        // Responses API delete (actual handler)
+        crate::responses::handler::delete_response,
         // Batch API endpoints (actual handlers)
         api::handlers::files::upload_file,
         api::handlers::files::list_files,
