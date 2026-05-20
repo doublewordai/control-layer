@@ -9,6 +9,10 @@ import * as hooks from "../../../api/control-layer/hooks";
 vi.mock("../../../api/control-layer/hooks", () => ({
   useConfig: vi.fn(),
   useAsyncRequests: vi.fn(),
+  useDeleteAsyncRequest: vi.fn(() => ({
+    mutateAsync: vi.fn(),
+    isPending: false,
+  })),
   useModels: vi.fn(),
 }));
 

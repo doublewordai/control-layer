@@ -230,6 +230,8 @@ fn create_response() {}
             extra_types::ResponseObject,
             extra_types::ResponseInput,
             extra_types::ResponseItem,
+            crate::responses::handler::ResponseDeleted,
+            crate::responses::handler::ResponseDeletedObjectType,
             // File/Batch types
             api::models::files::ListFilesQuery,
             api::models::files::FileResponse,
