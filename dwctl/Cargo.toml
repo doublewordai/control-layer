@@ -101,6 +101,12 @@ lettre = { version = "0.11", features = [
   "tokio1-rustls-tls",
   "builder",
 ], default-features = false }
+# DNS resolver for verifying that the recipient domain of a new
+# organization contact email has at least one MX (or implicit A) record.
+hickory-resolver = { version = "0.24", default-features = false, features = [
+  "system-config",
+  "tokio-runtime",
+] }
 aes-gcm = "0.10.3"
 paste = "1.0"
 serde_with = "3.14.1"

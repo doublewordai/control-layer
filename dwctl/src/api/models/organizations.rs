@@ -53,16 +53,52 @@ pub struct OrganizationResponse {
     /// Number of members in the organization
     #[serde(skip_serializing_if = "Option::is_none")]
     pub member_count: Option<i64>,
+    /// A pending email change awaiting verification. Present when the
+    /// caller has requested a new contact email but it has not yet been
+    /// confirmed via the link sent to the new address.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_email_change: Option<PendingEmailChangeResponse>,
 }
 
 impl OrganizationResponse {
     pub fn from_user(user: UserResponse) -> Self {
-        Self { user, member_count: None }
+        Self {
+            user,
+            member_count: None,
+            pending_email_change: None,
+        }
     }
 
     pub fn with_member_count(mut self, count: i64) -> Self {
         self.member_count = Some(count);
         self
+    }
+
+    pub fn with_pending_email_change(mut self, info: PendingEmailChangeResponse) -> Self {
+        self.pending_email_change = Some(info);
+        self
+    }
+}
+
+/// Public projection of a pending organization email change.
+///
+/// Deliberately omits the row id, requested-by user, and token-related
+/// fields stored in [`PendingOrgEmailChangeDBResponse`] so that no
+/// token-adjacent metadata leaks out of the API layer.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PendingEmailChangeResponse {
+    /// The address the contact email will become if the verification link is clicked.
+    pub new_email: String,
+    /// When the verification token expires.
+    pub expires_at: DateTime<Utc>,
+}
+
+impl From<crate::db::models::organizations::PendingOrgEmailChangeDBResponse> for PendingEmailChangeResponse {
+    fn from(p: crate::db::models::organizations::PendingOrgEmailChangeDBResponse) -> Self {
+        Self {
+            new_email: p.new_email,
+            expires_at: p.expires_at,
+        }
     }
 }
 

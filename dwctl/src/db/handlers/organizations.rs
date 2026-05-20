@@ -10,7 +10,9 @@ use crate::db::{
     errors::{DbError, Result},
     handlers::users::{UserFilter, Users},
     models::{
-        organizations::{OrganizationCreateDBRequest, OrganizationMemberDBResponse, OrganizationUpdateDBRequest},
+        organizations::{
+            OrganizationCreateDBRequest, OrganizationMemberDBResponse, OrganizationUpdateDBRequest, PendingOrgEmailChangeDBResponse,
+        },
         users::UserDBResponse,
     },
 };
@@ -579,6 +581,189 @@ impl<'c> Organizations<'c> {
         .await?;
 
         Ok(count.unwrap_or(0))
+    }
+
+    /// Look up the current pending email-change row for an org, if any.
+    ///
+    /// Intended for audit-logging just before [`Self::upsert_pending_email_change`]
+    /// supersedes the row — callers can capture the prior `requested_by` and
+    /// `new_email` for the audit trail, since the UPSERT will overwrite them.
+    #[instrument(skip(self), fields(org_id = %abbrev_uuid(&org_id)), err)]
+    pub async fn find_pending_email_change_for_org(&mut self, org_id: UserId) -> Result<Option<PendingOrgEmailChangeDBResponse>> {
+        let row = sqlx::query!(
+            r#"
+            SELECT id, organization_id, new_email, requested_by,
+                   new_email_confirmed_at, old_email_confirmed_at,
+                   created_at, expires_at
+            FROM pending_org_email_changes
+            WHERE organization_id = $1
+            "#,
+            org_id,
+        )
+        .fetch_optional(&mut *self.db)
+        .await?;
+
+        Ok(row.map(|r| PendingOrgEmailChangeDBResponse {
+            id: r.id,
+            organization_id: r.organization_id,
+            new_email: r.new_email,
+            requested_by: r.requested_by,
+            new_email_confirmed_at: r.new_email_confirmed_at,
+            old_email_confirmed_at: r.old_email_confirmed_at,
+            created_at: r.created_at,
+            expires_at: r.expires_at,
+        }))
+    }
+
+    /// Atomically insert or replace the pending email-change row for an org.
+    ///
+    /// The `pending_org_email_changes.organization_id` column has a UNIQUE
+    /// constraint, so `ON CONFLICT` ensures that at most one pending change
+    /// exists per org and that older verification tokens are invalidated the
+    /// instant a new one is accepted — without a read-then-write race
+    /// window. The `created_at` reset and the cleared `*_confirmed_at`
+    /// columns guarantee that a superseded change never finalizes using a
+    /// confirmation that was recorded against the previous (now-replaced)
+    /// row.
+    #[instrument(
+        skip(self, new_email_token_hash, old_email_token_hash),
+        fields(org_id = %abbrev_uuid(&org_id)),
+        err,
+    )]
+    pub async fn upsert_pending_email_change(
+        &mut self,
+        org_id: UserId,
+        new_email: &str,
+        requested_by: UserId,
+        new_email_token_hash: &str,
+        old_email_token_hash: &str,
+        expires_at: DateTime<Utc>,
+    ) -> Result<PendingOrgEmailChangeDBResponse> {
+        let row = sqlx::query!(
+            r#"
+            INSERT INTO pending_org_email_changes
+                (organization_id, new_email, requested_by, new_email_token_hash, old_email_token_hash, expires_at)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            ON CONFLICT (organization_id) DO UPDATE SET
+                new_email = EXCLUDED.new_email,
+                requested_by = EXCLUDED.requested_by,
+                new_email_token_hash = EXCLUDED.new_email_token_hash,
+                old_email_token_hash = EXCLUDED.old_email_token_hash,
+                new_email_confirmed_at = NULL,
+                old_email_confirmed_at = NULL,
+                expires_at = EXCLUDED.expires_at,
+                created_at = NOW()
+            RETURNING id, organization_id, new_email, requested_by,
+                      new_email_confirmed_at, old_email_confirmed_at,
+                      created_at, expires_at
+            "#,
+            org_id,
+            new_email,
+            requested_by,
+            new_email_token_hash,
+            old_email_token_hash,
+            expires_at,
+        )
+        .fetch_one(&mut *self.db)
+        .await?;
+
+        Ok(PendingOrgEmailChangeDBResponse {
+            id: row.id,
+            organization_id: row.organization_id,
+            new_email: row.new_email,
+            requested_by: row.requested_by,
+            new_email_confirmed_at: row.new_email_confirmed_at,
+            old_email_confirmed_at: row.old_email_confirmed_at,
+            created_at: row.created_at,
+            expires_at: row.expires_at,
+        })
+    }
+
+    /// Mark the new-email side of the pending change as confirmed.
+    ///
+    /// Atomic update with the same hardening as the confirm-side lookups:
+    /// joins `users` and requires `is_deleted = false`, blocks
+    /// already-confirmed and expired tokens. Returns the freshly-updated row
+    /// (including both `*_confirmed_at` timestamps so the caller can check
+    /// if the change is now ready to apply), or `None` if no row matched.
+    #[instrument(skip(self, token_hash), err)]
+    pub async fn confirm_new_email_side(&mut self, token_hash: &str) -> Result<Option<PendingOrgEmailChangeDBResponse>> {
+        let row = sqlx::query!(
+            r#"
+            UPDATE pending_org_email_changes p
+            SET new_email_confirmed_at = NOW()
+            FROM users u
+            WHERE p.new_email_token_hash = $1
+              AND p.new_email_confirmed_at IS NULL
+              AND p.expires_at > NOW()
+              AND p.organization_id = u.id
+              AND u.is_deleted = false
+            RETURNING p.id, p.organization_id, p.new_email, p.requested_by,
+                      p.new_email_confirmed_at, p.old_email_confirmed_at,
+                      p.created_at, p.expires_at
+            "#,
+            token_hash,
+        )
+        .fetch_optional(&mut *self.db)
+        .await?;
+
+        Ok(row.map(|r| PendingOrgEmailChangeDBResponse {
+            id: r.id,
+            organization_id: r.organization_id,
+            new_email: r.new_email,
+            requested_by: r.requested_by,
+            new_email_confirmed_at: r.new_email_confirmed_at,
+            old_email_confirmed_at: r.old_email_confirmed_at,
+            created_at: r.created_at,
+            expires_at: r.expires_at,
+        }))
+    }
+
+    /// Mark the old-email side of the pending change as confirmed.
+    /// Symmetric to [`Self::confirm_new_email_side`].
+    #[instrument(skip(self, token_hash), err)]
+    pub async fn confirm_old_email_side(&mut self, token_hash: &str) -> Result<Option<PendingOrgEmailChangeDBResponse>> {
+        let row = sqlx::query!(
+            r#"
+            UPDATE pending_org_email_changes p
+            SET old_email_confirmed_at = NOW()
+            FROM users u
+            WHERE p.old_email_token_hash = $1
+              AND p.old_email_confirmed_at IS NULL
+              AND p.expires_at > NOW()
+              AND p.organization_id = u.id
+              AND u.is_deleted = false
+            RETURNING p.id, p.organization_id, p.new_email, p.requested_by,
+                      p.new_email_confirmed_at, p.old_email_confirmed_at,
+                      p.created_at, p.expires_at
+            "#,
+            token_hash,
+        )
+        .fetch_optional(&mut *self.db)
+        .await?;
+
+        Ok(row.map(|r| PendingOrgEmailChangeDBResponse {
+            id: r.id,
+            organization_id: r.organization_id,
+            new_email: r.new_email,
+            requested_by: r.requested_by,
+            new_email_confirmed_at: r.new_email_confirmed_at,
+            old_email_confirmed_at: r.old_email_confirmed_at,
+            created_at: r.created_at,
+            expires_at: r.expires_at,
+        }))
+    }
+
+    /// Delete a pending email change row by id. Used by the confirm
+    /// handler once both sides are confirmed and the change has been
+    /// applied to `users.email` — both operations must run inside the
+    /// same transaction so a failure in either rolls back the other.
+    #[instrument(skip(self), err)]
+    pub async fn delete_pending_email_change(&mut self, id: Uuid) -> Result<bool> {
+        let result = sqlx::query!("DELETE FROM pending_org_email_changes WHERE id = $1", id)
+            .execute(&mut *self.db)
+            .await?;
+        Ok(result.rows_affected() > 0)
     }
 }
 

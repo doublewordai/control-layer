@@ -1232,6 +1232,13 @@ pub async fn build_router(
             "/organizations/invites/{token}/decline",
             post(api::handlers::organizations::decline_invite),
         )
+        // Email-change confirmation (GET so the link in the verification email works
+        // when clicked from any mail client; no auth — secret token is the proof of
+        // mailbox possession).
+        .route(
+            "/organizations/email-change/{token}/confirm",
+            get(api::handlers::organizations::confirm_email_change),
+        )
         // User's organizations (sub-resource on users)
         .route(
             "/users/{user_id}/organizations",
