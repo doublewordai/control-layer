@@ -276,6 +276,12 @@ struct FileStreamConfig {
     /// Walker mode for the calling user. Pinned to [`ImageNormalizerMode::HttpOnly`]
     /// until the per-user opt-in flag is wired in.
     normalizer_mode: ImageNormalizerMode,
+    /// Optional DB pool for `image_access` bookkeeping. `None` disables
+    /// the bookkeeping (the substitution itself still runs).
+    access_pool: Option<sqlx::PgPool>,
+    /// User to credit `image_access` rows to. Typically the org owner when
+    /// the upload is in org context, else the individual user.
+    access_user_id: Option<uuid::Uuid>,
 }
 
 impl std::fmt::Debug for FileStreamConfig {
@@ -287,18 +293,24 @@ impl std::fmt::Debug for FileStreamConfig {
             .field("buffer_size", &self.buffer_size)
             .field("normalizer_enabled", &self.normalizer.is_some())
             .field("normalizer_mode", &self.normalizer_mode)
+            .field("image_access_enabled", &self.access_pool.is_some())
+            .field("access_user_id", &self.access_user_id)
             .finish()
     }
 }
 
-/// Walk a single batch template's body and replace HTTP(S) `image_url` fields
-/// with opaque `dw-img://{sha256}` tokens via the normaliser. No-op when
-/// the normaliser is unset or the body is not valid JSON (the existing line
-/// parser would already have rejected non-JSON).
+/// Walk a single batch template's body and replace `image_url` fields with
+/// opaque `dw-img://{sha256}` tokens via the normaliser. Records each ingested
+/// image in `image_access` so the user can later view their submitted bytes
+/// via the dashboard endpoint. No-op when the normaliser is unset or the
+/// body is not valid JSON (the existing line parser would already have
+/// rejected non-JSON).
 async fn normalize_template_body_in_place(
     normalizer: Option<&Arc<dyn ImageNormalizer>>,
     mode: ImageNormalizerMode,
     template: &mut fusillade::RequestTemplateInput,
+    access_pool: Option<&sqlx::PgPool>,
+    access_user_id: Option<uuid::Uuid>,
 ) -> std::result::Result<(), String> {
     let Some(normalizer) = normalizer else {
         return Ok(());
@@ -309,8 +321,17 @@ async fn normalize_template_body_in_place(
     };
     let count = image_walker::substitute_with(&mut body_value, mode, |url| {
         let normalizer = Arc::clone(normalizer);
+        let access_pool = access_pool.cloned();
+        let is_data_uri = url.starts_with("data:");
         async move {
-            let token = normalizer.ingest(ImageInput::HttpUrl(url)).await.map_err(|e| e.to_string())?;
+            let input = if is_data_uri { ImageInput::DataUri(url) } else { ImageInput::HttpUrl(url) };
+            let token = normalizer.ingest(input).await.map_err(|e| e.to_string())?;
+            if let (Some(pool), Some(uid)) = (access_pool, access_user_id) {
+                // Fire-and-forget bookkeeping; non-fatal.
+                tokio::spawn(async move {
+                    crate::api::handlers::images::record_image_access(&pool, uid, token, "", 0).await;
+                });
+            }
             Ok::<String, String>(token.to_dw_img_uri())
         }
     })
@@ -499,6 +520,8 @@ fn create_file_stream(
     } = req_ctx;
     let normalizer = config.normalizer.clone();
     let normalizer_mode = config.normalizer_mode;
+    let access_pool = config.access_pool.clone();
+    let access_user_id = config.access_user_id;
     let (tx, rx) = mpsc::channel(config.buffer_size);
     // std::sync::Mutex is appropriate here because:
     // 1. Lock is held only briefly (no await points while locked)
@@ -691,7 +714,7 @@ fn create_file_stream(
                                                     // before the size cap check, since substitution
                                                     // replaces (potentially large) HTTP URLs with
                                                     // short opaque tokens — bodies usually shrink.
-                                                    if let Err(e) = normalize_template_body_in_place(normalizer.as_ref(), normalizer_mode, &mut template).await {
+                                                    if let Err(e) = normalize_template_body_in_place(normalizer.as_ref(), normalizer_mode, &mut template, access_pool.as_ref(), access_user_id).await {
                                                         abort!(FileUploadError::ValidationError {
                                                             line: line_count + 1,
                                                             message: format!("image input normalisation failed: {e}"),
@@ -783,7 +806,7 @@ fn create_file_stream(
                                     match openai_req.to_internal(&endpoint, api_key.clone(), &accessible_models, &allowed_url_paths) {
                                         Ok(mut template) => {
                                             // Normalise image URLs in the trailing line as well.
-                                            if let Err(e) = normalize_template_body_in_place(normalizer.as_ref(), normalizer_mode, &mut template).await {
+                                            if let Err(e) = normalize_template_body_in_place(normalizer.as_ref(), normalizer_mode, &mut template, access_pool.as_ref(), access_user_id).await {
                                                 abort!(FileUploadError::ValidationError {
                                                     line: line_count + 1,
                                                     message: format!("image input normalisation failed: {e}"),
@@ -927,6 +950,11 @@ pub async fn upload_file<P: PoolProvider>(
         message: format!("Invalid multipart request: {}", e),
     })?;
 
+    // When in org context, attribute file ownership to the org (not the individual user).
+    // Also used for the hidden API key lookup below.
+    let target_user_id = current_user.active_organization.unwrap_or(current_user.id);
+    let uploaded_by = Some(target_user_id.to_string());
+
     // Build the image normaliser handle for the batch ingest path. The
     // dispatcher will JIT-resign any `dw-img://` tokens produced here with
     // a fresh short-lived signed URL before sending to the provider.
@@ -935,22 +963,24 @@ pub async fn upload_file<P: PoolProvider>(
     } else {
         None
     };
+    // Choose walker mode from the calling user's opt-in flag.
+    let normalizer_mode = if current_user.image_normalization_enabled {
+        ImageNormalizerMode::All
+    } else {
+        ImageNormalizerMode::HttpOnly
+    };
     let stream_config = FileStreamConfig {
         max_file_size: config.limits.files.max_file_size,
         max_requests_per_file: config.limits.files.max_requests_per_file,
         max_request_body_size: config.limits.requests.max_body_size,
         buffer_size: config.batches.files.upload_buffer_size,
         normalizer,
-        // Per-user opt-in (mode All) is wired in a follow-up commit that
-        // surfaces the `users.image_normalization_enabled` flag through the
-        // auth context. Until then, batch ingest runs HttpOnly (the floor
-        // security control).
-        normalizer_mode: ImageNormalizerMode::HttpOnly,
+        normalizer_mode,
+        access_pool: Some(state.db.write().clone()),
+        // image_access rows are credited to the org owner when uploading in
+        // org context — matches the file-ownership attribution above.
+        access_user_id: Some(target_user_id),
     };
-    // When in org context, attribute file ownership to the org (not the individual user).
-    // Also used for the hidden API key lookup below.
-    let target_user_id = current_user.active_organization.unwrap_or(current_user.id);
-    let uploaded_by = Some(target_user_id.to_string());
 
     // Get or create user-specific hidden batch API key for batch request execution.
     // We need the key ID for per-member attribution within orgs.

@@ -44,6 +44,7 @@ use std::time::Duration;
 use tracing::{debug, warn};
 
 use crate::image_normalizer::{ImageInput, ImageNormalizer, Mode, NormalizeError, walker};
+use sqlx::PgPool;
 
 /// Shared state threaded through the middleware.
 #[derive(Clone)]
@@ -52,6 +53,48 @@ pub struct ImageNormalizerMiddlewareState {
     /// TTL applied to signed URLs handed to upstream providers from this
     /// (realtime) path. Copied from `ImageNormalizerConfig::signing.realtime_ttl()`.
     pub realtime_ttl: Duration,
+    /// Optional DB pool used (a) to look up the caller's user_id from the
+    /// bearer-token API key for `image_access` bookkeeping, and (b) by the
+    /// per-user-mode lookup once the opt-in flag is wired through.
+    /// `None` disables both (useful in tests).
+    pub pool: Option<PgPool>,
+}
+
+/// Extract the Bearer token from `Authorization`, case-insensitive.
+fn extract_bearer_token(request: &Request<Body>) -> Option<String> {
+    let auth = request.headers().get(axum::http::header::AUTHORIZATION)?.to_str().ok()?;
+    let auth = auth.trim();
+    if auth.len() > 7 && auth[..7].eq_ignore_ascii_case("bearer ") {
+        Some(auth[7..].to_string())
+    } else {
+        None
+    }
+}
+
+/// Resolve `bearer` → `(user_id, image_normalization_enabled)`. Returns
+/// `None` if the key isn't known. Best-effort; errors are logged and
+/// swallowed.
+async fn resolve_caller_for_normalizer(pool: &PgPool, bearer: &str) -> Option<(uuid::Uuid, bool)> {
+    match sqlx::query!(
+        r#"
+        SELECT u.id AS "id!", u.image_normalization_enabled AS "image_normalization_enabled!"
+        FROM api_keys ak
+        INNER JOIN users u ON u.id = ak.user_id
+        WHERE ak.secret = $1 AND ak.is_deleted = FALSE AND u.is_deleted = FALSE
+        LIMIT 1
+        "#,
+        bearer
+    )
+    .fetch_optional(pool)
+    .await
+    {
+        Ok(Some(row)) => Some((row.id, row.image_normalization_enabled)),
+        Ok(None) => None,
+        Err(e) => {
+            warn!(error = %e, "failed to resolve bearer token for image normaliser (non-fatal)");
+            None
+        }
+    }
 }
 
 /// Axum middleware function. Applies to the onwards router, runs in front
@@ -87,21 +130,43 @@ pub async fn image_normalizer_middleware(
         }
     };
 
-    // Walk + substitute. Mode is pinned to HttpOnly here. The per-user
-    // opt-in for full-content normalisation (mode `All`) is wired in by
-    // a follow-up commit that connects the auth-context user flag.
+    // Resolve the caller's user_id (for image_access bookkeeping) and the
+    // per-user opt-in flag (which selects walker mode).
+    let caller = match (state.pool.as_ref(), extract_bearer_token(&request)) {
+        (Some(pool), Some(bearer)) => resolve_caller_for_normalizer(pool, &bearer).await,
+        _ => None,
+    };
+    let mode = match caller {
+        Some((_uid, true)) => Mode::All,
+        _ => Mode::HttpOnly,
+    };
+
     let normalizer = state.normalizer.clone();
     let realtime_ttl = state.realtime_ttl;
-    let substitute = |url: String| {
+    let pool_for_access = state.pool.clone();
+    let user_id_for_access = caller.map(|(uid, _)| uid);
+    let substitute = move |url: String| {
         let normalizer = normalizer.clone();
+        let pool_for_access = pool_for_access.clone();
+        let is_data_uri = url.starts_with("data:");
         async move {
-            let token = normalizer.ingest(ImageInput::HttpUrl(url)).await?;
+            let input = if is_data_uri { ImageInput::DataUri(url) } else { ImageInput::HttpUrl(url) };
+            let token = normalizer.ingest(input).await?;
             let signed = normalizer.sign(token, realtime_ttl).await?;
+            // Best-effort image_access bookkeeping: fire-and-forget so
+            // the request path isn't blocked. The (mime, bytes_len)
+            // metadata are not needed here; the dashboard endpoint reads
+            // them from the store directly.
+            if let (Some(pool), Some(user_id)) = (pool_for_access, user_id_for_access) {
+                tokio::spawn(async move {
+                    crate::api::handlers::images::record_image_access(&pool, user_id, token, "", 0).await;
+                });
+            }
             Ok::<String, NormalizeError>(signed.url)
         }
     };
 
-    let substituted = match walker::substitute_with(&mut body_value, Mode::HttpOnly, substitute).await {
+    let substituted = match walker::substitute_with(&mut body_value, mode, substitute).await {
         Ok(n) => n,
         Err(e) => {
             warn!(error = %e, "image normalisation failed");
@@ -195,6 +260,7 @@ mod tests {
         ImageNormalizerMiddlewareState {
             normalizer,
             realtime_ttl: Duration::from_secs(900),
+            pool: None,
         }
     }
 

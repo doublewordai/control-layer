@@ -1414,6 +1414,7 @@ pub async fn build_router(
         let image_normalizer_state = crate::responses::image_normalizer_middleware::ImageNormalizerMiddlewareState {
             normalizer,
             realtime_ttl,
+            pool: Some(state.db.write().clone()),
         };
         onwards_router.layer(middleware::from_fn_with_state(
             image_normalizer_state,
