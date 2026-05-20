@@ -153,7 +153,8 @@ export function CreateAsyncModal({
       if (lang === "python") {
         // JSON.stringify produces a double-quoted string with all special
         // characters escaped — that's also a valid Python string literal,
-        // so it survives model aliases like `acme's-llm-v2` or `path\foo`.
+        // so every interpolated value (model alias, API key, base URL,
+        // prompts) survives `'`, `"`, `\`, etc. without breaking the snippet.
         const createArgs = [`    model=${JSON.stringify(modelValue)},`];
         if (instructions) {
           createArgs.push(`    instructions=${JSON.stringify(instructions)},`);
@@ -177,8 +178,8 @@ print(f"Final status: {resp.status}\\nOutput:\\n{resp.output_text}")`
         return `${header}
 
 client = OpenAI(
-    api_key="${keyValue}",
-    base_url="${baseUrl}",
+    api_key=${JSON.stringify(keyValue)},
+    base_url=${JSON.stringify(baseUrl)},
 )
 
 resp = client.responses.create(
@@ -190,8 +191,9 @@ ${tail}`;
 
       if (lang === "javascript") {
         // Same reasoning as the Python branch — JSON-quoted strings are
-        // valid JS strings, so apostrophes/backslashes in the alias don't
-        // break the snippet. Yields `model: "alias"` rather than `'alias'`.
+        // valid JS strings, so any interpolated value survives quotes /
+        // backslashes / newlines. Yields `model: "alias"` rather than
+        // `'alias'`, matching what the openai SDK accepts.
         const createArgs = [`    model: ${JSON.stringify(modelValue)},`];
         if (instructions) {
           createArgs.push(
@@ -214,8 +216,8 @@ console.log(\`Final status: \${resp.status}\\nOutput:\\n\${resp.output_text}\`);
         return `import OpenAI from 'openai';
 
 const client = new OpenAI({
-    apiKey: '${keyValue}',
-    baseURL: '${baseUrl}',
+    apiKey: ${JSON.stringify(keyValue)},
+    baseURL: ${JSON.stringify(baseUrl)},
 });
 
 let resp = await client.responses.create({
