@@ -583,6 +583,38 @@ impl<'c> Organizations<'c> {
         Ok(count.unwrap_or(0))
     }
 
+    /// Look up the current pending email-change row for an org, if any.
+    ///
+    /// Intended for audit-logging just before [`Self::upsert_pending_email_change`]
+    /// supersedes the row — callers can capture the prior `requested_by` and
+    /// `new_email` for the audit trail, since the UPSERT will overwrite them.
+    #[instrument(skip(self), fields(org_id = %abbrev_uuid(&org_id)), err)]
+    pub async fn find_pending_email_change_for_org(&mut self, org_id: UserId) -> Result<Option<PendingOrgEmailChangeDBResponse>> {
+        let row = sqlx::query!(
+            r#"
+            SELECT id, organization_id, new_email, requested_by,
+                   new_email_confirmed_at, old_email_confirmed_at,
+                   created_at, expires_at
+            FROM pending_org_email_changes
+            WHERE organization_id = $1
+            "#,
+            org_id,
+        )
+        .fetch_optional(&mut *self.db)
+        .await?;
+
+        Ok(row.map(|r| PendingOrgEmailChangeDBResponse {
+            id: r.id,
+            organization_id: r.organization_id,
+            new_email: r.new_email,
+            requested_by: r.requested_by,
+            new_email_confirmed_at: r.new_email_confirmed_at,
+            old_email_confirmed_at: r.old_email_confirmed_at,
+            created_at: r.created_at,
+            expires_at: r.expires_at,
+        }))
+    }
+
     /// Atomically insert or replace the pending email-change row for an org.
     ///
     /// The `pending_org_email_changes.organization_id` column has a UNIQUE

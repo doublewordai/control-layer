@@ -73,6 +73,27 @@ fn validate_contact_email(input: &str) -> Result<String> {
 /// How long a pending email-change verification token stays valid.
 const EMAIL_CHANGE_TOKEN_TTL_HOURS: i64 = 24;
 
+/// Process-wide DNS resolver used by [`verify_email_deliverable`].
+///
+/// hickory's per-instance cache respects each record's TTL, so sharing one
+/// resolver across requests lets repeated lookups for the same domain reuse
+/// cached MX/A results within their TTL window instead of re-parsing
+/// `/etc/resolv.conf` and opening fresh sockets per call. The resolver is
+/// instantiated lazily on first use so we don't pay the parse cost at app
+/// startup, and the initialization itself can be retried on subsequent calls
+/// if the first attempt fails (e.g. `/etc/resolv.conf` not readable yet).
+static DNS_RESOLVER: tokio::sync::OnceCell<hickory_resolver::TokioAsyncResolver> = tokio::sync::OnceCell::const_new();
+
+async fn dns_resolver() -> Result<&'static hickory_resolver::TokioAsyncResolver> {
+    DNS_RESOLVER
+        .get_or_try_init(|| async {
+            hickory_resolver::TokioAsyncResolver::tokio_from_system_conf().map_err(|e| Error::Internal {
+                operation: format!("initialize DNS resolver: {e}"),
+            })
+        })
+        .await
+}
+
 /// Verify that the domain part of `email` has at least one publishable mail
 /// destination — an MX record, or an implicit A/AAAA per RFC 5321 §5.
 ///
@@ -90,9 +111,7 @@ async fn verify_email_deliverable(email: &str) -> Result<()> {
         });
     }
 
-    let resolver = hickory_resolver::TokioAsyncResolver::tokio_from_system_conf().map_err(|e| Error::Internal {
-        operation: format!("initialize DNS resolver: {e}"),
-    })?;
+    let resolver = dns_resolver().await?;
 
     // Try MX first. An empty MX response means the domain explicitly opts out
     // of mail (rare but valid); we then fall back to A/AAAA per RFC 5321 §5.
@@ -489,8 +508,23 @@ pub async fn update_organization<P: PoolProvider>(
 
             // Single UPSERT atomically supersedes any prior pending change for this org,
             // invalidating both older verification tokens and clearing prior
-            // partial confirmations in the same statement.
+            // partial confirmations in the same statement. We look up the
+            // prior row first so we can audit-log the supersede with the
+            // displaced requester's identity — once the UPSERT runs, only
+            // `current_user` is retained.
             let mut org_repo = Organizations::new(&mut pool_conn);
+            if let Some(prior) = org_repo.find_pending_email_change_for_org(id).await? {
+                tracing::warn!(
+                    org_id = %id,
+                    superseded_requested_by = %prior.requested_by,
+                    superseded_new_email = %prior.new_email,
+                    superseded_created_at = %prior.created_at,
+                    new_requested_by = %current_user.id,
+                    new_email = %normalized,
+                    kind = "org_email_change_superseded",
+                    "PATCH superseded a prior pending org email change",
+                );
+            }
             let pending = org_repo
                 .upsert_pending_email_change(
                     id,
@@ -587,7 +621,10 @@ pub async fn update_organization<P: PoolProvider>(
     }
 
     // Apply non-email updates only. The email never flows through this DB call:
-    // either it was unchanged, or it's now gated behind the verification flow above.
+    // either it was unchanged, or it's now gated behind the verification flow
+    // above. The debug-only assert turns the convention into a fail-fast
+    // runtime check so a future refactor that mistakenly threads `data.email`
+    // through here trips a test before reaching production.
     let db_request = OrganizationUpdateDBRequest {
         display_name: data.display_name,
         avatar_url: None,
@@ -595,6 +632,10 @@ pub async fn update_organization<P: PoolProvider>(
         batch_notifications_enabled: data.batch_notifications_enabled,
         low_balance_threshold: data.low_balance_threshold,
     };
+    debug_assert!(
+        db_request.email.is_none(),
+        "user-facing PATCH must never write email directly — verification flow gates this field",
+    );
 
     let mut repo = Organizations::new(&mut pool_conn);
     let org = repo.update(id, &db_request).await?;
@@ -1637,10 +1678,13 @@ pub async fn confirm_email_change<P: PoolProvider>(
     let mut tx = state.db.write().begin().await.map_err(|e| Error::Database(e.into()))?;
     let mut org_repo = Organizations::new(&mut tx);
 
-    // Try the token against each side. The UPDATE ... RETURNING is atomic and
-    // enforces (token matches column) AND (not already confirmed) AND (not
-    // expired) AND (org not soft-deleted). The second `.await` runs only
-    // when the first returned None, so each PATCH consumes at most one token.
+    // Try the token against each side. Each `confirm_*_email_side` call is an
+    // atomic `UPDATE … RETURNING` that matches at most one row, scoped to the
+    // corresponding `*_email_token_hash` column AND (not already confirmed)
+    // AND (not expired) AND (org not soft-deleted). Because the two token-hash
+    // columns are independently UNIQUE, exactly one of these two queries can
+    // match a given click, so the `else if` short-circuits the second
+    // `UPDATE`: this click only ever updates one column on at most one row.
     let (pending, just_confirmed_side) = if let Some(p) = org_repo.confirm_new_email_side(&token_hash).await? {
         (p, ConfirmedSide::New)
     } else if let Some(p) = org_repo.confirm_old_email_side(&token_hash).await? {
@@ -1696,10 +1740,20 @@ enum ConfirmedSide {
 }
 
 /// Render a minimal HTML confirmation page for the email-change flow.
+///
+/// Hardening headers, even though the threat model for this GET endpoint is
+/// low (the token reaches the user out-of-band via email; no other origin
+/// learns it):
+///
+/// * `Referrer-Policy: no-referrer` — if the user navigates onward from
+///   this page (or any embedded resource it loaded), the verification URL
+///   must not leak to the next origin via the `Referer` header.
+/// * `Cache-Control: no-store` — keeps the URL out of intermediate caches
+///   and browser disk cache; pairs with `Pragma: no-cache` for legacy proxies.
 fn email_change_html(status: StatusCode, message: &str) -> axum::response::Response {
     let body = format!(
         r#"<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>Email change</title></head>
+<html><head><meta charset="utf-8"><meta name="referrer" content="no-referrer"><title>Email change</title></head>
 <body style="font-family: system-ui, sans-serif; max-width: 540px; margin: 60px auto; padding: 20px; color: #333;">
 <h2>Organization contact email</h2>
 <p>{}</p>
@@ -1709,6 +1763,9 @@ fn email_change_html(status: StatusCode, message: &str) -> axum::response::Respo
     axum::response::Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .header(header::REFERRER_POLICY, "no-referrer")
+        .header(header::CACHE_CONTROL, "no-store")
+        .header("Pragma", "no-cache")
         .body(body.into())
         .expect("static HTML response builds")
 }
