@@ -24,9 +24,7 @@ use crate::{
         pagination::PaginatedResponse,
         users::CurrentUser,
     },
-    auth::permissions::{
-        RequiresPermission, can_delete_all_resources, can_read_all_resources, operation, resource,
-    },
+    auth::permissions::{RequiresPermission, can_delete_all_resources, can_read_all_resources, operation, resource},
     errors::{Error, Result},
     types::Resource,
 };
@@ -324,9 +322,21 @@ pub async fn get_batch_request<P: PoolProvider>(
 
 /// Delete a response (batchless fusillade request) by ID.
 ///
-/// Hard-deletes the row for right-to-erasure compliance: response_steps
-/// cascade via FK; `http_analytics` and `credits_transactions` are denormalized
-/// and survive the delete so billing/usage metrics remain intact.
+/// Hard-deletes for right-to-erasure compliance. The fusillade primitive
+/// (`Storage::delete_request`) removes:
+/// * the `requests` row,
+/// * its dedicated batchless `request_templates` row (carrying the prompt
+///   body — 1:1 with the request when `file_id IS NULL`), and
+/// * all `response_steps` whose `request_id` matches (via FK cascade).
+///
+/// **Preserved**: `http_analytics` (token counts, cost, status code — no FK
+/// to requests) and `credits_transactions` (immutable; denormalizes
+/// `fusillade_batch_id` only, not `fusillade_request_id`). Billing and
+/// usage records survive the erasure.
+///
+/// Multi-step Open Responses (with a step tree) are deleted via
+/// `DELETE /ai/v1/responses/{id}` instead — that handler walks the chain
+/// and calls this primitive for every backing sub-request.
 #[utoipa::path(
     delete,
     path = "/admin/api/v1/batches/requests/{request_id}",

@@ -525,12 +525,10 @@ async fn test_delete_response_removes_fusillade_row(pool: PgPool) {
     let start = std::time::Instant::now();
     let mut id = uuid::Uuid::nil();
     while start.elapsed() < std::time::Duration::from_secs(5) {
-        if let Some(row) = sqlx::query(
-            "SELECT id, state FROM fusillade.requests WHERE model = 'gpt-4o' ORDER BY created_at DESC LIMIT 1",
-        )
-        .fetch_optional(&pool)
-        .await
-        .unwrap()
+        if let Some(row) = sqlx::query("SELECT id, state FROM fusillade.requests WHERE model = 'gpt-4o' ORDER BY created_at DESC LIMIT 1")
+            .fetch_optional(&pool)
+            .await
+            .unwrap()
             && sqlx::Row::get::<String, _>(&row, "state") == "completed"
         {
             id = sqlx::Row::get(&row, "id");
