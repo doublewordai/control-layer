@@ -108,9 +108,12 @@ export function CreateAsyncModal({
     return base.endsWith("/v1") ? base : `${base}/v1`;
   }, [config?.ai_api_base_url]);
 
-  // Submit URL — the admin/ai proxy rewrites this to /ai/v1/responses and
-  // injects a per-user hidden API key derived from the session, so the
-  // browser submits with cookies and never needs to handle a user-facing key.
+  // Submit URL — routed through `/admin/api/v1/ai/v1` so dwctl's
+  // `admin_ai_proxy_middleware` can resolve the current user from the
+  // session cookie, mint a hidden playground API key, and forward to
+  // onwards as `POST /ai/v1/responses`. Posting directly to `/ai/v1/...`
+  // would hit onwards, which only accepts Bearer-key auth and 401s on a
+  // bare cookie. Same pattern the Playground uses for chat completions.
   const submitUrl = "/admin/api/v1/ai/v1/responses";
 
   const buildResponseBody = useCallback(() => {
@@ -303,14 +306,18 @@ curl ${baseUrl}/responses/YOUR_RESP_ID \\
 
     setIsSubmitting(true);
     try {
-      // Submit through the admin/ai proxy. The backend middleware reads the
-      // session cookie, looks up (or mints) a hidden playground API key for
-      // the user, and rewrites the path to /ai/v1/responses before passing
-      // through onwards and the responses middleware. The browser never
-      // needs to know about the API key.
+      // Same-origin POST — dwctl accepts the session cookie via the
+      // admin/ai proxy (it mints a hidden playground key from the session
+      // and forwards to onwards), so the user doesn't need a Bearer key
+      // to submit from inside the dashboard. (The Snippet tab still
+      // surfaces a Bearer key because that snippet is meant to be
+      // copy-pasted into the user's own app.)
       const res = await fetch(submitUrl, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        headers: {
+          "Content-Type": "application/json",
+        },
         body: JSON.stringify(buildResponseBody()),
       });
 
@@ -319,7 +326,7 @@ curl ${baseUrl}/responses/YOUR_RESP_ID \\
         if (res.status === 401) {
           // No / expired session — the user actually does need to sign in.
           throw new Error(
-            "Your session was rejected — try signing in again and retrying",
+            "Your session has expired — please reload and sign in again",
           );
         }
         if (res.status === 403) {
@@ -533,9 +540,10 @@ curl ${baseUrl}/responses/YOUR_RESP_ID \\
               />
             </div>
 
-            {/* API key bar lives in the snippet tab because that's its only
-                purpose — submissions from this modal use the dashboard
-                session, so no key is needed to hit Create. */}
+            {/* API key bar — only relevant to the snippet, since the Compose
+                tab submits same-origin and authenticates via session cookie.
+                Users mint a key here so the copy-pasteable snippet they take
+                to their own app has a real Bearer token baked in. */}
             <div className="flex items-center justify-between gap-3 rounded-md border bg-muted/30 px-3 py-2">
               <div className="flex items-center gap-2 min-w-0">
                 <KeyRound className="h-4 w-4 text-muted-foreground flex-shrink-0" />

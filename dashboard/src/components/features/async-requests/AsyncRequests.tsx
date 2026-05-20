@@ -1,7 +1,8 @@
 import { useState, useEffect, useRef } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
-import { Code, Play, X, Filter, Clock, DollarSign, Check, ChevronsUpDown, Zap, FastForward } from "lucide-react";
+import { Code, Play, X, Filter, Clock, DollarSign, Check, ChevronsUpDown, Zap, FastForward, Trash2, Loader2 } from "lucide-react";
 import { type ColumnDef } from "@tanstack/react-table";
+import { toast } from "sonner";
 import { Button } from "../../ui/button";
 import { DataTable } from "../../ui/data-table";
 import { Switch } from "../../ui/switch";
@@ -17,6 +18,13 @@ import {
   SelectTrigger,
   SelectValue,
 } from "../../ui/select";
+import {
+  Dialog,
+  DialogContent,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "../../ui/dialog";
 import { DateTimeRangeSelector } from "../../ui/date-time-range-selector";
 import { Popover, PopoverContent, PopoverTrigger } from "../../ui/popover";
 import {
@@ -28,7 +36,7 @@ import {
   CommandList,
 } from "../../ui/command";
 import { cn } from "../../../lib/utils";
-import { useAsyncRequests, useModels } from "../../../api/control-layer/hooks";
+import { useAsyncRequests, useDeleteAsyncRequest, useModels } from "../../../api/control-layer/hooks";
 import { useAuthorization } from "../../../utils/authorization";
 import type {
   AsyncRequest,
@@ -110,7 +118,8 @@ const userColumn: ColumnDef<AsyncRequest> = {
 
 function createColumns(
   showUserColumn: boolean,
-  modelDisplayNames?: Map<string, string>,
+  modelDisplayNames: Map<string, string> | undefined,
+  onDelete: (req: AsyncRequest) => void,
 ): ColumnDef<AsyncRequest>[] {
   return [
   {
@@ -265,6 +274,31 @@ function createColumns(
       );
     },
   },
+  {
+    id: "actions",
+    header: "Actions",
+    enableHiding: false,
+    cell: ({ row }) => (
+      <div className="flex items-center gap-2 -ml-2">
+        <Tooltip delayDuration={500}>
+          <TooltipTrigger asChild>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-7 w-7 p-0 text-red-600 hover:bg-red-50 hover:text-red-700"
+              onClick={(e) => {
+                e.stopPropagation();
+                onDelete(row.original);
+              }}
+            >
+              <Trash2 className="h-4 w-4" />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent>Delete response</TooltipContent>
+        </Tooltip>
+      </div>
+    ),
+  },
 ];
 }
 
@@ -338,7 +372,31 @@ export function AsyncRequests() {
   // Server-side offset pagination
   const pagination = useServerPagination({ defaultPageSize: 10 });
 
-  const columns = createColumns(showUserColumn, modelDisplayNames);
+  // Delete confirmation flow — same shape as the batches table action.
+  const [requestToDelete, setRequestToDelete] = useState<AsyncRequest | null>(
+    null,
+  );
+  const deleteMutation = useDeleteAsyncRequest();
+
+  const columns = createColumns(showUserColumn, modelDisplayNames, (req) =>
+    setRequestToDelete(req),
+  );
+
+  const confirmDelete = async () => {
+    if (!requestToDelete) return;
+    try {
+      await deleteMutation.mutateAsync(requestToDelete.id);
+      toast.success(`Response "${requestToDelete.id}" deleted successfully`);
+      setRequestToDelete(null);
+    } catch (error) {
+      console.error("Failed to delete response:", error);
+      toast.error(
+        error instanceof Error
+          ? error.message
+          : "Failed to delete response. Please try again.",
+      );
+    }
+  };
 
   const { data, isLoading } = useAsyncRequests({
     service_tiers: tierFilter.length > 0 ? tierFilter.join(",") : undefined,
@@ -625,6 +683,61 @@ export function AsyncRequests() {
         onClose={() => setShowApiExamples(false)}
         defaultTab="async"
       />
+
+      {/* Delete response confirmation. Pattern mirrors BatchesContainer's
+          delete dialog so the destructive-action UX is consistent. */}
+      <Dialog
+        open={!!requestToDelete}
+        onOpenChange={(open) => {
+          if (!open) setRequestToDelete(null);
+        }}
+      >
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 bg-red-100 rounded-full flex items-center justify-center">
+                <Trash2 className="w-5 h-5 text-red-600" />
+              </div>
+              <div>
+                <DialogTitle>Delete Response</DialogTitle>
+                <p className="text-sm text-gray-600">
+                  This action cannot be undone
+                </p>
+              </div>
+            </div>
+          </DialogHeader>
+
+          <div className="py-4">
+            <p className="text-sm text-gray-700">
+              Are you sure you want to delete response{" "}
+              <strong className="font-mono">"{requestToDelete?.id}"</strong>?
+              The prompt body, response body, and any associated step records
+              will be permanently erased. Token / cost analytics are preserved
+              for billing.
+            </p>
+          </div>
+
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => setRequestToDelete(null)}
+            >
+              Cancel
+            </Button>
+            <Button
+              onClick={confirmDelete}
+              disabled={deleteMutation.isPending}
+              variant="destructive"
+            >
+              {deleteMutation.isPending && (
+                <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+              )}
+              Delete Response
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

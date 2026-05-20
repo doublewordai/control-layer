@@ -1246,6 +1246,10 @@ pub async fn build_router(
             "/batches/requests/{request_id}",
             get(api::handlers::batch_requests::get_batch_request),
         )
+        .route(
+            "/batches/requests/{request_id}",
+            delete(api::handlers::batch_requests::delete_batch_request),
+        )
         .route("/requests", get(api::handlers::requests::list_requests))
         .route("/requests/aggregate", get(api::handlers::requests::aggregate_requests))
         .route("/requests/aggregate-by-user", get(api::handlers::requests::aggregate_by_user))
@@ -1359,6 +1363,7 @@ pub async fn build_router(
                 .route("/files/{file_id}/cost-estimate", get(api::handlers::files::get_file_cost_estimate))
                 // Responses retrieval (Open Responses API)
                 .route("/responses/{response_id}", get(crate::responses::handler::get_response))
+                .route("/responses/{response_id}", delete(crate::responses::handler::delete_response))
                 // Batches management
                 .route("/batches", post(api::handlers::batches::create_batch))
                 .route("/batches", get(api::handlers::batches::list_batches))

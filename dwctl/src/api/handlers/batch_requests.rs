@@ -10,6 +10,7 @@
 
 use axum::{
     extract::{Path, Query, State},
+    http::StatusCode,
     response::Json,
 };
 use fusillade::Storage;
@@ -23,7 +24,7 @@ use crate::{
         pagination::PaginatedResponse,
         users::CurrentUser,
     },
-    auth::permissions::{RequiresPermission, can_read_all_resources, operation, resource},
+    auth::permissions::{RequiresPermission, can_delete_all_resources, can_read_all_resources, operation, resource},
     errors::{Error, Result},
     types::Resource,
 };
@@ -319,6 +320,90 @@ pub async fn get_batch_request<P: PoolProvider>(
     }))
 }
 
+/// Delete a response (batchless fusillade request) by ID.
+///
+/// Hard-deletes for right-to-erasure compliance. The fusillade primitive
+/// (`Storage::delete_request`) removes:
+/// * the `requests` row,
+/// * its dedicated batchless `request_templates` row (carrying the prompt
+///   body — 1:1 with the request when `file_id IS NULL`), and
+/// * all `response_steps` whose `request_id` matches (via FK cascade).
+///
+/// **Preserved**: `http_analytics` (token counts, cost, status code — no FK
+/// to requests) and `credits_transactions` (immutable; denormalizes
+/// `fusillade_batch_id` only, not `fusillade_request_id`). Billing and
+/// usage records survive the erasure.
+///
+/// Multi-step Open Responses (with a step tree) are deleted via
+/// `DELETE /ai/v1/responses/{id}` instead — that handler walks the chain
+/// and calls this primitive for every backing sub-request.
+#[utoipa::path(
+    delete,
+    path = "/admin/api/v1/batches/requests/{request_id}",
+    params(
+        ("request_id" = Uuid, Path, description = "The request ID"),
+    ),
+    responses(
+        (status = 204, description = "Response deleted"),
+        (status = 404, description = "Response not found"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "batch_requests",
+)]
+#[tracing::instrument(skip_all, fields(user_id = %current_user.id, request_id = %request_id))]
+pub async fn delete_batch_request<P: PoolProvider>(
+    State(state): State<AppState<P>>,
+    Path(request_id): Path<Uuid>,
+    current_user: CurrentUser,
+    _: RequiresPermission<resource::Batches, operation::DeleteOwn>,
+) -> Result<StatusCode> {
+    // Fetch first to verify existence + ownership. `get_request_detail` filters
+    // batched rows (WHERE r.created_by IS NOT NULL), so we can't accidentally
+    // delete a row that belongs to a batch via this endpoint.
+    let detail = state
+        .request_manager
+        .get_request_detail(fusillade::RequestId(request_id))
+        .await
+        .map_err(|e| match e {
+            fusillade::FusilladeError::RequestNotFound(_) => Error::NotFound {
+                resource: "Response".to_string(),
+                id: request_id.to_string(),
+            },
+            other => {
+                tracing::error!(request_id = %request_id, error = %other, "failed to fetch response for delete");
+                Error::Internal {
+                    operation: format!("get response for delete: {}", other),
+                }
+            }
+        })?;
+
+    // 404 (not 403) avoids leaking existence of other users' responses.
+    let can_delete_all = can_delete_all_resources(&current_user, Resource::Batches);
+    if !can_delete_all && !is_batch_owner(&current_user, &detail.created_by) {
+        return Err(Error::NotFound {
+            resource: "Response".to_string(),
+            id: request_id.to_string(),
+        });
+    }
+
+    state
+        .request_manager
+        .delete_request(fusillade::RequestId(request_id))
+        .await
+        .map_err(|e| match e {
+            fusillade::FusilladeError::RequestNotFound(_) => Error::NotFound {
+                resource: "Response".to_string(),
+                id: request_id.to_string(),
+            },
+            other => Error::Internal {
+                operation: format!("delete response: {}", other),
+            },
+        })?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// Analytics data from http_analytics (dwctl-owned, not fusillade schema)
 #[derive(sqlx::FromRow)]
 struct AnalyticsRow {
@@ -444,5 +529,97 @@ mod tests {
         let body: serde_json::Value = response.json();
         assert_eq!(body["id"], request_id.to_string());
         assert_eq!(body["created_by_email"], user.email);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_delete_batch_request_removes_row(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let auth = add_auth_headers(&user);
+
+        let template_id = uuid::Uuid::new_v4();
+        let request_id = uuid::Uuid::new_v4();
+        let body = serde_json::json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}]});
+
+        sqlx::query(
+            "INSERT INTO fusillade.request_templates (id, file_id, model, api_key, endpoint, path, body, custom_id, method) VALUES ($1, NULL, 'test-model', 'test-key', 'http://test', '/v1/chat/completions', $2, NULL, 'POST')",
+        )
+        .bind(template_id)
+        .bind(serde_json::to_string(&body).unwrap())
+        .execute(&pool)
+        .await
+        .expect("insert template");
+
+        sqlx::query(
+            "INSERT INTO fusillade.requests (id, batch_id, template_id, model, state, created_at, created_by) VALUES ($1, NULL, $2, 'test-model', 'pending', NOW(), $3)",
+        )
+        .bind(request_id)
+        .bind(template_id)
+        .bind(user.id.to_string())
+        .execute(&pool)
+        .await
+        .expect("insert request");
+
+        let response = app
+            .delete(&format!("/admin/api/v1/batches/requests/{}", request_id))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+        response.assert_status(axum::http::StatusCode::NO_CONTENT);
+
+        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM fusillade.requests WHERE id = $1")
+            .bind(request_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count.0, 0, "fusillade row should be hard-deleted");
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_delete_batch_request_404_for_other_users_row(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let owner = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let intruder = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let intruder_auth = add_auth_headers(&intruder);
+
+        let template_id = uuid::Uuid::new_v4();
+        let request_id = uuid::Uuid::new_v4();
+        let body = serde_json::json!({"model": "test-model", "messages": []});
+
+        sqlx::query(
+            "INSERT INTO fusillade.request_templates (id, file_id, model, api_key, endpoint, path, body, custom_id, method) VALUES ($1, NULL, 'test-model', 'test-key', 'http://test', '/v1/chat/completions', $2, NULL, 'POST')",
+        )
+        .bind(template_id)
+        .bind(serde_json::to_string(&body).unwrap())
+        .execute(&pool)
+        .await
+        .expect("insert template");
+
+        sqlx::query(
+            "INSERT INTO fusillade.requests (id, batch_id, template_id, model, state, created_at, created_by) VALUES ($1, NULL, $2, 'test-model', 'pending', NOW(), $3)",
+        )
+        .bind(request_id)
+        .bind(template_id)
+        .bind(owner.id.to_string())
+        .execute(&pool)
+        .await
+        .expect("insert request");
+
+        let response = app
+            .delete(&format!("/admin/api/v1/batches/requests/{}", request_id))
+            .add_header(&intruder_auth[0].0, &intruder_auth[0].1)
+            .add_header(&intruder_auth[1].0, &intruder_auth[1].1)
+            .await;
+        response.assert_status_not_found();
+
+        // Row is still there — intruder couldn't delete it.
+        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM fusillade.requests WHERE id = $1")
+            .bind(request_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count.0, 1, "row should remain — ownership check should reject");
     }
 }
