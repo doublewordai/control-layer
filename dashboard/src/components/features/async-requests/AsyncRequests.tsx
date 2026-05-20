@@ -279,7 +279,7 @@ function createColumns(
     header: "Actions",
     enableHiding: false,
     cell: ({ row }) => (
-      <div className="flex items-center justify-end gap-1">
+      <div className="flex items-center gap-2 -ml-2">
         <Tooltip delayDuration={500}>
           <TooltipTrigger asChild>
             <Button
