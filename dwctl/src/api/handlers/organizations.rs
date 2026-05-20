@@ -410,7 +410,17 @@ pub async fn get_organization<P: PoolProvider>(
     let mut org_repo = Organizations::new(&mut pool_conn);
     let members = org_repo.list_members(id).await?;
 
+    // Surface any in-flight email-change verification so the dashboard can
+    // render the pending state without requiring the user to refresh from the
+    // exact PATCH response that initiated the change. Reads from the read
+    // pool inherit normal replica-lag semantics; the verification row is the
+    // source of truth either way.
+    let pending_email_change = org_repo.find_pending_email_change_for_org(id).await?;
+
     let mut response = OrganizationResponse::from_user(UserResponse::from(org)).with_member_count(members.len() as i64);
+    if let Some(pending) = pending_email_change {
+        response = response.with_pending_email_change(PendingEmailChangeResponse::from(pending));
+    }
 
     // Include credit balance if the user has permission to view billing data
     let can_view_billing = crate::auth::permissions::has_permission(&current_user, Resource::Credits, Operation::ReadAll)
@@ -640,8 +650,21 @@ pub async fn update_organization<P: PoolProvider>(
     let mut repo = Organizations::new(&mut pool_conn);
     let org = repo.update(id, &db_request).await?;
 
+    // Surface any pending email-change on EVERY PATCH response — not just
+    // the one that created it — so a dashboard mid-verification doesn't lose
+    // the state when the user PATCHes another field (e.g. renames the org).
+    // If this PATCH triggered a new pending change we already have it in
+    // `pending_email_info`; otherwise look up whatever's currently pending.
+    let pending_email_change = match pending_email_info {
+        Some(info) => Some(info),
+        None => repo
+            .find_pending_email_change_for_org(id)
+            .await?
+            .map(PendingEmailChangeResponse::from),
+    };
+
     let mut response = OrganizationResponse::from_user(UserResponse::from(org));
-    if let Some(info) = pending_email_info {
+    if let Some(info) = pending_email_change {
         response = response.with_pending_email_change(info);
     }
 
@@ -1710,7 +1733,20 @@ pub async fn confirm_email_change<P: PoolProvider>(
             low_balance_threshold: None,
         };
         org_repo.update(pending.organization_id, &update).await?;
-        org_repo.delete_pending_email_change(pending.id).await?;
+        // The `confirm_*_email_side` UPDATE above already locked this row, so
+        // a `false` here would mean the row was somehow deleted from within
+        // our own transaction — a logic bug, not a race. Fail loudly so we
+        // don't silently commit a state where `users.email` was updated but
+        // the pending row stuck around.
+        let deleted = org_repo.delete_pending_email_change(pending.id).await?;
+        if !deleted {
+            return Err(Error::Internal {
+                operation: format!(
+                    "delete_pending_email_change for {} returned false inside confirm transaction; logic bug",
+                    pending.id,
+                ),
+            });
+        }
         tx.commit().await.map_err(|e| Error::Database(e.into()))?;
 
         return Ok(email_change_html(
@@ -3116,5 +3152,86 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    // ── Pending state visibility ──────────────────────────────────────
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_get_org_surfaces_pending_email_change(pool: PgPool) {
+        // A dashboard refresh mid-verification should still see the pending
+        // state via GET, not only on the PATCH that created it.
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let pm = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let pm_headers = add_auth_headers(&pm);
+        let owner = create_test_user(&pool, Role::StandardUser).await;
+        let owner_headers = add_auth_headers(&owner);
+
+        let org_id = create_org_for(&server, &pm_headers, "pending-visible-org", "billing@example.com", owner.id).await;
+
+        // Initiate change.
+        let resp = server
+            .patch(&format!("/admin/api/v1/organizations/{org_id}"))
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .json(&json!({ "email": "next@example.com" }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::OK);
+
+        // GET the org — pending_email_change should be present.
+        let resp = server
+            .get(&format!("/admin/api/v1/organizations/{org_id}"))
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .await;
+        resp.assert_status(axum::http::StatusCode::OK);
+        let body = resp.json::<serde_json::Value>();
+        assert_eq!(body["email"].as_str().unwrap(), "billing@example.com");
+        assert_eq!(
+            body["pending_email_change"]["new_email"].as_str().unwrap(),
+            "next@example.com",
+            "GET should surface in-flight pending change; got: {body}",
+        );
+        assert!(body["pending_email_change"]["expires_at"].is_string());
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_patch_other_fields_still_reports_pending_email_change(pool: PgPool) {
+        // After initiating an email change, a follow-up PATCH that touches
+        // only non-email fields must still reflect the still-pending change
+        // in its response — otherwise the dashboard loses visibility.
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let pm = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let pm_headers = add_auth_headers(&pm);
+        let owner = create_test_user(&pool, Role::StandardUser).await;
+        let owner_headers = add_auth_headers(&owner);
+
+        let org_id = create_org_for(&server, &pm_headers, "pending-survives-org", "billing@example.com", owner.id).await;
+
+        // Initiate the change.
+        let resp = server
+            .patch(&format!("/admin/api/v1/organizations/{org_id}"))
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .json(&json!({ "email": "next@example.com" }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::OK);
+
+        // Follow-up PATCH that only renames the org — no email field.
+        let resp = server
+            .patch(&format!("/admin/api/v1/organizations/{org_id}"))
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .json(&json!({ "display_name": "Renamed Org" }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::OK);
+        let body = resp.json::<serde_json::Value>();
+        assert_eq!(body["display_name"].as_str().unwrap(), "Renamed Org");
+        assert_eq!(
+            body["pending_email_change"]["new_email"].as_str().unwrap(),
+            "next@example.com",
+            "non-email PATCH must still surface the in-flight change; got: {body}",
+        );
     }
 }
