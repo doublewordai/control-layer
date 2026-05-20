@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.52.1](https://github.com/doublewordai/control-layer/compare/v8.52.0...v8.52.1) (2026-05-20)
+
+
+### Bug Fixes
+
+* **organizations:** verify and validate contact-email changes ([#1080](https://github.com/doublewordai/control-layer/issues/1080)) ([4f91377](https://github.com/doublewordai/control-layer/commit/4f91377ed7e10f32e1c607073df01beda27d8591))
+
 ## [8.52.0](https://github.com/doublewordai/control-layer/compare/v8.51.0...v8.52.0) (2026-05-20)
 
 
