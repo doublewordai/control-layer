@@ -71,13 +71,13 @@ fn extract_bearer_token(request: &Request<Body>) -> Option<String> {
     }
 }
 
-/// Resolve `bearer` → `(user_id, image_normalization_enabled)`. Returns
-/// `None` if the key isn't known. Best-effort; errors are logged and
-/// swallowed.
-async fn resolve_caller_for_normalizer(pool: &PgPool, bearer: &str) -> Option<(uuid::Uuid, bool)> {
+/// Resolve `bearer` → `user_id` for the `image_access` bookkeeping row.
+/// Returns `None` if the key isn't known. Best-effort; errors are logged
+/// and swallowed.
+async fn resolve_caller_user_id(pool: &PgPool, bearer: &str) -> Option<uuid::Uuid> {
     match sqlx::query!(
         r#"
-        SELECT u.id AS "id!", u.image_normalization_enabled AS "image_normalization_enabled!"
+        SELECT ak.user_id AS "user_id!"
         FROM api_keys ak
         INNER JOIN users u ON u.id = ak.user_id
         WHERE ak.secret = $1 AND ak.is_deleted = FALSE AND u.is_deleted = FALSE
@@ -88,10 +88,10 @@ async fn resolve_caller_for_normalizer(pool: &PgPool, bearer: &str) -> Option<(u
     .fetch_optional(pool)
     .await
     {
-        Ok(Some(row)) => Some((row.id, row.image_normalization_enabled)),
+        Ok(Some(row)) => Some(row.user_id),
         Ok(None) => None,
         Err(e) => {
-            warn!(error = %e, "failed to resolve bearer token for image normaliser (non-fatal)");
+            warn!(error = %e, "failed to resolve bearer token for image_access bookkeeping (non-fatal)");
             None
         }
     }
@@ -130,21 +130,22 @@ pub async fn image_normalizer_middleware(
         }
     };
 
-    // Resolve the caller's user_id (for image_access bookkeeping) and the
-    // per-user opt-in flag (which selects walker mode).
-    let caller = match (state.pool.as_ref(), extract_bearer_token(&request)) {
-        (Some(pool), Some(bearer)) => resolve_caller_for_normalizer(pool, &bearer).await,
+    // Image normalisation is a system-wide setting (controlled by
+    // `config.image_normalizer.enabled` at startup). When the middleware
+    // is wired in, every image input — HTTP(S) URL or `data:` URI — gets
+    // normalised through the content-addressed store.
+    let mode = Mode::All;
+
+    // Caller user_id is only used for `image_access` bookkeeping, not for
+    // mode selection — best-effort, never blocks the request.
+    let user_id_for_access = match (state.pool.as_ref(), extract_bearer_token(&request)) {
+        (Some(pool), Some(bearer)) => resolve_caller_user_id(pool, &bearer).await,
         _ => None,
-    };
-    let mode = match caller {
-        Some((_uid, true)) => Mode::All,
-        _ => Mode::HttpOnly,
     };
 
     let normalizer = state.normalizer.clone();
     let realtime_ttl = state.realtime_ttl;
     let pool_for_access = state.pool.clone();
-    let user_id_for_access = caller.map(|(uid, _)| uid);
     let substitute = move |url: String| {
         let normalizer = normalizer.clone();
         let pool_for_access = pool_for_access.clone();

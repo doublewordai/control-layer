@@ -54,8 +54,6 @@ pub struct UserUpdateDBRequest {
     /// Monthly auto top-up spending limit.
     /// `None` = don't change, `Some(None)` = disable limit, `Some(Some(val))` = set limit.
     pub auto_topup_monthly_limit: Option<Option<f32>>,
-    /// Image normalisation opt-in. `None` = don't change.
-    pub image_normalization_enabled: Option<bool>,
 }
 
 impl UserUpdateDBRequest {
@@ -70,7 +68,6 @@ impl UserUpdateDBRequest {
             auto_topup_amount: update.auto_topup_amount,
             auto_topup_threshold: update.auto_topup_threshold,
             auto_topup_monthly_limit: update.auto_topup_monthly_limit,
-            image_normalization_enabled: update.image_normalization_enabled,
         }
     }
 }
@@ -105,11 +102,4 @@ pub struct UserDBResponse {
     pub auto_topup_monthly_limit: Option<f32>,
     /// User type: 'individual' or 'organization'
     pub user_type: String,
-    /// When true, the user has opted into full image-input normalisation.
-    /// In this mode the realtime middleware and batch ingest path replace
-    /// **both** `data:` URIs and HTTP(S) URLs with opaque image tokens, so
-    /// no raw image bytes ever appear in the body forwarded to an upstream
-    /// provider. Default false; HTTP(S) URLs are always normalised
-    /// regardless of this flag (the floor security control).
-    pub image_normalization_enabled: bool,
 }

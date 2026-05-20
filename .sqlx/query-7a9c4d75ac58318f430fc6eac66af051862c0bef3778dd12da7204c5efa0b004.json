@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id, username, email, display_name, avatar_url, auth_source, created_at, updated_at,\n                   is_admin, password_hash, external_user_id, payment_provider_id,\n                   is_deleted, is_internal, batch_notifications_enabled, first_batch_email_sent,\n                   low_balance_notification_sent, low_balance_threshold,\n                   auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, user_type,\n                   image_normalization_enabled\n            FROM users\n            WHERE username = $1 AND user_type = 'organization' AND is_deleted = false\n            ",
+  "query": "\n            SELECT id, username, email, display_name, avatar_url, auth_source, created_at, updated_at,\n                   is_admin, password_hash, external_user_id, payment_provider_id,\n                   is_deleted, is_internal, batch_notifications_enabled, first_batch_email_sent,\n                   low_balance_notification_sent, low_balance_threshold,\n                   auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, user_type\n            FROM users\n            WHERE username = $1 AND user_type = 'organization' AND is_deleted = false\n            ",
   "describe": {
     "columns": [
       {
@@ -112,11 +112,6 @@
         "ordinal": 21,
         "name": "user_type",
         "type_info": "Varchar"
-      },
-      {
-        "ordinal": 22,
-        "name": "image_normalization_enabled",
-        "type_info": "Bool"
       }
     ],
     "parameters": {
@@ -146,9 +141,8 @@
       true,
       true,
       true,
-      false,
       false
     ]
   },
-  "hash": "bb8017ded49d3674ec7c8ed350704fa7ede6491ba304adc9377c485c2a0b1efb"
+  "hash": "7a9c4d75ac58318f430fc6eac66af051862c0bef3778dd12da7204c5efa0b004"
 }

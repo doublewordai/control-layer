@@ -253,7 +253,6 @@ mod tests {
             avatar_url: None,
             organizations: vec![],
             active_organization: None,
-            image_normalization_enabled: false,
         }
     }
 

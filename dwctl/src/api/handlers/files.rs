@@ -963,12 +963,10 @@ pub async fn upload_file<P: PoolProvider>(
     } else {
         None
     };
-    // Choose walker mode from the calling user's opt-in flag.
-    let normalizer_mode = if current_user.image_normalization_enabled {
-        ImageNormalizerMode::All
-    } else {
-        ImageNormalizerMode::HttpOnly
-    };
+    // Image normalisation is a system-wide setting (controlled by
+    // `config.image_normalizer.enabled`). When on, every image input —
+    // HTTP(S) URL or `data:` URI — gets normalised through the store.
+    let normalizer_mode = ImageNormalizerMode::All;
     let stream_config = FileStreamConfig {
         max_file_size: config.limits.files.max_file_size,
         max_requests_per_file: config.limits.files.max_requests_per_file,

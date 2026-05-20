@@ -129,7 +129,6 @@ mod tests {
             payment_provider_id: None,
             organizations: vec![],
             active_organization: None,
-            image_normalization_enabled: false,
         }
     }
 
