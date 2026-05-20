@@ -280,6 +280,15 @@ pub struct UsageDateQuery {
     pub end_date: Option<DateTime<Utc>>,
     /// When true, bypasses the server-side cache and forces fresh aggregation.
     pub refresh: Option<bool>,
+    /// User or org to scope usage data to. When omitted, the handler defaults to
+    /// the caller's `active_organization` if present (so org-context callers see
+    /// org-wide usage rather than their personal usage) and falls back to the
+    /// caller's own id otherwise. Org owners / admins may pass another member's
+    /// id to drill into per-member usage; non-admins are limited to their own id
+    /// or the active org's id.
+    #[param(value_type = Option<String>, format = "uuid")]
+    #[schema(value_type = Option<String>, format = "uuid")]
+    pub user_id: Option<crate::types::UserId>,
 }
 
 // ===== AGGREGATE/ANALYTICS RESPONSE TYPES =====
