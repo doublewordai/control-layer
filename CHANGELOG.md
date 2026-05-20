@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.52.0](https://github.com/doublewordai/control-layer/compare/v8.51.0...v8.52.0) (2026-05-20)
+
+
+### Features
+
+* **usage:** scope /usage to active organization and accept user_id filter ([#1086](https://github.com/doublewordai/control-layer/issues/1086)) ([1d4a05c](https://github.com/doublewordai/control-layer/commit/1d4a05c66f063176232d43630e408ffa065b3426))
+
 ## [8.51.0](https://github.com/doublewordai/control-layer/compare/v8.50.0...v8.51.0) (2026-05-20)
 
 
