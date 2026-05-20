@@ -983,13 +983,16 @@ mod tests {
             .unwrap();
 
         let updated = orgs
-            .update(org.id, &OrganizationUpdateDBRequest {
-                display_name: Some("New Acme Name".to_string()),
-                avatar_url: None,
-                email: Some("new@acme.example.com".to_string()),
-                batch_notifications_enabled: None,
-                low_balance_threshold: None,
-            })
+            .update(
+                org.id,
+                &OrganizationUpdateDBRequest {
+                    display_name: Some("New Acme Name".to_string()),
+                    avatar_url: None,
+                    email: Some("new@acme.example.com".to_string()),
+                    batch_notifications_enabled: None,
+                    low_balance_threshold: None,
+                },
+            )
             .await
             .unwrap();
 
@@ -1022,13 +1025,16 @@ mod tests {
 
         // Update only email, leave display_name unchanged
         let updated = orgs
-            .update(org.id, &OrganizationUpdateDBRequest {
-                display_name: None,
-                avatar_url: None,
-                email: Some("new@acme.example.com".to_string()),
-                batch_notifications_enabled: None,
-                low_balance_threshold: None,
-            })
+            .update(
+                org.id,
+                &OrganizationUpdateDBRequest {
+                    display_name: None,
+                    avatar_url: None,
+                    email: Some("new@acme.example.com".to_string()),
+                    batch_notifications_enabled: None,
+                    low_balance_threshold: None,
+                },
+            )
             .await
             .unwrap();
 
@@ -1064,13 +1070,16 @@ mod tests {
 
         // Enable notifications and set threshold
         let updated = orgs
-            .update(org.id, &OrganizationUpdateDBRequest {
-                display_name: None,
-                avatar_url: None,
-                email: None,
-                batch_notifications_enabled: Some(true),
-                low_balance_threshold: Some(Some(10.0)),
-            })
+            .update(
+                org.id,
+                &OrganizationUpdateDBRequest {
+                    display_name: None,
+                    avatar_url: None,
+                    email: None,
+                    batch_notifications_enabled: Some(true),
+                    low_balance_threshold: Some(Some(10.0)),
+                },
+            )
             .await
             .unwrap();
 
@@ -1080,13 +1089,16 @@ mod tests {
 
         // Partial update: change threshold only, notifications stay enabled
         let updated = orgs
-            .update(org.id, &OrganizationUpdateDBRequest {
-                display_name: None,
-                avatar_url: None,
-                email: None,
-                batch_notifications_enabled: None,
-                low_balance_threshold: Some(Some(25.0)),
-            })
+            .update(
+                org.id,
+                &OrganizationUpdateDBRequest {
+                    display_name: None,
+                    avatar_url: None,
+                    email: None,
+                    batch_notifications_enabled: None,
+                    low_balance_threshold: Some(Some(25.0)),
+                },
+            )
             .await
             .unwrap();
 
@@ -1097,13 +1109,16 @@ mod tests {
 
         // Clear threshold to disable alerts
         let updated = orgs
-            .update(org.id, &OrganizationUpdateDBRequest {
-                display_name: None,
-                avatar_url: None,
-                email: None,
-                batch_notifications_enabled: None,
-                low_balance_threshold: Some(None),
-            })
+            .update(
+                org.id,
+                &OrganizationUpdateDBRequest {
+                    display_name: None,
+                    avatar_url: None,
+                    email: None,
+                    batch_notifications_enabled: None,
+                    low_balance_threshold: Some(None),
+                },
+            )
             .await
             .unwrap();
 
@@ -1112,13 +1127,16 @@ mod tests {
 
         // Omitting threshold entirely leaves it unchanged
         let updated = orgs
-            .update(org.id, &OrganizationUpdateDBRequest {
-                display_name: None,
-                avatar_url: None,
-                email: None,
-                batch_notifications_enabled: None,
-                low_balance_threshold: None,
-            })
+            .update(
+                org.id,
+                &OrganizationUpdateDBRequest {
+                    display_name: None,
+                    avatar_url: None,
+                    email: None,
+                    batch_notifications_enabled: None,
+                    low_balance_threshold: None,
+                },
+            )
             .await
             .unwrap();
 
