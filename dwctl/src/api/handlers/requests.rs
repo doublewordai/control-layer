@@ -348,38 +348,55 @@ async fn resolve_usage_target<P: PoolProvider>(
         return Ok(default_target);
     };
 
+    // Self is always allowed — no DB round-trip needed.
     if requested == current_user.id {
         return Ok(requested);
     }
 
+    // Every remaining authorisation path requires the caller to be in an org
+    // context. Without one we can short-circuit to 403 before acquiring a
+    // DB connection (avoids a pool round-trip on every malformed `user_id`
+    // request from a personal-context caller).
+    let Some(active_org) = current_user.active_organization else {
+        return Err(unauthorized_usage_target_error(requested));
+    };
+
     let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
-
-    // The active org itself is always queryable by any of its members.
-    if let Some(active_org) = current_user.active_organization
-        && requested == active_org
-    {
-        let mut repo = crate::db::handlers::Organizations::new(&mut conn);
-        if repo.get_user_org_role(current_user.id, active_org).await?.is_some() {
-            return Ok(requested);
-        }
+    let mut repo = crate::db::handlers::Organizations::new(&mut conn);
+    let actor_role = repo.get_user_org_role(current_user.id, active_org).await?;
+    // Non-members of the active org get the same 403 as a personal-context
+    // caller — they're outside the org's authority surface entirely.
+    if actor_role.is_none() {
+        return Err(unauthorized_usage_target_error(requested));
     }
 
-    // Drilling into another member's id requires owner/admin role on the
-    // active org *and* the requested id to be a member of it.
-    if let Some(active_org) = current_user.active_organization {
-        let mut repo = crate::db::handlers::Organizations::new(&mut conn);
-        let actor_role = repo.get_user_org_role(current_user.id, active_org).await?;
-        let target_role = repo.get_user_org_role(requested, active_org).await?;
-        if matches!(actor_role.as_deref(), Some("owner" | "admin")) && target_role.is_some() {
-            return Ok(requested);
-        }
+    // The active org itself is queryable by any of its members.
+    if requested == active_org {
+        return Ok(requested);
     }
 
-    Err(Error::InsufficientPermissions {
-        required: crate::types::Permission::Allow(crate::types::Resource::Requests, crate::types::Operation::ReadOwn),
-        action: crate::types::Operation::ReadOwn,
+    // Per-member drill-down: requires owner/admin role on the active org
+    // *and* the requested id to actually be a member of it.
+    let target_role = repo.get_user_org_role(requested, active_org).await?;
+    if matches!(actor_role.as_deref(), Some("owner" | "admin")) && target_role.is_some() {
+        return Ok(requested);
+    }
+
+    Err(unauthorized_usage_target_error(requested))
+}
+
+/// Single source of truth for the 403 a caller gets when they request a
+/// `user_id` they aren't allowed to read. The permission label points at
+/// `Resource::Requests` + `Operation::ReadAll` — the closest analogue to
+/// "read someone else's request history", which is what the per-member
+/// drill-down case actually is. The previous `ReadOwn` label made the
+/// log line look like a normal self-read failure, which it isn't.
+fn unauthorized_usage_target_error(requested: crate::types::UserId) -> Error {
+    Error::InsufficientPermissions {
+        required: crate::types::Permission::Allow(crate::types::Resource::Requests, crate::types::Operation::ReadAll),
+        action: crate::types::Operation::ReadAll,
         resource: format!("Usage for user {requested}"),
-    })
+    }
 }
 
 #[cfg(test)]
@@ -871,6 +888,20 @@ mod tests {
         .expect("Failed to insert test analytics row");
     }
 
+    /// Build a `/usage` URL with the standard one-hour-ago window and an
+    /// optional `user_id`. Centralised so the per-test cases describe what
+    /// they're checking rather than the date-format ceremony (chrono's
+    /// `to_rfc3339()` emits `+00:00`, where the `+` is decoded as a space
+    /// by the query-string parser — the `Z` suffix avoids it).
+    fn build_usage_url(user_id: Option<uuid::Uuid>) -> String {
+        let start = (Utc::now() - Duration::hours(1)).format("%Y-%m-%dT%H:%M:%SZ");
+        let end = Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
+        match user_id {
+            Some(id) => format!("/admin/api/v1/usage?start_date={start}&end_date={end}&user_id={id}"),
+            None => format!("/admin/api/v1/usage?start_date={start}&end_date={end}"),
+        }
+    }
+
     #[sqlx::test]
     #[test_log::test]
     async fn test_usage_defaults_to_active_organization(pool: PgPool) {
@@ -884,17 +915,11 @@ mod tests {
         insert_analytics_for_user(&pool, user.id, 100, 50).await;
         insert_analytics_for_user(&pool, org.id, 1000, 500).await;
 
-        // `to_rfc3339()` would emit `+00:00`, and `+` in a query string is
-        // interpreted as a space by the standard parser — use the explicit
-        // `Z` suffix to keep the timestamp unambiguous.
-        let start = (Utc::now() - Duration::hours(1)).format("%Y-%m-%dT%H:%M:%SZ").to_string();
-        let end = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-        let url = format!("/admin/api/v1/usage?start_date={start}&end_date={end}");
         let org_cookie = format!("dw_active_org={}", org.id);
         let auth = add_auth_headers(&user);
 
         let response = app
-            .get(&url)
+            .get(&build_usage_url(None))
             .add_header(&auth[0].0, &auth[0].1)
             .add_header(&auth[1].0, &auth[1].1)
             .add_header("cookie", &org_cookie)
@@ -921,17 +946,11 @@ mod tests {
         insert_analytics_for_user(&pool, user.id, 100, 50).await;
         insert_analytics_for_user(&pool, org.id, 1000, 500).await;
 
-        // `to_rfc3339()` would emit `+00:00`, and `+` in a query string is
-        // interpreted as a space by the standard parser — use the explicit
-        // `Z` suffix to keep the timestamp unambiguous.
-        let start = (Utc::now() - Duration::hours(1)).format("%Y-%m-%dT%H:%M:%SZ").to_string();
-        let end = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-        let url = format!("/admin/api/v1/usage?start_date={start}&end_date={end}&user_id={}", user.id);
         let org_cookie = format!("dw_active_org={}", org.id);
         let auth = add_auth_headers(&user);
 
         let response = app
-            .get(&url)
+            .get(&build_usage_url(Some(user.id)))
             .add_header(&auth[0].0, &auth[0].1)
             .add_header(&auth[1].0, &auth[1].1)
             .add_header("cookie", &org_cookie)
@@ -955,17 +974,11 @@ mod tests {
 
         insert_analytics_for_user(&pool, member.id, 25, 25).await;
 
-        // `to_rfc3339()` would emit `+00:00`, and `+` in a query string is
-        // interpreted as a space by the standard parser — use the explicit
-        // `Z` suffix to keep the timestamp unambiguous.
-        let start = (Utc::now() - Duration::hours(1)).format("%Y-%m-%dT%H:%M:%SZ").to_string();
-        let end = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-        let url = format!("/admin/api/v1/usage?start_date={start}&end_date={end}&user_id={}", member.id);
         let org_cookie = format!("dw_active_org={}", org.id);
         let auth = add_auth_headers(&owner);
 
         let response = app
-            .get(&url)
+            .get(&build_usage_url(Some(member.id)))
             .add_header(&auth[0].0, &auth[0].1)
             .add_header(&auth[1].0, &auth[1].1)
             .add_header("cookie", &org_cookie)
@@ -990,20 +1003,35 @@ mod tests {
         crate::test::utils::add_org_member(&pool, org.id, member_a.id, "member").await;
         crate::test::utils::add_org_member(&pool, org.id, member_b.id, "member").await;
 
-        // `to_rfc3339()` would emit `+00:00`, and `+` in a query string is
-        // interpreted as a space by the standard parser — use the explicit
-        // `Z` suffix to keep the timestamp unambiguous.
-        let start = (Utc::now() - Duration::hours(1)).format("%Y-%m-%dT%H:%M:%SZ").to_string();
-        let end = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-        let url = format!("/admin/api/v1/usage?start_date={start}&end_date={end}&user_id={}", member_b.id);
         let org_cookie = format!("dw_active_org={}", org.id);
         let auth = add_auth_headers(&member_a);
 
         let response = app
-            .get(&url)
+            .get(&build_usage_url(Some(member_b.id)))
             .add_header(&auth[0].0, &auth[0].1)
             .add_header(&auth[1].0, &auth[1].1)
             .add_header("cookie", &org_cookie)
+            .await;
+
+        response.assert_status(axum::http::StatusCode::FORBIDDEN);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_usage_personal_context_other_user_id_forbidden(pool: PgPool) {
+        // Personal-context callers (no `active_organization`) shouldn't be
+        // able to request a `user_id` other than their own. This case also
+        // covers the short-circuit early-return that avoids a DB acquire
+        // for malformed requests from non-org callers.
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let alice = create_test_user(&pool, Role::StandardUser).await;
+        let bob = create_test_user(&pool, Role::StandardUser).await;
+
+        let auth = add_auth_headers(&alice);
+        let response = app
+            .get(&build_usage_url(Some(bob.id)))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
             .await;
 
         response.assert_status(axum::http::StatusCode::FORBIDDEN);
