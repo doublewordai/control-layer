@@ -165,15 +165,19 @@ pub async fn image_normalizer_middleware(
             } else {
                 ImageInput::HttpUrl(url)
             };
-            let token = normalizer.ingest(input).await?;
-            let signed = normalizer.sign(token, realtime_ttl).await?;
+            let ingested = normalizer.ingest(input).await?;
+            let signed = normalizer.sign(ingested.token, realtime_ttl).await?;
             // Best-effort image_access bookkeeping: fire-and-forget so
-            // the request path isn't blocked. The (mime, bytes_len)
-            // metadata are not needed here; the dashboard endpoint reads
-            // them from the store directly.
+            // the realtime request path isn't blocked. Records real
+            // (mime, bytes_len) captured from the ingest result rather
+            // than empty placeholders — useful for any future
+            // dedup-stats or storage-accounting query.
             if let (Some(pool), Some(user_id)) = (pool_for_access, user_id_for_access) {
+                let mime = ingested.mime.clone();
+                let bytes_len = ingested.bytes_len;
+                let token = ingested.token;
                 tokio::spawn(async move {
-                    crate::api::handlers::images::record_image_access(&pool, user_id, token, "", 0).await;
+                    crate::api::handlers::images::record_image_access(&pool, user_id, token, &mime, bytes_len).await;
                 });
             }
             Ok::<String, NormalizeError>(signed.url)

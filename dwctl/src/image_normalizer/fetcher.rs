@@ -73,10 +73,15 @@ impl ImageFetcher {
         for attempt in 0..attempts {
             if attempt > 0 {
                 let base = self.config.retry_base_delay();
-                // exp backoff: 1x, 2x, 4x, ...
+                // Exponential backoff: 1x, 2x, 4x, …, saturating at
+                // u32::MAX-multiplied for very large `attempt` (saturating
+                // arithmetic on Duration prevents overflow further on).
                 let multiplier = 1u32.checked_shl(attempt as u32 - 1).unwrap_or(u32::MAX);
                 let mut delay = base.saturating_mul(multiplier);
-                // jitter: +/- 10%
+                // Add 0..20% positive jitter to spread retry hammers from
+                // many concurrent failures across time. Positive-only
+                // (rather than ±10%) so the backoff never undershoots the
+                // base delay.
                 let jitter_ms = {
                     let mut rng = rand::rng();
                     rng.random_range(0..(delay.as_millis() as u64 / 5 + 1))

@@ -273,8 +273,11 @@ struct FileStreamConfig {
     /// opaque `dw-img://` token. The dispatcher swaps tokens for short-lived
     /// signed URLs at send time. When `None`, bodies pass through unchanged.
     normalizer: Option<Arc<dyn ImageNormalizer>>,
-    /// Walker mode for the calling user. Pinned to [`ImageNormalizerMode::HttpOnly`]
-    /// until the per-user opt-in flag is wired in.
+    /// Walker mode. Image normalisation is a deployment-level posture
+    /// (controlled by `config.image_normalizer.enabled`); when on, batch
+    /// ingest pins this to [`ImageNormalizerMode::All`] so every image
+    /// input — HTTP URLs *and* `data:` URIs — flows through the
+    /// content-addressed store.
     normalizer_mode: ImageNormalizerMode,
     /// Optional DB pool for `image_access` bookkeeping. `None` disables
     /// the bookkeeping (the substitution itself still runs).
@@ -356,14 +359,15 @@ async fn normalize_template_body_in_place(
                 ImageInput::HttpUrl(url)
             };
             match normalizer.ingest(input).await {
-                Ok(token) => {
+                Ok(ingested) => {
                     if let (Some(pool), Some(uid)) = (access_pool, access_user_id) {
                         // Batch ingest is already async (file upload latency dominates),
                         // so we AWAIT the bookkeeping write rather than fire-and-forget —
                         // the user's later "view what I submitted" lookup depends on it.
-                        crate::api::handlers::images::record_image_access(&pool, uid, token, "", 0).await;
+                        // Records real (mime, bytes_len) captured from the ingest result.
+                        crate::api::handlers::images::record_image_access(&pool, uid, ingested.token, &ingested.mime, ingested.bytes_len).await;
                     }
-                    Ok::<String, ()>(token.to_dw_img_uri())
+                    Ok::<String, ()>(ingested.token.to_dw_img_uri())
                 }
                 Err(e) => {
                     let mapped = match e {

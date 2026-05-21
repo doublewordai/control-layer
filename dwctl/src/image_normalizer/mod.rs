@@ -107,14 +107,25 @@ impl From<StoreError> for NormalizeError {
     }
 }
 
+/// Outcome of a successful [`ImageNormalizer::ingest`] call. Carries
+/// not just the content-hash token but also the resolved mime type and
+/// byte length, so callers can record useful metadata in `image_access`
+/// without re-reading the object from the store.
+#[derive(Debug, Clone)]
+pub struct IngestResult {
+    pub token: ImageToken,
+    pub mime: String,
+    pub bytes_len: u64,
+}
+
 /// The normaliser interface. Hand to middleware and the dispatcher; pick
 /// the implementation at startup based on [`ImageNormalizerConfig::enabled`]
 /// and [`BackendConfig`].
 #[async_trait]
 pub trait ImageNormalizer: Send + Sync {
     /// Fetch (or decode) `input`, ensure bytes are in the store, return
-    /// the [`ImageToken`] referencing them.
-    async fn ingest(&self, input: ImageInput) -> Result<ImageToken, NormalizeError>;
+    /// the [`IngestResult`] (token + resolved metadata).
+    async fn ingest(&self, input: ImageInput) -> Result<IngestResult, NormalizeError>;
 
     /// Generate a fresh signed URL for `token` with TTL `ttl`.
     async fn sign(&self, token: ImageToken, ttl: Duration) -> Result<SignedImageUrl, NormalizeError>;
@@ -131,7 +142,7 @@ pub struct DisabledNormalizer;
 
 #[async_trait]
 impl ImageNormalizer for DisabledNormalizer {
-    async fn ingest(&self, _input: ImageInput) -> Result<ImageToken, NormalizeError> {
+    async fn ingest(&self, _input: ImageInput) -> Result<IngestResult, NormalizeError> {
         Err(NormalizeError::BadInput("image normalisation is disabled".into()))
     }
     async fn sign(&self, _token: ImageToken, _ttl: Duration) -> Result<SignedImageUrl, NormalizeError> {
@@ -160,7 +171,7 @@ impl<S: ImageStore> DefaultImageNormalizer<S> {
 
 #[async_trait]
 impl<S: ImageStore + 'static> ImageNormalizer for DefaultImageNormalizer<S> {
-    async fn ingest(&self, input: ImageInput) -> Result<ImageToken, NormalizeError> {
+    async fn ingest(&self, input: ImageInput) -> Result<IngestResult, NormalizeError> {
         let (mime, bytes) = match input {
             ImageInput::HttpUrl(url) => {
                 let fetched = self.fetcher.fetch(&url).await?;
@@ -171,6 +182,7 @@ impl<S: ImageStore + 'static> ImageNormalizer for DefaultImageNormalizer<S> {
                 (decoded.mime, Bytes::from(decoded.bytes))
             }
         };
+        let bytes_len = bytes.len() as u64;
         let mut hasher = Sha256::new();
         hasher.update(&bytes);
         let digest = hasher.finalize();
@@ -182,7 +194,7 @@ impl<S: ImageStore + 'static> ImageNormalizer for DefaultImageNormalizer<S> {
         if !self.store.exists(token).await? {
             self.store.put(token, &mime, bytes).await?;
         }
-        Ok(token)
+        Ok(IngestResult { token, mime, bytes_len })
     }
 
     async fn sign(&self, token: ImageToken, ttl: Duration) -> Result<SignedImageUrl, NormalizeError> {
@@ -239,12 +251,16 @@ mod tests {
         let store = Arc::new(MemoryStore::new());
         let n = DefaultImageNormalizer::new(FetcherConfig::default(), store.clone());
 
-        let token = n.ingest(ImageInput::DataUri(TINY_PNG_DATA_URI.to_string())).await.unwrap();
+        let result = n.ingest(ImageInput::DataUri(TINY_PNG_DATA_URI.to_string())).await.unwrap();
+        let token = result.token;
+        assert_eq!(result.mime, "image/png");
+        assert!(result.bytes_len > 0, "bytes_len should be the actual decoded length, got 0");
 
         // dedup: ingesting the same URI again yields the same token and
         // does not duplicate the stored bytes.
-        let token_again = n.ingest(ImageInput::DataUri(TINY_PNG_DATA_URI.to_string())).await.unwrap();
-        assert_eq!(token, token_again);
+        let result_again = n.ingest(ImageInput::DataUri(TINY_PNG_DATA_URI.to_string())).await.unwrap();
+        assert_eq!(token, result_again.token);
+        assert_eq!(result.bytes_len, result_again.bytes_len);
 
         // sign returns a usable URL with the token hex baked in.
         let signed = n.sign(token, Duration::from_secs(60)).await.unwrap();

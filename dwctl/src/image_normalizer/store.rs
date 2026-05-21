@@ -4,22 +4,17 @@
 //!
 //! - [`MemoryStore`] — an in-process `HashMap<Sha256, Bytes>` used by tests
 //!   and local development. Signed URLs returned here are local
-//!   `http://host/dw-img/{hex}` URLs that the dashboard image endpoint or
-//!   integration-test fixtures can resolve.
-//! - [`GcsStore`] — uploads to Google Cloud Storage and returns V4
-//!   signed URLs via the IAM `signBlob` API.
+//!   `http://host/dw-img/{hex}` URLs whose `?expires=` parameter is
+//!   advisory only (the store does not enforce expiry on read — the
+//!   memory backend is intended for `cargo test` and local `cargo run`).
+//! - [`GcsStore`] — uploads to Google Cloud Storage via
+//!   `google-cloud-storage` and returns V4 signed URLs via the IAM
+//!   `signBlob` API (Workload-Identity-friendly: no on-disk private
+//!   key required).
 //!
-//! Production deployments use [`GcsStore`]; the in-memory store is meant for
-//! `cargo test` and local `cargo run` workflows where no GCS bucket is
-//! configured.
-//!
-//! NOTE (GCS implementation): the GCS-backed store is currently scaffolded
-//! and returns `Unimplemented` from `put` / `sign`. Wiring it up requires
-//! choosing a crate combination for Workload-Identity-based V4 signing
-//! (likely `cloud-storage` or `google-cloud-storage` plus `gcp_auth` for
-//! the IAM `signBlob` dance). This is a focused follow-up — the trait
-//! seam is stable, so the rest of the system can be built and tested
-//! against `MemoryStore` first.
+//! Production deployments use [`GcsStore`]; the in-memory store is meant
+//! for `cargo test` and local `cargo run` workflows where no GCS bucket
+//! is configured.
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
