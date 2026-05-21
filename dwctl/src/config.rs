@@ -191,6 +191,42 @@ pub struct Config {
     /// fusillade.
     #[serde(default)]
     pub responses: ResponsesConfig,
+    /// OpenAPI spec exposure controls. Defaults disable the Admin spec
+    /// (which describes internal management endpoints) and enable the
+    /// AI spec (which mirrors the publicly-documented OpenAI surface).
+    /// Both surfaces require authentication regardless of these flags.
+    #[serde(default)]
+    pub openapi: OpenApiConfig,
+}
+
+/// Controls exposure of the OpenAPI specs and Scalar doc UIs.
+///
+/// Both surfaces are mounted by default but always require
+/// authentication. The Admin spec additionally requires an admin-level
+/// identity (PlatformManager role, the admin user, or a `platform`-
+/// purpose API key) — inference `sk-*` keys, StandardUsers, and
+/// RequestViewers are rejected. Operators who want to remove the route
+/// entirely can set the relevant flag to `false`; disabled routes
+/// return an explicit 404 so probes can't tell the route exists.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct OpenApiConfig {
+    /// Expose `/admin/openapi.json` and `/admin/docs`. Defaults to
+    /// `true`; the routes require an admin-level identity. Set to
+    /// `false` to remove the routes entirely (they return 404).
+    pub admin_enabled: bool,
+    /// Expose `/ai/openapi.json` and `/ai/docs`. Defaults to `true`;
+    /// the routes require any authenticated identity.
+    pub ai_enabled: bool,
+}
+
+impl Default for OpenApiConfig {
+    fn default() -> Self {
+        Self {
+            admin_enabled: true,
+            ai_enabled: true,
+        }
+    }
 }
 
 /// Configuration for `/v1/responses` multi-step orchestration.
@@ -1794,6 +1830,7 @@ impl Default for Config {
             support_email: "support@doubleword.ai".to_string(),
             connections: ConnectionsConfig::default(),
             responses: ResponsesConfig::default(),
+            openapi: OpenApiConfig::default(),
         }
     }
 }

@@ -373,8 +373,17 @@ async fn try_api_key_auth(parts: &axum::http::request::Parts, db: &PgPool) -> Op
 
     // Validate purpose for the endpoint
     debug!(path, purpose = purpose_str.as_str(), "API key purpose check");
-    let is_valid = if path.starts_with("/admin/api/") {
-        // Platform endpoints require platform keys
+    let is_valid = if matches!(path, "/admin/openapi.json" | "/admin/docs" | "/ai/openapi.json" | "/ai/docs") {
+        // OpenAPI spec / docs routes accept any key purpose so platform-key
+        // holders can read the AI spec and inference-key holders can be
+        // properly rejected (with a permission error from the handler's
+        // RequiresPermission gate) when they probe the Admin spec. The
+        // admin routes are additionally gated to admin/PlatformManager in
+        // the handler itself.
+        true
+    } else if path.starts_with("/admin/") {
+        // All other /admin/* endpoints (management API + future admin
+        // routes) require platform keys.
         purpose_str == "platform"
     } else if path.starts_with("/ai/") {
         // AI inference endpoints accept any inference-type key

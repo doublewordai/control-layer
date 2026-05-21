@@ -184,7 +184,6 @@ use crate::{
     db::handlers::{Deployments, Groups, Repository, Users},
     db::models::{deployments::DeploymentCreateDBRequest, users::UserCreateDBRequest},
     metrics::GenAiMetrics,
-    openapi::{AdminApiDoc, AiApiDoc},
     request_logging::serializers::{parse_ai_request, parse_ai_response},
 };
 use sqlx_pool_router::{DbPools, PoolProvider};
@@ -214,8 +213,6 @@ use tower::Layer;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing::{debug, info, instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
-use utoipa::OpenApi;
-use utoipa_scalar::{Scalar, Servable};
 use uuid::Uuid;
 
 pub use types::{ApiKeyId, DeploymentId, GroupId, InferenceEndpointId, UserId};
@@ -1478,12 +1475,51 @@ pub async fn build_router(
         router = router.nest("/ai/v1", ai_router);
     }
 
+    // OpenAPI spec routes. Both surfaces are gated by extractors in the
+    // handlers (Admin → admin/PlatformManager; AI → any authenticated
+    // identity) and can be disabled entirely via `config.openapi`. The
+    // Admin surface is opt-in because the spec maps the full internal
+    // management API. When disabled, we mount an explicit 404 stub so
+    // probes can't tell the route exists (the SPA static fallback would
+    // otherwise return the dashboard HTML).
+    let not_found = || async { axum::http::StatusCode::NOT_FOUND };
+    let openapi_router = Router::new()
+        .route(
+            "/admin/openapi.json",
+            if config.openapi.admin_enabled {
+                get(api::handlers::openapi_docs::admin_openapi_json)
+            } else {
+                get(not_found)
+            },
+        )
+        .route(
+            "/admin/docs",
+            if config.openapi.admin_enabled {
+                get(api::handlers::openapi_docs::admin_openapi_docs)
+            } else {
+                get(not_found)
+            },
+        )
+        .route(
+            "/ai/openapi.json",
+            if config.openapi.ai_enabled {
+                get(api::handlers::openapi_docs::ai_openapi_json)
+            } else {
+                get(not_found)
+            },
+        )
+        .route(
+            "/ai/docs",
+            if config.openapi.ai_enabled {
+                get(api::handlers::openapi_docs::ai_openapi_docs)
+            } else {
+                get(not_found)
+            },
+        );
+
     let router = router
         .nest("/admin/api/v1", api_routes_with_state)
-        .route("/admin/openapi.json", get(|| async { axum::Json(AdminApiDoc::openapi()) }))
-        .route("/ai/openapi.json", get(|| async { axum::Json(AiApiDoc::openapi()) }))
-        .merge(Scalar::with_url("/admin/docs", AdminApiDoc::openapi()))
-        .merge(Scalar::with_url("/ai/docs", AiApiDoc::openapi()))
+        .merge(openapi_router.with_state(state.clone()))
         .fallback_service(fallback.with_state(state.clone()));
 
     // Create CORS layer from config
