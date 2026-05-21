@@ -201,29 +201,29 @@ pub struct Config {
 
 /// Controls exposure of the OpenAPI specs and Scalar doc UIs.
 ///
-/// The Admin spec leaks the full management API surface (paths, schemas,
-/// auth schemes) so it defaults to disabled — operators must explicitly
-/// opt in for internal/dev environments. Even when enabled, the spec
-/// requires an admin-level identity (PlatformManager role, the admin
-/// user, or a `platform`-purpose API key).
+/// Both surfaces are mounted by default but always require
+/// authentication. The Admin spec additionally requires an admin-level
+/// identity (PlatformManager role, the admin user, or a `platform`-
+/// purpose API key) — inference `sk-*` keys, StandardUsers, and
+/// RequestViewers are rejected. Operators who want to remove the route
+/// entirely can set the relevant flag to `false`; disabled routes
+/// return an explicit 404 so probes can't tell the route exists.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct OpenApiConfig {
     /// Expose `/admin/openapi.json` and `/admin/docs`. Defaults to
-    /// `false` so production deployments don't disclose the admin
-    /// surface. When `true`, the routes still require an admin-level
-    /// identity.
+    /// `true`; the routes require an admin-level identity. Set to
+    /// `false` to remove the routes entirely (they return 404).
     pub admin_enabled: bool,
-    /// Expose `/ai/openapi.json` and `/ai/docs`. Defaults to `true` —
-    /// the AI surface mirrors the publicly-documented OpenAI API. The
-    /// routes require any authenticated identity.
+    /// Expose `/ai/openapi.json` and `/ai/docs`. Defaults to `true`;
+    /// the routes require any authenticated identity.
     pub ai_enabled: bool,
 }
 
 impl Default for OpenApiConfig {
     fn default() -> Self {
         Self {
-            admin_enabled: false,
+            admin_enabled: true,
             ai_enabled: true,
         }
     }
