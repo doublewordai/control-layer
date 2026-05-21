@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.52.2](https://github.com/doublewordai/control-layer/compare/v8.52.1...v8.52.2) (2026-05-21)
+
+
+### Bug Fixes
+
+* **openapi:** gate admin spec behind admin auth and disable by default ([#1089](https://github.com/doublewordai/control-layer/issues/1089)) ([56b145c](https://github.com/doublewordai/control-layer/commit/56b145ce6f8932bedaffc2f4d07a1009c2b7e3c4))
+
 ## [8.52.1](https://github.com/doublewordai/control-layer/compare/v8.52.0...v8.52.1) (2026-05-20)
 
 
