@@ -1206,14 +1206,18 @@ mod openapi_access_control {
     async fn create_api_key(pool: &PgPool, user_id: Uuid, purpose: ApiKeyPurpose) -> String {
         let mut conn = pool.acquire().await.unwrap();
         let mut repo = ApiKeys::new(&mut conn);
-        repo.create(&ApiKeyCreateDBRequest::new(user_id, user_id, ApiKeyCreate {
-            name: format!("{purpose:?} key"),
-            description: None,
-            purpose,
-            requests_per_second: None,
-            burst_size: None,
-            member_id: None,
-        }))
+        repo.create(&ApiKeyCreateDBRequest::new(
+            user_id,
+            user_id,
+            ApiKeyCreate {
+                name: format!("{purpose:?} key"),
+                description: None,
+                purpose,
+                requests_per_second: None,
+                burst_size: None,
+                member_id: None,
+            },
+        ))
         .await
         .expect("create api key")
         .secret
@@ -1402,11 +1406,15 @@ async fn test_build_router_with_metrics_disabled(pool: PgPool) {
         cascade_batch_state_job: std::sync::Arc::new(std::sync::OnceLock::new()),
     };
     let task_runner = std::sync::Arc::new(
-        crate::tasks::TaskRunner::new(pool.clone(), task_state, &crate::config::TaskWorkersConfig {
-            create_batch_workers: 0,
-            cascade_batch_state_workers: 0,
-            response_workers: 0,
-        })
+        crate::tasks::TaskRunner::new(
+            pool.clone(),
+            task_state,
+            &crate::config::TaskWorkersConfig {
+                create_batch_workers: 0,
+                cascade_batch_state_workers: 0,
+                response_workers: 0,
+            },
+        )
         .await
         .expect("Failed to create task runner"),
     );
@@ -1457,11 +1465,15 @@ async fn test_build_router_with_metrics_enabled(pool: PgPool) {
         cascade_batch_state_job: std::sync::Arc::new(std::sync::OnceLock::new()),
     };
     let task_runner = std::sync::Arc::new(
-        crate::tasks::TaskRunner::new(pool.clone(), task_state, &crate::config::TaskWorkersConfig {
-            create_batch_workers: 0,
-            cascade_batch_state_workers: 0,
-            response_workers: 0,
-        })
+        crate::tasks::TaskRunner::new(
+            pool.clone(),
+            task_state,
+            &crate::config::TaskWorkersConfig {
+                create_batch_workers: 0,
+                cascade_batch_state_workers: 0,
+                response_workers: 0,
+            },
+        )
         .await
         .expect("Failed to create task runner"),
     );
