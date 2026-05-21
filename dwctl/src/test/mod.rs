@@ -1163,36 +1163,219 @@ async fn test_create_initial_admin_user_existing_user(pool: PgPool) {
 }
 
 #[tokio::test]
-async fn test_openapi_json_endpoints() {
-    use axum::routing::get;
+async fn test_openapi_specs_serialize() {
+    // Sanity check: both OpenAPI doc structs serialize to a valid spec
+    // with the expected titles and (for the AI surface) proxied paths.
+    // Real router wiring + access control is exercised by the sqlx tests
+    // in `openapi_access_control` below.
     use utoipa::OpenApi;
-    use utoipa_scalar::{Scalar, Servable};
 
-    // Create a test router with both OpenAPI endpoints
-    let router = axum::Router::new()
-        .route("/admin/openapi.json", get(|| async { axum::Json(AdminApiDoc::openapi()) }))
-        .route("/ai/openapi.json", get(|| async { axum::Json(AiApiDoc::openapi()) }))
-        .merge(Scalar::with_url("/admin/docs", AdminApiDoc::openapi()))
-        .merge(Scalar::with_url("/ai/docs", AiApiDoc::openapi()));
+    let admin_spec = serde_json::to_string(&AdminApiDoc::openapi()).expect("admin spec serializes");
+    assert!(admin_spec.contains("\"openapi\""));
+    assert!(admin_spec.contains("Admin API"));
 
-    let server = axum_test::TestServer::new(router).expect("Failed to create test server");
+    let ai_spec = serde_json::to_string(&AiApiDoc::openapi()).expect("ai spec serializes");
+    assert!(ai_spec.contains("\"openapi\""));
+    assert!(ai_spec.contains("AI API"));
+    assert!(ai_spec.contains("/chat/completions"));
+    assert!(ai_spec.contains("/embeddings"));
+}
 
-    // Test admin API OpenAPI spec
-    let admin_response = server.get("/admin/openapi.json").await;
-    assert_eq!(admin_response.status_code().as_u16(), 200);
-    let admin_content = admin_response.text();
-    assert!(admin_content.contains("\"openapi\""));
-    assert!(admin_content.contains("Admin API"));
+/// Access-control tests for `/admin/openapi.json`, `/admin/docs`,
+/// `/ai/openapi.json`, and `/ai/docs`. These exist because a pentest
+/// found the Admin spec was world-readable, leaking the full internal
+/// management surface (paths, schemas, auth schemes) to anyone holding a
+/// free-tier inference key.
+mod openapi_access_control {
+    use super::*;
+    use crate::{
+        api::models::api_keys::ApiKeyCreate,
+        db::{
+            handlers::{Repository, api_keys::ApiKeys},
+            models::api_keys::{ApiKeyCreateDBRequest, ApiKeyPurpose},
+        },
+    };
 
-    // Test AI API OpenAPI spec
-    let ai_response = server.get("/ai/openapi.json").await;
-    assert_eq!(ai_response.status_code().as_u16(), 200);
-    let ai_content = ai_response.text();
-    assert!(ai_content.contains("\"openapi\""));
-    assert!(ai_content.contains("AI API"));
-    // Should include proxied endpoints
-    assert!(ai_content.contains("/chat/completions"));
-    assert!(ai_content.contains("/embeddings"));
+    async fn make_app_with_admin_docs(pool: PgPool, admin_enabled: bool) -> (TestServer, crate::BackgroundServices) {
+        let mut config = crate::test::utils::create_test_config();
+        config.openapi.admin_enabled = admin_enabled;
+        config.openapi.ai_enabled = true;
+        crate::test::utils::create_test_app_with_config(pool, config, false).await
+    }
+
+    async fn create_api_key(pool: &PgPool, user_id: Uuid, purpose: ApiKeyPurpose) -> String {
+        let mut conn = pool.acquire().await.unwrap();
+        let mut repo = ApiKeys::new(&mut conn);
+        repo.create(&ApiKeyCreateDBRequest::new(user_id, user_id, ApiKeyCreate {
+            name: format!("{purpose:?} key"),
+            description: None,
+            purpose,
+            requests_per_second: None,
+            burst_size: None,
+            member_id: None,
+        }))
+        .await
+        .expect("create api key")
+        .secret
+    }
+
+    #[sqlx::test]
+    async fn admin_spec_returns_404_when_disabled(pool: PgPool) {
+        let (server, _bg) = make_app_with_admin_docs(pool.clone(), false).await;
+        let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let headers = add_auth_headers(&admin);
+
+        // Even an admin gets 404 — the route isn't mounted.
+        let response = server
+            .get("/admin/openapi.json")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .await;
+        assert_eq!(response.status_code().as_u16(), 404);
+
+        let response = server
+            .get("/admin/docs")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .await;
+        assert_eq!(response.status_code().as_u16(), 404);
+    }
+
+    #[sqlx::test]
+    async fn admin_spec_rejects_unauthenticated(pool: PgPool) {
+        let (server, _bg) = make_app_with_admin_docs(pool, true).await;
+
+        let response = server.get("/admin/openapi.json").await;
+        assert_eq!(response.status_code().as_u16(), 401);
+
+        let response = server.get("/admin/docs").await;
+        assert_eq!(response.status_code().as_u16(), 401);
+    }
+
+    #[sqlx::test]
+    async fn admin_spec_rejects_inference_api_key(pool: PgPool) {
+        let (server, _bg) = make_app_with_admin_docs(pool.clone(), true).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let key = create_api_key(&pool, user.id, ApiKeyPurpose::Realtime).await;
+
+        // The path-purpose check in current_user.rs rejects the inference
+        // key before the handler's permission check runs.
+        let response = server
+            .get("/admin/openapi.json")
+            .add_header("authorization", format!("Bearer {key}"))
+            .await;
+        assert_eq!(response.status_code().as_u16(), 403);
+
+        let response = server.get("/admin/docs").add_header("authorization", format!("Bearer {key}")).await;
+        assert_eq!(response.status_code().as_u16(), 403);
+    }
+
+    #[sqlx::test]
+    async fn admin_spec_rejects_standard_user_session(pool: PgPool) {
+        let (server, _bg) = make_app_with_admin_docs(pool.clone(), true).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let headers = add_auth_headers(&user);
+
+        // Path-purpose check passes (no API key); RequiresPermission in
+        // the handler then denies the StandardUser.
+        let response = server
+            .get("/admin/openapi.json")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .await;
+        assert_eq!(response.status_code().as_u16(), 403);
+    }
+
+    #[sqlx::test]
+    async fn admin_spec_rejects_request_viewer(pool: PgPool) {
+        let (server, _bg) = make_app_with_admin_docs(pool.clone(), true).await;
+        let user = crate::test::utils::create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::RequestViewer]).await;
+        let headers = add_auth_headers(&user);
+
+        // RequestViewer adds log access but no admin/platform privileges.
+        let response = server
+            .get("/admin/openapi.json")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .await;
+        assert_eq!(response.status_code().as_u16(), 403);
+    }
+
+    #[sqlx::test]
+    async fn admin_spec_allows_platform_manager_session(pool: PgPool) {
+        let (server, _bg) = make_app_with_admin_docs(pool.clone(), true).await;
+        let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let headers = add_auth_headers(&admin);
+
+        let response = server
+            .get("/admin/openapi.json")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .await;
+        assert_eq!(response.status_code().as_u16(), 200);
+        let body = response.text();
+        assert!(body.contains("Admin API"));
+
+        let response = server
+            .get("/admin/docs")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .await;
+        assert_eq!(response.status_code().as_u16(), 200);
+    }
+
+    #[sqlx::test]
+    async fn admin_spec_allows_platform_api_key(pool: PgPool) {
+        let (server, _bg) = make_app_with_admin_docs(pool.clone(), true).await;
+        let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let key = create_api_key(&pool, admin.id, ApiKeyPurpose::Platform).await;
+
+        let response = server
+            .get("/admin/openapi.json")
+            .add_header("authorization", format!("Bearer {key}"))
+            .await;
+        assert_eq!(response.status_code().as_u16(), 200);
+    }
+
+    #[sqlx::test]
+    async fn ai_spec_rejects_unauthenticated(pool: PgPool) {
+        let (server, _bg) = make_app_with_admin_docs(pool, true).await;
+        let response = server.get("/ai/openapi.json").await;
+        assert_eq!(response.status_code().as_u16(), 401);
+    }
+
+    #[sqlx::test]
+    async fn ai_spec_allows_any_authenticated_identity(pool: PgPool) {
+        let (server, _bg) = make_app_with_admin_docs(pool.clone(), true).await;
+
+        // Session auth — standard user.
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let headers = add_auth_headers(&user);
+        let response = server
+            .get("/ai/openapi.json")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .await;
+        assert_eq!(response.status_code().as_u16(), 200);
+
+        // Inference key.
+        let realtime = create_api_key(&pool, user.id, ApiKeyPurpose::Realtime).await;
+        let response = server
+            .get("/ai/openapi.json")
+            .add_header("authorization", format!("Bearer {realtime}"))
+            .await;
+        assert_eq!(response.status_code().as_u16(), 200);
+
+        // Platform key — also allowed because the spec-route special case
+        // overrides the /ai/* purpose check.
+        let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let platform = create_api_key(&pool, admin.id, ApiKeyPurpose::Platform).await;
+        let response = server
+            .get("/ai/openapi.json")
+            .add_header("authorization", format!("Bearer {platform}"))
+            .await;
+        assert_eq!(response.status_code().as_u16(), 200);
+    }
 }
 
 #[sqlx::test]
@@ -1219,15 +1402,11 @@ async fn test_build_router_with_metrics_disabled(pool: PgPool) {
         cascade_batch_state_job: std::sync::Arc::new(std::sync::OnceLock::new()),
     };
     let task_runner = std::sync::Arc::new(
-        crate::tasks::TaskRunner::new(
-            pool.clone(),
-            task_state,
-            &crate::config::TaskWorkersConfig {
-                create_batch_workers: 0,
-                cascade_batch_state_workers: 0,
-                response_workers: 0,
-            },
-        )
+        crate::tasks::TaskRunner::new(pool.clone(), task_state, &crate::config::TaskWorkersConfig {
+            create_batch_workers: 0,
+            cascade_batch_state_workers: 0,
+            response_workers: 0,
+        })
         .await
         .expect("Failed to create task runner"),
     );
@@ -1278,15 +1457,11 @@ async fn test_build_router_with_metrics_enabled(pool: PgPool) {
         cascade_batch_state_job: std::sync::Arc::new(std::sync::OnceLock::new()),
     };
     let task_runner = std::sync::Arc::new(
-        crate::tasks::TaskRunner::new(
-            pool.clone(),
-            task_state,
-            &crate::config::TaskWorkersConfig {
-                create_batch_workers: 0,
-                cascade_batch_state_workers: 0,
-                response_workers: 0,
-            },
-        )
+        crate::tasks::TaskRunner::new(pool.clone(), task_state, &crate::config::TaskWorkersConfig {
+            create_batch_workers: 0,
+            cascade_batch_state_workers: 0,
+            response_workers: 0,
+        })
         .await
         .expect("Failed to create task runner"),
     );

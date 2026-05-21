@@ -191,6 +191,42 @@ pub struct Config {
     /// fusillade.
     #[serde(default)]
     pub responses: ResponsesConfig,
+    /// OpenAPI spec exposure controls. Defaults disable the Admin spec
+    /// (which describes internal management endpoints) and enable the
+    /// AI spec (which mirrors the publicly-documented OpenAI surface).
+    /// Both surfaces require authentication regardless of these flags.
+    #[serde(default)]
+    pub openapi: OpenApiConfig,
+}
+
+/// Controls exposure of the OpenAPI specs and Scalar doc UIs.
+///
+/// The Admin spec leaks the full management API surface (paths, schemas,
+/// auth schemes) so it defaults to disabled — operators must explicitly
+/// opt in for internal/dev environments. Even when enabled, the spec
+/// requires an admin-level identity (PlatformManager role, the admin
+/// user, or a `platform`-purpose API key).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct OpenApiConfig {
+    /// Expose `/admin/openapi.json` and `/admin/docs`. Defaults to
+    /// `false` so production deployments don't disclose the admin
+    /// surface. When `true`, the routes still require an admin-level
+    /// identity.
+    pub admin_enabled: bool,
+    /// Expose `/ai/openapi.json` and `/ai/docs`. Defaults to `true` —
+    /// the AI surface mirrors the publicly-documented OpenAI API. The
+    /// routes require any authenticated identity.
+    pub ai_enabled: bool,
+}
+
+impl Default for OpenApiConfig {
+    fn default() -> Self {
+        Self {
+            admin_enabled: false,
+            ai_enabled: true,
+        }
+    }
 }
 
 /// Configuration for `/v1/responses` multi-step orchestration.
@@ -1794,6 +1830,7 @@ impl Default for Config {
             support_email: "support@doubleword.ai".to_string(),
             connections: ConnectionsConfig::default(),
             responses: ResponsesConfig::default(),
+            openapi: OpenApiConfig::default(),
         }
     }
 }
