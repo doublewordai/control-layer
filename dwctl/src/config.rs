@@ -749,7 +749,7 @@ pub struct PasswordConfig {
     pub argon2_parallelism: u32,
 }
 
-/// Security configuration for JWT and CORS.
+/// Security configuration for JWT, CORS, and browser security response headers.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SecurityConfig {
@@ -1917,8 +1917,7 @@ impl Default for SecurityHeadersConfig {
             frame_options: "DENY".to_string(),
             referrer_policy: "strict-origin-when-cross-origin".to_string(),
             permissions_policy:
-                "accelerometer=(), camera=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), payment=(), usb=()"
-                    .to_string(),
+                "accelerometer=(), camera=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), payment=(), usb=()".to_string(),
             // Opt-in: empty means the header is not sent.
             content_security_policy: String::new(),
             content_security_policy_report_only: String::new(),

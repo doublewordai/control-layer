@@ -210,7 +210,7 @@ auth:
     # Each header is set only if the response does not already carry it.
     headers:
       enabled: true
-      frame_options: "DENY" # X-Frame-Options; "" to disable. (X-Content-Type-Options: nosniff is always set when enabled.)
+      frame_options: "DENY" # X-Frame-Options; "" to disable. (X-Content-Type-Options: nosniff is fixed on whenever headers.enabled is true.)
       referrer_policy: "strict-origin-when-cross-origin" # "" to disable
       permissions_policy: "accelerometer=(), camera=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), payment=(), usb=()"
       # Opt-in headers (empty = not sent):

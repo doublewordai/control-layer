@@ -950,9 +950,7 @@ fn create_cors_layer(config: &Config) -> anyhow::Result<CorsLayer> {
 /// (CSP, CSP-Report-Only, HSTS) are included only when their configured value
 /// is non-empty. Invalid header values are rejected with an error so a
 /// misconfiguration surfaces at startup rather than silently dropping a header.
-fn security_header_pairs(
-    cfg: &crate::config::SecurityHeadersConfig,
-) -> anyhow::Result<Vec<(http::HeaderName, http::HeaderValue)>> {
+fn security_header_pairs(cfg: &crate::config::SecurityHeadersConfig) -> anyhow::Result<Vec<(http::HeaderName, http::HeaderValue)>> {
     let mut pairs: Vec<(http::HeaderName, http::HeaderValue)> = Vec::new();
     if !cfg.enabled {
         return Ok(pairs);
@@ -962,8 +960,7 @@ fn security_header_pairs(
         if value.is_empty() {
             return Ok(());
         }
-        let header_value = http::HeaderValue::from_str(value)
-            .with_context(|| format!("invalid value for security header `{name}`"))?;
+        let header_value = http::HeaderValue::from_str(value).with_context(|| format!("invalid value for security header `{name}`"))?;
         pairs.push((http::HeaderName::from_static(name), header_value));
         Ok(())
     };
@@ -1006,7 +1003,8 @@ fn security_header_pairs(
 ///
 /// # Errors
 ///
-/// Returns an error if CORS configuration is invalid or metrics initialization fails.
+/// Returns an error if CORS configuration is invalid, a configured security
+/// response header has an invalid value, or metrics initialization fails.
 #[instrument(skip_all)]
 pub async fn build_router(
     state: &mut AppState,
@@ -1529,9 +1527,9 @@ pub async fn build_router(
     // Apply CORS to main router (request logging already applied to onwards_router above)
     let mut router = router.layer(cors_layer);
 
-    // Apply browser security response headers as outer layers. `if_not_present`
-    // means any stricter per-route header (e.g. `Referrer-Policy: no-referrer`
-    // on sensitive auth responses) is preserved rather than overwritten.
+    // Apply browser security response headers. `if_not_present` means any
+    // stricter per-route header (e.g. `Referrer-Policy: no-referrer` on
+    // sensitive auth responses) is preserved rather than overwritten.
     for (name, value) in security_header_pairs(&config.auth.security.headers)? {
         router = router.layer(SetResponseHeaderLayer::if_not_present(name, value));
     }
