@@ -340,6 +340,22 @@ connections:
     # Default endpoint for sync-created batches.
     default_endpoint: "/v1/chat/completions"
 
+# OpenAPI spec exposure controls
+# Both surfaces always require authentication when enabled. Disabled
+# routes return 404 (not 403) so probes can't tell the route exists.
+openapi:
+  # Expose /admin/openapi.json and /admin/docs.
+  # The Admin spec describes internal management endpoints, so access
+  # requires an admin-level identity (PlatformManager role, the admin
+  # user, or a platform-purpose API key). Inference sk-* keys are
+  # rejected. Set to false to remove the routes entirely.
+  # Set via environment: DWCTL_OPENAPI__ADMIN_ENABLED=false
+  admin_enabled: true
+  # Expose /ai/openapi.json and /ai/docs.
+  # The AI surface mirrors the publicly-documented OpenAI API; requires
+  # any authenticated identity.
+  ai_enabled: true
+
 # Onwards AI proxy configuration
 # Controls behavior of the onwards routing layer for AI proxy requests
 onwards:

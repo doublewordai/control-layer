@@ -322,6 +322,7 @@ pub fn create_test_config() -> crate::config::Config {
         support_email: "support@test.com".to_string(),
         connections: Default::default(),
         responses: Default::default(),
+        openapi: Default::default(),
     }
 }
 
