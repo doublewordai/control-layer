@@ -504,11 +504,11 @@ impl FileUploadError {
             FileUploadError::ValidationError { line, message } => Error::BadRequest {
                 message: format!("Line {}: {}", line, message),
             },
-            FileUploadError::ImageTransient { line, message } => Error::Internal {
-                operation: format!("Line {}: image fetch failed after retries (try again): {}", line, message),
+            FileUploadError::ImageTransient { line, message } => Error::ServiceUnavailable {
+                message: format!("Line {}: image fetch failed after retries, please retry: {}", line, message),
             },
-            FileUploadError::ImageStoreFailed { line, message } => Error::Internal {
-                operation: format!("Line {}: image content store unavailable: {}", line, message),
+            FileUploadError::ImageStoreFailed { line, message } => Error::ServiceUnavailable {
+                message: format!("Line {}: image content store temporarily unavailable: {}", line, message),
             },
         }
     }

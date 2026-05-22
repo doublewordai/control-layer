@@ -120,7 +120,9 @@ pub async fn record_image_access(pool: &sqlx::PgPool, user_id: uuid::Uuid, token
         INSERT INTO image_access (user_id, sha256, mime, bytes_len, first_seen_at, last_seen_at)
         VALUES ($1, $2, $3, $4, NOW(), NOW())
         ON CONFLICT (user_id, sha256) DO UPDATE
-        SET last_seen_at = NOW()
+        SET last_seen_at = NOW(),
+            mime = EXCLUDED.mime,
+            bytes_len = EXCLUDED.bytes_len
         "#,
         user_id,
         sha_bytes,
