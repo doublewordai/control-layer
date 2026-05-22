@@ -110,6 +110,7 @@ mod tests {
                 security: SecurityConfig {
                     jwt_expiry: Duration::from_secs(3600), // 1 hour
                     cors: crate::config::CorsConfig::default(),
+                    ..Default::default()
                 },
                 ..Default::default()
             },

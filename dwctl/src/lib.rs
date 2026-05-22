@@ -211,7 +211,7 @@ use std::str::FromStr;
 use std::sync::{Arc, OnceLock};
 use tokio::net::TcpListener;
 use tower::Layer;
-use tower_http::{cors::CorsLayer, trace::TraceLayer};
+use tower_http::{cors::CorsLayer, set_header::SetResponseHeaderLayer, trace::TraceLayer};
 use tracing::{debug, info, instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use utoipa::OpenApi;
@@ -944,6 +944,43 @@ fn create_cors_layer(config: &Config) -> anyhow::Result<CorsLayer> {
     Ok(cors)
 }
 
+/// Build the (name, value) pairs for the configured security response headers.
+///
+/// Returns an empty list when the feature is disabled. Opt-in headers
+/// (CSP, CSP-Report-Only, HSTS) are included only when their configured value
+/// is non-empty. Invalid header values are rejected with an error so a
+/// misconfiguration surfaces at startup rather than silently dropping a header.
+fn security_header_pairs(
+    cfg: &crate::config::SecurityHeadersConfig,
+) -> anyhow::Result<Vec<(http::HeaderName, http::HeaderValue)>> {
+    let mut pairs: Vec<(http::HeaderName, http::HeaderValue)> = Vec::new();
+    if !cfg.enabled {
+        return Ok(pairs);
+    }
+
+    let mut push = |name: &'static str, value: &str| -> anyhow::Result<()> {
+        if value.is_empty() {
+            return Ok(());
+        }
+        let header_value = http::HeaderValue::from_str(value)
+            .with_context(|| format!("invalid value for security header `{name}`"))?;
+        pairs.push((http::HeaderName::from_static(name), header_value));
+        Ok(())
+    };
+
+    // X-Content-Type-Options has a single meaningful value, so it is not
+    // configurable — it is always `nosniff` while the feature is enabled.
+    push("x-content-type-options", "nosniff")?;
+    push("x-frame-options", &cfg.frame_options)?;
+    push("referrer-policy", &cfg.referrer_policy)?;
+    push("permissions-policy", &cfg.permissions_policy)?;
+    push("content-security-policy", &cfg.content_security_policy)?;
+    push("content-security-policy-report-only", &cfg.content_security_policy_report_only)?;
+    push("strict-transport-security", &cfg.strict_transport_security)?;
+
+    Ok(pairs)
+}
+
 /// Build the main application router with all endpoints and middleware.
 ///
 /// This function constructs the complete Axum router with:
@@ -1491,6 +1528,13 @@ pub async fn build_router(
 
     // Apply CORS to main router (request logging already applied to onwards_router above)
     let mut router = router.layer(cors_layer);
+
+    // Apply browser security response headers as outer layers. `if_not_present`
+    // means any stricter per-route header (e.g. `Referrer-Policy: no-referrer`
+    // on sensitive auth responses) is preserved rather than overwritten.
+    for (name, value) in security_header_pairs(&config.auth.security.headers)? {
+        router = router.layer(SetResponseHeaderLayer::if_not_present(name, value));
+    }
 
     // Add Prometheus metrics if enabled
     if config.enable_metrics {
@@ -2966,5 +3010,72 @@ impl Application {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod security_header_tests {
+    use super::security_header_pairs;
+    use crate::config::SecurityHeadersConfig;
+
+    fn names(cfg: &SecurityHeadersConfig) -> Vec<String> {
+        security_header_pairs(cfg)
+            .unwrap()
+            .into_iter()
+            .map(|(name, _)| name.as_str().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn defaults_emit_the_safe_hardening_headers() {
+        let names = names(&SecurityHeadersConfig::default());
+        assert!(names.contains(&"x-content-type-options".to_string()));
+        assert!(names.contains(&"x-frame-options".to_string()));
+        assert!(names.contains(&"referrer-policy".to_string()));
+        assert!(names.contains(&"permissions-policy".to_string()));
+        // Opt-in headers are not emitted unless explicitly configured.
+        assert!(!names.contains(&"content-security-policy".to_string()));
+        assert!(!names.contains(&"content-security-policy-report-only".to_string()));
+        assert!(!names.contains(&"strict-transport-security".to_string()));
+    }
+
+    #[test]
+    fn disabled_emits_nothing() {
+        let cfg = SecurityHeadersConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        assert!(security_header_pairs(&cfg).unwrap().is_empty());
+    }
+
+    #[test]
+    fn opt_in_headers_emitted_when_set() {
+        let cfg = SecurityHeadersConfig {
+            content_security_policy: "default-src 'self'".to_string(),
+            strict_transport_security: "max-age=31536000; includeSubDomains".to_string(),
+            ..Default::default()
+        };
+        let names = names(&cfg);
+        assert!(names.contains(&"content-security-policy".to_string()));
+        assert!(names.contains(&"strict-transport-security".to_string()));
+    }
+
+    #[test]
+    fn empty_value_disables_individual_header() {
+        let cfg = SecurityHeadersConfig {
+            frame_options: String::new(),
+            ..Default::default()
+        };
+        assert!(!names(&cfg).contains(&"x-frame-options".to_string()));
+    }
+
+    #[test]
+    fn invalid_header_value_is_rejected() {
+        let cfg = SecurityHeadersConfig {
+            // A bare newline is not a valid header value.
+            referrer_policy: "bad\nvalue".to_string(),
+            ..Default::default()
+        };
+        assert!(security_header_pairs(&cfg).is_err());
     }
 }
