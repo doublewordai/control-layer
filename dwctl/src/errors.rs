@@ -136,9 +136,15 @@ pub enum Error {
         message: String,
     },
 
-    /// Too many concurrent requests - rate limiting
+    /// Too many requests — rate limiting or capacity rejection.
+    ///
+    /// `retry_after_seconds` is surfaced both in the `Retry-After` HTTP header
+    /// and in the JSON body so clients with retry logic can wait the right
+    /// amount. Callers should pass a value calibrated to the limit they hit
+    /// (e.g. 60s for a short-term concurrency cap; the full window length
+    /// for a sliding-window per-user limit).
     #[error("Too many requests: {message}")]
-    TooManyRequests { message: String },
+    TooManyRequests { message: String, retry_after_seconds: u64 },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -230,7 +236,7 @@ impl Error {
             Error::InsufficientCredits { message, .. } => message.clone(),
             Error::ModelAccessDenied { message, .. } => message.clone(),
             Error::ModalityAccessDenied { message, .. } => message.clone(),
-            Error::TooManyRequests { message } => message.clone(),
+            Error::TooManyRequests { message, .. } => message.clone(),
         }
     }
 }
@@ -329,20 +335,21 @@ impl IntoResponse for Error {
 
                 (status, axum::response::Json(body)).into_response()
             }
-            Error::TooManyRequests { message } => {
+            Error::TooManyRequests {
+                message,
+                retry_after_seconds,
+            } => {
                 use axum::http::header::RETRY_AFTER;
                 use serde_json::json;
 
-                // Suggest retry after 60 seconds for capacity-based rejections
-                let retry_after_secs = "60";
-
+                let retry_after_str = retry_after_seconds.to_string();
                 let body = json!({
                     "error": "too_many_requests",
                     "message": message,
-                    "retry_after_seconds": 30
+                    "retry_after_seconds": retry_after_seconds,
                 });
 
-                (status, [(RETRY_AFTER, retry_after_secs)], axum::response::Json(body)).into_response()
+                (status, [(RETRY_AFTER, retry_after_str.as_str())], axum::response::Json(body)).into_response()
             }
             _ => {
                 // For all other errors, return simple text message (unchanged)

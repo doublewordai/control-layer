@@ -2903,7 +2903,7 @@ mod tests {
         let result = limiter.acquire().await;
         assert!(result.is_err(), "Third request should be rejected when queue is full");
 
-        if let Err(crate::errors::Error::TooManyRequests { message }) = result {
+        if let Err(crate::errors::Error::TooManyRequests { message, .. }) = result {
             assert!(message.contains("Too many file uploads"));
         } else {
             panic!("Expected TooManyRequests error");

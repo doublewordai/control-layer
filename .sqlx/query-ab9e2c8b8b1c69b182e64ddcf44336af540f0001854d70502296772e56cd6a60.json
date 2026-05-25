@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT COUNT(*) FROM support_request_submissions\n         WHERE user_id = $1\n           AND created_at > NOW() - make_interval(secs => $2::int)",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "count",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int4"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "ab9e2c8b8b1c69b182e64ddcf44336af540f0001854d70502296772e56cd6a60"
+}

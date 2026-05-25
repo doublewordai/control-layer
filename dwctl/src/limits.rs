@@ -106,6 +106,7 @@ impl UploadLimiter {
             self.waiting_count.fetch_sub(1, Ordering::SeqCst);
             return Err(Error::TooManyRequests {
                 message: "Too many file uploads in progress. Please retry later.".to_string(),
+                retry_after_seconds: 60,
             });
         }
 
@@ -127,6 +128,7 @@ impl UploadLimiter {
             // Zero timeout means reject immediately if not available
             Err(Error::TooManyRequests {
                 message: "Too many file uploads in progress. Please retry later.".to_string(),
+                retry_after_seconds: 60,
             })
         } else {
             match tokio::time::timeout(self.max_wait, self.semaphore.clone().acquire_owned()).await {
@@ -135,12 +137,14 @@ impl UploadLimiter {
                     // Semaphore closed (shouldn't happen in normal operation)
                     Err(Error::TooManyRequests {
                         message: "Upload service temporarily unavailable.".to_string(),
+                        retry_after_seconds: 60,
                     })
                 }
                 Err(_) => {
                     // Timeout elapsed
                     Err(Error::TooManyRequests {
                         message: "Timed out waiting for upload slot. Please retry later.".to_string(),
+                        retry_after_seconds: 60,
                     })
                 }
             }
@@ -235,7 +239,7 @@ mod tests {
         // Second waiter should be rejected (queue full)
         let result = limiter.acquire().await;
         assert!(result.is_err());
-        if let Err(Error::TooManyRequests { message }) = result {
+        if let Err(Error::TooManyRequests { message, .. }) = result {
             assert!(message.contains("Too many file uploads"));
         } else {
             panic!("Expected TooManyRequests error");
@@ -259,7 +263,7 @@ mod tests {
         assert!(elapsed >= Duration::from_secs(1));
         assert!(elapsed < Duration::from_secs(2));
 
-        if let Err(Error::TooManyRequests { message }) = result {
+        if let Err(Error::TooManyRequests { message, .. }) = result {
             assert!(message.contains("Timed out"));
         } else {
             panic!("Expected TooManyRequests error");

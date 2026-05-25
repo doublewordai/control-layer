@@ -828,6 +828,9 @@ async fn reserve_capacity_for_batch<P: PoolProvider>(
                 "Insufficient capacity for {} completion window. The following models are currently at capacity: {}. Try again later or use a longer completion window.",
                 completion_window, models
             ),
+            // 60s aligns with the previous default; tune if batch capacity
+            // turnaround is consistently faster or slower than that.
+            retry_after_seconds: 60,
         },
         CapacityError::Internal(msg) => Error::Internal { operation: msg },
     })
