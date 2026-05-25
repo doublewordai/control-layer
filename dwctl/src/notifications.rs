@@ -48,7 +48,7 @@ use crate::webhooks::events::{WebhookEvent, WebhookEventType};
 const WEBHOOK_EVENT_CHANNEL: &str = "webhook_event";
 
 /// Outcome of a completed batch for notification purposes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum BatchOutcome {
     Completed,
     PartiallyCompleted,
@@ -56,6 +56,10 @@ pub enum BatchOutcome {
 }
 
 /// Unified batch notification info used by both email and webhook delivery.
+///
+/// Serializable so it can be embedded in the `SendEmailInput::BatchCompletion`
+/// underway job payload.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BatchNotificationInfo {
     pub batch_id: String,
     pub batch_uuid: Uuid,

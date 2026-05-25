@@ -24,7 +24,6 @@ use crate::{
             api_keys::ApiKeyPurpose, credits::CreditTransactionCreateDBRequest, deployments::ModelStatus, users::UserCreateDBRequest,
         },
     },
-    email::EmailService,
     errors::Error,
 };
 
@@ -434,11 +433,24 @@ pub async fn request_password_reset<P: PoolProvider>(
         // Create reset token
         let (raw_token, token) = token_repo.create_for_user(user.id, &config).await?;
 
-        // Send email with token ID
-        let email_service = EmailService::new(&config)?;
-        email_service
-            .send_password_reset_email(&user.email, user.display_name.as_deref(), &token.id, &raw_token)
-            .await?;
+        // Enqueue the reset email. The user-visible response is the same whether
+        // the actual send succeeds or fails (we always claim "if an account
+        // with that email exists..." to avoid email enumeration), so a queued
+        // send that retries on transient provider failure is strictly better
+        // than an inline send that could 5xx and leak existence.
+        state
+            .task_runner
+            .send_email_job
+            .enqueue(&crate::email_jobs::SendEmailInput::PasswordReset {
+                to_email: user.email.clone(),
+                to_name: user.display_name.clone(),
+                token_id: token.id,
+                token: raw_token,
+            })
+            .await
+            .map_err(|e| Error::Internal {
+                operation: format!("enqueue password reset email: {e}"),
+            })?;
     }
     tx.commit().await.map_err(|e| Error::Database(e.into()))?;
 

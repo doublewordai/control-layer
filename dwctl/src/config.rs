@@ -1853,6 +1853,14 @@ pub struct TaskWorkersConfig {
     /// Handles create-response and complete-response jobs from the responses
     /// middleware and outlet handler. Set to 0 to disable.
     pub response_workers: usize,
+    /// Number of send-email workers (default: 1).
+    ///
+    /// Always at least 1 in practice: every email send (password reset, org
+    /// invite, support request, batch completion, etc.) goes through the
+    /// `send-email` underway queue. With 0 workers, enqueued sends never
+    /// run and recipients never get their mail. Setting this >0 is also how
+    /// you scale email throughput if the queue starts backing up.
+    pub email_workers: usize,
 }
 
 impl Default for TaskWorkersConfig {
@@ -1861,6 +1869,7 @@ impl Default for TaskWorkersConfig {
             create_batch_workers: 1,
             cascade_batch_state_workers: 1,
             response_workers: 1,
+            email_workers: 1,
         }
     }
 }

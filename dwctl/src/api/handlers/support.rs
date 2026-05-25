@@ -8,7 +8,7 @@ use utoipa::ToSchema;
 use crate::{
     AppState,
     api::models::users::CurrentUser,
-    email::EmailService,
+    email_jobs::SendEmailInput,
     errors::{Error, Result},
 };
 
@@ -22,18 +22,26 @@ pub struct SupportRequest {
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct SupportResponse {
-    /// Whether the support request was sent successfully
+    /// Whether the support request was accepted for delivery. Accepted does
+    /// not mean delivered — the actual send runs asynchronously via the
+    /// `send-email` worker, which retries transient provider failures.
     pub sent: bool,
 }
 
-/// Submit a support request via email
+/// Submit a support request via email.
+///
+/// Enqueues the send rather than awaiting it inline so the caller doesn't
+/// see a 5xx when the upstream provider is unavailable or rate-limiting.
+/// The actual delivery runs in the `send-email` worker with retry on
+/// transient errors.
 #[utoipa::path(
     post,
     path = "/support/requests",
     request_body = SupportRequest,
     responses(
-        (status = 200, description = "Support request sent", body = SupportResponse),
-        (status = 500, description = "Failed to send support request"),
+        (status = 200, description = "Support request accepted for delivery", body = SupportResponse),
+        (status = 400, description = "Subject or message missing"),
+        (status = 500, description = "Failed to enqueue support request"),
     ),
     security(("BearerAuth" = []), ("CookieAuth" = []), ("X-Doubleword-User" = [])),
 )]
@@ -53,16 +61,20 @@ pub async fn submit_support_request<P: PoolProvider>(
         });
     }
 
-    let email_service = EmailService::new(&config)?;
-    email_service
-        .send_support_request(
-            &config.support_email,
-            &current_user.email,
-            current_user.display_name.as_deref(),
-            subject,
-            message,
-        )
-        .await?;
+    state
+        .task_runner
+        .send_email_job
+        .enqueue(&SendEmailInput::SupportRequest {
+            support_email: config.support_email.clone(),
+            user_email: current_user.email.clone(),
+            user_name: current_user.display_name.clone(),
+            subject: subject.to_string(),
+            message: message.to_string(),
+        })
+        .await
+        .map_err(|e| Error::Internal {
+            operation: format!("enqueue support request: {e}"),
+        })?;
 
     Ok(Json(SupportResponse { sent: true }))
 }
