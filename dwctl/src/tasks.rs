@@ -17,6 +17,7 @@ use crate::api::handlers::batches::{CascadeBatchStateInput, CreateBatchInput, bu
 use crate::connections::sync::{
     ActivateBatchInput, IngestFileInput, SyncConnectionInput, build_activate_batch_job, build_ingest_file_job, build_sync_connection_job,
 };
+use crate::email_jobs::{SendEmailInput, build_send_email_job};
 use crate::responses::jobs::{CompleteResponseInput, CreateResponseInput, build_complete_response_job, build_create_response_job};
 
 /// A lazily-initialized, shared job reference using `Weak` to avoid reference
@@ -103,6 +104,10 @@ pub struct TaskRunner<P: PoolProvider + Clone + 'static = sqlx_pool_router::DbPo
     pub activate_batch_job: Arc<Job<ActivateBatchInput, TaskState<P>>>,
     pub create_response_job: Arc<Job<CreateResponseInput, TaskState<P>>>,
     pub complete_response_job: Arc<Job<CompleteResponseInput, TaskState<P>>>,
+    /// Queue for all outbound transactional email. Handlers enqueue rather
+    /// than awaiting an SMTP/HTTP send so the user-facing request can return
+    /// quickly even if the provider is down or rate-limiting.
+    pub send_email_job: Arc<Job<SendEmailInput, TaskState<P>>>,
 }
 
 impl<P: PoolProvider + Clone + Send + Sync + 'static> TaskRunner<P> {
@@ -126,6 +131,7 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> TaskRunner<P> {
         let activate_batch_job = Arc::new(build_activate_batch_job(pool.clone(), state.clone()).await?);
         let create_response_job = Arc::new(build_create_response_job(pool.clone(), state.clone()).await?);
         let complete_response_job = Arc::new(build_complete_response_job(pool.clone(), state.clone()).await?);
+        let send_email_job = Arc::new(build_send_email_job(pool.clone(), state.clone()).await?);
         let sync_connection_job = Arc::new(build_sync_connection_job(pool, state.clone()).await?);
 
         // Wire weak cross-references. All jobs share the same Arc<OnceLock>,
@@ -151,6 +157,7 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> TaskRunner<P> {
             activate_batch_job,
             create_response_job,
             complete_response_job,
+            send_email_job,
         })
     }
 
@@ -227,6 +234,24 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> TaskRunner<P> {
                     }),
                 ));
             }
+        }
+
+        // Send-email workers — drain the email queue populated by every public
+        // EmailService caller. Always run at least one: with zero workers,
+        // enqueued sends would silently never deliver. Use `email_workers > 1`
+        // to scale throughput if the queue starts backing up.
+        let email_workers = task_config.email_workers.max(1);
+        for i in 0..email_workers {
+            let mut worker = self.send_email_job.worker();
+            worker.set_shutdown_token(shutdown_token.clone());
+            handles.push((
+                "send-email-worker",
+                tokio::spawn(async move {
+                    if let Err(e) = worker.run().await {
+                        tracing::error!(error = %e, worker = i, "Send-email worker error");
+                    }
+                }),
+            ));
         }
 
         if !sync_config.enabled {

@@ -14,7 +14,6 @@ use crate::{
     auth::permissions::{can_manage_org_resource, can_read_all_resources, can_read_own_resource},
     db::handlers::{Credits, Organizations, Repository, Users, api_keys::ApiKeys, organizations::OrganizationFilter},
     db::models::organizations::{OrganizationCreateDBRequest, OrganizationUpdateDBRequest},
-    email::EmailService,
     errors::{Error, Result},
     types::{Operation, Permission, Resource, UserId, UserIdOrCurrent},
 };
@@ -571,59 +570,51 @@ pub async fn update_organization<P: PoolProvider>(
             let new_email_link = make_link(&new_email_token);
             let old_email_link = make_link(&old_email_token);
 
-            match EmailService::new(&config) {
-                Ok(email_service) => {
-                    if let Err(error) = email_service
-                        .send_org_email_change_verify_new(&normalized, &org_name, &new_email_link)
-                        .await
-                    {
-                        tracing::warn!(
-                            org_id = %id,
-                            new_email = %normalized,
-                            error = %error,
-                            kind = "org_email_change_verify_new_failed",
-                            "Failed to send org email-change verify-new email",
-                        );
-                    }
-                    if let Err(error) = email_service
-                        .send_org_email_change_verify_old(
-                            &current_org.email,
-                            &org_name,
-                            &normalized,
-                            &old_email_link,
-                            Some(&config.support_email),
-                        )
-                        .await
-                    {
-                        // Security-relevant: failure here means the legitimate
-                        // owner can't authorize the change, but it also means
-                        // an attacker can't get the old-side approval — so the
-                        // verification gate still holds. We still alert on
-                        // `kind = "org_email_change_verify_old_failed"` so ops
-                        // can spot silent SMTP failures against the old address.
-                        //
-                        // Follow-up: a durable retry (via the task runner /
-                        // batched email queue) would harden this further
-                        // against transient SMTP failures. Out of scope for
-                        // this PR.
-                        tracing::warn!(
-                            org_id = %id,
-                            old_email = %current_org.email,
-                            new_email = %normalized,
-                            error = %error,
-                            kind = "org_email_change_verify_old_failed",
-                            "Failed to send org email-change verify-old email — current owner cannot authorize",
-                        );
-                    }
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        org_id = %id,
-                        error = %error,
-                        kind = "org_email_change_email_service_unavailable",
-                        "Email service unavailable for org email-change verification",
-                    );
-                }
+            // Enqueue both verification emails. The `send-email` worker
+            // retries transient provider failures with backoff, so a flaky
+            // upstream doesn't strand the owner unable to authorize the
+            // change.
+            if let Err(error) = state
+                .task_runner
+                .send_email_job
+                .enqueue(&crate::email_jobs::SendEmailInput::OrgEmailChangeVerifyNew {
+                    to_email: normalized.clone(),
+                    org_name: org_name.clone(),
+                    confirm_link: new_email_link,
+                })
+                .await
+            {
+                tracing::warn!(
+                    org_id = %id,
+                    new_email = %normalized,
+                    error = %error,
+                    kind = "org_email_change_verify_new_enqueue_failed",
+                    "Failed to enqueue org email-change verify-new email",
+                );
+            }
+            if let Err(error) = state
+                .task_runner
+                .send_email_job
+                .enqueue(&crate::email_jobs::SendEmailInput::OrgEmailChangeVerifyOld {
+                    to_email: current_org.email.clone(),
+                    org_name: org_name.clone(),
+                    new_email: normalized.clone(),
+                    confirm_link: old_email_link,
+                    support_email: Some(config.support_email.clone()),
+                })
+                .await
+            {
+                // Enqueue failure here is exceptional (it means the underway
+                // pool is down). The verification gate still holds — neither
+                // side can confirm, so the email change is blocked.
+                tracing::warn!(
+                    org_id = %id,
+                    old_email = %current_org.email,
+                    new_email = %normalized,
+                    error = %error,
+                    kind = "org_email_change_verify_old_enqueue_failed",
+                    "Failed to enqueue org email-change verify-old email — current owner cannot authorize",
+                );
             }
 
             pending_email_info = Some(PendingEmailChangeResponse::from(pending));
@@ -1365,15 +1356,24 @@ pub async fn invite_member<P: PoolProvider>(
         .and_then(|u| u.display_name.clone())
         .unwrap_or_else(|| inviter.as_ref().map(|u| u.username.clone()).unwrap_or_default());
 
-    // Send invite email
+    // Enqueue invite email. Failure here means the underway pool is down,
+    // not the provider — the invite row is already persisted, so the user
+    // can still be re-invited via the dashboard.
     let config = state.current_config();
     let invite_link = format!("{}/org-invite?token={}", config.dashboard_url.trim_end_matches('/'), token);
-    let email_service = EmailService::new(&config)?;
-    if let Err(e) = email_service
-        .send_org_invite_email(&email, &org_name, &inviter_name, role, &invite_link)
+    if let Err(e) = state
+        .task_runner
+        .send_email_job
+        .enqueue(&crate::email_jobs::SendEmailInput::OrgInvite {
+            to_email: email.clone(),
+            org_name: org_name.clone(),
+            inviter_name,
+            role: role.to_string(),
+            invite_link,
+        })
         .await
     {
-        tracing::warn!("Failed to send invite email to {email}: {e}");
+        tracing::warn!("Failed to enqueue invite email to {email}: {e}");
     }
 
     Ok((
@@ -3065,6 +3065,10 @@ mod tests {
         // to a per-test directory via create_test_app_with_config so other
         // tests' emails don't pollute the scan. Double-opt-in means BOTH
         // mailboxes get a verification link, not just the new one.
+        //
+        // Sends are now async — the handler enqueues, the send-email worker
+        // drains. This test enables `email_workers: 1` and polls the scratch
+        // dir until both .eml files appear (or it times out).
         let scratch = std::env::temp_dir().join(format!("dwctl-test-emails-patch-{}-{}", std::process::id(), uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&scratch).unwrap();
 
@@ -3072,6 +3076,7 @@ mod tests {
         config.email.transport = crate::config::EmailTransportConfig::File {
             path: scratch.to_string_lossy().to_string(),
         };
+        config.background_services.task_workers.email_workers = 1;
 
         let (server, _bg) = create_test_app_with_config(pool.clone(), config, false).await;
         let pm = create_test_admin_user(&pool, Role::PlatformManager).await;
@@ -3089,22 +3094,36 @@ mod tests {
             .await;
         resp.assert_status(axum::http::StatusCode::OK);
 
-        // Read all .eml files written to the scratch dir. We expect two:
-        // one to the new address and one to the current address, both
-        // containing a confirmation link (not a notice).
+        // Pre-condition: before the worker runs, no files yet (the handler
+        // returned right after enqueue; the send happens in the background).
+        // We don't assert this strictly — the worker may have already drained
+        // depending on scheduling — but the post-condition is the real check.
+
+        // Poll for both files to appear. Timeout generous because the test
+        // postgres is shared and underway listen/notify can be quirky under
+        // sqlx::test parallelism.
         let mut to_addresses: Vec<String> = Vec::new();
         let mut bodies: Vec<String> = Vec::new();
-        for entry in std::fs::read_dir(&scratch).unwrap() {
-            let path = entry.unwrap().path();
-            if path.extension().and_then(|s| s.to_str()) == Some("eml") {
-                let body = std::fs::read_to_string(&path).unwrap();
-                for line in body.lines() {
-                    if let Some(rest) = line.strip_prefix("To: ") {
-                        to_addresses.push(rest.trim().to_string());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            to_addresses.clear();
+            bodies.clear();
+            for entry in std::fs::read_dir(&scratch).unwrap() {
+                let path = entry.unwrap().path();
+                if path.extension().and_then(|s| s.to_str()) == Some("eml") {
+                    let body = std::fs::read_to_string(&path).unwrap();
+                    for line in body.lines() {
+                        if let Some(rest) = line.strip_prefix("To: ") {
+                            to_addresses.push(rest.trim().to_string());
+                        }
                     }
+                    bodies.push(body);
                 }
-                bodies.push(body);
             }
+            if bodies.len() >= 2 || std::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         to_addresses.sort();
         assert_eq!(

@@ -149,6 +149,7 @@ mod crypto;
 pub mod db;
 mod email;
 mod email_http;
+pub mod email_jobs;
 pub mod encryption;
 mod error_enrichment;
 pub mod errors;
