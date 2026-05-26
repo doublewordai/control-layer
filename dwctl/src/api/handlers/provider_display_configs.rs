@@ -10,10 +10,14 @@ use crate::db::models::provider_display_configs::{ProviderDisplayConfigCreateDBR
 use crate::errors::{Error, Result};
 use axum::{
     Json,
+    body::Body,
     extract::{Path, State},
     http::StatusCode,
+    response::Response,
 };
 use std::collections::{BTreeMap, HashMap};
+use std::time::Duration;
+use url::Url;
 
 fn normalize_provider_key(value: &str) -> String {
     value.trim().to_lowercase()
@@ -281,6 +285,153 @@ pub async fn delete_provider_display_config<P: PoolProvider>(
         });
     }
     Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------- Icon proxy ----------
+
+/// Cap on bytes returned from the upstream icon URL. Icons are SVG/PNG logos;
+/// anything larger is either a misconfiguration or an upstream that returned
+/// something unexpected (HTML error page, etc.) — better to fail closed.
+const MAX_ICON_SIZE_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Total time (connect + read) we'll spend talking to the upstream icon host
+/// before giving up. Provider logos are tiny static files; if the upstream
+/// can't deliver in this window, it's not going to.
+const ICON_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// `Cache-Control` returned to the browser. Provider icons effectively never
+/// change at a given URL — `staleTime` on the SPA's TanStack Query already
+/// keeps the list response cached for 30 minutes, so an hour here is conservative.
+const ICON_CACHE_CONTROL: &str = "public, max-age=3600";
+
+/// Server-side proxy for operator-set provider icon URLs.
+///
+/// `provider_display_configs.icon` is set by admins through the admin surface
+/// and currently points at arbitrary external hosts (npmmirror, simpleicons,
+/// Wikipedia, GitHub avatars, Webflow CDNs, ...) that change each time a new
+/// provider is added. Routing the dashboard's icon loads through this endpoint
+/// means the browser only ever fetches icons from the same origin, so the SPA
+/// can run with a tight `img-src 'self' data: blob:` CSP rather than allowing
+/// every external image host that an admin might paste in.
+///
+/// Returns:
+///   - **200** with the upstream bytes and `Content-Type` (must be `image/*`)
+///   - **404** if the provider has no config, no icon set, or the configured
+///     value isn't an absolute `https://` URL (relative paths and registry-key
+///     shortcuts are handled client-side and bypass this endpoint)
+///   - **500** if the upstream fetch fails, times out, exceeds 2 MiB, returns
+///     non-2xx, or serves a non-image Content-Type
+#[utoipa::path(
+    get,
+    path = "/provider-display-configs/{provider_key}/icon",
+    tag = "provider-display-configs",
+    summary = "Proxy the provider's configured icon",
+    description = "Fetches the operator-set icon URL server-side and streams it back. Lets the SPA keep a tight CSP regardless of where the icon URL points.",
+    params(("provider_key" = String, Path)),
+    responses(
+        (status = 200, description = "Icon bytes"),
+        (status = 404, description = "Provider or icon not found / not proxyable"),
+        (status = 500, description = "Upstream icon fetch failed"),
+    ),
+    security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
+        ("X-Doubleword-User" = [])
+    )
+)]
+#[tracing::instrument(skip_all, fields(provider_key = %provider_key))]
+pub async fn get_provider_display_config_icon<P: PoolProvider>(
+    State(state): State<AppState<P>>,
+    Path(provider_key): Path<String>,
+    _: RequiresPermission<resource::Models, operation::ReadOwn>,
+) -> Result<Response> {
+    let provider_key = normalize_provider_key(&provider_key);
+
+    let icon_value = {
+        let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+        let mut repo = ProviderDisplayConfigs::new(&mut conn);
+        repo.get_by_key(&provider_key)
+            .await?
+            .ok_or_else(|| Error::NotFound {
+                resource: "provider display config".to_string(),
+                id: provider_key.clone(),
+            })?
+            .icon
+            .unwrap_or_default()
+    };
+
+    // Only proxy absolute https:// URLs. Relative paths (`/brand/...`) and
+    // registry-key shortcuts (`anthropic`, `google`) are resolved by the SPA
+    // and don't need (or want) to round-trip through this endpoint.
+    let icon_url = match Url::parse(&icon_value) {
+        Ok(u) if u.scheme() == "https" => u,
+        _ => {
+            return Err(Error::NotFound {
+                resource: "proxyable icon for provider".to_string(),
+                id: provider_key,
+            });
+        }
+    };
+
+    let client = reqwest::Client::builder()
+        .timeout(ICON_FETCH_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::limited(3))
+        .build()
+        .map_err(|e| Error::Other(anyhow::anyhow!("build http client: {e}")))?;
+
+    let resp = client.get(icon_url).send().await.map_err(|e| {
+        tracing::warn!(error = %e, "provider icon upstream fetch failed");
+        Error::Other(anyhow::anyhow!("fetch provider icon: {e}"))
+    })?;
+
+    let upstream_status = resp.status();
+    if !upstream_status.is_success() {
+        return Err(Error::Other(anyhow::anyhow!(
+            "upstream icon host returned status {upstream_status}",
+        )));
+    }
+
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "application/octet-stream".to_string());
+
+    // Refuse to proxy anything that isn't an image — guards against an
+    // upstream returning an HTML error page that the browser would then try
+    // to render in an <img> tag.
+    if !content_type.to_ascii_lowercase().starts_with("image/") {
+        return Err(Error::Other(anyhow::anyhow!(
+            "upstream icon content-type {content_type:?} is not image/*",
+        )));
+    }
+
+    let body_bytes = read_capped_body(resp, MAX_ICON_SIZE_BYTES).await.map_err(|e| {
+        tracing::warn!(error = %e, "provider icon body read failed");
+        Error::Other(anyhow::anyhow!("read provider icon body: {e}"))
+    })?;
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(axum::http::header::CONTENT_TYPE, content_type)
+        .header(axum::http::header::CACHE_CONTROL, ICON_CACHE_CONTROL)
+        .body(Body::from(body_bytes))
+        .map_err(|e| Error::Other(anyhow::anyhow!("build icon response: {e}")))
+}
+
+/// Drain a `reqwest::Response` body, returning early with an error if the
+/// accumulated bytes would exceed `max`. Avoids buffering an unbounded body
+/// from an untrusted upstream.
+async fn read_capped_body(mut resp: reqwest::Response, max: u64) -> anyhow::Result<bytes::Bytes> {
+    let mut buf = bytes::BytesMut::new();
+    while let Some(chunk) = resp.chunk().await? {
+        if (buf.len() as u64) + (chunk.len() as u64) > max {
+            anyhow::bail!("icon body exceeds {max} bytes");
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf.freeze())
 }
 
 #[cfg(test)]
