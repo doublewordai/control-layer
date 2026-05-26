@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.53.0](https://github.com/doublewordai/control-layer/compare/v8.52.2...v8.53.0) (2026-05-26)
+
+
+### Features
+
+* add configurable browser security response headers ([#1091](https://github.com/doublewordai/control-layer/issues/1091)) ([0357624](https://github.com/doublewordai/control-layer/commit/03576247b13cb70b26f4338624b039c4153d8df8))
+
 ## [8.52.2](https://github.com/doublewordai/control-layer/compare/v8.52.1...v8.52.2) (2026-05-21)
 
 
