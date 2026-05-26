@@ -785,7 +785,7 @@ pub struct PasswordConfig {
     pub argon2_parallelism: u32,
 }
 
-/// Security configuration for JWT and CORS.
+/// Security configuration for JWT, CORS, and browser security response headers.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SecurityConfig {
@@ -794,6 +794,44 @@ pub struct SecurityConfig {
     pub jwt_expiry: Duration,
     /// CORS configuration for browser clients
     pub cors: CorsConfig,
+    /// Browser security response headers (CSP, X-Frame-Options, etc.)
+    pub headers: SecurityHeadersConfig,
+}
+
+/// Browser security response headers added to every HTTP response.
+///
+/// Defence-in-depth at the application layer: these are emitted even when a
+/// reverse proxy or ingress in front of the server does not add them. Each
+/// header is set only if not already present on the response, so any
+/// stricter per-route header (e.g. a more restrictive `Referrer-Policy` on
+/// sensitive endpoints) is preserved.
+///
+/// `content_security_policy`, `content_security_policy_report_only` and
+/// `strict_transport_security` are opt-in (empty = not sent): a CSP that does
+/// not match the deployed frontend can break it, and HSTS is usually owned by
+/// whatever terminates TLS. The remaining headers are safe defaults and are
+/// on unless `enabled` is set to false.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SecurityHeadersConfig {
+    /// Master switch for all security response headers below.
+    pub enabled: bool,
+    /// `X-Frame-Options` value (e.g. `DENY`, `SAMEORIGIN`). Empty = not sent.
+    pub frame_options: String,
+    /// `Referrer-Policy` value. Empty = not sent.
+    pub referrer_policy: String,
+    /// `Permissions-Policy` value. Empty = not sent.
+    pub permissions_policy: String,
+    /// `Content-Security-Policy` value. Empty = not sent (opt-in).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub content_security_policy: String,
+    /// `Content-Security-Policy-Report-Only` value. Empty = not sent (opt-in).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub content_security_policy_report_only: String,
+    /// `Strict-Transport-Security` value. Empty = not sent (opt-in; usually
+    /// owned by whatever terminates TLS).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub strict_transport_security: String,
 }
 
 /// CORS (Cross-Origin Resource Sharing) configuration.
@@ -1904,6 +1942,23 @@ impl Default for SecurityConfig {
         Self {
             jwt_expiry: Duration::from_secs(24 * 60 * 60), // 24 hours
             cors: CorsConfig::default(),
+            headers: SecurityHeadersConfig::default(),
+        }
+    }
+}
+
+impl Default for SecurityHeadersConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            frame_options: "DENY".to_string(),
+            referrer_policy: "strict-origin-when-cross-origin".to_string(),
+            permissions_policy:
+                "accelerometer=(), camera=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), payment=(), usb=()".to_string(),
+            // Opt-in: empty means the header is not sent.
+            content_security_policy: String::new(),
+            content_security_policy_report_only: String::new(),
+            strict_transport_security: String::new(),
         }
     }
 }
