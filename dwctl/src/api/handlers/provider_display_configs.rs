@@ -373,9 +373,16 @@ pub async fn get_provider_display_config_icon<P: PoolProvider>(
         }
     };
 
+    // Several icon hosts (Wikimedia in particular, per its User-Agent policy)
+    // return 403 for requests with no User-Agent, so identify ourselves.
     let client = reqwest::Client::builder()
         .timeout(ICON_FETCH_TIMEOUT)
         .redirect(reqwest::redirect::Policy::limited(3))
+        .user_agent(concat!(
+            "dwctl-icon-proxy/",
+            env!("CARGO_PKG_VERSION"),
+            " (+https://github.com/doublewordai/control-layer)",
+        ))
         .build()
         .map_err(|e| Error::Other(anyhow::anyhow!("build http client: {e}")))?;
 
