@@ -1,5 +1,6 @@
 import React, { useState, useMemo } from "react";
 import type { Model, ProviderDisplayConfig } from "../../../../api/control-layer/types";
+import { providerIconUrl } from "../../../../api/control-layer/types";
 import { CatalogIcon } from "../catalog/CatalogIcon";
 
 type FilterType = "category" | "capability";
@@ -187,7 +188,10 @@ export const MobileModelsView: React.FC<MobileModelsViewProps> = ({
               <Swimlane
                 key={key}
                 title={displayName}
-                titleIcon={config?.icon ?? key}
+                // Fall back to the registry key string (`anthropic`,
+                // `openai`, …) so CatalogIcon's bundled-asset registry
+                // can resolve it client-side when no operator icon set.
+                titleIcon={providerIconUrl(key, config?.icon) ?? key}
                 models={laneModels}
                 onNavigate={onNavigate}
               />
