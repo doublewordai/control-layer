@@ -382,6 +382,21 @@ fn ipv6_is_globally_routable(ip: Ipv6Addr) -> bool {
     true
 }
 
+/// Returns `true` unless `url`'s host is an IP literal (RFC3986
+/// `IP-literal` or `IPv4address`) that [`is_globally_routable`] rejects.
+/// Hostnames return `true` here — they're validated by [`SsrfSafeResolver`]
+/// when reqwest opens the connection. Use this for the synchronous check
+/// before/around DNS, in particular when reqwest skips the DNS resolver
+/// entirely (URLs like `https://10.0.0.1/foo` go straight to connect).
+fn url_host_is_globally_routable(url: &Url) -> bool {
+    match url.host() {
+        Some(url::Host::Ipv4(ip)) => is_globally_routable(IpAddr::V4(ip)),
+        Some(url::Host::Ipv6(ip)) => is_globally_routable(IpAddr::V6(ip)),
+        // Domain or no host — defer to the DNS-layer check.
+        _ => true,
+    }
+}
+
 /// DNS resolver used by [`icon_http_client`]. Drops any address that
 /// [`is_globally_routable`] rejects.
 ///
@@ -421,10 +436,25 @@ fn icon_http_client() -> &'static reqwest::Client {
     CLIENT.get_or_init(|| {
         reqwest::Client::builder()
             .timeout(ICON_FETCH_TIMEOUT)
-            // Redirects disabled: the SSRF resolver only inspects the
-            // initial host. A 302 from an upstream into the internal
-            // network would bypass it, so refuse to follow them at all.
-            .redirect(reqwest::redirect::Policy::none())
+            // Allow up to 3 redirects, but enforce the same constraints
+            // on every hop that we apply to the initial URL: https-only
+            // scheme, and (when the host is an IP literal) a globally
+            // routable address. The DNS resolver re-runs for hostnames
+            // on each hop, so a redirect that resolves into the
+            // internal network is blocked there — this policy only adds
+            // the synchronous checks that don't need DNS.
+            .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                if attempt.previous().len() >= 3 {
+                    return attempt.error("too many redirects");
+                }
+                if attempt.url().scheme() != "https" {
+                    return attempt.error("redirect scheme is not https");
+                }
+                if !url_host_is_globally_routable(attempt.url()) {
+                    return attempt.error("redirect host is not globally routable");
+                }
+                attempt.follow()
+            }))
             .dns_resolver(Arc::new(SsrfSafeResolver))
             // Several icon hosts (Wikimedia in particular, per its
             // User-Agent policy) return 403 for requests with no
@@ -498,11 +528,15 @@ pub async fn get_provider_display_config_icon<P: PoolProvider>(
     // and `Url::parse` rejects them.
     let icon_value = icon_value.trim();
 
-    // Only proxy absolute https:// URLs. Relative paths (`/brand/...`) and
-    // registry-key shortcuts (`anthropic`, `google`) are resolved by the SPA
-    // and don't need (or want) to round-trip through this endpoint.
+    // Only proxy absolute https:// URLs with a globally-routable host.
+    // Relative paths (`/brand/...`) and registry-key shortcuts
+    // (`anthropic`, `google`) are resolved by the SPA and don't need (or
+    // want) to round-trip through this endpoint. IP-literal hosts (e.g.
+    // `https://10.0.0.1/foo`) need an explicit check here because
+    // reqwest skips the DNS resolver in that case and goes straight to
+    // connect — bypassing [`SsrfSafeResolver`].
     let icon_url = match Url::parse(icon_value) {
-        Ok(u) if u.scheme() == "https" => u,
+        Ok(u) if u.scheme() == "https" && url_host_is_globally_routable(&u) => u,
         _ => {
             return Err(Error::NotFound {
                 resource: "proxyable icon for provider".to_string(),
@@ -660,6 +694,39 @@ mod ssrf_filter_tests {
         assert!(!check("::ffff:127.0.0.1"));
         assert!(!check("::ffff:10.0.0.1"));
         assert!(!check("::ffff:169.254.169.254"));
+    }
+
+    use super::url_host_is_globally_routable;
+    use url::Url;
+
+    fn url_ok(s: &str) -> bool {
+        url_host_is_globally_routable(&Url::parse(s).unwrap())
+    }
+
+    #[test]
+    fn url_helper_passes_hostnames_through() {
+        // Hostnames are validated by the DNS resolver, not here.
+        assert!(url_ok("https://example.com/foo"));
+        assert!(url_ok("https://registry.npmmirror.com/x.svg"));
+    }
+
+    #[test]
+    fn url_helper_blocks_ip_literal_private() {
+        assert!(!url_ok("https://10.0.0.1/foo"));
+        assert!(!url_ok("https://192.168.1.1/foo"));
+        assert!(!url_ok("https://127.0.0.1/foo"));
+        assert!(!url_ok("https://169.254.169.254/latest/meta-data/"));
+        assert!(!url_ok("https://[::1]/foo"));
+        assert!(!url_ok("https://[fc00::1]/foo"));
+        // ::ffff:10.0.0.1 — url::Host normalises to IPv4 here, so the
+        // IPv4-mapped path runs.
+        assert!(!url_ok("https://[::ffff:10.0.0.1]/foo"));
+    }
+
+    #[test]
+    fn url_helper_allows_ip_literal_public() {
+        assert!(url_ok("https://1.1.1.1/foo"));
+        assert!(url_ok("https://[2606:4700:4700::1111]/foo"));
     }
 }
 
