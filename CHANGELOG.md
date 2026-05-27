@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.54.1](https://github.com/doublewordai/control-layer/compare/v8.54.0...v8.54.1) (2026-05-27)
+
+
+### Bug Fixes
+
+* **dashboard:** load provider icons via the icon proxy ([#1099](https://github.com/doublewordai/control-layer/issues/1099)) ([afaee05](https://github.com/doublewordai/control-layer/commit/afaee05c756a90860dc0e67a79ccc1260e95e344))
+
 ## [8.54.0](https://github.com/doublewordai/control-layer/compare/v8.53.0...v8.54.0) (2026-05-27)
 
 
