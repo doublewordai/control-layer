@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.54.0](https://github.com/doublewordai/control-layer/compare/v8.53.0...v8.54.0) (2026-05-27)
+
+
+### Features
+
+* proxy provider-display-config icons through the API ([#1096](https://github.com/doublewordai/control-layer/issues/1096)) ([f460543](https://github.com/doublewordai/control-layer/commit/f4605435070461edddcd933c1c70737ebc00ba09))
+
 ## [8.53.0](https://github.com/doublewordai/control-layer/compare/v8.52.2...v8.53.0) (2026-05-26)
 
 
