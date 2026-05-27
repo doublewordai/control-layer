@@ -177,6 +177,12 @@ struct DeployedModel {
     pub fallback_on_status: Option<Vec<i32>>,
     pub fallback_with_replacement: Option<bool>,
     pub fallback_max_attempts: Option<i32>,
+    pub backoff_enabled: bool,
+    pub backoff_initial_ms: i32,
+    pub backoff_max_ms: i32,
+    pub backoff_factor: f64,
+    pub backoff_jitter: String,
+    pub backoff_max_total_ms: Option<i32>,
     pub sanitize_responses: bool,
     pub trusted: bool,
     pub open_responses_adapter: Option<bool>,
@@ -236,6 +242,12 @@ impl From<(Option<ModelType>, DeployedModel)> for DeploymentDBResponse {
             fallback_on_status: m.fallback_on_status.unwrap_or_else(|| vec![429, 500, 502, 503, 504]),
             fallback_with_replacement: m.fallback_with_replacement.unwrap_or(false),
             fallback_max_attempts: m.fallback_max_attempts,
+            backoff_enabled: m.backoff_enabled,
+            backoff_initial_ms: m.backoff_initial_ms,
+            backoff_max_ms: m.backoff_max_ms,
+            backoff_factor: m.backoff_factor,
+            backoff_jitter: m.backoff_jitter,
+            backoff_max_total_ms: m.backoff_max_total_ms,
             sanitize_responses: m.sanitize_responses,
             trusted: m.trusted,
             open_responses_adapter: m.open_responses_adapter.unwrap_or(true),
@@ -290,9 +302,10 @@ impl<'c> Repository for Deployments<'c> {
                 is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status,
                 fallback_with_replacement, fallback_max_attempts,
                 sanitize_responses, trusted, open_responses_adapter, allowed_batch_completion_windows,
-                metadata
+                metadata,
+                backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor, backoff_jitter, backoff_max_total_ms
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38)
             RETURNING *
             "#,
             request.model_name.trim(),
@@ -326,7 +339,13 @@ impl<'c> Repository for Deployments<'c> {
             request.trusted,
             Some(request.open_responses_adapter),
             request.allowed_batch_completion_windows.as_ref().map(|w| w.as_slice()),
-            request.metadata.as_ref().map(|m| serde_json::to_value(m).unwrap_or_else(|_| serde_json::json!({}))).unwrap_or_else(|| serde_json::json!({})) as serde_json::Value
+            request.metadata.as_ref().map(|m| serde_json::to_value(m).unwrap_or_else(|_| serde_json::json!({}))).unwrap_or_else(|| serde_json::json!({})) as serde_json::Value,
+            request.backoff_enabled,                  // $33
+            request.backoff_initial_ms,               // $34
+            request.backoff_max_ms,                   // $35
+            request.backoff_factor,                   // $36
+            request.backoff_jitter.as_str(),          // $37
+            request.backoff_max_total_ms,             // $38
         )
         .fetch_one(&mut *self.db)
         .await?;
@@ -345,7 +364,7 @@ impl<'c> Repository for Deployments<'c> {
     async fn get_by_id(&mut self, id: Self::Id) -> Result<Option<Self::Response>> {
         let model = sqlx::query_as!(
             DeployedModel,
-            "SELECT id, model_name, alias, display_name, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_with_replacement, fallback_max_attempts, sanitize_responses, trusted, open_responses_adapter, allowed_batch_completion_windows, metadata FROM deployed_models WHERE id = $1",
+            "SELECT id, model_name, alias, display_name, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_with_replacement, fallback_max_attempts, backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor, backoff_jitter, backoff_max_total_ms, sanitize_responses, trusted, open_responses_adapter, allowed_batch_completion_windows, metadata FROM deployed_models WHERE id = $1",
             id
         )
             .fetch_optional(&mut *self.db)
@@ -370,7 +389,7 @@ impl<'c> Repository for Deployments<'c> {
 
         let deployments = sqlx::query_as!(
             DeployedModel,
-            "SELECT id, model_name, alias, display_name, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_with_replacement, fallback_max_attempts, sanitize_responses, trusted, open_responses_adapter, allowed_batch_completion_windows, metadata FROM deployed_models WHERE id = ANY($1)",
+            "SELECT id, model_name, alias, display_name, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_with_replacement, fallback_max_attempts, backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor, backoff_jitter, backoff_max_total_ms, sanitize_responses, trusted, open_responses_adapter, allowed_batch_completion_windows, metadata FROM deployed_models WHERE id = ANY($1)",
             ids.as_slice()
         )
             .fetch_all(&mut *self.db)
@@ -547,6 +566,17 @@ impl<'c> Repository for Deployments<'c> {
 
             display_name = COALESCE($48, display_name),
 
+            -- Inter-attempt backoff
+            backoff_enabled = COALESCE($49, backoff_enabled),
+            backoff_initial_ms = COALESCE($50, backoff_initial_ms),
+            backoff_max_ms = COALESCE($51, backoff_max_ms),
+            backoff_factor = COALESCE($52, backoff_factor),
+            backoff_jitter = COALESCE($53, backoff_jitter),
+            backoff_max_total_ms = CASE
+                WHEN $54 THEN $55
+                ELSE backoff_max_total_ms
+            END,
+
             updated_at = NOW()
         WHERE id = $1
         RETURNING *
@@ -613,6 +643,14 @@ impl<'c> Repository for Deployments<'c> {
                 .map(|m| serde_json::to_value(m).unwrap_or_else(|_| serde_json::json!({})))
                 .unwrap_or_else(|| serde_json::json!({})) as serde_json::Value, // $47
             request.display_name.as_deref(),    // $48
+            // Inter-attempt backoff
+            request.backoff_enabled,                                                // $49
+            request.backoff_initial_ms,                                             // $50
+            request.backoff_max_ms,                                                 // $51
+            request.backoff_factor,                                                 // $52
+            request.backoff_jitter.as_deref(),                                      // $53
+            request.backoff_max_total_ms.is_some() as bool,                         // $54
+            request.backoff_max_total_ms.as_ref().and_then(|inner| inner.as_ref()), // $55
         )
         .fetch_one(&mut *self.db)
         .await?;

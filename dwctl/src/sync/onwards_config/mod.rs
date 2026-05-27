@@ -4,9 +4,9 @@ use std::{collections::HashMap, num::NonZeroU32, sync::Arc};
 
 use metrics::histogram;
 use onwards::target::{
-    Auth, ConcurrencyLimitParameters, ConfigFile, FallbackConfig as OnwardsFallbackConfig, KeyDefinition,
-    LoadBalanceStrategy as OnwardsLoadBalanceStrategy, OpenResponsesConfig, PoolSpec, ProviderSpec, RateLimitParameters, RoutingAction,
-    RoutingRule, TargetSpecOrList, Targets, WatchTargetsStream,
+    Auth, BackoffConfig as OnwardsBackoffConfig, ConcurrencyLimitParameters, ConfigFile, FallbackConfig as OnwardsFallbackConfig,
+    JitterStrategy as OnwardsJitterStrategy, KeyDefinition, LoadBalanceStrategy as OnwardsLoadBalanceStrategy, OpenResponsesConfig,
+    PoolSpec, ProviderSpec, RateLimitParameters, RoutingAction, RoutingRule, TargetSpecOrList, Targets, WatchTargetsStream,
 };
 use sqlx::{PgPool, postgres::PgListener};
 use tokio::sync::{mpsc, watch};
@@ -60,6 +60,22 @@ struct OnwardsTarget {
     open_responses_adapter: bool,
     /// Traffic routing rules from the model_traffic_rules table
     routing_rules: Vec<RoutingRule>,
+
+    // Fallback / backoff config. Standard (single-provider) models only retry
+    // when fallback is on AND `with_replacement` is true (otherwise the
+    // SelectIter yields exactly once). The backoff fields gate the
+    // inter-attempt sleep onwards inserts when retries happen.
+    fallback_enabled: bool,
+    fallback_on_rate_limit: bool,
+    fallback_on_status: Vec<i32>,
+    fallback_with_replacement: bool,
+    fallback_max_attempts: Option<i32>,
+    backoff_enabled: bool,
+    backoff_initial_ms: i32,
+    backoff_max_ms: i32,
+    backoff_factor: f64,
+    backoff_jitter: String,
+    backoff_max_total_ms: Option<i32>,
 
     // Endpoint info
     endpoint_url: url::Url,
@@ -416,6 +432,17 @@ struct OnwardsCompositeModel {
     fallback_with_replacement: bool,
     /// Maximum number of failover attempts
     fallback_max_attempts: Option<i32>,
+    /// Inter-attempt exponential backoff configuration. When `backoff_enabled`
+    /// is false, the legacy zero-delay retry behavior is preserved.
+    backoff_enabled: bool,
+    backoff_initial_ms: i32,
+    backoff_max_ms: i32,
+    backoff_factor: f64,
+    backoff_jitter: String,
+    /// Optional cumulative budget cap across inter-attempt sleeps.
+    /// Independent of `backoff_enabled` semantics; only consulted when
+    /// backoff is enabled.
+    backoff_max_total_ms: Option<i32>,
     /// Whether to sanitize/filter sensitive data from model responses
     sanitize_responses: bool,
     /// Whether to mark provider as trusted in strict mode
@@ -588,6 +615,12 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
             fallback_on_status,
             fallback_with_replacement,
             fallback_max_attempts,
+            backoff_enabled,
+            backoff_initial_ms,
+            backoff_max_ms,
+            backoff_factor,
+            backoff_jitter,
+            backoff_max_total_ms,
             sanitize_responses,
             trusted,
             open_responses_adapter as "open_responses_adapter?"
@@ -622,6 +655,12 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                 fallback_on_status: row.fallback_on_status.unwrap_or_else(|| vec![429, 500, 502, 503, 504]),
                 fallback_with_replacement: row.fallback_with_replacement.unwrap_or(false),
                 fallback_max_attempts: row.fallback_max_attempts,
+                backoff_enabled: row.backoff_enabled,
+                backoff_initial_ms: row.backoff_initial_ms,
+                backoff_max_ms: row.backoff_max_ms,
+                backoff_factor: row.backoff_factor,
+                backoff_jitter: row.backoff_jitter,
+                backoff_max_total_ms: row.backoff_max_total_ms,
                 sanitize_responses: row.sanitize_responses,
                 trusted: row.trusted,
                 open_responses_adapter: row.open_responses_adapter.unwrap_or(true),
@@ -659,6 +698,20 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                     trusted: row.deployment_trusted,
                     open_responses_adapter: row.deployment_open_responses_adapter.unwrap_or(true),
                     routing_rules: Vec::new(), // Components don't have their own routing rules
+                    // Components don't surface their own fallback/backoff —
+                    // the composite's PoolSpec.fallback drives retries across
+                    // the whole pool.
+                    fallback_enabled: false,
+                    fallback_on_rate_limit: false,
+                    fallback_on_status: Vec::new(),
+                    fallback_with_replacement: false,
+                    fallback_max_attempts: None,
+                    backoff_enabled: false,
+                    backoff_initial_ms: 100,
+                    backoff_max_ms: 5_000,
+                    backoff_factor: 2.0,
+                    backoff_jitter: "full".to_string(),
+                    backoff_max_total_ms: None,
                     endpoint_url,
                     endpoint_api_key: row.endpoint_api_key.clone(),
                     auth_header_name: row.auth_header_name.clone(),
@@ -773,6 +826,19 @@ fn convert_composite_to_target_spec(
 
     // Build fallback configuration
     let fallback = if composite.fallback_enabled {
+        let backoff = composite.backoff_enabled.then_some(OnwardsBackoffConfig {
+            // The DB CHECK constraints guarantee these are positive and
+            // ordered, but we use `max(1)` defensively to avoid panicking
+            // the proxy if a row ever escaped validation.
+            initial_ms: composite.backoff_initial_ms.max(1) as u64,
+            max_ms: composite.backoff_max_ms.max(composite.backoff_initial_ms.max(1)) as u64,
+            factor: composite.backoff_factor.max(1.0),
+            jitter: match composite.backoff_jitter.as_str() {
+                "none" => OnwardsJitterStrategy::None,
+                _ => OnwardsJitterStrategy::Full,
+            },
+        });
+        let max_total_backoff_ms = composite.backoff_max_total_ms.and_then(|n| u64::try_from(n).ok());
         Some(OnwardsFallbackConfig {
             enabled: true,
             on_rate_limit: composite.fallback_on_rate_limit,
@@ -782,6 +848,8 @@ fn convert_composite_to_target_spec(
             max_attempts: composite
                 .fallback_max_attempts
                 .and_then(|n| usize::try_from(n).ok().filter(|&v| v >= 1)),
+            backoff,
+            max_total_backoff_ms,
         })
     } else {
         None
@@ -970,12 +1038,42 @@ fn convert_to_config_file(targets: Vec<OnwardsTarget>, composites: Vec<OnwardsCo
                 trusted: Some(target.trusted),
             };
 
+            // Build fallback configuration. For single-provider (standard)
+            // models the SelectIter only yields more than once when
+            // `with_replacement` is true; the backoff fields control the
+            // inter-attempt sleep when retries do happen.
+            let fallback = if target.fallback_enabled {
+                let backoff = target.backoff_enabled.then_some(OnwardsBackoffConfig {
+                    initial_ms: target.backoff_initial_ms.max(1) as u64,
+                    max_ms: target.backoff_max_ms.max(target.backoff_initial_ms.max(1)) as u64,
+                    factor: target.backoff_factor.max(1.0),
+                    jitter: match target.backoff_jitter.as_str() {
+                        "none" => OnwardsJitterStrategy::None,
+                        _ => OnwardsJitterStrategy::Full,
+                    },
+                });
+                let max_total_backoff_ms = target.backoff_max_total_ms.and_then(|n| u64::try_from(n).ok());
+                Some(OnwardsFallbackConfig {
+                    enabled: true,
+                    on_rate_limit: target.fallback_on_rate_limit,
+                    on_status: target.fallback_on_status.iter().map(|&s| s as u16).collect(),
+                    with_replacement: target.fallback_with_replacement,
+                    max_attempts: target
+                        .fallback_max_attempts
+                        .and_then(|n| usize::try_from(n).ok().filter(|&v| v >= 1)),
+                    backoff,
+                    max_total_backoff_ms,
+                })
+            } else {
+                None
+            };
+
             // Use PoolSpec so routing_rules are carried through
             let pool_spec = PoolSpec {
                 keys,
                 rate_limit: None,
                 concurrency_limit: None,
-                fallback: None,
+                fallback,
                 strategy: OnwardsLoadBalanceStrategy::default(),
                 providers: vec![provider],
                 response_headers: None,
@@ -1063,6 +1161,17 @@ pub async fn load_targets_from_db(db: &PgPool, escalation_models: &[String], str
             dm.sanitize_responses,
             dm.trusted,
             dm.open_responses_adapter,
+            dm.fallback_enabled,
+            dm.fallback_on_rate_limit,
+            dm.fallback_on_status,
+            dm.fallback_with_replacement,
+            dm.fallback_max_attempts,
+            dm.backoff_enabled,
+            dm.backoff_initial_ms,
+            dm.backoff_max_ms,
+            dm.backoff_factor,
+            dm.backoff_jitter,
+            dm.backoff_max_total_ms,
             ie.id as endpoint_id,
             ie.url as "endpoint_url!",
             ie.api_key as endpoint_api_key,
@@ -1153,6 +1262,17 @@ pub async fn load_targets_from_db(db: &PgPool, escalation_models: &[String], str
                 trusted: row.trusted,
                 open_responses_adapter: row.open_responses_adapter.unwrap_or(true),
                 routing_rules: Vec::new(), // Populated from separate query below
+                fallback_enabled: row.fallback_enabled.unwrap_or(true),
+                fallback_on_rate_limit: row.fallback_on_rate_limit.unwrap_or(true),
+                fallback_on_status: row.fallback_on_status.clone().unwrap_or_else(|| vec![429, 500, 502, 503, 504]),
+                fallback_with_replacement: row.fallback_with_replacement.unwrap_or(false),
+                fallback_max_attempts: row.fallback_max_attempts,
+                backoff_enabled: row.backoff_enabled,
+                backoff_initial_ms: row.backoff_initial_ms,
+                backoff_max_ms: row.backoff_max_ms,
+                backoff_factor: row.backoff_factor,
+                backoff_jitter: row.backoff_jitter.clone(),
+                backoff_max_total_ms: row.backoff_max_total_ms,
                 endpoint_url: url::Url::parse(&row.endpoint_url).expect("Invalid URL in database"),
                 endpoint_api_key: row.endpoint_api_key.clone(),
                 auth_header_name: row.auth_header_name.clone(),

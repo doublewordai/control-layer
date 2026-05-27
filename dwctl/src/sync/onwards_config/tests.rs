@@ -23,6 +23,17 @@ fn create_test_target(model_name: &str, alias: &str, endpoint_url: &str) -> Onwa
         open_responses_adapter: true,
         endpoint_url: url::Url::parse(endpoint_url).unwrap(),
         routing_rules: Vec::new(),
+        fallback_enabled: false,
+        fallback_on_rate_limit: false,
+        fallback_on_status: Vec::new(),
+        fallback_with_replacement: false,
+        fallback_max_attempts: None,
+        backoff_enabled: false,
+        backoff_initial_ms: 100,
+        backoff_max_ms: 5_000,
+        backoff_factor: 2.0,
+        backoff_jitter: "full".to_string(),
+        backoff_max_total_ms: None,
         endpoint_api_key: None,
         auth_header_name: "Authorization".to_string(),
         auth_header_prefix: "Bearer ".to_string(),
@@ -239,6 +250,47 @@ async fn test_cache_shape_composite_pool_strategy_and_fallback(pool: sqlx::PgPoo
     assert_eq!(providers[1].weight, 70);
     assert!(providers[0].target.sanitize_response);
     assert!(providers[1].target.sanitize_response);
+
+    // Default migration state: no backoff configured. The fallback config
+    // surfaces to onwards with `backoff: None`, which preserves the legacy
+    // zero-delay retry behavior for composites that haven't opted in.
+    let fallback = composite_pool.fallback().expect("fallback should be set");
+    assert!(fallback.backoff.is_none(), "backoff should default to None");
+    assert!(fallback.max_total_backoff_ms.is_none());
+}
+
+/// When an admin sets the per-model backoff knobs on a composite, the values
+/// round-trip from the deployed_models row through the sync layer into the
+/// in-memory `onwards::FallbackConfig.backoff`. The migration's DB CHECK
+/// constraints reject silly values, so the conversion can trust them.
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+async fn test_cache_shape_composite_backoff_round_trips(pool: sqlx::PgPool) {
+    sqlx::query!(
+        r#"
+        UPDATE deployed_models
+           SET backoff_enabled = TRUE,
+               backoff_initial_ms = 250,
+               backoff_max_ms = 4000,
+               backoff_factor = 3.0,
+               backoff_jitter = 'none',
+               backoff_max_total_ms = 6000
+         WHERE alias = 'composite-priority'
+        "#
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let targets = super::load_targets_from_db(&pool, &[], false).await.unwrap();
+    let composite = targets.targets.get("composite-priority").expect("composite-priority should exist");
+    let fallback = composite.value().fallback().expect("fallback should be present");
+
+    let backoff = fallback.backoff.as_ref().expect("backoff should be Some");
+    assert_eq!(backoff.initial_ms, 250);
+    assert_eq!(backoff.max_ms, 4_000);
+    assert!((backoff.factor - 3.0).abs() < f64::EPSILON);
+    assert_eq!(backoff.jitter, onwards::target::JitterStrategy::None);
+    assert_eq!(fallback.max_total_backoff_ms, Some(6_000));
 }
 
 #[sqlx::test(fixtures(path = "fixtures", scripts("cache_base", "cache_balance_batch_owner_positive")))]
@@ -452,6 +504,12 @@ async fn test_onwards_config_reloads_on_tariff_change(pool: sqlx::PgPool) {
             fallback_on_status: None,
             fallback_with_replacement: None,
             fallback_max_attempts: None,
+            backoff_enabled: false,
+            backoff_initial_ms: 100,
+            backoff_max_ms: 5_000,
+            backoff_factor: 2.0,
+            backoff_jitter: "full".to_string(),
+            backoff_max_total_ms: None,
             sanitize_responses: true,
             trusted: false,
             open_responses_adapter: true,
@@ -572,6 +630,12 @@ async fn test_batch_api_key_access_to_composite_escalation_target(pool: sqlx::Pg
             fallback_on_status: None,
             fallback_with_replacement: None,
             fallback_max_attempts: None,
+            backoff_enabled: false,
+            backoff_initial_ms: 100,
+            backoff_max_ms: 5_000,
+            backoff_factor: 2.0,
+            backoff_jitter: "full".to_string(),
+            backoff_max_total_ms: None,
             allowed_batch_completion_windows: None,
             metadata: None,
             sanitize_responses: true,
@@ -610,6 +674,12 @@ async fn test_batch_api_key_access_to_composite_escalation_target(pool: sqlx::Pg
             fallback_with_replacement: None,
             allowed_batch_completion_windows: None,
             fallback_max_attempts: None,
+            backoff_enabled: false,
+            backoff_initial_ms: 100,
+            backoff_max_ms: 5_000,
+            backoff_factor: 2.0,
+            backoff_jitter: "full".to_string(),
+            backoff_max_total_ms: None,
             metadata: None,
             sanitize_responses: true,
             trusted: false,
