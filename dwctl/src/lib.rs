@@ -1189,6 +1189,10 @@ pub async fn build_router(
             "/provider-display-configs/{provider_key}",
             delete(api::handlers::provider_display_configs::delete_provider_display_config),
         )
+        .route(
+            "/provider-display-configs/{provider_key}/icon",
+            get(api::handlers::provider_display_configs::get_provider_display_config_icon),
+        )
         // Composite model component management (for models where is_composite=true)
         .route("/models/{id}/components", get(api::handlers::deployments::get_model_components))
         .route(
