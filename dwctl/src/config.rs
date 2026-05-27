@@ -1819,10 +1819,12 @@ pub struct TaskWorkersConfig {
     /// Number of cascade-batch-state workers (default: 1).
     /// Updates child request states after a batch is cancelled or deleted.
     pub cascade_batch_state_workers: usize,
-    /// Number of response lifecycle workers (default: 1).
-    /// Handles create-response and complete-response jobs from the responses
-    /// middleware and outlet handler. Set to 0 to disable.
-    pub response_workers: usize,
+    /// Maximum records per flush in the in-process responses writer
+    /// (default: 100). Larger values amortise commit overhead across the
+    /// batch; smaller values reduce per-record latency from outlet send
+    /// to row visible. Replaces the previous underway-based
+    /// `response_workers` setting.
+    pub response_writer_batch_size: usize,
 }
 
 impl Default for TaskWorkersConfig {
@@ -1830,7 +1832,7 @@ impl Default for TaskWorkersConfig {
         Self {
             create_batch_workers: 1,
             cascade_batch_state_workers: 1,
-            response_workers: 1,
+            response_writer_batch_size: 100,
         }
     }
 }
