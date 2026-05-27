@@ -185,6 +185,41 @@ export interface ProviderDisplayConfig {
   updated_at?: string | null;
 }
 
+/**
+ * Resolve a provider config's `icon` field to a value safe to render in
+ * `<CatalogIcon icon=...>`.
+ *
+ * - `https://…` URLs (operator-set, point at npmmirror / wikipedia /
+ *   simpleicons / GitHub avatars / arbitrary CDNs) are routed through
+ *   the server-side icon proxy
+ *   (`GET /admin/api/v1/provider-display-configs/{providerKey}/icon`,
+ *   added in control-layer 8.54.0) so the browser only ever loads
+ *   provider logos from the same origin as the dashboard. Lets us keep
+ *   the deployed `img-src 'self' data: blob:` CSP regardless of which
+ *   CDN an admin pastes.
+ * - Root-relative paths (`/endpoints/anthropic.svg`) pass through —
+ *   already same-origin.
+ * - Registry keys (`anthropic`, `google`, `openai`, `onwards`,
+ *   `snowflake`) pass through — `CatalogIcon`'s built-in `ICON_REGISTRY`
+ *   maps them to bundled assets client-side.
+ * - Empty/whitespace/null → `undefined` so `CatalogIcon` falls back.
+ *
+ * Takes `providerKey` separately because the deployment-providers chip
+ * mapping (`providerConfigMap.get(dp)` in ModelCatalog) uses slim configs
+ * keyed by the same `dp` string we already have to hand.
+ */
+export function providerIconUrl(
+  providerKey: string,
+  iconValue: string | null | undefined,
+): string | undefined {
+  const icon = iconValue?.trim();
+  if (!icon) return undefined;
+  if (icon.startsWith("https://")) {
+    return `/admin/api/v1/provider-display-configs/${encodeURIComponent(providerKey)}/icon`;
+  }
+  return icon;
+}
+
 export interface ProviderDisplayConfigCreateRequest {
   provider_key: string;
   display_name?: string;

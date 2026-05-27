@@ -15,7 +15,12 @@ import {
   Code,
   Copy,
 } from "lucide-react";
-import { useModels, useGroups, useProviderDisplayConfigs } from "../../../../api/control-layer";
+import {
+  useModels,
+  useGroups,
+  useProviderDisplayConfigs,
+  providerIconUrl,
+} from "../../../../api/control-layer";
 import type {
   Model,
   ModelDisplayCategory,
@@ -364,7 +369,7 @@ function ModelRow({
                       <TooltipTrigger asChild>
                         <span className="hidden shrink-0 min-[700px]:inline-flex">
                           <CatalogIcon
-                            icon={config.icon || undefined}
+                            icon={providerIconUrl(dp, config.icon)}
                             label={config.display_name}
                             size="sm"
                             fallback="none"
@@ -392,7 +397,7 @@ function ModelRow({
                   return (
                     <CatalogIcon
                       key={dp}
-                      icon={config.icon || undefined}
+                      icon={providerIconUrl(dp, config.icon)}
                       label={config.display_name}
                       size="sm"
                       fallback="none"
@@ -621,7 +626,7 @@ function SectionTable({
         providerConfig?.display_name ||
         model.metadata?.provider?.trim() ||
         "Other",
-      providerIcon: providerConfig?.icon,
+      providerIcon: providerIconUrl(providerKey, providerConfig?.icon),
     };
   };
 
