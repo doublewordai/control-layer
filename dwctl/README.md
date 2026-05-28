@@ -263,4 +263,5 @@ Migrations are stored in the `migrations/` directory, and run automatically on s
 - See OpenAPI docs at `/admin/docs` when running
 - AI proxy requests are served under `/ai/v1/*` (e.g. `/ai/v1/chat/completions`, `/ai/v1/responses`) and routed by the embedded `onwards` layer
 - Management API requests are served under `/admin/api/v1/*`
+- Provider display configs (operator-set logos / display names for inference providers) live under `/admin/api/v1/provider-display-configs`, with `GET .../{provider_key}/icon` serving as a same-origin proxy for operator-set icon URLs so the dashboard can keep a tight `img-src` CSP regardless of which CDN an admin pastes
 
