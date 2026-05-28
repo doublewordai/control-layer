@@ -12,6 +12,14 @@ pub fn stream_usage_transform(path: &str, headers: &axum::http::HeaderMap, body_
     let fusillade_stream = headers.get("x-fusillade-stream").and_then(|v| v.to_str().ok()) == Some("true");
 
     if let Ok(mut json_body) = serde_json::from_slice::<serde_json::Value>(body_bytes) {
+        // Strip `background` for /responses. dwctl owns the background
+        // semantic (return 202, poll via GET /v1/responses/{id});
+        // forwarding it upstream causes OpenAI-style providers to return
+        // a "queued" envelope that the completion path would record as
+        // the final result with usage=null.
+        let background_stripped =
+            path.ends_with("/responses") && json_body.as_object_mut().is_some_and(|obj| obj.remove("background").is_some());
+
         let request_streaming =
             json_body.as_object().and_then(|obj| obj.get("stream")).and_then(|v| v.as_bool()) == Some(true) || fusillade_stream;
 
@@ -37,6 +45,11 @@ pub fn stream_usage_transform(path: &str, headers: &axum::http::HeaderMap, body_
             if let Ok(bytes) = serde_json::to_vec(&json_body) {
                 return Some(axum::body::Bytes::from(bytes));
             }
+        }
+
+        // background was the only mutation: serialize and return.
+        if background_stripped && let Ok(bytes) = serde_json::to_vec(&json_body) {
+            return Some(axum::body::Bytes::from(bytes));
         }
     }
 
@@ -181,6 +194,37 @@ mod tests {
             "input": "hello"
         });
         assert!(call_with_headers("/embeddings", &fusillade_stream_headers(), &body).is_none());
+    }
+
+    #[test]
+    fn strips_background_for_responses() {
+        let body = serde_json::json!({
+            "model": "gpt-4",
+            "input": "hello",
+            "background": true
+        });
+        let result = call("/v1/responses", &body).expect("should transform");
+        assert!(result.get("background").is_none());
+        assert_eq!(result["model"], "gpt-4");
+    }
+
+    #[test]
+    fn does_not_strip_background_for_other_paths() {
+        let body = serde_json::json!({
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": "hi"}],
+            "background": true
+        });
+        assert!(call("/chat/completions", &body).is_none());
+    }
+
+    #[test]
+    fn no_transform_when_background_absent_on_responses() {
+        let body = serde_json::json!({
+            "model": "gpt-4",
+            "input": "hello"
+        });
+        assert!(call("/v1/responses", &body).is_none());
     }
 
     #[test]
