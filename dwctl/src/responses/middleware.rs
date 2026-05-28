@@ -407,7 +407,12 @@ async fn handle_realtime<P: PoolProvider + Clone + Send + Sync + 'static>(
         }
     }
     // Non-background realtime: no pre-write. Row appears at completion via
-    // the outlet handler -> RequestsWriter path.
+    // the outlet handler -> RequestsWriter path (handle_response on success,
+    // handle_abandoned on mid-flight client disconnect). Behaviour change from
+    // the underway era: if neither outlet hook fires (process panic mid-request,
+    // SIGKILL between proxy and handler), no row is ever recorded for this
+    // request. Previously the create-response job enqueued up front and would
+    // synthesise a 'processing' row even in those cases.
 
     // Attach the response ID as x-fusillade-request-id so that onwards uses
     // it as the response object's `id` field (configured via response_id_header).

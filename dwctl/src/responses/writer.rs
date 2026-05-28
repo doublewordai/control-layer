@@ -13,6 +13,30 @@
 //! appears for observability". The pre-existing analytics batcher solves
 //! the same shape for `http_analytics`; this is the parallel for `requests`.
 //!
+//! # Failure modes (explicit)
+//!
+//! Records can be lost in two situations, and there is no dead-letter
+//! store — this is a deliberate trade-off:
+//!
+//!   * **Process crash with records still in-channel**: anything sitting
+//!     in the mpsc buffer or pre-batch buffer when the process dies is
+//!     gone. Graceful shutdown drains and flushes; SIGKILL or panic does
+//!     not. Realtime clients already lost their connection in that
+//!     scenario so the missing row is the smaller loss.
+//!   * **Sustained fusillade outage**: `flush_batch` retries with
+//!     exponential backoff up to `max_retries` (default 3). If every
+//!     attempt fails the batch is dropped, logged at `error`, and
+//!     `dwctl_requests_writer_flush_errors_total` increments. There is
+//!     no requeue or dead-letter table.
+//!
+//! Both losses are acceptable here because billing and usage accounting
+//! read from `http_analytics` and `credit_transactions`, not `requests`.
+//! The `requests` table only powers the responses listing and
+//! `GET /v1/responses/{id}` polling, where eventual visibility under
+//! normal operation is sufficient. If that ever changes, the right fix
+//! is either a config-gated panic on drop (for crash-restart recovery)
+//! or a dead-letter table — both larger changes than this writer.
+//!
 //! # Architecture
 //!
 //! ```text
@@ -141,10 +165,18 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> RequestsWriter<P> {
                 biased;
 
                 _ = shutdown_token.cancelled() => {
-                    info!("Shutdown signal received, draining responses writer channel");
+                    // Close first so no new records can be sent, then drain
+                    // whatever is already in the channel + the pre-existing
+                    // buffer. Anything that arrived between cancel and close
+                    // is still drained because `recv` only returns None once
+                    // the channel is both closed and empty.
+                    let pre_buffered = buffer.len();
+                    info!(pre_buffered, "Shutdown signal received, draining responses writer channel");
                     self.receiver.close();
+                    let mut drained = 0usize;
                     while let Some(record) = self.receiver.recv().await {
                         buffer.push(record);
+                        drained += 1;
                         if buffer.len() >= self.batch_size {
                             self.flush_batch(&mut buffer).await;
                         }
@@ -152,7 +184,14 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> RequestsWriter<P> {
                     if !buffer.is_empty() {
                         self.flush_batch(&mut buffer).await;
                     }
-                    info!("Responses writer shutdown complete");
+                    let total_flushed = pre_buffered + drained;
+                    counter!("dwctl_requests_writer_shutdown_records_flushed").increment(total_flushed as u64);
+                    info!(
+                        pre_buffered,
+                        drained,
+                        total_flushed,
+                        "Responses writer shutdown complete"
+                    );
                     break;
                 }
 
@@ -398,9 +437,11 @@ mod tests {
 
     #[sqlx::test(migrations = "../../fusillade/migrations")]
     async fn test_writer_drains_channel_on_shutdown(pool: sqlx::PgPool) {
-        // Records sent right before shutdown must still be persisted: the
-        // shutdown branch of `run` drains the receiver and flushes the
-        // residual buffer before exiting.
+        // Exercises the shutdown-cancellation arm specifically: cancel the
+        // token while the sender is still alive, so `run` exits via
+        // `shutdown_token.cancelled()` (which closes the receiver and
+        // drains) rather than via the channel-closed arm. Records sent
+        // before cancel must still land in fusillade.
         let (writer, sender, manager) = build_writer(pool).await;
         let shutdown = CancellationToken::new();
         let handle = tokio::spawn(writer.run(shutdown.clone()));
@@ -420,23 +461,29 @@ mod tests {
             .await
             .expect("send should succeed");
 
-        // Drop the sender so the receiver sees the channel close after this
-        // record. The drain path picks it up.
-        drop(sender);
+        // Cancel BEFORE dropping the sender — this routes the writer
+        // through the `shutdown_token.cancelled()` branch (which then
+        // calls `receiver.close()` itself), which is the path we want
+        // under test. Keep the sender alive so the writer can't exit
+        // via the channel-closed arm by accident.
+        shutdown.cancel();
 
         timeout(Duration::from_secs(5), handle)
             .await
             .expect("writer should shut down within 5s")
             .expect("writer task should not panic");
 
-        // Verify the record landed (writer didn't drop it on close).
+        // Verify the record landed (writer drained + flushed via the
+        // shutdown path).
         let detail = Storage::get_request_detail(&*manager, RequestId(request_id))
             .await
             .expect("request should exist after drain");
         assert_eq!(detail.status, "completed");
         assert_eq!(detail.response_body, Some(r#"{"output":"shutdown-test"}"#.to_string()));
 
-        // Avoid the shutdown token being dropped before handle awaits it.
-        let _ = shutdown;
+        // Sender outlives the writer task to guarantee we didn't exit via
+        // the channel-closed arm. Drop it here explicitly to make the
+        // sequence intent clear.
+        drop(sender);
     }
 }

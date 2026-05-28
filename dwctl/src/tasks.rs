@@ -196,7 +196,8 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> TaskRunner<P> {
         // Response lifecycle no longer runs through underway. The
         // FusilladeOutletHandler sends completion records to the
         // in-process `RequestsWriter` task spawned by
-        // `setup_background_services`.
+        // `setup_background_services` (see lib.rs `responses-writer`
+        // spawn around line 2525).
 
         if !sync_config.enabled {
             tracing::info!("Sync workers disabled on this instance");
