@@ -17,8 +17,8 @@ pub fn stream_usage_transform(path: &str, headers: &axum::http::HeaderMap, body_
         // forwarding it upstream causes OpenAI-style providers to return
         // a "queued" envelope that the completion path would record as
         // the final result with usage=null.
-        let background_stripped = path.ends_with("/responses")
-            && json_body.as_object_mut().is_some_and(|obj| obj.remove("background").is_some());
+        let background_stripped =
+            path.ends_with("/responses") && json_body.as_object_mut().is_some_and(|obj| obj.remove("background").is_some());
 
         let request_streaming =
             json_body.as_object().and_then(|obj| obj.get("stream")).and_then(|v| v.as_bool()) == Some(true) || fusillade_stream;
@@ -48,9 +48,7 @@ pub fn stream_usage_transform(path: &str, headers: &axum::http::HeaderMap, body_
         }
 
         // background was the only mutation: serialize and return.
-        if background_stripped
-            && let Ok(bytes) = serde_json::to_vec(&json_body)
-        {
+        if background_stripped && let Ok(bytes) = serde_json::to_vec(&json_body) {
             return Some(axum::body::Bytes::from(bytes));
         }
     }

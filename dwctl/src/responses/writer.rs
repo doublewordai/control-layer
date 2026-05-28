@@ -323,10 +323,13 @@ mod tests {
     use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
 
-    /// Builds a writer wired to a fresh `#[sqlx::test]` pool plus the
-    /// fusillade request manager backed by the same pool. Tests pass
-    /// `created_by` directly on each record; the outlet handler is the
-    /// part that resolves attribution from an api_key in production.
+    /// Builds a writer wired to a fresh `#[sqlx::test]` pool with the
+    /// fusillade schema installed via `fusillade::migrator()` (so we don't
+    /// reference the fusillade source directory, which doesn't exist in
+    /// CI). The returned request manager runs against a pool scoped to
+    /// the fusillade schema. Tests pass `created_by` directly on each
+    /// record; the outlet handler is the part that resolves attribution
+    /// from an api_key in production.
     async fn build_writer(
         pool: sqlx::PgPool,
     ) -> (
@@ -334,7 +337,8 @@ mod tests {
         RequestsWriterSender,
         Arc<PostgresRequestManager<TestDbPools, ReqwestHttpClient>>,
     ) {
-        let pools = TestDbPools::new(pool).await.unwrap();
+        let fusillade_pool = crate::test::utils::setup_fusillade_pool(&pool).await;
+        let pools = TestDbPools::new(fusillade_pool).await.unwrap();
         let http_client = Arc::new(ReqwestHttpClient::default());
         let manager = Arc::new(PostgresRequestManager::with_client(pools, http_client));
         let (writer, sender) = RequestsWriter::new(manager.clone(), 8);
@@ -363,7 +367,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test(migrations = "../../fusillade/migrations")]
+    #[sqlx::test]
     async fn test_writer_persists_completed_record(pool: sqlx::PgPool) {
         let (writer, sender, manager) = build_writer(pool).await;
         let shutdown = CancellationToken::new();
@@ -397,7 +401,7 @@ mod tests {
             .expect("writer task should not panic");
     }
 
-    #[sqlx::test(migrations = "../../fusillade/migrations")]
+    #[sqlx::test]
     async fn test_writer_batches_multiple_records_in_one_flush(pool: sqlx::PgPool) {
         // Send N records faster than the writer can flush so they buffer up;
         // confirm all N land in the DB. Using batch_size=8 (from build_writer)
@@ -435,7 +439,7 @@ mod tests {
             .expect("writer task should not panic");
     }
 
-    #[sqlx::test(migrations = "../../fusillade/migrations")]
+    #[sqlx::test]
     async fn test_writer_drains_channel_on_shutdown(pool: sqlx::PgPool) {
         // Exercises the shutdown-cancellation arm specifically: cancel the
         // token while the sender is still alive, so `run` exits via
