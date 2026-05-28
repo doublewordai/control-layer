@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.54.2](https://github.com/doublewordai/control-layer/compare/v8.54.1...v8.54.2) (2026-05-28)
+
+
+### Bug Fixes
+
+* **files:** return 400 not 500 for malformed multipart uploads ([#1102](https://github.com/doublewordai/control-layer/issues/1102)) ([8e11774](https://github.com/doublewordai/control-layer/commit/8e11774fb880b696e62836af6ea2532461c9a918))
+
 ## [8.54.1](https://github.com/doublewordai/control-layer/compare/v8.54.0...v8.54.1) (2026-05-27)
 
 
