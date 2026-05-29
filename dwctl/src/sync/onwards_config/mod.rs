@@ -1330,14 +1330,24 @@ pub async fn load_targets_from_db(
             }
         });
 
-        if let (Some(api_key_id), Some(api_key_secret), Some(api_key_purpose)) = (row.api_key_id, row.api_key_secret, row.api_key_purpose) {
+        // user_verified is Option only because of the outer LEFT JOIN; whenever the
+        // lateral subquery emits a row, the inner JOIN to users guarantees it. We
+        // tie it to the same "row materialised" check as the other api_key columns
+        // so a future schema/SQL change can't silently demote keys to the
+        // unverified tier.
+        if let (Some(api_key_id), Some(api_key_secret), Some(api_key_purpose), Some(user_verified)) = (
+            row.api_key_id,
+            row.api_key_secret,
+            row.api_key_purpose,
+            row.api_key_user_verified,
+        ) {
             target.api_keys.push(OnwardsApiKey {
                 id: api_key_id,
                 secret: api_key_secret,
                 purpose: api_key_purpose,
                 requests_per_second: row.api_key_requests_per_second,
                 burst_size: row.api_key_burst_size,
-                user_verified: row.api_key_user_verified.unwrap_or(false),
+                user_verified,
             });
         }
     }

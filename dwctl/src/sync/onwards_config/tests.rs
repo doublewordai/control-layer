@@ -290,7 +290,9 @@ async fn test_cache_shape_composite_backoff_round_trips(pool: sqlx::PgPool) {
     .await
     .unwrap();
 
-    let targets = super::load_targets_from_db(&pool, &[], false).await.unwrap();
+    let targets = super::load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
+        .await
+        .unwrap();
     let composite = targets.targets.get("composite-priority").expect("composite-priority should exist");
     let fallback = composite.value().fallback().expect("fallback should be present");
 
