@@ -1335,12 +1335,9 @@ pub async fn load_targets_from_db(
         // tie it to the same "row materialised" check as the other api_key columns
         // so a future schema/SQL change can't silently demote keys to the
         // unverified tier.
-        if let (Some(api_key_id), Some(api_key_secret), Some(api_key_purpose), Some(user_verified)) = (
-            row.api_key_id,
-            row.api_key_secret,
-            row.api_key_purpose,
-            row.api_key_user_verified,
-        ) {
+        if let (Some(api_key_id), Some(api_key_secret), Some(api_key_purpose), Some(user_verified)) =
+            (row.api_key_id, row.api_key_secret, row.api_key_purpose, row.api_key_user_verified)
+        {
             target.api_keys.push(OnwardsApiKey {
                 id: api_key_id,
                 secret: api_key_secret,
