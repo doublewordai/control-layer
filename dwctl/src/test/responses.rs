@@ -20,7 +20,10 @@ async fn setup_ai_test(
     let mut config = create_test_config();
     config.onwards.strict_mode = strict_mode;
     config.background_services.onwards_sync.enabled = true;
-    config.background_services.task_workers.response_workers = 1;
+    // 1 record per flush keeps the test deterministic: each completed
+    // realtime response lands in fusillade immediately rather than
+    // waiting for a buffer of N to accumulate.
+    config.background_services.task_workers.response_writer_batch_size = 1;
 
     let app = crate::Application::new_with_pool(config, Some(pool.clone()), None)
         .await
@@ -106,10 +109,10 @@ async fn setup_ai_test(
             .await;
         if check.status_code() == 200 {
             let models: serde_json::Value = check.json();
-            if let Some(data) = models["data"].as_array() {
-                if data.iter().any(|m| m["id"].as_str() == Some("gpt-4o")) {
-                    break;
-                }
+            if let Some(data) = models["data"].as_array()
+                && data.iter().any(|m| m["id"].as_str() == Some("gpt-4o"))
+            {
+                break;
             }
         }
         tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;

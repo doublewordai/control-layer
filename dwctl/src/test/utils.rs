@@ -58,7 +58,7 @@ pub async fn create_test_app_state_with_config(pool: PgPool, config: crate::conf
             &crate::config::TaskWorkersConfig {
                 create_batch_workers: 0,
                 cascade_batch_state_workers: 0,
-                response_workers: 0,
+                response_writer_batch_size: 0,
             },
         )
         .await
@@ -135,7 +135,7 @@ pub async fn create_test_app_state_with_fusillade(pool: PgPool, config: crate::c
             &crate::config::TaskWorkersConfig {
                 create_batch_workers: 0,
                 cascade_batch_state_workers: 0,
-                response_workers: 0,
+                response_writer_batch_size: 0,
             },
         )
         .await
@@ -299,7 +299,7 @@ pub fn create_test_config() -> crate::config::Config {
             task_workers: crate::config::TaskWorkersConfig {
                 create_batch_workers: 0,
                 cascade_batch_state_workers: 0,
-                response_workers: 0,
+                response_writer_batch_size: 0,
             },
             ..Default::default()
         },

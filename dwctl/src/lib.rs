@@ -1013,6 +1013,7 @@ pub async fn build_router(
     state: &mut AppState,
     onwards_router: Router,
     analytics_sender: Option<request_logging::batcher::AnalyticsSender>,
+    requests_writer_sender: Option<crate::responses::writer::RequestsWriterSender>,
     metrics_recorder: Option<GenAiMetrics>,
     strict_mode: bool,
     responses_middleware_state: Option<crate::responses::middleware::ResponsesMiddlewareState>,
@@ -1055,10 +1056,13 @@ pub async fn build_router(
             multi_handler = multi_handler.with(analytics_handler);
         }
 
-        // Add FusilladeOutletHandler to enqueue response completion jobs
-        if responses_middleware_state.is_some() {
-            let fusillade_handler =
-                crate::responses::outlet_handler::FusilladeOutletHandler::new(state.task_runner.complete_response_job.clone());
+        // Add FusilladeOutletHandler so completed responses get written to
+        // fusillade via the in-process RequestsWriter. We only attach when
+        // both the responses middleware is active and we actually have a
+        // sender to give the handler; without a sender the handler would
+        // silently swallow rows.
+        if let (Some(rms), Some(sender)) = (responses_middleware_state.as_ref(), requests_writer_sender.clone()) {
+            let fusillade_handler = crate::responses::outlet_handler::FusilladeOutletHandler::new(sender, rms.dwctl_pool.clone());
             multi_handler = multi_handler.with(fusillade_handler);
         }
 
@@ -1794,6 +1798,11 @@ pub struct BackgroundServices {
     strict_mode: bool,
     /// Sender for analytics records (if analytics is enabled)
     analytics_sender: Option<request_logging::batcher::AnalyticsSender>,
+    /// Sender for completed-response records consumed by the in-process
+    /// `RequestsWriter` (replaces the underway response jobs). Always set
+    /// once `setup_background_services` runs; `None` only in test harnesses
+    /// that bypass that path.
+    requests_writer_sender: Option<crate::responses::writer::RequestsWriterSender>,
     // JoinSet is cancel-safe - can be polled in select! without losing tasks
     background_tasks: tokio::task::JoinSet<anyhow::Result<()>>,
     // Map task IDs to names for logging
@@ -2515,6 +2524,22 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         None
     };
 
+    // Start the responses writer. Replaces the underway create-response /
+    // complete-response jobs. Outlet's FusilladeOutletHandler holds the
+    // sender; this task drains the channel and flushes to fusillade.
+    let requests_writer_sender = {
+        let (writer, sender) = crate::responses::writer::RequestsWriter::new(
+            request_manager.clone(),
+            config.background_services.task_workers.response_writer_batch_size,
+        );
+        let writer_shutdown = shutdown_token.clone();
+        background_tasks.spawn("responses-writer", async move {
+            writer.run(writer_shutdown).await;
+            Ok(())
+        });
+        Some(sender)
+    };
+
     // Build the underway task runner for background jobs (batch population, sync pipeline, etc.)
     let encryption_key = match config.connections.encryption_key.as_deref().or(config.secret_key.as_deref()) {
         Some(secret) if !secret.trim().is_empty() => Some(encryption::derive_encryption_key(secret.trim())),
@@ -2557,6 +2582,7 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         onwards_sender,
         strict_mode: config.onwards.strict_mode,
         analytics_sender,
+        requests_writer_sender,
         background_tasks,
         task_names,
         shutdown_token,
@@ -2885,7 +2911,9 @@ impl Application {
         // OR the leader-gained closure). All daemons see the
         // multi-step processor at claim time.
 
-        // Responses middleware state (enqueues create-response jobs via underway)
+        // Responses middleware state. Non-background realtime no longer
+        // does any DB work up front; the completion path goes through
+        // FusilladeOutletHandler -> RequestsWriter.
         let responses_middleware_state = crate::responses::middleware::ResponsesMiddlewareState {
             request_manager: bg_services.request_manager.clone(),
             daemon_id: crate::responses::store::OnwardsDaemonId(onwards_daemon_id),
@@ -2899,7 +2927,6 @@ impl Application {
                 format!("http://{addr}/ai")
             },
             dwctl_pool: (*db_pools).write().clone(),
-            create_response_job: bg_services.task_runner.create_response_job.clone(),
             response_store: response_store.clone(),
             multi_step_tool_executor,
             multi_step_http_client,
@@ -2948,6 +2975,7 @@ impl Application {
             &mut app_state,
             onwards_router,
             bg_services.analytics_sender.clone(),
+            bg_services.requests_writer_sender.clone(),
             metrics_recorder,
             bg_services.onwards_targets.strict_mode,
             Some(responses_middleware_state),

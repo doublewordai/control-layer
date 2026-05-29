@@ -1882,7 +1882,7 @@ checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
 name = "dwctl"
-version = "8.54.1"
+version = "8.54.2"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -2402,9 +2402,9 @@ checksum = "e6d5a32815ae3f33302d95fdcb2ce17862f8c65363dcfd29360480ba1001fc9c"
 
 [[package]]
 name = "fusillade"
-version = "17.1.0"
+version = "17.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "99dfb7043acf8e2fba87a5c97bc839e63ad193d28f2a2b5b980995e62af75ff4"
+checksum = "2f6c1d1882c68e6872bb59d0ff1554618cc2917aebe4abbfd211fd3ce8d2c6c1"
 dependencies = [
  "anyhow",
  "async-trait",
