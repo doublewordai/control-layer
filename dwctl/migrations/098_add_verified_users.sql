@@ -25,6 +25,16 @@ WHERE EXISTS (
       AND ct.amount > 0
 );
 
+-- The system user (nil UUID) owns the internal API key used by DB probes and
+-- other internal traffic. It has no payment history so the purchase backfill
+-- above leaves it unverified, which would pin internal calls to the
+-- unverified tier whenever that tier is configured. Treat the system user
+-- as verified to keep internal traffic on the verified tier (or unlimited if
+-- the verified tier is unset).
+UPDATE users
+SET verified = true
+WHERE id = '00000000-0000-0000-0000-000000000000';
+
 -- Notify onwards sync when verified flips so the in-memory cache picks up the
 -- new tier without waiting for an unrelated config change. Scoped to UPDATEs
 -- of this one column (via the WHEN clause) so unrelated user edits do not
