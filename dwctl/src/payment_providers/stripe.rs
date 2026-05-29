@@ -350,8 +350,12 @@ impl PaymentProvider for StripeProvider {
             api_key_id: None,
         };
 
-        let mut credits = Credits::new(&mut conn);
-        credits.create_transaction(&request).await?;
+        Credits::new(&mut conn).create_transaction(&request).await?;
+
+        // Real money moved: mark the payer as verified for the onwards rate-limit tier.
+        crate::db::handlers::users::Users::new(&mut conn)
+            .set_verified(payment_session.creditor_id)
+            .await?;
 
         tracing::debug!(
             "Successfully fulfilled checkout session {} for user {}",

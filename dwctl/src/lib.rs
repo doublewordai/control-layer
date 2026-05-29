@@ -1984,7 +1984,9 @@ impl BackgroundServices {
 
         // Use the same load function as the automatic sync
         // Note: escalation_models is empty for tests - individual tests can set up their own
-        let new_targets = crate::sync::onwards_config::load_targets_from_db(pool, &[], self.strict_mode).await?;
+        let new_targets =
+            crate::sync::onwards_config::load_targets_from_db(pool, &[], self.strict_mode, &crate::config::RateLimitTiersConfig::default())
+                .await?;
 
         // Send through the watch channel (same as automatic sync)
         sender
@@ -2151,6 +2153,7 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
             config.background_services.batch_daemon.default_model_concurrency,
             escalation_models,
             config.onwards.strict_mode,
+            config.auth.rate_limits.clone(),
         )
         .await?;
 

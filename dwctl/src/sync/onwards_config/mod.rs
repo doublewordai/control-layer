@@ -23,7 +23,7 @@ pub enum SyncStatus {
 }
 
 use crate::{
-    config::ONWARDS_CONFIG_CHANGED_CHANNEL,
+    config::{ONWARDS_CONFIG_CHANGED_CHANNEL, RateLimitTiersConfig},
     db::models::deployments::LoadBalancingStrategy,
     types::{ApiKeyId, DeploymentId},
 };
@@ -79,6 +79,10 @@ struct OnwardsApiKey {
     purpose: String,
     requests_per_second: Option<f32>,
     burst_size: Option<i32>,
+    /// `verified` flag on the api_key's owning user (api_keys.user_id), used to
+    /// pick between the verified/unverified default rate-limit tiers when this
+    /// key has no per-key override.
+    user_verified: bool,
 }
 
 /// Manages the integration between onwards-pilot and the onwards proxy
@@ -95,6 +99,9 @@ pub struct OnwardsConfigSync {
     cache_info_state: crate::metrics::CacheInfoState,
     /// Enable strict mode with schema validation
     strict_mode: bool,
+    /// Default rate-limit tiers applied to API keys based on the owning user's
+    /// `verified` flag. Used when a key has no per-key override.
+    rate_limit_tiers: RateLimitTiersConfig,
 }
 
 pub struct SyncConfig {
@@ -120,7 +127,7 @@ impl OnwardsConfigSync {
     #[cfg(test)]
     #[instrument(skip(db))]
     pub async fn new(db: PgPool) -> Result<(Self, Targets, WatchTargetsStream), anyhow::Error> {
-        Self::new_with_daemon_limits(db, None, 10, Vec::new(), false).await
+        Self::new_with_daemon_limits(db, None, 10, Vec::new(), false, RateLimitTiersConfig::default()).await
     }
 
     /// Creates a new OnwardsConfigSync with optional daemon capacity limits map and escalation models
@@ -129,16 +136,18 @@ impl OnwardsConfigSync {
     /// `default_batch_capacity` - Default concurrency limit for models without explicit `batch_capacity`.
     /// `escalation_models` - Model aliases that batch API keys should have automatic access to.
     /// `strict_mode` - Enable strict mode with schema validation (only known OpenAI API paths accepted)
-    #[instrument(skip(db, daemon_capacity_limits, escalation_models))]
+    /// `rate_limit_tiers` - Default rate limits applied per-key based on the owning user's `verified` flag.
+    #[instrument(skip(db, daemon_capacity_limits, escalation_models, rate_limit_tiers))]
     pub async fn new_with_daemon_limits(
         db: PgPool,
         daemon_capacity_limits: Option<Arc<dashmap::DashMap<String, usize>>>,
         default_batch_capacity: usize,
         escalation_models: Vec<String>,
         strict_mode: bool,
+        rate_limit_tiers: RateLimitTiersConfig,
     ) -> Result<(Self, Targets, WatchTargetsStream), anyhow::Error> {
         // Load initial configuration (including composite models)
-        let initial_targets = load_targets_from_db(&db, &escalation_models, strict_mode).await?;
+        let initial_targets = load_targets_from_db(&db, &escalation_models, strict_mode, &rate_limit_tiers).await?;
 
         // If daemon limits are provided, populate them
         if let Some(ref limits) = daemon_capacity_limits {
@@ -162,6 +171,7 @@ impl OnwardsConfigSync {
             escalation_models,
             cache_info_state,
             strict_mode,
+            rate_limit_tiers,
         };
         let stream = WatchTargetsStream::new(receiver);
 
@@ -251,7 +261,7 @@ impl OnwardsConfigSync {
 
                                 // Reload configuration from database (including composite models)
                                 last_reload_time = std::time::Instant::now();
-                                match load_targets_from_db(&self.db, &self.escalation_models, self.strict_mode).await {
+                                match load_targets_from_db(&self.db, &self.escalation_models, self.strict_mode, &self.rate_limit_tiers).await {
                                     Ok(new_targets) => {
                                         debug!("Loaded {} targets from database", new_targets.targets.len());
                                         for entry in new_targets.targets.iter() {
@@ -338,7 +348,7 @@ impl OnwardsConfigSync {
                         }
 
                         last_reload_time = std::time::Instant::now();
-                        match load_targets_from_db(&self.db, &self.escalation_models, self.strict_mode).await {
+                        match load_targets_from_db(&self.db, &self.escalation_models, self.strict_mode, &self.rate_limit_tiers).await {
                             Ok(new_targets) => {
                                 debug!("Fallback sync: loaded {} targets from database", new_targets.targets.len());
 
@@ -512,7 +522,8 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
             ak.secret as api_key_secret,
             ak.purpose as api_key_purpose,
             ak.requests_per_second,
-            ak.burst_size
+            ak.burst_size,
+            ak.user_verified
         FROM deployed_models cm
         CROSS JOIN LATERAL (
             SELECT DISTINCT
@@ -520,8 +531,10 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                 ak.secret,
                 ak.purpose,
                 ak.requests_per_second,
-                ak.burst_size
+                ak.burst_size,
+                u.verified as user_verified
             FROM api_keys ak
+            JOIN users u ON u.id = ak.user_id
             WHERE (
                 -- System user always has access
                 ak.user_id = '00000000-0000-0000-0000-000000000000'
@@ -680,6 +693,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                     purpose: row.api_key_purpose.clone(),
                     requests_per_second: row.requests_per_second,
                     burst_size: row.burst_size,
+                    user_verified: row.user_verified,
                 });
             }
         }
@@ -702,20 +716,16 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
 fn convert_composite_to_target_spec(
     composite: &OnwardsCompositeModel,
     key_definitions: &mut HashMap<String, KeyDefinition>,
+    rate_limit_tiers: &RateLimitTiersConfig,
 ) -> (String, TargetSpecOrList) {
     // Add this composite model's API keys to key_definitions
     for api_key in &composite.api_keys {
-        let rate_limit = match (api_key.requests_per_second, api_key.burst_size) {
-            (Some(rps), burst) if rps > 0.0 => {
-                let rps_u32 = NonZeroU32::new((rps.max(1.0) as u32).max(1)).unwrap();
-                let burst_u32 = burst.and_then(|b| NonZeroU32::new(b.max(1) as u32));
-                Some(RateLimitParameters {
-                    requests_per_second: rps_u32,
-                    burst_size: burst_u32,
-                })
-            }
-            _ => None,
-        };
+        let rate_limit = resolve_key_rate_limit(
+            api_key.requests_per_second,
+            api_key.burst_size,
+            api_key.user_verified,
+            rate_limit_tiers,
+        );
 
         let labels = HashMap::from([("purpose".to_string(), api_key.purpose.clone())]);
 
@@ -881,9 +891,45 @@ fn convert_composite_to_target_spec(
     (composite.alias.clone(), TargetSpecOrList::Pool(pool_spec))
 }
 
+/// Resolves the rate limit for an API key. A non-NULL per-key
+/// `requests_per_second` always wins; otherwise we fall back to the
+/// verified/unverified tier defaults from config, which may themselves be unset
+/// (legacy "no limit unless overridden" behaviour).
+fn resolve_key_rate_limit(
+    per_key_rps: Option<f32>,
+    per_key_burst: Option<i32>,
+    user_verified: bool,
+    tiers: &RateLimitTiersConfig,
+) -> Option<RateLimitParameters> {
+    let (rps, burst) = match per_key_rps {
+        Some(rps) if rps > 0.0 => (rps, per_key_burst),
+        _ => {
+            let tier = if user_verified {
+                tiers.verified.as_ref()
+            } else {
+                tiers.unverified.as_ref()
+            };
+            let tier = tier?;
+            (tier.requests_per_second, tier.burst_size)
+        }
+    };
+
+    let rps_u32 = NonZeroU32::new((rps.max(1.0) as u32).max(1))?;
+    let burst_u32 = burst.and_then(|b| NonZeroU32::new(b.max(1) as u32));
+    Some(RateLimitParameters {
+        requests_per_second: rps_u32,
+        burst_size: burst_u32,
+    })
+}
+
 /// Converts both regular targets and composite models to ConfigFile format
-#[tracing::instrument(skip(targets, composites))]
-fn convert_to_config_file(targets: Vec<OnwardsTarget>, composites: Vec<OnwardsCompositeModel>, strict_mode: bool) -> ConfigFile {
+#[tracing::instrument(skip(targets, composites, rate_limit_tiers))]
+fn convert_to_config_file(
+    targets: Vec<OnwardsTarget>,
+    composites: Vec<OnwardsCompositeModel>,
+    strict_mode: bool,
+    rate_limit_tiers: &RateLimitTiersConfig,
+) -> ConfigFile {
     let mut key_definitions = HashMap::new();
 
     // Convert regular deployed models (wrapped in TargetSpecOrList::Pool)
@@ -892,17 +938,12 @@ fn convert_to_config_file(targets: Vec<OnwardsTarget>, composites: Vec<OnwardsCo
         .map(|target| {
             // Add this target's API keys to key_definitions
             for api_key in &target.api_keys {
-                let rate_limit = match (api_key.requests_per_second, api_key.burst_size) {
-                    (Some(rps), burst) if rps > 0.0 => {
-                        let rps_u32 = NonZeroU32::new((rps.max(1.0) as u32).max(1)).unwrap();
-                        let burst_u32 = burst.and_then(|b| NonZeroU32::new(b.max(1) as u32));
-                        Some(RateLimitParameters {
-                            requests_per_second: rps_u32,
-                            burst_size: burst_u32,
-                        })
-                    }
-                    _ => None,
-                };
+                let rate_limit = resolve_key_rate_limit(
+                    api_key.requests_per_second,
+                    api_key.burst_size,
+                    api_key.user_verified,
+                    rate_limit_tiers,
+                );
 
                 // Build labels from API key purpose
                 let labels = HashMap::from([("purpose".to_string(), api_key.purpose.clone())]);
@@ -998,7 +1039,7 @@ fn convert_to_config_file(targets: Vec<OnwardsTarget>, composites: Vec<OnwardsCo
             );
         }
 
-        let (alias, spec) = convert_composite_to_target_spec(&composite, &mut key_definitions);
+        let (alias, spec) = convert_composite_to_target_spec(&composite, &mut key_definitions, rate_limit_tiers);
         target_specs.insert(alias, spec);
     }
 
@@ -1028,7 +1069,12 @@ fn convert_to_config_file(targets: Vec<OnwardsTarget>, composites: Vec<OnwardsCo
 /// separate API key configuration.
 /// `strict_mode` - Enable strict mode with schema validation (only known OpenAI API paths accepted)
 #[tracing::instrument(skip(db, escalation_models))]
-pub async fn load_targets_from_db(db: &PgPool, escalation_models: &[String], strict_mode: bool) -> Result<Targets, anyhow::Error> {
+pub async fn load_targets_from_db(
+    db: &PgPool,
+    escalation_models: &[String],
+    strict_mode: bool,
+    rate_limit_tiers: &RateLimitTiersConfig,
+) -> Result<Targets, anyhow::Error> {
     let query_start = std::time::Instant::now();
     debug!("Loading onwards targets from database (with composite models)");
 
@@ -1072,7 +1118,8 @@ pub async fn load_targets_from_db(db: &PgPool, escalation_models: &[String], str
             ak.secret as "api_key_secret?",
             ak.purpose as "api_key_purpose?",
             ak.requests_per_second as api_key_requests_per_second,
-            ak.burst_size as api_key_burst_size
+            ak.burst_size as api_key_burst_size,
+            ak.user_verified as "api_key_user_verified?"
         FROM deployed_models dm
         INNER JOIN inference_endpoints ie ON dm.hosted_on = ie.id
         LEFT JOIN LATERAL (
@@ -1081,8 +1128,10 @@ pub async fn load_targets_from_db(db: &PgPool, escalation_models: &[String], str
                 ak.secret,
                 ak.purpose,
                 ak.requests_per_second,
-                ak.burst_size
+                ak.burst_size,
+                u.verified as user_verified
             FROM api_keys ak
+            JOIN users u ON u.id = ak.user_id
             WHERE (
                 -- System user always has access
                 ak.user_id = '00000000-0000-0000-0000-000000000000'
@@ -1168,6 +1217,7 @@ pub async fn load_targets_from_db(db: &PgPool, escalation_models: &[String], str
                 purpose: api_key_purpose,
                 requests_per_second: row.api_key_requests_per_second,
                 burst_size: row.api_key_burst_size,
+                user_verified: row.api_key_user_verified.unwrap_or(false),
             });
         }
     }
@@ -1230,7 +1280,7 @@ pub async fn load_targets_from_db(db: &PgPool, escalation_models: &[String], str
         .collect();
 
     // Convert to ConfigFile format
-    let config = convert_to_config_file(targets, composites, strict_mode);
+    let config = convert_to_config_file(targets, composites, strict_mode, rate_limit_tiers);
 
     // Convert ConfigFile to Targets
     Targets::from_config(config)

@@ -8,6 +8,7 @@ use onwards::{
 use tokio::{sync::mpsc, time::timeout};
 use tokio_util::sync::CancellationToken;
 
+use crate::config::RateLimitTiersConfig;
 use crate::sync::onwards_config::{OnwardsTarget, SyncConfig, convert_to_config_file, parse_notify_payload};
 
 // Helper function to create a test target
@@ -51,7 +52,7 @@ fn test_convert_to_config_file() {
     let target2 = create_test_target("claude-3", "claude-alias", "https://api.anthropic.com");
 
     let targets = vec![target1, target2];
-    let config = convert_to_config_file(targets, vec![], false);
+    let config = convert_to_config_file(targets, vec![], false, &RateLimitTiersConfig::default());
 
     // Verify the config
     assert_eq!(config.targets.len(), 2);
@@ -86,7 +87,7 @@ fn test_convert_to_config_file_with_single_target() {
     let target = create_test_target("valid-model", "valid-alias", "https://api.valid.com");
 
     let targets = vec![target];
-    let config = convert_to_config_file(targets, vec![], false);
+    let config = convert_to_config_file(targets, vec![], false, &RateLimitTiersConfig::default());
 
     // Should have exactly one target
     assert_eq!(config.targets.len(), 1);
@@ -131,7 +132,9 @@ fn test_parse_notify_payload() {
 
 #[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
 async fn test_cache_shape_regular_public_and_private_access(pool: sqlx::PgPool) {
-    let targets = super::load_targets_from_db(&pool, &[], false).await.unwrap();
+    let targets = super::load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
+        .await
+        .unwrap();
 
     let public = targets.targets.get("regular-public").expect("regular-public should exist");
     let public_pool = public.value();
@@ -167,7 +170,9 @@ async fn test_cache_shape_regular_public_and_private_access(pool: sqlx::PgPool) 
 
 #[sqlx::test(fixtures(path = "fixtures", scripts("cache_base", "cache_tariff_metered", "cache_balance_user_a_positive")))]
 async fn test_cache_shape_metered_model_requires_positive_balance(pool: sqlx::PgPool) {
-    let targets = super::load_targets_from_db(&pool, &[], false).await.unwrap();
+    let targets = super::load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
+        .await
+        .unwrap();
     let metered = targets.targets.get("metered-public").expect("metered-public should exist");
     let metered_pool = metered.value();
 
@@ -186,7 +191,9 @@ async fn test_cache_shape_metered_model_requires_positive_balance(pool: sqlx::Pg
 async fn test_cache_shape_batch_escalation_access_for_private_alias(pool: sqlx::PgPool) {
     let alias = "escalation-private".to_string();
 
-    let without_escalation = super::load_targets_from_db(&pool, &[], false).await.unwrap();
+    let without_escalation = super::load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
+        .await
+        .unwrap();
     let pool_without = without_escalation.targets.get(&alias).expect("target should exist");
     assert_eq!(
         pool_keys_len(pool_without.value()),
@@ -196,7 +203,7 @@ async fn test_cache_shape_batch_escalation_access_for_private_alias(pool: sqlx::
     assert!(pool_has_key(pool_without.value(), SYSTEM_KEY_SECRET));
     assert!(!pool_has_key(pool_without.value(), KEY_BATCH_SECRET));
 
-    let with_escalation = super::load_targets_from_db(&pool, std::slice::from_ref(&alias), false)
+    let with_escalation = super::load_targets_from_db(&pool, std::slice::from_ref(&alias), false, &RateLimitTiersConfig::default())
         .await
         .unwrap();
     let pool_with = with_escalation.targets.get(&alias).expect("target should exist");
@@ -207,7 +214,9 @@ async fn test_cache_shape_batch_escalation_access_for_private_alias(pool: sqlx::
 
 #[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
 async fn test_cache_shape_composite_pool_strategy_and_fallback(pool: sqlx::PgPool) {
-    let targets = super::load_targets_from_db(&pool, &[], false).await.unwrap();
+    let targets = super::load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
+        .await
+        .unwrap();
     let composite = targets.targets.get("composite-priority").expect("composite-priority should exist");
     let composite_pool = composite.value();
 
@@ -245,18 +254,24 @@ async fn test_cache_shape_composite_pool_strategy_and_fallback(pool: sqlx::PgPoo
 async fn test_cache_shape_composite_batch_escalation_access(pool: sqlx::PgPool) {
     let alias = "composite-priority".to_string();
 
-    let without_escalation = super::load_targets_from_db(&pool, &[], false).await.unwrap();
+    let without_escalation = super::load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
+        .await
+        .unwrap();
     let pool_without = without_escalation.targets.get(&alias).expect("target should exist");
     assert!(!pool_has_key(pool_without.value(), KEY_BATCH_SECRET));
 
-    let with_escalation = super::load_targets_from_db(&pool, &[alias], false).await.unwrap();
+    let with_escalation = super::load_targets_from_db(&pool, &[alias], false, &RateLimitTiersConfig::default())
+        .await
+        .unwrap();
     let pool_with = with_escalation.targets.get("composite-priority").expect("target should exist");
     assert!(pool_has_key(pool_with.value(), KEY_BATCH_SECRET));
 }
 
 #[sqlx::test(fixtures(path = "fixtures", scripts("cache_base", "cache_components_all_disabled")))]
 async fn test_cache_shape_composite_with_all_components_disabled(pool: sqlx::PgPool) {
-    let targets = super::load_targets_from_db(&pool, &[], false).await.unwrap();
+    let targets = super::load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
+        .await
+        .unwrap();
     let pool_entry = targets
         .targets
         .get("composite-priority")
@@ -269,7 +284,9 @@ async fn test_cache_shape_composite_with_all_components_disabled(pool: sqlx::PgP
 
 #[sqlx::test(fixtures(path = "fixtures", scripts("cache_base", "cache_regular_public_extra_group_assignment")))]
 async fn test_cache_shape_duplicate_access_paths_do_not_duplicate_keys(pool: sqlx::PgPool) {
-    let targets = super::load_targets_from_db(&pool, &[], false).await.unwrap();
+    let targets = super::load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
+        .await
+        .unwrap();
     let public = targets.targets.get("regular-public").expect("regular-public should exist");
     assert_eq!(
         pool_keys_len(public.value()),
@@ -280,16 +297,22 @@ async fn test_cache_shape_duplicate_access_paths_do_not_duplicate_keys(pool: sql
 
 #[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
 async fn test_cache_shape_strict_mode_flag_propagates(pool: sqlx::PgPool) {
-    let strict_targets = super::load_targets_from_db(&pool, &[], true).await.unwrap();
+    let strict_targets = super::load_targets_from_db(&pool, &[], true, &RateLimitTiersConfig::default())
+        .await
+        .unwrap();
     assert!(strict_targets.strict_mode, "strict_mode=true should propagate to Targets");
 
-    let lax_targets = super::load_targets_from_db(&pool, &[], false).await.unwrap();
+    let lax_targets = super::load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
+        .await
+        .unwrap();
     assert!(!lax_targets.strict_mode, "strict_mode=false should propagate to Targets");
 }
 
 #[sqlx::test(fixtures(path = "fixtures", scripts("cache_base", "cache_user_b_in_private_group")))]
 async fn test_cache_shape_overlapping_group_memberships_expand_access(pool: sqlx::PgPool) {
-    let targets = super::load_targets_from_db(&pool, &[], false).await.unwrap();
+    let targets = super::load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
+        .await
+        .unwrap();
     let private = targets.targets.get("regular-private").expect("regular-private should exist");
     let private_pool = private.value();
 
@@ -305,7 +328,9 @@ async fn test_cache_shape_overlapping_group_memberships_expand_access(pool: sqlx
 
 #[sqlx::test(fixtures(path = "fixtures", scripts("cache_base", "cache_delete_regular_public")))]
 async fn test_cache_shape_deleted_regular_model_is_excluded(pool: sqlx::PgPool) {
-    let targets = super::load_targets_from_db(&pool, &[], false).await.unwrap();
+    let targets = super::load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
+        .await
+        .unwrap();
     assert!(
         targets.targets.get("regular-public").is_none(),
         "deleted regular model should be excluded from cache"
@@ -314,7 +339,9 @@ async fn test_cache_shape_deleted_regular_model_is_excluded(pool: sqlx::PgPool) 
 
 #[sqlx::test(fixtures(path = "fixtures", scripts("cache_base", "cache_delete_component_a_model")))]
 async fn test_cache_shape_deleted_component_model_is_excluded_from_composite(pool: sqlx::PgPool) {
-    let targets = super::load_targets_from_db(&pool, &[], false).await.unwrap();
+    let targets = super::load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
+        .await
+        .unwrap();
     let composite = targets.targets.get("composite-priority").expect("composite-priority should exist");
     let providers = composite.value().providers();
     assert_eq!(
@@ -327,7 +354,9 @@ async fn test_cache_shape_deleted_component_model_is_excluded_from_composite(poo
 
 #[sqlx::test(fixtures(path = "fixtures", scripts("cache_base", "cache_traffic_routing_rules")))]
 async fn test_cache_shape_regular_model_routing_rules(pool: sqlx::PgPool) {
-    let targets = super::load_targets_from_db(&pool, &[], false).await.unwrap();
+    let targets = super::load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
+        .await
+        .unwrap();
     let regular_private = targets.targets.get("regular-private").expect("regular-private should exist");
     let rules = regular_private.value().routing_rules();
 
@@ -345,7 +374,9 @@ async fn test_cache_shape_regular_model_routing_rules(pool: sqlx::PgPool) {
 
 #[sqlx::test(fixtures(path = "fixtures", scripts("cache_base", "cache_traffic_routing_rules")))]
 async fn test_cache_shape_composite_model_routing_rules(pool: sqlx::PgPool) {
-    let targets = super::load_targets_from_db(&pool, &[], false).await.unwrap();
+    let targets = super::load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
+        .await
+        .unwrap();
     let composite = targets.targets.get("composite-priority").expect("composite-priority should exist");
     let rules = composite.value().routing_rules();
 
@@ -373,7 +404,9 @@ async fn test_known_issue_composite_invalid_component_endpoint_should_be_skipped
     // - Regular-model path uses Url::parse(...).expect(...), which panics on invalid DB URL.
     // - Because endpoints are shared across deployments in this fixture, regular loading panics
     //   before we can assert composite skip behavior.
-    let _ = super::load_targets_from_db(&pool, &[], false).await.unwrap();
+    let _ = super::load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
+        .await
+        .unwrap();
 }
 
 #[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
@@ -381,7 +414,9 @@ async fn test_composite_unmetered_access_matches_regular_model_policy(pool: sqlx
     // For unmetered aliases (no active non-zero tariff), group-authorized keys are allowed
     // even when user balance is non-positive. Composite and regular aliases follow the same
     // key visibility policy.
-    let targets = super::load_targets_from_db(&pool, &[], false).await.unwrap();
+    let targets = super::load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
+        .await
+        .unwrap();
     let composite = targets.targets.get("composite-priority").expect("composite-priority should exist");
     let composite_pool = composite.value();
 
@@ -651,7 +686,9 @@ async fn test_batch_api_key_access_to_composite_escalation_target(pool: sqlx::Pg
 
     // Load targets with composite alias in escalation_models
     let escalation_models = vec![composite_alias.clone()];
-    let targets = super::load_targets_from_db(&pool, &escalation_models, false).await.unwrap();
+    let targets = super::load_targets_from_db(&pool, &escalation_models, false, &RateLimitTiersConfig::default())
+        .await
+        .unwrap();
 
     // Find the composite model in targets (DashMap)
     let composite_target = targets.targets.get(&composite_alias).expect("Composite model should be in targets");
@@ -814,4 +851,62 @@ async fn test_fallback_sync_triggers_without_notifications(pool: sqlx::PgPool) {
     // Cleanup
     shutdown_token.cancel();
     let _ = timeout(Duration::from_secs(1), sync_handle).await;
+}
+
+#[cfg(test)]
+mod resolve_key_rate_limit_tests {
+    use super::*;
+    use crate::config::RateLimitTierConfig;
+    use std::num::NonZeroU32;
+
+    fn tiers(verified: Option<(f32, Option<i32>)>, unverified: Option<(f32, Option<i32>)>) -> RateLimitTiersConfig {
+        let make = |t: (f32, Option<i32>)| RateLimitTierConfig {
+            requests_per_second: t.0,
+            burst_size: t.1,
+        };
+        RateLimitTiersConfig {
+            verified: verified.map(make),
+            unverified: unverified.map(make),
+        }
+    }
+
+    #[test]
+    fn per_key_override_beats_tier() {
+        let t = tiers(Some((1.0, None)), Some((2.0, None)));
+        let rl = super::super::resolve_key_rate_limit(Some(10.0), Some(20), true, &t).unwrap();
+        assert_eq!(rl.requests_per_second, NonZeroU32::new(10).unwrap());
+        assert_eq!(rl.burst_size, Some(NonZeroU32::new(20).unwrap()));
+    }
+
+    #[test]
+    fn unverified_user_with_no_override_gets_unverified_tier() {
+        let t = tiers(Some((100.0, None)), Some((5.0, Some(10))));
+        let rl = super::super::resolve_key_rate_limit(None, None, false, &t).unwrap();
+        assert_eq!(rl.requests_per_second, NonZeroU32::new(5).unwrap());
+        assert_eq!(rl.burst_size, Some(NonZeroU32::new(10).unwrap()));
+    }
+
+    #[test]
+    fn verified_user_with_no_override_gets_verified_tier() {
+        let t = tiers(Some((100.0, None)), Some((5.0, None)));
+        let rl = super::super::resolve_key_rate_limit(None, None, true, &t).unwrap();
+        assert_eq!(rl.requests_per_second, NonZeroU32::new(100).unwrap());
+    }
+
+    #[test]
+    fn no_tier_configured_and_no_override_means_no_limit() {
+        let t = tiers(None, None);
+        assert!(super::super::resolve_key_rate_limit(None, None, false, &t).is_none());
+        assert!(super::super::resolve_key_rate_limit(None, None, true, &t).is_none());
+    }
+
+    #[test]
+    fn only_one_tier_configured_other_tier_unrestricted() {
+        let t = tiers(None, Some((5.0, None)));
+        // Verified user falls through to None because verified tier is unset.
+        assert!(super::super::resolve_key_rate_limit(None, None, true, &t).is_none());
+        // Unverified user gets the configured tier.
+        let rl = super::super::resolve_key_rate_limit(None, None, false, &t).unwrap();
+        assert_eq!(rl.requests_per_second, NonZeroU32::new(5).unwrap());
+    }
 }
