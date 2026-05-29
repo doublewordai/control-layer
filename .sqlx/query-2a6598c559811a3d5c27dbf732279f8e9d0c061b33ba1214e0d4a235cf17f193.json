@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            id as composite_model_id,\n            alias,\n            requests_per_second,\n            burst_size,\n            capacity,\n            lb_strategy,\n            fallback_enabled,\n            fallback_on_rate_limit,\n            fallback_on_status,\n            fallback_with_replacement,\n            fallback_max_attempts,\n            sanitize_responses,\n            trusted,\n            open_responses_adapter as \"open_responses_adapter?\"\n        FROM deployed_models\n        WHERE is_composite = TRUE\n          AND deleted = FALSE\n        ",
+  "query": "\n        SELECT\n            id as composite_model_id,\n            alias,\n            requests_per_second,\n            burst_size,\n            capacity,\n            lb_strategy,\n            fallback_enabled,\n            fallback_on_rate_limit,\n            fallback_on_status,\n            fallback_with_replacement,\n            fallback_max_attempts,\n            backoff_enabled,\n            backoff_initial_ms,\n            backoff_max_ms,\n            backoff_factor,\n            backoff_jitter,\n            backoff_max_total_ms,\n            sanitize_responses,\n            trusted,\n            open_responses_adapter as \"open_responses_adapter?\"\n        FROM deployed_models\n        WHERE is_composite = TRUE\n          AND deleted = FALSE\n        ",
   "describe": {
     "columns": [
       {
@@ -60,16 +60,46 @@
       },
       {
         "ordinal": 11,
-        "name": "sanitize_responses",
+        "name": "backoff_enabled",
         "type_info": "Bool"
       },
       {
         "ordinal": 12,
+        "name": "backoff_initial_ms",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 13,
+        "name": "backoff_max_ms",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 14,
+        "name": "backoff_factor",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 15,
+        "name": "backoff_jitter",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 16,
+        "name": "backoff_max_total_ms",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 17,
+        "name": "sanitize_responses",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 18,
         "name": "trusted",
         "type_info": "Bool"
       },
       {
-        "ordinal": 13,
+        "ordinal": 19,
         "name": "open_responses_adapter?",
         "type_info": "Bool"
       }
@@ -91,8 +121,14 @@
       true,
       false,
       false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
       true
     ]
   },
-  "hash": "5d6eb69010211d74c88d92aa2fd9d641d4e85fca710facf468a7c3c8f019b1b8"
+  "hash": "2a6598c559811a3d5c27dbf732279f8e9d0c061b33ba1214e0d4a235cf17f193"
 }
