@@ -1,5 +1,13 @@
 # Changelog
 
+## [8.55.0](https://github.com/doublewordai/control-layer/compare/v8.54.2...v8.55.0) (2026-05-29)
+
+
+### Features
+
+* expose onwards 0.29 retry backoff per composite model ([#1097](https://github.com/doublewordai/control-layer/issues/1097)) ([fbe6717](https://github.com/doublewordai/control-layer/commit/fbe67170b33331eb01b9c43eba8e0b36d2faedef))
+* replace underway for response creation to use channel system ([#1101](https://github.com/doublewordai/control-layer/issues/1101)) ([9fdcb96](https://github.com/doublewordai/control-layer/commit/9fdcb963e8dbfcce295723242db4cce049ac5445))
+
 ## [8.54.2](https://github.com/doublewordai/control-layer/compare/v8.54.1...v8.54.2) (2026-05-28)
 
 

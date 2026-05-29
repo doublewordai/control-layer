@@ -14,12 +14,25 @@ export type ModelDisplayCategory = "generation" | "embedding" | "ocr";
 // Virtual model types (virtual models route requests across multiple hosted models)
 export type LoadBalancingStrategy = "weighted_random" | "priority";
 
+export type JitterStrategy = "none" | "full";
+
+export interface BackoffConfig {
+  initial_ms: number;
+  max_ms: number;
+  factor: number;
+  jitter: JitterStrategy;
+}
+
 export interface FallbackConfig {
   enabled: boolean;
   on_rate_limit: boolean;
   on_status: number[];
   with_replacement: boolean;
   max_attempts: number | null;
+  /** Inter-attempt exponential backoff. `null` (or omitted) = no delay between retries. */
+  backoff?: BackoffConfig | null;
+  /** Cumulative inter-attempt sleep budget, in milliseconds. `null` = no budget cap. */
+  max_total_backoff_ms?: number | null;
 }
 
 export interface ComponentEndpointSummary {
@@ -306,6 +319,13 @@ export interface VirtualModelCreate {
   fallback_on_status?: number[];
   fallback_with_replacement?: boolean;
   fallback_max_attempts?: number | null;
+  /** Inter-attempt backoff toggle; defaults to false (legacy zero-delay retry). */
+  backoff_enabled?: boolean;
+  backoff_initial_ms?: number;
+  backoff_max_ms?: number;
+  backoff_factor?: number;
+  backoff_jitter?: JitterStrategy;
+  backoff_max_total_ms?: number | null;
   sanitize_responses?: boolean;
   traffic_routing_rules?: TrafficRoutingRule[];
   allowed_batch_completion_windows?: string[];
@@ -535,6 +555,14 @@ export interface ModelUpdateRequest {
   fallback_on_status?: number[] | null;
   fallback_with_replacement?: boolean | null;
   fallback_max_attempts?: number | null;
+  /** Inter-attempt backoff toggle. `null` (or omitted) = no change. */
+  backoff_enabled?: boolean | null;
+  backoff_initial_ms?: number | null;
+  backoff_max_ms?: number | null;
+  backoff_factor?: number | null;
+  backoff_jitter?: JitterStrategy | null;
+  /** Three-state: omitted = no change, null = clear cap, number = set cap. */
+  backoff_max_total_ms?: number | null;
   sanitize_responses?: boolean | null;
   trusted?: boolean | null;
   open_responses_adapter?: boolean | null;

@@ -354,6 +354,14 @@ pub struct FallbackConfig {
     /// Maximum number of failover attempts (default: provider count)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_attempts: Option<i32>,
+    /// Inter-attempt exponential backoff. None means "no inter-attempt
+    /// delay" (legacy zero-delay retry behavior).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backoff: Option<BackoffConfig>,
+    /// Cumulative budget across inter-attempt sleeps, in milliseconds.
+    /// Only consulted when `backoff` is Some. None = no budget cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_total_backoff_ms: Option<i32>,
 }
 
 impl FallbackConfig {
@@ -364,8 +372,46 @@ impl FallbackConfig {
             on_status: default_fallback_status_codes(),
             with_replacement: false,
             max_attempts: None,
+            backoff: None,
+            max_total_backoff_ms: None,
         }
     }
+}
+
+/// Jitter strategy applied to retry backoff delays.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum JitterStrategy {
+    /// Use the computed exponential delay verbatim.
+    None,
+    /// Sample uniformly from `[0, computed_delay]` (default; recommended).
+    #[default]
+    Full,
+}
+
+impl JitterStrategy {
+    /// Stable string the DB column uses. Kept in sync with the
+    /// `backoff_jitter_known` CHECK constraint in migration 098.
+    pub fn as_db_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Full => "full",
+        }
+    }
+}
+
+/// Exponential backoff between fallback attempts. Mirrors
+/// `onwards::target::BackoffConfig`.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct BackoffConfig {
+    /// Delay before the first retry, in milliseconds.
+    pub initial_ms: i32,
+    /// Hard ceiling on the per-retry delay, in milliseconds.
+    pub max_ms: i32,
+    /// Exponential growth factor between successive retries.
+    pub factor: f64,
+    /// Jitter strategy applied to each delay.
+    pub jitter: JitterStrategy,
 }
 
 /// A component of a composite model (a deployed model with a weight)
@@ -446,6 +492,19 @@ pub struct DeploymentCreateDBRequest {
     pub fallback_on_status: Option<Vec<i32>>,
     pub fallback_with_replacement: Option<bool>,
     pub fallback_max_attempts: Option<i32>,
+    /// Inter-attempt backoff flag (defaults to false: legacy zero-delay).
+    #[builder(default = false)]
+    pub backoff_enabled: bool,
+    #[builder(default = 100)]
+    pub backoff_initial_ms: i32,
+    #[builder(default = 5_000)]
+    pub backoff_max_ms: i32,
+    #[builder(default = 2.0)]
+    pub backoff_factor: f64,
+    /// DB-string form ("none" or "full"); see `JitterStrategy::as_db_str`.
+    #[builder(default = "full".to_string())]
+    pub backoff_jitter: String,
+    pub backoff_max_total_ms: Option<i32>,
     /// Whether to sanitize/filter sensitive data from model responses (defaults to false)
     #[builder(default = false)]
     pub sanitize_responses: bool,
@@ -465,28 +524,50 @@ impl DeploymentCreateDBRequest {
     /// Creates a deployment request from API model creation data
     pub fn from_api_create(created_by: UserId, create: DeployedModelCreate) -> Self {
         match create {
-            DeployedModelCreate::Standard(standard) => Self::builder()
-                .created_by(created_by)
-                .model_name(standard.model_name.clone())
-                .alias(standard.alias.unwrap_or(standard.model_name))
-                .maybe_display_name(standard.display_name)
-                .maybe_description(standard.description)
-                .maybe_model_type(standard.model_type)
-                .maybe_capabilities(standard.capabilities)
-                .hosted_on(standard.hosted_on)
-                .maybe_requests_per_second(standard.requests_per_second)
-                .maybe_burst_size(standard.burst_size)
-                .maybe_capacity(standard.capacity)
-                .maybe_batch_capacity(standard.batch_capacity)
-                .maybe_throughput(standard.throughput)
-                .maybe_provider_pricing(standard.provider_pricing)
-                .is_composite(false)
-                .sanitize_responses(standard.sanitize_responses.unwrap_or(false))
-                .trusted(standard.trusted.unwrap_or(false))
-                .open_responses_adapter(standard.open_responses_adapter.unwrap_or(true))
-                .maybe_allowed_batch_completion_windows(standard.allowed_batch_completion_windows)
-                .maybe_metadata(standard.metadata)
-                .build(),
+            DeployedModelCreate::Standard(standard) => {
+                // For a single-provider standard model, retries only happen
+                // when fallback is enabled AND `with_replacement` is true
+                // (otherwise SelectIter yields exactly once). Enabling backoff
+                // implicitly enables both, so the user only has to set one
+                // toggle in the UI.
+                let backoff_on = standard.backoff_enabled;
+                // A single-provider pool only retries when max_attempts > 1
+                // (otherwise SelectIter yields once). Default to 3 attempts
+                // when backoff is enabled so the policy can actually execute;
+                // None when off.
+                let standard_max_attempts = backoff_on.then_some(3);
+                Self::builder()
+                    .created_by(created_by)
+                    .model_name(standard.model_name.clone())
+                    .alias(standard.alias.unwrap_or(standard.model_name))
+                    .maybe_display_name(standard.display_name)
+                    .maybe_description(standard.description)
+                    .maybe_model_type(standard.model_type)
+                    .maybe_capabilities(standard.capabilities)
+                    .hosted_on(standard.hosted_on)
+                    .maybe_requests_per_second(standard.requests_per_second)
+                    .maybe_burst_size(standard.burst_size)
+                    .maybe_capacity(standard.capacity)
+                    .maybe_batch_capacity(standard.batch_capacity)
+                    .maybe_throughput(standard.throughput)
+                    .maybe_provider_pricing(standard.provider_pricing)
+                    .is_composite(false)
+                    .fallback_enabled(backoff_on)
+                    .fallback_with_replacement(backoff_on)
+                    .maybe_fallback_max_attempts(standard_max_attempts)
+                    .backoff_enabled(backoff_on)
+                    .backoff_initial_ms(standard.backoff_initial_ms)
+                    .backoff_max_ms(standard.backoff_max_ms)
+                    .backoff_factor(standard.backoff_factor)
+                    .backoff_jitter(standard.backoff_jitter.as_db_str().to_string())
+                    .maybe_backoff_max_total_ms(standard.backoff_max_total_ms)
+                    .sanitize_responses(standard.sanitize_responses.unwrap_or(false))
+                    .trusted(standard.trusted.unwrap_or(false))
+                    .open_responses_adapter(standard.open_responses_adapter.unwrap_or(true))
+                    .maybe_allowed_batch_completion_windows(standard.allowed_batch_completion_windows)
+                    .maybe_metadata(standard.metadata)
+                    .build()
+            }
             DeployedModelCreate::Composite(composite) => Self::builder()
                 .created_by(created_by)
                 .model_name(composite.model_name.clone())
@@ -507,6 +588,12 @@ impl DeploymentCreateDBRequest {
                 .fallback_on_status(composite.fallback_on_status)
                 .fallback_with_replacement(composite.fallback_with_replacement)
                 .maybe_fallback_max_attempts(composite.fallback_max_attempts)
+                .backoff_enabled(composite.backoff_enabled)
+                .backoff_initial_ms(composite.backoff_initial_ms)
+                .backoff_max_ms(composite.backoff_max_ms)
+                .backoff_factor(composite.backoff_factor)
+                .backoff_jitter(composite.backoff_jitter.as_db_str().to_string())
+                .maybe_backoff_max_total_ms(composite.backoff_max_total_ms)
                 .sanitize_responses(composite.sanitize_responses)
                 .trusted(composite.trusted.unwrap_or(false))
                 .open_responses_adapter(composite.open_responses_adapter.unwrap_or(true))
@@ -543,6 +630,16 @@ pub struct DeploymentUpdateDBRequest {
     pub fallback_on_status: Option<Vec<i32>>,
     pub fallback_with_replacement: Option<bool>,
     pub fallback_max_attempts: Option<Option<i32>>,
+    /// Toggle inter-attempt backoff (None = no change).
+    pub backoff_enabled: Option<bool>,
+    pub backoff_initial_ms: Option<i32>,
+    pub backoff_max_ms: Option<i32>,
+    pub backoff_factor: Option<f64>,
+    /// DB-string form ("none" or "full"); see `JitterStrategy::as_db_str`.
+    pub backoff_jitter: Option<String>,
+    /// Cumulative inter-attempt sleep budget
+    /// (None = no change, Some(None) = clear cap, Some(Some(n)) = set).
+    pub backoff_max_total_ms: Option<Option<i32>>,
     /// Whether to sanitize/filter sensitive data from model responses
     pub sanitize_responses: Option<bool>,
     /// Whether to mark provider as trusted in strict mode (bypasses sanitization)
@@ -575,6 +672,12 @@ impl From<DeployedModelUpdate> for DeploymentUpdateDBRequest {
             .maybe_fallback_on_status(update.fallback_on_status)
             .maybe_fallback_with_replacement(update.fallback_with_replacement)
             .maybe_fallback_max_attempts(update.fallback_max_attempts)
+            .maybe_backoff_enabled(update.backoff_enabled)
+            .maybe_backoff_initial_ms(update.backoff_initial_ms)
+            .maybe_backoff_max_ms(update.backoff_max_ms)
+            .maybe_backoff_factor(update.backoff_factor)
+            .maybe_backoff_jitter(update.backoff_jitter.map(|j| j.as_db_str().to_string()))
+            .maybe_backoff_max_total_ms(update.backoff_max_total_ms)
             .maybe_sanitize_responses(update.sanitize_responses)
             .maybe_trusted(update.trusted)
             .maybe_open_responses_adapter(update.open_responses_adapter)
@@ -639,6 +742,14 @@ pub struct DeploymentDBResponse {
     pub fallback_on_status: Vec<i32>,
     pub fallback_with_replacement: bool,
     pub fallback_max_attempts: Option<i32>,
+    /// Inter-attempt backoff fields (mirrored from deployed_models columns).
+    /// `backoff_enabled = false` means no inter-attempt delay.
+    pub backoff_enabled: bool,
+    pub backoff_initial_ms: i32,
+    pub backoff_max_ms: i32,
+    pub backoff_factor: f64,
+    pub backoff_jitter: String,
+    pub backoff_max_total_ms: Option<i32>,
     /// Whether to sanitize/filter sensitive data from model responses
     pub sanitize_responses: bool,
     /// Whether to mark provider as trusted in strict mode (bypasses sanitization)
@@ -669,4 +780,42 @@ pub struct TrafficRuleDBRow {
     /// Populated via LEFT JOIN on deployed_models
     pub redirect_target_alias: Option<String>,
     pub created_at: DateTime<Utc>,
+}
+
+#[cfg(test)]
+mod backoff_derivation_tests {
+    use super::*;
+
+    // Build a standard-model create request from minimal JSON, relying on
+    // serde defaults for everything except the fields under test.
+    fn standard_create(backoff_enabled: bool) -> DeployedModelCreate {
+        serde_json::from_value(serde_json::json!({
+            "type": "standard",
+            "model_name": "m",
+            "hosted_on": uuid::Uuid::nil(),
+            "backoff_enabled": backoff_enabled,
+        }))
+        .expect("valid StandardModelCreate JSON")
+    }
+
+    // Regression guard for the headline invariant: a single-provider model
+    // only retries when fallback + with_replacement + max_attempts>1 are all
+    // set. Enabling backoff must derive all three, or onwards' SelectIter
+    // yields once and backoff silently never fires.
+    #[test]
+    fn standard_backoff_on_derives_fallback_replacement_and_max_attempts() {
+        let req = DeploymentCreateDBRequest::from_api_create(uuid::Uuid::nil(), standard_create(true));
+        assert!(req.backoff_enabled);
+        assert_eq!(req.fallback_enabled, Some(true));
+        assert_eq!(req.fallback_with_replacement, Some(true));
+        assert_eq!(req.fallback_max_attempts, Some(3), "must be >1 or no retry happens");
+    }
+
+    #[test]
+    fn standard_backoff_off_leaves_retry_inert() {
+        let req = DeploymentCreateDBRequest::from_api_create(uuid::Uuid::nil(), standard_create(false));
+        assert!(!req.backoff_enabled);
+        assert_eq!(req.fallback_enabled, Some(false));
+        assert_eq!(req.fallback_max_attempts, None);
+    }
 }
