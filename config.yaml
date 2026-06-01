@@ -247,6 +247,13 @@ credits:
   # Set to 0 to disable initial credits (users start with no credits)
   # Example: 100.00 gives users 100 credits on registration
   initial_credits_for_standard_users: 0
+  # First-payment match promotion: a user's first ever payment (checkout or
+  # auto-topup) is matched with bonus credits, up to this amount (in dollars).
+  # A first payment below this is matched in full; above it is capped here.
+  # Set to 0 to disable. Existing paying customers are never matched (eligibility
+  # is derived from whether they have any prior purchase).
+  # Example: 50 matches a new user's first $50 of credits.
+  first_payment_match_up_to: 0
 
 # Optional feature toggles
 enable_metrics: true # Enable Prometheus metrics endpoint
