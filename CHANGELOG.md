@@ -1,5 +1,17 @@
 # Changelog
 
+## [8.57.0](https://github.com/doublewordai/control-layer/compare/v8.56.0...v8.57.0) (2026-06-01)
+
+
+### Features
+
+* add pending request decay window ([#1107](https://github.com/doublewordai/control-layer/issues/1107)) ([5eda366](https://github.com/doublewordai/control-layer/commit/5eda3665580509ab8466948bc14f66ac2499a066))
+
+
+### Bug Fixes
+
+* **deps:** bump tar from 0.4.45 to 0.4.46 in /dwctl ([#1109](https://github.com/doublewordai/control-layer/issues/1109)) ([5381f6d](https://github.com/doublewordai/control-layer/commit/5381f6d54f1c6832d5b3f053e963f84fe008a8b2))
+
 ## [8.56.0](https://github.com/doublewordai/control-layer/compare/v8.55.0...v8.56.0) (2026-06-01)
 
 
