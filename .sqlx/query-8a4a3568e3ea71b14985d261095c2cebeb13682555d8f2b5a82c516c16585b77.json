@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT NOT EXISTS (\n                SELECT 1 FROM credits_transactions\n                WHERE user_id = $1\n                  AND transaction_type = 'purchase'\n                  AND seq < $2\n            ) AS \"is_first!\"\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "is_first!",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "8a4a3568e3ea71b14985d261095c2cebeb13682555d8f2b5a82c516c16585b77"
+}

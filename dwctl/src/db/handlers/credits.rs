@@ -163,11 +163,16 @@ impl<'c> Credits<'c> {
     /// Grant a first-payment match bonus to `payee` if eligible.
     ///
     /// The promotion matches a user's first ever payment with bonus credits, up
-    /// to `match_up_to` (in dollars); `match_up_to <= 0` disables it. Eligibility
-    /// is derived from the ledger: the payee must have no `purchase` other than
-    /// the one identified by `purchase_source_id`, so existing paying customers
-    /// are never matched and the check is order-independent (works whether or not
-    /// the triggering purchase has been written yet).
+    /// to `match_up_to` (in dollars); `match_up_to <= 0` disables it.
+    ///
+    /// Eligibility is derived from the ledger by ordering, not by counting:
+    /// the triggering purchase (identified by `purchase_source_id`) is "first"
+    /// iff no purchase exists for the payee with a lower `seq`. Using the
+    /// monotonic `seq` is concurrency-safe in a way that "any other purchase by
+    /// source_id" is not - with two simultaneous first payments, exactly the
+    /// lowest-seq one qualifies, so we never silently grant zero matches (and
+    /// existing paying customers are still never matched). It also requires the
+    /// purchase to actually exist before we grant.
     ///
     /// The bonus is recorded as an `admin_grant` with a derived `source_id`, so a
     /// webhook+poll double-fire or a webhook retry cannot double-grant (the
@@ -190,18 +195,31 @@ impl<'c> Credits<'c> {
             return Ok(());
         }
 
-        // First payment = no prior purchase for this payee other than this one.
+        // Locate the triggering purchase's ordering key. If it doesn't exist
+        // (shouldn't happen - the caller records it first), there's nothing to
+        // match against, so skip rather than guess.
+        let Some(purchase_seq) = sqlx::query_scalar!(
+            "SELECT seq FROM credits_transactions WHERE source_id = $1 AND transaction_type = 'purchase'",
+            purchase_source_id
+        )
+        .fetch_optional(&mut *self.db)
+        .await?
+        else {
+            return Ok(());
+        };
+
+        // First payment = no earlier purchase (lower seq) for this payee.
         let is_first = sqlx::query_scalar!(
             r#"
             SELECT NOT EXISTS (
                 SELECT 1 FROM credits_transactions
                 WHERE user_id = $1
                   AND transaction_type = 'purchase'
-                  AND source_id <> $2
+                  AND seq < $2
             ) AS "is_first!"
             "#,
             payee,
-            purchase_source_id
+            purchase_seq
         )
         .fetch_one(&mut *self.db)
         .await?;
