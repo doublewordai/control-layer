@@ -275,7 +275,7 @@ pub async fn process_payment<P: PoolProvider>(
     };
 
     // Process the payment session using the provider trait
-    match provider.process_payment_session(state.db.write(), &id).await {
+    match provider.process_payment_session(state.db.write(), &id, &config.credits).await {
         Ok(()) => Ok(Json(json!({
             "message": "Payment processed successfully"
         }))
@@ -357,7 +357,7 @@ pub async fn webhook_handler<P: PoolProvider>(
     tracing::trace!("Received webhook event: {}", event.event_type);
 
     // Process the webhook event
-    match provider.process_webhook_event(state.db.write(), &event).await {
+    match provider.process_webhook_event(state.db.write(), &event, &config.credits).await {
         Ok(()) => {
             tracing::trace!("Successfully processed webhook event: {}", event.event_type);
             StatusCode::OK

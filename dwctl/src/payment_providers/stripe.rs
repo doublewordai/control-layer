@@ -273,7 +273,12 @@ impl PaymentProvider for StripeProvider {
         })
     }
 
-    async fn process_payment_session(&self, db_pool: &PgPool, session_id: &str) -> Result<()> {
+    async fn process_payment_session(
+        &self,
+        db_pool: &PgPool,
+        session_id: &str,
+        credits_config: &crate::config::CreditsConfig,
+    ) -> Result<()> {
         // Acquire connection early for idempotency check
         let mut conn = db_pool.acquire().await?;
 
@@ -350,7 +355,31 @@ impl PaymentProvider for StripeProvider {
             api_key_id: None,
         };
 
-        Credits::new(&mut conn).create_transaction(&request).await?;
+        // Record the purchase first. This is the critical write (real money moved)
+        // and is never made contingent on the secondary effects below.
+        let mut credits = Credits::new(&mut conn);
+        credits.create_transaction(&request).await?;
+
+        // First-payment match (no-op unless enabled and this is the payee's first
+        // ever payment). The bonus lands on the creditee (whose balance was just
+        // topped up), deliberately the credited account rather than the payer we
+        // verify below, since the promo rewards whoever receives the credits.
+        // Best-effort: a freebie must never undo the recorded purchase, so we log
+        // and continue on failure rather than failing payment processing. Note
+        // such a failure is not retried (the webhook retry's fast-path sees the
+        // purchase already recorded), so the error log is the signal to grant it
+        // manually.
+        if let Err(e) = credits
+            .grant_first_payment_match(
+                credits_config.first_payment_match_up_to,
+                payment_session.creditee_id,
+                payment_session.amount,
+                session_id,
+            )
+            .await
+        {
+            tracing::error!(session_id, creditee_id = %payment_session.creditee_id, error = %e, "First-payment match failed; purchase unaffected, grant manually if needed");
+        }
 
         // Real money moved: mark the payer as verified for the onwards rate-limit
         // tier. `creditor_id` is the resolved billing target (org when paying as an
@@ -409,7 +438,12 @@ impl PaymentProvider for StripeProvider {
         Ok(Some(webhook_event))
     }
 
-    async fn process_webhook_event(&self, db_pool: &PgPool, event: &WebhookEvent) -> Result<()> {
+    async fn process_webhook_event(
+        &self,
+        db_pool: &PgPool,
+        event: &WebhookEvent,
+        credits_config: &crate::config::CreditsConfig,
+    ) -> Result<()> {
         // Only process checkout session completion events — ignore all others silently.
         // Stripe may send events like charge.updated, payment_intent.succeeded, etc.
         // that we don't need to act on.
@@ -427,7 +461,7 @@ impl PaymentProvider for StripeProvider {
         tracing::trace!("Processing webhook event {} for session: {}", event.event_type, session_id);
 
         // Use the existing process_payment_session method
-        self.process_payment_session(db_pool, session_id).await
+        self.process_payment_session(db_pool, session_id, credits_config).await
     }
 
     async fn create_auto_topup_checkout_session(&self, payer: &CheckoutPayer, cancel_url: &str, success_url: &str) -> Result<String> {
@@ -742,7 +776,9 @@ mod tests {
         let provider = StripeProvider::from(config);
 
         // Process the same session - should hit fast path and succeed
-        let result = provider.process_payment_session(&pool, session_id).await;
+        let result = provider
+            .process_payment_session(&pool, session_id, &crate::config::CreditsConfig::default())
+            .await;
         assert!(result.is_ok(), "Should succeed via fast path (transaction already exists)");
 
         // Verify only one transaction exists

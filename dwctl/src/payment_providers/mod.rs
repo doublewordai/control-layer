@@ -8,7 +8,10 @@ use axum::http::StatusCode;
 use rust_decimal::Decimal;
 use sqlx::PgPool;
 
-use crate::{UserId, config::PaymentConfig};
+use crate::{
+    UserId,
+    config::{CreditsConfig, PaymentConfig},
+};
 
 pub mod dummy;
 pub mod stripe;
@@ -156,7 +159,11 @@ pub trait PaymentProvider: Send + Sync {
     ///
     /// This is idempotent - calling multiple times with the same session_id
     /// should not create duplicate transactions.
-    async fn process_payment_session(&self, db_pool: &PgPool, session_id: &str) -> Result<()>;
+    ///
+    /// `credits_config` carries credit-system settings (e.g. the first-payment
+    /// match promotion) applied as part of processing, so the provider can act on
+    /// the session it already fetched rather than the caller re-fetching it.
+    async fn process_payment_session(&self, db_pool: &PgPool, session_id: &str, credits_config: &CreditsConfig) -> Result<()>;
 
     /// Validate and extract webhook event from raw request data
     ///
@@ -168,7 +175,10 @@ pub trait PaymentProvider: Send + Sync {
     ///
     /// This is called after validate_webhook succeeds.
     /// Should be idempotent - processing the same event multiple times should be safe.
-    async fn process_webhook_event(&self, db_pool: &PgPool, event: &WebhookEvent) -> Result<()>;
+    ///
+    /// `credits_config` is forwarded to payment processing (see
+    /// `process_payment_session`).
+    async fn process_webhook_event(&self, db_pool: &PgPool, event: &WebhookEvent, credits_config: &CreditsConfig) -> Result<()>;
 
     /// Create a billing portal session for customer self-service
     ///

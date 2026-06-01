@@ -160,6 +160,82 @@ impl<'c> Credits<'c> {
         Ok(CreditTransactionDBResponse::from(transaction))
     }
 
+    /// Grant a first-payment match bonus to `payee` if eligible.
+    ///
+    /// The promotion matches a user's first ever payment with bonus credits, up
+    /// to `match_up_to` (in dollars); `match_up_to <= 0` disables it. Eligibility
+    /// is derived from the ledger: the payee must have no `purchase` other than
+    /// the one identified by `purchase_source_id`, so existing paying customers
+    /// are never matched and the check is order-independent (works whether or not
+    /// the triggering purchase has been written yet).
+    ///
+    /// The bonus is recorded as an `admin_grant` with a derived `source_id`, so a
+    /// webhook+poll double-fire or a webhook retry cannot double-grant (the
+    /// `source_id` unique constraint makes the second insert a no-op). Reuses
+    /// `create_transaction`, so the bonus also triggers the balance-restored
+    /// notify like any other credit.
+    #[instrument(skip(self), fields(payee = %abbrev_uuid(&payee), match_up_to = %match_up_to), err)]
+    pub async fn grant_first_payment_match(
+        &mut self,
+        match_up_to: Decimal,
+        payee: UserId,
+        payment_amount: Decimal,
+        purchase_source_id: &str,
+    ) -> Result<()> {
+        if match_up_to <= Decimal::ZERO {
+            return Ok(());
+        }
+        let match_amount = payment_amount.min(match_up_to);
+        if match_amount <= Decimal::ZERO {
+            return Ok(());
+        }
+
+        // First payment = no prior purchase for this payee other than this one.
+        let is_first = sqlx::query_scalar!(
+            r#"
+            SELECT NOT EXISTS (
+                SELECT 1 FROM credits_transactions
+                WHERE user_id = $1
+                  AND transaction_type = 'purchase'
+                  AND source_id <> $2
+            ) AS "is_first!"
+            "#,
+            payee,
+            purchase_source_id
+        )
+        .fetch_one(&mut *self.db)
+        .await?;
+
+        if !is_first {
+            return Ok(());
+        }
+
+        let request = CreditTransactionCreateDBRequest {
+            user_id: payee,
+            transaction_type: CreditTransactionType::AdminGrant,
+            amount: match_amount,
+            source_id: format!("{purchase_source_id}:first-payment-match"),
+            description: Some(format!("First payment match bonus (matched {})", match_amount)),
+            fusillade_batch_id: None,
+            api_key_id: None,
+        };
+
+        match self.create_transaction(&request).await {
+            Ok(_) => {
+                trace!("Granted first-payment match of {} to payee {}", match_amount, payee);
+                Ok(())
+            }
+            // Another concurrent payment path already granted the match for this
+            // source: idempotent no-op.
+            Err(crate::db::errors::DbError::UniqueViolation { constraint, .. })
+                if constraint.as_deref() == Some("credits_transactions_source_id_unique") =>
+            {
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// Send pg_notify when a user's balance is restored (crosses zero upward).
     /// Format: "credits_transactions:{epoch_micros}" to match other triggers and enable lag metrics.
     async fn notify_balance_restored(&mut self, user_id: UserId) -> Result<()> {
@@ -2237,5 +2313,139 @@ mod tests {
             Decimal::from_str("50.0").unwrap(),
             "User B should only see their own spend"
         );
+    }
+
+    /// Insert a purchase transaction for a user (test helper).
+    async fn insert_purchase(credits: &mut Credits<'_>, user: UserId, amount: &str, source_id: &str) {
+        let request = CreditTransactionCreateDBRequest {
+            user_id: user,
+            transaction_type: CreditTransactionType::Purchase,
+            amount: Decimal::from_str(amount).unwrap(),
+            source_id: source_id.to_string(),
+            description: None,
+            fusillade_batch_id: None,
+            api_key_id: None,
+        };
+        credits.create_transaction(&request).await.expect("insert purchase");
+    }
+
+    /// Fetch the bonus amount granted for a given purchase source_id, if any.
+    async fn match_bonus_amount(pool: &PgPool, source_id: &str) -> Option<Decimal> {
+        sqlx::query_scalar!(
+            "SELECT amount FROM credits_transactions WHERE source_id = $1",
+            format!("{source_id}:first-payment-match")
+        )
+        .fetch_optional(pool)
+        .await
+        .expect("query bonus")
+    }
+
+    #[sqlx::test]
+    async fn test_first_payment_match_grants_on_first_purchase(pool: PgPool) {
+        let user = create_test_user(&pool).await;
+        let mut conn = pool.acquire().await.unwrap();
+        let mut credits = Credits::new(&mut conn);
+
+        insert_purchase(&mut credits, user, "30.0", "sess-1").await;
+        credits
+            .grant_first_payment_match(
+                Decimal::from_str("50.0").unwrap(),
+                user,
+                Decimal::from_str("30.0").unwrap(),
+                "sess-1",
+            )
+            .await
+            .unwrap();
+
+        // First payment of 30 is under the 50 cap, so it is matched in full.
+        assert_eq!(match_bonus_amount(&pool, "sess-1").await, Some(Decimal::from_str("30.0").unwrap()));
+    }
+
+    #[sqlx::test]
+    async fn test_first_payment_match_caps_at_match_up_to(pool: PgPool) {
+        let user = create_test_user(&pool).await;
+        let mut conn = pool.acquire().await.unwrap();
+        let mut credits = Credits::new(&mut conn);
+
+        insert_purchase(&mut credits, user, "100.0", "sess-1").await;
+        credits
+            .grant_first_payment_match(
+                Decimal::from_str("50.0").unwrap(),
+                user,
+                Decimal::from_str("100.0").unwrap(),
+                "sess-1",
+            )
+            .await
+            .unwrap();
+
+        // First payment of 100 is capped at the 50 match limit.
+        assert_eq!(match_bonus_amount(&pool, "sess-1").await, Some(Decimal::from_str("50.0").unwrap()));
+    }
+
+    #[sqlx::test]
+    async fn test_first_payment_match_skips_when_not_first(pool: PgPool) {
+        let user = create_test_user(&pool).await;
+        let mut conn = pool.acquire().await.unwrap();
+        let mut credits = Credits::new(&mut conn);
+
+        // A prior purchase exists, so the current one is not the user's first.
+        insert_purchase(&mut credits, user, "20.0", "sess-0").await;
+        insert_purchase(&mut credits, user, "30.0", "sess-1").await;
+        credits
+            .grant_first_payment_match(
+                Decimal::from_str("50.0").unwrap(),
+                user,
+                Decimal::from_str("30.0").unwrap(),
+                "sess-1",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(match_bonus_amount(&pool, "sess-1").await, None);
+    }
+
+    #[sqlx::test]
+    async fn test_first_payment_match_disabled_when_zero(pool: PgPool) {
+        let user = create_test_user(&pool).await;
+        let mut conn = pool.acquire().await.unwrap();
+        let mut credits = Credits::new(&mut conn);
+
+        insert_purchase(&mut credits, user, "30.0", "sess-1").await;
+        credits
+            .grant_first_payment_match(Decimal::ZERO, user, Decimal::from_str("30.0").unwrap(), "sess-1")
+            .await
+            .unwrap();
+
+        assert_eq!(match_bonus_amount(&pool, "sess-1").await, None);
+    }
+
+    #[sqlx::test]
+    async fn test_first_payment_match_idempotent(pool: PgPool) {
+        let user = create_test_user(&pool).await;
+        let mut conn = pool.acquire().await.unwrap();
+        let mut credits = Credits::new(&mut conn);
+
+        insert_purchase(&mut credits, user, "30.0", "sess-1").await;
+        for _ in 0..2 {
+            credits
+                .grant_first_payment_match(
+                    Decimal::from_str("50.0").unwrap(),
+                    user,
+                    Decimal::from_str("30.0").unwrap(),
+                    "sess-1",
+                )
+                .await
+                .unwrap();
+        }
+
+        // The derived source_id's unique constraint means only one bonus exists.
+        let count = sqlx::query_scalar!(
+            "SELECT COUNT(*) FROM credits_transactions WHERE source_id = $1",
+            "sess-1:first-payment-match"
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, Some(1));
     }
 }
