@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.56.0](https://github.com/doublewordai/control-layer/compare/v8.55.0...v8.56.0) (2026-06-01)
+
+
+### Features
+
+* adds rate limits for unverified users ([#1105](https://github.com/doublewordai/control-layer/issues/1105)) ([3e07a01](https://github.com/doublewordai/control-layer/commit/3e07a01765170ac36a3ce436ca9e750da1c2a205))
+
 ## [8.55.0](https://github.com/doublewordai/control-layer/compare/v8.54.2...v8.55.0) (2026-05-29)
 
 
