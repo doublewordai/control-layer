@@ -262,6 +262,7 @@ pub fn create_test_config() -> crate::config::Config {
             },
             security: SecurityConfig::default(),
             default_user_roles: vec![crate::api::models::users::Role::StandardUser],
+            rate_limits: crate::config::RateLimitTiersConfig::default(),
         },
         enable_metrics: false,
         enable_request_logging: false,

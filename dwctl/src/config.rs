@@ -674,6 +674,10 @@ pub struct AuthConfig {
     /// Applies to user registration and proxy header auth auto-creation
     /// StandardUser role is always guaranteed to be present even if not specified
     pub default_user_roles: Vec<Role>,
+    /// Default rate-limit tiers applied to API keys based on the owning user's
+    /// `verified` flag. Only used when the api_key has no explicit per-key
+    /// override. Leaving either tier as `None` means "no limit for that tier".
+    pub rate_limits: RateLimitTiersConfig,
 }
 
 impl Default for AuthConfig {
@@ -683,8 +687,26 @@ impl Default for AuthConfig {
             proxy_header: ProxyHeaderAuthConfig::default(),
             security: SecurityConfig::default(),
             default_user_roles: vec![Role::StandardUser],
+            rate_limits: RateLimitTiersConfig::default(),
         }
     }
+}
+
+/// Per-tier defaults for API key rate limits. A `None` tier means no default
+/// limit is applied, preserving the legacy "unlimited unless overridden"
+/// behaviour for that tier.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RateLimitTiersConfig {
+    pub verified: Option<RateLimitTierConfig>,
+    pub unverified: Option<RateLimitTierConfig>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RateLimitTierConfig {
+    pub requests_per_second: f32,
+    pub burst_size: Option<i32>,
 }
 
 /// Native username/password authentication configuration.

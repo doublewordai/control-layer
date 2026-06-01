@@ -295,6 +295,7 @@ mod tests {
     use std::str::FromStr;
 
     use crate::Role;
+    use crate::config::RateLimitTiersConfig;
     use crate::db::handlers::{Deployments, Groups, InferenceEndpoints, Repository, Tariffs};
     use crate::db::models::{
         deployments::{DeploymentCreateDBRequest, LoadBalancingStrategy},
@@ -417,7 +418,9 @@ mod tests {
         tx.commit().await.unwrap();
 
         // Load targets and update metrics
-        let targets = load_targets_from_db(&pool, &[], false).await.unwrap();
+        let targets = load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
+            .await
+            .unwrap();
         super::update_cache_info_metrics(&pool, &targets, &mut state).await.unwrap();
 
         let output = handle.render();
@@ -566,7 +569,9 @@ mod tests {
         .await
         .unwrap();
 
-        let targets = load_targets_from_db(&pool, &[], false).await.unwrap();
+        let targets = load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
+            .await
+            .unwrap();
         super::update_cache_info_metrics(&pool, &targets, &mut state).await.unwrap();
 
         let output = handle.render();
@@ -657,7 +662,9 @@ mod tests {
         .unwrap();
         tx.commit().await.unwrap();
 
-        let targets = load_targets_from_db(&pool, &[], false).await.unwrap();
+        let targets = load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
+            .await
+            .unwrap();
         super::update_cache_info_metrics(&pool, &targets, &mut state).await.unwrap();
 
         let output = handle.render();
@@ -779,7 +786,9 @@ mod tests {
         .unwrap();
 
         // Cycle 1: group is present — populates PREV_GROUPS
-        let targets = load_targets_from_db(&pool, &[], false).await.unwrap();
+        let targets = load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
+            .await
+            .unwrap();
         super::update_cache_info_metrics(&pool, &targets, &mut state).await.unwrap();
 
         let output = handle.render();
@@ -806,7 +815,9 @@ mod tests {
         .unwrap();
 
         // Cycle 2: group is gone — zeroing should zero the ORIGINAL series
-        let targets = load_targets_from_db(&pool, &[], false).await.unwrap();
+        let targets = load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
+            .await
+            .unwrap();
         super::update_cache_info_metrics(&pool, &targets, &mut state).await.unwrap();
 
         let output = handle.render();
@@ -956,7 +967,9 @@ mod tests {
         .unwrap();
 
         // Cycle 1: component is present
-        let targets = load_targets_from_db(&pool, &[], false).await.unwrap();
+        let targets = load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
+            .await
+            .unwrap();
         super::update_cache_info_metrics(&pool, &targets, &mut state).await.unwrap();
 
         let output = handle.render();
@@ -981,7 +994,9 @@ mod tests {
         .unwrap();
 
         // Cycle 2: component is gone — should zero the original series
-        let targets = load_targets_from_db(&pool, &[], false).await.unwrap();
+        let targets = load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
+            .await
+            .unwrap();
         super::update_cache_info_metrics(&pool, &targets, &mut state).await.unwrap();
 
         let output = handle.render();
@@ -1079,7 +1094,9 @@ mod tests {
         tx.commit().await.unwrap();
 
         // Cycle 1: model is active
-        let targets = load_targets_from_db(&pool, &[], false).await.unwrap();
+        let targets = load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
+            .await
+            .unwrap();
         super::update_cache_info_metrics(&pool, &targets, &mut state).await.unwrap();
 
         let output = handle.render();
@@ -1104,7 +1121,9 @@ mod tests {
             .unwrap();
 
         // Cycle 2: model is deleted — gauges should be zeroed
-        let targets = load_targets_from_db(&pool, &[], false).await.unwrap();
+        let targets = load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
+            .await
+            .unwrap();
         super::update_cache_info_metrics(&pool, &targets, &mut state).await.unwrap();
 
         let output = handle.render();
@@ -1206,7 +1225,9 @@ mod tests {
         tx.commit().await.unwrap();
 
         // Cycle 1: model exists, is_metered=false (no tariff)
-        let targets = load_targets_from_db(&pool, &[], false).await.unwrap();
+        let targets = load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
+            .await
+            .unwrap();
         super::update_cache_info_metrics(&pool, &targets, &mut state).await.unwrap();
 
         let output = handle.render();
@@ -1234,7 +1255,9 @@ mod tests {
         tx.commit().await.unwrap();
 
         // Cycle 2: same model, but is_metered changed
-        let targets = load_targets_from_db(&pool, &[], false).await.unwrap();
+        let targets = load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
+            .await
+            .unwrap();
         super::update_cache_info_metrics(&pool, &targets, &mut state).await.unwrap();
 
         let output = handle.render();
