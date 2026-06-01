@@ -30,6 +30,10 @@ type PendingCountsByModelAndWindow = HashMap<String, HashMap<String, i64>>;
 ///   externally rather than by the fusillade daemon and so should not drive
 ///   GPU scheduling decisions.
 ///
+/// When `batches.priority_decay_window_secs` is configured, recently completed
+/// flex requests are added back into the `1h` count for their model for
+/// that many seconds.
+///
 /// Useful for monitoring queue depth and load distribution across models.
 #[utoipa::path(
     get,
@@ -60,7 +64,14 @@ pub async fn get_pending_request_counts<P: PoolProvider>(
 
     let counts = state
         .request_manager
-        .get_pending_request_counts_by_model_and_window(&windows, &states, &model_filter, &service_tier_filter, false)
+        .get_pending_request_counts_by_model_and_window(
+            &windows,
+            &states,
+            &model_filter,
+            &service_tier_filter,
+            config.batches.priority_decay_window_secs,
+            false,
+        )
         .await
         .map_err(|e| Error::Internal {
             operation: format!("get pending request counts: {}", e),
@@ -226,5 +237,166 @@ mod tests {
             count_24h, 2,
             "expected 2 (batch + flex) within 24h window — priority must be excluded; got {count_24h} ({model_counts:?})"
         );
+    }
+
+    #[sqlx::test]
+    async fn test_pending_request_counts_priority_decay_window_includes_recent_flex(pool: PgPool) {
+        use fusillade::{CreateFlexInput, RequestId, Storage};
+        use sqlx::postgres::PgConnectOptions;
+        use sqlx_pool_router::TestDbPools;
+
+        let mut config = create_test_config();
+        config.batches.allowed_completion_windows = vec!["1h".to_string(), "24h".to_string()];
+        config.batches.priority_decay_window_secs = Some(600);
+        let (server, _bg): (TestServer, _) = create_test_app_with_config(pool.clone(), config, false).await;
+        let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+
+        let base_opts: PgConnectOptions = pool.connect_options().as_ref().clone();
+        let fusillade_pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .min_connections(0)
+            .connect_with(base_opts.options([("search_path", "fusillade")]))
+            .await
+            .expect("Failed to create fusillade pool");
+        let fusillade_pools = TestDbPools::new(fusillade_pool.clone()).await.expect("TestDbPools");
+        let request_manager = fusillade::PostgresRequestManager::new(fusillade_pools, Default::default());
+
+        let model = "flex-decay-model";
+        let recent_id = uuid::Uuid::new_v4();
+        request_manager
+            .create_flex(CreateFlexInput {
+                request_id: recent_id,
+                body: r#"{"input":"recent"}"#.to_string(),
+                model: model.to_string(),
+                endpoint: "http://localhost".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/responses".to_string(),
+                api_key: String::new(),
+                created_by: "queue-user".to_string(),
+            })
+            .await
+            .expect("create recent flex");
+        mark_fusillade_request_processing(&fusillade_pool, recent_id)
+            .await
+            .expect("start recent flex");
+        request_manager
+            .complete_request(RequestId(recent_id), r#"{"output":"recent"}"#, 200)
+            .await
+            .expect("complete recent flex");
+
+        let old_id = uuid::Uuid::new_v4();
+        request_manager
+            .create_flex(CreateFlexInput {
+                request_id: old_id,
+                body: r#"{"input":"old"}"#.to_string(),
+                model: model.to_string(),
+                endpoint: "http://localhost".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/responses".to_string(),
+                api_key: String::new(),
+                created_by: "queue-user".to_string(),
+            })
+            .await
+            .expect("create old flex");
+        mark_fusillade_request_processing(&fusillade_pool, old_id)
+            .await
+            .expect("start old flex");
+        request_manager
+            .complete_request(RequestId(old_id), r#"{"output":"old"}"#, 200)
+            .await
+            .expect("complete old flex");
+
+        let failed_id = uuid::Uuid::new_v4();
+        request_manager
+            .create_flex(CreateFlexInput {
+                request_id: failed_id,
+                body: r#"{"input":"failed"}"#.to_string(),
+                model: model.to_string(),
+                endpoint: "http://localhost".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/responses".to_string(),
+                api_key: String::new(),
+                created_by: "queue-user".to_string(),
+            })
+            .await
+            .expect("create failed flex");
+        mark_fusillade_request_processing(&fusillade_pool, failed_id)
+            .await
+            .expect("start failed flex");
+        request_manager
+            .fail_request(RequestId(failed_id), r#"{"error":"failed"}"#, 500)
+            .await
+            .expect("fail flex");
+
+        let canceled_id = uuid::Uuid::new_v4();
+        request_manager
+            .create_flex(CreateFlexInput {
+                request_id: canceled_id,
+                body: r#"{"input":"canceled"}"#.to_string(),
+                model: model.to_string(),
+                endpoint: "http://localhost".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/responses".to_string(),
+                api_key: String::new(),
+                created_by: "queue-user".to_string(),
+            })
+            .await
+            .expect("create canceled flex");
+
+        sqlx::query("UPDATE requests SET completed_at = NOW() - INTERVAL '5 minutes' WHERE id = $1")
+            .bind(recent_id)
+            .execute(&fusillade_pool)
+            .await
+            .expect("age recent completion");
+        sqlx::query("UPDATE requests SET completed_at = NOW() - INTERVAL '20 minutes' WHERE id = $1")
+            .bind(old_id)
+            .execute(&fusillade_pool)
+            .await
+            .expect("age old completion");
+        sqlx::query("UPDATE requests SET failed_at = NOW() - INTERVAL '5 minutes' WHERE id = $1")
+            .bind(failed_id)
+            .execute(&fusillade_pool)
+            .await
+            .expect("age failed request");
+        sqlx::query("UPDATE requests SET state = 'canceled', canceled_at = NOW() - INTERVAL '5 minutes' WHERE id = $1")
+            .bind(canceled_id)
+            .execute(&fusillade_pool)
+            .await
+            .expect("cancel request");
+
+        let response = server
+            .get("/admin/api/v1/monitoring/pending-request-counts")
+            .add_header(&add_auth_headers(&admin)[0].0, &add_auth_headers(&admin)[0].1)
+            .add_header(&add_auth_headers(&admin)[1].0, &add_auth_headers(&admin)[1].1)
+            .await;
+        response.assert_status_ok();
+        let counts: HashMap<String, HashMap<String, i64>> = response.json();
+
+        let model_counts = counts
+            .get(model)
+            .unwrap_or_else(|| panic!("expected '{model}' in response, got {counts:?}"));
+        assert_eq!(
+            *model_counts.get("1h").unwrap_or(&0),
+            1,
+            "only completed flex requests within the 10 minute decay window should count"
+        );
+    }
+
+    async fn mark_fusillade_request_processing(pool: &PgPool, id: uuid::Uuid) -> sqlx::Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE requests
+            SET state = 'processing',
+                daemon_id = gen_random_uuid(),
+                claimed_at = NOW(),
+                started_at = NOW()
+            WHERE id = $1
+            "#,
+        )
+        .bind(id)
+        .execute(pool)
+        .await?;
+
+        Ok(())
     }
 }

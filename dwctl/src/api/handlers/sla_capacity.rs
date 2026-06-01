@@ -240,6 +240,7 @@ pub(crate) async fn reserve_capacity<P: sqlx_pool_router::PoolProvider>(
             &states,
             &model_filter,
             &ServiceTierFilter::Exclude(vec![Some("priority".to_string())]),
+            None,
             true,
         )
         .await
