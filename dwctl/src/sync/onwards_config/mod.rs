@@ -773,12 +773,17 @@ fn convert_composite_to_target_spec(
 ) -> (String, TargetSpecOrList) {
     // Add this composite model's API keys to key_definitions
     for api_key in &composite.api_keys {
-        let rate_limit = resolve_key_rate_limit(
-            api_key.requests_per_second,
-            api_key.burst_size,
-            api_key.user_verified,
-            rate_limit_tiers,
-        );
+        // The system key (nil UUID) carries internal traffic and is never tiered.
+        let rate_limit = if api_key.id.is_nil() {
+            None
+        } else {
+            resolve_key_rate_limit(
+                api_key.requests_per_second,
+                api_key.burst_size,
+                api_key.user_verified,
+                rate_limit_tiers,
+            )
+        };
 
         let labels = HashMap::from([("purpose".to_string(), api_key.purpose.clone())]);
 
@@ -1006,12 +1011,17 @@ fn convert_to_config_file(
         .map(|target| {
             // Add this target's API keys to key_definitions
             for api_key in &target.api_keys {
-                let rate_limit = resolve_key_rate_limit(
-                    api_key.requests_per_second,
-                    api_key.burst_size,
-                    api_key.user_verified,
-                    rate_limit_tiers,
-                );
+                // The system key (nil UUID) carries internal traffic and is never tiered.
+                let rate_limit = if api_key.id.is_nil() {
+                    None
+                } else {
+                    resolve_key_rate_limit(
+                        api_key.requests_per_second,
+                        api_key.burst_size,
+                        api_key.user_verified,
+                        rate_limit_tiers,
+                    )
+                };
 
                 // Build labels from API key purpose
                 let labels = HashMap::from([("purpose".to_string(), api_key.purpose.clone())]);

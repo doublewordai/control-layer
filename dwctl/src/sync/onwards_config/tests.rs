@@ -478,6 +478,81 @@ async fn test_composite_unmetered_access_matches_regular_model_policy(pool: sqlx
     assert!(pool_has_key(composite_pool, KEY_A_SECRET));
 }
 
+/// End-to-end check that the verified/unverified tier reaches the onwards
+/// limiter for a real key loaded from the DB. Exercises the full path: the
+/// `JOIN users` that fetches `verified`, `resolve_key_rate_limit`, and
+/// `Targets::from_config` building the governor limiter. We assert behaviour
+/// (burst enforcement) rather than the configured numbers because governor
+/// does not expose the quota once built.
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+async fn test_unverified_key_gets_tier_limiter_verified_key_does_not(pool: sqlx::PgPool) {
+    use crate::config::RateLimitTierConfig;
+
+    // User A (KEY_A_SECRET) starts unverified (column default) and owns a key
+    // with no per-key override, with access to the unmetered `regular-private`
+    // model. Configure an unverified tier and leave the verified tier unset.
+    let tiers = RateLimitTiersConfig {
+        verified: None,
+        unverified: Some(RateLimitTierConfig {
+            requests_per_second: 1.0,
+            burst_size: Some(3),
+        }),
+    };
+
+    let targets = super::load_targets_from_db(&pool, &[], false, &tiers).await.unwrap();
+
+    // The unverified user's key has a limiter, and it enforces burst = 3:
+    // three immediate checks pass, the fourth is throttled. All four run
+    // back-to-back so no replenishment happens between them.
+    {
+        let limiter = targets
+            .key_rate_limiters
+            .get(KEY_A_SECRET)
+            .expect("unverified user's key should have a rate limiter");
+        assert!(limiter.check().is_ok(), "1st request within burst");
+        assert!(limiter.check().is_ok(), "2nd request within burst");
+        assert!(limiter.check().is_ok(), "3rd request within burst");
+        assert!(limiter.check().is_err(), "4th request exceeds burst of 3");
+    }
+
+    // Flip the user to verified. With the verified tier unset, the key should
+    // now have no limiter at all (unlimited).
+    sqlx::query!("UPDATE users SET verified = true WHERE id = '00000000-0000-0000-0000-0000000000a1'")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let targets = super::load_targets_from_db(&pool, &[], false, &tiers).await.unwrap();
+    assert!(
+        targets.key_rate_limiters.get(KEY_A_SECRET).is_none(),
+        "verified user with an unset verified tier should have no limiter"
+    );
+}
+
+/// The system key (nil UUID) carries internal traffic (DB probes, deployment
+/// access) and must never be subject to a tier limit, even when both tiers are
+/// configured restrictively.
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+async fn test_system_key_is_immune_to_rate_limit_tiers(pool: sqlx::PgPool) {
+    use crate::config::RateLimitTierConfig;
+
+    let restrictive = RateLimitTierConfig {
+        requests_per_second: 1.0,
+        burst_size: Some(1),
+    };
+    let tiers = RateLimitTiersConfig {
+        verified: Some(restrictive),
+        unverified: Some(restrictive),
+    };
+
+    let targets = super::load_targets_from_db(&pool, &[], false, &tiers).await.unwrap();
+
+    assert!(
+        targets.key_rate_limiters.get(SYSTEM_KEY_SECRET).is_none(),
+        "system key must never receive a tier rate limiter"
+    );
+}
+
 /// Test that tariff changes trigger onwards config reload via Postgres NOTIFY
 #[sqlx::test]
 async fn test_onwards_config_reloads_on_tariff_change(pool: sqlx::PgPool) {
