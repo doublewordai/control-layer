@@ -253,13 +253,17 @@ impl PaymentProvider for StripeProvider {
             })?
             .unwrap_or(creditor_id);
 
-        // Get price from line_items or amount_total
+        // Credit the pre-tax amount. Stripe's `amount_total` includes the sales
+        // tax we collect on its behalf, so crediting it would hand users free
+        // credits equal to the tax. `amount_subtotal` is the amount before tax
+        // (the price of the credits themselves). This flow uses a fixed price with
+        // no discounts, so subtotal is the correct credited value.
         let price = checkout_session
             .line_items
-            .and_then(|items| items.data.first().map(|item| item.amount_total))
-            .or(checkout_session.amount_total)
+            .and_then(|items| items.data.first().map(|item| item.amount_subtotal))
+            .or(checkout_session.amount_subtotal)
             .ok_or_else(|| {
-                tracing::error!("Checkout session missing both line_items and amount_total");
+                tracing::error!("Checkout session missing both line_items and amount_subtotal");
                 PaymentError::InvalidData("Missing payment amount".to_string())
             })?
             / 100; // Convert cents to dollars
