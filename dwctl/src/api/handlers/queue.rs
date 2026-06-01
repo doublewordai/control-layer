@@ -276,9 +276,7 @@ mod tests {
             })
             .await
             .expect("create recent flex");
-        sqlx::query("UPDATE requests SET state = 'processing' WHERE id = $1")
-            .bind(recent_id)
-            .execute(&fusillade_pool)
+        mark_fusillade_request_processing(&fusillade_pool, recent_id)
             .await
             .expect("start recent flex");
         request_manager
@@ -300,9 +298,7 @@ mod tests {
             })
             .await
             .expect("create old flex");
-        sqlx::query("UPDATE requests SET state = 'processing' WHERE id = $1")
-            .bind(old_id)
-            .execute(&fusillade_pool)
+        mark_fusillade_request_processing(&fusillade_pool, old_id)
             .await
             .expect("start old flex");
         request_manager
@@ -324,9 +320,7 @@ mod tests {
             })
             .await
             .expect("create failed flex");
-        sqlx::query("UPDATE requests SET state = 'processing' WHERE id = $1")
-            .bind(failed_id)
-            .execute(&fusillade_pool)
+        mark_fusillade_request_processing(&fusillade_pool, failed_id)
             .await
             .expect("start failed flex");
         request_manager
@@ -386,5 +380,23 @@ mod tests {
             1,
             "only completed flex requests within the 10 minute decay window should count"
         );
+    }
+
+    async fn mark_fusillade_request_processing(pool: &PgPool, id: uuid::Uuid) -> sqlx::Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE requests
+            SET state = 'processing',
+                daemon_id = gen_random_uuid(),
+                claimed_at = NOW(),
+                started_at = NOW()
+            WHERE id = $1
+            "#,
+        )
+        .bind(id)
+        .execute(pool)
+        .await?;
+
+        Ok(())
     }
 }
