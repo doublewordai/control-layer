@@ -936,6 +936,13 @@ async fn process_auto_topups(
             api_key_id: None,
         };
 
+        // Charge succeeded above (`charge_auto_topup` returned Ok), so the card has
+        // been charged regardless of what happens with the credit-transaction insert
+        // below. Mark verified now for the onwards rate-limit tier.
+        if let Err(e) = Users::new(&mut *conn).set_verified(user.id).await {
+            tracing::warn!(user_id = %user.id, error = %e, "Failed to mark user verified after auto top-up");
+        }
+
         let mut credits = Credits::new(&mut *conn);
         match credits.create_transaction(&request).await {
             Ok(_) => {

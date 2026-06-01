@@ -350,8 +350,18 @@ impl PaymentProvider for StripeProvider {
             api_key_id: None,
         };
 
-        let mut credits = Credits::new(&mut conn);
-        credits.create_transaction(&request).await?;
+        Credits::new(&mut conn).create_transaction(&request).await?;
+
+        // Real money moved: mark the payer as verified for the onwards rate-limit
+        // tier. `creditor_id` is the resolved billing target (org when paying as an
+        // org, otherwise self), so this naturally verifies whichever entity owns
+        // the keys we care about in the common case. For the rare admin
+        // pay-on-behalf flow (explicit `creditee_id` query param) the payer is
+        // verified rather than the recipient, which we accept as the right
+        // semantic for "this entity can pay".
+        crate::db::handlers::users::Users::new(&mut conn)
+            .set_verified(payment_session.creditor_id)
+            .await?;
 
         tracing::debug!(
             "Successfully fulfilled checkout session {} for user {}",

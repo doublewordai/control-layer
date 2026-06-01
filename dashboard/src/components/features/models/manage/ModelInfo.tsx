@@ -58,6 +58,7 @@ import { Input } from "../../../ui/input";
 import { Textarea } from "../../../ui/textarea";
 import { InfoTip } from "../../../ui/info-tip";
 import { Checkbox } from "../../../ui/checkbox";
+import { Switch } from "../../../ui/switch";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "../../../ui/tabs";
 import {
   Select,
@@ -167,6 +168,20 @@ const ModelInfo: React.FC = () => {
     allowed_batch_completion_windows: null as string[] | null,
     traffic_routing_rules: [] as TrafficRoutingRule[],
     metadata: null as ModelMetadata | null,
+    // Inter-attempt retry backoff. Toggling on for a standard
+    // (single-provider) model also flips fallback_enabled +
+    // fallback_with_replacement in handleSave so onwards' SelectIter
+    // actually retries (otherwise it yields exactly once).
+    backoff_enabled: false,
+    backoff_initial_ms: 100,
+    backoff_max_ms: 5000,
+    backoff_factor: 2.0,
+    backoff_jitter: "full" as "full" | "none",
+    backoff_max_total_ms: null as number | null,
+    // Total attempts incl. the first. For a single-provider model this is
+    // what lets the same provider be retried — without it (> 1) onwards caps
+    // at the provider count (1) and backoff never fires.
+    backoff_max_attempts: 3 as number | null,
   });
   const [settingsError, setSettingsError] = useState<string | null>(null);
   const [showApiExamples, setShowApiExamples] = useState(false);
@@ -273,6 +288,13 @@ const ModelInfo: React.FC = () => {
           model.allowed_batch_completion_windows ?? null,
         traffic_routing_rules: model.traffic_routing_rules || [],
         metadata: model.metadata ?? null,
+        backoff_enabled: model.fallback?.backoff != null,
+        backoff_initial_ms: model.fallback?.backoff?.initial_ms ?? 100,
+        backoff_max_ms: model.fallback?.backoff?.max_ms ?? 5000,
+        backoff_factor: model.fallback?.backoff?.factor ?? 2.0,
+        backoff_jitter: model.fallback?.backoff?.jitter ?? "full",
+        backoff_max_total_ms: model.fallback?.max_total_backoff_ms ?? null,
+        backoff_max_attempts: model.fallback?.max_attempts ?? 3,
       });
       aliasForm.reset({
         alias: model.alias,
@@ -312,6 +334,25 @@ const ModelInfo: React.FC = () => {
     }
 
     try {
+      // For standard (single-provider) models, the backoff toggle implicitly
+      // controls fallback + with_replacement too — otherwise SelectIter
+      // yields exactly once and there are no retries to delay. Composite
+      // models keep their fallback config in the Routing Configuration
+      // dialog, so we only send backoff fields here.
+      const isStandard = !model.is_composite;
+      const standardFallbackOverrides = isStandard
+        ? {
+            fallback_enabled: updateData.backoff_enabled,
+            fallback_with_replacement: updateData.backoff_enabled,
+            // Without max_attempts > 1 a single-provider pool yields once and
+            // backoff can't fire. Carry the user's value when backoff is on;
+            // clear it when off.
+            fallback_max_attempts: updateData.backoff_enabled
+              ? (updateData.backoff_max_attempts ?? 3)
+              : null,
+          }
+        : {};
+
       await updateModelMutation.mutateAsync({
         id: model.id,
         data: {
@@ -337,6 +378,15 @@ const ModelInfo: React.FC = () => {
             updateData.allowed_batch_completion_windows,
           traffic_routing_rules: normalizedTrafficRules,
           metadata: updateData.metadata,
+          backoff_enabled: updateData.backoff_enabled,
+          backoff_initial_ms: updateData.backoff_initial_ms,
+          backoff_max_ms: updateData.backoff_max_ms,
+          backoff_factor: updateData.backoff_factor,
+          backoff_jitter: updateData.backoff_jitter,
+          backoff_max_total_ms: updateData.backoff_enabled
+            ? updateData.backoff_max_total_ms
+            : null,
+          ...standardFallbackOverrides,
         },
       });
       setIsEditingModelDetails(false);
@@ -371,6 +421,13 @@ const ModelInfo: React.FC = () => {
           model.allowed_batch_completion_windows ?? null,
         traffic_routing_rules: model.traffic_routing_rules || [],
         metadata: model.metadata ?? null,
+        backoff_enabled: model.fallback?.backoff != null,
+        backoff_initial_ms: model.fallback?.backoff?.initial_ms ?? 100,
+        backoff_max_ms: model.fallback?.backoff?.max_ms ?? 5000,
+        backoff_factor: model.fallback?.backoff?.factor ?? 2.0,
+        backoff_jitter: model.fallback?.backoff?.jitter ?? "full",
+        backoff_max_total_ms: model.fallback?.max_total_backoff_ms ?? null,
+        backoff_max_attempts: model.fallback?.max_attempts ?? 3,
       });
     }
     setIsEditingModelDetails(false);
@@ -1802,6 +1859,231 @@ const ModelInfo: React.FC = () => {
                               </p>
                             </div>
                           )}
+                      </div>
+
+                      {/* Retry Backoff Section */}
+                      <div className="space-y-4 pt-6 border-t">
+                        <div>
+                          <h4 className="text-base font-semibold text-gray-900 flex items-center gap-2">
+                            Retry Backoff
+                            <InfoTip>
+                              <p className="text-sm text-muted-foreground">
+                                Insert an exponential delay between retry
+                                attempts on transient upstream failures
+                                (rate-limit / 5xx / network errors). For
+                                single-provider models, this also opts into
+                                same-provider retries. For composite models,
+                                this gates the wait between fallback hops
+                                configured in Routing Configuration.
+                              </p>
+                            </InfoTip>
+                          </h4>
+                          <p className="text-sm text-gray-500 mt-1">
+                            Off (default) preserves the legacy zero-delay
+                            retry behavior.
+                          </p>
+                        </div>
+
+                        <div className="flex items-center justify-between">
+                          <label className="text-sm text-gray-700">
+                            Enable backoff
+                          </label>
+                          <Switch
+                            checked={updateData.backoff_enabled}
+                            onCheckedChange={(checked) =>
+                              setUpdateData((prev) => ({
+                                ...prev,
+                                backoff_enabled: checked,
+                              }))
+                            }
+                          />
+                        </div>
+
+                        {updateData.backoff_enabled && (
+                          <div className="space-y-3 pl-4 border-l-2 border-gray-200">
+                            {/* Max attempts — only meaningful (and only
+                                settable here) for single-provider models.
+                                Composite models set failover attempts in the
+                                Routing Configuration dialog instead. */}
+                            {!model.is_composite && (
+                              <div>
+                                <label className="text-sm text-gray-600 mb-1 flex items-center gap-1">
+                                  Max attempts
+                                  <InfoTip>
+                                    <p className="text-sm text-muted-foreground">
+                                      Total tries including the first. Must be
+                                      &gt; 1 for retries to happen — a
+                                      single-provider model otherwise makes one
+                                      attempt and stops, so backoff never fires.
+                                    </p>
+                                  </InfoTip>
+                                </label>
+                                <Input
+                                  type="number"
+                                  min="2"
+                                  value={updateData.backoff_max_attempts ?? ""}
+                                  onChange={(e) => {
+                                    const val = e.target.value;
+                                    if (val === "") {
+                                      setUpdateData((prev) => ({
+                                        ...prev,
+                                        backoff_max_attempts: null,
+                                      }));
+                                    } else {
+                                      const num = Number(val);
+                                      // Must be > 1: a single attempt means no
+                                      // retry, so backoff would never fire.
+                                      if (Number.isFinite(num) && num >= 2) {
+                                        setUpdateData((prev) => ({
+                                          ...prev,
+                                          backoff_max_attempts: Math.floor(num),
+                                        }));
+                                      }
+                                    }
+                                  }}
+                                  placeholder="3"
+                                  className="w-32"
+                                />
+                              </div>
+                            )}
+                            <div className="grid grid-cols-2 gap-3">
+                              <div>
+                                <label className="text-sm text-gray-600 mb-1 block">
+                                  Initial delay (ms)
+                                </label>
+                                <Input
+                                  type="number"
+                                  min="1"
+                                  value={updateData.backoff_initial_ms}
+                                  onChange={(e) => {
+                                    const num = Number(e.target.value);
+                                    if (Number.isFinite(num) && num >= 1) {
+                                      setUpdateData((prev) => ({
+                                        ...prev,
+                                        backoff_initial_ms: Math.floor(num),
+                                      }));
+                                    }
+                                  }}
+                                />
+                              </div>
+                              <div>
+                                <label className="text-sm text-gray-600 mb-1 block">
+                                  Max delay (ms)
+                                </label>
+                                <Input
+                                  type="number"
+                                  min="1"
+                                  value={updateData.backoff_max_ms}
+                                  onChange={(e) => {
+                                    const num = Number(e.target.value);
+                                    if (Number.isFinite(num) && num >= 1) {
+                                      setUpdateData((prev) => ({
+                                        ...prev,
+                                        backoff_max_ms: Math.floor(num),
+                                      }));
+                                    }
+                                  }}
+                                />
+                              </div>
+                            </div>
+
+                            <div className="grid grid-cols-2 gap-3">
+                              <div>
+                                <label className="text-sm text-gray-600 mb-1 flex items-center gap-1">
+                                  Growth factor
+                                  <InfoTip>
+                                    <p className="text-sm text-muted-foreground">
+                                      Each retry's base delay = initial ×
+                                      factor^(retry − 1), capped at max delay.
+                                    </p>
+                                  </InfoTip>
+                                </label>
+                                <Input
+                                  type="number"
+                                  step="0.1"
+                                  min="1"
+                                  value={updateData.backoff_factor}
+                                  onChange={(e) => {
+                                    const num = Number(e.target.value);
+                                    if (Number.isFinite(num) && num >= 1) {
+                                      setUpdateData((prev) => ({
+                                        ...prev,
+                                        backoff_factor: num,
+                                      }));
+                                    }
+                                  }}
+                                />
+                              </div>
+                              <div>
+                                <label className="text-sm text-gray-600 mb-1 flex items-center gap-1">
+                                  Jitter
+                                  <InfoTip>
+                                    <p className="text-sm text-muted-foreground">
+                                      <b>Full</b> samples uniformly from
+                                      [0, delay] to avoid synchronized retries.
+                                      <br />
+                                      <b>None</b> uses the exact computed delay.
+                                    </p>
+                                  </InfoTip>
+                                </label>
+                                <Select
+                                  value={updateData.backoff_jitter}
+                                  onValueChange={(v) =>
+                                    setUpdateData((prev) => ({
+                                      ...prev,
+                                      backoff_jitter: v as "full" | "none",
+                                    }))
+                                  }
+                                >
+                                  <SelectTrigger>
+                                    <SelectValue />
+                                  </SelectTrigger>
+                                  <SelectContent>
+                                    <SelectItem value="full">Full</SelectItem>
+                                    <SelectItem value="none">None</SelectItem>
+                                  </SelectContent>
+                                </Select>
+                              </div>
+                            </div>
+
+                            <div>
+                              <label className="text-sm text-gray-600 mb-1 flex items-center gap-1">
+                                Total backoff budget (ms)
+                                <InfoTip>
+                                  <p className="text-sm text-muted-foreground">
+                                    Cumulative cap across all inter-attempt
+                                    sleeps. Blank = no budget cap (max_attempts
+                                    still bounds the loop).
+                                  </p>
+                                </InfoTip>
+                              </label>
+                              <Input
+                                type="number"
+                                min="1"
+                                value={updateData.backoff_max_total_ms ?? ""}
+                                onChange={(e) => {
+                                  const val = e.target.value;
+                                  if (val === "") {
+                                    setUpdateData((prev) => ({
+                                      ...prev,
+                                      backoff_max_total_ms: null,
+                                    }));
+                                  } else {
+                                    const num = Number(val);
+                                    if (Number.isFinite(num) && num >= 1) {
+                                      setUpdateData((prev) => ({
+                                        ...prev,
+                                        backoff_max_total_ms: Math.floor(num),
+                                      }));
+                                    }
+                                  }
+                                }}
+                                placeholder="No cap"
+                                className="w-40"
+                              />
+                            </div>
+                          </div>
+                        )}
                       </div>
 
                       <div className="flex items-center gap-3 pt-4 border-t justify-end">

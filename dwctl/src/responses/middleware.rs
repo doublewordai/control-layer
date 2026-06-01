@@ -26,7 +26,6 @@ use axum::{
 use fusillade::{PostgresRequestManager, ReqwestHttpClient};
 use sqlx_pool_router::PoolProvider;
 
-use super::jobs::CreateResponseInput;
 use super::store::{self as response_store, ONWARDS_RESPONSE_ID_HEADER, OnwardsDaemonId};
 
 /// State for the responses middleware.
@@ -40,9 +39,6 @@ pub struct ResponsesMiddlewareState<P: PoolProvider + Clone = sqlx_pool_router::
     pub loopback_base_url: String,
     /// dwctl database pool for model access validation.
     pub dwctl_pool: sqlx::PgPool,
-    /// Underway job used to create the realtime tracking batch asynchronously
-    /// on the blocking (non-background) path.
-    pub create_response_job: Arc<underway::Job<CreateResponseInput, crate::tasks::TaskState<P>>>,
     /// Multi-step warm-path streaming pieces. When the user sends
     /// `stream: true` (and not `background: true`) on `/v1/responses`,
     /// the middleware routes the request through
@@ -380,10 +376,14 @@ fn warm_path_branch(is_responses_api: bool, is_flex: bool, background: bool, str
 
 /// Handle a realtime request (priority/default/auto).
 ///
-/// For `background=true`: creates the request row synchronously (so the client
-/// can immediately poll by ID), then spawns the proxy in the background.
-/// For `background=false`: fires off row creation in the background and
-/// proxies immediately — the outlet handler completes the row.
+/// For `background=true`: creates the request row synchronously so the client
+/// can immediately poll by ID, then spawns the proxy in the background.
+///
+/// For `background=false`: no DB write up front. The client is holding the
+/// HTTP connection and cannot poll, so the row only needs to appear at
+/// completion time. The outlet handler sends a completion record to the
+/// in-process `RequestsWriter`, which inserts the row directly in
+/// `completed` state via the batched persist path.
 #[allow(clippy::too_many_arguments)]
 async fn handle_realtime<P: PoolProvider + Clone + Send + Sync + 'static>(
     state: &ResponsesMiddlewareState<P>,
@@ -405,28 +405,14 @@ async fn handle_realtime<P: PoolProvider + Clone + Send + Sync + 'static>(
         if let Err(e) = fusillade::Storage::create_realtime(&*rm, realtime_input).await {
             tracing::warn!(error = %e, "Failed to create realtime tracking row");
         }
-    } else {
-        // Blocking mode: enqueue the create-response underway job so a crash
-        // between proxying and the DB insert still leaves a retryable record.
-        // The job resolves attribution and calls create_realtime.
-        let job_input = CreateResponseInput {
-            request_id: realtime_input.request_id,
-            body: realtime_input.body,
-            model: realtime_input.model,
-            base_url: realtime_input.endpoint,
-            endpoint: realtime_input.path,
-            api_key: Some(realtime_input.api_key).filter(|s| !s.is_empty()),
-        };
-        tracing::debug!(
-            request_id = %job_input.request_id,
-            model = %job_input.model,
-            endpoint = %job_input.endpoint,
-            "responses_middleware enqueueing create-response job"
-        );
-        if let Err(e) = state.create_response_job.enqueue(&job_input).await {
-            tracing::warn!(error = %e, "Failed to enqueue create-response job");
-        }
     }
+    // Non-background realtime: no pre-write. Row appears at completion via
+    // the outlet handler -> RequestsWriter path (handle_response on success,
+    // handle_abandoned on mid-flight client disconnect). Behaviour change from
+    // the underway era: if neither outlet hook fires (process panic mid-request,
+    // SIGKILL between proxy and handler), no row is ever recorded for this
+    // request. Previously the create-response job enqueued up front and would
+    // synthesise a 'processing' row even in those cases.
 
     // Attach the response ID as x-fusillade-request-id so that onwards uses
     // it as the response object's `id` field (configured via response_id_header).

@@ -110,6 +110,7 @@ struct User {
     pub auto_topup_monthly_limit: Option<f32>,
     pub auto_topup_limit_notification_sent: bool,
     pub user_type: String,
+    pub verified: bool,
 }
 
 pub struct Users<'c> {
@@ -238,11 +239,12 @@ impl<'c> Repository for Users<'c> {
                 u.auto_topup_monthly_limit,
                 u.auto_topup_limit_notification_sent,
                 u.user_type,
+                u.verified,
                 ARRAY_AGG(ur.role) FILTER (WHERE ur.role IS NOT NULL) as "roles: Vec<Role>"
             FROM users u
             LEFT JOIN user_roles ur ON ur.user_id = u.id
             WHERE u.id = $1 AND u.id != '00000000-0000-0000-0000-000000000000' AND u.is_deleted = false
-            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id, u.is_deleted, u.is_internal, u.batch_notifications_enabled, u.first_batch_email_sent, u.low_balance_notification_sent, u.low_balance_threshold, u.auto_topup_amount, u.auto_topup_threshold, u.auto_topup_monthly_limit, u.auto_topup_limit_notification_sent, u.user_type
+            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id, u.is_deleted, u.is_internal, u.batch_notifications_enabled, u.first_batch_email_sent, u.low_balance_notification_sent, u.low_balance_threshold, u.auto_topup_amount, u.auto_topup_threshold, u.auto_topup_monthly_limit, u.auto_topup_limit_notification_sent, u.user_type, u.verified
             "#,
             id
         )
@@ -275,6 +277,7 @@ impl<'c> Repository for Users<'c> {
                 auto_topup_monthly_limit: row.auto_topup_monthly_limit,
                 auto_topup_limit_notification_sent: row.auto_topup_limit_notification_sent,
                 user_type: row.user_type,
+                verified: row.verified,
             };
 
             let roles = row.roles.unwrap_or_default();
@@ -319,11 +322,12 @@ impl<'c> Repository for Users<'c> {
                 u.auto_topup_monthly_limit,
                 u.auto_topup_limit_notification_sent,
                 u.user_type,
+                u.verified,
                 ARRAY_AGG(ur.role) FILTER (WHERE ur.role IS NOT NULL) as "roles: Vec<Role>"
             FROM users u
             LEFT JOIN user_roles ur ON ur.user_id = u.id
             WHERE u.id = ANY($1) AND u.id != '00000000-0000-0000-0000-000000000000' AND u.is_deleted = false
-            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id, u.is_deleted, u.is_internal, u.batch_notifications_enabled, u.first_batch_email_sent, u.low_balance_notification_sent, u.low_balance_threshold, u.auto_topup_amount, u.auto_topup_threshold, u.auto_topup_monthly_limit, u.auto_topup_limit_notification_sent, u.user_type
+            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id, u.is_deleted, u.is_internal, u.batch_notifications_enabled, u.first_batch_email_sent, u.low_balance_notification_sent, u.low_balance_threshold, u.auto_topup_amount, u.auto_topup_threshold, u.auto_topup_monthly_limit, u.auto_topup_limit_notification_sent, u.user_type, u.verified
             "#,
             ids.as_slice()
         )
@@ -358,6 +362,7 @@ impl<'c> Repository for Users<'c> {
                 auto_topup_monthly_limit: row.auto_topup_monthly_limit,
                 auto_topup_limit_notification_sent: row.auto_topup_limit_notification_sent,
                 user_type: row.user_type,
+                verified: row.verified,
             };
 
             let roles = row.roles.unwrap_or_default();
@@ -927,6 +932,20 @@ impl<'c> Users<'c> {
 
         Ok(rows_affected > 0)
     }
+
+    /// Mark a user as verified. Called from the Stripe payment-success paths once
+    /// real money has moved (completed checkout, successful auto-topup charge).
+    /// The onwards sync uses this flag to pick between the verified and unverified
+    /// rate-limit tiers.
+    #[instrument(skip(self), err)]
+    pub async fn set_verified(&mut self, user_id: UserId) -> Result<bool> {
+        let rows_affected = sqlx::query!("UPDATE users SET verified = true WHERE id = $1 AND verified = false", user_id)
+            .execute(&mut *self.db)
+            .await?
+            .rows_affected();
+
+        Ok(rows_affected > 0)
+    }
 }
 
 #[cfg(test)]
@@ -1388,6 +1407,42 @@ mod tests {
         assert_eq!(result[0].auto_topup_amount, Decimal::from_str("25.0").unwrap());
         assert_eq!(result[0].auto_topup_threshold, Decimal::from_str("5.0").unwrap());
         assert_eq!(result[0].payment_provider_id, "cus_test_456");
+    }
+
+    #[sqlx::test]
+    async fn test_set_verified_flips_flag_idempotently(pool: PgPool) {
+        let mut conn = pool.acquire().await.unwrap();
+
+        let user_id = {
+            let mut repo = Users::new(&mut conn);
+            let create = UserCreateDBRequest::from(UserCreate {
+                username: format!("verify_{}", Uuid::new_v4().simple()),
+                email: format!("verify_{}@example.com", Uuid::new_v4().simple()),
+                display_name: Some("Verify Me".to_string()),
+                avatar_url: None,
+                roles: vec![Role::StandardUser],
+            });
+            repo.create(&create).await.unwrap().id
+        };
+
+        let initial = sqlx::query_scalar!("SELECT verified FROM users WHERE id = $1", user_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(!initial, "users should start unverified");
+
+        let mut users = Users::new(&mut conn);
+        let changed = users.set_verified(user_id).await.unwrap();
+        assert!(changed, "first set_verified call should flip the flag");
+
+        let flipped = sqlx::query_scalar!("SELECT verified FROM users WHERE id = $1", user_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(flipped);
+
+        let changed_again = users.set_verified(user_id).await.unwrap();
+        assert!(!changed_again, "second call should be a no-op since user is already verified");
     }
 
     #[sqlx::test]

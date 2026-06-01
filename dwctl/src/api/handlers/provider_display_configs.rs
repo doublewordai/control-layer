@@ -10,10 +10,16 @@ use crate::db::models::provider_display_configs::{ProviderDisplayConfigCreateDBR
 use crate::errors::{Error, Result};
 use axum::{
     Json,
+    body::Body,
     extract::{Path, State},
     http::StatusCode,
+    response::Response,
 };
 use std::collections::{BTreeMap, HashMap};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
+use url::Url;
 
 fn normalize_provider_key(value: &str) -> String {
     value.trim().to_lowercase()
@@ -281,6 +287,447 @@ pub async fn delete_provider_display_config<P: PoolProvider>(
         });
     }
     Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------- Icon proxy ----------
+
+/// Cap on bytes returned from the upstream icon URL. Icons are SVG/PNG logos;
+/// anything larger is either a misconfiguration or an upstream that returned
+/// something unexpected (HTML error page, etc.) — better to fail closed.
+const MAX_ICON_SIZE_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Total time (connect + read) we'll spend talking to the upstream icon host
+/// before giving up. Provider logos are tiny static files; if the upstream
+/// can't deliver in this window, it's not going to.
+const ICON_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// `Cache-Control` returned to the browser. Provider icons effectively never
+/// change at a given URL — `staleTime` on the SPA's TanStack Query already
+/// keeps the list response cached for 30 minutes, so an hour here is conservative.
+const ICON_CACHE_CONTROL: &str = "public, max-age=3600";
+
+/// Returns `false` for any IP we don't want the icon proxy to reach:
+/// RFC1918 (`10.*`, `172.16/12`, `192.168.*`), loopback, link-local
+/// (including the cloud metadata address `169.254.169.254`), CGNAT
+/// (`100.64/10`, also Tailscale's range), IPv6 unique-local (`fc00::/7`)
+/// and link-local (`fe80::/10`), and the various "reserved" / documentation
+/// ranges. Built from stable [`Ipv4Addr`] / [`Ipv6Addr`] predicates plus
+/// hand-rolled bit checks for ranges whose helpers are still nightly-only
+/// (`is_shared`, `is_unique_local`, `is_unicast_link_local`, etc).
+fn is_globally_routable(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => ipv4_is_globally_routable(v4),
+        // Treat IPv4-mapped IPv6 as IPv4 — without this, `::ffff:127.0.0.1`
+        // would slip past the IPv6 checks and resolve to loopback.
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => ipv4_is_globally_routable(v4),
+            None => ipv6_is_globally_routable(v6),
+        },
+    }
+}
+
+fn ipv4_is_globally_routable(ip: Ipv4Addr) -> bool {
+    if ip.is_unspecified()
+        || ip.is_loopback()
+        || ip.is_private()
+        || ip.is_link_local()
+        || ip.is_broadcast()
+        || ip.is_documentation()
+        || ip.is_multicast()
+    {
+        return false;
+    }
+    let [a, b, _, _] = ip.octets();
+    // RFC6598 CGNAT (`100.64.0.0/10`). Cluster overlays (incl. Tailscale)
+    // sit in this range; `Ipv4Addr::is_shared` is still nightly-only.
+    if a == 100 && (0x40..=0x7f).contains(&b) {
+        return false;
+    }
+    // IETF Protocol Assignments `192.0.0.0/24`.
+    if a == 192 && b == 0 && ip.octets()[2] == 0 {
+        return false;
+    }
+    // Benchmarking `198.18.0.0/15`.
+    if a == 198 && (b == 18 || b == 19) {
+        return false;
+    }
+    // Reserved class E `240.0.0.0/4` (255.255.255.255 already filtered).
+    if a >= 240 {
+        return false;
+    }
+    true
+}
+
+fn ipv6_is_globally_routable(ip: Ipv6Addr) -> bool {
+    if ip.is_unspecified() || ip.is_loopback() || ip.is_multicast() {
+        return false;
+    }
+    let s = ip.segments();
+    // Unique-local `fc00::/7` (RFC4193) — `is_unique_local` is nightly-only.
+    if (s[0] & 0xfe00) == 0xfc00 {
+        return false;
+    }
+    // Link-local `fe80::/10` — `is_unicast_link_local` is nightly-only.
+    if (s[0] & 0xffc0) == 0xfe80 {
+        return false;
+    }
+    // Documentation `2001:db8::/32`.
+    if s[0] == 0x2001 && s[1] == 0x0db8 {
+        return false;
+    }
+    // Discard prefix `100::/64`.
+    if s[0] == 0x0100 && s[1] == 0 && s[2] == 0 && s[3] == 0 {
+        return false;
+    }
+    true
+}
+
+/// Returns `true` unless `url`'s host is an IP literal (RFC3986
+/// `IP-literal` or `IPv4address`) that [`is_globally_routable`] rejects.
+/// Hostnames return `true` here — they're validated by [`SsrfSafeResolver`]
+/// when reqwest opens the connection. Use this for the synchronous check
+/// before/around DNS, in particular when reqwest skips the DNS resolver
+/// entirely (URLs like `https://10.0.0.1/foo` go straight to connect).
+fn url_host_is_globally_routable(url: &Url) -> bool {
+    match url.host() {
+        Some(url::Host::Ipv4(ip)) => is_globally_routable(IpAddr::V4(ip)),
+        Some(url::Host::Ipv6(ip)) => is_globally_routable(IpAddr::V6(ip)),
+        // Domain or no host — defer to the DNS-layer check.
+        _ => true,
+    }
+}
+
+/// DNS resolver used by [`icon_http_client`]. Drops any address that
+/// [`is_globally_routable`] rejects.
+///
+/// Without this filter the icon proxy is an SSRF gadget: even though an
+/// operator picks the `icon` URL, a compromised provider host or a hostile
+/// DNS response can resolve to an address inside the cluster network and let
+/// an unprivileged caller pull data from the host. Filtering at the resolver
+/// (rather than parsing the URL) catches CNAMEs, A-record changes, and
+/// multi-record responses where only one entry is internal.
+#[derive(Debug, Default)]
+struct SsrfSafeResolver;
+
+impl reqwest::dns::Resolve for SsrfSafeResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        Box::pin(async move {
+            let host = name.as_str().to_owned();
+            // Port 0 — reqwest substitutes the URL's port before connecting.
+            let resolved = tokio::net::lookup_host((host.as_str(), 0)).await?;
+            let filtered: Vec<SocketAddr> = resolved.filter(|sa| is_globally_routable(sa.ip())).collect();
+            if filtered.is_empty() {
+                return Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("no globally routable address for {host}"),
+                )) as Box<dyn std::error::Error + Send + Sync>);
+            }
+            Ok(Box::new(filtered.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
+/// Shared HTTP client for the icon proxy. Built once on first use so that
+/// the connection pool, TLS state, and DNS resolver are reused across
+/// requests — re-building per request would defeat all three caches and
+/// drop a fresh `SsrfSafeResolver` instance every call.
+fn icon_http_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(ICON_FETCH_TIMEOUT)
+            // Allow up to 3 redirects, but enforce the same constraints
+            // on every hop that we apply to the initial URL: https-only
+            // scheme, and (when the host is an IP literal) a globally
+            // routable address. The DNS resolver re-runs for hostnames
+            // on each hop, so a redirect that resolves into the
+            // internal network is blocked there — this policy only adds
+            // the synchronous checks that don't need DNS.
+            .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                if attempt.previous().len() >= 3 {
+                    return attempt.error("too many redirects");
+                }
+                if attempt.url().scheme() != "https" {
+                    return attempt.error("redirect scheme is not https");
+                }
+                if !url_host_is_globally_routable(attempt.url()) {
+                    return attempt.error("redirect host is not globally routable");
+                }
+                attempt.follow()
+            }))
+            .dns_resolver(Arc::new(SsrfSafeResolver))
+            // Several icon hosts (Wikimedia in particular, per its
+            // User-Agent policy) return 403 for requests with no
+            // User-Agent, so identify ourselves.
+            .user_agent(concat!(
+                "dwctl-icon-proxy/",
+                env!("CARGO_PKG_VERSION"),
+                " (+https://github.com/doublewordai/control-layer)",
+            ))
+            .build()
+            .expect("icon proxy reqwest client builds with a static config")
+    })
+}
+
+/// Server-side proxy for operator-set provider icon URLs.
+///
+/// `provider_display_configs.icon` is set by admins through the admin surface
+/// and currently points at arbitrary external hosts (npmmirror, simpleicons,
+/// Wikipedia, GitHub avatars, Webflow CDNs, ...) that change each time a new
+/// provider is added. Routing the dashboard's icon loads through this endpoint
+/// means the browser only ever fetches icons from the same origin, so the SPA
+/// can run with a tight `img-src 'self' data: blob:` CSP rather than allowing
+/// every external image host that an admin might paste in.
+///
+/// Returns:
+///   - **200** with the upstream bytes and `Content-Type` (must be `image/*`)
+///   - **404** if the provider has no config, no icon set, or the configured
+///     value isn't an absolute `https://` URL (relative paths and registry-key
+///     shortcuts are handled client-side and bypass this endpoint)
+///   - **500** if the upstream fetch fails, times out, exceeds 2 MiB, returns
+///     non-2xx, or serves a non-image Content-Type
+#[utoipa::path(
+    get,
+    path = "/provider-display-configs/{provider_key}/icon",
+    tag = "provider-display-configs",
+    summary = "Proxy the provider's configured icon",
+    description = "Fetches the operator-set icon URL server-side and streams it back. Lets the SPA keep a tight CSP regardless of where the icon URL points.",
+    params(("provider_key" = String, Path)),
+    responses(
+        (status = 200, description = "Icon bytes"),
+        (status = 404, description = "Provider or icon not found / not proxyable"),
+        (status = 500, description = "Upstream icon fetch failed"),
+    ),
+    security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
+        ("X-Doubleword-User" = [])
+    )
+)]
+#[tracing::instrument(skip_all, fields(provider_key = %provider_key))]
+pub async fn get_provider_display_config_icon<P: PoolProvider>(
+    State(state): State<AppState<P>>,
+    Path(provider_key): Path<String>,
+    _: RequiresPermission<resource::Models, operation::ReadOwn>,
+) -> Result<Response> {
+    let provider_key = normalize_provider_key(&provider_key);
+
+    let icon_value = {
+        let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+        let mut repo = ProviderDisplayConfigs::new(&mut conn);
+        repo.get_by_key(&provider_key)
+            .await?
+            .ok_or_else(|| Error::NotFound {
+                resource: "provider display config".to_string(),
+                id: provider_key.clone(),
+            })?
+            .icon
+            .unwrap_or_default()
+    };
+    // Trim — operator-pasted values regularly have trailing whitespace,
+    // and `Url::parse` rejects them.
+    let icon_value = icon_value.trim();
+
+    // Only proxy absolute https:// URLs with a globally-routable host.
+    // Relative paths (`/brand/...`) and registry-key shortcuts
+    // (`anthropic`, `google`) are resolved by the SPA and don't need (or
+    // want) to round-trip through this endpoint. IP-literal hosts (e.g.
+    // `https://10.0.0.1/foo`) need an explicit check here because
+    // reqwest skips the DNS resolver in that case and goes straight to
+    // connect — bypassing [`SsrfSafeResolver`].
+    let icon_url = match Url::parse(icon_value) {
+        Ok(u) if u.scheme() == "https" && url_host_is_globally_routable(&u) => u,
+        _ => {
+            return Err(Error::NotFound {
+                resource: "proxyable icon for provider".to_string(),
+                id: provider_key,
+            });
+        }
+    };
+
+    let resp = icon_http_client()
+        .get(icon_url)
+        .send()
+        .await
+        .map_err(|e| Error::Other(anyhow::anyhow!("fetch provider icon: {e}")))?;
+
+    let upstream_status = resp.status();
+    if !upstream_status.is_success() {
+        return Err(Error::Other(anyhow::anyhow!(
+            "upstream icon host returned status {upstream_status}",
+        )));
+    }
+
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "application/octet-stream".to_string());
+
+    // Refuse to proxy anything that isn't an image — guards against an
+    // upstream returning an HTML error page that the browser would then try
+    // to render in an <img> tag.
+    if !content_type.to_ascii_lowercase().starts_with("image/") {
+        return Err(Error::Other(anyhow::anyhow!(
+            "upstream icon content-type {content_type:?} is not image/*",
+        )));
+    }
+
+    let body_bytes = read_capped_body(resp, MAX_ICON_SIZE_BYTES)
+        .await
+        .map_err(|e| Error::Other(anyhow::anyhow!("read provider icon body: {e}")))?;
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(axum::http::header::CONTENT_TYPE, content_type)
+        .header(axum::http::header::CACHE_CONTROL, ICON_CACHE_CONTROL)
+        .body(Body::from(body_bytes))
+        .map_err(|e| Error::Other(anyhow::anyhow!("build icon response: {e}")))
+}
+
+/// Drain a `reqwest::Response` body, returning early with an error if the
+/// accumulated bytes would exceed `max`. Avoids buffering an unbounded body
+/// from an untrusted upstream.
+async fn read_capped_body(mut resp: reqwest::Response, max: u64) -> anyhow::Result<bytes::Bytes> {
+    let mut buf = bytes::BytesMut::new();
+    while let Some(chunk) = resp.chunk().await? {
+        if (buf.len() as u64) + (chunk.len() as u64) > max {
+            anyhow::bail!("icon body exceeds {max} bytes");
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf.freeze())
+}
+
+#[cfg(test)]
+mod ssrf_filter_tests {
+    use super::is_globally_routable;
+    use std::net::IpAddr;
+
+    fn check(s: &str) -> bool {
+        is_globally_routable(s.parse::<IpAddr>().unwrap())
+    }
+
+    #[test]
+    fn allows_public_v4() {
+        assert!(check("8.8.8.8"));
+        assert!(check("1.1.1.1"));
+        assert!(check("142.250.190.78")); // google.com sample
+    }
+
+    #[test]
+    fn allows_public_v6() {
+        assert!(check("2606:4700:4700::1111")); // cloudflare
+        assert!(check("2001:4860:4860::8888")); // google
+    }
+
+    #[test]
+    fn blocks_rfc1918() {
+        assert!(!check("10.0.0.1"));
+        assert!(!check("10.255.255.255"));
+        assert!(!check("172.16.0.1"));
+        assert!(!check("172.31.255.255"));
+        assert!(!check("192.168.1.1"));
+    }
+
+    #[test]
+    fn blocks_loopback() {
+        assert!(!check("127.0.0.1"));
+        assert!(!check("127.255.255.254"));
+        assert!(!check("::1"));
+    }
+
+    #[test]
+    fn blocks_link_local_and_metadata() {
+        assert!(!check("169.254.169.254")); // AWS / GCP / Azure metadata
+        assert!(!check("169.254.0.1"));
+        assert!(!check("fe80::1"));
+    }
+
+    #[test]
+    fn blocks_cgnat() {
+        // RFC6598 100.64.0.0/10 — also Tailscale's range.
+        assert!(!check("100.64.0.1"));
+        assert!(!check("100.127.255.254"));
+        // Just outside the /10 — must remain allowed.
+        assert!(check("100.63.255.254"));
+        assert!(check("100.128.0.1"));
+    }
+
+    #[test]
+    fn blocks_unspecified_and_broadcast() {
+        assert!(!check("0.0.0.0"));
+        assert!(!check("255.255.255.255"));
+        assert!(!check("::"));
+    }
+
+    #[test]
+    fn blocks_multicast() {
+        assert!(!check("224.0.0.1"));
+        assert!(!check("239.255.255.255"));
+        assert!(!check("ff02::1"));
+    }
+
+    #[test]
+    fn blocks_reserved_class_e_and_documentation() {
+        assert!(!check("240.0.0.1"));
+        assert!(!check("254.0.0.1"));
+        assert!(!check("192.0.2.1")); // TEST-NET-1
+        assert!(!check("198.51.100.1")); // TEST-NET-2
+        assert!(!check("203.0.113.1")); // TEST-NET-3
+        assert!(!check("198.18.0.1")); // benchmarking
+        assert!(!check("192.0.0.1")); // IETF protocol assignments
+        assert!(!check("2001:db8::1")); // IPv6 documentation
+    }
+
+    #[test]
+    fn blocks_ipv6_unique_local() {
+        // fc00::/7
+        assert!(!check("fc00::1"));
+        assert!(!check("fdff:ffff::1"));
+    }
+
+    #[test]
+    fn blocks_ipv4_mapped_ipv6_loopback() {
+        // ::ffff:127.0.0.1 should be treated as 127.0.0.1.
+        assert!(!check("::ffff:127.0.0.1"));
+        assert!(!check("::ffff:10.0.0.1"));
+        assert!(!check("::ffff:169.254.169.254"));
+    }
+
+    use super::url_host_is_globally_routable;
+    use url::Url;
+
+    fn url_ok(s: &str) -> bool {
+        url_host_is_globally_routable(&Url::parse(s).unwrap())
+    }
+
+    #[test]
+    fn url_helper_passes_hostnames_through() {
+        // Hostnames are validated by the DNS resolver, not here.
+        assert!(url_ok("https://example.com/foo"));
+        assert!(url_ok("https://registry.npmmirror.com/x.svg"));
+    }
+
+    #[test]
+    fn url_helper_blocks_ip_literal_private() {
+        assert!(!url_ok("https://10.0.0.1/foo"));
+        assert!(!url_ok("https://192.168.1.1/foo"));
+        assert!(!url_ok("https://127.0.0.1/foo"));
+        assert!(!url_ok("https://169.254.169.254/latest/meta-data/"));
+        assert!(!url_ok("https://[::1]/foo"));
+        assert!(!url_ok("https://[fc00::1]/foo"));
+        // ::ffff:10.0.0.1 — url::Host normalises to IPv4 here, so the
+        // IPv4-mapped path runs.
+        assert!(!url_ok("https://[::ffff:10.0.0.1]/foo"));
+    }
+
+    #[test]
+    fn url_helper_allows_ip_literal_public() {
+        assert!(url_ok("https://1.1.1.1/foo"));
+        assert!(url_ok("https://[2606:4700:4700::1111]/foo"));
+    }
 }
 
 #[cfg(test)]

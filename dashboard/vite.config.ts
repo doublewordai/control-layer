@@ -91,6 +91,12 @@ export default defineConfig(({ mode }) => {
       },
     },
     build: {
+      // Don't emit Vite's module-preload polyfill as an inline <script>.
+      // When served behind a strict Content-Security-Policy with
+      // `script-src 'self'` (no 'unsafe-inline'), an inline polyfill script is
+      // blocked and breaks the app. Evergreen browsers support
+      // <link rel="modulepreload"> natively, so the polyfill is unnecessary.
+      modulePreload: { polyfill: false },
       rollupOptions: {
         output: {
           manualChunks: {

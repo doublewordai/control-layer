@@ -674,6 +674,10 @@ pub struct AuthConfig {
     /// Applies to user registration and proxy header auth auto-creation
     /// StandardUser role is always guaranteed to be present even if not specified
     pub default_user_roles: Vec<Role>,
+    /// Default rate-limit tiers applied to API keys based on the owning user's
+    /// `verified` flag. Only used when the api_key has no explicit per-key
+    /// override. Leaving either tier as `None` means "no limit for that tier".
+    pub rate_limits: RateLimitTiersConfig,
 }
 
 impl Default for AuthConfig {
@@ -683,8 +687,26 @@ impl Default for AuthConfig {
             proxy_header: ProxyHeaderAuthConfig::default(),
             security: SecurityConfig::default(),
             default_user_roles: vec![Role::StandardUser],
+            rate_limits: RateLimitTiersConfig::default(),
         }
     }
+}
+
+/// Per-tier defaults for API key rate limits. A `None` tier means no default
+/// limit is applied, preserving the legacy "unlimited unless overridden"
+/// behaviour for that tier.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RateLimitTiersConfig {
+    pub verified: Option<RateLimitTierConfig>,
+    pub unverified: Option<RateLimitTierConfig>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RateLimitTierConfig {
+    pub requests_per_second: f32,
+    pub burst_size: Option<i32>,
 }
 
 /// Native username/password authentication configuration.
@@ -785,7 +807,7 @@ pub struct PasswordConfig {
     pub argon2_parallelism: u32,
 }
 
-/// Security configuration for JWT and CORS.
+/// Security configuration for JWT, CORS, and browser security response headers.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SecurityConfig {
@@ -794,6 +816,44 @@ pub struct SecurityConfig {
     pub jwt_expiry: Duration,
     /// CORS configuration for browser clients
     pub cors: CorsConfig,
+    /// Browser security response headers (CSP, X-Frame-Options, etc.)
+    pub headers: SecurityHeadersConfig,
+}
+
+/// Browser security response headers added to every HTTP response.
+///
+/// Defence-in-depth at the application layer: these are emitted even when a
+/// reverse proxy or ingress in front of the server does not add them. Each
+/// header is set only if not already present on the response, so any
+/// stricter per-route header (e.g. a more restrictive `Referrer-Policy` on
+/// sensitive endpoints) is preserved.
+///
+/// `content_security_policy`, `content_security_policy_report_only` and
+/// `strict_transport_security` are opt-in (empty = not sent): a CSP that does
+/// not match the deployed frontend can break it, and HSTS is usually owned by
+/// whatever terminates TLS. The remaining headers are safe defaults and are
+/// on unless `enabled` is set to false.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SecurityHeadersConfig {
+    /// Master switch for all security response headers below.
+    pub enabled: bool,
+    /// `X-Frame-Options` value (e.g. `DENY`, `SAMEORIGIN`). Empty = not sent.
+    pub frame_options: String,
+    /// `Referrer-Policy` value. Empty = not sent.
+    pub referrer_policy: String,
+    /// `Permissions-Policy` value. Empty = not sent.
+    pub permissions_policy: String,
+    /// `Content-Security-Policy` value. Empty = not sent (opt-in).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub content_security_policy: String,
+    /// `Content-Security-Policy-Report-Only` value. Empty = not sent (opt-in).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub content_security_policy_report_only: String,
+    /// `Strict-Transport-Security` value. Empty = not sent (opt-in; usually
+    /// owned by whatever terminates TLS).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub strict_transport_security: String,
 }
 
 /// CORS (Cross-Origin Resource Sharing) configuration.
@@ -1804,10 +1864,12 @@ pub struct TaskWorkersConfig {
     /// Number of cascade-batch-state workers (default: 1).
     /// Updates child request states after a batch is cancelled or deleted.
     pub cascade_batch_state_workers: usize,
-    /// Number of response lifecycle workers (default: 1).
-    /// Handles create-response and complete-response jobs from the responses
-    /// middleware and outlet handler. Set to 0 to disable.
-    pub response_workers: usize,
+    /// Maximum records per flush in the in-process responses writer
+    /// (default: 100). Larger values amortise commit overhead across the
+    /// batch; smaller values reduce per-record latency from outlet send
+    /// to row visible. Replaces the previous underway-based
+    /// `response_workers` setting.
+    pub response_writer_batch_size: usize,
 }
 
 impl Default for TaskWorkersConfig {
@@ -1815,7 +1877,7 @@ impl Default for TaskWorkersConfig {
         Self {
             create_batch_workers: 1,
             cascade_batch_state_workers: 1,
-            response_workers: 1,
+            response_writer_batch_size: 100,
         }
     }
 }
@@ -1927,6 +1989,23 @@ impl Default for SecurityConfig {
         Self {
             jwt_expiry: Duration::from_secs(24 * 60 * 60), // 24 hours
             cors: CorsConfig::default(),
+            headers: SecurityHeadersConfig::default(),
+        }
+    }
+}
+
+impl Default for SecurityHeadersConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            frame_options: "DENY".to_string(),
+            referrer_policy: "strict-origin-when-cross-origin".to_string(),
+            permissions_policy:
+                "accelerometer=(), camera=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), payment=(), usb=()".to_string(),
+            // Opt-in: empty means the header is not sent.
+            content_security_policy: String::new(),
+            content_security_policy_report_only: String::new(),
+            strict_transport_security: String::new(),
         }
     }
 }

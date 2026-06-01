@@ -210,7 +210,7 @@ use std::str::FromStr;
 use std::sync::{Arc, OnceLock};
 use tokio::net::TcpListener;
 use tower::Layer;
-use tower_http::{cors::CorsLayer, trace::TraceLayer};
+use tower_http::{cors::CorsLayer, set_header::SetResponseHeaderLayer, trace::TraceLayer};
 use tracing::{debug, info, instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use uuid::Uuid;
@@ -527,6 +527,12 @@ pub async fn seed_database(sources: &[config::ModelSource], db: &PgPool) -> Resu
                             sanitize_responses: None,
                             trusted: None,
                             open_responses_adapter: None,
+                            backoff_enabled: false,
+                            backoff_initial_ms: 100,
+                            backoff_max_ms: 5_000,
+                            backoff_factor: 2.0,
+                            backoff_jitter: Default::default(),
+                            backoff_max_total_ms: None,
                             traffic_routing_rules: None,
                             allowed_batch_completion_windows: None,
                             metadata: None,
@@ -941,6 +947,40 @@ fn create_cors_layer(config: &Config) -> anyhow::Result<CorsLayer> {
     Ok(cors)
 }
 
+/// Build the (name, value) pairs for the configured security response headers.
+///
+/// Returns an empty list when the feature is disabled. Opt-in headers
+/// (CSP, CSP-Report-Only, HSTS) are included only when their configured value
+/// is non-empty. Invalid header values are rejected with an error so a
+/// misconfiguration surfaces at startup rather than silently dropping a header.
+fn security_header_pairs(cfg: &crate::config::SecurityHeadersConfig) -> anyhow::Result<Vec<(http::HeaderName, http::HeaderValue)>> {
+    let mut pairs: Vec<(http::HeaderName, http::HeaderValue)> = Vec::new();
+    if !cfg.enabled {
+        return Ok(pairs);
+    }
+
+    let mut push = |name: &'static str, value: &str| -> anyhow::Result<()> {
+        if value.is_empty() {
+            return Ok(());
+        }
+        let header_value = http::HeaderValue::from_str(value).with_context(|| format!("invalid value for security header `{name}`"))?;
+        pairs.push((http::HeaderName::from_static(name), header_value));
+        Ok(())
+    };
+
+    // X-Content-Type-Options has a single meaningful value, so it is not
+    // configurable — it is always `nosniff` while the feature is enabled.
+    push("x-content-type-options", "nosniff")?;
+    push("x-frame-options", &cfg.frame_options)?;
+    push("referrer-policy", &cfg.referrer_policy)?;
+    push("permissions-policy", &cfg.permissions_policy)?;
+    push("content-security-policy", &cfg.content_security_policy)?;
+    push("content-security-policy-report-only", &cfg.content_security_policy_report_only)?;
+    push("strict-transport-security", &cfg.strict_transport_security)?;
+
+    Ok(pairs)
+}
+
 /// Build the main application router with all endpoints and middleware.
 ///
 /// This function constructs the complete Axum router with:
@@ -966,12 +1006,14 @@ fn create_cors_layer(config: &Config) -> anyhow::Result<CorsLayer> {
 ///
 /// # Errors
 ///
-/// Returns an error if CORS configuration is invalid or metrics initialization fails.
+/// Returns an error if CORS configuration is invalid, a configured security
+/// response header has an invalid value, or metrics initialization fails.
 #[instrument(skip_all)]
 pub async fn build_router(
     state: &mut AppState,
     onwards_router: Router,
     analytics_sender: Option<request_logging::batcher::AnalyticsSender>,
+    requests_writer_sender: Option<crate::responses::writer::RequestsWriterSender>,
     metrics_recorder: Option<GenAiMetrics>,
     strict_mode: bool,
     responses_middleware_state: Option<crate::responses::middleware::ResponsesMiddlewareState>,
@@ -1014,10 +1056,13 @@ pub async fn build_router(
             multi_handler = multi_handler.with(analytics_handler);
         }
 
-        // Add FusilladeOutletHandler to enqueue response completion jobs
-        if responses_middleware_state.is_some() {
-            let fusillade_handler =
-                crate::responses::outlet_handler::FusilladeOutletHandler::new(state.task_runner.complete_response_job.clone());
+        // Add FusilladeOutletHandler so completed responses get written to
+        // fusillade via the in-process RequestsWriter. We only attach when
+        // both the responses middleware is active and we actually have a
+        // sender to give the handler; without a sender the handler would
+        // silently swallow rows.
+        if let (Some(rms), Some(sender)) = (responses_middleware_state.as_ref(), requests_writer_sender.clone()) {
+            let fusillade_handler = crate::responses::outlet_handler::FusilladeOutletHandler::new(sender, rms.dwctl_pool.clone());
             multi_handler = multi_handler.with(fusillade_handler);
         }
 
@@ -1153,6 +1198,10 @@ pub async fn build_router(
         .route(
             "/provider-display-configs/{provider_key}",
             delete(api::handlers::provider_display_configs::delete_provider_display_config),
+        )
+        .route(
+            "/provider-display-configs/{provider_key}/icon",
+            get(api::handlers::provider_display_configs::get_provider_display_config_icon),
         )
         // Composite model component management (for models where is_composite=true)
         .route("/models/{id}/components", get(api::handlers::deployments::get_model_components))
@@ -1528,6 +1577,13 @@ pub async fn build_router(
     // Apply CORS to main router (request logging already applied to onwards_router above)
     let mut router = router.layer(cors_layer);
 
+    // Apply browser security response headers. `if_not_present` means any
+    // stricter per-route header (e.g. `Referrer-Policy: no-referrer` on
+    // sensitive auth responses) is preserved rather than overwritten.
+    for (name, value) in security_header_pairs(&config.auth.security.headers)? {
+        router = router.layer(SetResponseHeaderLayer::if_not_present(name, value));
+    }
+
     // Add Prometheus metrics if enabled
     if config.enable_metrics {
         let metric_handle = get_or_install_prometheus_handle();
@@ -1742,6 +1798,11 @@ pub struct BackgroundServices {
     strict_mode: bool,
     /// Sender for analytics records (if analytics is enabled)
     analytics_sender: Option<request_logging::batcher::AnalyticsSender>,
+    /// Sender for completed-response records consumed by the in-process
+    /// `RequestsWriter` (replaces the underway response jobs). Always set
+    /// once `setup_background_services` runs; `None` only in test harnesses
+    /// that bypass that path.
+    requests_writer_sender: Option<crate::responses::writer::RequestsWriterSender>,
     // JoinSet is cancel-safe - can be polled in select! without losing tasks
     background_tasks: tokio::task::JoinSet<anyhow::Result<()>>,
     // Map task IDs to names for logging
@@ -1929,7 +1990,9 @@ impl BackgroundServices {
 
         // Use the same load function as the automatic sync
         // Note: escalation_models is empty for tests - individual tests can set up their own
-        let new_targets = crate::sync::onwards_config::load_targets_from_db(pool, &[], self.strict_mode).await?;
+        let new_targets =
+            crate::sync::onwards_config::load_targets_from_db(pool, &[], self.strict_mode, &crate::config::RateLimitTiersConfig::default())
+                .await?;
 
         // Send through the watch channel (same as automatic sync)
         sender
@@ -2096,6 +2159,7 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
             config.background_services.batch_daemon.default_model_concurrency,
             escalation_models,
             config.onwards.strict_mode,
+            config.auth.rate_limits.clone(),
         )
         .await?;
 
@@ -2463,6 +2527,22 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         None
     };
 
+    // Start the responses writer. Replaces the underway create-response /
+    // complete-response jobs. Outlet's FusilladeOutletHandler holds the
+    // sender; this task drains the channel and flushes to fusillade.
+    let requests_writer_sender = {
+        let (writer, sender) = crate::responses::writer::RequestsWriter::new(
+            request_manager.clone(),
+            config.background_services.task_workers.response_writer_batch_size,
+        );
+        let writer_shutdown = shutdown_token.clone();
+        background_tasks.spawn("responses-writer", async move {
+            writer.run(writer_shutdown).await;
+            Ok(())
+        });
+        Some(sender)
+    };
+
     // Build the underway task runner for background jobs (batch population, sync pipeline, etc.)
     let encryption_key = match config.connections.encryption_key.as_deref().or(config.secret_key.as_deref()) {
         Some(secret) if !secret.trim().is_empty() => Some(encryption::derive_encryption_key(secret.trim())),
@@ -2505,6 +2585,7 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         onwards_sender,
         strict_mode: config.onwards.strict_mode,
         analytics_sender,
+        requests_writer_sender,
         background_tasks,
         task_names,
         shutdown_token,
@@ -2833,7 +2914,9 @@ impl Application {
         // OR the leader-gained closure). All daemons see the
         // multi-step processor at claim time.
 
-        // Responses middleware state (enqueues create-response jobs via underway)
+        // Responses middleware state. Non-background realtime no longer
+        // does any DB work up front; the completion path goes through
+        // FusilladeOutletHandler -> RequestsWriter.
         let responses_middleware_state = crate::responses::middleware::ResponsesMiddlewareState {
             request_manager: bg_services.request_manager.clone(),
             daemon_id: crate::responses::store::OnwardsDaemonId(onwards_daemon_id),
@@ -2847,7 +2930,6 @@ impl Application {
                 format!("http://{addr}/ai")
             },
             dwctl_pool: (*db_pools).write().clone(),
-            create_response_job: bg_services.task_runner.create_response_job.clone(),
             response_store: response_store.clone(),
             multi_step_tool_executor,
             multi_step_http_client,
@@ -2896,6 +2978,7 @@ impl Application {
             &mut app_state,
             onwards_router,
             bg_services.analytics_sender.clone(),
+            bg_services.requests_writer_sender.clone(),
             metrics_recorder,
             bg_services.onwards_targets.strict_mode,
             Some(responses_middleware_state),
@@ -3002,5 +3085,72 @@ impl Application {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod security_header_tests {
+    use super::security_header_pairs;
+    use crate::config::SecurityHeadersConfig;
+
+    fn names(cfg: &SecurityHeadersConfig) -> Vec<String> {
+        security_header_pairs(cfg)
+            .unwrap()
+            .into_iter()
+            .map(|(name, _)| name.as_str().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn defaults_emit_the_safe_hardening_headers() {
+        let names = names(&SecurityHeadersConfig::default());
+        assert!(names.contains(&"x-content-type-options".to_string()));
+        assert!(names.contains(&"x-frame-options".to_string()));
+        assert!(names.contains(&"referrer-policy".to_string()));
+        assert!(names.contains(&"permissions-policy".to_string()));
+        // Opt-in headers are not emitted unless explicitly configured.
+        assert!(!names.contains(&"content-security-policy".to_string()));
+        assert!(!names.contains(&"content-security-policy-report-only".to_string()));
+        assert!(!names.contains(&"strict-transport-security".to_string()));
+    }
+
+    #[test]
+    fn disabled_emits_nothing() {
+        let cfg = SecurityHeadersConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        assert!(security_header_pairs(&cfg).unwrap().is_empty());
+    }
+
+    #[test]
+    fn opt_in_headers_emitted_when_set() {
+        let cfg = SecurityHeadersConfig {
+            content_security_policy: "default-src 'self'".to_string(),
+            strict_transport_security: "max-age=31536000; includeSubDomains".to_string(),
+            ..Default::default()
+        };
+        let names = names(&cfg);
+        assert!(names.contains(&"content-security-policy".to_string()));
+        assert!(names.contains(&"strict-transport-security".to_string()));
+    }
+
+    #[test]
+    fn empty_value_disables_individual_header() {
+        let cfg = SecurityHeadersConfig {
+            frame_options: String::new(),
+            ..Default::default()
+        };
+        assert!(!names(&cfg).contains(&"x-frame-options".to_string()));
+    }
+
+    #[test]
+    fn invalid_header_value_is_rejected() {
+        let cfg = SecurityHeadersConfig {
+            // A bare newline is not a valid header value.
+            referrer_policy: "bad\nvalue".to_string(),
+            ..Default::default()
+        };
+        assert!(security_header_pairs(&cfg).is_err());
     }
 }

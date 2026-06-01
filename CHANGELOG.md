@@ -1,5 +1,41 @@
 # Changelog
 
+## [8.55.0](https://github.com/doublewordai/control-layer/compare/v8.54.2...v8.55.0) (2026-05-29)
+
+
+### Features
+
+* expose onwards 0.29 retry backoff per composite model ([#1097](https://github.com/doublewordai/control-layer/issues/1097)) ([fbe6717](https://github.com/doublewordai/control-layer/commit/fbe67170b33331eb01b9c43eba8e0b36d2faedef))
+* replace underway for response creation to use channel system ([#1101](https://github.com/doublewordai/control-layer/issues/1101)) ([9fdcb96](https://github.com/doublewordai/control-layer/commit/9fdcb963e8dbfcce295723242db4cce049ac5445))
+
+## [8.54.2](https://github.com/doublewordai/control-layer/compare/v8.54.1...v8.54.2) (2026-05-28)
+
+
+### Bug Fixes
+
+* **files:** return 400 not 500 for malformed multipart uploads ([#1102](https://github.com/doublewordai/control-layer/issues/1102)) ([8e11774](https://github.com/doublewordai/control-layer/commit/8e11774fb880b696e62836af6ea2532461c9a918))
+
+## [8.54.1](https://github.com/doublewordai/control-layer/compare/v8.54.0...v8.54.1) (2026-05-27)
+
+
+### Bug Fixes
+
+* **dashboard:** load provider icons via the icon proxy ([#1099](https://github.com/doublewordai/control-layer/issues/1099)) ([afaee05](https://github.com/doublewordai/control-layer/commit/afaee05c756a90860dc0e67a79ccc1260e95e344))
+
+## [8.54.0](https://github.com/doublewordai/control-layer/compare/v8.53.0...v8.54.0) (2026-05-27)
+
+
+### Features
+
+* proxy provider-display-config icons through the API ([#1096](https://github.com/doublewordai/control-layer/issues/1096)) ([f460543](https://github.com/doublewordai/control-layer/commit/f4605435070461edddcd933c1c70737ebc00ba09))
+
+## [8.53.0](https://github.com/doublewordai/control-layer/compare/v8.52.2...v8.53.0) (2026-05-26)
+
+
+### Features
+
+* add configurable browser security response headers ([#1091](https://github.com/doublewordai/control-layer/issues/1091)) ([0357624](https://github.com/doublewordai/control-layer/commit/03576247b13cb70b26f4338624b039c4153d8df8))
+
 ## [8.52.2](https://github.com/doublewordai/control-layer/compare/v8.52.1...v8.52.2) (2026-05-21)
 
 
