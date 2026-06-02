@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use sqlx::PgPool;
 
 use crate::{
+    config::CreditsConfig,
     db::{
         handlers::{credits::Credits, repository::Repository},
         models::credits::{CreditTransactionCreateDBRequest, CreditTransactionType},
@@ -90,7 +91,7 @@ impl PaymentProvider for DummyProvider {
         })
     }
 
-    async fn process_payment_session(&self, db_pool: &PgPool, session_id: &str) -> Result<()> {
+    async fn process_payment_session(&self, db_pool: &PgPool, session_id: &str, credits_config: &CreditsConfig) -> Result<()> {
         // Acquire connection early for idempotency check
         let mut conn = db_pool.acquire().await?;
 
@@ -151,6 +152,20 @@ impl PaymentProvider for DummyProvider {
         let mut credits = Credits::new(&mut conn);
         credits.create_transaction(&request).await?;
 
+        // Best-effort first-payment match, mirroring the Stripe provider: never let
+        // the bonus undo the recorded purchase.
+        if let Err(e) = credits
+            .grant_first_payment_match(
+                credits_config.first_payment_match_up_to,
+                payment_session.creditee_id,
+                payment_session.amount,
+                session_id,
+            )
+            .await
+        {
+            tracing::error!(session_id, creditee_id = %payment_session.creditee_id, error = %e, "First-payment match failed; purchase unaffected, grant manually if needed");
+        }
+
         tracing::info!(
             "Successfully fulfilled checkout session {} for user {}",
             session_id,
@@ -164,7 +179,7 @@ impl PaymentProvider for DummyProvider {
         Ok(None)
     }
 
-    async fn process_webhook_event(&self, _db_pool: &PgPool, _event: &WebhookEvent) -> Result<()> {
+    async fn process_webhook_event(&self, _db_pool: &PgPool, _event: &WebhookEvent, _credits_config: &CreditsConfig) -> Result<()> {
         // Dummy provider doesn't use webhooks
         Ok(())
     }
@@ -306,7 +321,9 @@ mod tests {
         assert_eq!(count_before.count.unwrap(), 0, "Transaction should not exist before processing");
 
         // Step 2: Frontend calls backend to process payment
-        let result = provider.process_payment_session(&pool, session_id).await;
+        let result = provider
+            .process_payment_session(&pool, session_id, &crate::config::CreditsConfig::default())
+            .await;
         assert!(result.is_ok(), "Payment processing should succeed");
 
         // Step 3: Verify transaction was created
@@ -350,9 +367,15 @@ mod tests {
         let session_id = query_pairs.get("session_id").unwrap();
 
         // Process payment multiple times (simulating retries, webhook + manual, etc.)
-        let result1 = provider.process_payment_session(&pool, session_id).await;
-        let result2 = provider.process_payment_session(&pool, session_id).await;
-        let result3 = provider.process_payment_session(&pool, session_id).await;
+        let result1 = provider
+            .process_payment_session(&pool, session_id, &crate::config::CreditsConfig::default())
+            .await;
+        let result2 = provider
+            .process_payment_session(&pool, session_id, &crate::config::CreditsConfig::default())
+            .await;
+        let result3 = provider
+            .process_payment_session(&pool, session_id, &crate::config::CreditsConfig::default())
+            .await;
 
         assert!(result1.is_ok());
         assert!(result2.is_ok());

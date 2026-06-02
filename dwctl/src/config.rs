@@ -1730,6 +1730,12 @@ where
 pub struct CreditsConfig {
     /// Initial credits given to standard users when they are created (default: 0)
     pub initial_credits_for_standard_users: rust_decimal::Decimal,
+    /// First-payment match promotion: a user's first ever payment (checkout or
+    /// auto-topup) is matched with bonus credits, up to this amount (in dollars).
+    /// 0 disables the promotion. Eligibility is derived from the ledger (no prior
+    /// `purchase`), so existing paying customers are never matched.
+    #[serde(default)]
+    pub first_payment_match_up_to: rust_decimal::Decimal,
 }
 
 impl Default for CreditsConfig {
@@ -1737,6 +1743,8 @@ impl Default for CreditsConfig {
         Self {
             // Default to 0 credits (no credits given on creation)
             initial_credits_for_standard_users: rust_decimal::Decimal::ZERO,
+            // Default to 0 (first-payment match promotion disabled)
+            first_payment_match_up_to: rust_decimal::Decimal::ZERO,
         }
     }
 }

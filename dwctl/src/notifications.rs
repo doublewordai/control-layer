@@ -367,7 +367,7 @@ pub async fn run_notification_poller(
 
         // === Step 7: Auto top-up charges ===
         if let Some(ref provider) = payment_provider {
-            process_auto_topups(provider.as_ref(), &mut conn, email_service.as_ref()).await;
+            process_auto_topups(provider.as_ref(), &mut conn, email_service.as_ref(), &app_config.credits).await;
         }
 
         // === Step 8: Dispatch webhooks (claim → sign → send → process results) ===
@@ -718,6 +718,7 @@ async fn process_auto_topups(
     provider: &dyn PaymentProvider,
     conn: &mut sqlx::pool::PoolConnection<sqlx::Postgres>,
     email_service: Option<&EmailService>,
+    credits_config: &crate::config::CreditsConfig,
 ) {
     // 1. Get users with auto top-up configured
     let candidates = {
@@ -962,6 +963,15 @@ async fn process_auto_topups(
                         tracing::warn!(user_id = %user.id, error = %e, "Failed to send auto top-up success email");
                     }
                 }
+                // First-payment match (no-op unless enabled and this is the user's
+                // first ever payment). The bonus lands on the same user being charged.
+                // Best-effort: never let the bonus undo the recorded purchase.
+                if let Err(e) = credits
+                    .grant_first_payment_match(credits_config.first_payment_match_up_to, user.id, charge_amount, &request.source_id)
+                    .await
+                {
+                    tracing::error!(user_id = %user.id, error = %e, "First-payment match failed after auto top-up; purchase unaffected, grant manually if needed");
+                }
             }
             Err(crate::db::errors::DbError::UniqueViolation { constraint, .. })
                 if constraint.as_deref() == Some("credits_transactions_source_id_unique") =>
@@ -1027,7 +1037,7 @@ async fn send_low_balance_notifications(
 mod tests {
     use super::*;
     use crate::api::models::users::Role;
-    use crate::config::DummyConfig;
+    use crate::config::{CreditsConfig, DummyConfig};
     use crate::payment_providers;
     use rust_decimal::Decimal;
     use sqlx::PgPool;
@@ -1057,7 +1067,7 @@ mod tests {
         }));
 
         let mut conn = pool.acquire().await.unwrap();
-        process_auto_topups(provider.as_ref(), &mut conn, None).await;
+        process_auto_topups(provider.as_ref(), &mut conn, None, &CreditsConfig::default()).await;
 
         // Verify a credit transaction was created
         let txn = sqlx::query!("SELECT amount, source_id FROM credits_transactions WHERE user_id = $1", user.id)
@@ -1109,7 +1119,7 @@ mod tests {
             amount: Decimal::new(100, 0),
         }));
 
-        process_auto_topups(provider.as_ref(), &mut conn, None).await;
+        process_auto_topups(provider.as_ref(), &mut conn, None, &CreditsConfig::default()).await;
 
         // Should only have the seed transaction, no auto-topup
         let count = sqlx::query!("SELECT COUNT(*) as count FROM credits_transactions WHERE user_id = $1", user.id)
@@ -1142,8 +1152,8 @@ mod tests {
 
         // Run twice
         let mut conn = pool.acquire().await.unwrap();
-        process_auto_topups(provider.as_ref(), &mut conn, None).await;
-        process_auto_topups(provider.as_ref(), &mut conn, None).await;
+        process_auto_topups(provider.as_ref(), &mut conn, None, &CreditsConfig::default()).await;
+        process_auto_topups(provider.as_ref(), &mut conn, None, &CreditsConfig::default()).await;
 
         // Should only have one transaction (idempotent via source_id)
         let count = sqlx::query!(
@@ -1217,7 +1227,7 @@ mod tests {
         }));
 
         let mut conn = pool.acquire().await.unwrap();
-        process_auto_topups(provider.as_ref(), &mut conn, None).await;
+        process_auto_topups(provider.as_ref(), &mut conn, None, &CreditsConfig::default()).await;
 
         let count = sqlx::query!(
             "SELECT COUNT(*) as count FROM credits_transactions WHERE user_id = $1 AND source_id LIKE 'auto_topup_%'",
@@ -1285,7 +1295,7 @@ mod tests {
         }));
 
         let mut conn = pool.acquire().await.unwrap();
-        process_auto_topups(provider.as_ref(), &mut conn, None).await;
+        process_auto_topups(provider.as_ref(), &mut conn, None, &CreditsConfig::default()).await;
 
         // Should have charged a partial amount ($15) instead of skipping
         let rows = sqlx::query!(
@@ -1356,7 +1366,7 @@ mod tests {
         }));
 
         let mut conn = pool.acquire().await.unwrap();
-        process_auto_topups(provider.as_ref(), &mut conn, None).await;
+        process_auto_topups(provider.as_ref(), &mut conn, None, &CreditsConfig::default()).await;
 
         let count = sqlx::query!(
             "SELECT COUNT(*) as count FROM credits_transactions WHERE user_id = $1 AND source_id LIKE 'auto_topup_%'",
