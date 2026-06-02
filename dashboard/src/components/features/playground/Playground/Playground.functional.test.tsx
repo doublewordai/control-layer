@@ -26,45 +26,50 @@ beforeAll(() => {
 afterEach(() => server.resetHandlers());
 afterAll(() => server.close());
 
-const mockOpenAI = {
-  chat: {
-    completions: {
-      create: vi.fn().mockResolvedValue({
-        choices: [
-          {
-            delta: { content: "Hello! How can I help you today?" },
+const { mockOpenAI } = vi.hoisted(() => {
+  const mockOpenAI = {
+    chat: {
+      completions: {
+        create: vi.fn().mockResolvedValue({
+          choices: [
+            {
+              delta: { content: "Hello! How can I help you today?" },
+            },
+          ],
+          async *[Symbol.asyncIterator]() {
+            yield { choices: [{ delta: { content: "Hello! " } }] };
+            yield { choices: [{ delta: { content: "How can I " } }] };
+            yield { choices: [{ delta: { content: "help you today?" } }] };
           },
-        ],
-        async *[Symbol.asyncIterator]() {
-          yield { choices: [{ delta: { content: "Hello! " } }] };
-          yield { choices: [{ delta: { content: "How can I " } }] };
-          yield { choices: [{ delta: { content: "help you today?" } }] };
-        },
-      }),
+        }),
+      },
     },
-  },
-  embeddings: {
-    create: vi
-      .fn()
-      .mockResolvedValueOnce({
-        data: [
-          {
-            embedding: [0.8, 0.6, 0.7, 0.5, 0.9], // Mock embedding vector for text A
-          },
-        ],
-      })
-      .mockResolvedValueOnce({
-        data: [
-          {
-            embedding: [0.7, 0.5, 0.8, 0.6, 0.8], // Mock embedding vector for text B (similar to A)
-          },
-        ],
-      }),
-  },
-};
+    embeddings: {
+      create: vi
+        .fn()
+        .mockResolvedValueOnce({
+          data: [
+            {
+              embedding: [0.8, 0.6, 0.7, 0.5, 0.9],
+            },
+          ],
+        })
+        .mockResolvedValueOnce({
+          data: [
+            {
+              embedding: [0.7, 0.5, 0.8, 0.6, 0.8],
+            },
+          ],
+        }),
+    },
+  };
+  return { mockOpenAI };
+});
 
 vi.mock("openai", () => ({
-  default: vi.fn(() => mockOpenAI),
+  default: vi.fn(function () {
+    return mockOpenAI;
+  }),
 }));
 
 let queryClient: QueryClient;
