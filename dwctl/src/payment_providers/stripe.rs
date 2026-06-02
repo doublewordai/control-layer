@@ -130,6 +130,22 @@ impl StripeProvider {
     }
 }
 
+/// Pre-tax amount (in cents) to credit for a completed checkout session.
+///
+/// Prefers the first line item's `amount_subtotal`, falling back to the
+/// session-level `amount_subtotal`. Both are deliberately the *subtotal*
+/// (before tax): `amount_total` includes the sales tax we collect on Stripe's
+/// behalf, and crediting that would gift users credits equal to the tax. This
+/// flow uses a fixed price with no discounts, so the subtotal is the value of
+/// the credits purchased. Returns `None` if neither amount is present.
+fn pretax_credit_cents(session: &stripe_checkout::CheckoutSession) -> Option<i64> {
+    session
+        .line_items
+        .as_ref()
+        .and_then(|items| items.data.first().map(|item| item.amount_subtotal))
+        .or(session.amount_subtotal)
+}
+
 #[async_trait]
 impl PaymentProvider for StripeProvider {
     async fn create_checkout_session(
@@ -230,6 +246,7 @@ impl PaymentProvider for StripeProvider {
         // Parse creditor ID from client_reference_id
         let creditor_id: UserId = checkout_session
             .client_reference_id
+            .as_deref()
             .ok_or_else(|| {
                 tracing::error!("Checkout session missing client_reference_id");
                 PaymentError::InvalidData("Missing client_reference_id".to_string())
@@ -253,16 +270,10 @@ impl PaymentProvider for StripeProvider {
             })?
             .unwrap_or(creditor_id);
 
-        // Get price from line_items or amount_total
-        let price = checkout_session
-            .line_items
-            .and_then(|items| items.data.first().map(|item| item.amount_total))
-            .or(checkout_session.amount_total)
-            .ok_or_else(|| {
-                tracing::error!("Checkout session missing both line_items and amount_total");
-                PaymentError::InvalidData("Missing payment amount".to_string())
-            })?
-            / 100; // Convert cents to dollars
+        let price = pretax_credit_cents(&checkout_session).ok_or_else(|| {
+            tracing::error!("Checkout session missing both line_items and amount_subtotal");
+            PaymentError::InvalidData("Missing payment amount".to_string())
+        })? / 100; // Convert cents to dollars
 
         Ok(PaymentSession {
             creditee_id,
@@ -795,6 +806,24 @@ mod tests {
         .unwrap();
 
         assert_eq!(count.count.unwrap(), 1, "Should still have exactly one transaction");
+    }
+
+    /// Regression test for the tax-inclusive crediting bug: Stripe's
+    /// `amount_total` includes sales tax, so we must credit `amount_subtotal`.
+    /// The fixture is a real `checkout.session.completed` session with
+    /// subtotal 2500, tax 500, total 3000.
+    #[test]
+    fn test_pretax_credit_cents_excludes_tax() {
+        let session: stripe_checkout::CheckoutSession = serde_json::from_str(include_str!("test_fixtures/checkout_session_with_tax.json"))
+            .expect("fixture should deserialize into a Stripe CheckoutSession");
+
+        // Sanity-check the fixture is the tax-bearing case we care about.
+        assert_eq!(session.amount_subtotal, Some(2500));
+        assert_eq!(session.amount_total, Some(3000));
+
+        // We must credit the pre-tax subtotal (2500), never the tax-inclusive
+        // total (3000) - crediting the total would gift users the tax.
+        assert_eq!(pretax_credit_cents(&session), Some(2500));
     }
 
     #[test]
