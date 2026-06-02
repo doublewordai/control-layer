@@ -276,6 +276,11 @@ batches:
   # TTL for batch capacity reservations (seconds)
   reservation_ttl_secs: 600
 
+  # Optional realtime priority decay window for queue monitoring (seconds).
+  # When set, completed FLEX requests within this lookback are included in
+  # the 1h pending-request-counts bucket. Omit or set null to disable.
+  priority_decay_window_secs: 600
+
   # Allowed completion windows for batch processing
   # These define the maximum time from batch creation to completion
   # Default: ["24h"] - only 24 hour completion window is allowed
