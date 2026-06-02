@@ -32,6 +32,7 @@ describe("SettingsContext", () => {
   afterEach(() => {
     cleanup();
     localStorage.clear();
+    vi.unstubAllGlobals();
   });
 
   it("provides default settings when no localStorage or URL params", () => {
@@ -86,23 +87,24 @@ describe("SettingsContext", () => {
     };
     localStorage.setItem("app-settings", JSON.stringify(storedSettings));
 
-    // Mock URLSearchParams to return our desired flags
-    const originalURLSearchParams = global.URLSearchParams;
-    global.URLSearchParams = vi.fn().mockImplementation(() => ({
-      get: vi.fn((key) => {
-        if (key === "flags") return "demo";
-        return null;
+    // Mock URLSearchParams to return our desired flags.
+    // Vitest 4 requires a function/class (not arrow) so `new URLSearchParams(...)`
+    // can be invoked as a constructor; vi.stubGlobal auto-restores via
+    // vi.unstubAllGlobals() in afterEach.
+    vi.stubGlobal(
+      "URLSearchParams",
+      vi.fn(function () {
+        return {
+          get: vi.fn((key: string) => (key === "flags" ? "demo" : null)),
+        };
       }),
-    }));
+    );
 
     const { container } = render(
       <SettingsProvider>
         <TestComponent />
       </SettingsProvider>,
     );
-
-    // Restore URLSearchParams
-    global.URLSearchParams = originalURLSearchParams;
 
     // URL flags should override localStorage (only demo enabled)
     expect(within(container).getByTestId("demo-enabled")).toHaveTextContent(

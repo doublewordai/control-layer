@@ -82,14 +82,16 @@ const EMAIL_CHANGE_TOKEN_TTL_HOURS: i64 = 24;
 /// instantiated lazily on first use so we don't pay the parse cost at app
 /// startup, and the initialization itself can be retried on subsequent calls
 /// if the first attempt fails (e.g. `/etc/resolv.conf` not readable yet).
-static DNS_RESOLVER: tokio::sync::OnceCell<hickory_resolver::TokioAsyncResolver> = tokio::sync::OnceCell::const_new();
+static DNS_RESOLVER: tokio::sync::OnceCell<hickory_resolver::TokioResolver> = tokio::sync::OnceCell::const_new();
 
-async fn dns_resolver() -> Result<&'static hickory_resolver::TokioAsyncResolver> {
+async fn dns_resolver() -> Result<&'static hickory_resolver::TokioResolver> {
     DNS_RESOLVER
         .get_or_try_init(|| async {
-            hickory_resolver::TokioAsyncResolver::tokio_from_system_conf().map_err(|e| Error::Internal {
-                operation: format!("initialize DNS resolver: {e}"),
-            })
+            hickory_resolver::TokioResolver::builder_tokio()
+                .and_then(|b| b.build())
+                .map_err(|e| Error::Internal {
+                    operation: format!("initialize DNS resolver: {e}"),
+                })
         })
         .await
 }
@@ -116,7 +118,7 @@ async fn verify_email_deliverable(email: &str) -> Result<()> {
     // Try MX first. An empty MX response means the domain explicitly opts out
     // of mail (rare but valid); we then fall back to A/AAAA per RFC 5321 §5.
     match resolver.mx_lookup(domain).await {
-        Ok(mx) if mx.iter().next().is_some() => Ok(()),
+        Ok(mx) if !mx.answers().is_empty() => Ok(()),
         Ok(_) => {
             // No MX records — check for an implicit A/AAAA.
             match resolver.lookup_ip(domain).await {
@@ -124,38 +126,32 @@ async fn verify_email_deliverable(email: &str) -> Result<()> {
                 Ok(_) => Err(Error::BadRequest {
                     message: format!("Email domain '{domain}' has no mail servers and no address records"),
                 }),
-                Err(e) => match e.kind() {
-                    hickory_resolver::error::ResolveErrorKind::NoRecordsFound { .. } => Err(Error::BadRequest {
-                        message: format!("Email domain '{domain}' has no mail servers and no address records"),
-                    }),
-                    _ => Err(Error::Internal {
-                        operation: format!("DNS A lookup for {domain}: {e}"),
-                    }),
-                },
+                Err(e) if e.is_no_records_found() => Err(Error::BadRequest {
+                    message: format!("Email domain '{domain}' has no mail servers and no address records"),
+                }),
+                Err(e) => Err(Error::Internal {
+                    operation: format!("DNS A lookup for {domain}: {e}"),
+                }),
             }
         }
-        Err(e) => match e.kind() {
-            hickory_resolver::error::ResolveErrorKind::NoRecordsFound { .. } => {
-                // NXDOMAIN or NODATA on MX — try A as implicit MX.
-                match resolver.lookup_ip(domain).await {
-                    Ok(ips) if ips.iter().next().is_some() => Ok(()),
-                    Ok(_) => Err(Error::BadRequest {
-                        message: format!("Email domain '{domain}' has no mail servers and no address records"),
-                    }),
-                    Err(ae) => match ae.kind() {
-                        hickory_resolver::error::ResolveErrorKind::NoRecordsFound { .. } => Err(Error::BadRequest {
-                            message: format!("Email domain '{domain}' has no mail servers and no address records"),
-                        }),
-                        _ => Err(Error::Internal {
-                            operation: format!("DNS A lookup for {domain}: {ae}"),
-                        }),
-                    },
-                }
+        Err(e) if e.is_no_records_found() => {
+            // NXDOMAIN or NODATA on MX — try A as implicit MX.
+            match resolver.lookup_ip(domain).await {
+                Ok(ips) if ips.iter().next().is_some() => Ok(()),
+                Ok(_) => Err(Error::BadRequest {
+                    message: format!("Email domain '{domain}' has no mail servers and no address records"),
+                }),
+                Err(ae) if ae.is_no_records_found() => Err(Error::BadRequest {
+                    message: format!("Email domain '{domain}' has no mail servers and no address records"),
+                }),
+                Err(ae) => Err(Error::Internal {
+                    operation: format!("DNS A lookup for {domain}: {ae}"),
+                }),
             }
-            _ => Err(Error::Internal {
-                operation: format!("DNS MX lookup for {domain}: {e}"),
-            }),
-        },
+        }
+        Err(e) => Err(Error::Internal {
+            operation: format!("DNS MX lookup for {domain}: {e}"),
+        }),
     }
 }
 
