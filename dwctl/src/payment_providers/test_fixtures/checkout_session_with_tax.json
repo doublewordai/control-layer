@@ -1,0 +1,109 @@
+{
+  "id": "cs_live_ExampleCheckoutSession0000000000000000000000000000",
+  "object": "checkout.session",
+  "adaptive_pricing": {
+    "enabled": true
+  },
+  "after_expiration": null,
+  "allow_promotion_codes": null,
+  "amount_subtotal": 2500,
+  "amount_total": 3000,
+  "automatic_tax": {
+    "enabled": true,
+    "liability": {
+      "type": "self"
+    },
+    "provider": "stripe",
+    "status": "complete"
+  },
+  "billing_address_collection": null,
+  "cancel_url": "https://console.doubleword.ai/cost-management?payment=cancelled&session_id={CHECKOUT_SESSION_ID}",
+  "client_reference_id": "00000000-0000-0000-0000-000000000000",
+  "client_secret": null,
+  "consent": null,
+  "consent_collection": null,
+  "created": 1780346867,
+  "currency": "usd",
+  "currency_conversion": null,
+  "custom_fields": [],
+  "custom_text": {
+    "after_submit": null,
+    "shipping_address": null,
+    "submit": null,
+    "terms_of_service_acceptance": null
+  },
+  "customer": "cus_ExampleCustomer",
+  "customer_creation": "always",
+  "customer_details": {
+    "address": {
+      "city": null,
+      "country": "GB",
+      "line1": null,
+      "line2": null,
+      "postal_code": "EC1 1AA",
+      "state": null
+    },
+    "email": "test@test.com",
+    "name": "Test Limited",
+    "phone": null,
+    "tax_exempt": "none",
+    "tax_ids": []
+  },
+  "customer_email": "test@test.com",
+  "expires_at": 1780433266,
+  "invoice": "in_1ExampleInvoice00000000",
+  "invoice_creation": {
+    "enabled": true,
+    "invoice_data": {
+      "account_tax_ids": null,
+      "custom_fields": null,
+      "description": null,
+      "footer": null,
+      "issuer": {
+        "type": "self"
+      },
+      "metadata": {},
+      "rendering_options": null
+    }
+  },
+  "livemode": true,
+  "locale": null,
+  "metadata": {},
+  "mode": "payment",
+  "payment_intent": "pi_3ExamplePaymentIntent00",
+  "payment_link": null,
+  "payment_method_collection": "if_required",
+  "payment_method_options": {
+    "card": {
+      "request_three_d_secure": "automatic"
+    }
+  },
+  "payment_method_types": [
+    "card",
+    "link"
+  ],
+  "payment_status": "paid",
+  "phone_number_collection": {
+    "enabled": false
+  },
+  "recovered_from": null,
+  "setup_intent": null,
+  "shipping_address_collection": null,
+  "shipping_cost": null,
+  "shipping_options": [],
+  "status": "complete",
+  "submit_type": null,
+  "subscription": null,
+  "success_url": "https://console.doubleword.ai/cost-management?payment=success&session_id={CHECKOUT_SESSION_ID}",
+  "tax_id_collection": {
+    "enabled": true,
+    "required": "never"
+  },
+  "total_details": {
+    "amount_discount": 0,
+    "amount_shipping": 0,
+    "amount_tax": 500
+  },
+  "ui_mode": "hosted",
+  "url": null
+}
