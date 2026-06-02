@@ -1609,10 +1609,15 @@ impl Default for PoolMetricsSamplerConfig {
 pub struct OnwardsSyncConfig {
     /// Enable onwards config sync service (default: true)
     pub enabled: bool,
-    /// Fallback sync interval in milliseconds (default: 10000ms = 10 seconds)
+    /// Fallback sync interval in milliseconds (default: 300000ms = 5 minutes)
     ///
     /// Even when LISTEN/NOTIFY is working, this provides periodic full syncs to guarantee
     /// eventual consistency. Prevents issues from dropped notifications or connection problems.
+    ///
+    /// Each fallback tick triggers a FULL routing-table reload (all models, endpoints,
+    /// secrets, and authorized keys), which is expensive in DB egress. Because LISTEN/NOTIFY
+    /// already propagates real changes in real time, this only needs to be frequent enough to
+    /// recover from a *missed* notification — minutes, not seconds.
     ///
     /// Set to `0` to disable periodic fallback syncs entirely. Disabling the fallback interval
     /// removes protection against missed notifications and is generally not recommended
@@ -1624,7 +1629,7 @@ impl Default for OnwardsSyncConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            fallback_interval_milliseconds: 10_000, // 10 seconds
+            fallback_interval_milliseconds: 300_000, // 5 minutes (NOTIFY handles real changes; this is only a missed-notification safety net)
         }
     }
 }
