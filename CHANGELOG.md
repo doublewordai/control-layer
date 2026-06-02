@@ -1,5 +1,18 @@
 # Changelog
 
+## [8.58.0](https://github.com/doublewordai/control-layer/compare/v8.57.0...v8.58.0) (2026-06-02)
+
+
+### Features
+
+* match initial purchase amount ([#1113](https://github.com/doublewordai/control-layer/issues/1113)) ([f09db56](https://github.com/doublewordai/control-layer/commit/f09db563e84f1daf324aaff488768197b085da3c))
+
+
+### Bug Fixes
+
+* **deps:** bump hickory-resolver to 0.26 + aws-sdk-s3 to 1.134 (closes 4 backend alerts) ([#1116](https://github.com/doublewordai/control-layer/issues/1116)) ([d90d7b0](https://github.com/doublewordai/control-layer/commit/d90d7b07a414f45d09cafaa1e15c7f8bc6528315))
+* Give the pre-tax total as credits, not the total. ([#1115](https://github.com/doublewordai/control-layer/issues/1115)) ([7abae48](https://github.com/doublewordai/control-layer/commit/7abae48b94f20f26477e9290987a8e7859fa0fea))
+
 ## [8.57.0](https://github.com/doublewordai/control-layer/compare/v8.56.0...v8.57.0) (2026-06-01)
 
 
