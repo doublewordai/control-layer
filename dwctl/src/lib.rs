@@ -142,6 +142,7 @@ fn install_crypto_provider() {
 
 pub mod api;
 pub mod auth;
+mod balance_reconcile;
 pub mod config;
 mod config_watcher;
 pub mod connections;
@@ -151,7 +152,6 @@ mod email;
 pub mod encryption;
 mod error_enrichment;
 pub mod errors;
-mod balance_reconcile;
 mod leader_election;
 pub mod limits;
 mod metrics;
