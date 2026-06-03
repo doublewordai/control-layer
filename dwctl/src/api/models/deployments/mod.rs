@@ -6,8 +6,8 @@ use super::pagination::Pagination;
 use crate::api::models::groups::GroupResponse;
 use crate::db::models::api_keys::ApiKeyPurpose;
 use crate::db::models::deployments::{
-    DeploymentDBResponse, FallbackConfig, LoadBalancingStrategy, ModelCatalogMetadata, ModelType, ProviderPricing, ProviderPricingUpdate,
-    TrafficRuleDBRow,
+    BackoffConfig, DeploymentDBResponse, FallbackConfig, JitterStrategy, LoadBalancingStrategy, ModelCatalogMetadata, ModelType,
+    ProviderPricing, ProviderPricingUpdate, TrafficRuleDBRow,
 };
 use crate::types::{DeploymentId, InferenceEndpointId, UserId};
 use chrono::{DateTime, Utc};
@@ -236,6 +236,22 @@ pub struct StandardModelCreate {
     /// Whether to enable the open_responses adapter that converts /v1/responses to /v1/chat/completions (defaults to true)
     #[serde(default)]
     pub open_responses_adapter: Option<bool>,
+    /// Insert an exponential backoff between retry attempts. For a standard
+    /// (single-provider) model, enabling this implicitly also turns on
+    /// fallback + with_replacement so that the same provider can be retried
+    /// (otherwise onwards' SelectIter would yield exactly once).
+    #[serde(default)]
+    pub backoff_enabled: bool,
+    #[serde(default = "default_backoff_initial_ms")]
+    pub backoff_initial_ms: i32,
+    #[serde(default = "default_backoff_max_ms")]
+    pub backoff_max_ms: i32,
+    #[serde(default = "default_backoff_factor")]
+    pub backoff_factor: f64,
+    #[serde(default)]
+    pub backoff_jitter: JitterStrategy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backoff_max_total_ms: Option<i32>,
     /// Traffic routing rules evaluated against API key labels.
     /// Each rule matches on key labels (e.g., purpose) and either denies or redirects traffic.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -294,6 +310,27 @@ pub struct CompositeModelCreate {
     /// Maximum number of failover attempts (defaults to provider count)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback_max_attempts: Option<i32>,
+    /// Insert an exponential backoff between fallback attempts. Defaults to
+    /// false (preserves legacy zero-delay retry behavior). When true, the
+    /// other `backoff_*` fields take effect.
+    #[serde(default)]
+    pub backoff_enabled: bool,
+    /// Delay before the first retry, in milliseconds (default 100).
+    #[serde(default = "default_backoff_initial_ms")]
+    pub backoff_initial_ms: i32,
+    /// Hard ceiling on the per-retry delay, in milliseconds (default 5000).
+    #[serde(default = "default_backoff_max_ms")]
+    pub backoff_max_ms: i32,
+    /// Exponential growth factor between successive retries (default 2.0).
+    #[serde(default = "default_backoff_factor")]
+    pub backoff_factor: f64,
+    /// Jitter strategy: "none" or "full" (default "full").
+    #[serde(default)]
+    pub backoff_jitter: JitterStrategy,
+    /// Cumulative budget across inter-attempt sleeps, in milliseconds
+    /// (null = no budget cap).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backoff_max_total_ms: Option<i32>,
     /// Whether to sanitize/filter sensitive data from model responses (defaults to false, used when strict_mode=false)
     #[serde(default)]
     pub sanitize_responses: bool,
@@ -322,6 +359,18 @@ fn default_true() -> bool {
 
 fn default_fallback_statuses() -> Vec<i32> {
     vec![500, 502, 503, 504]
+}
+
+fn default_backoff_initial_ms() -> i32 {
+    100
+}
+
+fn default_backoff_max_ms() -> i32 {
+    5_000
+}
+
+fn default_backoff_factor() -> f64 {
+    2.0
 }
 
 /// The data required to update a specific model.
@@ -373,6 +422,25 @@ pub struct DeployedModelUpdate {
     /// Maximum number of failover attempts (null = no change, Some(None) = reset to default)
     #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
     pub fallback_max_attempts: Option<Option<i32>>,
+    /// Toggle the inter-attempt backoff on/off (null = no change).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backoff_enabled: Option<bool>,
+    /// Delay before the first retry, in milliseconds (null = no change).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backoff_initial_ms: Option<i32>,
+    /// Hard ceiling on the per-retry delay, in milliseconds (null = no change).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backoff_max_ms: Option<i32>,
+    /// Exponential growth factor between successive retries (null = no change).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backoff_factor: Option<f64>,
+    /// Jitter strategy (null = no change).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backoff_jitter: Option<JitterStrategy>,
+    /// Cumulative inter-attempt sleep budget, in milliseconds
+    /// (null = no change, Some(None) = clear cap, Some(Some(n)) = set).
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
+    pub backoff_max_total_ms: Option<Option<i32>>,
     /// Whether to sanitize/filter sensitive data from model responses (null = no change, used when strict_mode=false)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sanitize_responses: Option<bool>,
@@ -507,18 +575,27 @@ pub struct DeployedModelResponse {
 
 impl From<DeploymentDBResponse> for DeployedModelResponse {
     fn from(db: DeploymentDBResponse) -> Self {
-        // Build fallback config for composite models
-        let fallback = if db.is_composite {
-            Some(FallbackConfig {
-                enabled: db.fallback_enabled,
-                on_rate_limit: db.fallback_on_rate_limit,
-                on_status: db.fallback_on_status,
-                with_replacement: db.fallback_with_replacement,
-                max_attempts: db.fallback_max_attempts,
-            })
-        } else {
-            None
-        };
+        // Build fallback config. Returned for composite *and* standard
+        // models — standards now honor these fields too (with_replacement +
+        // backoff make single-provider retries possible).
+        let backoff = db.backoff_enabled.then_some(BackoffConfig {
+            initial_ms: db.backoff_initial_ms,
+            max_ms: db.backoff_max_ms,
+            factor: db.backoff_factor,
+            jitter: match db.backoff_jitter.as_str() {
+                "none" => JitterStrategy::None,
+                _ => JitterStrategy::Full,
+            },
+        });
+        let fallback = Some(FallbackConfig {
+            enabled: db.fallback_enabled,
+            on_rate_limit: db.fallback_on_rate_limit,
+            on_status: db.fallback_on_status,
+            with_replacement: db.fallback_with_replacement,
+            max_attempts: db.fallback_max_attempts,
+            backoff,
+            max_total_backoff_ms: db.backoff_max_total_ms,
+        });
 
         Self {
             id: db.id,

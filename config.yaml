@@ -205,6 +205,29 @@ auth:
       allow_credentials: true
       max_age: 3600 # Cache preflight requests for 1 hour
       # exposed_headers: []  # Optional: Custom headers to expose to browser (e.g., ["X-Incomplete", "X-Last-Line"])
+    # Browser security response headers added to every response (defence in
+    # depth — emitted even if a proxy/ingress in front does not add them).
+    # Each header is set only if the response does not already carry it.
+    headers:
+      enabled: true
+      frame_options: "DENY" # X-Frame-Options; "" to disable. (X-Content-Type-Options: nosniff is fixed on whenever headers.enabled is true.)
+      referrer_policy: "strict-origin-when-cross-origin" # "" to disable
+      permissions_policy: "accelerometer=(), camera=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), payment=(), usb=()"
+      # Opt-in headers (empty = not sent):
+      # content_security_policy: "default-src 'self'"  # set a policy that matches your frontend; a wrong policy can break the dashboard
+      # content_security_policy_report_only: ""        # roll a CSP out in report-only first
+      # strict_transport_security: "max-age=31536000; includeSubDomains"  # usually set on whatever terminates TLS instead
+
+  # Default per-API-key rate limits, applied based on the owning user's
+  # `verified` flag (set true after a successful Stripe payment or auto-topup
+  # charge). Only used when the api_key has no explicit per-key override.
+  # Omit a tier (or the whole `rate_limits` block) to leave that tier
+  # unlimited.
+  rate_limits:
+    # verified tier left unset = no default limit for verified users
+    unverified:
+      requests_per_second: 5
+      burst_size: 10
 
 # Email configuration for password resets and notifications
 email:
@@ -224,6 +247,13 @@ credits:
   # Set to 0 to disable initial credits (users start with no credits)
   # Example: 100.00 gives users 100 credits on registration
   initial_credits_for_standard_users: 0
+  # First-payment match promotion: a user's first ever payment (checkout or
+  # auto-topup) is matched with bonus credits, up to this amount (in dollars).
+  # A first payment below this is matched in full; above it is capped here.
+  # Set to 0 to disable. Existing paying customers are never matched (eligibility
+  # is derived from whether they have any prior purchase).
+  # Example: 50 matches a new user's first $50 of credits.
+  first_payment_match_up_to: 0
 
 # Optional feature toggles
 enable_metrics: true # Enable Prometheus metrics endpoint
@@ -245,6 +275,11 @@ batches:
 
   # TTL for batch capacity reservations (seconds)
   reservation_ttl_secs: 600
+
+  # Optional realtime priority decay window for queue monitoring (seconds).
+  # When set, completed FLEX requests within this lookback are included in
+  # the 1h pending-request-counts bucket. Omit or set null to disable.
+  priority_decay_window_secs: 600
 
   # Allowed completion windows for batch processing
   # These define the maximum time from batch creation to completion
@@ -328,6 +363,22 @@ connections:
     # Default endpoint for sync-created batches.
     default_endpoint: "/v1/chat/completions"
 
+# OpenAPI spec exposure controls
+# Both surfaces always require authentication when enabled. Disabled
+# routes return 404 (not 403) so probes can't tell the route exists.
+openapi:
+  # Expose /admin/openapi.json and /admin/docs.
+  # The Admin spec describes internal management endpoints, so access
+  # requires an admin-level identity (PlatformManager role, the admin
+  # user, or a platform-purpose API key). Inference sk-* keys are
+  # rejected. Set to false to remove the routes entirely.
+  # Set via environment: DWCTL_OPENAPI__ADMIN_ENABLED=false
+  admin_enabled: true
+  # Expose /ai/openapi.json and /ai/docs.
+  # The AI surface mirrors the publicly-documented OpenAI API; requires
+  # any authenticated identity.
+  ai_enabled: true
+
 # Onwards AI proxy configuration
 # Controls behavior of the onwards routing layer for AI proxy requests
 onwards:
@@ -344,6 +395,11 @@ background_services:
   # Disabling this will prevent the AI proxy from receiving config updates
   onwards_sync:
     enabled: true # Default: true (recommended)
+    # Periodic full-resync safety net (milliseconds). LISTEN/NOTIFY propagates real config
+    # changes in real time; this fallback only guards against dropped notifications. Each tick
+    # triggers a full routing-table reload (heavy DB egress), so keep it in minutes, not seconds.
+    # Default: 300000 (5 min). Set to 0 to disable (not recommended).
+    fallback_interval_milliseconds: 300000
 
   # Probe scheduler - periodically checks inference endpoint health
   # When leader_election is enabled, only runs on the elected leader

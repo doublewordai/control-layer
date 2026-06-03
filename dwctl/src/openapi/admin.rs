@@ -85,6 +85,7 @@ impl Modify for AdminSecurityAddon {
         api::handlers::provider_display_configs::create_provider_display_config,
         api::handlers::provider_display_configs::update_provider_display_config,
         api::handlers::provider_display_configs::delete_provider_display_config,
+        api::handlers::provider_display_configs::get_provider_display_config_icon,
         api::handlers::groups::list_groups,
         api::handlers::groups::create_group,
         api::handlers::groups::get_group,

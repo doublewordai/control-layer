@@ -58,7 +58,7 @@ pub async fn create_test_app_state_with_config(pool: PgPool, config: crate::conf
             &crate::config::TaskWorkersConfig {
                 create_batch_workers: 0,
                 cascade_batch_state_workers: 0,
-                response_workers: 0,
+                response_writer_batch_size: 0,
             },
         )
         .await
@@ -140,7 +140,7 @@ pub async fn create_test_app_state_with_fusillade(pool: PgPool, config: crate::c
             &crate::config::TaskWorkersConfig {
                 create_batch_workers: 0,
                 cascade_batch_state_workers: 0,
-                response_workers: 0,
+                response_writer_batch_size: 0,
             },
         )
         .await
@@ -270,6 +270,7 @@ pub fn create_test_config() -> crate::config::Config {
             },
             security: SecurityConfig::default(),
             default_user_roles: vec![crate::api::models::users::Role::StandardUser],
+            rate_limits: crate::config::RateLimitTiersConfig::default(),
         },
         enable_metrics: false,
         enable_request_logging: false,
@@ -307,7 +308,7 @@ pub fn create_test_config() -> crate::config::Config {
             task_workers: crate::config::TaskWorkersConfig {
                 create_batch_workers: 0,
                 cascade_batch_state_workers: 0,
-                response_workers: 0,
+                response_writer_batch_size: 0,
             },
             ..Default::default()
         },
@@ -331,6 +332,7 @@ pub fn create_test_config() -> crate::config::Config {
         connections: Default::default(),
         responses: Default::default(),
         image_normalizer: Default::default(),
+        openapi: Default::default(),
     }
 }
 

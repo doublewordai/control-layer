@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO files (name, description, size_bytes, size_finalized, status, purpose, uploaded_by)\n            VALUES ($1, $2, 0, FALSE, 'processed', 'batch_output', NULLIF($3, ''))\n            RETURNING id\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "4dcbe331418c76a6a2c3642c66f3081cde2844de9bbf2defa293b7ad593cf460"
+}

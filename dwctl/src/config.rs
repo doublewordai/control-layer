@@ -200,6 +200,42 @@ pub struct Config {
     /// shape and defaults.
     #[serde(default)]
     pub image_normalizer: crate::image_normalizer::ImageNormalizerConfig,
+    /// OpenAPI spec exposure controls. Defaults disable the Admin spec
+    /// (which describes internal management endpoints) and enable the
+    /// AI spec (which mirrors the publicly-documented OpenAI surface).
+    /// Both surfaces require authentication regardless of these flags.
+    #[serde(default)]
+    pub openapi: OpenApiConfig,
+}
+
+/// Controls exposure of the OpenAPI specs and Scalar doc UIs.
+///
+/// Both surfaces are mounted by default but always require
+/// authentication. The Admin spec additionally requires an admin-level
+/// identity (PlatformManager role, the admin user, or a `platform`-
+/// purpose API key) — inference `sk-*` keys, StandardUsers, and
+/// RequestViewers are rejected. Operators who want to remove the route
+/// entirely can set the relevant flag to `false`; disabled routes
+/// return an explicit 404 so probes can't tell the route exists.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct OpenApiConfig {
+    /// Expose `/admin/openapi.json` and `/admin/docs`. Defaults to
+    /// `true`; the routes require an admin-level identity. Set to
+    /// `false` to remove the routes entirely (they return 404).
+    pub admin_enabled: bool,
+    /// Expose `/ai/openapi.json` and `/ai/docs`. Defaults to `true`;
+    /// the routes require any authenticated identity.
+    pub ai_enabled: bool,
+}
+
+impl Default for OpenApiConfig {
+    fn default() -> Self {
+        Self {
+            admin_enabled: true,
+            ai_enabled: true,
+        }
+    }
 }
 
 /// Configuration for `/v1/responses` multi-step orchestration.
@@ -647,6 +683,10 @@ pub struct AuthConfig {
     /// Applies to user registration and proxy header auth auto-creation
     /// StandardUser role is always guaranteed to be present even if not specified
     pub default_user_roles: Vec<Role>,
+    /// Default rate-limit tiers applied to API keys based on the owning user's
+    /// `verified` flag. Only used when the api_key has no explicit per-key
+    /// override. Leaving either tier as `None` means "no limit for that tier".
+    pub rate_limits: RateLimitTiersConfig,
 }
 
 impl Default for AuthConfig {
@@ -656,8 +696,26 @@ impl Default for AuthConfig {
             proxy_header: ProxyHeaderAuthConfig::default(),
             security: SecurityConfig::default(),
             default_user_roles: vec![Role::StandardUser],
+            rate_limits: RateLimitTiersConfig::default(),
         }
     }
+}
+
+/// Per-tier defaults for API key rate limits. A `None` tier means no default
+/// limit is applied, preserving the legacy "unlimited unless overridden"
+/// behaviour for that tier.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RateLimitTiersConfig {
+    pub verified: Option<RateLimitTierConfig>,
+    pub unverified: Option<RateLimitTierConfig>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RateLimitTierConfig {
+    pub requests_per_second: f32,
+    pub burst_size: Option<i32>,
 }
 
 /// Native username/password authentication configuration.
@@ -758,7 +816,7 @@ pub struct PasswordConfig {
     pub argon2_parallelism: u32,
 }
 
-/// Security configuration for JWT and CORS.
+/// Security configuration for JWT, CORS, and browser security response headers.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SecurityConfig {
@@ -767,6 +825,44 @@ pub struct SecurityConfig {
     pub jwt_expiry: Duration,
     /// CORS configuration for browser clients
     pub cors: CorsConfig,
+    /// Browser security response headers (CSP, X-Frame-Options, etc.)
+    pub headers: SecurityHeadersConfig,
+}
+
+/// Browser security response headers added to every HTTP response.
+///
+/// Defence-in-depth at the application layer: these are emitted even when a
+/// reverse proxy or ingress in front of the server does not add them. Each
+/// header is set only if not already present on the response, so any
+/// stricter per-route header (e.g. a more restrictive `Referrer-Policy` on
+/// sensitive endpoints) is preserved.
+///
+/// `content_security_policy`, `content_security_policy_report_only` and
+/// `strict_transport_security` are opt-in (empty = not sent): a CSP that does
+/// not match the deployed frontend can break it, and HSTS is usually owned by
+/// whatever terminates TLS. The remaining headers are safe defaults and are
+/// on unless `enabled` is set to false.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SecurityHeadersConfig {
+    /// Master switch for all security response headers below.
+    pub enabled: bool,
+    /// `X-Frame-Options` value (e.g. `DENY`, `SAMEORIGIN`). Empty = not sent.
+    pub frame_options: String,
+    /// `Referrer-Policy` value. Empty = not sent.
+    pub referrer_policy: String,
+    /// `Permissions-Policy` value. Empty = not sent.
+    pub permissions_policy: String,
+    /// `Content-Security-Policy` value. Empty = not sent (opt-in).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub content_security_policy: String,
+    /// `Content-Security-Policy-Report-Only` value. Empty = not sent (opt-in).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub content_security_policy_report_only: String,
+    /// `Strict-Transport-Security` value. Empty = not sent (opt-in; usually
+    /// owned by whatever terminates TLS).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub strict_transport_security: String,
 }
 
 /// CORS (Cross-Origin Resource Sharing) configuration.
@@ -1000,6 +1096,12 @@ pub struct BatchConfig {
         deserialize_with = "deserialize_positive_reservation_ttl"
     )]
     pub reservation_ttl_secs: i64,
+    /// Optional realtime priority decay window (seconds) for queue monitoring.
+    /// When set, completed FLEX requests within this lookback are included
+    /// in the 1h pending-request-counts bucket. When null or omitted, no decay
+    /// count is applied.
+    #[serde(default, deserialize_with = "deserialize_non_negative_optional_i64")]
+    pub priority_decay_window_secs: Option<i64>,
 }
 
 /// Configuration for the async requests feature.
@@ -1083,6 +1185,22 @@ where
     }
 }
 
+fn deserialize_non_negative_optional_i64<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+
+    let opt: Option<i64> = Option::deserialize(deserializer)?;
+    match opt {
+        Some(value) if value < 0 => Err(D::Error::custom(format!(
+            "priority_decay_window_secs must be non-negative, got {}",
+            value
+        ))),
+        value => Ok(value),
+    }
+}
+
 /// Custom deserializer that validates throughput is positive, with null/missing defaulting to 100.0
 fn deserialize_positive_throughput<'de, D>(deserializer: D) -> Result<f32, D::Error>
 where
@@ -1119,6 +1237,7 @@ impl Default for BatchConfig {
             files: FilesConfig::default(),
             default_throughput: default_batch_throughput(),
             reservation_ttl_secs: default_reservation_ttl_secs(),
+            priority_decay_window_secs: None,
         }
     }
 }
@@ -1499,10 +1618,15 @@ impl Default for PoolMetricsSamplerConfig {
 pub struct OnwardsSyncConfig {
     /// Enable onwards config sync service (default: true)
     pub enabled: bool,
-    /// Fallback sync interval in milliseconds (default: 10000ms = 10 seconds)
+    /// Fallback sync interval in milliseconds (default: 300000ms = 5 minutes)
     ///
     /// Even when LISTEN/NOTIFY is working, this provides periodic full syncs to guarantee
     /// eventual consistency. Prevents issues from dropped notifications or connection problems.
+    ///
+    /// Each fallback tick triggers a FULL routing-table reload (all models, endpoints,
+    /// secrets, and authorized keys), which is expensive in DB egress. Because LISTEN/NOTIFY
+    /// already propagates real changes in real time, this only needs to be frequent enough to
+    /// recover from a *missed* notification — minutes, not seconds.
     ///
     /// Set to `0` to disable periodic fallback syncs entirely. Disabling the fallback interval
     /// removes protection against missed notifications and is generally not recommended
@@ -1514,7 +1638,7 @@ impl Default for OnwardsSyncConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            fallback_interval_milliseconds: 10_000, // 10 seconds
+            fallback_interval_milliseconds: 300_000, // 5 minutes (NOTIFY handles real changes; this is only a missed-notification safety net)
         }
     }
 }
@@ -1620,6 +1744,12 @@ where
 pub struct CreditsConfig {
     /// Initial credits given to standard users when they are created (default: 0)
     pub initial_credits_for_standard_users: rust_decimal::Decimal,
+    /// First-payment match promotion: a user's first ever payment (checkout or
+    /// auto-topup) is matched with bonus credits, up to this amount (in dollars).
+    /// 0 disables the promotion. Eligibility is derived from the ledger (no prior
+    /// `purchase`), so existing paying customers are never matched.
+    #[serde(default)]
+    pub first_payment_match_up_to: rust_decimal::Decimal,
 }
 
 impl Default for CreditsConfig {
@@ -1627,6 +1757,8 @@ impl Default for CreditsConfig {
         Self {
             // Default to 0 credits (no credits given on creation)
             initial_credits_for_standard_users: rust_decimal::Decimal::ZERO,
+            // Default to 0 (first-payment match promotion disabled)
+            first_payment_match_up_to: rust_decimal::Decimal::ZERO,
         }
     }
 }
@@ -1754,10 +1886,12 @@ pub struct TaskWorkersConfig {
     /// Number of cascade-batch-state workers (default: 1).
     /// Updates child request states after a batch is cancelled or deleted.
     pub cascade_batch_state_workers: usize,
-    /// Number of response lifecycle workers (default: 1).
-    /// Handles create-response and complete-response jobs from the responses
-    /// middleware and outlet handler. Set to 0 to disable.
-    pub response_workers: usize,
+    /// Maximum records per flush in the in-process responses writer
+    /// (default: 100). Larger values amortise commit overhead across the
+    /// batch; smaller values reduce per-record latency from outlet send
+    /// to row visible. Replaces the previous underway-based
+    /// `response_workers` setting.
+    pub response_writer_batch_size: usize,
 }
 
 impl Default for TaskWorkersConfig {
@@ -1765,7 +1899,7 @@ impl Default for TaskWorkersConfig {
         Self {
             create_batch_workers: 1,
             cascade_batch_state_workers: 1,
-            response_workers: 1,
+            response_writer_batch_size: 100,
         }
     }
 }
@@ -1804,6 +1938,7 @@ impl Default for Config {
             connections: ConnectionsConfig::default(),
             responses: ResponsesConfig::default(),
             image_normalizer: crate::image_normalizer::ImageNormalizerConfig::default(),
+            openapi: OpenApiConfig::default(),
         }
     }
 }
@@ -1877,6 +2012,23 @@ impl Default for SecurityConfig {
         Self {
             jwt_expiry: Duration::from_secs(24 * 60 * 60), // 24 hours
             cors: CorsConfig::default(),
+            headers: SecurityHeadersConfig::default(),
+        }
+    }
+}
+
+impl Default for SecurityHeadersConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            frame_options: "DENY".to_string(),
+            referrer_policy: "strict-origin-when-cross-origin".to_string(),
+            permissions_policy:
+                "accelerometer=(), camera=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), payment=(), usb=()".to_string(),
+            // Opt-in: empty means the header is not sent.
+            content_security_policy: String::new(),
+            content_security_policy_report_only: String::new(),
+            strict_transport_security: String::new(),
         }
     }
 }
@@ -2844,6 +2996,59 @@ batches:
     fn test_reservation_ttl_default() {
         let config = Config::default();
         assert_eq!(config.batches.reservation_ttl_secs, 600);
+    }
+
+    #[test]
+    fn test_priority_decay_window_default_disabled() {
+        let config = Config::default();
+        assert_eq!(config.batches.priority_decay_window_secs, None);
+    }
+
+    #[test]
+    fn test_priority_decay_window_explicit_value() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+batches:
+  priority_decay_window_secs: 600
+"#,
+            )?;
+
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+            let config = Config::load(&args)?;
+            assert_eq!(config.batches.priority_decay_window_secs, Some(600));
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_priority_decay_window_negative_rejected() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+batches:
+  priority_decay_window_secs: -1
+"#,
+            )?;
+
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+            let result = Config::load(&args);
+            assert!(result.is_err());
+            assert!(result.unwrap_err().to_string().contains("priority_decay_window_secs"));
+
+            Ok(())
+        });
     }
 
     #[test]

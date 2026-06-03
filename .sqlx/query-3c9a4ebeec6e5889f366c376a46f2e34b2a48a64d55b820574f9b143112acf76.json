@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            DELETE FROM requests\n            WHERE id IN (\n                SELECT r.id\n                FROM (SELECT id FROM batches WHERE deleted_at IS NOT NULL) b,\n                LATERAL (\n                    SELECT id FROM requests\n                    WHERE batch_id = b.id\n                    LIMIT $1\n                    FOR UPDATE SKIP LOCKED\n                ) r\n                LIMIT $1\n            )\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "3c9a4ebeec6e5889f366c376a46f2e34b2a48a64d55b820574f9b143112acf76"
+}

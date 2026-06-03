@@ -130,6 +130,22 @@ impl StripeProvider {
     }
 }
 
+/// Pre-tax amount (in cents) to credit for a completed checkout session.
+///
+/// Prefers the first line item's `amount_subtotal`, falling back to the
+/// session-level `amount_subtotal`. Both are deliberately the *subtotal*
+/// (before tax): `amount_total` includes the sales tax we collect on Stripe's
+/// behalf, and crediting that would gift users credits equal to the tax. This
+/// flow uses a fixed price with no discounts, so the subtotal is the value of
+/// the credits purchased. Returns `None` if neither amount is present.
+fn pretax_credit_cents(session: &stripe_checkout::CheckoutSession) -> Option<i64> {
+    session
+        .line_items
+        .as_ref()
+        .and_then(|items| items.data.first().map(|item| item.amount_subtotal))
+        .or(session.amount_subtotal)
+}
+
 #[async_trait]
 impl PaymentProvider for StripeProvider {
     async fn create_checkout_session(
@@ -230,6 +246,7 @@ impl PaymentProvider for StripeProvider {
         // Parse creditor ID from client_reference_id
         let creditor_id: UserId = checkout_session
             .client_reference_id
+            .as_deref()
             .ok_or_else(|| {
                 tracing::error!("Checkout session missing client_reference_id");
                 PaymentError::InvalidData("Missing client_reference_id".to_string())
@@ -253,16 +270,10 @@ impl PaymentProvider for StripeProvider {
             })?
             .unwrap_or(creditor_id);
 
-        // Get price from line_items or amount_total
-        let price = checkout_session
-            .line_items
-            .and_then(|items| items.data.first().map(|item| item.amount_total))
-            .or(checkout_session.amount_total)
-            .ok_or_else(|| {
-                tracing::error!("Checkout session missing both line_items and amount_total");
-                PaymentError::InvalidData("Missing payment amount".to_string())
-            })?
-            / 100; // Convert cents to dollars
+        let price = pretax_credit_cents(&checkout_session).ok_or_else(|| {
+            tracing::error!("Checkout session missing both line_items and amount_subtotal");
+            PaymentError::InvalidData("Missing payment amount".to_string())
+        })? / 100; // Convert cents to dollars
 
         Ok(PaymentSession {
             creditee_id,
@@ -273,7 +284,12 @@ impl PaymentProvider for StripeProvider {
         })
     }
 
-    async fn process_payment_session(&self, db_pool: &PgPool, session_id: &str) -> Result<()> {
+    async fn process_payment_session(
+        &self,
+        db_pool: &PgPool,
+        session_id: &str,
+        credits_config: &crate::config::CreditsConfig,
+    ) -> Result<()> {
         // Acquire connection early for idempotency check
         let mut conn = db_pool.acquire().await?;
 
@@ -350,8 +366,42 @@ impl PaymentProvider for StripeProvider {
             api_key_id: None,
         };
 
+        // Record the purchase first. This is the critical write (real money moved)
+        // and is never made contingent on the secondary effects below.
         let mut credits = Credits::new(&mut conn);
         credits.create_transaction(&request).await?;
+
+        // First-payment match (no-op unless enabled and this is the payee's first
+        // ever payment). The bonus lands on the creditee (whose balance was just
+        // topped up), deliberately the credited account rather than the payer we
+        // verify below, since the promo rewards whoever receives the credits.
+        // Best-effort: a freebie must never undo the recorded purchase, so we log
+        // and continue on failure rather than failing payment processing. Note
+        // such a failure is not retried (the webhook retry's fast-path sees the
+        // purchase already recorded), so the error log is the signal to grant it
+        // manually.
+        if let Err(e) = credits
+            .grant_first_payment_match(
+                credits_config.first_payment_match_up_to,
+                payment_session.creditee_id,
+                payment_session.amount,
+                session_id,
+            )
+            .await
+        {
+            tracing::error!(session_id, creditee_id = %payment_session.creditee_id, error = %e, "First-payment match failed; purchase unaffected, grant manually if needed");
+        }
+
+        // Real money moved: mark the payer as verified for the onwards rate-limit
+        // tier. `creditor_id` is the resolved billing target (org when paying as an
+        // org, otherwise self), so this naturally verifies whichever entity owns
+        // the keys we care about in the common case. For the rare admin
+        // pay-on-behalf flow (explicit `creditee_id` query param) the payer is
+        // verified rather than the recipient, which we accept as the right
+        // semantic for "this entity can pay".
+        crate::db::handlers::users::Users::new(&mut conn)
+            .set_verified(payment_session.creditor_id)
+            .await?;
 
         tracing::debug!(
             "Successfully fulfilled checkout session {} for user {}",
@@ -399,7 +449,12 @@ impl PaymentProvider for StripeProvider {
         Ok(Some(webhook_event))
     }
 
-    async fn process_webhook_event(&self, db_pool: &PgPool, event: &WebhookEvent) -> Result<()> {
+    async fn process_webhook_event(
+        &self,
+        db_pool: &PgPool,
+        event: &WebhookEvent,
+        credits_config: &crate::config::CreditsConfig,
+    ) -> Result<()> {
         // Only process checkout session completion events — ignore all others silently.
         // Stripe may send events like charge.updated, payment_intent.succeeded, etc.
         // that we don't need to act on.
@@ -417,7 +472,7 @@ impl PaymentProvider for StripeProvider {
         tracing::trace!("Processing webhook event {} for session: {}", event.event_type, session_id);
 
         // Use the existing process_payment_session method
-        self.process_payment_session(db_pool, session_id).await
+        self.process_payment_session(db_pool, session_id, credits_config).await
     }
 
     async fn create_auto_topup_checkout_session(&self, payer: &CheckoutPayer, cancel_url: &str, success_url: &str) -> Result<String> {
@@ -732,7 +787,9 @@ mod tests {
         let provider = StripeProvider::from(config);
 
         // Process the same session - should hit fast path and succeed
-        let result = provider.process_payment_session(&pool, session_id).await;
+        let result = provider
+            .process_payment_session(&pool, session_id, &crate::config::CreditsConfig::default())
+            .await;
         assert!(result.is_ok(), "Should succeed via fast path (transaction already exists)");
 
         // Verify only one transaction exists
@@ -749,6 +806,24 @@ mod tests {
         .unwrap();
 
         assert_eq!(count.count.unwrap(), 1, "Should still have exactly one transaction");
+    }
+
+    /// Regression test for the tax-inclusive crediting bug: Stripe's
+    /// `amount_total` includes sales tax, so we must credit `amount_subtotal`.
+    /// The fixture is a real `checkout.session.completed` session with
+    /// subtotal 2500, tax 500, total 3000.
+    #[test]
+    fn test_pretax_credit_cents_excludes_tax() {
+        let session: stripe_checkout::CheckoutSession = serde_json::from_str(include_str!("test_fixtures/checkout_session_with_tax.json"))
+            .expect("fixture should deserialize into a Stripe CheckoutSession");
+
+        // Sanity-check the fixture is the tax-bearing case we care about.
+        assert_eq!(session.amount_subtotal, Some(2500));
+        assert_eq!(session.amount_total, Some(3000));
+
+        // We must credit the pre-tax subtotal (2500), never the tax-inclusive
+        // total (3000) - crediting the total would gift users the tax.
+        assert_eq!(pretax_credit_cents(&session), Some(2500));
     }
 
     #[test]

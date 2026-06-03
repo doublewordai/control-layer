@@ -5,7 +5,7 @@ use crate::{
     api::models::{
         organizations::{
             AddMemberRequest, InviteDetailsResponse, InviteMemberRequest, InviteMemberResponse, ListOrganizationsQuery, OrganizationCreate,
-            OrganizationMemberResponse, OrganizationResponse, OrganizationUpdate, SetActiveOrganizationRequest,
+            OrganizationMemberResponse, OrganizationResponse, OrganizationUpdate, PendingEmailChangeResponse, SetActiveOrganizationRequest,
             SetActiveOrganizationResponse, UpdateMemberRoleRequest,
         },
         pagination::PaginatedResponse,
@@ -50,6 +50,109 @@ fn validate_role(role: &str) -> Result<()> {
         });
     }
     Ok(())
+}
+
+/// Validate and normalize a contact email address. Returns the trimmed,
+/// lowercased form, or `Error::BadRequest` if the address can't be parsed
+/// as an SMTP mailbox.
+fn validate_contact_email(input: &str) -> Result<String> {
+    let trimmed = input.trim().to_lowercase();
+    if trimmed.is_empty() {
+        return Err(Error::BadRequest {
+            message: "Email address cannot be empty".to_string(),
+        });
+    }
+    if trimmed.parse::<lettre::Address>().is_err() {
+        return Err(Error::BadRequest {
+            message: "Invalid email address".to_string(),
+        });
+    }
+    Ok(trimmed)
+}
+
+/// How long a pending email-change verification token stays valid.
+const EMAIL_CHANGE_TOKEN_TTL_HOURS: i64 = 24;
+
+/// Process-wide DNS resolver used by [`verify_email_deliverable`].
+///
+/// hickory's per-instance cache respects each record's TTL, so sharing one
+/// resolver across requests lets repeated lookups for the same domain reuse
+/// cached MX/A results within their TTL window instead of re-parsing
+/// `/etc/resolv.conf` and opening fresh sockets per call. The resolver is
+/// instantiated lazily on first use so we don't pay the parse cost at app
+/// startup, and the initialization itself can be retried on subsequent calls
+/// if the first attempt fails (e.g. `/etc/resolv.conf` not readable yet).
+static DNS_RESOLVER: tokio::sync::OnceCell<hickory_resolver::TokioResolver> = tokio::sync::OnceCell::const_new();
+
+async fn dns_resolver() -> Result<&'static hickory_resolver::TokioResolver> {
+    DNS_RESOLVER
+        .get_or_try_init(|| async {
+            hickory_resolver::TokioResolver::builder_tokio()
+                .and_then(|b| b.build())
+                .map_err(|e| Error::Internal {
+                    operation: format!("initialize DNS resolver: {e}"),
+                })
+        })
+        .await
+}
+
+/// Verify that the domain part of `email` has at least one publishable mail
+/// destination — an MX record, or an implicit A/AAAA per RFC 5321 §5.
+///
+/// `Error::BadRequest` is returned for domains with no resolvable mail
+/// destination (typos, disposable domains, parked domains). `Error::Internal`
+/// is returned for transient DNS failures so the caller retries rather than
+/// silently accepting an unverifiable address.
+async fn verify_email_deliverable(email: &str) -> Result<()> {
+    let domain = email.rsplit_once('@').map(|(_, d)| d).ok_or_else(|| Error::BadRequest {
+        message: "Invalid email address".to_string(),
+    })?;
+    if domain.is_empty() {
+        return Err(Error::BadRequest {
+            message: "Invalid email address".to_string(),
+        });
+    }
+
+    let resolver = dns_resolver().await?;
+
+    // Try MX first. An empty MX response means the domain explicitly opts out
+    // of mail (rare but valid); we then fall back to A/AAAA per RFC 5321 §5.
+    match resolver.mx_lookup(domain).await {
+        Ok(mx) if !mx.answers().is_empty() => Ok(()),
+        Ok(_) => {
+            // No MX records — check for an implicit A/AAAA.
+            match resolver.lookup_ip(domain).await {
+                Ok(ips) if ips.iter().next().is_some() => Ok(()),
+                Ok(_) => Err(Error::BadRequest {
+                    message: format!("Email domain '{domain}' has no mail servers and no address records"),
+                }),
+                Err(e) if e.is_no_records_found() => Err(Error::BadRequest {
+                    message: format!("Email domain '{domain}' has no mail servers and no address records"),
+                }),
+                Err(e) => Err(Error::Internal {
+                    operation: format!("DNS A lookup for {domain}: {e}"),
+                }),
+            }
+        }
+        Err(e) if e.is_no_records_found() => {
+            // NXDOMAIN or NODATA on MX — try A as implicit MX.
+            match resolver.lookup_ip(domain).await {
+                Ok(ips) if ips.iter().next().is_some() => Ok(()),
+                Ok(_) => Err(Error::BadRequest {
+                    message: format!("Email domain '{domain}' has no mail servers and no address records"),
+                }),
+                Err(ae) if ae.is_no_records_found() => Err(Error::BadRequest {
+                    message: format!("Email domain '{domain}' has no mail servers and no address records"),
+                }),
+                Err(ae) => Err(Error::Internal {
+                    operation: format!("DNS A lookup for {domain}: {ae}"),
+                }),
+            }
+        }
+        Err(e) => Err(Error::Internal {
+            operation: format!("DNS MX lookup for {domain}: {e}"),
+        }),
+    }
 }
 
 /// Check that the caller has sufficient privilege to assign the given role.
@@ -116,6 +219,8 @@ pub async fn create_organization<P: PoolProvider>(
         });
     }
 
+    let email = validate_contact_email(&data.email)?;
+
     // Only platform managers can specify a different owner
     let owner_id = if is_platform_manager {
         data.owner_id.unwrap_or(current_user.id)
@@ -132,7 +237,7 @@ pub async fn create_organization<P: PoolProvider>(
 
     let db_request = OrganizationCreateDBRequest {
         name: data.name,
-        email: data.email,
+        email,
         display_name: data.display_name,
         avatar_url: None,
         created_by: owner_id,
@@ -301,7 +406,17 @@ pub async fn get_organization<P: PoolProvider>(
     let mut org_repo = Organizations::new(&mut pool_conn);
     let members = org_repo.list_members(id).await?;
 
+    // Surface any in-flight email-change verification so the dashboard can
+    // render the pending state without requiring the user to refresh from the
+    // exact PATCH response that initiated the change. Reads from the read
+    // pool inherit normal replica-lag semantics; the verification row is the
+    // source of truth either way.
+    let pending_email_change = org_repo.find_pending_email_change_for_org(id).await?;
+
     let mut response = OrganizationResponse::from_user(UserResponse::from(org)).with_member_count(members.len() as i64);
+    if let Some(pending) = pending_email_change {
+        response = response.with_pending_email_change(PendingEmailChangeResponse::from(pending));
+    }
 
     // Include credit balance if the user has permission to view billing data
     let can_view_billing = crate::auth::permissions::has_permission(&current_user, Resource::Credits, Operation::ReadAll)
@@ -359,18 +474,197 @@ pub async fn update_organization<P: PoolProvider>(
         }
     }
 
+    // Look up the current org so we can compare emails and address verification emails.
+    let mut users_repo = Users::new(&mut pool_conn);
+    let current_org = users_repo.get_by_id(id).await?.ok_or_else(|| Error::NotFound {
+        resource: "Organization".to_string(),
+        id: id.to_string(),
+    })?;
+    if current_org.user_type != "organization" {
+        return Err(Error::NotFound {
+            resource: "Organization".to_string(),
+            id: id.to_string(),
+        });
+    }
+
+    // If an email change is requested, validate the format, check the domain
+    // is mail-deliverable, and route it through the double-opt-in verification
+    // flow instead of applying it directly. Both the current contact mailbox
+    // AND the new mailbox must click their respective verification links
+    // within 24 hours; the change is only applied to `users.email` once both
+    // are confirmed. The contact email is rendered into Stripe receipts,
+    // invitation emails and audit notifications, so a silent change could
+    // redirect security-sensitive mail to an attacker (session hijack) or to
+    // a typo'd address (deliverability failure).
+    let mut pending_email_info: Option<PendingEmailChangeResponse> = None;
+    if let Some(ref requested) = data.email {
+        let normalized = validate_contact_email(requested)?;
+        if normalized != current_org.email.to_lowercase() {
+            // MX-record (or implicit-A) deliverability check. Rejects typo'd
+            // and disposable domains before we ever generate tokens. Failures
+            // are fatal on this PATCH — better to make the user retry than to
+            // queue a verification email at an undeliverable domain.
+            verify_email_deliverable(&normalized).await?;
+
+            let new_email_token = crate::auth::password::generate_reset_token();
+            let old_email_token = crate::auth::password::generate_reset_token();
+            let new_email_token_hash = hash_invite_token(&new_email_token);
+            let old_email_token_hash = hash_invite_token(&old_email_token);
+            let expires_at = chrono::Utc::now() + Duration::hours(EMAIL_CHANGE_TOKEN_TTL_HOURS);
+
+            // Single UPSERT atomically supersedes any prior pending change for this org,
+            // invalidating both older verification tokens and clearing prior
+            // partial confirmations in the same statement. We look up the
+            // prior row first so we can audit-log the supersede with the
+            // displaced requester's identity — once the UPSERT runs, only
+            // `current_user` is retained.
+            let mut org_repo = Organizations::new(&mut pool_conn);
+            if let Some(prior) = org_repo.find_pending_email_change_for_org(id).await? {
+                tracing::warn!(
+                    org_id = %id,
+                    superseded_requested_by = %prior.requested_by,
+                    superseded_new_email = %prior.new_email,
+                    superseded_created_at = %prior.created_at,
+                    new_requested_by = %current_user.id,
+                    new_email = %normalized,
+                    kind = "org_email_change_superseded",
+                    "PATCH superseded a prior pending org email change",
+                );
+            }
+            let pending = org_repo
+                .upsert_pending_email_change(
+                    id,
+                    &normalized,
+                    current_user.id,
+                    &new_email_token_hash,
+                    &old_email_token_hash,
+                    expires_at,
+                )
+                .await?;
+
+            // Best-effort: send both verification emails. The verification row
+            // already gates the actual email change, so we never let mail
+            // failures (transport down, template error, service misconfig)
+            // roll back the API call or hide the pending state from the
+            // client. Each failure is logged with structured fields so ops
+            // can alert specifically on the old-side path — that one is the
+            // legitimate owner's authorisation gate, and its silent absence
+            // would benefit a session-hijack attacker.
+            let config = state.current_config();
+            let org_name = current_org.display_name.clone().unwrap_or_else(|| current_org.username.clone());
+            // Verification links are backend GETs that return HTML, so they
+            // work straight from any mail client (no dashboard route needed).
+            // The backend and dashboard share an origin in production
+            // deployments, so `dashboard_url` is the right base — matches how
+            // invite links are built.
+            let make_link = |tok: &str| {
+                format!(
+                    "{}/admin/api/v1/organizations/email-change/{}/confirm",
+                    config.dashboard_url.trim_end_matches('/'),
+                    tok,
+                )
+            };
+            let new_email_link = make_link(&new_email_token);
+            let old_email_link = make_link(&old_email_token);
+
+            match EmailService::new(&config) {
+                Ok(email_service) => {
+                    if let Err(error) = email_service
+                        .send_org_email_change_verify_new(&normalized, &org_name, &new_email_link)
+                        .await
+                    {
+                        tracing::warn!(
+                            org_id = %id,
+                            new_email = %normalized,
+                            error = %error,
+                            kind = "org_email_change_verify_new_failed",
+                            "Failed to send org email-change verify-new email",
+                        );
+                    }
+                    if let Err(error) = email_service
+                        .send_org_email_change_verify_old(
+                            &current_org.email,
+                            &org_name,
+                            &normalized,
+                            &old_email_link,
+                            Some(&config.support_email),
+                        )
+                        .await
+                    {
+                        // Security-relevant: failure here means the legitimate
+                        // owner can't authorize the change, but it also means
+                        // an attacker can't get the old-side approval — so the
+                        // verification gate still holds. We still alert on
+                        // `kind = "org_email_change_verify_old_failed"` so ops
+                        // can spot silent SMTP failures against the old address.
+                        //
+                        // Follow-up: a durable retry (via the task runner /
+                        // batched email queue) would harden this further
+                        // against transient SMTP failures. Out of scope for
+                        // this PR.
+                        tracing::warn!(
+                            org_id = %id,
+                            old_email = %current_org.email,
+                            new_email = %normalized,
+                            error = %error,
+                            kind = "org_email_change_verify_old_failed",
+                            "Failed to send org email-change verify-old email — current owner cannot authorize",
+                        );
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        org_id = %id,
+                        error = %error,
+                        kind = "org_email_change_email_service_unavailable",
+                        "Email service unavailable for org email-change verification",
+                    );
+                }
+            }
+
+            pending_email_info = Some(PendingEmailChangeResponse::from(pending));
+        }
+    }
+
+    // Apply non-email updates only. The email never flows through this DB call:
+    // either it was unchanged, or it's now gated behind the verification flow
+    // above. The debug-only assert turns the convention into a fail-fast
+    // runtime check so a future refactor that mistakenly threads `data.email`
+    // through here trips a test before reaching production.
     let db_request = OrganizationUpdateDBRequest {
         display_name: data.display_name,
         avatar_url: None,
-        email: data.email,
+        email: None,
         batch_notifications_enabled: data.batch_notifications_enabled,
         low_balance_threshold: data.low_balance_threshold,
     };
+    debug_assert!(
+        db_request.email.is_none(),
+        "user-facing PATCH must never write email directly — verification flow gates this field",
+    );
 
     let mut repo = Organizations::new(&mut pool_conn);
     let org = repo.update(id, &db_request).await?;
 
-    Ok(Json(OrganizationResponse::from_user(UserResponse::from(org))))
+    // Surface any pending email-change on EVERY PATCH response — not just
+    // the one that created it — so a dashboard mid-verification doesn't lose
+    // the state when the user PATCHes another field (e.g. renames the org).
+    // If this PATCH triggered a new pending change we already have it in
+    // `pending_email_info`; otherwise look up whatever's currently pending.
+    let pending_email_change = match pending_email_info {
+        Some(info) => Some(info),
+        None => repo
+            .find_pending_email_change_for_org(id)
+            .await?
+            .map(PendingEmailChangeResponse::from),
+    };
+
+    let mut response = OrganizationResponse::from_user(UserResponse::from(org));
+    if let Some(info) = pending_email_change {
+        response = response.with_pending_email_change(info);
+    }
+
+    Ok(Json(response))
 }
 
 /// Delete an organization. Platform managers only.
@@ -1348,6 +1642,170 @@ pub async fn cancel_invite<P: PoolProvider>(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Confirm one side of a pending organization email change.
+///
+/// The PATCH endpoint sends two verification links: one to the new contact
+/// address (the "new" side) and one to the current contact address (the
+/// "old" side). Each link carries a distinct token. The change is only
+/// applied to `users.email` once BOTH sides have been clicked within their
+/// 24-hour TTL — clicking one side records the confirmation and either
+/// finalizes the change (if the other side is already confirmed) or shows
+/// a "waiting on the other party" page.
+///
+/// Mail clients render the links as plain anchors, so this is a `GET`
+/// endpoint that returns a small HTML page describing the result — no
+/// dashboard route is required to make the link work, and no separate API
+/// call is needed.
+///
+/// No authentication is required because the secret token itself proves
+/// possession of the corresponding mailbox. (Note: this codebase's
+/// authentication is opt-in via the `CurrentUser` extractor on each
+/// handler, not via a router layer around `/admin/api/v1`, so the absence
+/// of `CurrentUser` here is what makes the endpoint public.)
+///
+/// **Pool routing:** this endpoint MUST always run against the primary
+/// database pool. The transaction below uses `state.db.write().begin()`,
+/// which routes to the primary via the `DbPools.write()` API. Do not add
+/// a replica fast-path here or split the consume + update across pools —
+/// the security guarantee (no replay, atomic finalize) only holds if all
+/// statements run inside the same primary-pool transaction.
+#[utoipa::path(
+    get,
+    path = "/organizations/email-change/{token}/confirm",
+    tag = "organizations",
+    summary = "Confirm one side of an organization email change",
+    description = "Mark one side (old or new) of a pending organization email change as confirmed. When both sides are confirmed, the change is applied. Returns an HTML page.",
+    params(
+        ("token" = String, Path, description = "Email change verification token"),
+    ),
+    responses(
+        (status = 200, description = "Side recorded as confirmed, or change applied (HTML page)"),
+        (status = 404, description = "Invalid, already-used, or expired token (HTML page)"),
+    ),
+)]
+#[tracing::instrument(skip_all)]
+pub async fn confirm_email_change<P: PoolProvider>(
+    State(state): State<AppState<P>>,
+    Path(token): Path<String>,
+) -> Result<axum::response::Response> {
+    let token_hash = hash_invite_token(&token);
+
+    // The lookup + finalize pair runs in a single transaction so a failure
+    // applying the change to `users.email` rolls back the confirmation
+    // timestamp update — leaving the token usable for a retry rather than
+    // silently consumed with no email change applied.
+    let mut tx = state.db.write().begin().await.map_err(|e| Error::Database(e.into()))?;
+    let mut org_repo = Organizations::new(&mut tx);
+
+    // Try the token against each side. Each `confirm_*_email_side` call is an
+    // atomic `UPDATE … RETURNING` that matches at most one row, scoped to the
+    // corresponding `*_email_token_hash` column AND (not already confirmed)
+    // AND (not expired) AND (org not soft-deleted). Because the two token-hash
+    // columns are independently UNIQUE, exactly one of these two queries can
+    // match a given click, so the `else if` short-circuits the second
+    // `UPDATE`: this click only ever updates one column on at most one row.
+    let (pending, just_confirmed_side) = if let Some(p) = org_repo.confirm_new_email_side(&token_hash).await? {
+        (p, ConfirmedSide::New)
+    } else if let Some(p) = org_repo.confirm_old_email_side(&token_hash).await? {
+        (p, ConfirmedSide::Old)
+    } else {
+        // No row matched — invalid, already-confirmed, expired, or org soft-deleted.
+        tx.rollback().await.map_err(|e| Error::Database(e.into()))?;
+        return Ok(email_change_html(
+            StatusCode::NOT_FOUND,
+            "This confirmation link is invalid, has already been used, or has expired.",
+        ));
+    };
+
+    if pending.is_fully_confirmed() {
+        // Apply the email change and delete the pending row, all in this
+        // transaction — so a failure here rolls back the just-recorded
+        // confirmation and the user can retry.
+        let update = OrganizationUpdateDBRequest {
+            display_name: None,
+            avatar_url: None,
+            email: Some(pending.new_email.clone()),
+            batch_notifications_enabled: None,
+            low_balance_threshold: None,
+        };
+        org_repo.update(pending.organization_id, &update).await?;
+        // The `confirm_*_email_side` UPDATE above already locked this row, so
+        // a `false` here would mean the row was somehow deleted from within
+        // our own transaction — a logic bug, not a race. Fail loudly so we
+        // don't silently commit a state where `users.email` was updated but
+        // the pending row stuck around.
+        let deleted = org_repo.delete_pending_email_change(pending.id).await?;
+        if !deleted {
+            return Err(Error::Internal {
+                operation: format!(
+                    "delete_pending_email_change for {} returned false inside confirm transaction; logic bug",
+                    pending.id,
+                ),
+            });
+        }
+        tx.commit().await.map_err(|e| Error::Database(e.into()))?;
+
+        return Ok(email_change_html(
+            StatusCode::OK,
+            "Your organization's contact email has been updated. You can close this tab.",
+        ));
+    }
+
+    tx.commit().await.map_err(|e| Error::Database(e.into()))?;
+
+    let waiting_message = match just_confirmed_side {
+        ConfirmedSide::New => {
+            "Thanks — we've verified the new address. The change will take effect once the current contact also confirms via the link sent to their inbox."
+        }
+        ConfirmedSide::Old => {
+            "Thanks — we've recorded the current owner's authorization. The change will take effect once the new address also confirms via the link sent to their inbox."
+        }
+    };
+    Ok(email_change_html(StatusCode::OK, waiting_message))
+}
+
+/// Which side of the double-opt-in flow was just confirmed by the
+/// most recent click.
+enum ConfirmedSide {
+    New,
+    Old,
+}
+
+/// Render a minimal HTML confirmation page for the email-change flow.
+///
+/// Hardening headers, even though the threat model for this GET endpoint is
+/// low (the token reaches the user out-of-band via email; no other origin
+/// learns it):
+///
+/// * `Referrer-Policy: no-referrer` — if the user navigates onward from
+///   this page (or any embedded resource it loaded), the verification URL
+///   must not leak to the next origin via the `Referer` header.
+/// * `Cache-Control: no-store` — keeps the URL out of intermediate caches
+///   and browser disk cache; pairs with `Pragma: no-cache` for legacy proxies.
+fn email_change_html(status: StatusCode, message: &str) -> axum::response::Response {
+    let body = format!(
+        r#"<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="referrer" content="no-referrer"><title>Email change</title></head>
+<body style="font-family: system-ui, sans-serif; max-width: 540px; margin: 60px auto; padding: 20px; color: #333;">
+<h2>Organization contact email</h2>
+<p>{}</p>
+</body></html>"#,
+        html_escape(message),
+    );
+    axum::response::Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .header(header::REFERRER_POLICY, "no-referrer")
+        .header(header::CACHE_CONTROL, "no-store")
+        .header("Pragma", "no-cache")
+        .body(body.into())
+        .expect("static HTML response builds")
+}
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
 #[cfg(test)]
 mod tests {
     use crate::api::models::users::Role;
@@ -1955,5 +2413,821 @@ mod tests {
         resp.assert_status(axum::http::StatusCode::OK);
         let cookie = resp.headers().get("set-cookie").unwrap().to_str().unwrap();
         assert!(!cookie.contains("Domain="), "cookie should not include Domain: {cookie}");
+    }
+
+    // ── Organization update / email-change verification flow ────────────
+
+    /// Helper: PM creates an org owned by `owner` with the given contact email,
+    /// returning the new organization's ID.
+    async fn create_org_for(
+        server: &axum_test::TestServer,
+        pm_headers: &[(String, String)],
+        name: &str,
+        email: &str,
+        owner_id: crate::types::UserId,
+    ) -> String {
+        let resp = server
+            .post("/admin/api/v1/organizations")
+            .add_header(&pm_headers[0].0, &pm_headers[0].1)
+            .add_header(&pm_headers[1].0, &pm_headers[1].1)
+            .json(&json!({ "name": name, "email": email, "owner_id": owner_id }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::CREATED);
+        resp.json::<serde_json::Value>()["id"].as_str().unwrap().to_string()
+    }
+
+    /// Helper: plant a pending email-change row directly and return both
+    /// plaintext tokens (new-side, old-side). Tests use this so they can
+    /// click each verification link without going through the email-send
+    /// path (which can't easily expose tokens to the test). `requested_by`
+    /// defaults to the org's notional owner; `expires_at` to NOW + 1h.
+    async fn plant_pending_email_change(
+        pool: &PgPool,
+        org_id: uuid::Uuid,
+        new_email: &str,
+        requested_by: crate::types::UserId,
+        expires_at_relative_seconds: i64,
+    ) -> (String, String) {
+        let new_token = crate::auth::password::generate_reset_token();
+        let old_token = crate::auth::password::generate_reset_token();
+        let new_hash = super::hash_invite_token(&new_token);
+        let old_hash = super::hash_invite_token(&old_token);
+        sqlx::query(
+            "INSERT INTO pending_org_email_changes
+                (organization_id, new_email, requested_by,
+                 new_email_token_hash, old_email_token_hash, expires_at)
+             VALUES ($1, $2, $3, $4, $5, NOW() + ($6 || ' seconds')::interval)",
+        )
+        .bind(org_id)
+        .bind(new_email)
+        .bind(requested_by)
+        .bind(&new_hash)
+        .bind(&old_hash)
+        .bind(expires_at_relative_seconds.to_string())
+        .execute(pool)
+        .await
+        .unwrap();
+        (new_token, old_token)
+    }
+
+    /// Helper: click a confirmation link.
+    async fn click_confirm(server: &axum_test::TestServer, token: &str) -> axum_test::TestResponse {
+        server
+            .get(&format!("/admin/api/v1/organizations/email-change/{token}/confirm"))
+            .await
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_patch_org_with_invalid_email_rejected(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let pm = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let pm_headers = add_auth_headers(&pm);
+        let owner = create_test_user(&pool, Role::StandardUser).await;
+        let owner_headers = add_auth_headers(&owner);
+
+        let org_id = create_org_for(&server, &pm_headers, "validate-email-org", "billing@example.com", owner.id).await;
+
+        for bad in ["not-an-email", "missing-at.com", "  ", "spaces in@addr.com"] {
+            let resp = server
+                .patch(&format!("/admin/api/v1/organizations/{org_id}"))
+                .add_header(&owner_headers[0].0, &owner_headers[0].1)
+                .add_header(&owner_headers[1].0, &owner_headers[1].1)
+                .json(&json!({ "email": bad }))
+                .await;
+            resp.assert_status(axum::http::StatusCode::BAD_REQUEST);
+        }
+
+        // The contact email must be untouched after the rejected requests.
+        let resp = server
+            .get(&format!("/admin/api/v1/organizations/{org_id}"))
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .await;
+        resp.assert_status(axum::http::StatusCode::OK);
+        let body = resp.json::<serde_json::Value>();
+        assert_eq!(body["email"].as_str().unwrap(), "billing@example.com");
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_patch_org_email_does_not_apply_immediately(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let pm = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let pm_headers = add_auth_headers(&pm);
+        let owner = create_test_user(&pool, Role::StandardUser).await;
+        let owner_headers = add_auth_headers(&owner);
+
+        let org_id = create_org_for(&server, &pm_headers, "verify-flow-org", "billing@example.com", owner.id).await;
+
+        // The owner asks to change to a new address. The PATCH succeeds but
+        // the change must be gated behind the (now double-opt-in) verification
+        // flow. example.com is used because the MX-deliverability check on
+        // the new domain runs as part of the PATCH.
+        let resp = server
+            .patch(&format!("/admin/api/v1/organizations/{org_id}"))
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .json(&json!({ "email": "attacker@example.com" }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::OK);
+        let body = resp.json::<serde_json::Value>();
+        assert_eq!(
+            body["email"].as_str().unwrap(),
+            "billing@example.com",
+            "old email must remain until both sides confirm"
+        );
+        assert_eq!(body["pending_email_change"]["new_email"].as_str().unwrap(), "attacker@example.com");
+        assert!(body["pending_email_change"]["expires_at"].is_string());
+
+        // Re-fetch to make sure the field really wasn't written.
+        let resp = server
+            .get(&format!("/admin/api/v1/organizations/{org_id}"))
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .await;
+        resp.assert_status(axum::http::StatusCode::OK);
+        let body = resp.json::<serde_json::Value>();
+        assert_eq!(body["email"].as_str().unwrap(), "billing@example.com");
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_patch_org_display_name_still_applies_when_email_pending(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let pm = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let pm_headers = add_auth_headers(&pm);
+        let owner = create_test_user(&pool, Role::StandardUser).await;
+        let owner_headers = add_auth_headers(&owner);
+
+        let org_id = create_org_for(&server, &pm_headers, "rename-org", "billing@example.com", owner.id).await;
+
+        let resp = server
+            .patch(&format!("/admin/api/v1/organizations/{org_id}"))
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .json(&json!({ "display_name": "Renamed Org", "email": "new@example.com" }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::OK);
+        let body = resp.json::<serde_json::Value>();
+        assert_eq!(body["display_name"].as_str().unwrap(), "Renamed Org");
+        assert_eq!(body["email"].as_str().unwrap(), "billing@example.com");
+        assert_eq!(body["pending_email_change"]["new_email"].as_str().unwrap(), "new@example.com");
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_patch_org_with_same_email_is_noop(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let pm = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let pm_headers = add_auth_headers(&pm);
+        let owner = create_test_user(&pool, Role::StandardUser).await;
+        let owner_headers = add_auth_headers(&owner);
+
+        let org_id = create_org_for(&server, &pm_headers, "same-email-org", "billing@example.com", owner.id).await;
+
+        // Resending the same address (different case) must not start a verification flow.
+        let resp = server
+            .patch(&format!("/admin/api/v1/organizations/{org_id}"))
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .json(&json!({ "email": "Billing@Example.com" }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::OK);
+        let body = resp.json::<serde_json::Value>();
+        assert!(
+            body.get("pending_email_change").is_none() || body["pending_email_change"].is_null(),
+            "no pending change when email did not actually change: {body}"
+        );
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pending_org_email_changes WHERE organization_id = $1")
+            .bind(uuid::Uuid::parse_str(&org_id).unwrap())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_neither_side_alone_applies_email_change(pool: PgPool) {
+        // The security claim of double-opt-in: confirming only ONE side
+        // (either) must not change `users.email`. Both clicks are required.
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let pm = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let pm_headers = add_auth_headers(&pm);
+        let owner = create_test_user(&pool, Role::StandardUser).await;
+        let owner_headers = add_auth_headers(&owner);
+
+        let org_id = create_org_for(&server, &pm_headers, "single-side-org", "billing@example.com", owner.id).await;
+        let org_uuid = uuid::Uuid::parse_str(&org_id).unwrap();
+
+        let (new_token, _old_token) = plant_pending_email_change(&pool, org_uuid, "new@example.com", owner.id, 3600).await;
+
+        // Click the new-side link only.
+        let resp = click_confirm(&server, &new_token).await;
+        resp.assert_status(axum::http::StatusCode::OK);
+        let body = resp.text();
+        assert!(
+            body.contains("current contact"),
+            "expected a 'waiting on the other side' message; got: {body}"
+        );
+
+        // users.email must NOT have changed.
+        let resp = server
+            .get(&format!("/admin/api/v1/organizations/{org_id}"))
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .await;
+        assert_eq!(resp.json::<serde_json::Value>()["email"].as_str().unwrap(), "billing@example.com");
+
+        // Pending row still exists with only the new side confirmed.
+        let row: (Option<chrono::DateTime<chrono::Utc>>, Option<chrono::DateTime<chrono::Utc>>) = sqlx::query_as(
+            "SELECT new_email_confirmed_at, old_email_confirmed_at FROM pending_org_email_changes WHERE organization_id = $1",
+        )
+        .bind(org_uuid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(row.0.is_some(), "new side should be confirmed");
+        assert!(row.1.is_none(), "old side should NOT be confirmed");
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_both_sides_confirm_applies_change_in_any_order(pool: PgPool) {
+        // Two scenarios in one test: click new-then-old, and click old-then-new.
+        // Both must result in the change being applied and the pending row removed.
+        for &order in &[("new_first", true), ("old_first", false)] {
+            let _ = order; // for clarity in failure messages
+        }
+        for &new_first in &[true, false] {
+            let (server, _bg) = create_test_app(pool.clone(), false).await;
+            let pm = create_test_admin_user(&pool, Role::PlatformManager).await;
+            let pm_headers = add_auth_headers(&pm);
+            let owner = create_test_user(&pool, Role::StandardUser).await;
+            let owner_headers = add_auth_headers(&owner);
+
+            let label = if new_first { "new-first" } else { "old-first" };
+            let org_id = create_org_for(&server, &pm_headers, &format!("apply-{label}-org"), "billing@example.com", owner.id).await;
+            let org_uuid = uuid::Uuid::parse_str(&org_id).unwrap();
+
+            let (new_token, old_token) = plant_pending_email_change(&pool, org_uuid, "new@example.com", owner.id, 3600).await;
+
+            let (first, second) = if new_first {
+                (&new_token, &old_token)
+            } else {
+                (&old_token, &new_token)
+            };
+
+            // First click → waiting page, email unchanged.
+            click_confirm(&server, first).await.assert_status(axum::http::StatusCode::OK);
+            let resp = server
+                .get(&format!("/admin/api/v1/organizations/{org_id}"))
+                .add_header(&owner_headers[0].0, &owner_headers[0].1)
+                .add_header(&owner_headers[1].0, &owner_headers[1].1)
+                .await;
+            assert_eq!(
+                resp.json::<serde_json::Value>()["email"].as_str().unwrap(),
+                "billing@example.com",
+                "{label}: email must remain after only the first confirmation",
+            );
+
+            // Second click → applied + row removed.
+            let resp = click_confirm(&server, second).await;
+            resp.assert_status(axum::http::StatusCode::OK);
+            assert!(
+                resp.text().contains("contact email has been updated"),
+                "{label}: expected applied-message on second click",
+            );
+
+            let resp = server
+                .get(&format!("/admin/api/v1/organizations/{org_id}"))
+                .add_header(&owner_headers[0].0, &owner_headers[0].1)
+                .add_header(&owner_headers[1].0, &owner_headers[1].1)
+                .await;
+            assert_eq!(resp.json::<serde_json::Value>()["email"].as_str().unwrap(), "new@example.com");
+
+            let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pending_org_email_changes WHERE organization_id = $1")
+                .bind(org_uuid)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(count, 0, "{label}: pending row should be deleted once both sides confirmed");
+        }
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_confirm_email_change_invalid_token(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+
+        let resp = click_confirm(&server, "not-a-real-token").await;
+        resp.assert_status(axum::http::StatusCode::NOT_FOUND);
+        assert!(resp.text().contains("invalid"));
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_expired_token_returns_not_found(pool: PgPool) {
+        // The UPDATE in confirm_*_email_side filters `expires_at > NOW()`, so
+        // an expired token matches no row and returns 404. The pending row is
+        // NOT deleted — it just becomes inert until the org is hard-deleted
+        // or a fresh PATCH supersedes it.
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let pm = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let pm_headers = add_auth_headers(&pm);
+        let owner = create_test_user(&pool, Role::StandardUser).await;
+        let owner_headers = add_auth_headers(&owner);
+
+        let org_id = create_org_for(&server, &pm_headers, "expired-org", "billing@example.com", owner.id).await;
+        let org_uuid = uuid::Uuid::parse_str(&org_id).unwrap();
+
+        // Negative TTL → already expired at insert time.
+        let (new_token, old_token) = plant_pending_email_change(&pool, org_uuid, "new@example.com", owner.id, -3600).await;
+
+        for token in [&new_token, &old_token] {
+            let resp = click_confirm(&server, token).await;
+            resp.assert_status(axum::http::StatusCode::NOT_FOUND);
+        }
+
+        // The email must NOT have been updated.
+        let resp = server
+            .get(&format!("/admin/api/v1/organizations/{org_id}"))
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .await;
+        assert_eq!(resp.json::<serde_json::Value>()["email"].as_str().unwrap(), "billing@example.com");
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_second_email_change_supersedes_first(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let pm = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let pm_headers = add_auth_headers(&pm);
+        let owner = create_test_user(&pool, Role::StandardUser).await;
+        let owner_headers = add_auth_headers(&owner);
+
+        let org_id = create_org_for(&server, &pm_headers, "supersede-org", "billing@example.com", owner.id).await;
+
+        for new_email in ["one@example.com", "two@example.com"] {
+            let resp = server
+                .patch(&format!("/admin/api/v1/organizations/{org_id}"))
+                .add_header(&owner_headers[0].0, &owner_headers[0].1)
+                .add_header(&owner_headers[1].0, &owner_headers[1].1)
+                .json(&json!({ "email": new_email }))
+                .await;
+            resp.assert_status(axum::http::StatusCode::OK);
+        }
+
+        // Only the latest pending change should remain, with `requested_by`
+        // set to the caller — this is the audit field, and a regression that
+        // swaps the email but not the actor would be silent without this check.
+        let rows: Vec<(String, uuid::Uuid)> =
+            sqlx::query_as("SELECT new_email, requested_by FROM pending_org_email_changes WHERE organization_id = $1")
+                .bind(uuid::Uuid::parse_str(&org_id).unwrap())
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(rows, vec![("two@example.com".to_string(), owner.id)]);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_superseded_tokens_become_inert(pool: PgPool) {
+        // After a second PATCH, BOTH of the *first* request's tokens must be
+        // inert — clicking either old verification link must not move the
+        // change forward and must not resurrect the old new_email.
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let pm = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let pm_headers = add_auth_headers(&pm);
+        let owner = create_test_user(&pool, Role::StandardUser).await;
+        let owner_headers = add_auth_headers(&owner);
+
+        let org_id = create_org_for(&server, &pm_headers, "stale-token-org", "billing@example.com", owner.id).await;
+        let org_uuid = uuid::Uuid::parse_str(&org_id).unwrap();
+
+        // Plant the first request's tokens directly so we know the plaintext.
+        let (stale_new, stale_old) = plant_pending_email_change(&pool, org_uuid, "first@example.com", owner.id, 3600).await;
+
+        // A second PATCH supersedes via UPSERT — clears confirmations, rotates tokens.
+        let resp = server
+            .patch(&format!("/admin/api/v1/organizations/{org_id}"))
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .json(&json!({ "email": "second@example.com" }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::OK);
+
+        // Both stale tokens are inert.
+        for token in [&stale_new, &stale_old] {
+            click_confirm(&server, token).await.assert_status(axum::http::StatusCode::NOT_FOUND);
+        }
+
+        // The org's email is still the original — only the second token pair
+        // (which the test cannot read here) could change it.
+        let resp = server
+            .get(&format!("/admin/api/v1/organizations/{org_id}"))
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .await;
+        assert_eq!(resp.json::<serde_json::Value>()["email"].as_str().unwrap(), "billing@example.com");
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_confirm_token_cannot_be_replayed(pool: PgPool) {
+        // Each side's UPDATE filters on `*_confirmed_at IS NULL`, so replaying
+        // the same click against the same column returns 404. The other side
+        // is still usable independently.
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let pm = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let pm_headers = add_auth_headers(&pm);
+        let owner = create_test_user(&pool, Role::StandardUser).await;
+
+        let org_id = create_org_for(&server, &pm_headers, "replay-org", "billing@example.com", owner.id).await;
+        let org_uuid = uuid::Uuid::parse_str(&org_id).unwrap();
+
+        let (new_token, _old_token) = plant_pending_email_change(&pool, org_uuid, "new@example.com", owner.id, 3600).await;
+
+        // First new-side click succeeds (waiting message).
+        click_confirm(&server, &new_token).await.assert_status(axum::http::StatusCode::OK);
+
+        // Replay of the same new-side click is now 404 — its column is already set.
+        click_confirm(&server, &new_token)
+            .await
+            .assert_status(axum::http::StatusCode::NOT_FOUND);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_create_org_with_invalid_email_rejected(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let headers = add_auth_headers(&user);
+
+        let resp = server
+            .post("/admin/api/v1/organizations")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({ "name": "bad-email-org", "email": "not-an-email" }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    // ── Authorization on PATCH /organizations/{id} ──────────────────────
+    // These prove the security claim of the fix: only callers with
+    // owner/admin org-role (or platform manager) can start a verification
+    // flow. A future refactor of `can_manage_org_resource` that broadens
+    // access would be caught here.
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_plain_member_cannot_patch_org_email(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let pm = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let pm_headers = add_auth_headers(&pm);
+        let owner = create_test_user(&pool, Role::StandardUser).await;
+        let plain_member = create_test_user(&pool, Role::StandardUser).await;
+        let plain_member_headers = add_auth_headers(&plain_member);
+
+        let org_id = create_org_for(&server, &pm_headers, "auth-member-org", "billing@example.com", owner.id).await;
+
+        // Add as plain `member` — NOT owner/admin.
+        let resp = server
+            .post(&format!("/admin/api/v1/organizations/{org_id}/members"))
+            .add_header(&pm_headers[0].0, &pm_headers[0].1)
+            .add_header(&pm_headers[1].0, &pm_headers[1].1)
+            .json(&json!({ "user_id": plain_member.id, "role": "member" }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::CREATED);
+
+        // Plain member tries to PATCH the email — must be denied with 403.
+        let resp = server
+            .patch(&format!("/admin/api/v1/organizations/{org_id}"))
+            .add_header(&plain_member_headers[0].0, &plain_member_headers[0].1)
+            .add_header(&plain_member_headers[1].0, &plain_member_headers[1].1)
+            .json(&json!({ "email": "attacker@example.com" }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::FORBIDDEN);
+
+        // No pending row should have been created.
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pending_org_email_changes WHERE organization_id = $1")
+            .bind(uuid::Uuid::parse_str(&org_id).unwrap())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_non_member_cannot_patch_org_email(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let pm = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let pm_headers = add_auth_headers(&pm);
+        let owner = create_test_user(&pool, Role::StandardUser).await;
+        let outsider = create_test_user(&pool, Role::StandardUser).await;
+        let outsider_headers = add_auth_headers(&outsider);
+
+        let org_id = create_org_for(&server, &pm_headers, "auth-outsider-org", "billing@example.com", owner.id).await;
+
+        let resp = server
+            .patch(&format!("/admin/api/v1/organizations/{org_id}"))
+            .add_header(&outsider_headers[0].0, &outsider_headers[0].1)
+            .add_header(&outsider_headers[1].0, &outsider_headers[1].1)
+            .json(&json!({ "email": "attacker@example.com" }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::FORBIDDEN);
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pending_org_email_changes WHERE organization_id = $1")
+            .bind(uuid::Uuid::parse_str(&org_id).unwrap())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_platform_manager_can_patch_org_email_without_membership(pool: PgPool) {
+        // A platform manager who is NOT a member of the org must still be able
+        // to drive the change — they're our break-glass admin.
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let pm = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let pm_headers = add_auth_headers(&pm);
+        let owner = create_test_user(&pool, Role::StandardUser).await;
+
+        let org_id = create_org_for(&server, &pm_headers, "auth-pm-org", "billing@example.com", owner.id).await;
+
+        let resp = server
+            .patch(&format!("/admin/api/v1/organizations/{org_id}"))
+            .add_header(&pm_headers[0].0, &pm_headers[0].1)
+            .add_header(&pm_headers[1].0, &pm_headers[1].1)
+            .json(&json!({ "email": "new-contact@example.com" }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::OK);
+        let body = resp.json::<serde_json::Value>();
+        assert_eq!(
+            body["pending_email_change"]["new_email"].as_str().unwrap(),
+            "new-contact@example.com"
+        );
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_token_for_one_org_cannot_affect_another(pool: PgPool) {
+        // Per-row tenancy: a token issued for org A must never change org B's
+        // email even though the same handler serves both.
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let pm = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let pm_headers = add_auth_headers(&pm);
+        let owner_a = create_test_user(&pool, Role::StandardUser).await;
+        let owner_a_headers = add_auth_headers(&owner_a);
+        let owner_b = create_test_user(&pool, Role::StandardUser).await;
+        let owner_b_headers = add_auth_headers(&owner_b);
+
+        let org_a_id = create_org_for(&server, &pm_headers, "tenancy-org-a", "a@example.com", owner_a.id).await;
+        let org_b_id = create_org_for(&server, &pm_headers, "tenancy-org-b", "b@example.com", owner_b.id).await;
+        let org_a_uuid = uuid::Uuid::parse_str(&org_a_id).unwrap();
+
+        // Plant both tokens for org A so we can apply the full change.
+        let (new_a, old_a) = plant_pending_email_change(&pool, org_a_uuid, "new-a@example.com", owner_a.id, 3600).await;
+
+        click_confirm(&server, &new_a).await.assert_status(axum::http::StatusCode::OK);
+        click_confirm(&server, &old_a).await.assert_status(axum::http::StatusCode::OK);
+
+        // Org A's email moved.
+        let resp = server
+            .get(&format!("/admin/api/v1/organizations/{org_a_id}"))
+            .add_header(&owner_a_headers[0].0, &owner_a_headers[0].1)
+            .add_header(&owner_a_headers[1].0, &owner_a_headers[1].1)
+            .await;
+        assert_eq!(resp.json::<serde_json::Value>()["email"].as_str().unwrap(), "new-a@example.com");
+
+        // Org B's email is untouched.
+        let resp = server
+            .get(&format!("/admin/api/v1/organizations/{org_b_id}"))
+            .add_header(&owner_b_headers[0].0, &owner_b_headers[0].1)
+            .add_header(&owner_b_headers[1].0, &owner_b_headers[1].1)
+            .await;
+        assert_eq!(resp.json::<serde_json::Value>()["email"].as_str().unwrap(), "b@example.com");
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_soft_deleted_org_cannot_have_email_changed_via_token(pool: PgPool) {
+        // If an org is soft-deleted between PATCH and click, both tokens must
+        // become inert. The UPDATE in confirm_*_email_side joins users WHERE
+        // is_deleted = false, so a stale pending row matches no row.
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let pm = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let pm_headers = add_auth_headers(&pm);
+        let owner = create_test_user(&pool, Role::StandardUser).await;
+
+        let org_id = create_org_for(&server, &pm_headers, "soft-delete-org", "billing@example.com", owner.id).await;
+        let org_uuid = uuid::Uuid::parse_str(&org_id).unwrap();
+
+        let (new_token, old_token) = plant_pending_email_change(&pool, org_uuid, "new@example.com", owner.id, 3600).await;
+
+        // Soft-delete the org directly (mirrors what `delete_organization` does).
+        sqlx::query("UPDATE users SET is_deleted = true WHERE id = $1")
+            .bind(org_uuid)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // Both tokens are now inert.
+        for token in [&new_token, &old_token] {
+            click_confirm(&server, token).await.assert_status(axum::http::StatusCode::NOT_FOUND);
+        }
+
+        // Pending row is still present (the UPDATE didn't match anything) —
+        // it'll be reaped when the org is hard-deleted via CASCADE.
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pending_org_email_changes WHERE organization_id = $1")
+            .bind(org_uuid)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_patch_writes_both_verification_emails(pool: PgPool) {
+        // The file transport in the default test config writes each email to
+        // a temp directory shared across the process. We scope our assertions
+        // to a per-test directory via create_test_app_with_config so other
+        // tests' emails don't pollute the scan. Double-opt-in means BOTH
+        // mailboxes get a verification link, not just the new one.
+        let scratch = std::env::temp_dir().join(format!("dwctl-test-emails-patch-{}-{}", std::process::id(), uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&scratch).unwrap();
+
+        let mut config = create_test_config();
+        config.email.transport = crate::config::EmailTransportConfig::File {
+            path: scratch.to_string_lossy().to_string(),
+        };
+
+        let (server, _bg) = create_test_app_with_config(pool.clone(), config, false).await;
+        let pm = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let pm_headers = add_auth_headers(&pm);
+        let owner = create_test_user(&pool, Role::StandardUser).await;
+        let owner_headers = add_auth_headers(&owner);
+
+        let org_id = create_org_for(&server, &pm_headers, "email-send-org", "current@example.com", owner.id).await;
+
+        let resp = server
+            .patch(&format!("/admin/api/v1/organizations/{org_id}"))
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .json(&json!({ "email": "new@example.com" }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::OK);
+
+        // Read all .eml files written to the scratch dir. We expect two:
+        // one to the new address and one to the current address, both
+        // containing a confirmation link (not a notice).
+        let mut to_addresses: Vec<String> = Vec::new();
+        let mut bodies: Vec<String> = Vec::new();
+        for entry in std::fs::read_dir(&scratch).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|s| s.to_str()) == Some("eml") {
+                let body = std::fs::read_to_string(&path).unwrap();
+                for line in body.lines() {
+                    if let Some(rest) = line.strip_prefix("To: ") {
+                        to_addresses.push(rest.trim().to_string());
+                    }
+                }
+                bodies.push(body);
+            }
+        }
+        to_addresses.sort();
+        assert_eq!(
+            to_addresses,
+            vec!["current@example.com".to_string(), "new@example.com".to_string()],
+            "expected verification email to both addresses; got {to_addresses:?}",
+        );
+        // Both emails should contain a confirmation link (the URL path is the
+        // backend GET endpoint). This proves both sides got verification
+        // requests rather than one verification + one notice.
+        let confirm_link_count = bodies
+            .iter()
+            .filter(|b| b.contains("/admin/api/v1/organizations/email-change/"))
+            .count();
+        assert_eq!(confirm_link_count, 2, "both verification emails must carry a confirmation link");
+    }
+
+    // ── MX-record deliverability check ─────────────────────────────────
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_mx_check_rejects_undeliverable_domain(pool: PgPool) {
+        // RFC 6761 reserves `.invalid` as a TLD that must always NXDOMAIN.
+        // The MX check should fail-closed on that and return 400.
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let pm = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let pm_headers = add_auth_headers(&pm);
+        let owner = create_test_user(&pool, Role::StandardUser).await;
+        let owner_headers = add_auth_headers(&owner);
+
+        let org_id = create_org_for(&server, &pm_headers, "mx-check-org", "billing@example.com", owner.id).await;
+
+        let resp = server
+            .patch(&format!("/admin/api/v1/organizations/{org_id}"))
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .json(&json!({ "email": "bounce@no-such-host-please.invalid" }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::BAD_REQUEST);
+
+        // No pending row should have been created.
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pending_org_email_changes WHERE organization_id = $1")
+            .bind(uuid::Uuid::parse_str(&org_id).unwrap())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    // ── Pending state visibility ──────────────────────────────────────
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_get_org_surfaces_pending_email_change(pool: PgPool) {
+        // A dashboard refresh mid-verification should still see the pending
+        // state via GET, not only on the PATCH that created it.
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let pm = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let pm_headers = add_auth_headers(&pm);
+        let owner = create_test_user(&pool, Role::StandardUser).await;
+        let owner_headers = add_auth_headers(&owner);
+
+        let org_id = create_org_for(&server, &pm_headers, "pending-visible-org", "billing@example.com", owner.id).await;
+
+        // Initiate change.
+        let resp = server
+            .patch(&format!("/admin/api/v1/organizations/{org_id}"))
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .json(&json!({ "email": "next@example.com" }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::OK);
+
+        // GET the org — pending_email_change should be present.
+        let resp = server
+            .get(&format!("/admin/api/v1/organizations/{org_id}"))
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .await;
+        resp.assert_status(axum::http::StatusCode::OK);
+        let body = resp.json::<serde_json::Value>();
+        assert_eq!(body["email"].as_str().unwrap(), "billing@example.com");
+        assert_eq!(
+            body["pending_email_change"]["new_email"].as_str().unwrap(),
+            "next@example.com",
+            "GET should surface in-flight pending change; got: {body}",
+        );
+        assert!(body["pending_email_change"]["expires_at"].is_string());
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_patch_other_fields_still_reports_pending_email_change(pool: PgPool) {
+        // After initiating an email change, a follow-up PATCH that touches
+        // only non-email fields must still reflect the still-pending change
+        // in its response — otherwise the dashboard loses visibility.
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let pm = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let pm_headers = add_auth_headers(&pm);
+        let owner = create_test_user(&pool, Role::StandardUser).await;
+        let owner_headers = add_auth_headers(&owner);
+
+        let org_id = create_org_for(&server, &pm_headers, "pending-survives-org", "billing@example.com", owner.id).await;
+
+        // Initiate the change.
+        let resp = server
+            .patch(&format!("/admin/api/v1/organizations/{org_id}"))
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .json(&json!({ "email": "next@example.com" }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::OK);
+
+        // Follow-up PATCH that only renames the org — no email field.
+        let resp = server
+            .patch(&format!("/admin/api/v1/organizations/{org_id}"))
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .json(&json!({ "display_name": "Renamed Org" }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::OK);
+        let body = resp.json::<serde_json::Value>();
+        assert_eq!(body["display_name"].as_str().unwrap(), "Renamed Org");
+        assert_eq!(
+            body["pending_email_change"]["new_email"].as_str().unwrap(),
+            "next@example.com",
+            "non-email PATCH must still surface the in-flight change; got: {body}",
+        );
     }
 }

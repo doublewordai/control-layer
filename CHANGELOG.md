@@ -1,5 +1,115 @@
 # Changelog
 
+## [8.58.1](https://github.com/doublewordai/control-layer/compare/v8.58.0...v8.58.1) (2026-06-03)
+
+
+### Performance Improvements
+
+* **sync:** raise onwards fallback resync default 10s-&gt;5min ([#1118](https://github.com/doublewordai/control-layer/issues/1118)) ([86b9049](https://github.com/doublewordai/control-layer/commit/86b9049a7dfb625b77174d02fbf3131fbe868519))
+* **sync:** stop api_keys no-op upserts from triggering onwards reloads ([#1119](https://github.com/doublewordai/control-layer/issues/1119)) ([d0ca45d](https://github.com/doublewordai/control-layer/commit/d0ca45d84bfb8c308817bc13b7e567f8655a673f))
+
+## [8.58.0](https://github.com/doublewordai/control-layer/compare/v8.57.0...v8.58.0) (2026-06-02)
+
+
+### Features
+
+* match initial purchase amount ([#1113](https://github.com/doublewordai/control-layer/issues/1113)) ([f09db56](https://github.com/doublewordai/control-layer/commit/f09db563e84f1daf324aaff488768197b085da3c))
+
+
+### Bug Fixes
+
+* **deps:** bump hickory-resolver to 0.26 + aws-sdk-s3 to 1.134 (closes 4 backend alerts) ([#1116](https://github.com/doublewordai/control-layer/issues/1116)) ([d90d7b0](https://github.com/doublewordai/control-layer/commit/d90d7b07a414f45d09cafaa1e15c7f8bc6528315))
+* Give the pre-tax total as credits, not the total. ([#1115](https://github.com/doublewordai/control-layer/issues/1115)) ([7abae48](https://github.com/doublewordai/control-layer/commit/7abae48b94f20f26477e9290987a8e7859fa0fea))
+
+## [8.57.0](https://github.com/doublewordai/control-layer/compare/v8.56.0...v8.57.0) (2026-06-01)
+
+
+### Features
+
+* add pending request decay window ([#1107](https://github.com/doublewordai/control-layer/issues/1107)) ([5eda366](https://github.com/doublewordai/control-layer/commit/5eda3665580509ab8466948bc14f66ac2499a066))
+
+
+### Bug Fixes
+
+* **deps:** bump tar from 0.4.45 to 0.4.46 in /dwctl ([#1109](https://github.com/doublewordai/control-layer/issues/1109)) ([5381f6d](https://github.com/doublewordai/control-layer/commit/5381f6d54f1c6832d5b3f053e963f84fe008a8b2))
+
+## [8.56.0](https://github.com/doublewordai/control-layer/compare/v8.55.0...v8.56.0) (2026-06-01)
+
+
+### Features
+
+* adds rate limits for unverified users ([#1105](https://github.com/doublewordai/control-layer/issues/1105)) ([3e07a01](https://github.com/doublewordai/control-layer/commit/3e07a01765170ac36a3ce436ca9e750da1c2a205))
+
+## [8.55.0](https://github.com/doublewordai/control-layer/compare/v8.54.2...v8.55.0) (2026-05-29)
+
+
+### Features
+
+* expose onwards 0.29 retry backoff per composite model ([#1097](https://github.com/doublewordai/control-layer/issues/1097)) ([fbe6717](https://github.com/doublewordai/control-layer/commit/fbe67170b33331eb01b9c43eba8e0b36d2faedef))
+* replace underway for response creation to use channel system ([#1101](https://github.com/doublewordai/control-layer/issues/1101)) ([9fdcb96](https://github.com/doublewordai/control-layer/commit/9fdcb963e8dbfcce295723242db4cce049ac5445))
+
+## [8.54.2](https://github.com/doublewordai/control-layer/compare/v8.54.1...v8.54.2) (2026-05-28)
+
+
+### Bug Fixes
+
+* **files:** return 400 not 500 for malformed multipart uploads ([#1102](https://github.com/doublewordai/control-layer/issues/1102)) ([8e11774](https://github.com/doublewordai/control-layer/commit/8e11774fb880b696e62836af6ea2532461c9a918))
+
+## [8.54.1](https://github.com/doublewordai/control-layer/compare/v8.54.0...v8.54.1) (2026-05-27)
+
+
+### Bug Fixes
+
+* **dashboard:** load provider icons via the icon proxy ([#1099](https://github.com/doublewordai/control-layer/issues/1099)) ([afaee05](https://github.com/doublewordai/control-layer/commit/afaee05c756a90860dc0e67a79ccc1260e95e344))
+
+## [8.54.0](https://github.com/doublewordai/control-layer/compare/v8.53.0...v8.54.0) (2026-05-27)
+
+
+### Features
+
+* proxy provider-display-config icons through the API ([#1096](https://github.com/doublewordai/control-layer/issues/1096)) ([f460543](https://github.com/doublewordai/control-layer/commit/f4605435070461edddcd933c1c70737ebc00ba09))
+
+## [8.53.0](https://github.com/doublewordai/control-layer/compare/v8.52.2...v8.53.0) (2026-05-26)
+
+
+### Features
+
+* add configurable browser security response headers ([#1091](https://github.com/doublewordai/control-layer/issues/1091)) ([0357624](https://github.com/doublewordai/control-layer/commit/03576247b13cb70b26f4338624b039c4153d8df8))
+
+## [8.52.2](https://github.com/doublewordai/control-layer/compare/v8.52.1...v8.52.2) (2026-05-21)
+
+
+### Bug Fixes
+
+* **openapi:** gate admin spec behind admin auth and disable by default ([#1089](https://github.com/doublewordai/control-layer/issues/1089)) ([56b145c](https://github.com/doublewordai/control-layer/commit/56b145ce6f8932bedaffc2f4d07a1009c2b7e3c4))
+
+## [8.52.1](https://github.com/doublewordai/control-layer/compare/v8.52.0...v8.52.1) (2026-05-20)
+
+
+### Bug Fixes
+
+* **organizations:** verify and validate contact-email changes ([#1080](https://github.com/doublewordai/control-layer/issues/1080)) ([4f91377](https://github.com/doublewordai/control-layer/commit/4f91377ed7e10f32e1c607073df01beda27d8591))
+
+## [8.52.0](https://github.com/doublewordai/control-layer/compare/v8.51.0...v8.52.0) (2026-05-20)
+
+
+### Features
+
+* **usage:** scope /usage to active organization and accept user_id filter ([#1086](https://github.com/doublewordai/control-layer/issues/1086)) ([1d4a05c](https://github.com/doublewordai/control-layer/commit/1d4a05c66f063176232d43630e408ffa065b3426))
+
+## [8.51.0](https://github.com/doublewordai/control-layer/compare/v8.50.0...v8.51.0) (2026-05-20)
+
+
+### Features
+
+* single request deletion ([#1082](https://github.com/doublewordai/control-layer/issues/1082)) ([379e705](https://github.com/doublewordai/control-layer/commit/379e70597935e095cc7131d7137678dfc1b6585c))
+* unified http client ([#1078](https://github.com/doublewordai/control-layer/issues/1078)) ([106b78e](https://github.com/doublewordai/control-layer/commit/106b78e4ab775e425d29fa3fe6ffdc1f7eb80004))
+
+
+### Bug Fixes
+
+* open responses compliant deletion ([#1084](https://github.com/doublewordai/control-layer/issues/1084)) ([2de7390](https://github.com/doublewordai/control-layer/commit/2de7390227ce2376741902e54104ee4d731a9c63))
+
 ## [8.50.0](https://github.com/doublewordai/control-layer/compare/v8.49.1...v8.50.0) (2026-05-15)
 
 

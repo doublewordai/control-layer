@@ -27,7 +27,6 @@ use async_trait::async_trait;
 use fusillade::{
     PoolProvider as FusilladePoolProvider, PostgresRequestManager, PostgresResponseStepManager, ReqwestHttpClient, TestDbPools,
 };
-use onwards::client::HttpClient;
 use onwards::traits::RequestContext;
 use onwards::{
     ChainStep, LoopConfig, MultiStepStore, NextAction, RecordedStep, StepDescriptor, StepKind, StepState, StoreError, UpstreamTarget,
@@ -184,8 +183,21 @@ impl<P: FusilladePoolProvider + Clone + Send + Sync + 'static> MultiStepStore fo
     }
 }
 
-fn http_client_for_tests() -> Arc<dyn HttpClient + Send + Sync> {
-    Arc::new(onwards::client::create_hyper_client(10, 30))
+fn http_client_for_tests() -> Arc<ReqwestHttpClient> {
+    // `streamable_endpoints` is empty so this test's wiremock — which
+    // returns plain JSON, not SSE — goes through the buffered branch.
+    // Marking `/v1/chat/completions` streamable would route through
+    // fusillade's reassembler, which expects `data: …` events and would
+    // empty out the response_payload (no `wants_tool` field) and trip
+    // the transition function's unexpected-chain-state arm. The
+    // streaming behaviour itself is exercised by onwards' own
+    // response_loop tests against an SSE-emitting wiremock.
+    Arc::new(ReqwestHttpClient::new(
+        std::time::Duration::from_secs(60),
+        std::time::Duration::from_secs(60),
+        std::time::Duration::from_secs(120),
+        Vec::new(),
+    ))
 }
 
 async fn store_with_real_fusillade(pool: PgPool) -> FusilladeResponseStore<TestDbPools> {
@@ -252,7 +264,8 @@ async fn loop_drives_real_tool_and_model_calls_through_production_executor(pool:
     // Real onwards HyperClient for the model fire path.
     let http_client = http_client_for_tests();
     let upstream = UpstreamTarget {
-        url: format!("{}/v1/chat/completions", model_server.uri()),
+        endpoint: model_server.uri(),
+        path: "/v1/chat/completions".to_string(),
         api_key: None,
     };
 

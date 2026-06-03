@@ -33,6 +33,53 @@ use axum::{
 };
 use sqlx::Acquire;
 
+/// Validate the inter-attempt backoff shape. The values argument carries
+/// whatever the request is about to write (which may be the values from a
+/// create request, or the proposed values from a partial update).
+///
+/// Cross-field invariants that depend on *unchanged* fields during a partial
+/// update are not asserted here — the DB CHECK constraints in migration 098
+/// are the backstop for those rare cases. The goal of this function is a
+/// friendly API-layer error for the common single-field mistake.
+fn validate_backoff(initial_ms: Option<i32>, max_ms: Option<i32>, factor: Option<f64>, max_total_ms: Option<i32>) -> Result<()> {
+    if let Some(initial) = initial_ms
+        && initial < 1
+    {
+        return Err(Error::BadRequest {
+            message: format!("backoff_initial_ms must be >= 1 (got {})", initial),
+        });
+    }
+    if let Some(max) = max_ms
+        && max < 1
+    {
+        return Err(Error::BadRequest {
+            message: format!("backoff_max_ms must be >= 1 (got {})", max),
+        });
+    }
+    if let Some(f) = factor
+        && (f < 1.0 || !f.is_finite())
+    {
+        return Err(Error::BadRequest {
+            message: format!("backoff_factor must be >= 1.0 and finite (got {})", f),
+        });
+    }
+    if let (Some(initial), Some(max)) = (initial_ms, max_ms)
+        && max < initial
+    {
+        return Err(Error::BadRequest {
+            message: format!("backoff_max_ms ({}) must be >= backoff_initial_ms ({})", max, initial),
+        });
+    }
+    if let (Some(max), Some(budget)) = (max_ms, max_total_ms)
+        && budget < max
+    {
+        return Err(Error::BadRequest {
+            message: format!("backoff_max_total_ms ({}) must be >= backoff_max_ms ({})", budget, max),
+        });
+    }
+    Ok(())
+}
+
 /// Validate that model catalog metadata is within size and key count limits.
 fn validate_metadata(metadata: &ModelCatalogMetadata) -> Result<()> {
     let size = serde_json::to_vec(metadata).map(|v| v.len()).unwrap_or(0);
@@ -493,6 +540,17 @@ pub async fn create_deployed_model<P: PoolProvider>(
         validate_metadata(m)?;
     }
 
+    // Validate backoff shape. Both standard and composite models surface
+    // backoff config to onwards, so both carry the knobs and both need
+    // validating — otherwise a bad value slips past the API and trips the
+    // DB CHECK constraint (migration 098), surfacing as a 500 instead of a
+    // friendly 400.
+    let (b_initial, b_max, b_factor, b_total) = match &create {
+        DeployedModelCreate::Standard(s) => (s.backoff_initial_ms, s.backoff_max_ms, s.backoff_factor, s.backoff_max_total_ms),
+        DeployedModelCreate::Composite(c) => (c.backoff_initial_ms, c.backoff_max_ms, c.backoff_factor, c.backoff_max_total_ms),
+    };
+    validate_backoff(Some(b_initial), Some(b_max), Some(b_factor), b_total)?;
+
     let mut tx = state.db.write().begin().await.map_err(|e| Error::Database(e.into()))?;
 
     // Validate endpoint exists (only for standard models)
@@ -587,7 +645,7 @@ pub async fn update_deployed_model<P: PoolProvider>(
     State(state): State<AppState<P>>,
     Path(deployment_id): Path<DeploymentId>,
     current_user: RequiresPermission<resource::Models, operation::UpdateAll>,
-    Json(update): Json<DeployedModelUpdate>,
+    Json(mut update): Json<DeployedModelUpdate>,
 ) -> Result<Json<DeployedModelResponse>> {
     let has_system_access = has_permission(&current_user, resource::Models.into(), operation::SystemAccess.into());
 
@@ -623,8 +681,11 @@ pub async fn update_deployed_model<P: PoolProvider>(
 
     let mut tx = state.db.write().begin().await.map_err(|e| Error::Database(e.into()))?;
 
-    // Verify deployment exists and check access based on permissions
-    let model_alias = {
+    // Verify deployment exists and check access based on permissions.
+    // We also keep the current row so we can (a) validate the *merged* backoff
+    // state — not just the fields in this PATCH — and (b) derive the
+    // standard-model fallback invariant below.
+    let (model_alias, is_composite, cur_initial, cur_max, cur_factor, cur_total) = {
         let mut repo = Deployments::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
         match repo.get_by_id(deployment_id).await {
             Ok(Some(model)) => {
@@ -634,7 +695,14 @@ pub async fn update_deployed_model<P: PoolProvider>(
                         id: deployment_id.to_string(),
                     });
                 }
-                model.alias.clone()
+                (
+                    model.alias.clone(),
+                    model.is_composite,
+                    model.backoff_initial_ms,
+                    model.backoff_max_ms,
+                    model.backoff_factor,
+                    model.backoff_max_total_ms,
+                )
             }
             Ok(None) => {
                 return Err(Error::NotFound {
@@ -645,6 +713,45 @@ pub async fn update_deployed_model<P: PoolProvider>(
             Err(e) => return Err(e.into()),
         }
     };
+
+    // Validate the backoff state the update would *result in*, merging
+    // incoming fields over the stored values. Without merging, a one-sided
+    // partial update (e.g. only raising initial_ms above the stored max_ms)
+    // slips past the API and trips the DB CHECK as a 500 instead of a 400.
+    validate_backoff(
+        Some(update.backoff_initial_ms.unwrap_or(cur_initial)),
+        Some(update.backoff_max_ms.unwrap_or(cur_max)),
+        Some(update.backoff_factor.unwrap_or(cur_factor)),
+        match update.backoff_max_total_ms {
+            Some(v) => v,      // explicit set or clear
+            None => cur_total, // unchanged
+        },
+    )?;
+
+    // For a standard (single-provider) model, backoff is inert unless
+    // fallback + with_replacement + max_attempts>1 are all set (onwards'
+    // SelectIter otherwise yields once). The dashboard sends these companions,
+    // but a raw API PATCH of just `backoff_enabled` would save a config that
+    // does nothing — so derive them here too, mirroring create. Composite
+    // models manage fallback separately (Routing Configuration), so leave
+    // them untouched.
+    if !is_composite {
+        match update.backoff_enabled {
+            Some(true) => {
+                update.fallback_enabled = Some(true);
+                update.fallback_with_replacement = Some(true);
+                // Respect an explicit caller value; otherwise default to 3.
+                if update.fallback_max_attempts.is_none() {
+                    update.fallback_max_attempts = Some(Some(3));
+                }
+            }
+            Some(false) => {
+                // Standard-model fallback exists only to serve backoff retries.
+                update.fallback_enabled = Some(false);
+            }
+            None => {} // not touching backoff → leave fallback as-is
+        }
+    }
 
     // Resolve traffic routing rules if provided
     let resolved_rules = match &update.traffic_routing_rules {

@@ -14,12 +14,25 @@ export type ModelDisplayCategory = "generation" | "embedding" | "ocr";
 // Virtual model types (virtual models route requests across multiple hosted models)
 export type LoadBalancingStrategy = "weighted_random" | "priority";
 
+export type JitterStrategy = "none" | "full";
+
+export interface BackoffConfig {
+  initial_ms: number;
+  max_ms: number;
+  factor: number;
+  jitter: JitterStrategy;
+}
+
 export interface FallbackConfig {
   enabled: boolean;
   on_rate_limit: boolean;
   on_status: number[];
   with_replacement: boolean;
   max_attempts: number | null;
+  /** Inter-attempt exponential backoff. `null` (or omitted) = no delay between retries. */
+  backoff?: BackoffConfig | null;
+  /** Cumulative inter-attempt sleep budget, in milliseconds. `null` = no budget cap. */
+  max_total_backoff_ms?: number | null;
 }
 
 export interface ComponentEndpointSummary {
@@ -185,6 +198,41 @@ export interface ProviderDisplayConfig {
   updated_at?: string | null;
 }
 
+/**
+ * Resolve a provider config's `icon` field to a value safe to render in
+ * `<CatalogIcon icon=...>`.
+ *
+ * - `https://…` URLs (operator-set, point at npmmirror / wikipedia /
+ *   simpleicons / GitHub avatars / arbitrary CDNs) are routed through
+ *   the server-side icon proxy
+ *   (`GET /admin/api/v1/provider-display-configs/{providerKey}/icon`,
+ *   added in control-layer 8.54.0) so the browser only ever loads
+ *   provider logos from the same origin as the dashboard. Lets us keep
+ *   the deployed `img-src 'self' data: blob:` CSP regardless of which
+ *   CDN an admin pastes.
+ * - Root-relative paths (`/endpoints/anthropic.svg`) pass through —
+ *   already same-origin.
+ * - Registry keys (`anthropic`, `google`, `openai`, `onwards`,
+ *   `snowflake`) pass through — `CatalogIcon`'s built-in `ICON_REGISTRY`
+ *   maps them to bundled assets client-side.
+ * - Empty/whitespace/null → `undefined` so `CatalogIcon` falls back.
+ *
+ * Takes `providerKey` separately because the deployment-providers chip
+ * mapping (`providerConfigMap.get(dp)` in ModelCatalog) uses slim configs
+ * keyed by the same `dp` string we already have to hand.
+ */
+export function providerIconUrl(
+  providerKey: string,
+  iconValue: string | null | undefined,
+): string | undefined {
+  const icon = iconValue?.trim();
+  if (!icon) return undefined;
+  if (icon.startsWith("https://")) {
+    return `/admin/api/v1/provider-display-configs/${encodeURIComponent(providerKey)}/icon`;
+  }
+  return icon;
+}
+
 export interface ProviderDisplayConfigCreateRequest {
   provider_key: string;
   display_name?: string;
@@ -271,6 +319,13 @@ export interface VirtualModelCreate {
   fallback_on_status?: number[];
   fallback_with_replacement?: boolean;
   fallback_max_attempts?: number | null;
+  /** Inter-attempt backoff toggle; defaults to false (legacy zero-delay retry). */
+  backoff_enabled?: boolean;
+  backoff_initial_ms?: number;
+  backoff_max_ms?: number;
+  backoff_factor?: number;
+  backoff_jitter?: JitterStrategy;
+  backoff_max_total_ms?: number | null;
   sanitize_responses?: boolean;
   traffic_routing_rules?: TrafficRoutingRule[];
   allowed_batch_completion_windows?: string[];
@@ -500,6 +555,14 @@ export interface ModelUpdateRequest {
   fallback_on_status?: number[] | null;
   fallback_with_replacement?: boolean | null;
   fallback_max_attempts?: number | null;
+  /** Inter-attempt backoff toggle. `null` (or omitted) = no change. */
+  backoff_enabled?: boolean | null;
+  backoff_initial_ms?: number | null;
+  backoff_max_ms?: number | null;
+  backoff_factor?: number | null;
+  backoff_jitter?: JitterStrategy | null;
+  /** Three-state: omitted = no change, null = clear cap, number = set cap. */
+  backoff_max_total_ms?: number | null;
   sanitize_responses?: boolean | null;
   trusted?: boolean | null;
   open_responses_adapter?: boolean | null;

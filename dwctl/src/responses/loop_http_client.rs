@@ -19,8 +19,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use fusillade::http::{HttpClient as FusilladeHttpClient, HttpResponse};
-use fusillade::{FusilladeError, PoolProvider as FusilladePool, RequestData, Result as FusilladeResult};
-use onwards::client::HttpClient as OnwardsHttpClient;
+use fusillade::{FusilladeError, PoolProvider as FusilladePool, RequestData, ReqwestHttpClient, Result as FusilladeResult};
 use onwards::traits::{RequestContext, ToolExecutor};
 use onwards::{LoopConfig, LoopError, MultiStepStore, UpstreamTarget};
 
@@ -40,7 +39,13 @@ where
 {
     pub response_store: Arc<FusilladeResponseStore<P>>,
     pub tool_executor: Arc<T>,
-    pub inner_http: Arc<dyn OnwardsHttpClient + Send + Sync>,
+    /// Same `fusillade::ReqwestHttpClient` instance the batch / single-
+    /// step paths use. Going through fusillade for per-step model
+    /// fires (instead of an onwards `HyperClient`) is what gets the
+    /// `X-Fusillade-Request-Id` header — and therefore correct
+    /// analytics attribution — stamped on each outgoing call without
+    /// any extra plumbing on this side.
+    pub inner_http: Arc<ReqwestHttpClient>,
     pub tool_resolver: Option<Arc<dyn DaemonToolResolver>>,
     pub loop_config: LoopConfig,
 }
@@ -131,11 +136,13 @@ where
         // dwctl rewrites /v1/responses → /v1/chat/completions on the wire
         // since most upstreams speak chat-completions (transition.rs builds
         // the messages array). The row's `endpoint` carries the base URL.
+        // Splitting endpoint + path (rather than concatenating into a
+        // single URL) lets fusillade key its streaming-vs-buffered
+        // dispatch on `path` — passing the whole thing in `endpoint`
+        // would force every per-step fire down the non-streaming path.
         let upstream = UpstreamTarget {
-            url: {
-                let base = request.endpoint.trim_end_matches('/');
-                format!("{base}/v1/chat/completions")
-            },
+            endpoint: request.endpoint.trim_end_matches('/').to_string(),
+            path: "/v1/chat/completions".to_string(),
             api_key: api_key_opt,
         };
 

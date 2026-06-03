@@ -1,30 +1,40 @@
-//! Outlet `RequestHandler` that enqueues response completion jobs via underway.
+//! Outlet `RequestHandler` that sends response completion records into the
+//! in-process `RequestsWriter` channel.
 //!
 //! This handler is added to outlet's `MultiHandler` alongside the existing
-//! `PostgresHandler` (which writes to `http_analytics`). It enqueues a
-//! `CompleteResponseJob` carrying both the response data and enough request
-//! context to synthesize the fusillade row from scratch — `CompleteResponseJob`
-//! and `CreateResponseJob` are race-tolerant: whichever wins, the final state
-//! is correct.
+//! `PostgresHandler` (which writes to `http_analytics`). After outlet captures
+//! the response body, this handler builds a `RawCompletedRequest` and pushes
+//! it onto the writer's mpsc channel; the batched writer task then persists
+//! the row in fusillade.
+//!
+//! Channel-full backpressure flows back to the outlet handler via
+//! `Sender::send().await`, matching `AnalyticsHandler`'s shape. We prefer
+//! slowing outlet to dropping rows, since the `requests` table is the only
+//! place the responses listing reads from.
 
 use outlet::{RequestData, RequestHandler, ResponseData};
-use std::sync::Arc;
-use underway::Job;
+use sqlx::PgPool;
 use uuid::Uuid;
 
-use super::jobs::CompleteResponseInput;
-use super::store::ONWARDS_RESPONSE_ID_HEADER;
-use crate::tasks::TaskState;
+use super::store::{ONWARDS_RESPONSE_ID_HEADER, lookup_created_by};
+use super::writer::{RawCompletedRequest, RequestsWriterSender};
 
-/// Outlet handler that enqueues completion jobs for fusillade-tracked responses.
+/// Outlet handler that forwards completion records to the in-process writer.
+///
+/// Resolves `created_by` from the api_key here (one indexed lookup against
+/// dwctl_pool) before sending so the writer can flush without touching the
+/// dwctl pool inside its bulk transaction. Records without a resolvable
+/// attribution are dropped (matches the underway era, where the
+/// create-response job returned early on missing/invalid api_key).
 #[derive(Clone)]
 pub struct FusilladeOutletHandler {
-    job: Arc<Job<CompleteResponseInput, TaskState>>,
+    sender: RequestsWriterSender,
+    dwctl_pool: PgPool,
 }
 
 impl FusilladeOutletHandler {
-    pub fn new(job: Arc<Job<CompleteResponseInput, TaskState>>) -> Self {
-        Self { job }
+    pub fn new(sender: RequestsWriterSender, dwctl_pool: PgPool) -> Self {
+        Self { sender, dwctl_pool }
     }
 
     /// Extract the onwards response ID from request headers, if present.
@@ -111,14 +121,50 @@ struct CompleteResponseCtx {
     api_key: Option<String>,
 }
 
+impl FusilladeOutletHandler {
+    /// Resolve `created_by` from the api_key, drop records that can't be
+    /// attributed. The fusillade row's XOR check requires non-empty
+    /// `created_by` for batchless rows; the underway-era code skipped the
+    /// same case at the job level, so this is just where the skip moved to.
+    async fn resolve_attribution(&self, ctx: &CompleteResponseCtx) -> Option<(String, String)> {
+        let api_key = match ctx.api_key.as_deref() {
+            Some(key) if !key.is_empty() => key.to_string(),
+            _ => {
+                tracing::debug!(
+                    response_id = %ctx.response_id,
+                    "Skipping response writer send - no api_key on request"
+                );
+                metrics::counter!("dwctl_requests_writer_dropped_total", "reason" => "missing_api_key").increment(1);
+                return None;
+            }
+        };
+        let created_by = lookup_created_by(&self.dwctl_pool, Some(&api_key)).await;
+        match created_by {
+            Some(uid) if !uid.is_empty() => Some((api_key, uid)),
+            _ => {
+                tracing::debug!(
+                    response_id = %ctx.response_id,
+                    "Skipping response writer send - api_key did not resolve to a user"
+                );
+                metrics::counter!("dwctl_requests_writer_dropped_total", "reason" => "unknown_api_key").increment(1);
+                None
+            }
+        }
+    }
+}
+
 impl RequestHandler for FusilladeOutletHandler {
     async fn handle_request(&self, _data: RequestData) {}
 
     fn handle_response(&self, request_data: RequestData, response_data: ResponseData) -> impl std::future::Future<Output = ()> + Send {
-        let job = self.job.clone();
+        let sender = self.sender.clone();
+        let handler = self.clone();
 
         async move {
             let Some(ctx) = Self::extract_complete_response_ctx(&request_data) else {
+                return;
+            };
+            let Some((api_key, created_by)) = handler.resolve_attribution(&ctx).await else {
                 return;
             };
 
@@ -136,34 +182,44 @@ impl RequestHandler for FusilladeOutletHandler {
                 .unwrap_or("")
                 .to_string();
 
-            if let Err(e) = job
-                .enqueue(&CompleteResponseInput {
-                    response_id: ctx.response_id.clone(),
+            if let Err(e) = sender
+                .send(RawCompletedRequest {
+                    request_id: ctx.request_id,
                     status_code,
                     response_body,
-                    request_id: ctx.request_id,
                     request_body,
                     model: ctx.model,
                     endpoint: ctx.endpoint,
-                    base_url: String::new(),
-                    api_key: ctx.api_key,
+                    api_key,
+                    created_by,
                 })
                 .await
             {
-                tracing::warn!(error = %e, response_id = %ctx.response_id, "Failed to enqueue complete-response job");
+                metrics::counter!("dwctl_requests_writer_sends_total", "result" => "err").increment(1);
+                tracing::warn!(
+                    error = %e,
+                    response_id = %ctx.response_id,
+                    "Failed to send completed-response record to writer (channel closed)"
+                );
+            } else {
+                metrics::counter!("dwctl_requests_writer_sends_total", "result" => "ok").increment(1);
             }
         }
     }
 
     fn handle_abandoned(&self, request_data: RequestData) -> impl std::future::Future<Output = ()> + Send {
-        let job = self.job.clone();
+        let sender = self.sender.clone();
+        let handler = self.clone();
 
         async move {
             let Some(ctx) = Self::extract_complete_response_ctx(&request_data) else {
                 return;
             };
+            let Some((api_key, created_by)) = handler.resolve_attribution(&ctx).await else {
+                return;
+            };
 
-            // 499 Client Closed Request — nginx-popularized status for this
+            // 499 Client Closed Request - nginx-popularized status for this
             // scenario. The structured body distinguishes the row from a
             // real upstream 5xx in the responses listing; status 499 also
             // maps to `client_disconnected` in `status_to_error_type` so
@@ -171,7 +227,7 @@ impl RequestHandler for FusilladeOutletHandler {
             //
             // We omit `request_body` (set to "") because outlet's
             // AbandonGuard builds the abandon-time RequestData before body
-            // capture completes — `request_data.body` is always None on
+            // capture completes - `request_data.body` is always None on
             // this path. That's fine for create-if-missing: an empty body
             // is correct since no upstream call ever happened.
             const STATUS_CLIENT_CLOSED: u16 = 499;
@@ -184,21 +240,27 @@ impl RequestHandler for FusilladeOutletHandler {
             })
             .to_string();
 
-            if let Err(e) = job
-                .enqueue(&CompleteResponseInput {
-                    response_id: ctx.response_id.clone(),
+            if let Err(e) = sender
+                .send(RawCompletedRequest {
+                    request_id: ctx.request_id,
                     status_code: STATUS_CLIENT_CLOSED,
                     response_body: abandoned_body,
-                    request_id: ctx.request_id,
                     request_body: String::new(),
                     model: ctx.model,
                     endpoint: ctx.endpoint,
-                    base_url: String::new(),
-                    api_key: ctx.api_key,
+                    api_key,
+                    created_by,
                 })
                 .await
             {
-                tracing::warn!(error = %e, response_id = %ctx.response_id, "Failed to enqueue complete-response job for abandoned request");
+                metrics::counter!("dwctl_requests_writer_sends_total", "result" => "err").increment(1);
+                tracing::warn!(
+                    error = %e,
+                    response_id = %ctx.response_id,
+                    "Failed to send abandoned-response record to writer (channel closed)"
+                );
+            } else {
+                metrics::counter!("dwctl_requests_writer_sends_total", "result" => "ok").increment(1);
             }
         }
     }

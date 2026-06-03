@@ -458,9 +458,11 @@ impl FileUploadError {
     fn into_http_error(self) -> Error {
         match self {
             FileUploadError::StreamInterrupted { message } => {
-                // Stream errors are server-side issues we can't determine the cause of
-                Error::Internal {
-                    operation: format!("upload file: {}", message),
+                // The multipart body was malformed or the connection dropped — a client/transport
+                // problem, not a server fault. (Length-limit errors are mapped to FileTooLarge
+                // before reaching here.) Return 400 so it doesn't surface as a spurious 5xx.
+                Error::BadRequest {
+                    message: format!("Failed to read multipart upload: {message}"),
                 }
             }
             FileUploadError::FileTooLarge { max } => {
@@ -3413,15 +3415,21 @@ mod tests {
 
     #[test]
     fn test_file_upload_error_into_http_error_stream_interrupted() {
+        // A multipart parse/stream failure means the client sent a malformed body or the
+        // connection dropped — a client/transport problem, not a server fault. It must map
+        // to 400 (not 500) so it doesn't surface as a 5xx server error. Length-limit errors
+        // are split off to FileTooLarge before reaching this variant.
         let err = super::FileUploadError::StreamInterrupted {
-            message: "connection reset".to_string(),
+            message: "Multipart parsing failed: connection reset".to_string(),
         };
         let http_err = err.into_http_error();
+        assert_eq!(http_err.status_code(), axum::http::StatusCode::BAD_REQUEST);
         match http_err {
-            crate::errors::Error::Internal { operation } => {
-                assert!(operation.contains("connection reset"));
+            crate::errors::Error::BadRequest { message } => {
+                // Underlying detail is preserved so the client can fix their request.
+                assert!(message.contains("connection reset"));
             }
-            _ => panic!("Expected Internal error"),
+            other => panic!("Expected BadRequest error, got {other:?}"),
         }
     }
 

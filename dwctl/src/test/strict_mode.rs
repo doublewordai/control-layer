@@ -192,8 +192,9 @@ async fn test_strict_mode_allows_chat_completions(pool: PgPool) {
     config.onwards.strict_mode = true;
     config.background_services.onwards_sync.enabled = true;
     // This test asserts the response ID is rewritten to the fusillade ID,
-    // which requires the complete-response worker to run.
-    config.background_services.task_workers.response_workers = 1;
+    // which requires the responses writer to flush each completion.
+    // batch_size=1 flushes per-record so the assertion can poll.
+    config.background_services.task_workers.response_writer_batch_size = 1;
 
     let app = crate::Application::new_with_pool(config, Some(pool.clone()), None)
         .await

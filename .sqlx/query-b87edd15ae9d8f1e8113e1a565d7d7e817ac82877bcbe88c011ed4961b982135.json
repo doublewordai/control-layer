@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE batches\n            SET cancelling_at = $2,\n                cancelled_at = $2\n            WHERE id = $1 AND cancelling_at IS NULL\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "b87edd15ae9d8f1e8113e1a565d7d7e817ac82877bcbe88c011ed4961b982135"
+}

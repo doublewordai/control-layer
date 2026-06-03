@@ -4,9 +4,9 @@ use std::{collections::HashMap, num::NonZeroU32, sync::Arc};
 
 use metrics::histogram;
 use onwards::target::{
-    Auth, ConcurrencyLimitParameters, ConfigFile, FallbackConfig as OnwardsFallbackConfig, KeyDefinition,
-    LoadBalanceStrategy as OnwardsLoadBalanceStrategy, OpenResponsesConfig, PoolSpec, ProviderSpec, RateLimitParameters, RoutingAction,
-    RoutingRule, TargetSpecOrList, Targets, WatchTargetsStream,
+    Auth, BackoffConfig as OnwardsBackoffConfig, ConcurrencyLimitParameters, ConfigFile, FallbackConfig as OnwardsFallbackConfig,
+    JitterStrategy as OnwardsJitterStrategy, KeyDefinition, LoadBalanceStrategy as OnwardsLoadBalanceStrategy, OpenResponsesConfig,
+    PoolSpec, ProviderSpec, RateLimitParameters, RoutingAction, RoutingRule, TargetSpecOrList, Targets, WatchTargetsStream,
 };
 use sqlx::{PgPool, postgres::PgListener};
 use tokio::sync::{mpsc, watch};
@@ -23,7 +23,7 @@ pub enum SyncStatus {
 }
 
 use crate::{
-    config::ONWARDS_CONFIG_CHANGED_CHANNEL,
+    config::{ONWARDS_CONFIG_CHANGED_CHANNEL, RateLimitTiersConfig},
     db::models::deployments::LoadBalancingStrategy,
     types::{ApiKeyId, DeploymentId},
 };
@@ -61,6 +61,22 @@ struct OnwardsTarget {
     /// Traffic routing rules from the model_traffic_rules table
     routing_rules: Vec<RoutingRule>,
 
+    // Fallback / backoff config. Standard (single-provider) models only retry
+    // when fallback is on AND `with_replacement` is true (otherwise the
+    // SelectIter yields exactly once). The backoff fields gate the
+    // inter-attempt sleep onwards inserts when retries happen.
+    fallback_enabled: bool,
+    fallback_on_rate_limit: bool,
+    fallback_on_status: Vec<i32>,
+    fallback_with_replacement: bool,
+    fallback_max_attempts: Option<i32>,
+    backoff_enabled: bool,
+    backoff_initial_ms: i32,
+    backoff_max_ms: i32,
+    backoff_factor: f64,
+    backoff_jitter: String,
+    backoff_max_total_ms: Option<i32>,
+
     // Endpoint info
     endpoint_url: url::Url,
     endpoint_api_key: Option<String>,
@@ -79,6 +95,10 @@ struct OnwardsApiKey {
     purpose: String,
     requests_per_second: Option<f32>,
     burst_size: Option<i32>,
+    /// `verified` flag on the api_key's owning user (api_keys.user_id), used to
+    /// pick between the verified/unverified default rate-limit tiers when this
+    /// key has no per-key override.
+    user_verified: bool,
 }
 
 /// Manages the integration between onwards-pilot and the onwards proxy
@@ -95,6 +115,9 @@ pub struct OnwardsConfigSync {
     cache_info_state: crate::metrics::CacheInfoState,
     /// Enable strict mode with schema validation
     strict_mode: bool,
+    /// Default rate-limit tiers applied to API keys based on the owning user's
+    /// `verified` flag. Used when a key has no per-key override.
+    rate_limit_tiers: RateLimitTiersConfig,
 }
 
 pub struct SyncConfig {
@@ -120,7 +143,7 @@ impl OnwardsConfigSync {
     #[cfg(test)]
     #[instrument(skip(db))]
     pub async fn new(db: PgPool) -> Result<(Self, Targets, WatchTargetsStream), anyhow::Error> {
-        Self::new_with_daemon_limits(db, None, 10, Vec::new(), false).await
+        Self::new_with_daemon_limits(db, None, 10, Vec::new(), false, RateLimitTiersConfig::default()).await
     }
 
     /// Creates a new OnwardsConfigSync with optional daemon capacity limits map and escalation models
@@ -129,16 +152,18 @@ impl OnwardsConfigSync {
     /// `default_batch_capacity` - Default concurrency limit for models without explicit `batch_capacity`.
     /// `escalation_models` - Model aliases that batch API keys should have automatic access to.
     /// `strict_mode` - Enable strict mode with schema validation (only known OpenAI API paths accepted)
-    #[instrument(skip(db, daemon_capacity_limits, escalation_models))]
+    /// `rate_limit_tiers` - Default rate limits applied per-key based on the owning user's `verified` flag.
+    #[instrument(skip(db, daemon_capacity_limits, escalation_models, rate_limit_tiers))]
     pub async fn new_with_daemon_limits(
         db: PgPool,
         daemon_capacity_limits: Option<Arc<dashmap::DashMap<String, usize>>>,
         default_batch_capacity: usize,
         escalation_models: Vec<String>,
         strict_mode: bool,
+        rate_limit_tiers: RateLimitTiersConfig,
     ) -> Result<(Self, Targets, WatchTargetsStream), anyhow::Error> {
         // Load initial configuration (including composite models)
-        let initial_targets = load_targets_from_db(&db, &escalation_models, strict_mode).await?;
+        let initial_targets = load_targets_from_db(&db, &escalation_models, strict_mode, &rate_limit_tiers).await?;
 
         // If daemon limits are provided, populate them
         if let Some(ref limits) = daemon_capacity_limits {
@@ -162,6 +187,7 @@ impl OnwardsConfigSync {
             escalation_models,
             cache_info_state,
             strict_mode,
+            rate_limit_tiers,
         };
         let stream = WatchTargetsStream::new(receiver);
 
@@ -251,7 +277,7 @@ impl OnwardsConfigSync {
 
                                 // Reload configuration from database (including composite models)
                                 last_reload_time = std::time::Instant::now();
-                                match load_targets_from_db(&self.db, &self.escalation_models, self.strict_mode).await {
+                                match load_targets_from_db(&self.db, &self.escalation_models, self.strict_mode, &self.rate_limit_tiers).await {
                                     Ok(new_targets) => {
                                         debug!("Loaded {} targets from database", new_targets.targets.len());
                                         for entry in new_targets.targets.iter() {
@@ -338,7 +364,7 @@ impl OnwardsConfigSync {
                         }
 
                         last_reload_time = std::time::Instant::now();
-                        match load_targets_from_db(&self.db, &self.escalation_models, self.strict_mode).await {
+                        match load_targets_from_db(&self.db, &self.escalation_models, self.strict_mode, &self.rate_limit_tiers).await {
                             Ok(new_targets) => {
                                 debug!("Fallback sync: loaded {} targets from database", new_targets.targets.len());
 
@@ -416,6 +442,17 @@ struct OnwardsCompositeModel {
     fallback_with_replacement: bool,
     /// Maximum number of failover attempts
     fallback_max_attempts: Option<i32>,
+    /// Inter-attempt exponential backoff configuration. When `backoff_enabled`
+    /// is false, the legacy zero-delay retry behavior is preserved.
+    backoff_enabled: bool,
+    backoff_initial_ms: i32,
+    backoff_max_ms: i32,
+    backoff_factor: f64,
+    backoff_jitter: String,
+    /// Optional cumulative budget cap across inter-attempt sleeps.
+    /// Independent of `backoff_enabled` semantics; only consulted when
+    /// backoff is enabled.
+    backoff_max_total_ms: Option<i32>,
     /// Whether to sanitize/filter sensitive data from model responses
     sanitize_responses: bool,
     /// Whether to mark provider as trusted in strict mode
@@ -512,7 +549,8 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
             ak.secret as api_key_secret,
             ak.purpose as api_key_purpose,
             ak.requests_per_second,
-            ak.burst_size
+            ak.burst_size,
+            ak.user_verified
         FROM deployed_models cm
         CROSS JOIN LATERAL (
             SELECT DISTINCT
@@ -520,8 +558,10 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                 ak.secret,
                 ak.purpose,
                 ak.requests_per_second,
-                ak.burst_size
+                ak.burst_size,
+                u.verified as user_verified
             FROM api_keys ak
+            JOIN users u ON u.id = ak.user_id
             WHERE (
                 -- System user always has access
                 ak.user_id = '00000000-0000-0000-0000-000000000000'
@@ -588,6 +628,12 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
             fallback_on_status,
             fallback_with_replacement,
             fallback_max_attempts,
+            backoff_enabled,
+            backoff_initial_ms,
+            backoff_max_ms,
+            backoff_factor,
+            backoff_jitter,
+            backoff_max_total_ms,
             sanitize_responses,
             trusted,
             open_responses_adapter as "open_responses_adapter?"
@@ -622,6 +668,12 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                 fallback_on_status: row.fallback_on_status.unwrap_or_else(|| vec![429, 500, 502, 503, 504]),
                 fallback_with_replacement: row.fallback_with_replacement.unwrap_or(false),
                 fallback_max_attempts: row.fallback_max_attempts,
+                backoff_enabled: row.backoff_enabled,
+                backoff_initial_ms: row.backoff_initial_ms,
+                backoff_max_ms: row.backoff_max_ms,
+                backoff_factor: row.backoff_factor,
+                backoff_jitter: row.backoff_jitter,
+                backoff_max_total_ms: row.backoff_max_total_ms,
                 sanitize_responses: row.sanitize_responses,
                 trusted: row.trusted,
                 open_responses_adapter: row.open_responses_adapter.unwrap_or(true),
@@ -659,6 +711,20 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                     trusted: row.deployment_trusted,
                     open_responses_adapter: row.deployment_open_responses_adapter.unwrap_or(true),
                     routing_rules: Vec::new(), // Components don't have their own routing rules
+                    // Components don't surface their own fallback/backoff —
+                    // the composite's PoolSpec.fallback drives retries across
+                    // the whole pool.
+                    fallback_enabled: false,
+                    fallback_on_rate_limit: false,
+                    fallback_on_status: Vec::new(),
+                    fallback_with_replacement: false,
+                    fallback_max_attempts: None,
+                    backoff_enabled: false,
+                    backoff_initial_ms: 100,
+                    backoff_max_ms: 5_000,
+                    backoff_factor: 2.0,
+                    backoff_jitter: "full".to_string(),
+                    backoff_max_total_ms: None,
                     endpoint_url,
                     endpoint_api_key: row.endpoint_api_key.clone(),
                     auth_header_name: row.auth_header_name.clone(),
@@ -680,6 +746,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                     purpose: row.api_key_purpose.clone(),
                     requests_per_second: row.requests_per_second,
                     burst_size: row.burst_size,
+                    user_verified: row.user_verified,
                 });
             }
         }
@@ -702,19 +769,20 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
 fn convert_composite_to_target_spec(
     composite: &OnwardsCompositeModel,
     key_definitions: &mut HashMap<String, KeyDefinition>,
+    rate_limit_tiers: &RateLimitTiersConfig,
 ) -> (String, TargetSpecOrList) {
     // Add this composite model's API keys to key_definitions
     for api_key in &composite.api_keys {
-        let rate_limit = match (api_key.requests_per_second, api_key.burst_size) {
-            (Some(rps), burst) if rps > 0.0 => {
-                let rps_u32 = NonZeroU32::new((rps.max(1.0) as u32).max(1)).unwrap();
-                let burst_u32 = burst.and_then(|b| NonZeroU32::new(b.max(1) as u32));
-                Some(RateLimitParameters {
-                    requests_per_second: rps_u32,
-                    burst_size: burst_u32,
-                })
-            }
-            _ => None,
+        // The system key (nil UUID) carries internal traffic and is never tiered.
+        let rate_limit = if api_key.id.is_nil() {
+            None
+        } else {
+            resolve_key_rate_limit(
+                api_key.requests_per_second,
+                api_key.burst_size,
+                api_key.user_verified,
+                rate_limit_tiers,
+            )
         };
 
         let labels = HashMap::from([("purpose".to_string(), api_key.purpose.clone())]);
@@ -773,6 +841,19 @@ fn convert_composite_to_target_spec(
 
     // Build fallback configuration
     let fallback = if composite.fallback_enabled {
+        let backoff = composite.backoff_enabled.then_some(OnwardsBackoffConfig {
+            // The DB CHECK constraints guarantee these are positive and
+            // ordered, but we use `max(1)` defensively to avoid panicking
+            // the proxy if a row ever escaped validation.
+            initial_ms: composite.backoff_initial_ms.max(1) as u64,
+            max_ms: composite.backoff_max_ms.max(composite.backoff_initial_ms.max(1)) as u64,
+            factor: composite.backoff_factor.max(1.0),
+            jitter: match composite.backoff_jitter.as_str() {
+                "none" => OnwardsJitterStrategy::None,
+                _ => OnwardsJitterStrategy::Full,
+            },
+        });
+        let max_total_backoff_ms = composite.backoff_max_total_ms.and_then(|n| u64::try_from(n).ok());
         Some(OnwardsFallbackConfig {
             enabled: true,
             on_rate_limit: composite.fallback_on_rate_limit,
@@ -782,6 +863,8 @@ fn convert_composite_to_target_spec(
             max_attempts: composite
                 .fallback_max_attempts
                 .and_then(|n| usize::try_from(n).ok().filter(|&v| v >= 1)),
+            backoff,
+            max_total_backoff_ms,
         })
     } else {
         None
@@ -845,6 +928,12 @@ fn convert_composite_to_target_spec(
                     // Each provider uses its own trusted setting from the database
                     // This allows fine-grained control over which providers bypass error sanitization
                     trusted: Some(target.trusted),
+                    // None → inherit trace-context propagation from the resolved
+                    // `trusted` value: trusted (self-hosted) providers propagate
+                    // W3C trace headers for distributed tracing; untrusted
+                    // (third-party) providers do not, so our trace IDs aren't
+                    // leaked to them.
+                    propagate_trace_context: None,
                 }
             }
         })
@@ -881,9 +970,45 @@ fn convert_composite_to_target_spec(
     (composite.alias.clone(), TargetSpecOrList::Pool(pool_spec))
 }
 
+/// Resolves the rate limit for an API key. A non-NULL per-key
+/// `requests_per_second` always wins; otherwise we fall back to the
+/// verified/unverified tier defaults from config, which may themselves be unset
+/// (legacy "no limit unless overridden" behaviour).
+fn resolve_key_rate_limit(
+    per_key_rps: Option<f32>,
+    per_key_burst: Option<i32>,
+    user_verified: bool,
+    tiers: &RateLimitTiersConfig,
+) -> Option<RateLimitParameters> {
+    let (rps, burst) = match per_key_rps {
+        Some(rps) if rps > 0.0 => (rps, per_key_burst),
+        _ => {
+            let tier = if user_verified {
+                tiers.verified.as_ref()
+            } else {
+                tiers.unverified.as_ref()
+            };
+            let tier = tier?;
+            (tier.requests_per_second, tier.burst_size)
+        }
+    };
+
+    let rps_u32 = NonZeroU32::new((rps.max(1.0) as u32).max(1))?;
+    let burst_u32 = burst.and_then(|b| NonZeroU32::new(b.max(1) as u32));
+    Some(RateLimitParameters {
+        requests_per_second: rps_u32,
+        burst_size: burst_u32,
+    })
+}
+
 /// Converts both regular targets and composite models to ConfigFile format
-#[tracing::instrument(skip(targets, composites))]
-fn convert_to_config_file(targets: Vec<OnwardsTarget>, composites: Vec<OnwardsCompositeModel>, strict_mode: bool) -> ConfigFile {
+#[tracing::instrument(skip(targets, composites, rate_limit_tiers))]
+fn convert_to_config_file(
+    targets: Vec<OnwardsTarget>,
+    composites: Vec<OnwardsCompositeModel>,
+    strict_mode: bool,
+    rate_limit_tiers: &RateLimitTiersConfig,
+) -> ConfigFile {
     let mut key_definitions = HashMap::new();
 
     // Convert regular deployed models (wrapped in TargetSpecOrList::Pool)
@@ -892,16 +1017,16 @@ fn convert_to_config_file(targets: Vec<OnwardsTarget>, composites: Vec<OnwardsCo
         .map(|target| {
             // Add this target's API keys to key_definitions
             for api_key in &target.api_keys {
-                let rate_limit = match (api_key.requests_per_second, api_key.burst_size) {
-                    (Some(rps), burst) if rps > 0.0 => {
-                        let rps_u32 = NonZeroU32::new((rps.max(1.0) as u32).max(1)).unwrap();
-                        let burst_u32 = burst.and_then(|b| NonZeroU32::new(b.max(1) as u32));
-                        Some(RateLimitParameters {
-                            requests_per_second: rps_u32,
-                            burst_size: burst_u32,
-                        })
-                    }
-                    _ => None,
+                // The system key (nil UUID) carries internal traffic and is never tiered.
+                let rate_limit = if api_key.id.is_nil() {
+                    None
+                } else {
+                    resolve_key_rate_limit(
+                        api_key.requests_per_second,
+                        api_key.burst_size,
+                        api_key.user_verified,
+                        rate_limit_tiers,
+                    )
                 };
 
                 // Build labels from API key purpose
@@ -968,6 +1093,40 @@ fn convert_to_config_file(targets: Vec<OnwardsTarget>, composites: Vec<OnwardsCo
                 }),
                 request_timeout_secs: None,
                 trusted: Some(target.trusted),
+                // None → inherit from resolved `trusted` (see composite-model
+                // site above): self-hosted providers propagate W3C trace
+                // context, third-party providers do not.
+                propagate_trace_context: None,
+            };
+
+            // Build fallback configuration. For single-provider (standard)
+            // models the SelectIter only yields more than once when
+            // `with_replacement` is true; the backoff fields control the
+            // inter-attempt sleep when retries do happen.
+            let fallback = if target.fallback_enabled {
+                let backoff = target.backoff_enabled.then_some(OnwardsBackoffConfig {
+                    initial_ms: target.backoff_initial_ms.max(1) as u64,
+                    max_ms: target.backoff_max_ms.max(target.backoff_initial_ms.max(1)) as u64,
+                    factor: target.backoff_factor.max(1.0),
+                    jitter: match target.backoff_jitter.as_str() {
+                        "none" => OnwardsJitterStrategy::None,
+                        _ => OnwardsJitterStrategy::Full,
+                    },
+                });
+                let max_total_backoff_ms = target.backoff_max_total_ms.and_then(|n| u64::try_from(n).ok());
+                Some(OnwardsFallbackConfig {
+                    enabled: true,
+                    on_rate_limit: target.fallback_on_rate_limit,
+                    on_status: target.fallback_on_status.iter().map(|&s| s as u16).collect(),
+                    with_replacement: target.fallback_with_replacement,
+                    max_attempts: target
+                        .fallback_max_attempts
+                        .and_then(|n| usize::try_from(n).ok().filter(|&v| v >= 1)),
+                    backoff,
+                    max_total_backoff_ms,
+                })
+            } else {
+                None
             };
 
             // Use PoolSpec so routing_rules are carried through
@@ -975,7 +1134,7 @@ fn convert_to_config_file(targets: Vec<OnwardsTarget>, composites: Vec<OnwardsCo
                 keys,
                 rate_limit: None,
                 concurrency_limit: None,
-                fallback: None,
+                fallback,
                 strategy: OnwardsLoadBalanceStrategy::default(),
                 providers: vec![provider],
                 response_headers: None,
@@ -998,7 +1157,7 @@ fn convert_to_config_file(targets: Vec<OnwardsTarget>, composites: Vec<OnwardsCo
             );
         }
 
-        let (alias, spec) = convert_composite_to_target_spec(&composite, &mut key_definitions);
+        let (alias, spec) = convert_composite_to_target_spec(&composite, &mut key_definitions, rate_limit_tiers);
         target_specs.insert(alias, spec);
     }
 
@@ -1028,7 +1187,12 @@ fn convert_to_config_file(targets: Vec<OnwardsTarget>, composites: Vec<OnwardsCo
 /// separate API key configuration.
 /// `strict_mode` - Enable strict mode with schema validation (only known OpenAI API paths accepted)
 #[tracing::instrument(skip(db, escalation_models))]
-pub async fn load_targets_from_db(db: &PgPool, escalation_models: &[String], strict_mode: bool) -> Result<Targets, anyhow::Error> {
+pub async fn load_targets_from_db(
+    db: &PgPool,
+    escalation_models: &[String],
+    strict_mode: bool,
+    rate_limit_tiers: &RateLimitTiersConfig,
+) -> Result<Targets, anyhow::Error> {
     let query_start = std::time::Instant::now();
     debug!("Loading onwards targets from database (with composite models)");
 
@@ -1063,6 +1227,17 @@ pub async fn load_targets_from_db(db: &PgPool, escalation_models: &[String], str
             dm.sanitize_responses,
             dm.trusted,
             dm.open_responses_adapter,
+            dm.fallback_enabled,
+            dm.fallback_on_rate_limit,
+            dm.fallback_on_status,
+            dm.fallback_with_replacement,
+            dm.fallback_max_attempts,
+            dm.backoff_enabled,
+            dm.backoff_initial_ms,
+            dm.backoff_max_ms,
+            dm.backoff_factor,
+            dm.backoff_jitter,
+            dm.backoff_max_total_ms,
             ie.id as endpoint_id,
             ie.url as "endpoint_url!",
             ie.api_key as endpoint_api_key,
@@ -1072,7 +1247,8 @@ pub async fn load_targets_from_db(db: &PgPool, escalation_models: &[String], str
             ak.secret as "api_key_secret?",
             ak.purpose as "api_key_purpose?",
             ak.requests_per_second as api_key_requests_per_second,
-            ak.burst_size as api_key_burst_size
+            ak.burst_size as api_key_burst_size,
+            ak.user_verified as "api_key_user_verified?"
         FROM deployed_models dm
         INNER JOIN inference_endpoints ie ON dm.hosted_on = ie.id
         LEFT JOIN LATERAL (
@@ -1081,8 +1257,10 @@ pub async fn load_targets_from_db(db: &PgPool, escalation_models: &[String], str
                 ak.secret,
                 ak.purpose,
                 ak.requests_per_second,
-                ak.burst_size
+                ak.burst_size,
+                u.verified as user_verified
             FROM api_keys ak
+            JOIN users u ON u.id = ak.user_id
             WHERE (
                 -- System user always has access
                 ak.user_id = '00000000-0000-0000-0000-000000000000'
@@ -1153,6 +1331,17 @@ pub async fn load_targets_from_db(db: &PgPool, escalation_models: &[String], str
                 trusted: row.trusted,
                 open_responses_adapter: row.open_responses_adapter.unwrap_or(true),
                 routing_rules: Vec::new(), // Populated from separate query below
+                fallback_enabled: row.fallback_enabled.unwrap_or(true),
+                fallback_on_rate_limit: row.fallback_on_rate_limit.unwrap_or(true),
+                fallback_on_status: row.fallback_on_status.clone().unwrap_or_else(|| vec![429, 500, 502, 503, 504]),
+                fallback_with_replacement: row.fallback_with_replacement.unwrap_or(false),
+                fallback_max_attempts: row.fallback_max_attempts,
+                backoff_enabled: row.backoff_enabled,
+                backoff_initial_ms: row.backoff_initial_ms,
+                backoff_max_ms: row.backoff_max_ms,
+                backoff_factor: row.backoff_factor,
+                backoff_jitter: row.backoff_jitter.clone(),
+                backoff_max_total_ms: row.backoff_max_total_ms,
                 endpoint_url: url::Url::parse(&row.endpoint_url).expect("Invalid URL in database"),
                 endpoint_api_key: row.endpoint_api_key.clone(),
                 auth_header_name: row.auth_header_name.clone(),
@@ -1161,13 +1350,21 @@ pub async fn load_targets_from_db(db: &PgPool, escalation_models: &[String], str
             }
         });
 
-        if let (Some(api_key_id), Some(api_key_secret), Some(api_key_purpose)) = (row.api_key_id, row.api_key_secret, row.api_key_purpose) {
+        // user_verified is Option only because of the outer LEFT JOIN; whenever the
+        // lateral subquery emits a row, the inner JOIN to users guarantees it. We
+        // tie it to the same "row materialised" check as the other api_key columns
+        // so a future schema/SQL change can't silently demote keys to the
+        // unverified tier.
+        if let (Some(api_key_id), Some(api_key_secret), Some(api_key_purpose), Some(user_verified)) =
+            (row.api_key_id, row.api_key_secret, row.api_key_purpose, row.api_key_user_verified)
+        {
             target.api_keys.push(OnwardsApiKey {
                 id: api_key_id,
                 secret: api_key_secret,
                 purpose: api_key_purpose,
                 requests_per_second: row.api_key_requests_per_second,
                 burst_size: row.api_key_burst_size,
+                user_verified,
             });
         }
     }
@@ -1230,7 +1427,7 @@ pub async fn load_targets_from_db(db: &PgPool, escalation_models: &[String], str
         .collect();
 
     // Convert to ConfigFile format
-    let config = convert_to_config_file(targets, composites, strict_mode);
+    let config = convert_to_config_file(targets, composites, strict_mode, rate_limit_tiers);
 
     // Convert ConfigFile to Targets
     Targets::from_config(config)

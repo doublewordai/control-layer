@@ -43,6 +43,7 @@ pub mod files;
 pub mod groups;
 pub mod images;
 pub mod inference_endpoints;
+pub mod openapi_docs;
 pub mod organizations;
 pub mod payments;
 pub mod probes;

@@ -19,6 +19,8 @@ struct EmailTemplates {
     auto_topup_failed: String,
     auto_topup_limit_reached: String,
     org_invite: String,
+    org_email_change_verify_new: String,
+    org_email_change_verify_old: String,
 }
 
 impl EmailTemplates {
@@ -32,6 +34,8 @@ impl EmailTemplates {
             auto_topup_failed: include_str!("../default_templates/auto_topup_failed.html").to_string(),
             auto_topup_limit_reached: include_str!("../default_templates/auto_topup_limit_reached.html").to_string(),
             org_invite: include_str!("../default_templates/org_invite.html").to_string(),
+            org_email_change_verify_new: include_str!("../default_templates/org_email_change_verify_new.html").to_string(),
+            org_email_change_verify_old: include_str!("../default_templates/org_email_change_verify_old.html").to_string(),
         }
     }
 
@@ -58,6 +62,8 @@ impl EmailTemplates {
             auto_topup_failed: load("auto_topup_failed.html", embedded.auto_topup_failed),
             auto_topup_limit_reached: load("auto_topup_limit_reached.html", embedded.auto_topup_limit_reached),
             org_invite: load("org_invite.html", embedded.org_invite),
+            org_email_change_verify_new: load("org_email_change_verify_new.html", embedded.org_email_change_verify_new),
+            org_email_change_verify_old: load("org_email_change_verify_old.html", embedded.org_email_change_verify_old),
         }
     }
 }
@@ -515,6 +521,69 @@ impl EmailService {
             inviter_name,
             role,
             invite_link,
+        })
+    }
+
+    /// Send the verification link to the *new* contact address. The
+    /// recipient must click to prove possession of the mailbox; the change
+    /// only applies once the old-side has also confirmed.
+    pub async fn send_org_email_change_verify_new(&self, to_email: &str, org_name: &str, confirm_link: &str) -> Result<(), Error> {
+        let subject = format!("Confirm your new contact email for {org_name}");
+        let body = self
+            .render_org_email_change_verify_new_body(org_name, confirm_link)
+            .map_err(|e| Error::Internal {
+                operation: format!("render email template: {e}"),
+            })?;
+
+        self.send_email(to_email, None, &subject, &body).await
+    }
+
+    /// Send the verification link to the *current* contact address — the
+    /// legitimate owner must authorize the change before it can take
+    /// effect (defends against session-hijack attacks).
+    pub async fn send_org_email_change_verify_old(
+        &self,
+        to_email: &str,
+        org_name: &str,
+        new_email: &str,
+        confirm_link: &str,
+        support_email: Option<&str>,
+    ) -> Result<(), Error> {
+        let subject = format!("Authorize a contact email change for {org_name}");
+        let body = self
+            .render_org_email_change_verify_old_body(org_name, new_email, confirm_link, support_email)
+            .map_err(|e| Error::Internal {
+                operation: format!("render email template: {e}"),
+            })?;
+
+        self.send_email(to_email, None, &subject, &body).await
+    }
+
+    fn render_org_email_change_verify_new_body(&self, org_name: &str, confirm_link: &str) -> Result<String, minijinja::Error> {
+        let mut env = Environment::new();
+        env.add_template("email", &self.templates.org_email_change_verify_new)?;
+
+        env.get_template("email")?.render(context! {
+            org_name,
+            confirm_link,
+        })
+    }
+
+    fn render_org_email_change_verify_old_body(
+        &self,
+        org_name: &str,
+        new_email: &str,
+        confirm_link: &str,
+        support_email: Option<&str>,
+    ) -> Result<String, minijinja::Error> {
+        let mut env = Environment::new();
+        env.add_template("email", &self.templates.org_email_change_verify_old)?;
+
+        env.get_template("email")?.render(context! {
+            org_name,
+            new_email,
+            confirm_link,
+            support_email,
         })
     }
 }

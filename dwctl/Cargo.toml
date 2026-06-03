@@ -1,6 +1,6 @@
 [package]
 name = "dwctl"
-version = "8.50.0"
+version = "8.58.1"
 edition = "2024"
 description = "The Doubleword Control Layer - A self-hostable observability and analytics platform for LLM applications"
 license = "MIT OR Apache-2.0"
@@ -19,7 +19,7 @@ embedded-db = ["dep:postgresql_embedded"]
 
 [dependencies]
 axum = { version = "0.8", features = ["multipart"] }
-fusillade = { version = "17.0.2" }
+fusillade = { version = "17.2.0" }
 tokio = { version = "1.0", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = "0.7"
@@ -53,7 +53,7 @@ opentelemetry-otlp = { version = "0.31", default-features = false, features = [
 ] }
 tracing-opentelemetry = "0.32.1"
 tower = "0.5"
-tower-http = { version = "0.6", features = ["cors", "fs", "trace"] }
+tower-http = { version = "0.6", features = ["cors", "fs", "set-header", "trace"] }
 async-trait = "0.1"
 url = { version = "2.4", features = ["serde"] }
 clap = { version = "4.4", features = ["derive", "env"] }
@@ -79,7 +79,7 @@ jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 argon2 = "0.5"
 base64 = "0.22"
 bytes = "1.5"
-onwards = "0.27.0"
+onwards = { version = "0.30", features = ["multi-step"] }
 thiserror = "2.0.14"
 axum-prometheus = "0.10"
 # Metrics facade and exporter (same versions as axum-prometheus uses)
@@ -101,6 +101,12 @@ lettre = { version = "0.11", features = [
   "tokio1-rustls-tls",
   "builder",
 ], default-features = false }
+# DNS resolver for verifying that the recipient domain of a new
+# organization contact email has at least one MX (or implicit A) record.
+hickory-resolver = { version = "0.26", default-features = false, features = [
+  "system-config",
+  "tokio",
+] }
 aes-gcm = "0.10.3"
 paste = "1.0"
 serde_with = "3.14.1"

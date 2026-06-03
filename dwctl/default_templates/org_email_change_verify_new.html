@@ -1,0 +1,14 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"></head>
+<body style="font-family: system-ui, sans-serif; max-width: 600px; margin: 40px auto; padding: 20px; color: #333;">
+    <h2>Confirm your new contact email for {{ org_name }}</h2>
+    <p>Hello,</p>
+    <p>A request was made to set this address as the contact email for <strong>{{ org_name }}</strong>. Click the button below to confirm. The change requires confirmation from both this address and the current contact address; it will only take effect once both sides confirm.</p>
+    <p style="margin: 30px 0;">
+        <a href="{{ confirm_link }}" style="background-color: #333; color: #fff; padding: 12px 24px; text-decoration: none; border-radius: 4px;">Confirm email change</a>
+    </p>
+    <p style="font-size: 13px; color: #666; word-break: break-all;">{{ confirm_link }}</p>
+    <p style="font-size: 13px; color: #888;">This link expires in 24 hours. If you did not expect this request, you can ignore this email and the organization's contact address will remain unchanged.</p>
+</body>
+</html>
