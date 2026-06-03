@@ -1,5 +1,13 @@
 # Changelog
 
+## [8.58.1](https://github.com/doublewordai/control-layer/compare/v8.58.0...v8.58.1) (2026-06-03)
+
+
+### Performance Improvements
+
+* **sync:** raise onwards fallback resync default 10s-&gt;5min ([#1118](https://github.com/doublewordai/control-layer/issues/1118)) ([86b9049](https://github.com/doublewordai/control-layer/commit/86b9049a7dfb625b77174d02fbf3131fbe868519))
+* **sync:** stop api_keys no-op upserts from triggering onwards reloads ([#1119](https://github.com/doublewordai/control-layer/issues/1119)) ([d0ca45d](https://github.com/doublewordai/control-layer/commit/d0ca45d84bfb8c308817bc13b7e567f8655a673f))
+
 ## [8.58.0](https://github.com/doublewordai/control-layer/compare/v8.57.0...v8.58.0) (2026-06-02)
 
 
