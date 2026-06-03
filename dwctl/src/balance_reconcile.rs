@@ -10,6 +10,10 @@
 //! It is intentionally **read-only** and does not auto-correct: drift would mean a
 //! bug to investigate, and blindly overwriting `user_balances` could race the live
 //! maintenance trigger and *introduce* drift.
+//!
+//! The recompute re-derives every user's balance from the ledger, so it is
+//! **leader-gated** (spawned only on the elected leader): it runs once across the
+//! deployment on a slow interval, not on every instance.
 
 use std::time::Duration;
 

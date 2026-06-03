@@ -2204,19 +2204,6 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         };
         (onwards::target::Targets::from_config(empty_config)?, None)
     };
-    // Periodic balance drift check: a read-only safety net that flags any divergence
-    // between the materialized `user_balances` table and the credits ledger. It is
-    // cheap and read-only, so it runs on every instance rather than being leader-gated.
-    if config.background_services.balance_reconcile.enabled {
-        let reconcile_pool = pool.clone();
-        let reconcile_config = config.background_services.balance_reconcile.clone();
-        let reconcile_shutdown = shutdown_token.clone();
-        background_tasks.spawn("balance-reconcile", async move {
-            balance_reconcile::run_balance_reconcile(reconcile_pool, reconcile_config, reconcile_shutdown).await;
-            Ok(())
-        });
-    }
-
     // Leader election lock ID: 0x44574354_50524F42 (DWCT_PROB in hex for "dwctl probes")
     const LEADER_LOCK_ID: i64 = 0x4457_4354_5052_4F42_i64;
 
@@ -2251,6 +2238,19 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
             });
         } else {
             info!("Probe scheduler disabled by configuration");
+        }
+
+        // Periodic balance drift check (leader-only): read-only safety net flagging
+        // divergence between the materialized `user_balances` table and the credits
+        // ledger. This instance is the unconditional leader, so the check runs here.
+        if config.background_services.balance_reconcile.enabled {
+            let reconcile_pool = pool.clone();
+            let reconcile_config = config.background_services.balance_reconcile.clone();
+            let reconcile_shutdown = shutdown_token.clone();
+            background_tasks.spawn("balance-reconcile", async move {
+                balance_reconcile::run_balance_reconcile(reconcile_pool, reconcile_config, reconcile_shutdown).await;
+                Ok(())
+            });
         }
 
         // Start the fusillade batch processing daemon based on config
@@ -2394,6 +2394,18 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
                             });
                         } else {
                             tracing::info!("Probe scheduler disabled by configuration");
+                        }
+
+                        // Start the periodic balance drift check (leader-only), tied to
+                        // this leadership session so it stops if leadership is lost. The
+                        // recompute runs once across the deployment, not per instance.
+                        if config.background_services.balance_reconcile.enabled {
+                            let reconcile_pool = pool.clone();
+                            let reconcile_config = config.background_services.balance_reconcile.clone();
+                            let reconcile_session_token = session_token.clone();
+                            tokio::spawn(async move {
+                                balance_reconcile::run_balance_reconcile(reconcile_pool, reconcile_config, reconcile_session_token).await;
+                            });
                         }
 
                         let notification_request_manager = request_manager.clone();
