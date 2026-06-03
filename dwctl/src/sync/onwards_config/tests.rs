@@ -668,6 +668,100 @@ async fn test_onwards_config_reloads_on_tariff_change(pool: sqlx::PgPool) {
     );
 }
 
+/// Regression test for the api_keys NOTIFY storm.
+///
+/// `get_or_create_hidden_key` runs `INSERT ... ON CONFLICT DO NOTHING` ~15k+
+/// times/day. On the common "key already exists" path it changes nothing, so it
+/// must NOT trigger a full onwards config reload. The statement-level NOTIFY
+/// triggers use transition tables and notify only when rows were actually
+/// inserted/deleted or an auth-relevant column changed, so a no-op upsert
+/// (empty NEW transition table) stays silent.
+///
+/// Covers: no-op upsert (silent), real insert (notify), metadata-only update
+/// (silent), auth-relevant update (notify).
+#[sqlx::test]
+async fn test_api_keys_noop_upsert_does_not_trigger_notify(pool: sqlx::PgPool) {
+    use sqlx::postgres::PgListener;
+
+    use crate::Role;
+    use crate::db::handlers::api_keys::ApiKeys;
+    use crate::db::models::api_keys::ApiKeyPurpose;
+
+    let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+
+    let mut listener = PgListener::connect_with(&pool).await.unwrap();
+    listener.listen("auth_config_changed").await.unwrap();
+
+    // First call actually inserts the hidden key -> must notify.
+    let key_id = {
+        let mut tx = pool.begin().await.unwrap();
+        let mut repo = ApiKeys::new(&mut tx);
+        let (_secret, id) = repo
+            .get_or_create_hidden_key_with_id(user.id, ApiKeyPurpose::Realtime, user.id)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        id
+    };
+    let first = timeout(Duration::from_secs(2), listener.recv())
+        .await
+        .expect("first get_or_create_hidden_key (real insert) should notify")
+        .expect("failed to receive notification");
+    assert!(
+        first.payload().contains("api_keys"),
+        "insert notification should reference api_keys, got: {}",
+        first.payload()
+    );
+
+    // Drain anything still pending from the first insert. Loop only while an actual
+    // notification is received -- `.is_ok()` would also be true for Ok(None) (no
+    // notification / closed connection) and could spin.
+    while let Ok(Ok(Some(_))) = timeout(Duration::from_millis(50), listener.try_recv()).await {}
+
+    // Second call hits ON CONFLICT DO NOTHING (0 rows written) -> must NOT notify.
+    {
+        let mut tx = pool.begin().await.unwrap();
+        let mut repo = ApiKeys::new(&mut tx);
+        repo.get_or_create_hidden_key(user.id, ApiKeyPurpose::Realtime, user.id)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+    }
+    match timeout(Duration::from_millis(750), listener.recv()).await {
+        Err(_) => {} // timed out waiting for a notification -> correct: no-op did not notify
+        Ok(Ok(n)) => panic!("no-op upsert must NOT trigger a config-change notification, got: {}", n.payload()),
+        Ok(Err(e)) => panic!("listener error: {e}"),
+    }
+
+    // Metadata-only UPDATE (name) is not consumed by onwards -> must NOT notify.
+    sqlx::query("UPDATE api_keys SET name = 'renamed' WHERE id = $1")
+        .bind(key_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    match timeout(Duration::from_millis(500), listener.recv()).await {
+        Err(_) => {} // correct: metadata-only update did not notify
+        Ok(Ok(n)) => panic!("metadata-only update must NOT notify, got: {}", n.payload()),
+        Ok(Err(e)) => panic!("listener error: {e}"),
+    }
+
+    // Auth-relevant UPDATE (requests_per_second) -> must notify.
+    sqlx::query("UPDATE api_keys SET requests_per_second = 5 WHERE id = $1")
+        .bind(key_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let updated = timeout(Duration::from_secs(2), listener.recv())
+        .await
+        .expect("auth-relevant update should notify")
+        .expect("failed to receive notification");
+    assert!(
+        updated.payload().contains("api_keys"),
+        "update notification should reference api_keys, got: {}",
+        updated.payload()
+    );
+}
+
 /// Test that batch API keys get automatic access to composite escalation targets
 #[sqlx::test]
 async fn test_batch_api_key_access_to_composite_escalation_target(pool: sqlx::PgPool) {
