@@ -196,8 +196,14 @@ where
             // silently dispatching the literal token to an upstream
             // (which can't fetch a `dw-img://` URL) would manifest as a
             // confusing upstream error far from the root cause.
+            // Use ValidationError (not Other): a body that won't parse as
+            // JSON is malformed input that will never succeed on retry —
+            // semantically a validation failure, not a transient/unknown
+            // error. (The fusillade daemon currently treats all process()
+            // Err variants the same, but classifying it correctly future-
+            // proofs against fusillade differentiating non-retryable errors.)
             let mut body_value: serde_json::Value = serde_json::from_str(&request.data.body).map_err(|e| {
-                fusillade::FusilladeError::Other(anyhow::anyhow!(
+                fusillade::FusilladeError::ValidationError(format!(
                     "JIT image signing: request body is not valid JSON ({e}); refusing to dispatch with unresolved tokens"
                 ))
             })?;

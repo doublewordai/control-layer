@@ -138,6 +138,16 @@ pub struct SigningConfig {
     pub dispatch_ttl_secs: Option<u64>,
     /// Headroom added on top of `processing_timeout_ms` when deriving the
     /// dispatch TTL. Ignored if `dispatch_ttl_secs` is set.
+    ///
+    /// 5 minutes is sufficient regardless of how long a batch runs because
+    /// the URL is **re-signed on every dispatch attempt** (the JIT-signing
+    /// step in `DwctlRequestProcessor::process` runs per claim). A single
+    /// attempt is bounded by `processing_timeout_ms`, so a URL valid for
+    /// `processing_timeout + headroom` always outlives the attempt that
+    /// created it; a retry gets a brand-new URL with a fresh full TTL. The
+    /// headroom therefore only needs to cover the gap between signing and
+    /// the actual HTTP send within one attempt, plus clock skew — not the
+    /// cumulative duration of multiple retries or the whole batch window.
     pub dispatch_ttl_headroom_secs: u64,
     /// TTL applied to signed URLs served via the dashboard image-view
     /// endpoint. Short, since the dashboard re-signs on each page load.

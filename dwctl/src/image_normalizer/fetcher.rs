@@ -117,11 +117,18 @@ impl ImageFetcher {
                 .ok_or_else(|| FetchError::BadInput("unknown port".into()))?;
             let resolved = resolve_first_allowed(host, port).await?;
 
-            // Build a per-attempt reqwest client that:
+            // Build a per-hop reqwest client that:
             //  - manually disables auto-redirects (we walk them ourselves)
             //  - resolves the hostname to the IP we already vetted (DNS pinning)
             //  - applies the total timeout
             //  - carries no instrumentation
+            //
+            // Rebuilding the client on each redirect hop is deliberate, not an
+            // oversight: each hop re-resolves DNS and pins to a freshly-vetted
+            // IP, which is what defeats DNS-rebinding across a redirect chain.
+            // The cost (a connection pool allocation per hop) is bounded by
+            // `max_redirects` (default 3) and dwarfed by the network round-trip,
+            // so it's negligible for this path.
             let client = reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .timeout(self.config.timeout())

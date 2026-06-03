@@ -39,6 +39,10 @@ fn is_denied_v4(ip: Ipv4Addr) -> bool {
     if ip.is_loopback() || ip.is_link_local() || ip.is_broadcast() || ip.is_multicast() || ip.is_unspecified() || ip.is_documentation() {
         return true;
     }
+    // NOTE: std's `Ipv4Addr::is_private()` covers ONLY the three RFC1918
+    // ranges (10/8, 172.16/12, 192.168/16). It deliberately does NOT
+    // include CGNAT 100.64/10 (RFC 6598) — that range is denied
+    // explicitly below.
     if ip.is_private() {
         return true; // covers 10/8, 172.16/12, 192.168/16
     }
