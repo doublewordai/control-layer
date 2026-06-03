@@ -141,6 +141,62 @@ fn test_parse_notify_payload() {
     assert!(parse_notify_payload("too:many:colons").is_none());
 }
 
+/// Migration 102: the credits_transactions trigger keeps user_balances current,
+/// including aggregating a multi-row insert within a single statement.
+#[sqlx::test]
+async fn test_user_balances_trigger_maintains_balance(pool: sqlx::PgPool) {
+    use rust_decimal::Decimal;
+
+    use crate::Role;
+
+    async fn balance(pool: &sqlx::PgPool, user_id: uuid::Uuid) -> Decimal {
+        let value: Option<Decimal> = sqlx::query_scalar("SELECT balance FROM user_balances WHERE user_id = $1")
+            .bind(user_id)
+            .fetch_optional(pool)
+            .await
+            .unwrap();
+        value.unwrap_or(Decimal::ZERO)
+    }
+
+    let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+    let start = balance(&pool, user.id).await;
+
+    // A purchase credits the balance.
+    sqlx::query(
+        "INSERT INTO credits_transactions (id, user_id, transaction_type, amount, source_id, description) \
+         VALUES (gen_random_uuid(), $1, 'purchase', 100, gen_random_uuid()::text, 'p')",
+    )
+    .bind(user.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(balance(&pool, user.id).await, start + Decimal::from(100));
+
+    // Usage debits it.
+    sqlx::query(
+        "INSERT INTO credits_transactions (id, user_id, transaction_type, amount, source_id, description) \
+         VALUES (gen_random_uuid(), $1, 'usage', 30, gen_random_uuid()::text, 'u')",
+    )
+    .bind(user.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(balance(&pool, user.id).await, start + Decimal::from(70));
+
+    // A multi-row insert in ONE statement is aggregated by the statement-level
+    // trigger: +5 grant and -2 usage => net +3.
+    sqlx::query(
+        "INSERT INTO credits_transactions (id, user_id, transaction_type, amount, source_id, description) VALUES \
+         (gen_random_uuid(), $1, 'admin_grant', 5, gen_random_uuid()::text, 'g'), \
+         (gen_random_uuid(), $1, 'usage', 2, gen_random_uuid()::text, 'u2')",
+    )
+    .bind(user.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(balance(&pool, user.id).await, start + Decimal::from(73));
+}
+
 #[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
 async fn test_cache_shape_regular_public_and_private_access(pool: sqlx::PgPool) {
     let targets = super::load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
@@ -196,6 +252,43 @@ async fn test_cache_shape_metered_model_requires_positive_balance(pool: sqlx::Pg
     assert!(pool_has_key(metered_pool, KEY_A_SECRET));
     assert!(!pool_has_key(metered_pool, KEY_B_SECRET));
     assert!(!pool_has_key(metered_pool, KEY_BATCH_SECRET));
+}
+
+/// End-to-end: a metered model drops a user's key once their balance is depleted.
+/// The credits trigger decrements `user_balances` and the sync gate excludes them.
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base", "cache_tariff_metered", "cache_balance_user_a_positive")))]
+async fn test_metered_model_drops_user_when_balance_depleted(pool: sqlx::PgPool) {
+    let user_a = uuid::Uuid::parse_str("00000000-0000-0000-0000-0000000000a1").unwrap();
+
+    // The fixture grants user A a positive balance, so their key is present.
+    let before = super::load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
+        .await
+        .unwrap();
+    let metered_before = before.targets.get("metered-public").expect("metered-public should exist");
+    assert!(
+        pool_has_key(metered_before.value(), KEY_A_SECRET),
+        "positive-balance user should be present on the metered model"
+    );
+
+    // Spend the whole balance; the credits trigger drives user_balances to zero.
+    sqlx::query(
+        "INSERT INTO credits_transactions (id, user_id, transaction_type, amount, source_id, description) \
+         VALUES (gen_random_uuid(), $1, 'usage', 100, gen_random_uuid()::text, 'deplete')",
+    )
+    .bind(user_a)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // The metered model must now exclude user A's key.
+    let after = super::load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
+        .await
+        .unwrap();
+    let metered_after = after.targets.get("metered-public").expect("metered-public should exist");
+    assert!(
+        !pool_has_key(metered_after.value(), KEY_A_SECRET),
+        "depleted user should be dropped from the metered model"
+    );
 }
 
 #[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]

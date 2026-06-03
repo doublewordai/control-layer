@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT count(*) AS \"drift_count!\"\n        FROM (\n            SELECT u.id AS user_id,\n                   COALESCE(c.balance, 0) + COALESCE(\n                       (SELECT SUM(CASE WHEN ct.transaction_type IN ('purchase', 'admin_grant')\n                                        THEN ct.amount ELSE -ct.amount END)\n                        FROM credits_transactions ct\n                        WHERE ct.user_id = u.id AND ct.seq > COALESCE(c.checkpoint_seq, 0)), 0) AS derived\n            FROM users u\n            LEFT JOIN user_balance_checkpoints c ON c.user_id = u.id\n        ) d\n        LEFT JOIN user_balances ub ON ub.user_id = d.user_id\n        WHERE d.derived IS DISTINCT FROM COALESCE(ub.balance, 0)\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "drift_count!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "45e1909415d39ce82c3aa72b726fe054c8438ec3eedbcd9f6ba185971e65e094"
+}

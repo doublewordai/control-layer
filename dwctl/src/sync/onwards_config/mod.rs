@@ -527,22 +527,6 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
     // Query API keys with access to composite models (uses deployment_groups since composites are in deployed_models)
     let api_key_rows = sqlx::query!(
         r#"
-        WITH user_balances AS (
-            SELECT
-                u.id as user_id,
-                COALESCE(c.balance, 0) + COALESCE(
-                    (SELECT SUM(
-                        CASE WHEN ct.transaction_type IN ('purchase', 'admin_grant')
-                        THEN ct.amount ELSE -ct.amount END
-                    )
-                    FROM credits_transactions ct
-                    WHERE ct.user_id = u.id
-                    AND ct.seq > COALESCE(c.checkpoint_seq, 0)),
-                    0
-                ) as balance
-            FROM users u
-            LEFT JOIN user_balance_checkpoints c ON c.user_id = u.id
-        )
         SELECT
             cm.id as composite_model_id,
             ak.id as api_key_id,
@@ -1190,22 +1174,6 @@ pub async fn load_targets_from_db(
     // Note: We pass escalation_models to grant batch API keys access to escalation models
     let rows = sqlx::query!(
         r#"
-        WITH user_balances AS (
-            SELECT
-                u.id as user_id,
-                COALESCE(c.balance, 0) + COALESCE(
-                    (SELECT SUM(
-                        CASE WHEN ct.transaction_type IN ('purchase', 'admin_grant')
-                        THEN ct.amount ELSE -ct.amount END
-                    )
-                    FROM credits_transactions ct
-                    WHERE ct.user_id = u.id
-                    AND ct.seq > COALESCE(c.checkpoint_seq, 0)),
-                    0
-                ) as balance
-            FROM users u
-            LEFT JOIN user_balance_checkpoints c ON c.user_id = u.id
-        )
         SELECT
             dm.id as deployment_id,
             dm.model_name,

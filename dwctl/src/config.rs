@@ -1578,6 +1578,8 @@ pub struct BackgroundServicesConfig {
     pub sync_workers: SyncWorkersConfig,
     /// Worker counts for core batch task processing (always run, not gated by sync)
     pub task_workers: TaskWorkersConfig,
+    /// Periodic balance-reconcile drift check (read-only safety net for user_balances)
+    pub balance_reconcile: BalanceReconcileConfig,
 }
 
 /// Database pool metrics sampling configuration.
@@ -1643,6 +1645,33 @@ pub struct ProbeSchedulerConfig {
 impl Default for ProbeSchedulerConfig {
     fn default() -> Self {
         Self { enabled: true }
+    }
+}
+
+/// Periodic balance-reconcile drift check.
+///
+/// `user_balances` (migration 102) is maintained incrementally by a trigger on
+/// `credits_transactions`, and the ledger is append-only (migration 050), so the
+/// materialized balance should always equal the ledger-derived balance. This
+/// service periodically recomputes the derived balance and compares it, emitting
+/// the `dwctl_balance_drift_users` gauge and logging if they ever disagree. It is
+/// read-only and does NOT auto-correct: drift means a bug to investigate, and
+/// overwriting could race the live trigger and introduce drift.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BalanceReconcileConfig {
+    /// Enable the periodic balance drift check (default: true)
+    pub enabled: bool,
+    /// How often to run the drift check, in milliseconds (default: 3600000 = 1 hour)
+    pub interval_milliseconds: u64,
+}
+
+impl Default for BalanceReconcileConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_milliseconds: 3_600_000, // 1 hour
+        }
     }
 }
 

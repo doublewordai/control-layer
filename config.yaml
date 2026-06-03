@@ -401,6 +401,14 @@ background_services:
   probe_scheduler:
     enabled: true # Default: true
 
+  # Balance reconcile - periodic read-only check that the materialized user_balances
+  # table agrees with the credits ledger. Emits the dwctl_balance_drift_users gauge
+  # and logs if they diverge (it never auto-corrects). A safety net; drift should
+  # never occur because the balance is trigger-maintained and the ledger is append-only.
+  balance_reconcile:
+    enabled: true # Default: true
+    interval_milliseconds: 3600000 # Default: 3600000 (1 hour)
+
   # Batch processing daemon - processes batch requests asynchronously
   batch_daemon:
     # Controls when the batch processing daemon runs
