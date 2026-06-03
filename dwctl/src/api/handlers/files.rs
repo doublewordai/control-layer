@@ -365,7 +365,8 @@ async fn normalize_template_body_in_place(
                         // so we AWAIT the bookkeeping write rather than fire-and-forget —
                         // the user's later "view what I submitted" lookup depends on it.
                         // Records real (mime, bytes_len) captured from the ingest result.
-                        crate::api::handlers::images::record_image_access(&pool, uid, ingested.token, &ingested.mime, ingested.bytes_len).await;
+                        crate::api::handlers::images::record_image_access(&pool, uid, ingested.token, &ingested.mime, ingested.bytes_len)
+                            .await;
                     }
                     Ok::<String, ()>(ingested.token.to_dw_img_uri())
                 }
