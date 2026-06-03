@@ -395,6 +395,11 @@ background_services:
   # Disabling this will prevent the AI proxy from receiving config updates
   onwards_sync:
     enabled: true # Default: true (recommended)
+    # Periodic full-resync safety net (milliseconds). LISTEN/NOTIFY propagates real config
+    # changes in real time; this fallback only guards against dropped notifications. Each tick
+    # triggers a full routing-table reload (heavy DB egress), so keep it in minutes, not seconds.
+    # Default: 300000 (5 min). Set to 0 to disable (not recommended).
+    fallback_interval_milliseconds: 300000
 
   # Probe scheduler - periodically checks inference endpoint health
   # When leader_election is enabled, only runs on the elected leader
