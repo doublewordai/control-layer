@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT md5(\n            coalesce((SELECT string_agg(dm::text, ',' ORDER BY dm::text) FROM deployed_models dm), '') ||\n            coalesce((SELECT string_agg(ak::text, ',' ORDER BY ak::text) FROM api_keys ak), '') ||\n            coalesce((SELECT string_agg(ie::text, ',' ORDER BY ie::text) FROM inference_endpoints ie), '') ||\n            coalesce((SELECT string_agg(dg::text, ',' ORDER BY dg::text) FROM deployment_groups dg), '') ||\n            coalesce((SELECT string_agg(ug::text, ',' ORDER BY ug::text) FROM user_groups ug), '') ||\n            coalesce((SELECT string_agg(mt::text, ',' ORDER BY mt::text) FROM model_tariffs mt), '') ||\n            coalesce((SELECT string_agg(mtr::text, ',' ORDER BY mtr::text) FROM model_traffic_rules mtr), '') ||\n            coalesce((SELECT string_agg(dmc::text, ',' ORDER BY dmc::text) FROM deployed_model_components dmc), '') ||\n            -- users: only id + verified (the column that drives the rate-limit tier), not the\n            -- whole row, to avoid thrashing the hash on volatile columns like last_login.\n            coalesce((SELECT string_agg(u.id::text || ':' || u.verified::text, ',' ORDER BY u.id::text) FROM users u), '')\n        ) AS \"hash!\"\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "hash!",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "39b82d2cbe3a061be66cfa40c9fe6ec535fd8bed6b287937f9f49d4a17003886"
+}

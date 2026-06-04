@@ -28,9 +28,6 @@ use crate::{
     types::{ApiKeyId, DeploymentId},
 };
 
-/// Parse the NOTIFY payload to extract the timestamp
-/// Payload format: "table_name:epoch_microseconds"
-/// Returns the table name and the elapsed time since the notification was sent
 /// A parsed change notification from the `auth_config_changed` channel.
 ///
 /// Backward-compatible across payload formats: the legacy `table:epoch` (no entity
@@ -309,15 +306,30 @@ impl OnwardsConfigSync {
             return Vec::new();
         };
         match change.table.as_str() {
+            // A deployed_models change (endpoint, rates, flags) is embedded by any composite
+            // that uses it as a component, so re-query the deployment AND its parent composites.
+            "deployed_models" => {
+                let mut scope = vec![scope_id];
+                match self.composites_for_component(scope_id).await {
+                    Ok(parents) => scope.extend(parents),
+                    Err(e) => {
+                        error!("Failed to resolve composites for component {scope_id}: {e}; full reload");
+                        return Vec::new();
+                    }
+                }
+                scope
+            }
             // The scope id is itself a deployment id: re-query just that deployment.
-            "deployed_models" | "deployment_groups" | "model_tariffs" | "model_traffic_rules" | "deployed_model_components" => {
+            // (The inference_endpoints trigger emits one notify per deployment on the
+            // endpoint, so the scope id is already a deployment id for that table too.)
+            "deployment_groups" | "model_tariffs" | "model_traffic_rules" | "deployed_model_components" | "inference_endpoints" => {
                 vec![scope_id]
             }
             // The scope id is a user id: re-query every deployment that user can reach,
             // since a key/membership/balance change alters those deployments' key lists.
             // (`credits_transactions` is the app-level balance-crossing notify.) The
             // system user (nil uuid) reaches everything, so fall back to a full reload.
-            "api_keys" | "user_groups" | "user_organizations" | "credits_transactions" if scope_id != uuid::Uuid::nil() => {
+            "api_keys" | "user_groups" | "user_organizations" | "credits_transactions" | "users" if scope_id != uuid::Uuid::nil() => {
                 match self.deployments_for_user(scope_id).await {
                     Ok(ids) => ids,
                     Err(e) => {
@@ -355,6 +367,23 @@ impl OnwardsConfigSync {
             "#,
             user_id,
             &self.escalation_models
+        )
+        .fetch_all(&self.db)
+        .await?;
+        Ok(ids)
+    }
+
+    /// Composite deployments that embed `component_id` as an enabled component. They copy the
+    /// component's config (endpoint, rate limits, flags), so a change to the component must
+    /// also re-query its parent composites — otherwise they'd serve stale component config.
+    async fn composites_for_component(&self, component_id: DeploymentId) -> Result<Vec<DeploymentId>, anyhow::Error> {
+        let ids = sqlx::query_scalar!(
+            r#"
+            SELECT DISTINCT composite_model_id
+            FROM deployed_model_components
+            WHERE deployed_model_id = $1 AND enabled = TRUE
+            "#,
+            component_id
         )
         .fetch_all(&self.db)
         .await?;
@@ -456,6 +485,12 @@ impl OnwardsConfigSync {
 
                                 // Parse the change notification (table + optional scope id + lag).
                                 let change = parse_notify_payload(notification.payload());
+                                if change.is_none() {
+                                    debug!(
+                                        "Unparseable NOTIFY payload, falling back to a full reload: {:?}",
+                                        notification.payload()
+                                    );
+                                }
 
                                 // Debounce: skip if we just reloaded recently
                                 if last_reload_time.elapsed() < MIN_RELOAD_INTERVAL {
@@ -1647,7 +1682,10 @@ async fn config_content_hash(db: &PgPool) -> Result<String, sqlx::Error> {
             coalesce((SELECT string_agg(ug::text, ',' ORDER BY ug::text) FROM user_groups ug), '') ||
             coalesce((SELECT string_agg(mt::text, ',' ORDER BY mt::text) FROM model_tariffs mt), '') ||
             coalesce((SELECT string_agg(mtr::text, ',' ORDER BY mtr::text) FROM model_traffic_rules mtr), '') ||
-            coalesce((SELECT string_agg(dmc::text, ',' ORDER BY dmc::text) FROM deployed_model_components dmc), '')
+            coalesce((SELECT string_agg(dmc::text, ',' ORDER BY dmc::text) FROM deployed_model_components dmc), '') ||
+            -- users: only id + verified (the column that drives the rate-limit tier), not the
+            -- whole row, to avoid thrashing the hash on volatile columns like last_login.
+            coalesce((SELECT string_agg(u.id::text || ':' || u.verified::text, ',' ORDER BY u.id::text) FROM users u), '')
         ) AS "hash!"
         "#
     )
