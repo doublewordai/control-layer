@@ -1154,12 +1154,16 @@ jsonpath "$.input_file_id" == "{{user1_revoke_test_file_id}}"
 jsonpath "$.status" == "validating"
 
 # -----------------------------------------------------------------------------
-# Retrieve batch to get output and error file IDs (wait for processing to complete)
+# Retrieve batch to get output and error file IDs.
+# Poll until the batch reaches a terminal status instead of relying on a fixed
+# delay - batch processing time varies under CI load, so a one-shot check after
+# a fixed delay is flaky. retry re-issues the request until the assert passes.
 # -----------------------------------------------------------------------------
 
 GET http://localhost:3001/ai/v1/batches/{{user1_revoke_test_batch_id}}
 [Options]
-delay: 10000
+retry: 30
+retry-interval: 1000
 [Cookies]
 dwctl_session: {{user_jwt}}
 HTTP 200
@@ -1171,10 +1175,15 @@ user1_revoke_test_error_file_id: jsonpath "$.error_file_id"
 user1_revoke_test_batch_status: jsonpath "$.status"
 
 # -----------------------------------------------------------------------------
-# Debug: Check batch details
+# Check batch request counts. Poll until the counts settle (both requests
+# accounted for) rather than asserting once, since the count fields may lag
+# slightly behind the terminal status transition under load.
 # -----------------------------------------------------------------------------
 
 GET http://localhost:3001/ai/v1/batches/{{user1_revoke_test_batch_id}}
+[Options]
+retry: 30
+retry-interval: 1000
 [Cookies]
 dwctl_session: {{user_jwt}}
 HTTP 200
@@ -1186,9 +1195,15 @@ jsonpath "$.request_counts.failed" exists
 # -----------------------------------------------------------------------------
 # User1 CAN read the output file content
 # Should contain successful response for gpt-4-mock request (line 1 of mixed.jsonl)
+# Poll until the output file is populated - the file row exists from batch
+# creation, but its content is written asynchronously as requests complete, so
+# a one-shot read can race ahead of the worker and see an empty body.
 # -----------------------------------------------------------------------------
 
 GET http://localhost:3001/ai/v1/files/{{user1_revoke_test_output_file_id}}/content
+[Options]
+retry: 30
+retry-interval: 1000
 [Cookies]
 dwctl_session: {{user_jwt}}
 HTTP 200
@@ -1199,9 +1214,15 @@ body contains "gpt-4-mock"
 # -----------------------------------------------------------------------------
 # User1 CAN read the error file content
 # Should contain "Unauthorized" error for mock-gpt-markdown request (line 2 of mixed.jsonl)
+# Poll until the error file is populated - like the output file, its content is
+# written asynchronously as the failing request is processed, so a one-shot read
+# can race ahead of the worker and see an empty body.
 # -----------------------------------------------------------------------------
 
 GET http://localhost:3001/ai/v1/files/{{user1_revoke_test_error_file_id}}/content
+[Options]
+retry: 30
+retry-interval: 1000
 [Cookies]
 dwctl_session: {{user_jwt}}
 HTTP 200
