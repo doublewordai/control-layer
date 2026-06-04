@@ -57,9 +57,10 @@ pub enum BackendConfig {
     ///
     /// Credentials are intentionally NOT part of this (serializable)
     /// config — they are read from the environment at startup so they
-    /// can't leak via a config dump:
-    ///   - `DWCTL_IMAGE_NORMALIZER_S3_ACCESS_KEY_ID`
-    ///   - `DWCTL_IMAGE_NORMALIZER_S3_SECRET_ACCESS_KEY`
+    /// can't leak via a config dump (note: unprefixed, NOT `DWCTL_`, so
+    /// the config loader leaves them alone):
+    ///   - `IMAGE_NORMALIZER_S3_ACCESS_KEY_ID`
+    ///   - `IMAGE_NORMALIZER_S3_SECRET_ACCESS_KEY`
     ///
     /// Example (Cloudflare R2):
     ///   type: s3_compatible

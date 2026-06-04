@@ -519,9 +519,10 @@ image_normalizer:
     #
     # Any S3-compatible store via a custom endpoint (Cloudflare R2, MinIO,
     # Backblaze B2, AWS S3). Credentials are NOT set here — they are read
-    # from the environment so they never land in config or a config dump:
-    #   DWCTL_IMAGE_NORMALIZER_S3_ACCESS_KEY_ID
-    #   DWCTL_IMAGE_NORMALIZER_S3_SECRET_ACCESS_KEY
+    # from the environment so they never land in config or a config dump.
+    # (Unprefixed, NOT DWCTL_, so the config loader leaves them alone.)
+    #   IMAGE_NORMALIZER_S3_ACCESS_KEY_ID
+    #   IMAGE_NORMALIZER_S3_SECRET_ACCESS_KEY
     # type: s3_compatible
     # bucket: doubleword-images
     # endpoint_url: https://<account_id>.r2.cloudflarestorage.com

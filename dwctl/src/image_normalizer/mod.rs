@@ -243,16 +243,22 @@ pub fn from_config(cfg: &ImageNormalizerConfig) -> Result<Arc<dyn ImageNormalize
         } => {
             // Credentials are sourced from the environment (not the
             // serializable config) so they can't leak via a config dump.
-            let access_key_id = std::env::var("DWCTL_IMAGE_NORMALIZER_S3_ACCESS_KEY_ID").map_err(|_| {
+            //
+            // NB: these are deliberately NOT prefixed `DWCTL_`. The config
+            // loader maps every `DWCTL_`-prefixed variable onto a config
+            // field and rejects unknown ones, so a `DWCTL_`-prefixed secret
+            // name would fail startup. Plain (unprefixed) names are ignored
+            // by the config loader and read directly here.
+            let access_key_id = std::env::var("IMAGE_NORMALIZER_S3_ACCESS_KEY_ID").map_err(|_| {
                 anyhow::anyhow!(
                     "image_normalizer.backend.type = s3_compatible requires the \
-                     DWCTL_IMAGE_NORMALIZER_S3_ACCESS_KEY_ID environment variable"
+                     IMAGE_NORMALIZER_S3_ACCESS_KEY_ID environment variable"
                 )
             })?;
-            let secret_access_key = std::env::var("DWCTL_IMAGE_NORMALIZER_S3_SECRET_ACCESS_KEY").map_err(|_| {
+            let secret_access_key = std::env::var("IMAGE_NORMALIZER_S3_SECRET_ACCESS_KEY").map_err(|_| {
                 anyhow::anyhow!(
                     "image_normalizer.backend.type = s3_compatible requires the \
-                     DWCTL_IMAGE_NORMALIZER_S3_SECRET_ACCESS_KEY environment variable"
+                     IMAGE_NORMALIZER_S3_SECRET_ACCESS_KEY environment variable"
                 )
             })?;
             let store = Arc::new(store::S3CompatStore::new(
