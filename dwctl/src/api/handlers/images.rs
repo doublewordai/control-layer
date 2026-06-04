@@ -20,8 +20,9 @@
 //! OpenAI-compatible `/ai` surface (which has no equivalent concept). It
 //! accepts the same credentials as the rest of the management API:
 //!
-//! - a **dashboard session** — the console renders `dw-img://` tokens as
-//!   `<img>` automatically, so users see their original images; or
+//! - a **dashboard session** — the console renders each `dw-img://` token in
+//!   a request body as a link to this endpoint, so a user can open it to see
+//!   the original image they submitted; or
 //! - a **`platform`-purpose API key** (Bearer) for programmatic callers.
 //!
 //! Anything that follows redirects (a browser `<img>`, `curl -L`, an HTTP

@@ -22,7 +22,7 @@ import {
   DialogDescription,
 } from "../../../ui/dialog";
 import { CodeBlock } from "../../../ui/code-block";
-import { DwImageGallery } from "../../../ui/dw-image-gallery";
+import { dwImgLinkRenderer } from "../../../ui/dw-img-linkify";
 import { createBatchResultsColumns } from "./batch-results-columns";
 import type { BatchStatus } from "../../../../api/control-layer/types";
 
@@ -273,12 +273,9 @@ export default function BatchResults({
                 return (
                   <div className="space-y-4">
                     {content ? (
-                      <>
-                        <DwImageGallery body={content} />
-                        <CodeBlock language="json">
-                          {JSON.stringify(content, null, 2)}
-                        </CodeBlock>
-                      </>
+                      <CodeBlock language="json" renderer={dwImgLinkRenderer}>
+                        {JSON.stringify(content, null, 2)}
+                      </CodeBlock>
                     ) : (
                       <p className="text-gray-500 text-sm p-4">
                         No content available

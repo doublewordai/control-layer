@@ -1,4 +1,5 @@
 import { Light as SyntaxHighlighter } from "react-syntax-highlighter";
+import type { SyntaxHighlighterProps } from "react-syntax-highlighter";
 import python from "react-syntax-highlighter/dist/esm/languages/hljs/python";
 import javascript from "react-syntax-highlighter/dist/esm/languages/hljs/javascript";
 import bash from "react-syntax-highlighter/dist/esm/languages/hljs/bash";
@@ -17,6 +18,8 @@ interface CodeBlockProps {
   children: string;
   className?: string;
   variant?: "dark" | "light";
+  /** Optional custom row renderer (e.g. to linkify tokens in place). */
+  renderer?: SyntaxHighlighterProps["renderer"];
 }
 
 export function CodeBlock({
@@ -24,6 +27,7 @@ export function CodeBlock({
   children,
   className,
   variant = "dark",
+  renderer,
 }: CodeBlockProps) {
   return (
     <div style={{ maxWidth: "100%", overflow: "auto" }}>
@@ -42,6 +46,7 @@ export function CodeBlock({
         className={className}
         wrapLongLines={false}
         PreTag="div"
+        renderer={renderer}
       >
         {children}
       </SyntaxHighlighter>

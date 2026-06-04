@@ -10,7 +10,8 @@ import {
 } from "../../ui/dialog";
 import { Button } from "../../ui/button";
 import { ScrollArea } from "../../ui/scroll-area";
-import { DwImageGallery } from "../../ui/dw-image-gallery";
+import { CodeBlock } from "../../ui/code-block";
+import { dwImgLinkRenderer } from "../../ui/dw-img-linkify";
 import { dwctlApi } from "../../../api/control-layer/client";
 import type { FileObject, FileRequest } from "../../../api/control-layer/types";
 
@@ -51,16 +52,16 @@ function RequestCard({ request }: { request: FileRequest }) {
 
       {expanded && (
         <div className="p-4 bg-white space-y-3">
-          {/* Normalized image previews (if any) */}
-          <DwImageGallery body={request.body} />
-          {/* Request Body */}
+          {/* Request Body — dw-img:// image references render as links. */}
           <div>
             <h4 className="text-xs font-semibold text-gray-700 mb-2">
               Request Body
             </h4>
-            <pre className="text-xs bg-gray-50 p-3 rounded border border-gray-200 overflow-x-auto">
-              {JSON.stringify(request.body, null, 2)}
-            </pre>
+            <div className="rounded border border-gray-200 overflow-hidden">
+              <CodeBlock language="json" variant="light" renderer={dwImgLinkRenderer}>
+                {JSON.stringify(request.body, null, 2)}
+              </CodeBlock>
+            </div>
           </div>
         </div>
       )}

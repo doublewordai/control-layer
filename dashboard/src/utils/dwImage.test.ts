@@ -1,57 +1,48 @@
 import { describe, it, expect } from "vitest";
-import { extractDwImageShas, dwImageUrl } from "./dwImage";
+import { splitDwImgTokens, dwImageUrl } from "./dwImage";
 
 const SHA = "a".repeat(64);
 const SHA2 = "b".repeat(64);
 
-describe("extractDwImageShas", () => {
-  it("extracts a token from a chat-completions body object", () => {
-    const body = {
-      messages: [
-        {
-          role: "user",
-          content: [
-            { type: "text", text: "describe" },
-            { type: "image_url", image_url: { url: `dw-img://${SHA}` } },
-          ],
-        },
-      ],
-    };
-    expect(extractDwImageShas(body)).toEqual([SHA]);
+describe("splitDwImgTokens", () => {
+  it("returns a single text segment when there are no tokens", () => {
+    expect(splitDwImgTokens('{"x":1}')).toEqual([{ kind: "text", value: '{"x":1}' }]);
   });
 
-  it("extracts a token from the responses shape (bare image_url string)", () => {
-    const body = {
-      input: [{ content: [{ type: "input_image", image_url: `dw-img://${SHA}` }] }],
-    };
-    expect(extractDwImageShas(body)).toEqual([SHA]);
+  it("splits a token out of surrounding text", () => {
+    expect(splitDwImgTokens(`"url": "dw-img://${SHA}"`)).toEqual([
+      { kind: "text", value: '"url": "' },
+      { kind: "token", raw: `dw-img://${SHA}`, sha256: SHA },
+      { kind: "text", value: '"' },
+    ]);
   });
 
-  it("extracts a token from a raw JSON string body", () => {
-    expect(extractDwImageShas(JSON.stringify({ url: `dw-img://${SHA}` }))).toEqual([SHA]);
+  it("handles multiple tokens and preserves order", () => {
+    const segs = splitDwImgTokens(`a dw-img://${SHA} b dw-img://${SHA2} c`);
+    expect(segs).toEqual([
+      { kind: "text", value: "a " },
+      { kind: "token", raw: `dw-img://${SHA}`, sha256: SHA },
+      { kind: "text", value: " b " },
+      { kind: "token", raw: `dw-img://${SHA2}`, sha256: SHA2 },
+      { kind: "text", value: " c" },
+    ]);
   });
 
-  it("collects multiple distinct tokens and de-duplicates repeats", () => {
-    const body = { a: `dw-img://${SHA}`, b: `dw-img://${SHA}`, c: `dw-img://${SHA2}` };
-    expect(extractDwImageShas(body).sort()).toEqual([SHA, SHA2].sort());
-  });
-
-  it("returns [] when no tokens are present", () => {
-    expect(extractDwImageShas({ messages: [{ content: "no images here" }] })).toEqual([]);
-  });
-
-  it("ignores plain http and data: URLs", () => {
-    const body = { a: "https://example.com/x.png", b: "data:image/png;base64,AAAA" };
-    expect(extractDwImageShas(body)).toEqual([]);
+  it("handles a token at the very start and end", () => {
+    expect(splitDwImgTokens(`dw-img://${SHA}`)).toEqual([
+      { kind: "token", raw: `dw-img://${SHA}`, sha256: SHA },
+    ]);
   });
 
   it("ignores malformed tokens (wrong hash length)", () => {
-    expect(extractDwImageShas(`dw-img://${"a".repeat(10)}`)).toEqual([]);
+    const text = `dw-img://${"a".repeat(10)}`;
+    expect(splitDwImgTokens(text)).toEqual([{ kind: "text", value: text }]);
   });
 
-  it("handles null and undefined", () => {
-    expect(extractDwImageShas(null)).toEqual([]);
-    expect(extractDwImageShas(undefined)).toEqual([]);
+  it("lower-cases the captured hash", () => {
+    const upper = "A".repeat(64);
+    const segs = splitDwImgTokens(`dw-img://${upper}`);
+    expect(segs).toEqual([{ kind: "token", raw: `dw-img://${upper}`, sha256: SHA }]);
   });
 });
 
