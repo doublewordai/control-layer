@@ -348,8 +348,10 @@ impl OnwardsConfigSync {
     }
 
     /// All deployments a user can reach — group-assigned, public, or batch-escalation
-    /// targets. Ignores balance (the scoped re-query re-applies the balance gate) and
-    /// deliberately over-includes, so a key/membership change is never missed.
+    /// targets (batch keys get automatic access to escalation models for failover, so a
+    /// key/membership change for the owner must re-query those targets too). Ignores
+    /// balance (the scoped re-query re-applies the balance gate) and deliberately
+    /// over-includes, so a key/membership change is never missed.
     async fn deployments_for_user(&self, user_id: uuid::Uuid) -> Result<Vec<DeploymentId>, anyhow::Error> {
         let ids = sqlx::query_scalar!(
             r#"
@@ -1698,6 +1700,8 @@ async fn config_content_hash(db: &PgPool) -> Result<String, sqlx::Error> {
             coalesce((SELECT string_agg(dmc::text, ',' ORDER BY dmc::text) FROM deployed_model_components dmc), '') ||
             -- users: only id + verified (the column that drives the rate-limit tier), not the
             -- whole row, to avoid thrashing the hash on volatile columns like last_login.
+            -- WARNING: if a new routing-affecting users column is added (e.g. another
+            -- rate-limit flag), include it here or the fallback sync will miss the change.
             coalesce((SELECT string_agg(u.id::text || ':' || u.verified::text, ',' ORDER BY u.id::text) FROM users u), '')
         ) AS "hash!"
         "#

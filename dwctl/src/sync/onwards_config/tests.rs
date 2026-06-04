@@ -226,6 +226,8 @@ async fn test_user_scoped_change_resolves_reachable_deployments(pool: sqlx::PgPo
 
     // resolve_change_scope routes every user-owned table through deployments_for_user, so a
     // verified flip (users) or a key/membership/balance change scopes to the same set.
+    // (user_organizations takes the same path; its trigger firing is covered end-to-end by
+    // test_membership_delete_fires_scoped_notify.)
     for table in ["api_keys", "user_groups", "credits_transactions", "users"] {
         let change = super::NotifyChange {
             table: table.to_string(),
@@ -1001,6 +1003,42 @@ async fn test_membership_delete_fires_scoped_notify(pool: sqlx::PgPool) {
         del.payload().starts_with(&format!("user_organizations:DELETE:{user_a}:")),
         "user_organizations DELETE must emit a scoped notify for the removed user, got: {}",
         del.payload()
+    );
+}
+
+/// Deleting an inference_endpoint must not silently strand stale routing config. The FK
+/// deployed_models.hosted_on -> inference_endpoints(id) is ON DELETE CASCADE, so the endpoint's
+/// deployments are deleted and fire their own deployed_models:DELETE notify; migration 103's
+/// inference_endpoints trigger deliberately emits nothing on DELETE. Verify the cascade notify
+/// reaches the sync and the endpoint itself stays silent (guards the cascade-order assumption).
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+async fn test_endpoint_delete_surfaces_via_deployment_cascade(pool: sqlx::PgPool) {
+    use sqlx::postgres::PgListener;
+
+    // cache-endpoint-custom (30...02) hosts regular-private (40...02).
+    let endpoint = "30000000-0000-0000-0000-000000000002";
+
+    let mut listener = PgListener::connect_with(&pool).await.unwrap();
+    listener.listen("auth_config_changed").await.unwrap();
+
+    sqlx::query("DELETE FROM inference_endpoints WHERE id = $1::uuid")
+        .bind(endpoint)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // Collect the whole burst the cascade produces (recv until it goes quiet).
+    let mut payloads = Vec::new();
+    while let Ok(Ok(n)) = timeout(Duration::from_millis(400), listener.recv()).await {
+        payloads.push(n.payload().to_string());
+    }
+    assert!(
+        payloads.iter().any(|p| p.starts_with("deployed_models:DELETE:")),
+        "endpoint delete should surface via a cascaded deployed_models:DELETE notify, got: {payloads:?}"
+    );
+    assert!(
+        !payloads.iter().any(|p| p.starts_with("inference_endpoints:")),
+        "the inference_endpoints trigger must stay silent on DELETE (cascade covers it), got: {payloads:?}"
     );
 }
 
