@@ -299,13 +299,8 @@ impl S3CompatStore {
         access_key_id: impl Into<String>,
         secret_access_key: impl Into<String>,
     ) -> Self {
-        let creds = aws_credential_types::Credentials::new(
-            access_key_id.into(),
-            secret_access_key.into(),
-            None,
-            None,
-            "dwctl-image-normalizer",
-        );
+        let creds =
+            aws_credential_types::Credentials::new(access_key_id.into(), secret_access_key.into(), None, None, "dwctl-image-normalizer");
         let s3_config = aws_sdk_s3::config::Builder::new()
             .region(aws_sdk_s3::config::Region::new(region.into()))
             .credentials_provider(creds)
@@ -369,21 +364,14 @@ impl ImageStore for S3CompatStore {
 
     async fn read(&self, token: ImageToken) -> Result<(String, Bytes), StoreError> {
         let key = Self::key(token);
-        let resp = self
-            .client
-            .get_object()
-            .bucket(&self.bucket)
-            .key(&key)
-            .send()
-            .await
-            .map_err(|e| {
-                let svc = e.into_service_error();
-                if svc.is_no_such_key() {
-                    StoreError::NotFound
-                } else {
-                    StoreError::Backend(format!("S3 read {key}: {svc}"))
-                }
-            })?;
+        let resp = self.client.get_object().bucket(&self.bucket).key(&key).send().await.map_err(|e| {
+            let svc = e.into_service_error();
+            if svc.is_no_such_key() {
+                StoreError::NotFound
+            } else {
+                StoreError::Backend(format!("S3 read {key}: {svc}"))
+            }
+        })?;
         let mime = resp.content_type().unwrap_or("application/octet-stream").to_string();
         let bytes = resp
             .body
