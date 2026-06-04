@@ -49,6 +49,12 @@ use sqlx::PgPool;
 /// Shared state threaded through the middleware.
 #[derive(Clone)]
 pub struct ImageNormalizerMiddlewareState {
+    /// Whether image normalisation is enabled (`config.image_normalizer.enabled`).
+    /// When false, the middleware is a pure pass-through — the configured
+    /// normaliser is a `DisabledNormalizer` that errors on every call, so we
+    /// must NOT invoke it (otherwise image requests would fail when the
+    /// feature is off).
+    pub enabled: bool,
     pub normalizer: Arc<dyn ImageNormalizer>,
     /// TTL applied to signed URLs handed to upstream providers from this
     /// (realtime) path. Copied from `ImageNormalizerConfig::signing.realtime_ttl()`.
@@ -105,6 +111,13 @@ pub async fn image_normalizer_middleware(
     mut request: Request<Body>,
     next: Next,
 ) -> Response {
+    // Disabled feature → pass through untouched. The normaliser is a
+    // `DisabledNormalizer` in this case and would error on any image input,
+    // so we must short-circuit before touching the body.
+    if !state.enabled {
+        return next.run(request).await;
+    }
+
     // Only act on paths that can carry image inputs.
     if !path_accepts_images(request.uri().path()) {
         return next.run(request).await;
@@ -225,9 +238,51 @@ pub async fn image_normalizer_middleware(
     next.run(request).await
 }
 
+/// Normalise every image input in `body` to a `dw-img://` token (the
+/// content-addressed reference), ingesting the bytes into the store. Used by
+/// the **Flex** enqueue path: the request is persisted with tokens and the
+/// fusillade daemon's dispatch-time JIT signing turns each token into a fresh
+/// signed URL, so the provider never receives the raw image — matching the
+/// `/v1/files` batch path. (The realtime path above substitutes signed URLs
+/// directly instead, since it forwards immediately.)
+///
+/// Records `image_access` best-effort when a `pool` + `user_id` are supplied.
+/// Returns the number of substitutions made.
+pub(crate) async fn normalize_value_to_tokens(
+    body: &mut Value,
+    normalizer: &Arc<dyn ImageNormalizer>,
+    access_pool: Option<PgPool>,
+    user_id: Option<uuid::Uuid>,
+) -> Result<usize, NormalizeError> {
+    let normalizer = normalizer.clone();
+    let substitute = move |url: String| {
+        let normalizer = normalizer.clone();
+        let access_pool = access_pool.clone();
+        let is_data_uri = url.starts_with("data:");
+        async move {
+            let input = if is_data_uri {
+                ImageInput::DataUri(url)
+            } else {
+                ImageInput::HttpUrl(url)
+            };
+            let ingested = normalizer.ingest(input).await?;
+            if let (Some(pool), Some(uid)) = (access_pool, user_id) {
+                let mime = ingested.mime.clone();
+                let bytes_len = ingested.bytes_len;
+                let token = ingested.token;
+                tokio::spawn(async move {
+                    crate::api::handlers::images::record_image_access(&pool, uid, token, &mime, bytes_len).await;
+                });
+            }
+            Ok::<String, NormalizeError>(ingested.token.to_dw_img_uri())
+        }
+    };
+    walker::substitute_with(body, Mode::All, substitute).await
+}
+
 /// Map a [`NormalizeError`] to an HTTP response. Body shape is a small
 /// JSON object so OpenAI-compatible clients can surface it cleanly.
-fn normalize_error_response(err: NormalizeError) -> Response {
+pub(crate) fn normalize_error_response(err: NormalizeError) -> Response {
     let (status, code) = match &err {
         NormalizeError::BadInput(_) => (StatusCode::BAD_REQUEST, "image_url_rejected"),
         NormalizeError::Transient(_) => (StatusCode::SERVICE_UNAVAILABLE, "image_fetch_transient"),
@@ -255,7 +310,7 @@ fn path_accepts_images(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::image_normalizer::{DefaultImageNormalizer, MemoryStore, config::FetcherConfig};
+    use crate::image_normalizer::{DefaultImageNormalizer, DisabledNormalizer, ImageNormalizer, MemoryStore, config::FetcherConfig};
     use axum::{Router, body::to_bytes, http::Method, middleware, routing::post};
     use serde_json::json;
     use std::sync::Arc;
@@ -283,6 +338,7 @@ mod tests {
         let store = Arc::new(MemoryStore::new().with_base_url("http://test.local/dw-img"));
         let normalizer = Arc::new(DefaultImageNormalizer::new(FetcherConfig::default(), store));
         ImageNormalizerMiddlewareState {
+            enabled: true,
             normalizer,
             realtime_ttl: Duration::from_secs(900),
             pool: None,
@@ -419,5 +475,49 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         assert_eq!(&bytes[..], b"garbage");
+    }
+
+    #[tokio::test]
+    async fn disabled_passes_image_request_through_unchanged() {
+        // With the feature off, the configured normaliser is a
+        // `DisabledNormalizer` that errors on any call. The middleware must
+        // short-circuit so image requests still flow to the provider.
+        let state = ImageNormalizerMiddlewareState {
+            enabled: false,
+            normalizer: Arc::new(DisabledNormalizer),
+            realtime_ttl: Duration::from_secs(900),
+            pool: None,
+        };
+        let router = build_router(state);
+        let body = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": TINY_PNG_DATA_URI}}
+            ]}]
+        });
+        let (status, echoed) = post_json(router, "/chat/completions", body.clone()).await;
+        assert_eq!(status, StatusCode::OK);
+        // Body passed through verbatim — no error, no substitution.
+        assert_eq!(echoed, body);
+    }
+
+    #[tokio::test]
+    async fn normalize_value_to_tokens_replaces_image_with_token() {
+        // The Flex enqueue path substitutes images with dw-img:// tokens (not
+        // signed URLs) so the daemon JIT-signs them at dispatch.
+        let store = Arc::new(MemoryStore::new());
+        let normalizer: Arc<dyn ImageNormalizer> = Arc::new(DefaultImageNormalizer::new(FetcherConfig::default(), store));
+        let mut body = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "hi"},
+                {"type": "image_url", "image_url": {"url": TINY_PNG_DATA_URI}}
+            ]}]
+        });
+        let n = normalize_value_to_tokens(&mut body, &normalizer, None, None).await.unwrap();
+        assert_eq!(n, 1);
+        let url = body["messages"][0]["content"][1]["image_url"]["url"].as_str().unwrap();
+        assert!(url.starts_with("dw-img://"), "expected a dw-img token, got {url}");
+        assert!(!url.contains("base64"), "raw base64 must be replaced");
     }
 }

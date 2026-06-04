@@ -26,7 +26,9 @@ use axum::{
 use fusillade::{PostgresRequestManager, ReqwestHttpClient};
 use sqlx_pool_router::PoolProvider;
 
+use super::image_normalizer_middleware::{normalize_error_response, normalize_value_to_tokens};
 use super::store::{self as response_store, ONWARDS_RESPONSE_ID_HEADER, OnwardsDaemonId};
+use crate::image_normalizer::ImageNormalizer;
 
 /// State for the responses middleware.
 #[derive(Clone)]
@@ -47,6 +49,15 @@ pub struct ResponsesMiddlewareState<P: PoolProvider + Clone = sqlx_pool_router::
     pub multi_step_tool_executor: Arc<crate::tool_executor::HttpToolExecutor>,
     pub multi_step_http_client: Arc<fusillade::ReqwestHttpClient>,
     pub loop_config: onwards::LoopConfig,
+    /// Image-input normaliser (content-addressed store). On the **Flex**
+    /// path the request is persisted and dispatched later by the daemon, so
+    /// images are normalised to `dw-img://` tokens here (when enabled) — the
+    /// daemon JIT-signs them at dispatch, keeping the raw image off the wire
+    /// to the provider, matching the `/v1/files` batch path. (Realtime is
+    /// normalised by the separate image-normaliser layer instead.)
+    pub image_normalizer: Arc<dyn ImageNormalizer>,
+    /// Whether image normalisation is enabled (`config.image_normalizer.enabled`).
+    pub image_normalizer_enabled: bool,
 }
 
 /// Middleware that routes inference requests based on service_tier and background.
@@ -274,6 +285,28 @@ pub async fn responses_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
             handle_realtime(&state, realtime_input, &resp_id, model, background, parts, body_bytes, next).await
         }
         ServiceTier::Flex => {
+            // Flex is persisted now and dispatched later by the daemon, so —
+            // unlike realtime — it does NOT pass through the image-normaliser
+            // layer. Normalise image inputs to `dw-img://` tokens here so the
+            // daemon's dispatch-time JIT signing hands the provider a signed
+            // URL rather than the raw image/URL (closing the same exposure the
+            // realtime and `/v1/files` paths already close). No-op when the
+            // feature is disabled.
+            if state.image_normalizer_enabled {
+                let user_id = created_by.as_deref().and_then(|s| uuid::Uuid::parse_str(s).ok());
+                let access_pool = Some(state.dwctl_pool.clone());
+                match normalize_value_to_tokens(&mut request_value, &state.image_normalizer, access_pool, user_id).await {
+                    Ok(n) => {
+                        if n > 0 {
+                            tracing::debug!(substituted = n, "flex image normalisation replaced image inputs with tokens");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "flex image normalisation failed");
+                        return normalize_error_response(e);
+                    }
+                }
+            }
             let flex_input = fusillade::CreateFlexInput {
                 request_id,
                 body: request_value.to_string(),

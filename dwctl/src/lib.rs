@@ -1476,6 +1476,7 @@ pub async fn build_router(
         let normalizer = state.image_normalizer.clone();
         let realtime_ttl = cfg.image_normalizer.signing.realtime_ttl();
         let image_normalizer_state = crate::responses::image_normalizer_middleware::ImageNormalizerMiddlewareState {
+            enabled: cfg.image_normalizer.enabled,
             normalizer,
             realtime_ttl,
             pool: Some(state.db.write().clone()),
@@ -2984,6 +2985,8 @@ impl Application {
             multi_step_tool_executor,
             multi_step_http_client,
             loop_config: multi_step_loop_config,
+            image_normalizer: image_normalizer.clone(),
+            image_normalizer_enabled: config.image_normalizer.enabled,
         };
 
         // Build onwards router from targets with body transform, response sanitization, and tool executor.
