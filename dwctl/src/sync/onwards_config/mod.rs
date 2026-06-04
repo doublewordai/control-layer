@@ -386,9 +386,10 @@ impl OnwardsConfigSync {
     async fn composites_for_component(&self, component_id: DeploymentId) -> Result<Vec<DeploymentId>, anyhow::Error> {
         let ids = sqlx::query_scalar!(
             r#"
-            SELECT DISTINCT composite_model_id
-            FROM deployed_model_components
-            WHERE deployed_model_id = $1 AND enabled = TRUE
+            SELECT DISTINCT dmc.composite_model_id
+            FROM deployed_model_components dmc
+            JOIN deployed_models cm ON cm.id = dmc.composite_model_id
+            WHERE dmc.deployed_model_id = $1 AND dmc.enabled = TRUE AND cm.deleted = FALSE
             "#,
             component_id
         )
