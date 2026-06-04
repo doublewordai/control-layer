@@ -50,10 +50,48 @@ pub enum BackendConfig {
         #[serde(default = "default_gcs_region")]
         region: String,
     },
+    /// Any S3-compatible object store reached via a custom endpoint —
+    /// Cloudflare R2, MinIO, Backblaze B2, or AWS S3 itself. Uses static
+    /// access-key credentials and local SigV4 presigning (no signBlob /
+    /// Workload Identity needed).
+    ///
+    /// Credentials are intentionally NOT part of this (serializable)
+    /// config — they are read from the environment at startup so they
+    /// can't leak via a config dump:
+    ///   - `DWCTL_IMAGE_NORMALIZER_S3_ACCESS_KEY_ID`
+    ///   - `DWCTL_IMAGE_NORMALIZER_S3_SECRET_ACCESS_KEY`
+    ///
+    /// Example (Cloudflare R2):
+    ///   type: s3_compatible
+    ///   bucket: doubleword-images
+    ///   endpoint_url: https://<account_id>.r2.cloudflarestorage.com
+    ///   region: auto
+    S3Compatible {
+        bucket: String,
+        /// Full endpoint URL of the S3-compatible service.
+        endpoint_url: String,
+        /// Region label. R2 uses `auto`; AWS S3 uses e.g. `us-east-1`.
+        #[serde(default = "default_s3_region")]
+        region: String,
+        /// Use path-style addressing (`endpoint/bucket/key`) rather than
+        /// virtual-hosted (`bucket.endpoint/key`). Required by most
+        /// S3-compatible endpoints (R2, MinIO); defaults to true.
+        #[serde(default = "default_true")]
+        force_path_style: bool,
+    },
 }
 
 fn default_gcs_region() -> String {
     "europe-west4".to_string()
+}
+
+fn default_s3_region() -> String {
+    // R2 ignores region but the SDK requires one; "auto" is R2's convention.
+    "auto".to_string()
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Hardened-fetcher policy. All durations expressed in seconds in YAML;

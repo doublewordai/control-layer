@@ -235,6 +235,36 @@ pub fn from_config(cfg: &ImageNormalizerConfig) -> Result<Arc<dyn ImageNormalize
             let store = Arc::new(store::GcsStore::new(bucket.clone(), region.clone()));
             Arc::new(DefaultImageNormalizer::new(cfg.fetcher.clone(), store))
         }
+        BackendConfig::S3Compatible {
+            bucket,
+            endpoint_url,
+            region,
+            force_path_style,
+        } => {
+            // Credentials are sourced from the environment (not the
+            // serializable config) so they can't leak via a config dump.
+            let access_key_id = std::env::var("DWCTL_IMAGE_NORMALIZER_S3_ACCESS_KEY_ID").map_err(|_| {
+                anyhow::anyhow!(
+                    "image_normalizer.backend.type = s3_compatible requires the \
+                     DWCTL_IMAGE_NORMALIZER_S3_ACCESS_KEY_ID environment variable"
+                )
+            })?;
+            let secret_access_key = std::env::var("DWCTL_IMAGE_NORMALIZER_S3_SECRET_ACCESS_KEY").map_err(|_| {
+                anyhow::anyhow!(
+                    "image_normalizer.backend.type = s3_compatible requires the \
+                     DWCTL_IMAGE_NORMALIZER_S3_SECRET_ACCESS_KEY environment variable"
+                )
+            })?;
+            let store = Arc::new(store::S3CompatStore::new(
+                bucket.clone(),
+                endpoint_url.clone(),
+                region.clone(),
+                *force_path_style,
+                access_key_id,
+                secret_access_key,
+            ));
+            Arc::new(DefaultImageNormalizer::new(cfg.fetcher.clone(), store))
+        }
     })
 }
 

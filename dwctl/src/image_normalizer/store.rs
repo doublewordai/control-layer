@@ -1,6 +1,6 @@
 //! Object-store trait and implementations for normalised image bytes.
 //!
-//! Two implementations:
+//! Three implementations:
 //!
 //! - [`MemoryStore`] — an in-process `HashMap<Sha256, Bytes>` used by tests
 //!   and local development. Signed URLs returned here are local
@@ -11,10 +11,13 @@
 //!   `google-cloud-storage` and returns V4 signed URLs via the IAM
 //!   `signBlob` API (Workload-Identity-friendly: no on-disk private
 //!   key required).
+//! - [`S3CompatStore`] — any S3-compatible store reached via a custom
+//!   endpoint (Cloudflare R2, MinIO, Backblaze B2, AWS S3). Uses static
+//!   access-key credentials and local SigV4 presigning.
 //!
-//! Production deployments use [`GcsStore`]; the in-memory store is meant
-//! for `cargo test` and local `cargo run` workflows where no GCS bucket
-//! is configured.
+//! Production deployments use [`GcsStore`] or [`S3CompatStore`]; the
+//! in-memory store is meant for `cargo test` and local `cargo run`
+//! workflows where no bucket is configured.
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -264,6 +267,152 @@ impl ImageStore for GcsStore {
     }
 }
 
+// ========================== S3CompatStore =================================
+
+/// SigV4 presigning has a hard 7-day ceiling. Clamp any requested TTL to
+/// just under it so a misconfigured `dispatch_ttl` can't make presigning
+/// fail at runtime.
+const S3_MAX_PRESIGN: Duration = Duration::from_secs(7 * 24 * 60 * 60 - 60);
+
+/// S3-compatible object store backend (Cloudflare R2, MinIO, Backblaze B2,
+/// AWS S3) reached via a custom endpoint.
+///
+/// Unlike [`GcsStore`], this uses static access-key credentials and *local*
+/// SigV4 presigning — no `signBlob` round-trip and no Workload Identity. The
+/// credentials are supplied at construction (read from the environment by
+/// [`from_config`](super::from_config), never from the serializable config),
+/// so they cannot leak via a config dump.
+///
+/// The `aws_sdk_s3::Client` is cheap to build (no network at construction),
+/// so it is created eagerly in [`S3CompatStore::new`].
+pub struct S3CompatStore {
+    bucket: String,
+    client: aws_sdk_s3::Client,
+}
+
+impl S3CompatStore {
+    pub fn new(
+        bucket: impl Into<String>,
+        endpoint_url: impl Into<String>,
+        region: impl Into<String>,
+        force_path_style: bool,
+        access_key_id: impl Into<String>,
+        secret_access_key: impl Into<String>,
+    ) -> Self {
+        let creds = aws_credential_types::Credentials::new(
+            access_key_id.into(),
+            secret_access_key.into(),
+            None,
+            None,
+            "dwctl-image-normalizer",
+        );
+        let s3_config = aws_sdk_s3::config::Builder::new()
+            .region(aws_sdk_s3::config::Region::new(region.into()))
+            .credentials_provider(creds)
+            .endpoint_url(endpoint_url.into())
+            .force_path_style(force_path_style)
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .build();
+        Self {
+            bucket: bucket.into(),
+            client: aws_sdk_s3::Client::from_conf(s3_config),
+        }
+    }
+
+    /// Object key shape for a given token. Mirrors [`GcsStore::key`] so the
+    /// two backends are interchangeable for the same content hash.
+    fn key(token: ImageToken) -> String {
+        let hex = token.to_hex();
+        format!("images/{}/{}/{}", &hex[..2], &hex[2..4], hex)
+    }
+}
+
+#[async_trait]
+impl ImageStore for S3CompatStore {
+    async fn put(&self, token: ImageToken, mime: &str, bytes: Bytes) -> Result<bool, StoreError> {
+        // Idempotency: short-circuit if the object already exists.
+        if self.exists(token).await? {
+            return Ok(false);
+        }
+        let key = Self::key(token);
+        self.client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(&key)
+            .content_type(mime)
+            .body(aws_sdk_s3::primitives::ByteStream::from(bytes))
+            .send()
+            .await
+            .map_err(|e| StoreError::Backend(format!("S3 put {key}: {}", e.into_service_error())))?;
+        Ok(true)
+    }
+
+    async fn sign(&self, token: ImageToken, ttl: Duration) -> Result<SignedImageUrl, StoreError> {
+        let key = Self::key(token);
+        let ttl = ttl.min(S3_MAX_PRESIGN);
+        let presign = aws_sdk_s3::presigning::PresigningConfig::expires_in(ttl)
+            .map_err(|e| StoreError::Backend(format!("S3 presign config: {e}")))?;
+        let req = self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(&key)
+            .presigned(presign)
+            .await
+            .map_err(|e| StoreError::Backend(format!("S3 sign {key}: {}", e.into_service_error())))?;
+        let expires_at = Utc::now() + ChronoDuration::from_std(ttl).unwrap_or(ChronoDuration::seconds(900));
+        Ok(SignedImageUrl {
+            url: req.uri().to_string(),
+            expires_at,
+        })
+    }
+
+    async fn read(&self, token: ImageToken) -> Result<(String, Bytes), StoreError> {
+        let key = Self::key(token);
+        let resp = self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(&key)
+            .send()
+            .await
+            .map_err(|e| {
+                let svc = e.into_service_error();
+                if svc.is_no_such_key() {
+                    StoreError::NotFound
+                } else {
+                    StoreError::Backend(format!("S3 read {key}: {svc}"))
+                }
+            })?;
+        let mime = resp.content_type().unwrap_or("application/octet-stream").to_string();
+        let bytes = resp
+            .body
+            .collect()
+            .await
+            .map_err(|e| StoreError::Backend(format!("S3 read body {key}: {e}")))?
+            .into_bytes();
+        Ok((mime, bytes))
+    }
+
+    async fn exists(&self, token: ImageToken) -> Result<bool, StoreError> {
+        let key = Self::key(token);
+        // Typed 404 → false; any other error (auth, network, server) bubbles
+        // up so a misconfiguration can't be misread as a missing object
+        // (which would otherwise trigger a needless re-upload).
+        match self.client.head_object().bucket(&self.bucket).key(&key).send().await {
+            Ok(_) => Ok(true),
+            Err(e) => {
+                let svc = e.into_service_error();
+                if svc.is_not_found() {
+                    Ok(false)
+                } else {
+                    Err(StoreError::Backend(format!("S3 exists {key}: {svc}")))
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -326,5 +475,49 @@ mod tests {
     fn gcs_bucket_resource_format() {
         let s = GcsStore::new("my-bucket", "europe-west4");
         assert_eq!(s.bucket_resource(), "projects/_/buckets/my-bucket");
+    }
+
+    #[test]
+    fn s3_key_uses_two_level_prefix() {
+        let key = S3CompatStore::key(tok(0xab));
+        assert!(key.starts_with("images/ab/ab/abab"));
+    }
+
+    #[test]
+    fn s3_compat_store_builds_client() {
+        // Construction is offline (no network): proves the trimmed
+        // aws-sdk-s3 feature set is enough to build a custom-endpoint,
+        // path-style client with static credentials.
+        let s = S3CompatStore::new(
+            "imgs",
+            "https://example.r2.cloudflarestorage.com",
+            "auto",
+            true,
+            "AKIDEXAMPLE",
+            "secret",
+        );
+        assert_eq!(s.bucket, "imgs");
+    }
+
+    #[tokio::test]
+    async fn s3_presign_caps_ttl_at_seven_days() {
+        // A wildly oversized TTL must not blow past the SigV4 7-day ceiling;
+        // it is clamped before PresigningConfig validation, so signing the
+        // (offline) presigned URL succeeds rather than erroring.
+        let s = S3CompatStore::new(
+            "imgs",
+            "https://example.r2.cloudflarestorage.com",
+            "auto",
+            true,
+            "AKIDEXAMPLE",
+            "secret",
+        );
+        let signed = s
+            .sign(tok(5), Duration::from_secs(30 * 24 * 60 * 60))
+            .await
+            .expect("presign with clamped ttl should succeed");
+        assert!(signed.url.starts_with("https://example.r2.cloudflarestorage.com"));
+        // Expiry reflects the clamp, not the requested 30 days.
+        assert!(signed.expires_at <= Utc::now() + ChronoDuration::days(7));
     }
 }

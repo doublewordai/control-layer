@@ -509,10 +509,24 @@ background_services:
 image_normalizer:
   enabled: false # Default: false; set to true after configuring a backend
   backend:
-    type: memory # `memory` (tests / local dev) or `gcs` (production)
+    # `memory` (tests / local dev), `gcs`, or `s3_compatible` (production).
+    type: memory
+    #
+    # Google Cloud Storage (Workload Identity — no static keys):
     # type: gcs
     # bucket: doubleword-images
     # region: europe-west4
+    #
+    # Any S3-compatible store via a custom endpoint (Cloudflare R2, MinIO,
+    # Backblaze B2, AWS S3). Credentials are NOT set here — they are read
+    # from the environment so they never land in config or a config dump:
+    #   DWCTL_IMAGE_NORMALIZER_S3_ACCESS_KEY_ID
+    #   DWCTL_IMAGE_NORMALIZER_S3_SECRET_ACCESS_KEY
+    # type: s3_compatible
+    # bucket: doubleword-images
+    # endpoint_url: https://<account_id>.r2.cloudflarestorage.com
+    # region: auto            # R2 uses "auto"; AWS S3 uses e.g. us-east-1
+    # force_path_style: true  # required by most S3-compatible endpoints
   fetcher:
     max_bytes: 20971520        # 20 MiB
     timeout_secs: 30
