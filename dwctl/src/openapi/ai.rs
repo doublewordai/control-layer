@@ -121,7 +121,7 @@ fn list_models() {}
     summary = "Retrieve model",
     description = "Retrieves information about a specific model.",
     params(
-        ("model" = String, Path, description = "The model ID (e.g., `gpt-4`, `text-embedding-ada-002`)")
+        ("model" = String, Path, description = "The model ID (e.g., `deepseek-ai/DeepSeek-V4-Pro`, `Qwen/Qwen3-Embedding-8B`)")
     ),
     responses(
         (status = 200, description = "Model details including ID, owner, and creation timestamp.", body = extra_types::ModelObject),
