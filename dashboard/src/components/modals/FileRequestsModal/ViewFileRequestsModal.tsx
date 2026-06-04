@@ -10,6 +10,7 @@ import {
 } from "../../ui/dialog";
 import { Button } from "../../ui/button";
 import { ScrollArea } from "../../ui/scroll-area";
+import { DwImageGallery } from "../../ui/dw-image-gallery";
 import { dwctlApi } from "../../../api/control-layer/client";
 import type { FileObject, FileRequest } from "../../../api/control-layer/types";
 
@@ -50,6 +51,8 @@ function RequestCard({ request }: { request: FileRequest }) {
 
       {expanded && (
         <div className="p-4 bg-white space-y-3">
+          {/* Normalized image previews (if any) */}
+          <DwImageGallery body={request.body} />
           {/* Request Body */}
           <div>
             <h4 className="text-xs font-semibold text-gray-700 mb-2">

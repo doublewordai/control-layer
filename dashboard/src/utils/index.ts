@@ -11,3 +11,4 @@ export * from "./roles";
 export * from "./authorization";
 export * from "./modelAccess";
 export * from "./url";
+export * from "./dwImage";

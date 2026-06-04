@@ -5,6 +5,28 @@
 //! dashboard to render images that the user submitted via `data:` URI
 //! (or HTTP URL) and that have been normalised into the content store.
 //!
+//! ## Resolving `dw-img://` tokens
+//!
+//! When image-input normalization is enabled, stored request bodies
+//! reference images by an opaque `dw-img://<sha256>` token rather than the
+//! original URL or inline base64. To get the original bytes back for a
+//! token, call this endpoint with the token's `<sha256>`:
+//!
+//! ```text
+//! GET /admin/api/v1/images/<sha256>
+//! ```
+//!
+//! This lives on the dwctl-native management API, **not** the
+//! OpenAI-compatible `/ai` surface (which has no equivalent concept). It
+//! accepts the same credentials as the rest of the management API:
+//!
+//! - a **dashboard session** — the console renders `dw-img://` tokens as
+//!   `<img>` automatically, so users see their original images; or
+//! - a **`platform`-purpose API key** (Bearer) for programmatic callers.
+//!
+//! Anything that follows redirects (a browser `<img>`, `curl -L`, an HTTP
+//! client) then fetches the bytes from the returned signed URL.
+//!
 //! Authorisation: the user must have a row in `image_access` for this
 //! sha256, meaning they previously submitted a request that referenced
 //! this image. Content-addressed deduplication means many users can

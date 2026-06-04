@@ -36,6 +36,7 @@ import {
   DialogDescription,
 } from "../../../ui/dialog";
 import { CodeBlock } from "../../../ui/code-block";
+import { DwImageGallery } from "../../../ui/dw-image-gallery";
 import type { FileRequest } from "../../../../api/control-layer/types";
 import { useServerPagination } from "../../../../hooks/useServerPagination";
 
@@ -302,9 +303,12 @@ export function FileRequests() {
                 }
 
                 return content ? (
-                  <CodeBlock language="json">
-                    {JSON.stringify(content, null, 2)}
-                  </CodeBlock>
+                  <>
+                    <DwImageGallery body={content} className="mb-3" />
+                    <CodeBlock language="json">
+                      {JSON.stringify(content, null, 2)}
+                    </CodeBlock>
+                  </>
                 ) : (
                   <p className="text-gray-500 text-sm p-4">
                     No content available

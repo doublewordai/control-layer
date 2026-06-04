@@ -8,6 +8,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { Card, CardContent, CardHeader, CardTitle } from "../../ui/card";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "../../ui/collapsible";
 import { CodeBlock } from "../../ui/code-block";
+import { DwImageGallery } from "../../ui/dw-image-gallery";
 import { copyToClipboard } from "../../../utils";
 import { formatTimestamp } from "../../../utils";
 
@@ -164,6 +165,7 @@ export function AsyncRequestDetail() {
                 </CollapsibleTrigger>
                 <CopyIconButton value={inputJson} />
               </CardHeader>
+              <DwImageGallery body={request.body} className="px-6 pb-4" />
               <CollapsibleContent>
                 <CardContent className="px-6 pb-6 pt-0">
                   <div className="rounded-lg overflow-hidden border border-doubleword-border">
