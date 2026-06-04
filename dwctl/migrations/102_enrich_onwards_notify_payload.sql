@@ -29,11 +29,15 @@
 --   user_organizations         -> user id        = COALESCE(NEW.user_id, OLD.user_id)
 --
 -- The legacy 2-part `<table>:<epoch_micros>` form (introduced in migration 049)
--- carries no scope id and therefore requests a FULL reload. We deliberately keep
--- that form for `users` (users_verified_notify, migration 099): the users table
--- is not in resolve_change_scope's delta dispatch, so any scope id we emitted for
--- it would be ignored and a full reload done anyway. Emitting the legacy form is
--- the faithful, behaviour-preserving choice.
+-- carries no scope id and therefore requests a FULL reload. As of THIS migration
+-- the `users` trigger (users_verified_notify, migration 099) is kept on the legacy
+-- form, because `users` was not yet in resolve_change_scope's delta dispatch, so any
+-- scope id emitted for it would be ignored and a full reload done anyway.
+--
+-- SUPERSEDED: migration 103 adds a `users` arm to resolve_change_scope and upgrades
+-- users_verified_notify to the enriched `users:<op>:<user_id>:<epoch>` form, making a
+-- verified change a per-user delta. The notes in this file describe the state as of
+-- migration 102 only.
 --
 -- DESIGN: the old shared notify_config_change() served tables with DIFFERENT
 -- scope columns AND different trigger levels (row vs statement). A single

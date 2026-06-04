@@ -198,6 +198,93 @@ async fn test_scoped_reload_matches_full_reload(pool: sqlx::PgPool) {
 }
 
 #[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+async fn test_user_scoped_change_resolves_reachable_deployments(pool: sqlx::PgPool) {
+    // A user-owned change (api_keys / user_groups / credits_transactions / users) must
+    // resolve to every deployment that user can reach, so the delta reload patches all of
+    // them. Under-resolving here would leave a deployment serving stale config until the
+    // periodic fallback — this guards the user -> deployments resolution path directly.
+    let (sync, _, _) = super::OnwardsConfigSync::new(pool.clone()).await.unwrap();
+    let id = |s: &str| uuid::Uuid::parse_str(s).unwrap();
+
+    // From cache_base: user A is in group cache-private-a (granted the private regular model
+    // and the private composite); the two public models are reachable by everyone. The query
+    // over-includes (ignores balance), so metered-public is present despite being balance-gated.
+    let user_a = id("00000000-0000-0000-0000-0000000000a1");
+    let regular_public = id("40000000-0000-0000-0000-000000000001");
+    let regular_private = id("40000000-0000-0000-0000-000000000002");
+    let metered_public = id("40000000-0000-0000-0000-000000000003");
+    let private_composite = id("50000000-0000-0000-0000-000000000001");
+    let mut expected_a = vec![regular_public, regular_private, metered_public, private_composite];
+    expected_a.sort();
+
+    let mut got = sync.deployments_for_user(user_a).await.unwrap();
+    got.sort();
+    assert_eq!(
+        got, expected_a,
+        "user A should reach public + group-private deployments (incl. the composite)"
+    );
+
+    // resolve_change_scope routes every user-owned table through deployments_for_user, so a
+    // verified flip (users) or a key/membership/balance change scopes to the same set.
+    for table in ["api_keys", "user_groups", "credits_transactions", "users"] {
+        let change = super::NotifyChange {
+            table: table.to_string(),
+            op: Some("UPDATE".to_string()),
+            scope_id: Some(user_a),
+            lag: Duration::ZERO,
+        };
+        let mut scope = sync.resolve_change_scope(Some(&change)).await;
+        scope.sort();
+        assert_eq!(
+            scope, expected_a,
+            "a '{table}' change for user A must scope to their reachable deployments"
+        );
+    }
+
+    // A user with no group membership reaches only the public deployments.
+    let user_b = id("00000000-0000-0000-0000-0000000000b1");
+    let mut expected_b = vec![regular_public, metered_public];
+    expected_b.sort();
+    let mut got_b = sync.deployments_for_user(user_b).await.unwrap();
+    got_b.sort();
+    assert_eq!(got_b, expected_b, "user B (no group) should reach only public deployments");
+
+    // The system user (nil uuid) reaches everything, so a nil-scoped change falls back to a
+    // full reload (empty scope) rather than a narrow delta.
+    let nil_change = super::NotifyChange {
+        table: "api_keys".to_string(),
+        op: Some("UPDATE".to_string()),
+        scope_id: Some(uuid::Uuid::nil()),
+        lag: Duration::ZERO,
+    };
+    assert!(
+        sync.resolve_change_scope(Some(&nil_change)).await.is_empty(),
+        "a system-user (nil) change must fall back to a full reload"
+    );
+
+    // Close the loop: the user-resolved scope feeds a delta reload that matches a full reload
+    // for each resolved regular deployment.
+    let full = super::load_full_state(&pool, &[], &[]).await.unwrap();
+    let slice = super::load_full_state(&pool, &[], &expected_a).await.unwrap();
+    for dep_id in &expected_a {
+        if let Some(full_t) = full.regular.get(dep_id) {
+            let scoped_t = slice
+                .regular
+                .get(dep_id)
+                .expect("scoped reload missing a resolved regular deployment");
+            let mut scoped_keys: Vec<_> = scoped_t.api_keys.iter().map(|k| k.id).collect();
+            let mut full_keys: Vec<_> = full_t.api_keys.iter().map(|k| k.id).collect();
+            scoped_keys.sort();
+            full_keys.sort();
+            assert_eq!(
+                scoped_keys, full_keys,
+                "scoped reload must match full reload for a user-resolved deployment"
+            );
+        }
+    }
+}
+
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
 async fn test_config_content_hash_detects_changes(pool: sqlx::PgPool) {
     // Stable when nothing changes (so the fallback skips the full reload)...
     let before = super::config_content_hash(&pool).await.unwrap();
