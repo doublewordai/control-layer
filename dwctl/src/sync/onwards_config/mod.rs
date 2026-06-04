@@ -493,9 +493,12 @@ impl OnwardsConfigSync {
                                 // Parse the change notification (table + optional scope id + lag).
                                 let change = parse_notify_payload(notification.payload());
                                 if change.is_none() {
-                                    debug!(
-                                        "Unparseable NOTIFY payload, falling back to a full reload: {:?}",
-                                        notification.payload()
+                                    // An unparseable payload means a trigger bug, a version
+                                    // mismatch, or an external sender — surface it at warn so
+                                    // it is visible without debug logging enabled.
+                                    warn!(
+                                        payload = %notification.payload(),
+                                        "Unparseable NOTIFY payload, falling back to a full reload"
                                     );
                                 }
 
