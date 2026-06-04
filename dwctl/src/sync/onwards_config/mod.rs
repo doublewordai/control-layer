@@ -338,10 +338,16 @@ impl OnwardsConfigSync {
                     }
                 }
             }
-            // Unmapped: an unknown table, or a user-table change for the system user
-            // (nil uuid) which reaches everything. Either way, do a full reload.
+            // Unmapped → full reload. Two distinct causes, logged differently: a user-table
+            // change by the system user (nil uuid, which reaches everything) is expected, so
+            // debug; a genuinely unknown table means a trigger fires without a resolver arm
+            // (config drift), which should surface without debug logging, so warn.
             other => {
-                debug!("No delta scope for '{other}' (scope_id={scope_id}); falling back to a full reload");
+                if scope_id == uuid::Uuid::nil() {
+                    debug!("System-user (nil) change to '{other}'; falling back to a full reload");
+                } else {
+                    warn!("No delta scope mapping for table '{other}' (scope_id={scope_id}); falling back to a full reload");
+                }
                 Vec::new()
             }
         }
