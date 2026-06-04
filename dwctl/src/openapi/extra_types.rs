@@ -308,12 +308,12 @@ pub struct Usage {
 /// Request body for embeddings.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[schema(example = json!({
-    "model": "Qwen/Qwen3-30B-A3B-FP8",
+    "model": "Qwen/Qwen3-Embedding-8B",
     "input": "What is a doubleword?"
 }))]
 pub struct EmbeddingRequest {
     /// ID of the model to use.
-    #[schema(example = "Qwen/Qwen3-30B-A3B-FP8")]
+    #[schema(example = "Qwen/Qwen3-Embedding-8B")]
     pub model: String,
 
     /// Input text to embed. Can be a string or array of strings.
@@ -353,7 +353,7 @@ pub enum EmbeddingInput {
         "index": 0,
         "embedding": [0.0023, -0.0134, 0.0256]
     }],
-    "model": "Qwen/Qwen3-30B-A3B-FP8",
+    "model": "Qwen/Qwen3-Embedding-8B",
     "usage": {
         "prompt_tokens": 6,
         "total_tokens": 6
@@ -368,7 +368,7 @@ pub struct EmbeddingResponse {
     pub data: Vec<EmbeddingData>,
 
     /// The model used for generating embeddings.
-    #[schema(example = "Qwen/Qwen3-30B-A3B-FP8")]
+    #[schema(example = "Qwen/Qwen3-Embedding-8B")]
     pub model: String,
 
     /// Usage statistics for the request.
@@ -552,14 +552,14 @@ pub struct ResponseItem {
 /// Request body for creating a response.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[schema(example = json!({
-    "model": "gpt-4o",
+    "model": "deepseek-ai/DeepSeek-V4-Pro",
     "input": "What is a doubleword?",
     "temperature": 0.7,
     "max_output_tokens": 256
 }))]
 pub struct ResponseRequest {
     /// ID of the model to use.
-    #[schema(example = "gpt-4o")]
+    #[schema(example = "deepseek-ai/DeepSeek-V4-Pro")]
     pub model: String,
 
     /// The input to generate a response for. Can be a string or array of messages.
@@ -673,7 +673,7 @@ pub struct ResponseRequest {
     "object": "response",
     "created_at": 1703187200,
     "completed_at": 1703187205,
-    "model": "gpt-4o",
+    "model": "deepseek-ai/DeepSeek-V4-Pro",
     "status": "completed",
     "output": [{
         "type": "message",
@@ -706,7 +706,7 @@ pub struct ResponseObject {
     pub completed_at: i64,
 
     /// The model used for generating the response.
-    #[schema(example = "gpt-4o")]
+    #[schema(example = "deepseek-ai/DeepSeek-V4-Pro")]
     pub model: String,
 
     /// The status of the response. Can be "completed", "incomplete", "cancelled", or "failed".
