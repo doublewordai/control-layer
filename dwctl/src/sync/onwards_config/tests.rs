@@ -107,38 +107,114 @@ fn test_convert_to_config_file_with_single_target() {
 
 #[test]
 fn test_parse_notify_payload() {
-    // Test valid payload
     let now_micros = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_micros() as i64;
-    let payload = format!("api_keys:{}", now_micros);
-    let result = parse_notify_payload(&payload);
-    assert!(result.is_some());
-    let (table_name, lag) = result.unwrap();
-    assert_eq!(table_name, "api_keys");
-    // Lag should be very small (< 100ms) since we just created the timestamp
-    assert!(lag.as_millis() < 100, "Lag should be < 100ms, got {:?}", lag);
 
-    // Test payload from 1 second ago
-    let old_micros = now_micros - 1_000_000; // 1 second ago
-    let old_payload = format!("deployed_models:{}", old_micros);
-    let result = parse_notify_payload(&old_payload);
-    assert!(result.is_some());
-    let (table_name, lag) = result.unwrap();
-    assert_eq!(table_name, "deployed_models");
-    // Lag should be around 1 second
+    // Legacy `table:epoch` — recent timestamp, no scope id (⇒ full reload).
+    let c = parse_notify_payload(&format!("api_keys:{}", now_micros)).unwrap();
+    assert_eq!(c.table, "api_keys");
+    assert!(c.scope_id.is_none());
+    assert!(c.lag.as_millis() < 100, "Lag should be < 100ms, got {:?}", c.lag);
+
+    // Legacy from ~1 second ago.
+    let c = parse_notify_payload(&format!("deployed_models:{}", now_micros - 1_000_000)).unwrap();
+    assert_eq!(c.table, "deployed_models");
     assert!(
-        lag.as_millis() >= 1000 && lag.as_millis() < 1100,
+        c.lag.as_millis() >= 1000 && c.lag.as_millis() < 1100,
         "Lag should be ~1s, got {:?}",
-        lag
+        c.lag
     );
 
-    // Test invalid payloads
+    // Enriched `table:op:id:epoch`.
+    let id = uuid::Uuid::new_v4();
+    let c = parse_notify_payload(&format!("deployment_groups:INSERT:{}:{}", id, now_micros)).unwrap();
+    assert_eq!(c.table, "deployment_groups");
+    assert_eq!(c.op.as_deref(), Some("INSERT"));
+    assert_eq!(c.scope_id, Some(id));
+
+    // JSON form (as emitted by the tariff/component triggers).
+    let c = parse_notify_payload(&format!(
+        r#"{{"table":"model_tariffs","operation":"DELETE","id":"{}","timestamp":{}}}"#,
+        id, now_micros
+    ))
+    .unwrap();
+    assert_eq!(c.table, "model_tariffs");
+    assert_eq!(c.op.as_deref(), Some("DELETE"));
+    assert_eq!(c.scope_id, Some(id));
+
+    // Invalid payloads.
     assert!(parse_notify_payload("").is_none());
     assert!(parse_notify_payload("no_colon").is_none());
     assert!(parse_notify_payload("table:not_a_number").is_none());
-    assert!(parse_notify_payload("too:many:colons").is_none());
+    assert!(parse_notify_payload("only:three:parts").is_none());
+}
+
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+async fn test_scoped_reload_matches_full_reload(pool: sqlx::PgPool) {
+    // The deployment-scoped query must return exactly the same per-deployment data as a
+    // full reload — this is the invariant that makes a scoped delta == a full reload.
+    let full = super::load_full_state(&pool, &[], &[]).await.unwrap();
+    assert!(!full.regular.is_empty(), "fixture should have regular deployments");
+
+    for (id, full_target) in &full.regular {
+        let slice = super::load_full_state(&pool, &[], std::slice::from_ref(id)).await.unwrap();
+        assert_eq!(slice.regular.len(), 1, "scoped reload should return exactly one regular deployment");
+        let scoped = slice.regular.get(id).expect("scoped reload missing the requested deployment");
+        assert_eq!(scoped.alias, full_target.alias);
+
+        let mut scoped_keys: Vec<_> = scoped.api_keys.iter().map(|k| (k.id, k.secret.clone())).collect();
+        let mut full_keys: Vec<_> = full_target.api_keys.iter().map(|k| (k.id, k.secret.clone())).collect();
+        scoped_keys.sort();
+        full_keys.sort();
+        assert_eq!(
+            scoped_keys, full_keys,
+            "scoped key set must match full reload for '{}'",
+            full_target.alias
+        );
+    }
+
+    // Composite deployments converge too.
+    for composite in &full.composites {
+        let slice = super::load_full_state(&pool, &[], std::slice::from_ref(&composite.id))
+            .await
+            .unwrap();
+        let scoped = slice
+            .composites
+            .iter()
+            .find(|c| c.id == composite.id)
+            .expect("scoped reload missing the requested composite");
+        let mut scoped_keys: Vec<_> = scoped.api_keys.iter().map(|k| k.id).collect();
+        let mut full_keys: Vec<_> = composite.api_keys.iter().map(|k| k.id).collect();
+        scoped_keys.sort();
+        full_keys.sort();
+        assert_eq!(
+            scoped_keys, full_keys,
+            "scoped composite key set must match full reload for '{}'",
+            composite.alias
+        );
+    }
+}
+
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+async fn test_config_content_hash_detects_changes(pool: sqlx::PgPool) {
+    // Stable when nothing changes (so the fallback skips the full reload)...
+    let before = super::config_content_hash(&pool).await.unwrap();
+    let again = super::config_content_hash(&pool).await.unwrap();
+    assert_eq!(before, again, "hash must be stable when the config is unchanged");
+    assert!(!before.is_empty());
+
+    // ...but a routing-config change must move it (so the fallback won't skip a real change).
+    sqlx::query(
+        "UPDATE deployed_models SET alias = alias || '-changed' \
+         WHERE id = (SELECT id FROM deployed_models WHERE NOT deleted LIMIT 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let after = super::config_content_hash(&pool).await.unwrap();
+    assert_ne!(before, after, "hash must change when a config row changes");
 }
 
 #[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]

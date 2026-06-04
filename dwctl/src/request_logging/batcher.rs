@@ -972,7 +972,9 @@ where
     }
 
     /// Send pg_notify to trigger onwards sync when users have depleted balances.
-    /// Format: "credits_transactions:{epoch_micros}" to match other triggers and enable lag metrics.
+    /// Sends one notify per user, format `credits_transactions:<op>:<user_id>:<epoch_micros>`,
+    /// so the onwards sync can scope the reload to that user's deployments (a delta) instead
+    /// of a full reload.
     async fn notify_onwards_sync(&self, conn: &mut sqlx::PgConnection, depleted_users: &[Uuid]) -> Result<(), sqlx::Error> {
         debug!(
             depleted_count = depleted_users.len(),
@@ -984,13 +986,16 @@ where
             .unwrap_or_default()
             .as_micros();
 
-        let payload = format!("credits_transactions:{}", epoch_micros);
-
-        sqlx::query("SELECT pg_notify($1, $2)")
-            .bind(ONWARDS_CONFIG_CHANGED_CHANNEL)
-            .bind(&payload)
-            .execute(conn)
-            .await?;
+        // One notify per depleted user lets the onwards sync scope the reload to that
+        // user's deployments (a delta) instead of running the full reload.
+        for user_id in depleted_users {
+            let payload = format!("credits_transactions:deplete:{}:{}", user_id, epoch_micros);
+            sqlx::query("SELECT pg_notify($1, $2)")
+                .bind(ONWARDS_CONFIG_CHANGED_CHANNEL)
+                .bind(&payload)
+                .execute(&mut *conn)
+                .await?;
+        }
 
         counter!("dwctl_onwards_sync_notifications_total", "action" => "sent").increment(1);
 
@@ -1995,20 +2000,26 @@ mod integration_tests {
         let shutdown = tokio_util::sync::CancellationToken::new();
         batcher.run(shutdown).await;
 
-        // Should receive ONLY ONE notification despite 3 balance depletions
-        let first_notification = timeout(Duration::from_secs(2), listener.recv())
-            .await
-            .expect("Timeout waiting for first balance depletion notification")
-            .expect("Failed to receive notification");
-
-        assert_eq!(first_notification.channel(), "auth_config_changed");
-        println!("Received first notification: {}", first_notification.payload());
-
-        // Try to receive a second notification - should timeout because of rate limiting
-        let second_notification = timeout(Duration::from_millis(50), listener.recv()).await;
-        assert!(
-            second_notification.is_err(),
-            "Should NOT receive second notification due to rate limiting (interval is 100ms, we only waited 50ms)"
+        // The batch depletes 3 users; the rate-limited notify fires once and emits one
+        // scoped notification per depleted user (so the onwards sync can delta each user
+        // instead of doing a full reload). Drain them and confirm exactly one per user.
+        let mut deplete_users = std::collections::HashSet::new();
+        while let Ok(Ok(n)) = timeout(Duration::from_millis(300), listener.recv()).await {
+            assert_eq!(n.channel(), "auth_config_changed");
+            let payload = n.payload();
+            assert!(
+                payload.starts_with("credits_transactions:deplete:"),
+                "unexpected payload: {payload}"
+            );
+            // Format: credits_transactions:deplete:<user_id>:<epoch>
+            if let Some(user_id) = payload.split(':').nth(2) {
+                deplete_users.insert(user_id.to_string());
+            }
+        }
+        assert_eq!(
+            deplete_users.len(),
+            3,
+            "expected one deplete notification per depleted user (3), got {deplete_users:?}"
         );
 
         // Verify all 3 users have negative balances

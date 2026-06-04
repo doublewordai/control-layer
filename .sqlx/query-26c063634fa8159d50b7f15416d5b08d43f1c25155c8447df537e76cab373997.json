@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            id as composite_model_id,\n            alias,\n            requests_per_second,\n            burst_size,\n            capacity,\n            lb_strategy,\n            fallback_enabled,\n            fallback_on_rate_limit,\n            fallback_on_status,\n            fallback_with_replacement,\n            fallback_max_attempts,\n            backoff_enabled,\n            backoff_initial_ms,\n            backoff_max_ms,\n            backoff_factor,\n            backoff_jitter,\n            backoff_max_total_ms,\n            sanitize_responses,\n            trusted,\n            open_responses_adapter as \"open_responses_adapter?\"\n        FROM deployed_models\n        WHERE is_composite = TRUE\n          AND deleted = FALSE\n        ",
+  "query": "\n        SELECT\n            id as composite_model_id,\n            alias,\n            requests_per_second,\n            burst_size,\n            capacity,\n            lb_strategy,\n            fallback_enabled,\n            fallback_on_rate_limit,\n            fallback_on_status,\n            fallback_with_replacement,\n            fallback_max_attempts,\n            backoff_enabled,\n            backoff_initial_ms,\n            backoff_max_ms,\n            backoff_factor,\n            backoff_jitter,\n            backoff_max_total_ms,\n            sanitize_responses,\n            trusted,\n            open_responses_adapter as \"open_responses_adapter?\"\n        FROM deployed_models\n        WHERE is_composite = TRUE\n          AND deleted = FALSE\n          AND (cardinality($1::uuid[]) = 0 OR id = ANY($1::uuid[]))\n        ",
   "describe": {
     "columns": [
       {
@@ -105,7 +105,9 @@
       }
     ],
     "parameters": {
-      "Left": []
+      "Left": [
+        "UuidArray"
+      ]
     },
     "nullable": [
       false,
@@ -130,5 +132,5 @@
       true
     ]
   },
-  "hash": "2a6598c559811a3d5c27dbf732279f8e9d0c061b33ba1214e0d4a235cf17f193"
+  "hash": "26c063634fa8159d50b7f15416d5b08d43f1c25155c8447df537e76cab373997"
 }
