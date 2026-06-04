@@ -287,6 +287,41 @@ async fn test_user_scoped_change_resolves_reachable_deployments(pool: sqlx::PgPo
 }
 
 #[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+async fn test_component_change_resolves_parent_composite(pool: sqlx::PgPool) {
+    // A deployed_models change to a component embedded in a composite must re-query the
+    // component AND its parent composite, so the composite never serves stale component
+    // config. cache_base composite 50...01 embeds 40...06 and 40...05 as enabled components.
+    let (sync, _, _) = super::OnwardsConfigSync::new(pool.clone()).await.unwrap();
+    let id = |s: &str| uuid::Uuid::parse_str(s).unwrap();
+
+    let component = id("40000000-0000-0000-0000-000000000006");
+    let composite = id("50000000-0000-0000-0000-000000000001");
+
+    // composites_for_component finds the enabled, non-deleted parent.
+    assert_eq!(
+        sync.composites_for_component(component).await.unwrap(),
+        vec![composite],
+        "the component's enabled parent composite must be resolved"
+    );
+
+    // resolve_change_scope folds the parent into the scope alongside the component itself.
+    let change = super::NotifyChange {
+        table: "deployed_models".to_string(),
+        op: Some("UPDATE".to_string()),
+        scope_id: Some(component),
+        lag: Duration::ZERO,
+    };
+    let mut scope = sync.resolve_change_scope(Some(&change)).await;
+    scope.sort();
+    let mut expected = vec![component, composite];
+    expected.sort();
+    assert_eq!(
+        scope, expected,
+        "a component change must re-query the component and its parent composite"
+    );
+}
+
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
 async fn test_config_content_hash_detects_changes(pool: sqlx::PgPool) {
     // Stable when nothing changes (so the fallback skips the full reload)...
     let before = super::config_content_hash(&pool).await.unwrap();
