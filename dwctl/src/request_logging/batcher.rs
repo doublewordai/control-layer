@@ -986,7 +986,9 @@ where
             .unwrap_or_default()
             .as_micros();
 
-        // One notify per depleted user lets the onwards sync scope the reload to that
+        // Rate limiting is applied to the whole batch before this function is called (see
+        // should_notify_onwards_sync): either every depleted user is notified or none are.
+        // One notify per depleted user then lets the onwards sync scope each reload to that
         // user's deployments (a delta) instead of running the full reload.
         for user_id in depleted_users {
             let payload = format!("credits_transactions:deplete:{}:{}", user_id, epoch_micros);

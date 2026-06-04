@@ -518,8 +518,15 @@ impl OnwardsConfigSync {
                                             break;
                                         }
 
-                                        // Record metric for LISTEN/NOTIFY sync
-                                        metrics::counter!("dwctl_cache_sync_total", "source" => "listen_notify").increment(1);
+                                        // Record metric for LISTEN/NOTIFY sync, labelled by whether the
+                                        // reload was a scoped delta or a full reload — so delta-vs-full
+                                        // frequency is observable in production.
+                                        metrics::counter!(
+                                            "dwctl_cache_sync_total",
+                                            "source" => "listen_notify",
+                                            "mode" => if scope.is_empty() { "full" } else { "delta" }
+                                        )
+                                        .increment(1);
 
                                         // Record cache sync lag metric (time from DB change to cache update)
                                         if let Some(ref c) = change {
@@ -1680,6 +1687,7 @@ async fn config_content_hash(db: &PgPool) -> Result<String, sqlx::Error> {
             coalesce((SELECT string_agg(ie::text, ',' ORDER BY ie::text) FROM inference_endpoints ie), '') ||
             coalesce((SELECT string_agg(dg::text, ',' ORDER BY dg::text) FROM deployment_groups dg), '') ||
             coalesce((SELECT string_agg(ug::text, ',' ORDER BY ug::text) FROM user_groups ug), '') ||
+            coalesce((SELECT string_agg(uo::text, ',' ORDER BY uo::text) FROM user_organizations uo), '') ||
             coalesce((SELECT string_agg(mt::text, ',' ORDER BY mt::text) FROM model_tariffs mt), '') ||
             coalesce((SELECT string_agg(mtr::text, ',' ORDER BY mtr::text) FROM model_traffic_rules mtr), '') ||
             coalesce((SELECT string_agg(dmc::text, ',' ORDER BY dmc::text) FROM deployed_model_components dmc), '') ||

@@ -28,6 +28,12 @@
 --   user_groups                -> user id        = COALESCE(NEW.user_id, OLD.user_id)
 --   user_organizations         -> user id        = COALESCE(NEW.user_id, OLD.user_id)
 --
+-- <op> values: trigger-emitted notifies carry the SQL operation (INSERT / UPDATE /
+-- DELETE). The credits_transactions notify is emitted by the application (not a
+-- trigger) and carries a balance-crossing verb instead:
+--   * deplete -- a user's balance was exhausted        (request_logging/batcher.rs)
+--   * restore -- a user's balance crossed zero upward  (db/handlers/credits.rs)
+--
 -- The legacy 2-part `<table>:<epoch_micros>` form (introduced in migration 049)
 -- carries no scope id and therefore requests a FULL reload. As of THIS migration
 -- the `users` trigger (users_verified_notify, migration 099) is kept on the legacy
