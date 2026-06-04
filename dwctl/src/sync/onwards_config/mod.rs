@@ -338,7 +338,12 @@ impl OnwardsConfigSync {
                     }
                 }
             }
-            _ => Vec::new(),
+            // Unmapped: an unknown table, or a user-table change for the system user
+            // (nil uuid) which reaches everything. Either way, do a full reload.
+            other => {
+                debug!("No delta scope for '{other}' (scope_id={scope_id}); falling back to a full reload");
+                Vec::new()
+            }
         }
     }
 

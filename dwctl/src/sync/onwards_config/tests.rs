@@ -925,6 +925,85 @@ async fn test_api_keys_noop_upsert_does_not_trigger_notify(pool: sqlx::PgPool) {
     );
 }
 
+/// Removing a user from a group / organization must fire a scoped DELETE notify so the
+/// delta sync reloads that user's deployments — otherwise the removal only takes effect at
+/// the periodic fallback. Verifies the membership DELETE triggers (migration 102) fire and
+/// carry the removed user's id.
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+async fn test_membership_delete_fires_scoped_notify(pool: sqlx::PgPool) {
+    use sqlx::postgres::PgListener;
+
+    // cache_base puts user A in group cache-private-a via a user_groups row.
+    let user_a = "00000000-0000-0000-0000-0000000000a1";
+
+    let mut listener = PgListener::connect_with(&pool).await.unwrap();
+    listener.listen("auth_config_changed").await.unwrap();
+
+    // Removing the group membership must notify with the removed user's id.
+    sqlx::query("DELETE FROM user_groups WHERE user_id = $1::uuid")
+        .bind(user_a)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let n = timeout(Duration::from_secs(2), listener.recv())
+        .await
+        .expect("user_groups DELETE should notify")
+        .expect("failed to receive notification");
+    assert!(
+        n.payload().starts_with(&format!("user_groups:DELETE:{user_a}:")),
+        "user_groups DELETE must emit a scoped notify for the removed user, got: {}",
+        n.payload()
+    );
+    while let Ok(Ok(Some(_))) = timeout(Duration::from_millis(50), listener.try_recv()).await {}
+
+    // user_organizations needs an organization-type user (enforced by the membership
+    // type-check trigger) plus a membership row to delete.
+    let org_id = "00000000-0000-0000-0000-0000000000f1";
+    sqlx::query(
+        "INSERT INTO users (id, username, email, display_name, auth_source, is_admin, is_deleted, is_internal, user_type) \
+         VALUES ($1::uuid, 'cache_org', 'cache_org@example.com', 'Cache Org', 'test', false, false, false, 'organization')",
+    )
+    .bind(org_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    while let Ok(Ok(Some(_))) = timeout(Duration::from_millis(50), listener.try_recv()).await {}
+
+    sqlx::query("INSERT INTO user_organizations (user_id, organization_id) VALUES ($1::uuid, $2::uuid)")
+        .bind(user_a)
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let ins = timeout(Duration::from_secs(2), listener.recv())
+        .await
+        .expect("user_organizations INSERT should notify")
+        .expect("failed to receive notification");
+    assert!(
+        ins.payload().starts_with(&format!("user_organizations:INSERT:{user_a}:")),
+        "user_organizations INSERT must emit a scoped notify, got: {}",
+        ins.payload()
+    );
+    while let Ok(Ok(Some(_))) = timeout(Duration::from_millis(50), listener.try_recv()).await {}
+
+    // Removing the organization membership must notify with the removed user's id (OLD row).
+    sqlx::query("DELETE FROM user_organizations WHERE user_id = $1::uuid AND organization_id = $2::uuid")
+        .bind(user_a)
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let del = timeout(Duration::from_secs(2), listener.recv())
+        .await
+        .expect("user_organizations DELETE should notify")
+        .expect("failed to receive notification");
+    assert!(
+        del.payload().starts_with(&format!("user_organizations:DELETE:{user_a}:")),
+        "user_organizations DELETE must emit a scoped notify for the removed user, got: {}",
+        del.payload()
+    );
+}
+
 /// Test that batch API keys get automatic access to composite escalation targets
 #[sqlx::test]
 async fn test_batch_api_key_access_to_composite_escalation_target(pool: sqlx::PgPool) {
