@@ -77,32 +77,6 @@ fn extract_bearer_token(request: &Request<Body>) -> Option<String> {
     }
 }
 
-/// Resolve `bearer` → `user_id` for the `image_access` bookkeeping row.
-/// Returns `None` if the key isn't known. Best-effort; errors are logged
-/// and swallowed.
-async fn resolve_caller_user_id(pool: &PgPool, bearer: &str) -> Option<uuid::Uuid> {
-    match sqlx::query!(
-        r#"
-        SELECT ak.user_id AS "user_id!"
-        FROM api_keys ak
-        INNER JOIN users u ON u.id = ak.user_id
-        WHERE ak.secret = $1 AND ak.is_deleted = FALSE AND u.is_deleted = FALSE
-        LIMIT 1
-        "#,
-        bearer
-    )
-    .fetch_optional(pool)
-    .await
-    {
-        Ok(Some(row)) => Some(row.user_id),
-        Ok(None) => None,
-        Err(e) => {
-            warn!(error = %e, "failed to resolve bearer token for image_access bookkeeping (non-fatal)");
-            None
-        }
-    }
-}
-
 /// Axum middleware function. Applies to the onwards router, runs in front
 /// of `tool_injection_middleware` (i.e. configured as an outer Tower layer
 /// so the request reaches it first).
@@ -158,10 +132,11 @@ pub async fn image_normalizer_middleware(
     // normalised through the content-addressed store.
     let mode = Mode::All;
 
-    // Caller user_id is only used for `image_access` bookkeeping, not for
-    // mode selection — best-effort, never blocks the request.
-    let user_id_for_access = match (state.pool.as_ref(), extract_bearer_token(&request)) {
-        (Some(pool), Some(bearer)) => resolve_caller_user_id(pool, &bearer).await,
+    // Caller attribution (acting user + owning org) is only used for
+    // `image_access` bookkeeping, not for mode selection — best-effort,
+    // never blocks the request.
+    let attribution_for_access = match (state.pool.as_ref(), extract_bearer_token(&request)) {
+        (Some(pool), Some(bearer)) => crate::api::handlers::images::resolve_image_attribution(pool, &bearer).await,
         _ => None,
     };
 
@@ -185,12 +160,12 @@ pub async fn image_normalizer_middleware(
             // (mime, bytes_len) captured from the ingest result rather
             // than empty placeholders — useful for any future
             // dedup-stats or storage-accounting query.
-            if let (Some(pool), Some(user_id)) = (pool_for_access, user_id_for_access) {
+            if let (Some(pool), Some(attribution)) = (pool_for_access, attribution_for_access) {
                 let mime = ingested.mime.clone();
                 let bytes_len = ingested.bytes_len;
                 let token = ingested.token;
                 tokio::spawn(async move {
-                    crate::api::handlers::images::record_image_access(&pool, user_id, token, &mime, bytes_len).await;
+                    crate::api::handlers::images::record_image_access(&pool, attribution, token, &mime, bytes_len).await;
                 });
             }
             Ok::<String, NormalizeError>(signed.url)
@@ -252,7 +227,7 @@ pub(crate) async fn normalize_value_to_tokens(
     body: &mut Value,
     normalizer: &Arc<dyn ImageNormalizer>,
     access_pool: Option<PgPool>,
-    user_id: Option<uuid::Uuid>,
+    attribution: Option<crate::api::handlers::images::ImageAttribution>,
 ) -> Result<usize, NormalizeError> {
     let normalizer = normalizer.clone();
     let substitute = move |url: String| {
@@ -266,12 +241,12 @@ pub(crate) async fn normalize_value_to_tokens(
                 ImageInput::HttpUrl(url)
             };
             let ingested = normalizer.ingest(input).await?;
-            if let (Some(pool), Some(uid)) = (access_pool, user_id) {
+            if let (Some(pool), Some(attribution)) = (access_pool, attribution) {
                 let mime = ingested.mime.clone();
                 let bytes_len = ingested.bytes_len;
                 let token = ingested.token;
                 tokio::spawn(async move {
-                    crate::api::handlers::images::record_image_access(&pool, uid, token, &mime, bytes_len).await;
+                    crate::api::handlers::images::record_image_access(&pool, attribution, token, &mime, bytes_len).await;
                 });
             }
             Ok::<String, NormalizeError>(ingested.token.to_dw_img_uri())

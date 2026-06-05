@@ -282,9 +282,10 @@ struct FileStreamConfig {
     /// Optional DB pool for `image_access` bookkeeping. `None` disables
     /// the bookkeeping (the substitution itself still runs).
     access_pool: Option<sqlx::PgPool>,
-    /// User to credit `image_access` rows to. Typically the org owner when
-    /// the upload is in org context, else the individual user.
-    access_user_id: Option<uuid::Uuid>,
+    /// Who to attribute `image_access` rows to: the acting human, plus the
+    /// owning org when the upload is in org context (so org members can view
+    /// it, but personal uploads stay private to the user).
+    access_attribution: Option<crate::api::handlers::images::ImageAttribution>,
 }
 
 impl std::fmt::Debug for FileStreamConfig {
@@ -297,7 +298,7 @@ impl std::fmt::Debug for FileStreamConfig {
             .field("normalizer_enabled", &self.normalizer.is_some())
             .field("normalizer_mode", &self.normalizer_mode)
             .field("image_access_enabled", &self.access_pool.is_some())
-            .field("access_user_id", &self.access_user_id)
+            .field("access_attribution", &self.access_attribution)
             .finish()
     }
 }
@@ -334,7 +335,7 @@ async fn normalize_template_body_in_place(
     mode: ImageNormalizerMode,
     template: &mut fusillade::RequestTemplateInput,
     access_pool: Option<&sqlx::PgPool>,
-    access_user_id: Option<uuid::Uuid>,
+    access_attribution: Option<crate::api::handlers::images::ImageAttribution>,
 ) -> std::result::Result<(), BatchNormalizeError> {
     let Some(normalizer) = normalizer else {
         return Ok(());
@@ -360,13 +361,19 @@ async fn normalize_template_body_in_place(
             };
             match normalizer.ingest(input).await {
                 Ok(ingested) => {
-                    if let (Some(pool), Some(uid)) = (access_pool, access_user_id) {
+                    if let (Some(pool), Some(attribution)) = (access_pool, access_attribution) {
                         // Batch ingest is already async (file upload latency dominates),
                         // so we AWAIT the bookkeeping write rather than fire-and-forget —
                         // the user's later "view what I submitted" lookup depends on it.
                         // Records real (mime, bytes_len) captured from the ingest result.
-                        crate::api::handlers::images::record_image_access(&pool, uid, ingested.token, &ingested.mime, ingested.bytes_len)
-                            .await;
+                        crate::api::handlers::images::record_image_access(
+                            &pool,
+                            attribution,
+                            ingested.token,
+                            &ingested.mime,
+                            ingested.bytes_len,
+                        )
+                        .await;
                     }
                     Ok::<String, ()>(ingested.token.to_dw_img_uri())
                 }
@@ -617,7 +624,7 @@ fn create_file_stream(
     let normalizer = config.normalizer.clone();
     let normalizer_mode = config.normalizer_mode;
     let access_pool = config.access_pool.clone();
-    let access_user_id = config.access_user_id;
+    let access_attribution = config.access_attribution;
     let (tx, rx) = mpsc::channel(config.buffer_size);
     // std::sync::Mutex is appropriate here because:
     // 1. Lock is held only briefly (no await points while locked)
@@ -815,7 +822,7 @@ fn create_file_stream(
                                                         normalizer_mode,
                                                         &mut template,
                                                         access_pool.as_ref(),
-                                                        access_user_id,
+                                                        access_attribution,
                                                     )
                                                     .await
                                                     {
@@ -912,7 +919,7 @@ fn create_file_stream(
                                                 normalizer_mode,
                                                 &mut template,
                                                 access_pool.as_ref(),
-                                                access_user_id,
+                                                access_attribution,
                                             )
                                             .await
                                             {
@@ -1082,9 +1089,14 @@ pub async fn upload_file<P: PoolProvider>(
         normalizer,
         normalizer_mode,
         access_pool: Some(state.db.write().clone()),
-        // image_access rows are credited to the org owner when uploading in
-        // org context — matches the file-ownership attribution above.
-        access_user_id: Some(target_user_id),
+        // image_access is attributed to the acting human plus, for org-context
+        // uploads, the owning org — so org members can view org-key images
+        // while a personal upload stays private to the user. This is distinct
+        // from file ownership above, which is credited to the org.
+        access_attribution: Some(crate::api::handlers::images::ImageAttribution {
+            user_id: current_user.id,
+            organization_id: current_user.active_organization,
+        }),
     };
 
     // Get or create user-specific hidden batch API key for batch request execution.

@@ -293,9 +293,15 @@ pub async fn responses_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
             // realtime and `/v1/files` paths already close). No-op when the
             // feature is disabled.
             if state.image_normalizer_enabled {
-                let user_id = created_by.as_deref().and_then(|s| uuid::Uuid::parse_str(s).ok());
+                // Attribute the image to the acting human + owning org (for org
+                // keys), mirroring how CurrentUser is derived, so the console's
+                // org-scoped image-view authorization lines up.
+                let attribution = match api_key.as_deref() {
+                    Some(key) => crate::api::handlers::images::resolve_image_attribution(&state.dwctl_pool, key).await,
+                    None => None,
+                };
                 let access_pool = Some(state.dwctl_pool.clone());
-                match normalize_value_to_tokens(&mut request_value, &state.image_normalizer, access_pool, user_id).await {
+                match normalize_value_to_tokens(&mut request_value, &state.image_normalizer, access_pool, attribution).await {
                     Ok(n) => {
                         if n > 0 {
                             tracing::debug!(substituted = n, "flex image normalisation replaced image inputs with tokens");
