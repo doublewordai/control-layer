@@ -252,14 +252,15 @@ mod tests {
     /// Create an org-scoped API key (user_id = org, created_by = member) and return its secret.
     async fn create_org_api_key(pool: &PgPool, org_id: uuid::Uuid, member_id: uuid::Uuid) -> String {
         let mut conn = pool.acquire().await.unwrap();
-        let req = ApiKeyCreateDBRequest::new(org_id, member_id, ApiKeyCreate {
+        let create = ApiKeyCreate {
             name: format!("Org key {}", uuid::Uuid::new_v4().simple()),
             description: None,
             purpose: ApiKeyPurpose::Realtime,
             requests_per_second: None,
             burst_size: None,
             member_id: None,
-        });
+        };
+        let req = ApiKeyCreateDBRequest::new(org_id, member_id, create);
         ApiKeys::new(&mut conn).create(&req).await.unwrap().secret
     }
 
