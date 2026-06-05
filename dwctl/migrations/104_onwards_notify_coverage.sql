@@ -1,5 +1,5 @@
 -- Close four coverage gaps in the onwards `auth_config_changed` NOTIFY triggers
--- that migrations 102 and 099 left open. All payloads keep 102's unified colon format:
+-- that migrations 103 and 099 left open. All payloads keep 103's unified colon format:
 --
 --     <table>:<op>:<scope_id>:<epoch_micros>
 --
@@ -25,15 +25,15 @@
 --   (`inference_endpoints:<op>:<deployed_model.id>:<epoch>`) so the consumer can
 --   scope by deployment. An endpoint with no live deployments emits nothing.
 --
--- GAP 2 — model_traffic_rules UPDATE under-scoping. 102's UPDATE trigger
+-- GAP 2 — model_traffic_rules UPDATE under-scoping. 103's UPDATE trigger
 --   referenced only the NEW transition table, so an UPDATE that *moves* a rule to
 --   a different deployed_model_id notified the new deployment but never the old
 --   one — the old deployment kept a stale routing rule. We recreate the UPDATE
 --   trigger (and add a dedicated update function) to reference BOTH transition
 --   tables and emit one notify per DISTINCT deployed_model_id across their UNION.
---   The INSERT and DELETE triggers/function from 102 are left untouched.
+--   The INSERT and DELETE triggers/function from 103 are left untouched.
 --
--- GAP 3 — user_organizations UPDATE under-scoping, identical shape: 102's UPDATE
+-- GAP 3 — user_organizations UPDATE under-scoping, identical shape: 103's UPDATE
 --   trigger referenced only NEW, so an UPDATE that moves a membership to a
 --   different user_id never notified the old user. We recreate the UPDATE trigger
 --   (and add a dedicated update function) to reference BOTH transition tables and
@@ -47,7 +47,7 @@
 --
 -- Idempotent: CREATE OR REPLACE FUNCTION and DROP TRIGGER IF EXISTS before each
 -- CREATE TRIGGER, so this runs cleanly on a fresh DB and on a DB already carrying
--- migration 102's triggers.
+-- migration 103's triggers.
 
 -- ---------------------------------------------------------------------------
 -- GAP 1: inference_endpoints (STATEMENT-level, INSERT/UPDATE/DELETE).
@@ -57,7 +57,7 @@
 -- Postgres only permits a NEW TABLE on INSERT/UPDATE triggers and an OLD TABLE on
 -- DELETE/UPDATE triggers (the trigger DDL itself enforces this), so the three
 -- triggers below bind only the transition table(s) valid for their op. The single
--- shared function — exactly like migration 102's notify_traffic_rules_config_change
+-- shared function — exactly like migration 103's notify_traffic_rules_config_change
 -- — branches on TG_OP and reads only the transition table that the firing op
 -- bound: new_rows on INSERT, old_rows on DELETE. (A reference to a transition
 -- table in an unexecuted branch is fine; Postgres resolves transition tables at
@@ -72,7 +72,7 @@
 -- this AFTER STATEMENT trigger fires only after the cascade has run, so the
 -- `SELECT ... deployed_models WHERE hosted_on = <deleted endpoint>` finds zero
 -- rows and the DELETE branch emits nothing here. That is fine: each cascade-
--- deleted deployment already fires migration 102's row-level deployed_models
+-- deleted deployment already fires migration 103's row-level deployed_models
 -- DELETE trigger and emits its own `deployed_models:DELETE:<deployment_id>`
 -- notify, so the consumer still drops exactly those deployments. We keep the
 -- symmetric DELETE branch (a) to match the requested per-deployment shape and
@@ -155,7 +155,7 @@ CREATE TRIGGER inference_endpoints_notify_delete
 -- GAP 2: model_traffic_rules UPDATE (STATEMENT-level). Reference BOTH transition
 -- tables so a rule whose deployed_model_id moved notifies the OLD deployment as
 -- well as the NEW one. scope = deployed_model_id. INSERT/DELETE from migration
--- 102 (notify_traffic_rules_config_change) are intentionally left in place.
+-- 103 (notify_traffic_rules_config_change) are intentionally left in place.
 -- ---------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION notify_traffic_rules_config_change_update() RETURNS trigger AS $$
 DECLARE
@@ -183,7 +183,7 @@ CREATE TRIGGER model_traffic_rules_notify_update
 -- ---------------------------------------------------------------------------
 -- GAP 3: user_organizations UPDATE (STATEMENT-level). Reference BOTH transition
 -- tables so a membership whose user_id moved notifies the OLD user as well as
--- the NEW one. scope = user_id. INSERT/DELETE from migration 102
+-- the NEW one. scope = user_id. INSERT/DELETE from migration 103
 -- (notify_user_organizations_config_change) are intentionally left in place.
 -- ---------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION notify_user_organizations_config_change_update() RETURNS trigger AS $$

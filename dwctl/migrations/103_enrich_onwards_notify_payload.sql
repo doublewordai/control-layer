@@ -40,10 +40,10 @@
 -- form, because `users` was not yet in resolve_change_scope's delta dispatch, so any
 -- scope id emitted for it would be ignored and a full reload done anyway.
 --
--- SUPERSEDED: migration 103 adds a `users` arm to resolve_change_scope and upgrades
+-- SUPERSEDED: migration 104 adds a `users` arm to resolve_change_scope and upgrades
 -- users_verified_notify to the enriched `users:<op>:<user_id>:<epoch>` form, making a
 -- verified change a per-user delta. The notes in this file describe the state as of
--- migration 102 only.
+-- migration 103 only.
 --
 -- DESIGN: the old shared notify_config_change() served tables with DIFFERENT
 -- scope columns AND different trigger levels (row vs statement). A single
