@@ -339,13 +339,27 @@ impl OnwardsConfigSync {
                     }
                 }
             }
-            // Membership changes can REVOKE access: when a user is removed from a group or
-            // organization, the affected deployment is one the user can NO LONGER reach, so
-            // `deployments_for_user` (current reachability) would miss it and leave its key
-            // list stale — the revoked key would keep working until the periodic fallback.
-            // Full-reload instead so every deployment's key list is refreshed (this is what
-            // the pre-delta sync always did, and why this scenario passed before).
-            "user_groups" | "user_organizations" => Vec::new(),
+            // A user_groups change (a user joined or left group G) can only change the key
+            // list of the deployments G grants. A REVOCATION removes access to a deployment
+            // the user can NO LONGER reach, so `deployments_for_user` (current reachability)
+            // would miss it and leave the revoked key cached. Scoping by the GROUP's
+            // deployments (migration 105 emits the group id here) captures that revoked
+            // deployment AND stays a cheap delta. A nil group id is not a real grant, so it
+            // falls through to a full reload.
+            "user_groups" if scope_id != uuid::Uuid::nil() => match self.deployments_for_group(scope_id).await {
+                Ok(ids) => ids,
+                Err(e) => {
+                    error!("Failed to resolve deployments for group {scope_id}: {e}; doing a full reload");
+                    Vec::new()
+                }
+            },
+            // user_organizations membership does NOT grant deployment access — the routing
+            // query joins user_groups + the public group only and never references
+            // user_organizations — so an org change can't alter any deployment's key list. It
+            // still arrives as a NOTIFY, so fall back to a full reload: wasteful but correct,
+            // and org-membership churn is rare. (A revocation here also could not be
+            // user-scoped, so a full reload is the safe floor regardless.)
+            "user_organizations" => Vec::new(),
             // Unmapped → full reload. Two distinct causes, logged differently: a user-table
             // change by the system user (nil uuid, which reaches everything) is expected, so
             // debug; a genuinely unknown table means a trigger fires without a resolver arm
@@ -388,6 +402,25 @@ impl OnwardsConfigSync {
             "#,
             user_id,
             &self.escalation_models
+        )
+        .fetch_all(&self.db)
+        .await?;
+        Ok(ids)
+    }
+
+    /// All deployments a group grants access to (its `deployment_groups` rows). A
+    /// `user_groups` change (a user joining or leaving the group) can only affect these
+    /// deployments — and, unlike `deployments_for_user`, this set still includes a deployment
+    /// the user was just REVOKED from, so the scoped delta refreshes its key list instead of
+    /// leaving the revoked key cached. `group_id` is indexed (idx_deployment_groups_group_id).
+    async fn deployments_for_group(&self, group_id: uuid::Uuid) -> Result<Vec<DeploymentId>, anyhow::Error> {
+        let ids = sqlx::query_scalar!(
+            r#"
+            SELECT deployment_id
+            FROM deployment_groups
+            WHERE group_id = $1
+            "#,
+            group_id
         )
         .fetch_all(&self.db)
         .await?;
@@ -1758,6 +1791,9 @@ async fn config_content_hash(db: &PgPool) -> Result<String, sqlx::Error> {
             -- whole row, to avoid thrashing the hash on volatile columns like last_login.
             -- WARNING: if a new routing-affecting users column is added (e.g. another
             -- rate-limit flag), include it here or the fallback sync will miss the change.
+            -- Conversely, do NOT fold non-routing volatile columns (timestamps / audit
+            -- fields like last_login) into a table's full-row hash above, or the hash will
+            -- thrash on no-op updates and trigger needless full reloads.
             coalesce((SELECT string_agg(u.id::text || ':' || u.verified::text, ',' ORDER BY u.id::text) FROM users u), '')
         ) AS "hash!"
         "#

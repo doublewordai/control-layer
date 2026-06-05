@@ -265,6 +265,8 @@ impl<'c> Credits<'c> {
             .unwrap_or_default()
             .as_micros();
 
+        // Payload verbs (deplete/restore) and the <table>:<op>:<scope_id>:<epoch> format
+        // are documented in migration 103_enrich_onwards_notify_payload.sql.
         let payload = format!("credits_transactions:restore:{}:{}", user_id, epoch_micros);
 
         sqlx::query("SELECT pg_notify('auth_config_changed', $1)")

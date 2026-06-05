@@ -991,6 +991,8 @@ where
         // One notify per depleted user then lets the onwards sync scope each reload to that
         // user's deployments (a delta) instead of running the full reload.
         for user_id in depleted_users {
+            // Payload verbs (deplete/restore) and the <table>:<op>:<scope_id>:<epoch> format
+            // are documented in migration 103_enrich_onwards_notify_payload.sql.
             let payload = format!("credits_transactions:deplete:{}:{}", user_id, epoch_micros);
             sqlx::query("SELECT pg_notify($1, $2)")
                 .bind(ONWARDS_CONFIG_CHANGED_CHANNEL)

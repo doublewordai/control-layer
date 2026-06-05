@@ -241,22 +241,38 @@ async fn test_user_scoped_change_resolves_reachable_deployments(pool: sqlx::PgPo
         );
     }
 
-    // Membership changes (user_groups / user_organizations) can REVOKE access: the affected
-    // deployment is one the user no longer reaches, which deployments_for_user (current
-    // reachability) cannot see. They must fall back to a full reload (empty scope) so the
-    // revoked deployment's key list is refreshed — a user-scoped delta would leave it stale.
-    for table in ["user_groups", "user_organizations"] {
-        let change = super::NotifyChange {
-            table: table.to_string(),
-            op: Some("DELETE".to_string()),
-            scope_id: Some(user_a),
-            lag: Duration::ZERO,
-        };
-        assert!(
-            sync.resolve_change_scope(Some(&change)).await.is_empty(),
-            "a '{table}' change must trigger a full reload (revocation can't be user-scoped)"
-        );
-    }
+    // A user_groups change is scoped by the GROUP (migration 105): it resolves the
+    // deployments that group grants — a set that still includes a deployment the user was
+    // just REVOKED from, which deployments_for_user (current reachability) would miss. So the
+    // scope id here is a GROUP id and it resolves to that group's deployment set.
+    let group_a = id("00000000-0000-0000-0000-000000000aa1");
+    let mut group_a_deployments = vec![regular_private, private_composite];
+    group_a_deployments.sort();
+    let ug_change = super::NotifyChange {
+        table: "user_groups".to_string(),
+        op: Some("DELETE".to_string()),
+        scope_id: Some(group_a),
+        lag: Duration::ZERO,
+    };
+    let mut ug_scope = sync.resolve_change_scope(Some(&ug_change)).await;
+    ug_scope.sort();
+    assert_eq!(
+        ug_scope, group_a_deployments,
+        "a user_groups change must scope to the group's granted deployments (catches revocations)"
+    );
+
+    // user_organizations membership does not grant deployment access, so it falls back to a
+    // full reload (empty scope) rather than a delta.
+    let uo_change = super::NotifyChange {
+        table: "user_organizations".to_string(),
+        op: Some("DELETE".to_string()),
+        scope_id: Some(user_a),
+        lag: Duration::ZERO,
+    };
+    assert!(
+        sync.resolve_change_scope(Some(&uo_change)).await.is_empty(),
+        "a user_organizations change must trigger a full reload (org membership doesn't grant access)"
+    );
 
     // A user with no group membership reaches only the public deployments.
     let user_b = id("00000000-0000-0000-0000-0000000000b1");
@@ -978,20 +994,24 @@ async fn test_api_keys_noop_upsert_does_not_trigger_notify(pool: sqlx::PgPool) {
 }
 
 /// Removing a user from a group / organization must fire a scoped DELETE notify so the
-/// delta sync reloads that user's deployments — otherwise the removal only takes effect at
-/// the periodic fallback. Verifies the membership DELETE triggers (migration 103) fire and
-/// carry the removed user's id.
+/// delta sync reloads the affected deployments — otherwise the removal only takes effect at
+/// the periodic fallback. Verifies the membership DELETE triggers fire and carry the right
+/// scope id: the GROUP id for user_groups (migration 105, so the group's deployments —
+/// including a just-revoked one — get re-queried) and the removed user's id for
+/// user_organizations.
 #[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
 async fn test_membership_delete_fires_scoped_notify(pool: sqlx::PgPool) {
     use sqlx::postgres::PgListener;
 
-    // cache_base puts user A in group cache-private-a via a user_groups row.
+    // cache_base puts user A in group cache-private-a (id ...0aa1) via a user_groups row.
     let user_a = "00000000-0000-0000-0000-0000000000a1";
+    let group_a = "00000000-0000-0000-0000-000000000aa1";
 
     let mut listener = PgListener::connect_with(&pool).await.unwrap();
     listener.listen("auth_config_changed").await.unwrap();
 
-    // Removing the group membership must notify with the removed user's id.
+    // Removing the group membership must notify with the GROUP's id (migration 105), so the
+    // delta scopes to the group's deployments and catches the deployment just revoked.
     sqlx::query("DELETE FROM user_groups WHERE user_id = $1::uuid")
         .bind(user_a)
         .execute(&pool)
@@ -1002,8 +1022,8 @@ async fn test_membership_delete_fires_scoped_notify(pool: sqlx::PgPool) {
         .expect("user_groups DELETE should notify")
         .expect("failed to receive notification");
     assert!(
-        n.payload().starts_with(&format!("user_groups:DELETE:{user_a}:")),
-        "user_groups DELETE must emit a scoped notify for the removed user, got: {}",
+        n.payload().starts_with(&format!("user_groups:DELETE:{group_a}:")),
+        "user_groups DELETE must emit a scoped notify carrying the group id, got: {}",
         n.payload()
     );
     while let Ok(Ok(Some(_))) = timeout(Duration::from_millis(50), listener.try_recv()).await {}
